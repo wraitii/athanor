@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
-use oxc_ast::ast::{ArrowFunctionExpression, Function, IdentifierReference, Program};
+use oxc_ast::ast::{
+    ArrowFunctionExpression, Function, IdentifierReference, Program, ThisExpression,
+};
 use oxc_ast_visit::{Visit, walk};
 use oxc_semantic::Scoping;
 use oxc_span::Span;
@@ -17,11 +19,13 @@ pub(super) struct CaptureAnalysis {
 
 pub(super) struct FunctionCaptures {
     pub(super) captures: Vec<SymbolId>,
+    pub(super) lexical_this: bool,
 }
 
 struct ActiveFunction {
     scope: ScopeId,
     start: u32,
+    arrow: bool,
 }
 
 struct Analyzer<'s> {
@@ -43,31 +47,48 @@ impl CaptureAnalysis {
 }
 
 impl Analyzer<'_> {
-    fn enter(&mut self, scope: ScopeId, span: Span) {
+    fn enter(&mut self, scope: ScopeId, span: Span, arrow: bool) {
         self.result.functions.insert(
             span.start,
             FunctionCaptures {
                 captures: Vec::new(),
+                lexical_this: false,
             },
         );
         self.active.push(ActiveFunction {
             scope,
             start: span.start,
+            arrow,
         });
     }
 }
 
 impl<'a> Visit<'a> for Analyzer<'_> {
     fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
-        self.enter(function.scope_id.get().unwrap(), function.span);
+        self.enter(function.scope_id.get().unwrap(), function.span, false);
         walk::walk_function(self, function, flags);
         self.active.pop();
     }
 
     fn visit_arrow_function_expression(&mut self, function: &ArrowFunctionExpression<'a>) {
-        self.enter(function.scope_id.get().unwrap(), function.span);
+        self.enter(function.scope_id.get().unwrap(), function.span, true);
         walk::walk_arrow_function_expression(self, function);
         self.active.pop();
+    }
+
+    fn visit_this_expression(&mut self, _: &ThisExpression) {
+        for function in self
+            .active
+            .iter()
+            .rev()
+            .take_while(|function| function.arrow)
+        {
+            self.result
+                .functions
+                .get_mut(&function.start)
+                .unwrap()
+                .lexical_this = true;
+        }
     }
 
     fn visit_identifier_reference(&mut self, identifier: &IdentifierReference<'a>) {

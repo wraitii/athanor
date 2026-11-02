@@ -1,11 +1,9 @@
 use cranelift_codegen::ir::{BlockArg, InstBuilder, types};
-use oxc_ast::ast::{
-    BindingPattern, ForStatement, ForStatementInit, Statement, VariableDeclaration,
-    VariableDeclarationKind,
-};
+use oxc_ast::ast::{BindingPattern, Statement, VariableDeclaration, VariableDeclarationKind};
 use oxc_span::GetSpan;
 
 use crate::error::{Error, unsupported_at};
+use crate::jit::helpers::Helper;
 use crate::value::Value;
 
 use super::FunctionCompiler;
@@ -28,13 +26,86 @@ impl FunctionCompiler<'_, '_> {
         Ok(())
     }
 
-    fn emit_statement(&mut self, statement: &Statement<'_>) -> Result<(), Error> {
+    pub(super) fn emit_statement(&mut self, statement: &Statement<'_>) -> Result<(), Error> {
         match statement {
             Statement::BlockStatement(block) => self.emit_block(&block.body),
             Statement::EmptyStatement(_) | Statement::DebuggerStatement(_) => Ok(()),
             Statement::ExpressionStatement(statement) => {
+                if let oxc_ast::ast::Expression::YieldExpression(expression) = &statement.expression
+                {
+                    let generator = self.generator.ok_or_else(|| {
+                        unsupported_at(expression.span, "yield outside generator")
+                    })?;
+                    let value = match &expression.argument {
+                        Some(argument) => self.emit_expression(argument)?,
+                        None => self.constant(Value::UNDEFINED),
+                    };
+                    let (state, resume) = self.suspensions[&expression.span.start];
+                    let state = self.b.ins().iconst(types::I64, state as i64);
+                    let result =
+                        self.call_helper(Helper::GeneratorSuspend, &[generator, value, state]);
+                    self.b.ins().return_(&[result]);
+                    self.resume_blocks.push(resume);
+                    self.switch(resume);
+                    for variable in self.scopes.variables() {
+                        let slot = self.b.ins().iconst(types::I64, variable.as_u32() as i64);
+                        let value = self.call_helper(Helper::LocalGet, &[slot]);
+                        self.b.def_var(variable, value);
+                    }
+                    self.clear_temporaries();
+                    return Ok(());
+                }
                 self.emit_expression(&statement.expression)?;
                 self.clear_temporaries();
+                Ok(())
+            }
+            Statement::ThrowStatement(statement) => {
+                let value = self.emit_expression(&statement.argument)?;
+                self.call_helper(Helper::Throw, &[value]);
+                self.check_error();
+                let undefined = self.constant(Value::UNDEFINED);
+                self.jump(self.return_block, &[BlockArg::Value(undefined)]);
+                Ok(())
+            }
+            Statement::TryStatement(statement) => {
+                if statement.finalizer.is_some() {
+                    return Err(unsupported_at(statement.span, "finally"));
+                }
+                let handler = statement
+                    .handler
+                    .as_ref()
+                    .ok_or_else(|| unsupported_at(statement.span, "try without catch"))?;
+                if handler.param.as_ref().is_some_and(|param| {
+                    !matches!(param.pattern, BindingPattern::BindingIdentifier(_))
+                }) {
+                    return Err(unsupported_at(handler.span, "destructuring catch binding"));
+                }
+                let catch = self.b.create_block();
+                let done = self.b.create_block();
+                self.handlers.push(catch);
+                self.emit_block(&statement.block.body)?;
+                self.handlers.pop();
+                if !self.terminated {
+                    self.jump(done, &[]);
+                }
+                self.switch(catch);
+                let dummy = self.constant(Value::UNDEFINED);
+                let exception = self.call_helper(Helper::Catch, &[dummy]);
+                self.scopes.push();
+                if let Some(param) = &handler.param {
+                    if let BindingPattern::BindingIdentifier(identifier) = &param.pattern {
+                        let variable =
+                            self.declare_lexical_binding(identifier.symbol_id.get().unwrap());
+                        self.initialize_local(variable, exception);
+                    }
+                }
+                self.clear_temporaries();
+                self.emit_block(&handler.body.body)?;
+                self.leave_block();
+                if !self.terminated {
+                    self.jump(done, &[]);
+                }
+                self.switch(done);
                 Ok(())
             }
             Statement::ReturnStatement(statement) => {
@@ -74,49 +145,36 @@ impl FunctionCompiler<'_, '_> {
                 self.switch(done);
                 Ok(())
             }
-            Statement::WhileStatement(statement) => {
-                let header = self.b.create_block();
-                let body = self.b.create_block();
-                let done = self.b.create_block();
-                self.jump(header, &[]);
-
-                self.switch(header);
-                let test = self.emit_expression(&statement.test)?;
-                let condition = self.truthy(test);
-                self.clear_temporaries();
-                self.brif(condition, body, &[], done, &[]);
-
-                self.switch(body);
-                self.emit_statement(&statement.body)?;
-                if !self.terminated {
-                    self.jump(header, &[]);
-                }
-
-                self.switch(done);
-                Ok(())
-            }
-            Statement::DoWhileStatement(statement) => {
-                let body = self.b.create_block();
-                let test = self.b.create_block();
-                let done = self.b.create_block();
-                self.jump(body, &[]);
-
-                self.switch(body);
-                self.emit_statement(&statement.body)?;
-                if !self.terminated {
-                    self.jump(test, &[]);
-                }
-
-                self.switch(test);
-                let value = self.emit_expression(&statement.test)?;
-                let condition = self.truthy(value);
-                self.clear_temporaries();
-                self.brif(condition, body, &[], done, &[]);
-
-                self.switch(done);
-                Ok(())
-            }
+            Statement::WhileStatement(statement) => self.emit_while(statement),
+            Statement::DoWhileStatement(statement) => self.emit_do_while(statement),
             Statement::ForStatement(statement) => self.emit_for(statement),
+            Statement::ForOfStatement(statement) => self.emit_for_of(statement),
+            Statement::BreakStatement(statement) => {
+                if statement.label.is_some() {
+                    return Err(unsupported_at(statement.span, "labeled break"));
+                }
+                let target = self
+                    .loops
+                    .last()
+                    .ok_or_else(|| unsupported_at(statement.span, "break outside loop"))?
+                    .0;
+                self.clear_temporaries();
+                self.jump(target, &[]);
+                Ok(())
+            }
+            Statement::ContinueStatement(statement) => {
+                if statement.label.is_some() {
+                    return Err(unsupported_at(statement.span, "labeled continue"));
+                }
+                let target = self
+                    .loops
+                    .last()
+                    .ok_or_else(|| unsupported_at(statement.span, "continue outside loop"))?
+                    .1;
+                self.clear_temporaries();
+                self.jump(target, &[]);
+                Ok(())
+            }
             Statement::FunctionDeclaration(function) => {
                 Err(unsupported_at(function.span, "nested function declaration"))
             }
@@ -127,79 +185,7 @@ impl FunctionCompiler<'_, '_> {
         }
     }
 
-    fn emit_for(&mut self, statement: &ForStatement<'_>) -> Result<(), Error> {
-        let lexical_scope = matches!(
-            &statement.init,
-            Some(ForStatementInit::VariableDeclaration(declaration))
-                if declaration.kind != VariableDeclarationKind::Var
-        );
-        if lexical_scope {
-            if let Some(ForStatementInit::VariableDeclaration(declaration)) = &statement.init {
-                for declarator in &declaration.declarations {
-                    if let BindingPattern::BindingIdentifier(identifier) = &declarator.id {
-                        if self.captured.contains(&identifier.symbol_id.get().unwrap()) {
-                            return Err(unsupported_at(declarator.span, "captured loop binding"));
-                        }
-                    }
-                }
-            }
-        }
-        if let Some(init) = &statement.init {
-            match init {
-                ForStatementInit::VariableDeclaration(declaration) => {
-                    if lexical_scope {
-                        self.enter_for_declaration(declaration);
-                    }
-                    self.emit_variable_declaration(declaration)?;
-                }
-                other => {
-                    let expression = other
-                        .as_expression()
-                        .ok_or_else(|| unsupported_at(statement.span, "for loop init"))?;
-                    self.emit_expression(expression)?;
-                    self.clear_temporaries();
-                }
-            }
-        }
-
-        let header = self.b.create_block();
-        let body = self.b.create_block();
-        let update = self.b.create_block();
-        let done = self.b.create_block();
-        self.jump(header, &[]);
-
-        self.switch(header);
-        let condition = match &statement.test {
-            Some(expression) => {
-                let value = self.emit_expression(expression)?;
-                self.truthy(value)
-            }
-            None => self.b.ins().iconst(types::I8, 1),
-        };
-        self.clear_temporaries();
-        self.brif(condition, body, &[], done, &[]);
-
-        self.switch(body);
-        self.emit_statement(&statement.body)?;
-        if !self.terminated {
-            self.jump(update, &[]);
-        }
-
-        self.switch(update);
-        if let Some(expression) = &statement.update {
-            self.emit_expression(expression)?;
-            self.clear_temporaries();
-        }
-        self.jump(header, &[]);
-
-        self.switch(done);
-        if lexical_scope {
-            self.leave_block();
-        }
-        Ok(())
-    }
-
-    fn emit_variable_declaration(
+    pub(super) fn emit_variable_declaration(
         &mut self,
         declaration: &VariableDeclaration<'_>,
     ) -> Result<(), Error> {

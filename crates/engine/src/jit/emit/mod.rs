@@ -1,4 +1,5 @@
 mod expression;
+mod loops;
 mod ops;
 mod scope;
 mod statement;
@@ -9,7 +10,7 @@ use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
     Block, BlockArg, InstBuilder, MemFlags, Type, Value as ClifValue, types,
 };
-use cranelift_frontend::FunctionBuilder;
+use cranelift_frontend::{FunctionBuilder, Switch};
 use cranelift_jit::JITModule;
 use cranelift_module::{FuncId, Module};
 use oxc_ast::ast::{Expression, FormalParameters, Statement};
@@ -24,6 +25,12 @@ use scope::ScopeStack;
 
 pub(crate) use statement::statement_kind;
 
+pub(super) enum FunctionKind {
+    Ordinary,
+    Generator(super::generator::ResumePlan),
+    Factory(FuncId),
+}
+
 pub(super) struct FunctionCompiler<'a, 'f> {
     names: &'a mut Vec<Box<str>>,
     b: &'a mut FunctionBuilder<'f>,
@@ -32,12 +39,18 @@ pub(super) struct FunctionCompiler<'a, 'f> {
     scoping: &'a Scoping,
     pointer: Type,
     ctx: ClifValue,
+    receiver: ClifValue,
     argv: ClifValue,
     argc: ClifValue,
     captured: &'a HashSet<SymbolId>,
-    closures: &'a HashMap<u32, (FuncId, Vec<SymbolId>)>,
+    closures: &'a HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
     scopes: ScopeStack,
     return_block: Block,
+    handlers: Vec<Block>,
+    loops: Vec<(Block, Block)>,
+    generator: Option<ClifValue>,
+    resume_blocks: Vec<Block>,
+    suspensions: HashMap<u32, (usize, Block)>,
     terminated: bool,
 }
 
@@ -52,12 +65,13 @@ pub(super) fn build_function(
     expression: Option<&Expression<'_>>,
     captures: &[SymbolId],
     captured: &HashSet<SymbolId>,
-    closures: &HashMap<u32, (FuncId, Vec<SymbolId>)>,
+    closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
+    kind: FunctionKind,
 ) -> Result<(), Error> {
     let entry = b.create_block();
     b.switch_to_block(entry);
     b.append_block_params_for_function_params(entry);
-    let [ctx, closure, argv, argc] = b.block_params(entry).try_into().unwrap();
+    let [ctx, closure, receiver, argv, argc] = b.block_params(entry).try_into().unwrap();
     let return_block = b.create_block();
     b.append_block_param(return_block, types::I64);
 
@@ -70,17 +84,56 @@ pub(super) fn build_function(
         scoping,
         pointer,
         ctx,
+        receiver,
         argv,
         argc,
         captured,
         closures,
         scopes: ScopeStack::new(),
         return_block,
+        handlers: Vec::new(),
+        loops: Vec::new(),
+        generator: None,
+        resume_blocks: Vec::new(),
+        suspensions: HashMap::new(),
         terminated: false,
     };
 
-    compiler.enter_frame();
+    let dispatch = if let FunctionKind::Generator(plan) = &kind {
+        compiler.generator = Some(closure);
+        let dispatch = compiler.b.create_block();
+        let start = compiler.b.create_block();
+        compiler.jump(dispatch, &[]);
+        compiler.resume_blocks.push(start);
+        for (index, span) in plan.suspensions.iter().enumerate() {
+            let block = compiler.b.create_block();
+            compiler.suspensions.insert(*span, (index + 1, block));
+        }
+        compiler.switch(start);
+        Some(dispatch)
+    } else {
+        compiler.enter_frame();
+        None
+    };
+    if let FunctionKind::Factory(resume) = kind {
+        let args = compiler.call_helper(Helper::ArrayNew, &[argv, argc]);
+        compiler.check_error();
+        let code = compiler.b.ins().iconst(types::I64, resume.as_u32() as i64);
+        let generator =
+            compiler.call_helper(Helper::GeneratorNew, &[closure, receiver, args, code]);
+        compiler.check_error();
+        compiler.jump(return_block, &[BlockArg::Value(generator)]);
+        compiler.switch(return_block);
+        let result = compiler.b.block_params(return_block)[0];
+        compiler.return_value(result);
+        return Ok(());
+    }
     compiler.initialize_function(params, statements)?;
+    let closure = if compiler.generator.is_some() {
+        compiler.call_helper(Helper::GeneratorClosure, &[closure])
+    } else {
+        closure
+    };
     for (index, symbol) in captures.iter().enumerate() {
         let index = compiler.b.ins().iconst(types::I64, index as i64);
         let cell = compiler.call_helper(Helper::CaptureGet, &[closure, index]);
@@ -101,6 +154,20 @@ pub(super) fn build_function(
     compiler.switch(return_block);
     let result = compiler.b.block_params(return_block)[0];
     compiler.return_value(result);
+    if let Some(dispatch) = dispatch {
+        compiler.switch(dispatch);
+        let dummy = compiler.constant(Value::UNDEFINED);
+        let state = compiler.call_helper(Helper::GeneratorState, &[dummy]);
+        let mut switch = Switch::new();
+        for (state, block) in compiler.resume_blocks.iter().enumerate() {
+            switch.set_entry(state as u128, *block);
+        }
+        let invalid = compiler.b.create_block();
+        switch.emit(compiler.b, state, invalid);
+        compiler.switch(invalid);
+        let undefined = compiler.constant(Value::UNDEFINED);
+        compiler.jump(return_block, &[BlockArg::Value(undefined)]);
+    }
     Ok(())
 }
 
@@ -112,12 +179,12 @@ pub(super) fn build_global(
     names: &mut Vec<Box<str>>,
     statements: &[oxc_ast::ast::Statement<'_>],
     captured: &HashSet<SymbolId>,
-    closures: &HashMap<u32, (FuncId, Vec<SymbolId>)>,
+    closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
 ) -> Result<(), Error> {
     let entry = b.create_block();
     b.switch_to_block(entry);
     b.append_block_params_for_function_params(entry);
-    let [ctx, _closure, argv, argc] = b.block_params(entry).try_into().unwrap();
+    let [ctx, _closure, receiver, argv, argc] = b.block_params(entry).try_into().unwrap();
     let return_block = b.create_block();
     b.append_block_param(return_block, types::I64);
     let pointer = module.target_config().pointer_type();
@@ -129,12 +196,18 @@ pub(super) fn build_global(
         scoping,
         pointer,
         ctx,
+        receiver,
         argv,
         argc,
         captured,
         closures,
         scopes: ScopeStack::new(),
         return_block,
+        handlers: Vec::new(),
+        loops: Vec::new(),
+        generator: None,
+        resume_blocks: Vec::new(),
+        suspensions: HashMap::new(),
         terminated: false,
     };
     compiler.enter_frame();
@@ -192,7 +265,10 @@ impl FunctionCompiler<'_, '_> {
     }
 
     pub(super) fn return_value(&mut self, value: ClifValue) {
-        let value = self.call_helper(Helper::FrameExit, &[value]);
+        let value = match self.generator {
+            Some(generator) => self.call_helper(Helper::GeneratorComplete, &[generator, value]),
+            None => self.call_helper(Helper::FrameExit, &[value]),
+        };
         self.b.ins().return_(&[value]);
         self.terminated = true;
     }

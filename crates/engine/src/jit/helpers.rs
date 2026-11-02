@@ -17,6 +17,8 @@ pub(crate) enum HelperShape {
     Rest,
     IndexSet,
     Callable,
+    MethodCallable,
+    Quaternary,
 }
 
 pub(crate) struct HelperSpec {
@@ -44,17 +46,33 @@ macro_rules! define_helpers {
 }
 
 define_helpers! {
+    GeneratorNew => Quaternary, js_generator_new;
+    GeneratorClosure => Unary, js_generator_closure;
+    GeneratorState => Unary, js_generator_state;
+    GeneratorSuspend => IndexSet, js_generator_suspend;
+    GeneratorComplete => Binary, js_generator_complete;
+    LocalGet => Unary, js_local_get;
     CellNew => Unary, js_cell_new;
     CellGet => Unary, js_cell_get;
     CellSet => Binary, js_cell_set;
     CaptureGet => Binary, js_capture_get;
+    BindThis => Binary, js_bind_this;
+    DisableConstructor => Unary, js_disable_constructor;
     ClosureNew => Callable, js_closure_new;
-    Call => Callable, js_call;
+    Construct => Callable, js_construct;
+    Call => MethodCallable, js_call;
     FrameEnter => Unary, js_frame_enter;
     FrameExit => Unary, js_frame_exit;
     LocalSet => Binary, js_local_set;
     TempClear => Unary, js_temp_clear;
     TempRetain => Unary, js_temp_retain;
+    IterateNew => Unary, js_iterate_new;
+    IterateNext => Unary, js_iterate_next;
+    Typeof => Unary, js_typeof;
+    Truthy => Unary, js_truthy;
+    ObjectNew => Unary, js_object_new;
+    PropertyKey => Unary, js_property_key;
+    StringNew => ArrayNew, js_string_new;
     ArrayNew => ArrayNew, js_array_new;
     Rest => Rest, js_rest;
     IndexGet => Binary, js_index_get;
@@ -63,7 +81,16 @@ define_helpers! {
     PropertySet => PropertySet, js_property_set;
     GlobalGet => GlobalGet, js_global_get;
     GlobalSet => GlobalSet, js_global_set;
+    Throw => Unary, js_throw;
+    Catch => Unary, js_catch;
+    ExceptionPending => Unary, js_exception_pending;
     ErrorPending => Unary, js_error_pending;
+    BitwiseAnd => Binary, js_bitwise_and;
+    BitwiseOr => Binary, js_bitwise_or;
+    BitwiseXor => Binary, js_bitwise_xor;
+    ShiftLeft => Binary, js_shift_left;
+    ShiftRight => Binary, js_shift_right;
+    ShiftRightUnsigned => Binary, js_shift_right_unsigned;
     Add => Binary, js_add;
     Sub => Binary, js_sub;
     Mul => Binary, js_mul;
@@ -92,6 +119,12 @@ pub(crate) fn signature(shape: HelperShape, call_conv: CallConv, pointer: Type) 
     let mut signature = Signature::new(call_conv);
     signature.params.push(AbiParam::new(pointer));
     match shape {
+        HelperShape::MethodCallable => {
+            signature.params.push(AbiParam::new(types::I64));
+            signature.params.push(AbiParam::new(types::I64));
+            signature.params.push(AbiParam::new(pointer));
+            signature.params.push(AbiParam::new(types::I64));
+        }
         HelperShape::Callable => {
             signature.params.push(AbiParam::new(types::I64));
             signature.params.push(AbiParam::new(pointer));
@@ -106,6 +139,11 @@ pub(crate) fn signature(shape: HelperShape, call_conv: CallConv, pointer: Type) 
             signature.params.push(AbiParam::new(pointer));
             signature.params.push(AbiParam::new(types::I64));
             if shape == HelperShape::Rest {
+                signature.params.push(AbiParam::new(types::I64));
+            }
+        }
+        HelperShape::Quaternary => {
+            for _ in 0..4 {
                 signature.params.push(AbiParam::new(types::I64));
             }
         }
@@ -179,6 +217,9 @@ fn to_int32(number: f64) -> i32 {
 }
 
 fn loose_equals(ctx: *mut JitCtx, left: Value, right: Value) -> bool {
+    if left.is_string() && right.is_string() {
+        return strict_equals(ctx, left, right);
+    }
     if left.is_object() != right.is_object()
         && !left.is_nullish()
         && !right.is_nullish()
@@ -203,7 +244,11 @@ fn loose_equals(ctx: *mut JitCtx, left: Value, right: Value) -> bool {
     left.to_number() == right.to_number()
 }
 
-fn strict_equals(left: Value, right: Value) -> bool {
+fn strict_equals(ctx: *mut JitCtx, left: Value, right: Value) -> bool {
+    if left.is_string() && right.is_string() {
+        let heap = unsafe { &*ctx }.global.heap();
+        return heap.text(left) == heap.text(right);
+    }
     if left.is_number() && right.is_number() {
         return left.as_number() == right.as_number();
     }
@@ -214,6 +259,33 @@ fn strict_equals(left: Value, right: Value) -> bool {
 }
 
 pub(crate) extern "C" fn js_add(ctx: *mut JitCtx, left: Value, right: Value) -> Value {
+    if left.is_string() || right.is_string() {
+        let ctx = unsafe { &mut *ctx };
+        if (left.is_object() && ctx.global.heap().error_text(left).is_none())
+            || (right.is_object() && ctx.global.heap().error_text(right).is_none())
+        {
+            ctx.error = Some(crate::Error::Runtime(
+                "object-to-primitive conversion is unsupported".into(),
+            ));
+            return Value::UNDEFINED;
+        }
+        let heap = ctx.global.heap();
+        let left = heap
+            .text(left)
+            .or_else(|| heap.error_text(left))
+            .unwrap_or_else(|| left.to_string());
+        let right = heap
+            .text(right)
+            .or_else(|| heap.error_text(right))
+            .unwrap_or_else(|| right.to_string());
+        return match heap.string(&(left + &right)) {
+            Some(value) => ctx.own(value),
+            None => {
+                ctx.error = Some(crate::Error::Runtime("string heap exhausted".into()));
+                Value::UNDEFINED
+            }
+        };
+    }
     number_binary(ctx, left, right, |left, right| left + right)
 }
 
@@ -245,16 +317,12 @@ pub(crate) extern "C" fn js_loose_not_equal(ctx: *mut JitCtx, left: Value, right
     Value::boolean(!loose_equals(ctx, left, right))
 }
 
-pub(crate) extern "C" fn js_strict_equal(_ctx: *mut JitCtx, left: Value, right: Value) -> Value {
-    Value::boolean(strict_equals(left, right))
+pub(crate) extern "C" fn js_strict_equal(ctx: *mut JitCtx, left: Value, right: Value) -> Value {
+    Value::boolean(strict_equals(ctx, left, right))
 }
 
-pub(crate) extern "C" fn js_strict_not_equal(
-    _ctx: *mut JitCtx,
-    left: Value,
-    right: Value,
-) -> Value {
-    Value::boolean(!strict_equals(left, right))
+pub(crate) extern "C" fn js_strict_not_equal(ctx: *mut JitCtx, left: Value, right: Value) -> Value {
+    Value::boolean(!strict_equals(ctx, left, right))
 }
 
 pub(crate) extern "C" fn js_less(ctx: *mut JitCtx, left: Value, right: Value) -> Value {
@@ -287,8 +355,8 @@ pub(crate) extern "C" fn js_unary_negation(ctx: *mut JitCtx, value: Value) -> Va
     Value::number(-value.to_number())
 }
 
-pub(crate) extern "C" fn js_logical_not(_ctx: *mut JitCtx, value: Value) -> Value {
-    Value::boolean(!value.to_boolean())
+pub(crate) extern "C" fn js_logical_not(ctx: *mut JitCtx, value: Value) -> Value {
+    Value::boolean(js_truthy(ctx, value) == Value::FALSE)
 }
 
 pub(crate) extern "C" fn js_bitwise_not(ctx: *mut JitCtx, value: Value) -> Value {
@@ -330,7 +398,19 @@ extern "C" fn js_property_get(ctx: *mut JitCtx, object: Value, ptr: *const u8, l
     let ctx = unsafe { &mut *ctx };
     let name =
         unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len as usize)) };
+    if ctx.global.heap().generator_state(object).is_some() {
+        return generator_property(ctx, name);
+    }
+    if let Some(value) = super::builtins::property_get(ctx, object, name) {
+        return value;
+    }
+    if let Some(value) = set_property_get(ctx, object, name) {
+        return value;
+    }
     if object != Value::GLOBAL_OBJECT {
+        if let Some(value) = ctx.global.heap().property(object, name) {
+            return ctx.retain_temp(value);
+        }
         if name == "length" {
             if let Some(length) = ctx.global.heap().len(object) {
                 return Value::number(length as f64);
@@ -356,6 +436,9 @@ extern "C" fn js_property_set(
     let name =
         unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len as usize)) };
     if object != Value::GLOBAL_OBJECT {
+        if ctx.global.heap().set_property(object, name, value) {
+            return value;
+        }
         if name == "length"
             && array_index(value).is_some_and(|length| ctx.global.heap().truncate(object, length))
         {
@@ -422,6 +505,44 @@ fn array_index(value: Value) -> Option<usize> {
 }
 extern "C" fn js_index_get(ctx: *mut JitCtx, array: Value, index: Value) -> Value {
     let ctx = unsafe { &mut *ctx };
+    if ctx.global.heap().generator_state(array).is_some() {
+        let Some(name) = property_key(ctx, index) else {
+            return Value::UNDEFINED;
+        };
+        return generator_property(ctx, &name);
+    }
+    if ctx.global.heap().set_size(array).is_some() {
+        let Some(name) = property_key(ctx, index) else {
+            return Value::UNDEFINED;
+        };
+        return set_property_get(ctx, array, &name).unwrap();
+    }
+    if ctx.global.heap().has_properties(array) || array == Value::GLOBAL_OBJECT {
+        let Some(name) = property_key(ctx, index) else {
+            return Value::UNDEFINED;
+        };
+        let value = if array == Value::GLOBAL_OBJECT {
+            ctx.global.get_raw(&name).unwrap_or(Value::UNDEFINED)
+        } else {
+            ctx.global.heap().property(array, &name).unwrap()
+        };
+        return ctx.retain_temp(value);
+    }
+    if let Some(text) = ctx.global.heap().text(array) {
+        let Some(index) = array_index(index) else {
+            return Value::UNDEFINED;
+        };
+        let Some(character) = text.chars().nth(index) else {
+            return Value::UNDEFINED;
+        };
+        return match ctx.global.heap().string(character.encode_utf8(&mut [0; 4])) {
+            Some(value) => ctx.own(value),
+            None => {
+                ctx.error = Some(crate::Error::Runtime("string heap exhausted".into()));
+                Value::UNDEFINED
+            }
+        };
+    }
     let result = array_index(index).and_then(|index| ctx.global.heap().get(array, index));
     match result {
         Some(value) => ctx.retain_temp(value),
@@ -435,6 +556,19 @@ extern "C" fn js_index_get(ctx: *mut JitCtx, array: Value, index: Value) -> Valu
 }
 extern "C" fn js_index_set(ctx: *mut JitCtx, array: Value, index: Value, value: Value) -> Value {
     let ctx = unsafe { &mut *ctx };
+    if ctx.global.heap().has_properties(array) || array == Value::GLOBAL_OBJECT {
+        let Some(name) = property_key(ctx, index) else {
+            return Value::UNDEFINED;
+        };
+        if array == Value::GLOBAL_OBJECT {
+            if !ctx.global.set(&name, value) {
+                ctx.global.define(name, value);
+            }
+        } else {
+            ctx.global.heap().set_property(array, &name, value);
+        }
+        return value;
+    }
     if !array_index(index).is_some_and(|index| ctx.global.heap().set(array, index, value)) {
         ctx.error = Some(crate::Error::Runtime(
             "unsupported array index or receiver".into(),
@@ -525,7 +659,16 @@ extern "C" fn js_closure_new(
     }
 }
 
-extern "C" fn js_call(ctx: *mut JitCtx, closure: Value, argv: *const Value, argc: u64) -> Value {
+pub(super) extern "C" fn js_call(
+    ctx: *mut JitCtx,
+    closure: Value,
+    receiver: Value,
+    argv: *const Value,
+    argc: u64,
+) -> Value {
+    if let Some(function) = unsafe { &*ctx }.global.heap().native(closure) {
+        return native_call(ctx, function, receiver, argv, argc);
+    }
     let entry = {
         let context = unsafe { &mut *ctx };
         let entry = context
@@ -541,8 +684,525 @@ extern "C" fn js_call(ctx: *mut JitCtx, closure: Value, argv: *const Value, argc
         };
         entry
     };
-    let function: extern "C" fn(*mut JitCtx, Value, *const Value, u64) -> Value =
+    let function: extern "C" fn(*mut JitCtx, Value, Value, *const Value, u64) -> Value =
         unsafe { std::mem::transmute(entry) };
-    let value = function(ctx, closure, argv, argc);
+    let receiver = unsafe { &*ctx }
+        .global
+        .heap()
+        .lexical_this(closure)
+        .unwrap_or(receiver);
+    let value = function(ctx, closure, receiver, argv, argc);
     unsafe { &mut *ctx }.own(value)
+}
+
+extern "C" fn js_string_new(ctx: *mut JitCtx, ptr: *const u8, len: u64) -> Value {
+    let ctx = unsafe { &mut *ctx };
+    let text =
+        unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len as usize)) };
+    match ctx.global.heap().string(text) {
+        Some(value) => ctx.own(value),
+        None => {
+            ctx.error = Some(crate::Error::Runtime("string heap exhausted".into()));
+            Value::UNDEFINED
+        }
+    }
+}
+
+pub(super) extern "C" fn js_truthy(ctx: *mut JitCtx, value: Value) -> Value {
+    let ctx = unsafe { &*ctx };
+    Value::boolean(match ctx.global.heap().text(value) {
+        Some(text) => !text.is_empty(),
+        None => value.to_boolean(),
+    })
+}
+
+extern "C" fn js_throw(ctx: *mut JitCtx, value: Value) -> Value {
+    unsafe { &mut *ctx }.throw(value);
+    Value::UNDEFINED
+}
+
+extern "C" fn js_catch(ctx: *mut JitCtx, _: Value) -> Value {
+    unsafe { &mut *ctx }.catch()
+}
+
+extern "C" fn js_exception_pending(ctx: *mut JitCtx, _: Value) -> Value {
+    Value::boolean(unsafe { &*ctx }.exception_pending())
+}
+
+extern "C" fn js_construct(
+    ctx: *mut JitCtx,
+    constructor: Value,
+    argv: *const Value,
+    argc: u64,
+) -> Value {
+    let ctx = unsafe { &mut *ctx };
+    if ctx.global.heap().constructable(constructor) {
+        let Some(instance) = ctx.global.heap().object() else {
+            ctx.error = Some(crate::Error::Runtime("heap exhausted".into()));
+            return Value::UNDEFINED;
+        };
+        ctx.own(instance);
+        let result = js_call(ctx, constructor, instance, argv, argc);
+        if ctx.error.is_some() || ctx.exception_pending() {
+            return Value::UNDEFINED;
+        }
+        return if result.is_object() { result } else { instance };
+    }
+    if ctx.global.heap().native(constructor) == Some(crate::heap::NativeFunction::Set) {
+        let argument = if argc == 0 {
+            Value::UNDEFINED
+        } else {
+            unsafe { *argv }
+        };
+        if !argument.is_nullish() {
+            ctx.error = Some(crate::Error::Runtime(
+                "Set iterable construction is unsupported".into(),
+            ));
+            return Value::UNDEFINED;
+        }
+        return match ctx.global.heap().set_new() {
+            Some(value) => ctx.own(value),
+            None => {
+                ctx.error = Some(crate::Error::Runtime("heap exhausted".into()));
+                Value::UNDEFINED
+            }
+        };
+    }
+    if ctx.global.heap().native(constructor) != Some(crate::heap::NativeFunction::Error) {
+        ctx.error = Some(crate::Error::Runtime("unsupported constructor".into()));
+        return Value::UNDEFINED;
+    }
+    let argument = if argc == 0 {
+        Value::UNDEFINED
+    } else {
+        unsafe { *argv }
+    };
+    let heap = ctx.global.heap();
+    let text = if argument.is_undefined() {
+        String::new()
+    } else if argument.is_object() {
+        let Some(text) = heap.error_text(argument) else {
+            ctx.error = Some(crate::Error::Runtime(
+                "object-to-primitive conversion is unsupported".into(),
+            ));
+            return Value::UNDEFINED;
+        };
+        text
+    } else {
+        heap.text(argument).unwrap_or_else(|| argument.to_string())
+    };
+    let Some(message) = heap.string(&text) else {
+        ctx.error = Some(crate::Error::Runtime("heap exhausted".into()));
+        return Value::UNDEFINED;
+    };
+    let Some(name) = heap.string("Error") else {
+        heap.release(message);
+        ctx.error = Some(crate::Error::Runtime("heap exhausted".into()));
+        return Value::UNDEFINED;
+    };
+    let result = heap.error(message, name);
+    heap.release(message);
+    heap.release(name);
+    match result {
+        Some(value) => ctx.own(value),
+        None => {
+            ctx.error = Some(crate::Error::Runtime("heap exhausted".into()));
+            Value::UNDEFINED
+        }
+    }
+}
+
+extern "C" fn js_typeof(ctx: *mut JitCtx, value: Value) -> Value {
+    let ctx = unsafe { &mut *ctx };
+    if value == Value::UNINITIALIZED {
+        ctx.error = Some(crate::Error::Runtime(
+            "binding accessed before initialization".into(),
+        ));
+        return Value::UNDEFINED;
+    }
+    let name = if ctx.global.heap().closure_code(value).is_some()
+        || ctx.global.heap().native(value).is_some()
+    {
+        "function"
+    } else {
+        value.type_name()
+    };
+    match ctx.global.heap().string(name) {
+        Some(value) => ctx.own(value),
+        None => {
+            ctx.error = Some(crate::Error::Runtime("heap exhausted".into()));
+            Value::UNDEFINED
+        }
+    }
+}
+
+extern "C" fn js_iterate_new(ctx: *mut JitCtx, iterable: Value) -> Value {
+    let ctx = unsafe { &mut *ctx };
+    if ctx.global.heap().len(iterable).is_none() {
+        ctx.error = Some(crate::Error::Runtime(
+            "for-of requires an array or string".into(),
+        ));
+        return Value::UNDEFINED;
+    }
+    match ctx.global.heap().array(&[iterable, Value::number(0.0)]) {
+        Some(value) => ctx.own(value),
+        None => {
+            ctx.error = Some(crate::Error::Runtime("heap exhausted".into()));
+            Value::UNDEFINED
+        }
+    }
+}
+
+extern "C" fn js_iterate_next(ctx: *mut JitCtx, state: Value) -> Value {
+    let ctx = unsafe { &mut *ctx };
+    let heap = ctx.global.heap();
+    let iterable = heap.get(state, 0).unwrap();
+    let offset = heap.get(state, 1).unwrap().as_number().unwrap() as usize;
+    if iterable.is_string() {
+        let Some((character, next)) = heap.next_character(iterable, offset) else {
+            return Value::UNINITIALIZED;
+        };
+        heap.set(state, 1, Value::number(next as f64));
+        return match heap.string(character.encode_utf8(&mut [0; 4])) {
+            Some(value) => ctx.own(value),
+            None => {
+                ctx.error = Some(crate::Error::Runtime("heap exhausted".into()));
+                Value::UNDEFINED
+            }
+        };
+    }
+    if offset >= heap.len(iterable).unwrap() {
+        return Value::UNINITIALIZED;
+    }
+    let value = heap.get(iterable, offset).unwrap();
+    heap.set(state, 1, Value::number((offset + 1) as f64));
+    ctx.retain_temp(value)
+}
+
+fn bitwise_binary(
+    ctx: *mut JitCtx,
+    left: Value,
+    right: Value,
+    operation: impl FnOnce(i32, i32) -> i64,
+) -> Value {
+    if !numeric_operands(ctx, &[left, right]) {
+        return Value::UNDEFINED;
+    }
+    Value::number(operation(to_int32(left.to_number()), to_int32(right.to_number())) as f64)
+}
+
+extern "C" fn js_bitwise_and(ctx: *mut JitCtx, left: Value, right: Value) -> Value {
+    bitwise_binary(ctx, left, right, |left, right| (left & right) as i64)
+}
+
+extern "C" fn js_bitwise_or(ctx: *mut JitCtx, left: Value, right: Value) -> Value {
+    bitwise_binary(ctx, left, right, |left, right| (left | right) as i64)
+}
+
+extern "C" fn js_bitwise_xor(ctx: *mut JitCtx, left: Value, right: Value) -> Value {
+    bitwise_binary(ctx, left, right, |left, right| (left ^ right) as i64)
+}
+
+extern "C" fn js_shift_left(ctx: *mut JitCtx, left: Value, right: Value) -> Value {
+    bitwise_binary(ctx, left, right, |left, right| {
+        (left.wrapping_shl((right as u32) & 31)) as i64
+    })
+}
+
+extern "C" fn js_shift_right(ctx: *mut JitCtx, left: Value, right: Value) -> Value {
+    bitwise_binary(ctx, left, right, |left, right| {
+        (left.wrapping_shr((right as u32) & 31)) as i64
+    })
+}
+
+extern "C" fn js_shift_right_unsigned(ctx: *mut JitCtx, left: Value, right: Value) -> Value {
+    bitwise_binary(ctx, left, right, |left, right| {
+        (((left as u32) >> ((right as u32) & 31)) as i64) as i64
+    })
+}
+
+extern "C" fn js_object_new(ctx: *mut JitCtx, _: Value) -> Value {
+    let ctx = unsafe { &mut *ctx };
+    match ctx.global.heap().object() {
+        Some(value) => ctx.own(value),
+        None => {
+            ctx.error = Some(crate::Error::Runtime("heap exhausted".into()));
+            Value::UNDEFINED
+        }
+    }
+}
+
+fn property_key(ctx: &mut JitCtx, value: Value) -> Option<String> {
+    if value.is_object() {
+        ctx.error = Some(crate::Error::Runtime(
+            "object-to-property-key conversion is unsupported".into(),
+        ));
+        return None;
+    }
+    Some(ctx.global.heap().text(value).unwrap_or_else(|| {
+        if value.as_number() == Some(0.0) {
+            "0".into()
+        } else {
+            value.to_string()
+        }
+    }))
+}
+
+extern "C" fn js_property_key(ctx: *mut JitCtx, value: Value) -> Value {
+    let ctx = unsafe { &mut *ctx };
+    let Some(name) = property_key(ctx, value) else {
+        return Value::UNDEFINED;
+    };
+    match ctx.global.heap().string(&name) {
+        Some(value) => ctx.own(value),
+        None => {
+            ctx.error = Some(crate::Error::Runtime("heap exhausted".into()));
+            Value::UNDEFINED
+        }
+    }
+}
+
+fn set_property_get(ctx: &mut JitCtx, object: Value, name: &str) -> Option<Value> {
+    use crate::heap::NativeFunction;
+    let size = ctx.global.heap().set_size(object)?;
+    if name == "size" {
+        return Some(Value::number(size as f64));
+    }
+    let function = match name {
+        "add" => NativeFunction::SetAdd,
+        "has" => NativeFunction::SetHas,
+        "delete" => NativeFunction::SetDelete,
+        "clear" => NativeFunction::SetClear,
+        _ => return Some(Value::UNDEFINED),
+    };
+    Some(match ctx.global.heap().native_function(function) {
+        Some(value) => ctx.own(value),
+        None => {
+            ctx.error = Some(crate::Error::Runtime("heap exhausted".into()));
+            Value::UNDEFINED
+        }
+    })
+}
+
+fn native_call(
+    ctx: *mut JitCtx,
+    function: crate::heap::NativeFunction,
+    receiver: Value,
+    argv: *const Value,
+    argc: u64,
+) -> Value {
+    use crate::heap::NativeFunction;
+    if function == NativeFunction::Error {
+        let constructor = unsafe { &*ctx }
+            .global
+            .heap()
+            .native_function(function)
+            .unwrap();
+        let value = js_construct(ctx, constructor, argv, argc);
+        unsafe { &*ctx }.global.heap().release(constructor);
+        return value;
+    }
+    if function == NativeFunction::GeneratorNext {
+        if argc != 0 && unsafe { *argv } != Value::UNDEFINED {
+            unsafe { &mut *ctx }.error = Some(crate::Error::Runtime(
+                "generator resume arguments are unsupported".into(),
+            ));
+            return Value::UNDEFINED;
+        }
+        return generator_next(ctx, receiver);
+    }
+    if matches!(
+        function,
+        NativeFunction::HostReadFile
+            | NativeFunction::HostListFiles
+            | NativeFunction::HostEvaluateSource
+            | NativeFunction::ArrayFilter
+            | NativeFunction::ArrayMap
+            | NativeFunction::ArrayJoin
+            | NativeFunction::StringSlice
+            | NativeFunction::StringSplit
+            | NativeFunction::StringStartsWith
+            | NativeFunction::StringReplace
+    ) {
+        let args = if argc == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(argv, argc as usize) }
+        };
+        return super::builtins::call(ctx, function, receiver, args);
+    }
+    let ctx = unsafe { &mut *ctx };
+    if function == NativeFunction::Set {
+        ctx.error = Some(crate::Error::Runtime("Set requires new".into()));
+        return Value::UNDEFINED;
+    }
+    if ctx.global.heap().set_size(receiver).is_none() {
+        ctx.error = Some(crate::Error::Runtime(
+            "Set method requires a Set receiver".into(),
+        ));
+        return Value::UNDEFINED;
+    }
+    let argument = if argc == 0 {
+        Value::UNDEFINED
+    } else {
+        unsafe { *argv }
+    };
+    match function {
+        NativeFunction::SetHas => {
+            Value::boolean(ctx.global.heap().set_has(receiver, argument).unwrap())
+        }
+        NativeFunction::SetDelete => {
+            Value::boolean(ctx.global.heap().set_delete(receiver, argument).unwrap())
+        }
+        NativeFunction::SetAdd => {
+            if !ctx.global.heap().set_add(receiver, argument) {
+                ctx.error = Some(crate::Error::Runtime("invalid Set entry".into()));
+                return Value::UNDEFINED;
+            }
+            ctx.retain_temp(receiver)
+        }
+        NativeFunction::SetClear => {
+            if !ctx.global.heap().set_clear(receiver) {
+                ctx.error = Some(crate::Error::Runtime("heap exhausted".into()));
+            }
+            Value::UNDEFINED
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn generator_property(ctx: &mut JitCtx, name: &str) -> Value {
+    if name != "next" {
+        return Value::UNDEFINED;
+    }
+    match ctx
+        .global
+        .heap()
+        .native_function(crate::heap::NativeFunction::GeneratorNext)
+    {
+        Some(value) => ctx.own(value),
+        None => {
+            ctx.error = Some(crate::Error::Runtime("heap exhausted".into()));
+            Value::UNDEFINED
+        }
+    }
+}
+
+extern "C" fn js_generator_new(
+    ctx: *mut JitCtx,
+    closure: Value,
+    receiver: Value,
+    arguments: Value,
+    code: u64,
+) -> Value {
+    let ctx = unsafe { &mut *ctx };
+    match ctx
+        .global
+        .heap()
+        .generator(crate::heap::CodeId(code), closure, arguments, receiver)
+    {
+        Some(value) => ctx.own(value),
+        None => {
+            ctx.error = Some(crate::Error::Runtime("heap exhausted".into()));
+            Value::UNDEFINED
+        }
+    }
+}
+
+extern "C" fn js_generator_closure(ctx: *mut JitCtx, generator: Value) -> Value {
+    let ctx = unsafe { &mut *ctx };
+    let closure = ctx.global.heap().generator_parts(generator).unwrap().1;
+    ctx.retain_temp(closure)
+}
+
+extern "C" fn js_generator_state(ctx: *mut JitCtx, _: Value) -> u64 {
+    unsafe { &*ctx }.resume_state() as u64
+}
+
+extern "C" fn js_local_get(ctx: *mut JitCtx, slot: u64) -> Value {
+    unsafe { &mut *ctx }.local_get(slot as usize)
+}
+
+extern "C" fn js_generator_suspend(
+    ctx: *mut JitCtx,
+    generator: Value,
+    value: Value,
+    state: u64,
+) -> Value {
+    unsafe { &mut *ctx }.suspend(generator, value, state as usize)
+}
+
+extern "C" fn js_generator_complete(ctx: *mut JitCtx, generator: Value, value: Value) -> Value {
+    let ctx = unsafe { &mut *ctx };
+    let value = ctx.exit(value);
+    ctx.global.heap().generator_complete(generator);
+    value
+}
+
+fn generator_result(ctx: &mut JitCtx, value: Value, done: bool) -> Value {
+    let Some(result) = ctx.global.heap().object() else {
+        ctx.global.heap().release(value);
+        ctx.error = Some(crate::Error::Runtime("heap exhausted".into()));
+        return Value::UNDEFINED;
+    };
+    ctx.global.heap().set_property(result, "value", value);
+    ctx.global
+        .heap()
+        .set_property(result, "done", Value::boolean(done));
+    ctx.global.heap().release(value);
+    ctx.own(result)
+}
+
+fn generator_next(ctx: *mut JitCtx, generator: Value) -> Value {
+    use crate::heap::{GENERATOR_DONE, GENERATOR_RUNNING};
+    let context = unsafe { &mut *ctx };
+    let Some(state) = context.global.heap().generator_state(generator) else {
+        context.error = Some(crate::Error::Runtime(
+            "next requires a generator receiver".into(),
+        ));
+        return Value::UNDEFINED;
+    };
+    if state == GENERATOR_DONE {
+        return generator_result(context, Value::UNDEFINED, true);
+    }
+    if state == GENERATOR_RUNNING {
+        context.error = Some(crate::Error::Runtime("generator is already running".into()));
+        return Value::UNDEFINED;
+    }
+    let (code, _, arguments) = context.global.heap().generator_parts(generator).unwrap();
+    let Some(entry) = context.entry(code.0) else {
+        context.error = Some(crate::Error::Runtime(
+            "generator code is unavailable".into(),
+        ));
+        return Value::UNDEFINED;
+    };
+    let args: Vec<_> = (0..context.global.heap().len(arguments).unwrap())
+        .map(|index| context.global.heap().get(arguments, index).unwrap())
+        .collect();
+    let receiver = context.global.heap().generator_receiver(generator).unwrap();
+    let (state, locals) = context.global.heap().generator_begin(generator).unwrap();
+    context.resume(locals, state);
+    let function: extern "C" fn(*mut JitCtx, Value, Value, *const Value, u64) -> Value =
+        unsafe { std::mem::transmute(entry) };
+    let value = function(ctx, generator, receiver, args.as_ptr(), args.len() as u64);
+    let context = unsafe { &mut *ctx };
+    if context.error.is_some() || context.exception_pending() {
+        context.global.heap().release(value);
+        return Value::UNDEFINED;
+    }
+    let done = context.global.heap().generator_state(generator) == Some(GENERATOR_DONE);
+    generator_result(context, value, done)
+}
+
+extern "C" fn js_bind_this(ctx: *mut JitCtx, closure: Value, receiver: Value) -> Value {
+    let ctx = unsafe { &mut *ctx };
+    if !ctx.global.heap().bind_this(closure, receiver) {
+        ctx.error = Some(crate::Error::Runtime("invalid arrow receiver".into()));
+    }
+    closure
+}
+
+extern "C" fn js_disable_constructor(ctx: *mut JitCtx, closure: Value) -> Value {
+    unsafe { &*ctx }.global.heap().disable_constructor(closure);
+    closure
 }

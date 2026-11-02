@@ -11,6 +11,13 @@ use super::FunctionCompiler;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum BinaryOp {
+    BitwiseAnd,
+    BitwiseOr,
+    BitwiseXor,
+    ShiftLeft,
+    ShiftRight,
+    ShiftRightUnsigned,
+
     Add,
     Sub,
     Mul,
@@ -29,6 +36,7 @@ pub(super) enum BinaryOp {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum UnaryOp {
+    Typeof,
     Plus,
     Negation,
     Not,
@@ -38,6 +46,12 @@ pub(super) enum UnaryOp {
 impl BinaryOp {
     fn helper(self) -> Helper {
         match self {
+            Self::BitwiseAnd => Helper::BitwiseAnd,
+            Self::BitwiseOr => Helper::BitwiseOr,
+            Self::BitwiseXor => Helper::BitwiseXor,
+            Self::ShiftLeft => Helper::ShiftLeft,
+            Self::ShiftRight => Helper::ShiftRight,
+            Self::ShiftRightUnsigned => Helper::ShiftRightUnsigned,
             Self::Add => Helper::Add,
             Self::Sub => Helper::Sub,
             Self::Mul => Helper::Mul,
@@ -59,6 +73,7 @@ impl BinaryOp {
 impl UnaryOp {
     fn helper(self) -> Helper {
         match self {
+            Self::Typeof => Helper::Typeof,
             Self::Plus => Helper::UnaryPlus,
             Self::Negation => Helper::UnaryNegation,
             Self::Not => Helper::LogicalNot,
@@ -83,6 +98,12 @@ pub(super) fn binary_operator(operator: BinaryOperator) -> Option<BinaryOp> {
         BinaryOperator::Division => Some(BinaryOp::Div),
         BinaryOperator::Remainder => Some(BinaryOp::Rem),
         BinaryOperator::Exponential => Some(BinaryOp::Pow),
+        BinaryOperator::BitwiseAnd => Some(BinaryOp::BitwiseAnd),
+        BinaryOperator::BitwiseOR => Some(BinaryOp::BitwiseOr),
+        BinaryOperator::BitwiseXOR => Some(BinaryOp::BitwiseXor),
+        BinaryOperator::ShiftLeft => Some(BinaryOp::ShiftLeft),
+        BinaryOperator::ShiftRight => Some(BinaryOp::ShiftRight),
+        BinaryOperator::ShiftRightZeroFill => Some(BinaryOp::ShiftRightUnsigned),
         _ => None,
     }
 }
@@ -95,6 +116,12 @@ pub(super) fn compound_operator(operator: AssignmentOperator) -> Option<BinaryOp
         AssignmentOperator::Division => Some(BinaryOp::Div),
         AssignmentOperator::Remainder => Some(BinaryOp::Rem),
         AssignmentOperator::Exponential => Some(BinaryOp::Pow),
+        AssignmentOperator::BitwiseAnd => Some(BinaryOp::BitwiseAnd),
+        AssignmentOperator::BitwiseOR => Some(BinaryOp::BitwiseOr),
+        AssignmentOperator::BitwiseXOR => Some(BinaryOp::BitwiseXor),
+        AssignmentOperator::ShiftLeft => Some(BinaryOp::ShiftLeft),
+        AssignmentOperator::ShiftRight => Some(BinaryOp::ShiftRight),
+        AssignmentOperator::ShiftRightZeroFill => Some(BinaryOp::ShiftRightUnsigned),
         _ => None,
     }
 }
@@ -113,32 +140,10 @@ impl FunctionCompiler<'_, '_> {
     }
 
     pub(super) fn truthy(&mut self, value: ClifValue) -> ClifValue {
-        let is_number = self.is_number(value);
-
-        let float = self.b.ins().bitcast(types::F64, MemFlags::new(), value);
-        let zero = self.constant(Value::number(0.0));
-        let zero = self.b.ins().bitcast(types::F64, MemFlags::new(), zero);
-        let ordered = self.b.ins().fcmp(FloatCC::Ordered, float, zero);
-        let not_equal = self.b.ins().fcmp(FloatCC::NotEqual, float, zero);
-        let numeric = self.b.ins().band(ordered, not_equal);
-
-        let undefined = self
-            .b
+        let truth = self.call_helper(Helper::Truthy, &[value]);
+        self.b
             .ins()
-            .icmp_imm(IntCC::Equal, value, Value::UNDEFINED.bits() as i64);
-        let null = self
-            .b
-            .ins()
-            .icmp_imm(IntCC::Equal, value, Value::NULL.bits() as i64);
-        let false_value = self
-            .b
-            .ins()
-            .icmp_imm(IntCC::Equal, value, Value::FALSE.bits() as i64);
-        let falsy = self.b.ins().bor(undefined, null);
-        let falsy = self.b.ins().bor(falsy, false_value);
-        let non_numeric = self.b.ins().icmp_imm(IntCC::Equal, falsy, 0);
-
-        self.b.ins().select(is_number, numeric, non_numeric)
+            .icmp_imm(IntCC::Equal, truth, Value::TRUE.bits() as i64)
     }
 
     pub(super) fn is_nullish(&mut self, value: ClifValue) -> ClifValue {
@@ -348,6 +353,24 @@ impl FunctionCompiler<'_, '_> {
             done,
             &[],
         );
+        self.switch(done);
+        let pending = self.call_helper(Helper::ExceptionPending, &[dummy]);
+        let condition = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, pending, Value::TRUE.bits() as i64);
+        let done = self.b.create_block();
+        if let Some(handler) = self.handlers.last().copied() {
+            self.brif(condition, handler, &[], done, &[]);
+        } else {
+            self.brif(
+                condition,
+                self.return_block,
+                &[BlockArg::Value(dummy)],
+                done,
+                &[],
+            );
+        }
         self.switch(done);
     }
 }

@@ -1,6 +1,8 @@
 mod analysis;
+mod builtins;
 mod compiler;
 mod emit;
+mod generator;
 mod helpers;
 mod session;
 

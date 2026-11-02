@@ -1,3 +1,5 @@
+use crate::host::Host;
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use oxc_allocator::Allocator;
@@ -36,10 +38,11 @@ pub struct EngineOptions {
 }
 
 pub struct Engine {
-    compiler: Compiler,
+    compiler: RefCell<Compiler>,
     global: Environment,
-    functions: HashMap<String, Function>,
-    code: HashMap<u64, usize>,
+    functions: RefCell<HashMap<String, Function>>,
+    code: RefCell<HashMap<u64, usize>>,
+    pub(crate) host: Option<Box<dyn Host>>,
 }
 
 impl Engine {
@@ -50,12 +53,50 @@ impl Engine {
     pub fn with_options(options: EngineOptions) -> Result<Self, Error> {
         let global = Environment::new();
         global.define("globalThis", Value::GLOBAL_OBJECT);
+        let constructor = global
+            .heap()
+            .native_function(crate::heap::NativeFunction::Error)
+            .ok_or_else(|| Error::Runtime("heap exhausted".into()))?;
+        global.define("Error", constructor);
+        global.heap().release(constructor);
+        let constructor = global
+            .heap()
+            .native_function(crate::heap::NativeFunction::Set)
+            .ok_or_else(|| Error::Runtime("heap exhausted".into()))?;
+        global.define("Set", constructor);
+        global.heap().release(constructor);
         Ok(Self {
-            compiler: Compiler::new(options)?,
+            compiler: RefCell::new(Compiler::new(options)?),
             global,
-            functions: HashMap::new(),
-            code: HashMap::new(),
+            functions: RefCell::new(HashMap::new()),
+            code: RefCell::new(HashMap::new()),
+            host: None,
         })
+    }
+
+    pub fn install_host(&mut self, host: impl Host + 'static) -> Result<(), Error> {
+        use crate::heap::NativeFunction;
+        for (name, function) in [
+            ("hostReadFile", NativeFunction::HostReadFile),
+            ("hostListFiles", NativeFunction::HostListFiles),
+            ("hostEvaluateSource", NativeFunction::HostEvaluateSource),
+        ] {
+            let value = self
+                .global
+                .heap()
+                .native_function(function)
+                .ok_or_else(|| Error::Runtime("heap exhausted".into()))?;
+            if !self.global.set(name, value) {
+                self.global.define(name, value);
+            }
+            self.global.heap().release(value);
+        }
+        self.host = Some(Box::new(host));
+        Ok(())
+    }
+
+    pub(crate) fn entry(&self, code: u64) -> Option<usize> {
+        self.code.borrow().get(&code).copied()
     }
 
     pub fn global(&self) -> &Environment {
@@ -63,6 +104,26 @@ impl Engine {
     }
 
     pub fn compile(&mut self, source: &str, filename: &str) -> Result<(), Error> {
+        if let Some(initializer) = self.prepare_source(source, filename)? {
+            let value = unsafe {
+                jit::call(
+                    initializer,
+                    &[],
+                    self,
+                    Value::UNDEFINED,
+                    Value::GLOBAL_OBJECT,
+                )?
+            };
+            self.global.heap().release(value);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn prepare_source(
+        &self,
+        source: &str,
+        filename: &str,
+    ) -> Result<Option<usize>, Error> {
         let allocator = Allocator::default();
         let program = parse::parse(&allocator, source, filename)?;
         let analysis = SemanticBuilder::new_compiler()
@@ -77,23 +138,26 @@ impl Engine {
                 .join("\n");
             return Err(Error::Parse(message));
         }
-        let (functions, globals, initializer, code) = self.compiler.compile_program(
+        let (functions, globals, initializer, code) = self.compiler.borrow_mut().compile_program(
             &program,
             analysis.semantic.scoping(),
             analysis.semantic.nodes(),
         )?;
-        self.code.extend(code);
+        self.code.borrow_mut().extend(code);
         for function in functions {
             let value = self
                 .global
                 .heap()
                 .closure(CodeId(function.code), &[])
                 .ok_or_else(|| Error::Runtime("heap exhausted".into()))?;
+            if function.generator {
+                self.global.heap().disable_constructor(value);
+            }
             if !self.global.set(&function.name, value) {
                 self.global.define(function.name.clone(), value);
             }
             self.global.heap().release(value);
-            self.functions.insert(
+            self.functions.borrow_mut().insert(
                 function.name,
                 Function {
                     arity: function.arity,
@@ -103,14 +167,7 @@ impl Engine {
         for name in globals {
             self.global.define(name, Value::UNDEFINED);
         }
-        if let Some(initializer) = initializer {
-            unsafe {
-                let value =
-                    jit::call(initializer, &[], &self.global, &self.code, Value::UNDEFINED)?;
-                self.global.heap().release(value);
-            }
-        }
-        Ok(())
+        Ok(initializer)
     }
 
     /// Calls a function with borrowed arguments and returns an owning handle.
@@ -126,11 +183,16 @@ impl Engine {
             .global
             .heap()
             .closure_code(callable.value())
-            .and_then(|code| self.code.get(&code.0).copied())
+            .and_then(|code| self.entry(code.0))
             .ok_or_else(|| {
                 Error::Runtime(format!("value `{name}` is not callable in this engine"))
             })?;
-        let value = unsafe { jit::call(entry, args, &self.global, &self.code, callable.value())? };
+        let receiver = self
+            .global
+            .heap()
+            .lexical_this(callable.value())
+            .unwrap_or(Value::UNDEFINED);
+        let value = unsafe { jit::call(entry, args, self, callable.value(), receiver)? };
         self.global.heap().drain(64);
         Ok(OwnedValue::from_owned(value, self.global.heap().clone()))
     }
@@ -141,14 +203,22 @@ impl Engine {
     }
 
     pub fn arity(&self, name: &str) -> Option<usize> {
-        self.functions.get(name).map(|function| function.arity)
+        self.functions
+            .borrow()
+            .get(name)
+            .map(|function| function.arity)
     }
 
     pub fn has_function(&self, name: &str) -> bool {
-        self.functions.contains_key(name)
+        self.functions.borrow().contains_key(name)
     }
 
-    pub fn function_names(&self) -> impl Iterator<Item = &str> {
-        self.functions.keys().map(String::as_str)
+    pub fn function_names(&self) -> impl Iterator<Item = String> {
+        self.functions
+            .borrow()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
     }
 }

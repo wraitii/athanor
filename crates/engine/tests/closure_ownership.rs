@@ -207,7 +207,6 @@ fn unsupported_closure_semantics_fail_explicitly() {
     for source in [
         "function main(){ for (let i = 0; i < 3; i++){ let f = () => i; } }",
         "function main(){ const x = 1; return () => ++x; }",
-        "function main(){ return () => this; }",
         "var arguments = 7; function main(){ return () => arguments; }",
         "function main(){ function nested(){ return 1; } return nested; }",
     ] {

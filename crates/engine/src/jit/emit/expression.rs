@@ -1,7 +1,10 @@
 use cranelift_codegen::ir::{
     BlockArg, InstBuilder, MemFlags, StackSlotData, StackSlotKind, Value as ClifValue, types,
 };
-use oxc_ast::ast::{AssignmentTarget, CallExpression, Expression, SimpleAssignmentTarget};
+use oxc_ast::ast::{
+    AssignmentTarget, CallExpression, Expression, ObjectPropertyKind, PropertyKind,
+    SimpleAssignmentTarget,
+};
 use oxc_span::{GetSpan, Span};
 use oxc_syntax::operator::{AssignmentOperator, LogicalOperator, UnaryOperator, UpdateOperator};
 
@@ -18,9 +21,61 @@ impl FunctionCompiler<'_, '_> {
         expression: &Expression<'_>,
     ) -> Result<ClifValue, Error> {
         match expression {
+            Expression::StringLiteral(literal) => {
+                let text: Box<str> = literal
+                    .value
+                    .as_str()
+                    .ok_or_else(|| unsupported_at(literal.span, "lone surrogate in string"))?
+                    .into();
+                let ptr = self.b.ins().iconst(self.pointer, text.as_ptr() as i64);
+                let len = self.b.ins().iconst(types::I64, text.len() as i64);
+                self.names.push(text);
+                let result = self.call_helper(Helper::StringNew, &[ptr, len]);
+                self.check_error();
+                Ok(result)
+            }
+            Expression::ThisExpression(_) => Ok(self.receiver),
             Expression::NumericLiteral(literal) => Ok(self.constant(Value::number(literal.value))),
             Expression::BooleanLiteral(literal) => Ok(self.constant(Value::boolean(literal.value))),
             Expression::NullLiteral(_) => Ok(self.constant(Value::NULL)),
+            Expression::ObjectExpression(expression) => {
+                let dummy = self.constant(Value::UNDEFINED);
+                let object = self.call_helper(Helper::ObjectNew, &[dummy]);
+                self.check_error();
+                for property in &expression.properties {
+                    let ObjectPropertyKind::ObjectProperty(property) = property else {
+                        return Err(unsupported_at(property.span(), "object spread"));
+                    };
+                    if property.kind != PropertyKind::Init || property.method {
+                        return Err(unsupported_at(property.span, "object accessor or method"));
+                    }
+                    if property.computed {
+                        let key = property
+                            .key
+                            .as_expression()
+                            .ok_or_else(|| unsupported_at(property.span, "property key"))?;
+                        let key = self.emit_expression(key)?;
+                        let key = self.call_helper(Helper::PropertyKey, &[key]);
+                        self.check_error();
+                        let value = self.emit_expression(&property.value)?;
+                        self.index_access(object, key, Some(value));
+                    } else {
+                        let name = property
+                            .key
+                            .static_name()
+                            .ok_or_else(|| unsupported_at(property.span, "property key"))?;
+                        let name = name.as_str().ok_or_else(|| {
+                            unsupported_at(property.span, "lone surrogate in property key")
+                        })?;
+                        if name == "__proto__" && !property.shorthand {
+                            return Err(unsupported_at(property.span, "object prototype setter"));
+                        }
+                        let value = self.emit_expression(&property.value)?;
+                        self.property_access(object, name, Some(value));
+                    }
+                }
+                Ok(object)
+            }
             Expression::ArrayExpression(array) => {
                 let mut elements = Vec::with_capacity(array.elements.len());
                 for element in &array.elements {
@@ -65,8 +120,30 @@ impl FunctionCompiler<'_, '_> {
                 Ok(value)
             }
             Expression::UnaryExpression(expression) => {
-                let value = self.emit_expression(&expression.argument)?;
+                let mut argument = &expression.argument;
+                while let Expression::ParenthesizedExpression(parenthesized) = argument {
+                    argument = &parenthesized.expression;
+                }
+                let value = if expression.operator == UnaryOperator::Typeof {
+                    if let Expression::Identifier(identifier) = argument {
+                        let symbol = identifier
+                            .reference_id
+                            .get()
+                            .and_then(|id| self.scoping.get_reference(id).symbol_id());
+                        if symbol.is_none() && identifier.name != "arguments" {
+                            let global = self.constant(Value::GLOBAL_OBJECT);
+                            self.property_access(global, identifier.name.as_str(), None)
+                        } else {
+                            self.emit_expression(argument)?
+                        }
+                    } else {
+                        self.emit_expression(argument)?
+                    }
+                } else {
+                    self.emit_expression(argument)?
+                };
                 let op = match expression.operator {
+                    UnaryOperator::Typeof => UnaryOp::Typeof,
                     UnaryOperator::UnaryPlus => UnaryOp::Plus,
                     UnaryOperator::UnaryNegation => UnaryOp::Negation,
                     UnaryOperator::LogicalNot => UnaryOp::Not,
@@ -273,9 +350,28 @@ impl FunctionCompiler<'_, '_> {
                 }
                 Ok(value)
             }
-            Expression::ArrowFunctionExpression(function) => self.make_closure(function.span),
-            Expression::FunctionExpression(function) => self.make_closure(function.span),
+            Expression::ArrowFunctionExpression(function) => {
+                self.make_closure(function.span, true, false)
+            }
+            Expression::FunctionExpression(function) => {
+                self.make_closure(function.span, false, function.generator)
+            }
             Expression::CallExpression(expression) => self.emit_call(expression),
+            Expression::NewExpression(expression) => {
+                let callable = self.emit_expression(&expression.callee)?;
+                let mut args = Vec::new();
+                for argument in &expression.arguments {
+                    let argument = argument
+                        .as_expression()
+                        .ok_or_else(|| unsupported_at(expression.span, "spread argument"))?;
+                    args.push(self.emit_expression(argument)?);
+                }
+                let argv = self.stack_values(&args, expression.span)?;
+                let argc = self.b.ins().iconst(types::I64, args.len() as i64);
+                let result = self.call_helper(Helper::Construct, &[callable, argv, argc]);
+                self.check_error();
+                Ok(result)
+            }
             other => Err(unsupported_at(
                 other.span(),
                 format!("{} expression", expression_kind(other)),
@@ -284,13 +380,28 @@ impl FunctionCompiler<'_, '_> {
     }
 
     fn emit_call(&mut self, expression: &CallExpression<'_>) -> Result<ClifValue, Error> {
-        if matches!(
-            &expression.callee,
-            Expression::StaticMemberExpression(_) | Expression::ComputedMemberExpression(_)
-        ) {
-            return Err(unsupported_at(expression.span, "method call"));
+        let mut callee = &expression.callee;
+        while let Expression::ParenthesizedExpression(expression) = callee {
+            callee = &expression.expression;
         }
-        let callable = self.emit_expression(&expression.callee)?;
+        let (callable, receiver) = match callee {
+            Expression::StaticMemberExpression(member) => {
+                let receiver = self.emit_expression(&member.object)?;
+                let callable = self.property_access(receiver, member.property.name.as_str(), None);
+                (callable, receiver)
+            }
+            Expression::ComputedMemberExpression(member) => {
+                let receiver = self.emit_expression(&member.object)?;
+                let key = self.emit_expression(&member.expression)?;
+                let callable = self.index_access(receiver, key, None);
+                (callable, receiver)
+            }
+            _ => {
+                let callable = self.emit_expression(callee)?;
+                let receiver = self.constant(Value::UNDEFINED);
+                (callable, receiver)
+            }
+        };
         let mut args = Vec::with_capacity(expression.arguments.len());
         for argument in &expression.arguments {
             let argument: &Expression<'_> = argument
@@ -301,13 +412,18 @@ impl FunctionCompiler<'_, '_> {
         let argc = args.len();
         let argv = self.stack_values(&args, expression.span)?;
         let argc = self.b.ins().iconst(types::I64, argc as i64);
-        let result = self.call_helper(Helper::Call, &[callable, argv, argc]);
+        let result = self.call_helper(Helper::Call, &[callable, receiver, argv, argc]);
         self.check_error();
         Ok(result)
     }
 
-    fn make_closure(&mut self, span: Span) -> Result<ClifValue, Error> {
-        let (id, captures) = self
+    fn make_closure(
+        &mut self,
+        span: Span,
+        arrow: bool,
+        generator: bool,
+    ) -> Result<ClifValue, Error> {
+        let (id, captures, lexical_this) = self
             .closures
             .get(&span.start)
             .cloned()
@@ -324,6 +440,17 @@ impl FunctionCompiler<'_, '_> {
         let code = self.b.ins().iconst(types::I64, id.as_u32() as i64);
         let result = self.call_helper(Helper::ClosureNew, &[code, argv, count]);
         self.check_error();
+        if arrow {
+            let receiver = if lexical_this {
+                self.receiver
+            } else {
+                self.constant(Value::UNDEFINED)
+            };
+            self.call_helper(Helper::BindThis, &[result, receiver]);
+            self.check_error();
+        } else if generator {
+            self.call_helper(Helper::DisableConstructor, &[result]);
+        }
         Ok(result)
     }
 

@@ -23,6 +23,7 @@ pub(crate) struct CompiledFunction {
     pub(crate) name: String,
     pub(crate) arity: usize,
     pub(crate) code: u64,
+    pub(crate) generator: bool,
 }
 
 pub(crate) struct Compiler {
@@ -48,6 +49,7 @@ impl Compiler {
         let call_conv = target.default_call_conv;
         let mut signature = Signature::new(call_conv);
         signature.params.push(AbiParam::new(pointer));
+        signature.params.push(AbiParam::new(types::I64));
         signature.params.push(AbiParam::new(types::I64));
         signature.params.push(AbiParam::new(pointer));
         signature.params.push(AbiParam::new(types::I64));
@@ -165,7 +167,7 @@ impl Compiler {
         let mut closures = HashMap::new();
         let mut nested = Vec::new();
         for node in nodes.iter() {
-            let (span, params, statements, expression) = match node.kind() {
+            let (span, params, statements, expression, generator) = match node.kind() {
                 AstKind::ArrowFunctionExpression(function) => {
                     if function.r#async {
                         return Err(unsupported_at(function.span, "async arrow"));
@@ -176,19 +178,21 @@ impl Compiler {
                         }
                         body => (&[][..], body.as_expression()),
                     };
-                    (function.span, &*function.params, statements, expression)
+                    (
+                        function.span,
+                        &*function.params,
+                        statements,
+                        expression,
+                        false,
+                    )
                 }
                 AstKind::Function(function)
                     if !ordered.iter().any(|(_, top)| top.span == function.span) =>
                 {
-                    if function.id.is_some()
-                        || function.generator
-                        || function.r#async
-                        || function.body.is_none()
-                    {
+                    if function.id.is_some() || function.r#async || function.body.is_none() {
                         return Err(unsupported_at(
                             function.span,
-                            "named, async, generator or bodyless nested function",
+                            "named, async or bodyless nested function",
                         ));
                     }
                     (
@@ -196,6 +200,7 @@ impl Compiler {
                         &*function.params,
                         function.body.as_ref().unwrap().statements.as_slice(),
                         None,
+                        function.generator,
                     )
                 }
                 _ => continue,
@@ -212,12 +217,16 @@ impl Compiler {
                 .get(&span.start)
                 .map(|f| f.captures.clone())
                 .unwrap_or_default();
-            closures.insert(span.start, (id, captures));
-            nested.push((id, span, params, statements, expression));
+            let lexical_this = analysis
+                .functions
+                .get(&span.start)
+                .is_some_and(|function| function.lexical_this);
+            closures.insert(span.start, (id, captures, lexical_this));
+            nested.push((id, span, params, statements, expression, generator));
         }
         let mut pending = Vec::new();
         for (name, function) in &ordered {
-            let code = self.compile_function(
+            let (code, resume) = self.compile_callable(
                 &function.params,
                 &function.body.as_ref().unwrap().statements,
                 None,
@@ -225,12 +234,16 @@ impl Compiler {
                 &analysis.captured,
                 &closures,
                 scoping,
+                function.generator,
             )?;
+            if let Some(resume) = resume {
+                pending.push(resume);
+            }
             pending.push((ids[name], code));
         }
-        for (id, span, params, statements, expression) in nested {
+        for (id, span, params, statements, expression, generator) in nested {
             let captures = &closures[&span.start].1;
-            let code = self.compile_function(
+            let (code, resume) = self.compile_callable(
                 params,
                 statements,
                 expression,
@@ -238,7 +251,11 @@ impl Compiler {
                 &analysis.captured,
                 &closures,
                 scoping,
+                generator,
             )?;
+            if let Some(resume) = resume {
+                pending.push(resume);
+            }
             pending.push((id, code));
         }
         let compiled_ids: Vec<_> = pending.iter().map(|(id, _)| *id).collect();
@@ -304,6 +321,7 @@ impl Compiler {
                 name: name.clone(),
                 arity: function.params.items.len(),
                 code: ids[&name].as_u32() as u64,
+                generator: function.generator,
             });
         }
         self.functions = ids;
@@ -323,6 +341,68 @@ impl Compiler {
         ))
     }
 
+    fn compile_callable(
+        &mut self,
+        params: &FormalParameters<'_>,
+        statements: &[Statement<'_>],
+        expression: Option<&Expression<'_>>,
+        captures: &[SymbolId],
+        captured: &HashSet<SymbolId>,
+        closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
+        scoping: &Scoping,
+        generator: bool,
+    ) -> Result<
+        (
+            cranelift_codegen::ir::Function,
+            Option<(FuncId, cranelift_codegen::ir::Function)>,
+        ),
+        Error,
+    > {
+        if !generator {
+            return Ok((
+                self.compile_function(
+                    params,
+                    statements,
+                    expression,
+                    captures,
+                    captured,
+                    closures,
+                    scoping,
+                    emit::FunctionKind::Ordinary,
+                )?,
+                None,
+            ));
+        }
+        let plan = super::generator::ResumePlan::lower(statements)?;
+        let internal = format!("jsresume_{}", self.next_id);
+        self.next_id += 1;
+        let id = self
+            .module
+            .declare_function(&internal, Linkage::Local, &self.signature)
+            .map_err(|error| Error::Compile(error.to_string()))?;
+        let resume = self.compile_function(
+            params,
+            statements,
+            None,
+            captures,
+            captured,
+            closures,
+            scoping,
+            emit::FunctionKind::Generator(plan),
+        )?;
+        let factory = self.compile_function(
+            params,
+            &[],
+            None,
+            &[],
+            captured,
+            closures,
+            scoping,
+            emit::FunctionKind::Factory(id),
+        )?;
+        Ok((factory, Some((id, resume))))
+    }
+
     fn compile_function(
         &mut self,
         params: &FormalParameters<'_>,
@@ -330,8 +410,9 @@ impl Compiler {
         expression: Option<&Expression<'_>>,
         captures: &[SymbolId],
         captured: &HashSet<SymbolId>,
-        closures: &HashMap<u32, (FuncId, Vec<SymbolId>)>,
+        closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
         scoping: &Scoping,
+        kind: emit::FunctionKind,
     ) -> Result<cranelift_codegen::ir::Function, Error> {
         self.context.clear();
         self.context.func.signature = self.signature.clone();
@@ -352,6 +433,7 @@ impl Compiler {
                 captures,
                 captured,
                 closures,
+                kind,
             )?;
             builder.seal_all_blocks();
             builder.finalize();
@@ -369,10 +451,10 @@ fn validate_function(function: &Function<'_>) -> Result<String, Error> {
         .as_ref()
         .map(|identifier| identifier.name.to_string())
         .ok_or_else(|| compile_at(function.span, "function declaration has no name"))?;
-    if function.generator || function.r#async {
+    if function.r#async {
         return Err(unsupported_at(
             function.span,
-            format!("generator and async function `{name}`"),
+            format!("async function `{name}`"),
         ));
     }
     if function.body.is_none() {

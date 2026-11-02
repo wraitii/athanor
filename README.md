@@ -7,11 +7,33 @@ Experimental JavaScript engine runners.
 From this directory, run a script's `main` function with
 `cargo run -p js-runner -- <script>`, or
 use `--eval SOURCE`, `--function NAME`, and `--arg VALUE` to select source,
-function, and arguments. Run `cargo run -p js-runner -- --repl` for an
+function, and arguments. Repeat `--load SCRIPT` to compile and initialize files
+in order before the main source, sharing one engine and global environment.
+Run `cargo run -p js-runner -- --repl` for an
 interactive session. Each line is compiled separately, and global declarations
 persist between lines. Expressions print their value; enter `exit`, `.exit`, or
 EOF to leave. The REPL uses the global name `__repl_result` for expression
 results. The engine currently supports only a subset of JavaScript.
+
+The runner installs `hostReadFile`, `hostListFiles`, and `hostEvaluateSource`.
+Source evaluation shares the active engine, including nested library loads.
+To try the map workload from the repository root:
+
+```sh
+cargo run --manifest-path cranelift-exp/Cargo.toml -- \
+  --load cranelift-exp/bootstrap.js --eval '
+    modRoot = "binaries/data/mods/public";
+    hostEvaluateSource(
+      hostReadFile(modRoot + "/maps/random/new_rms_test.js")
+        .replace("export function* generateMap", "function* generateMap"),
+      "new_rms_test.js");
+    function main() { return runGenerator(generateMap()); }
+  '
+```
+
+This exercises file loading and nested source evaluation, but still stops on
+unsupported language features in the map libraries; it does not yet generate a
+complete map.
 
 ## cpp
 

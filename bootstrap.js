@@ -3,11 +3,23 @@ var modRoot = "";
 globalThis.TERRAIN_TILE_SIZE = 4;
 globalThis.MAP_BORDER_WIDTH = 3;
 
+function trimPathSlashes(path, trimStart)
+{
+	let start = 0;
+	let end = path.length;
+	if (trimStart)
+		while (start < end && path[start] === "/")
+			++start;
+	while (end > start && path[end - 1] === "/")
+		--end;
+	return path.slice(start, end);
+}
+
 function joinPath(...parts)
 {
 	return parts
 		.filter(part => part !== "")
-		.map((part, index) => index === 0 ? part.replace(/\/+$/, "") : part.replace(/^\/+|\/+$/g, ""))
+		.map((part, index) => index === 0 ? trimPathSlashes(part, false) : trimPathSlashes(part, true))
 		.join("/");
 }
 
@@ -25,7 +37,7 @@ function listPaths(path, filter, recursive)
 
 function relativeToModRoot(path)
 {
-	const prefix = modRoot.replace(/\/+$/, "") + "/";
+	const prefix = trimPathSlashes(modRoot, false) + "/";
 	return path.startsWith(prefix) ? path.slice(prefix.length) : path;
 }
 
@@ -259,7 +271,7 @@ function loadGlobalScripts()
 function loadMapScript(path)
 {
 	let source = readText(path);
-	source = source.replace(/\bexport\s+function\s*\*\s*generateMap\b/, "function* generateMap");
+	source = source.replace("export function* generateMap", "function* generateMap");
 	hostEvaluateSource(source, path);
 	if (typeof generateMap !== "function")
 		throw new Error("Map script did not define generateMap");
@@ -308,7 +320,7 @@ function summarizeMap(map)
 
 function run(scriptPath, dataRoot, settingsJson)
 {
-	modRoot = dataRoot.replace(/\/+$/, "");
+	modRoot = trimPathSlashes(dataRoot, false);
 	Engine.loadedLibraries.clear();
 
 	const settings = JSON.parse(settingsJson);

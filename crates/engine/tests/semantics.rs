@@ -192,10 +192,10 @@ fn optimization_level_is_configurable() {
 fn unsupported_errors_include_span_and_node_kind() {
     let mut engine = Engine::new().unwrap();
     let error = engine
-        .compile("function main(){ return {}; }", "error.js")
+        .compile("function main(){ return `text`; }", "error.js")
         .unwrap_err()
         .to_string();
-    assert!(error.contains("object expression"), "{error}");
+    assert!(error.contains("template literal expression"), "{error}");
     assert!(error.contains(" at "), "{error}");
 }
 
@@ -580,4 +580,582 @@ fn unsupported_object_coercion_stops_execution() {
         Value::number(0.0)
     );
     assert_eq!(engine.call("identity", &[]).unwrap().value(), Value::TRUE);
+}
+
+#[test]
+fn member_calls_resolve_callable_properties() {
+    check(
+        "globalThis.f = function(x) { return x + 1; }; function main() { return globalThis.f(41); }",
+        Value::number(42.0),
+    );
+    check(
+        "function main() { return [function(x) { return x + 1; }][0](41); }",
+        Value::number(42.0),
+    );
+}
+
+#[test]
+fn utf8_strings_use_scalar_indices_and_content_equality() {
+    check(
+        "function main() { return 'a😀é'.length; }",
+        Value::number(3.0),
+    );
+    check(
+        "function main() { return 'a😀é'[1] === '😀'; }",
+        Value::TRUE,
+    );
+    check(
+        "function main() { return ('é' + '😀') === 'é😀'; }",
+        Value::TRUE,
+    );
+    check("function main() { return '😀'[1]; }", Value::UNDEFINED);
+    check("function main() { return !'' && !!'😀'; }", Value::TRUE);
+    check(
+        "function main() { if ('') return false; return true; }",
+        Value::TRUE,
+    );
+    check(
+        "function main() { return '\\uD83D\\uDE00' === '😀'; }",
+        Value::TRUE,
+    );
+    check(
+        "function main() { return 'e\\u0301'.length; }",
+        Value::number(2.0),
+    );
+    check(
+        "function main() { let a = ['😀']; let f = () => a[0]; a = ['é']; return f() === 'é'; }",
+        Value::TRUE,
+    );
+}
+
+#[test]
+fn strings_reject_lone_surrogates() {
+    let mut engine = Engine::new().unwrap();
+    assert!(
+        engine
+            .compile("function main() { return '\\uD800'; }", "surrogate.js")
+            .is_err()
+    );
+}
+
+#[test]
+fn exceptions_propagate_and_catch_values() {
+    check(
+        "function main() { try { throw undefined; } catch (e) { return e; } }",
+        Value::UNDEFINED,
+    );
+    check(
+        "function main() { try { throw [42]; } catch (e) { return e[0]; } }",
+        Value::number(42.0),
+    );
+    check(
+        "function fail() { throw 'é😀'; } function main() { try { fail(); return false; } catch (e) { return e === 'é😀'; } }",
+        Value::TRUE,
+    );
+    check(
+        "function main() { try { try { throw 1; } catch (e) { throw e + 1; } } catch (e) { return e; } }",
+        Value::number(2.0),
+    );
+    check(
+        "function main() { let f; try { throw [42]; } catch (e) { f = () => e[0]; } return f(); }",
+        Value::number(42.0),
+    );
+    check(
+        "function main() { try { throw 1; } catch { } return 42; }",
+        Value::number(42.0),
+    );
+    check(
+        "function main() { try { return 42; } catch (e) { return 0; } }",
+        Value::number(42.0),
+    );
+    check(
+        "function main() { try { var x = 42; } catch { var y = 1; } return x; }",
+        Value::number(42.0),
+    );
+}
+
+#[test]
+fn engine_errors_bypass_catch_and_uncaught_exceptions_do_not_persist() {
+    let mut engine = Engine::new().unwrap();
+    engine.compile("function bad() { try { undefined(); } catch { return 42; } } function fail() { throw 'oops'; } function main() { return 42; }", "exceptions.js").unwrap();
+    assert!(matches!(engine.call("bad", &[]), Err(Error::Runtime(_))));
+    assert!(
+        engine
+            .call("fail", &[])
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("uncaught exception: oops")
+    );
+    assert_eq!(
+        engine.call("main", &[]).unwrap().value(),
+        Value::number(42.0)
+    );
+}
+
+#[test]
+fn exceptions_keep_thrown_closures_alive() {
+    check(
+        "function fail() { let a = [42]; throw () => a[0]; } function main() { let f; try { fail(); } catch (e) { f = e; } return f(); }",
+        Value::number(42.0),
+    );
+    check(
+        "function main() { let n = 0; for (let i = 0; i < 10; ++i) { try { throw [i]; } catch (e) { n += e[0]; } } return n; }",
+        Value::number(45.0),
+    );
+}
+
+#[test]
+fn finally_is_explicitly_unsupported() {
+    let mut engine = Engine::new().unwrap();
+    assert!(matches!(
+        engine.compile(
+            "function main() { try { return 1; } finally { return 2; } }",
+            "finally.js"
+        ),
+        Err(Error::Unsupported(_))
+    ));
+}
+
+#[test]
+fn basic_error_construction_and_propagation() {
+    check(
+        "function main() { return new Error('é😀').message === 'é😀'; }",
+        Value::TRUE,
+    );
+    check(
+        "function main() { return new Error().message === ''; }",
+        Value::TRUE,
+    );
+    check(
+        "function main() { return new Error(undefined).message === ''; }",
+        Value::TRUE,
+    );
+    check(
+        "function main() { return new Error(42).message === '42'; }",
+        Value::TRUE,
+    );
+    check(
+        "function main() { return Error('oops').name === 'Error'; }",
+        Value::TRUE,
+    );
+    check(
+        "function main() { let C = Error; return new C('oops').message === 'oops'; }",
+        Value::TRUE,
+    );
+    check(
+        "function main() { return ('prefix: ' + new Error('oops')) === 'prefix: Error: oops'; }",
+        Value::TRUE,
+    );
+    check(
+        "function main() { return ('' + new Error()) === 'Error'; }",
+        Value::TRUE,
+    );
+    check(
+        "function main() { let e = new Error('oops'); e.name = 'Custom'; e.message = 'changed'; return ('' + e) === 'Custom: changed'; }",
+        Value::TRUE,
+    );
+    check(
+        "function fail() { throw new Error('oops'); } function main() { try { fail(); } catch (e) { return e.message === 'oops'; } }",
+        Value::TRUE,
+    );
+    check(
+        "function main() { let e = new Error(); return e === e && e !== new Error(); }",
+        Value::TRUE,
+    );
+}
+
+#[test]
+fn uncaught_error_reports_its_message() {
+    let mut engine = Engine::new().unwrap();
+    engine
+        .compile("function main() { throw new Error('oops'); }", "error.js")
+        .unwrap();
+    assert!(
+        engine
+            .call("main", &[])
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("Error: oops")
+    );
+}
+
+#[test]
+fn typeof_reports_supported_types() {
+    for (expression, expected) in [
+        ("undefined", "undefined"),
+        ("neverDeclared", "undefined"),
+        ("null", "object"),
+        ("true", "boolean"),
+        ("42", "number"),
+        ("0 / 0", "number"),
+        ("'é😀'", "string"),
+        ("[]", "object"),
+        ("globalThis", "object"),
+        ("new Error('oops')", "object"),
+        ("Error", "function"),
+        ("main", "function"),
+        ("() => 1", "function"),
+        ("function() {}", "function"),
+    ] {
+        check(
+            &format!("function main() {{ return typeof ({expression}) === '{expected}'; }}"),
+            Value::TRUE,
+        );
+    }
+    check(
+        "function main() { let x = 0; typeof (x = x + 1); return x; }",
+        Value::number(1.0),
+    );
+    check(
+        "function main() { let f = () => { throw 42; }; try { return typeof f(); } catch (e) { return e; } }",
+        Value::number(42.0),
+    );
+}
+
+#[test]
+fn typeof_rejects_uninitialized_lexical_bindings() {
+    for source in [
+        "function main() { return typeof x; let x = 1; }",
+        "function main() { let f = () => typeof x; return f(); let x = 1; }",
+    ] {
+        let mut engine = Engine::new().unwrap();
+        engine.compile(source, "typeof.js").unwrap();
+        assert!(matches!(engine.call("main", &[]), Err(Error::Runtime(_))));
+    }
+}
+
+#[test]
+fn for_of_iterates_arrays_and_utf8_strings() {
+    check(
+        "function main() { let sum = 0; for (const x of [1, 2, 3]) sum += x; return sum; }",
+        Value::number(6.0),
+    );
+    check(
+        "function main() { let text = ''; for (const x of 'a😀e\\u0301') text += x; return text === 'a😀e\\u0301'; }",
+        Value::TRUE,
+    );
+    check(
+        "function main() { let n = 0; for (const x of '😀é') ++n; return n; }",
+        Value::number(2.0),
+    );
+    check(
+        "function main() { let n = 0; for (var x of []) ++n; return n; }",
+        Value::number(0.0),
+    );
+    check(
+        "function main() { for (var x of [1, 2]) {} return x; }",
+        Value::number(2.0),
+    );
+    check(
+        "function main() { let a = [1, 2]; let n = 0; for (const x of a) { n += x; if (x === 1) a[a.length] = 3; } return n; }",
+        Value::number(6.0),
+    );
+    check(
+        "function main() { let a = [1, 2, 3]; let n = 0; for (const x of a) { n += x; a.length = 0; } return n; }",
+        Value::number(1.0),
+    );
+    check(
+        "function main() { let a = [1, 2]; let n = 0; for (const x of a) { a = []; n += x; } return n; }",
+        Value::number(3.0),
+    );
+    check(
+        "function main() { let n = 0; let f = () => { ++n; return [1, 2]; }; for (const x of f()) {} return n; }",
+        Value::number(1.0),
+    );
+}
+
+#[test]
+fn for_of_captures_fresh_bindings() {
+    check(
+        "function main() { let fs = []; for (const x of [1, 2, 3]) fs[fs.length] = () => x; return fs[0]() * 100 + fs[1]() * 10 + fs[2](); }",
+        Value::number(123.0),
+    );
+    check(
+        "function main() { let fs = []; for (let x of [1, 2]) { fs[fs.length] = () => x; ++x; } return fs[0]() * 10 + fs[1](); }",
+        Value::number(23.0),
+    );
+    check(
+        "function main() { let fs = []; for (var x of [1, 2]) fs[fs.length] = () => x; return fs[0]() * 10 + fs[1](); }",
+        Value::number(22.0),
+    );
+    check(
+        "function main() { let fs = []; for (const x of [1, 2]) { fs[fs.length] = () => x; continue; } return fs[0]() * 10 + fs[1](); }",
+        Value::number(12.0),
+    );
+}
+
+#[test]
+fn loop_break_and_continue_use_innermost_targets() {
+    check(
+        "function main() { let n = 0; for (const x of [1, 2, 3, 4]) { if (x === 2) continue; if (x === 4) break; n += x; } return n; }",
+        Value::number(4.0),
+    );
+    check(
+        "function main() { let n = 0; for (const x of [1, 2]) { for (const y of [3, 4]) { ++n; break; } } return n; }",
+        Value::number(2.0),
+    );
+    check(
+        "function main() { let n = 0; for (let i = 0; i < 5; ++i) { if (i === 1) continue; if (i === 4) break; n += i; } return n; }",
+        Value::number(5.0),
+    );
+    check(
+        "function main() { let i = 0; while (i < 5) { ++i; if (i === 1) continue; break; } return i; }",
+        Value::number(2.0),
+    );
+    check(
+        "function main() { let i = 0; do { ++i; if (i < 3) continue; break; } while (i < 5); return i; }",
+        Value::number(3.0),
+    );
+    check(
+        "function main() { try { for (const x of [[42]]) throw x; } catch (e) { return e[0]; } }",
+        Value::number(42.0),
+    );
+}
+
+#[test]
+fn for_of_rejects_unsupported_iterables_and_binding_forms() {
+    for expression in ["42", "null", "new Error()"] {
+        let mut engine = Engine::new().unwrap();
+        engine
+            .compile(
+                &format!("function main() {{ for (const x of {expression}) {{}} }}"),
+                "iteration.js",
+            )
+            .unwrap();
+        assert!(matches!(engine.call("main", &[]), Err(Error::Runtime(_))));
+    }
+    for source in [
+        "function main() { for (const [x] of [[1]]) {} }",
+        "function main() { let x; for (x of [1]) {} }",
+        "function main() { outer: while (true) { break outer; } }",
+    ] {
+        let mut engine = Engine::new().unwrap();
+        assert!(matches!(
+            engine.compile(source, "iteration.js"),
+            Err(Error::Unsupported(_))
+        ));
+    }
+}
+
+#[test]
+fn bitwise_operators_use_32_bit_values_and_mask_shift_counts() {
+    for (expression, expected) in [
+        ("0xf0 & 0x3c", 48.0),
+        ("0xf0 | 0x3c", 252.0),
+        ("0xf0 ^ 0x3c", 204.0),
+        ("1 << 31", -2147483648.0),
+        ("-8 >> 2", -2.0),
+        ("-1 >>> 0", 4294967295.0),
+        ("-1 >>> 1", 2147483647.0),
+        ("1 << 32", 1.0),
+        ("1 << -1", -2147483648.0),
+        ("-8 >> 33", -4.0),
+        ("4294967297 | 0", 1.0),
+        ("-4294967297 | 0", -1.0),
+        ("3.9 & 1", 1.0),
+        ("(0 / 0) ^ 1", 1.0),
+        ("(1 / 0) | 1", 1.0),
+        ("true & 3", 1.0),
+        ("null | 2", 2.0),
+    ] {
+        check(
+            &format!("function main() {{ return {expression}; }}"),
+            Value::number(expected),
+        );
+    }
+}
+
+#[test]
+fn bitwise_compound_assignments_preserve_evaluation_order() {
+    for (operator, expected) in [
+        ("&=", 2.0),
+        ("|=", 7.0),
+        ("^=", 5.0),
+        ("<<=", 48.0),
+        (">>=", 0.0),
+        (">>>=", 0.0),
+    ] {
+        check(
+            &format!("function main() {{ let x = 6; return x {operator} 3; }}"),
+            Value::number(expected),
+        );
+    }
+    check(
+        "function main() { let x = 6; x ^= (x = 3); return x; }",
+        Value::number(5.0),
+    );
+    check(
+        "function main() { let a = [6]; let n = 0; let get = () => { ++n; return a; }; let index = () => { ++n; return 0; }; get()[index()] ^= (a[0] = 3); return a[0] * 10 + n; }",
+        Value::number(52.0),
+    );
+    check(
+        "function main() { let e = new Error(); e.x = 6; e.x ^= (e.x = 3); return e.x; }",
+        Value::number(5.0),
+    );
+    check(
+        "globalThis.bits = 6; function main() { bits ^= (bits = 3); return bits; }",
+        Value::number(5.0),
+    );
+    check(
+        "function main() { let x = 6; let f = () => x ^= 3; f(); return x; }",
+        Value::number(5.0),
+    );
+    check(
+        "function main() { let x = 6; let fail = () => { throw 42; }; try { x ^= fail(); } catch {} return x; }",
+        Value::number(6.0),
+    );
+}
+
+#[test]
+fn object_literals_support_named_computed_and_shorthand_properties() {
+    check(
+        "function main() { let x = 42; return ({ x }).x; }",
+        Value::number(42.0),
+    );
+    check(
+        "function main() { return ({ a: { b: 42 } }).a.b; }",
+        Value::number(42.0),
+    );
+    check(
+        "function main() { return ({ 'é😀': 42 })['é😀']; }",
+        Value::number(42.0),
+    );
+    check(
+        "function main() { return ({ 42: 7 })[42]; }",
+        Value::number(7.0),
+    );
+    check(
+        "function main() { let k = 'x'; return ({ [k]: 42 }).x; }",
+        Value::number(42.0),
+    );
+    check(
+        "function main() { return ({ [-0]: 42 })[0]; }",
+        Value::number(42.0),
+    );
+    check(
+        "function main() { return ({ [true]: 42 })['true']; }",
+        Value::number(42.0),
+    );
+    check("function main() { return ({}).missing; }", Value::UNDEFINED);
+    check(
+        "function main() { let o = {}; o['x'] = 6; o['x'] ^= 3; return o.x; }",
+        Value::number(5.0),
+    );
+    check(
+        "function main() { let o = {}; let a = o; a.x = 42; return o === a && o !== {} && o.x === 42; }",
+        Value::TRUE,
+    );
+    check(
+        "function main() { return ({ f: function(x) { return x + 1; } }).f(41); }",
+        Value::number(42.0),
+    );
+    check(
+        "function main() { let o = { ['__proto__']: 42 }; return o['__proto__']; }",
+        Value::number(42.0),
+    );
+}
+
+#[test]
+fn object_properties_evaluate_in_source_order_and_survive_exceptions() {
+    check(
+        "function main() { let n = 0; let o = { [++n]: ++n, [++n]: ++n }; return o[1] * 10 + o[3]; }",
+        Value::number(24.0),
+    );
+    check(
+        "function main() { let n = 0; let o = { x: ++n, x: ++n }; return o.x * 10 + n; }",
+        Value::number(22.0),
+    );
+    check(
+        "function main() { let o = { x: [42] }; o.x = o.x; return o.x[0]; }",
+        Value::number(42.0),
+    );
+    check(
+        "function fail() { throw { message: 'oops', data: [42] }; } function main() { try { fail(); } catch (e) { return e.data[0]; } }",
+        Value::number(42.0),
+    );
+    check(
+        "function main() { let n = 0; let fail = () => { throw 42; }; try { let o = { a: fail(), b: ++n }; } catch {} return n; }",
+        Value::number(0.0),
+    );
+}
+
+#[test]
+fn object_literals_reject_unsupported_property_semantics() {
+    for expression in [
+        "{ get x() { return 1; } }",
+        "{ f() {} }",
+        "{ ...{} }",
+        "{ __proto__: null }",
+        "{ '\\uD800': 1 }",
+    ] {
+        let mut engine = Engine::new().unwrap();
+        assert!(matches!(
+            engine.compile(
+                &format!("function main() {{ return ({expression}); }}"),
+                "object.js"
+            ),
+            Err(Error::Unsupported(_))
+        ));
+    }
+}
+
+#[test]
+fn native_sets_support_membership_and_mutation() {
+    check(
+        "function main() { let s = new Set(); s.add(42).add(42).add('x'); return s.size === 2 && s.has(42) && s.has('x') && !s.has(1); }",
+        Value::TRUE,
+    );
+    check(
+        "function main() { let s = new Set(); s.add(1); return s.delete(1) && !s.delete(1) && s.size === 0; }",
+        Value::TRUE,
+    );
+    check(
+        "function main() { let s = new Set(); s.add(undefined); s.clear(); s.add(42); return !s.has(undefined) && s.size === 1; }",
+        Value::TRUE,
+    );
+    check(
+        "function main() { let s = new Set(); s.add(); return s.has() && s.size === 1; }",
+        Value::TRUE,
+    );
+    check(
+        "function main() { let s = new Set(); s.add(0 / 0); s.add(0 / 0); s.add(-0); s.add(0); return s.size === 2 && s.has(0 / 0) && s.has(-0); }",
+        Value::TRUE,
+    );
+    check(
+        "function main() { let s = new Set(); s.add('é' + '😀'); return s.has('é😀'); }",
+        Value::TRUE,
+    );
+    check(
+        "function main() { let a = {}; let s = new Set(); s.add(a); s.add({}); return s.size === 2 && s.has(a) && !s.has({}); }",
+        Value::TRUE,
+    );
+    check(
+        "function main() { let a = new Set(); let b = new Set(); a.add(1); b.add(2); return a.has(1) && !b.has(1) && a.add === b.add; }",
+        Value::TRUE,
+    );
+    check(
+        "function main() { let s = new Set(); s['add'](42); return (s.has)(42) && typeof s.add === 'function' && typeof Set === 'function'; }",
+        Value::TRUE,
+    );
+    check(
+        "function main() { let s = new Set(); let alias = s; s.add(s); return alias.has(s); }",
+        Value::TRUE,
+    );
+}
+
+#[test]
+fn native_set_methods_require_receivers_and_constructors() {
+    for source in [
+        "function main() { return Set(); }",
+        "function main() { return new Set([1]); }",
+        "function main() { let s = new Set(); let f = s.add; return f(1); }",
+        "function main() { let s = new Set(); return ({ f: s.has }).f(1); }",
+        "function main() { let s = new Set(); return new s.add(); }",
+    ] {
+        let mut engine = Engine::new().unwrap();
+        engine.compile(source, "set.js").unwrap();
+        assert!(matches!(engine.call("main", &[]), Err(Error::Runtime(_))));
+    }
 }

@@ -3,8 +3,8 @@ use std::collections::{HashMap, HashSet};
 use cranelift_codegen::ir::{InstBuilder, Value as ClifValue, types};
 use cranelift_frontend::Variable;
 use oxc_ast::ast::{
-    BindingPattern, ForStatementInit, FormalParameters, Statement, VariableDeclaration,
-    VariableDeclarationKind,
+    BindingPattern, ForStatementInit, ForStatementLeft, FormalParameters, Statement,
+    VariableDeclaration, VariableDeclarationKind,
 };
 use oxc_syntax::symbol::SymbolId;
 
@@ -30,6 +30,13 @@ impl ScopeStack {
             scopes: Vec::new(),
             cells: HashSet::new(),
         }
+    }
+
+    pub(super) fn variables(&self) -> Vec<Variable> {
+        self.scopes
+            .iter()
+            .flat_map(|scope| scope.bindings.values().copied())
+            .collect()
     }
 
     pub(super) fn push(&mut self) {
@@ -188,11 +195,15 @@ impl FunctionCompiler<'_, '_> {
         self.scopes.insert_function(symbol, variable);
         let undefined = self.constant(Value::UNDEFINED);
         self.b.def_var(variable, undefined);
+        if self.generator.is_some() {
+            let slot = self.b.ins().iconst(types::I64, variable.as_u32() as i64);
+            self.call_helper(Helper::LocalSet, &[slot, undefined]);
+        }
         self.initialize_cell(symbol, variable, undefined);
         variable
     }
 
-    fn declare_lexical_binding(&mut self, symbol: SymbolId) -> Variable {
+    pub(super) fn declare_lexical_binding(&mut self, symbol: SymbolId) -> Variable {
         if let Some(variable) = self.scopes.resolve_current(symbol) {
             return variable;
         }
@@ -200,6 +211,10 @@ impl FunctionCompiler<'_, '_> {
         self.scopes.insert_current(symbol, variable);
         let uninitialized = self.constant(Value::UNINITIALIZED);
         self.b.def_var(variable, uninitialized);
+        if self.generator.is_some() {
+            let slot = self.b.ins().iconst(types::I64, variable.as_u32() as i64);
+            self.call_helper(Helper::LocalSet, &[slot, uninitialized]);
+        }
         self.initialize_cell(symbol, variable, uninitialized);
         variable
     }
@@ -259,6 +274,20 @@ pub(super) fn collect_var_symbols(statements: &[Statement<'_>], symbols: &mut Ve
                 collect_var_symbols(std::slice::from_ref(&statement.body), symbols);
             }
             Statement::WhileStatement(statement) => {
+                collect_var_symbols(std::slice::from_ref(&statement.body), symbols);
+            }
+            Statement::TryStatement(statement) => {
+                collect_var_symbols(&statement.block.body, symbols);
+                if let Some(handler) = &statement.handler {
+                    collect_var_symbols(&handler.body.body, symbols);
+                }
+            }
+            Statement::ForOfStatement(statement) => {
+                if let ForStatementLeft::VariableDeclaration(declaration) = &statement.left {
+                    if declaration.kind == VariableDeclarationKind::Var {
+                        collect_declaration_symbols(declaration, symbols);
+                    }
+                }
                 collect_var_symbols(std::slice::from_ref(&statement.body), symbols);
             }
             Statement::ForStatement(statement) => {

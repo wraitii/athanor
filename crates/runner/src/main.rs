@@ -1,3 +1,5 @@
+mod host;
+
 use std::fs;
 use std::io::{self, BufRead, Write};
 
@@ -13,6 +15,7 @@ fn main() {
 fn run() -> Result<(), String> {
     let mut arguments = std::env::args().skip(1);
     let mut script = None;
+    let mut preloads = Vec::new();
     let mut eval = None;
     let mut function = String::from("main");
     let mut values = Vec::new();
@@ -30,6 +33,7 @@ fn run() -> Result<(), String> {
                 let value = arguments.next().ok_or("--arg expects a value")?;
                 values.push(parse_value(&value)?);
             }
+            "--load" => preloads.push(arguments.next().ok_or("--load expects a path")?),
             "--repl" => repl = true,
             "--help" | "-h" => {
                 usage();
@@ -43,7 +47,12 @@ fn run() -> Result<(), String> {
     }
 
     if repl {
-        if eval.is_some() || script.is_some() || function != "main" || !values.is_empty() {
+        if eval.is_some()
+            || script.is_some()
+            || function != "main"
+            || !values.is_empty()
+            || !preloads.is_empty()
+        {
             return Err("--repl cannot be combined with script options".to_string());
         }
         return run_repl();
@@ -65,6 +74,11 @@ fn run() -> Result<(), String> {
     };
 
     let mut engine = Engine::new().map_err(display)?;
+    engine.install_host(host::FileHost).map_err(display)?;
+    for path in preloads {
+        let preload = fs::read_to_string(&path).map_err(|error| format!("{path}: {error}"))?;
+        engine.compile(&preload, &path).map_err(display)?;
+    }
     engine.compile(&source, &filename).map_err(display)?;
     let result = engine.call(&function, &values).map_err(display)?;
     let result = result.value();
@@ -74,6 +88,7 @@ fn run() -> Result<(), String> {
 
 fn run_repl() -> Result<(), String> {
     let mut engine = Engine::new().map_err(display)?;
+    engine.install_host(host::FileHost).map_err(display)?;
     let stdin = io::stdin();
     let mut lines = stdin.lock().lines();
     loop {
@@ -136,6 +151,6 @@ fn display(error: Error) -> String {
 
 fn usage() {
     eprintln!(
-        "usage: js-runner [--function NAME] [--arg VALUE]... <script>\n       js-runner [--function NAME] [--arg VALUE]... --eval SOURCE\n       js-runner --repl"
+        "usage: js-runner [--load SCRIPT]... [--function NAME] [--arg VALUE]... <script>\n       js-runner [--function NAME] [--arg VALUE]... --eval SOURCE\n       js-runner --repl"
     );
 }
