@@ -1,0 +1,12 @@
+[package]
+name = "js-runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "js-runner"
+path = "src/main.rs"
+
+[dependencies]
+js-engine = { path = "../engine" }

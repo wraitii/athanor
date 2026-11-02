@@ -1,0 +1,380 @@
+use cranelift_codegen::ir::{
+    BlockArg, InstBuilder, MemFlags, StackSlotData, StackSlotKind, Value as ClifValue, types,
+};
+use cranelift_module::Module;
+use oxc_ast::ast::{AssignmentTarget, CallExpression, Expression, SimpleAssignmentTarget};
+use oxc_span::{GetSpan, Span};
+use oxc_syntax::operator::{AssignmentOperator, LogicalOperator, UnaryOperator, UpdateOperator};
+
+use crate::error::{Error, compile_at, unsupported_at};
+use crate::jit::helpers::Helper;
+use crate::value::Value;
+
+use super::FunctionCompiler;
+use super::ops::{BinaryOp, UnaryOp, binary_operator, compound_operator, to_number};
+
+impl FunctionCompiler<'_, '_> {
+    pub(super) fn emit_expression(
+        &mut self,
+        expression: &Expression<'_>,
+    ) -> Result<ClifValue, Error> {
+        match expression {
+            Expression::NumericLiteral(literal) => Ok(self.constant(Value::number(literal.value))),
+            Expression::BooleanLiteral(literal) => Ok(self.constant(Value::boolean(literal.value))),
+            Expression::NullLiteral(_) => Ok(self.constant(Value::NULL)),
+            Expression::ArrayExpression(array) => {
+                let mut elements = Vec::with_capacity(array.elements.len());
+                for element in &array.elements {
+                    let expression = element.as_expression().ok_or_else(|| {
+                        unsupported_at(element.span(), "array holes and spread elements")
+                    })?;
+                    elements.push(self.emit_expression(expression)?);
+                }
+                let argv = self.stack_values(&elements, array.span)?;
+                let argc = self.b.ins().iconst(types::I64, elements.len() as i64);
+                let array = self.call_helper(Helper::ArrayNew, &[argv, argc]);
+                self.check_error();
+                Ok(array)
+            }
+            Expression::Identifier(identifier) => {
+                let symbol = identifier
+                    .reference_id
+                    .get()
+                    .and_then(|id| self.scoping.get_reference(id).symbol_id());
+                if let Some(variable) = symbol.and_then(|id| self.local(id)) {
+                    return Ok(self.read_local(variable));
+                }
+                if identifier.name == "undefined" && symbol.is_none() {
+                    return Ok(self.constant(Value::UNDEFINED));
+                }
+                Ok(self.global_access(identifier.name.as_str(), None))
+            }
+            Expression::ParenthesizedExpression(expression) => {
+                self.emit_expression(&expression.expression)
+            }
+            Expression::SequenceExpression(expression) => {
+                let mut value = self.constant(Value::UNDEFINED);
+                for expression in &expression.expressions {
+                    value = self.emit_expression(expression)?;
+                }
+                Ok(value)
+            }
+            Expression::UnaryExpression(expression) => {
+                let value = self.emit_expression(&expression.argument)?;
+                let op = match expression.operator {
+                    UnaryOperator::UnaryPlus => UnaryOp::Plus,
+                    UnaryOperator::UnaryNegation => UnaryOp::Negation,
+                    UnaryOperator::LogicalNot => UnaryOp::Not,
+                    UnaryOperator::BitwiseNot => UnaryOp::BitwiseNot,
+                    UnaryOperator::Void => return Ok(self.constant(Value::UNDEFINED)),
+                    _ => {
+                        return Err(unsupported_at(
+                            expression.span,
+                            "unary operator in unary expression",
+                        ));
+                    }
+                };
+                Ok(self.unary_helper(op, value))
+            }
+            Expression::UpdateExpression(expression) => {
+                if let SimpleAssignmentTarget::ComputedMemberExpression(member) =
+                    &expression.argument
+                {
+                    let object = self.emit_expression(&member.object)?;
+                    let index = self.emit_expression(&member.expression)?;
+                    let previous = self.index_access(object, index, None);
+                    let number = to_number(self, previous);
+                    let one = self.constant(Value::number(1.0));
+                    let op = match expression.operator {
+                        UpdateOperator::Increment => BinaryOp::Add,
+                        UpdateOperator::Decrement => BinaryOp::Sub,
+                    };
+                    let value = self.binary(op, number, one);
+                    self.index_access(object, index, Some(value));
+                    return Ok(if expression.prefix { value } else { number });
+                }
+                let (name, symbol) = match &expression.argument {
+                    SimpleAssignmentTarget::AssignmentTargetIdentifier(identifier) => (
+                        identifier.name.as_str(),
+                        identifier
+                            .reference_id
+                            .get()
+                            .and_then(|id| self.scoping.get_reference(id).symbol_id()),
+                    ),
+                    other => {
+                        return Err(unsupported_at(other.span(), "this update target"));
+                    }
+                };
+                let variable = symbol.and_then(|id| self.local(id));
+                let previous = match variable {
+                    Some(variable) => self.read_local(variable),
+                    None => self.global_access(name, None),
+                };
+                let number = to_number(self, previous);
+                let one = self.constant(Value::number(1.0));
+                let value = match expression.operator {
+                    UpdateOperator::Increment => self.binary(BinaryOp::Add, number, one),
+                    UpdateOperator::Decrement => self.binary(BinaryOp::Sub, number, one),
+                };
+                if let Some(variable) = variable {
+                    self.store_local(variable, value);
+                } else {
+                    self.global_access(name, Some(value));
+                }
+                Ok(if expression.prefix { value } else { number })
+            }
+            Expression::BinaryExpression(expression) => {
+                let op = binary_operator(expression.operator).ok_or_else(|| {
+                    unsupported_at(expression.span, "binary operator in binary expression")
+                })?;
+                let left = self.emit_expression(&expression.left)?;
+                let right = self.emit_expression(&expression.right)?;
+                Ok(self.binary(op, left, right))
+            }
+            Expression::LogicalExpression(expression) => {
+                let left = self.emit_expression(&expression.left)?;
+                let right_block = self.b.create_block();
+                let done = self.b.create_block();
+                self.b.append_block_param(done, types::I64);
+                match expression.operator {
+                    LogicalOperator::And => {
+                        let condition = self.truthy(left);
+                        self.brif(condition, right_block, &[], done, &[BlockArg::Value(left)]);
+                    }
+                    LogicalOperator::Or => {
+                        let condition = self.truthy(left);
+                        self.brif(condition, done, &[BlockArg::Value(left)], right_block, &[]);
+                    }
+                    LogicalOperator::Coalesce => {
+                        let nullish = self.is_nullish(left);
+                        self.brif(nullish, right_block, &[], done, &[BlockArg::Value(left)]);
+                    }
+                }
+                self.switch(right_block);
+                let right = self.emit_expression(&expression.right)?;
+                self.jump(done, &[BlockArg::Value(right)]);
+                self.switch(done);
+                Ok(self.b.block_params(done)[0])
+            }
+            Expression::ConditionalExpression(expression) => {
+                let test = self.emit_expression(&expression.test)?;
+                let condition = self.truthy(test);
+                let consequent = self.b.create_block();
+                let alternate = self.b.create_block();
+                let done = self.b.create_block();
+                self.b.append_block_param(done, types::I64);
+                self.brif(condition, consequent, &[], alternate, &[]);
+
+                self.switch(consequent);
+                let value = self.emit_expression(&expression.consequent)?;
+                self.jump(done, &[BlockArg::Value(value)]);
+
+                self.switch(alternate);
+                let value = self.emit_expression(&expression.alternate)?;
+                self.jump(done, &[BlockArg::Value(value)]);
+
+                self.switch(done);
+                Ok(self.b.block_params(done)[0])
+            }
+            Expression::StaticMemberExpression(member) => {
+                let object = self.emit_expression(&member.object)?;
+                Ok(self.property_access(object, member.property.name.as_str(), None))
+            }
+            Expression::ComputedMemberExpression(member) => {
+                let object = self.emit_expression(&member.object)?;
+                let index = self.emit_expression(&member.expression)?;
+                Ok(self.index_access(object, index, None))
+            }
+            Expression::AssignmentExpression(expression) => {
+                if let AssignmentTarget::ComputedMemberExpression(member) = &expression.left {
+                    let object = self.emit_expression(&member.object)?;
+                    let index = self.emit_expression(&member.expression)?;
+                    let compound = match expression.operator {
+                        AssignmentOperator::Assign => None,
+                        operator => Some(compound_operator(operator).ok_or_else(|| {
+                            unsupported_at(expression.span, "assignment operator")
+                        })?),
+                    };
+                    let left = compound.map(|_| self.index_access(object, index, None));
+                    let right = self.emit_expression(&expression.right)?;
+                    let value = match compound {
+                        Some(op) => self.binary(op, left.unwrap(), right),
+                        None => right,
+                    };
+                    return Ok(self.index_access(object, index, Some(value)));
+                }
+                if let AssignmentTarget::StaticMemberExpression(member) = &expression.left {
+                    let object = self.emit_expression(&member.object)?;
+                    let compound = match expression.operator {
+                        AssignmentOperator::Assign => None,
+                        operator => Some(compound_operator(operator).ok_or_else(|| {
+                            unsupported_at(expression.span, "assignment operator")
+                        })?),
+                    };
+                    let left = compound
+                        .map(|_| self.property_access(object, member.property.name.as_str(), None));
+                    let right = self.emit_expression(&expression.right)?;
+                    let value = match compound {
+                        Some(op) => self.binary(op, left.unwrap(), right),
+                        None => right,
+                    };
+                    return Ok(self.property_access(
+                        object,
+                        member.property.name.as_str(),
+                        Some(value),
+                    ));
+                }
+                let (name, symbol) = match &expression.left {
+                    AssignmentTarget::AssignmentTargetIdentifier(identifier) => (
+                        identifier.name.as_str(),
+                        identifier
+                            .reference_id
+                            .get()
+                            .and_then(|id| self.scoping.get_reference(id).symbol_id()),
+                    ),
+                    other => {
+                        return Err(unsupported_at(other.span(), "this assignment target"));
+                    }
+                };
+                let variable = symbol.and_then(|id| self.local(id));
+                let compound = match expression.operator {
+                    AssignmentOperator::Assign => None,
+                    operator => Some(compound_operator(operator).ok_or_else(|| {
+                        unsupported_at(
+                            expression.span,
+                            "assignment operator in assignment expression",
+                        )
+                    })?),
+                };
+                let left = compound.map(|_| match variable {
+                    Some(variable) => self.read_local(variable),
+                    None => self.global_access(name, None),
+                });
+                let right = self.emit_expression(&expression.right)?;
+                let value = match compound {
+                    Some(op) => self.binary(op, left.unwrap(), right),
+                    None => right,
+                };
+                if let Some(variable) = variable {
+                    self.store_local(variable, value);
+                } else {
+                    self.global_access(name, Some(value));
+                }
+                Ok(value)
+            }
+            Expression::CallExpression(expression) => self.emit_call(expression),
+            other => Err(unsupported_at(
+                other.span(),
+                format!("{} expression", expression_kind(other)),
+            )),
+        }
+    }
+
+    fn emit_call(&mut self, expression: &CallExpression<'_>) -> Result<ClifValue, Error> {
+        let identifier = match &expression.callee {
+            Expression::Identifier(identifier) => identifier,
+            _ => {
+                return Err(unsupported_at(
+                    expression.span,
+                    "only direct function calls are supported",
+                ));
+            }
+        };
+        let name = identifier.name.as_str();
+        let symbol = identifier
+            .reference_id
+            .get()
+            .and_then(|id| self.scoping.get_reference(id).symbol_id());
+        let function = match symbol {
+            Some(id) => self.function_symbols.get(&id),
+            None => self.functions.get(name),
+        }
+        .copied()
+        .ok_or_else(|| {
+            compile_at(
+                expression.span,
+                format!("unknown or non-callable function `{name}`"),
+            )
+        })?;
+        let mut args = Vec::with_capacity(expression.arguments.len());
+        for argument in &expression.arguments {
+            let argument: &Expression<'_> = argument
+                .as_expression()
+                .ok_or_else(|| unsupported_at(expression.span, "spread argument"))?;
+            args.push(self.emit_expression(argument)?);
+        }
+        let argc = args.len();
+        let argv = self.stack_values(&args, expression.span)?;
+        let argc = self.b.ins().iconst(types::I64, argc as i64);
+        let callee = self.module.declare_func_in_func(function, self.b.func);
+        let call = self.b.ins().call(callee, &[self.ctx, argv, argc]);
+        let result = self.b.inst_results(call)[0];
+        let result = self.call_helper(Helper::TempOwn, &[result]);
+        self.check_error();
+        Ok(result)
+    }
+
+    fn stack_values(&mut self, values: &[ClifValue], span: Span) -> Result<ClifValue, Error> {
+        if values.is_empty() {
+            return Ok(self.b.ins().iconst(self.pointer, 0));
+        }
+        let size = values
+            .len()
+            .checked_mul(8)
+            .filter(|size| *size <= i32::MAX as usize)
+            .ok_or_else(|| compile_at(span, "too many stack values"))?;
+        let slot = self.b.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            size as u32,
+            3,
+        ));
+        for (index, value) in values.iter().enumerate() {
+            let address = self
+                .b
+                .ins()
+                .stack_addr(self.pointer, slot, (index * 8) as i32);
+            self.b.ins().store(MemFlags::trusted(), *value, address, 0);
+        }
+        Ok(self.b.ins().stack_addr(self.pointer, slot, 0))
+    }
+}
+
+fn expression_kind(expression: &Expression<'_>) -> &'static str {
+    match expression {
+        Expression::BooleanLiteral(_) => "boolean literal",
+        Expression::NullLiteral(_) => "null literal",
+        Expression::NumericLiteral(_) => "numeric literal",
+        Expression::BigIntLiteral(_) => "bigint literal",
+        Expression::RegExpLiteral(_) => "regexp literal",
+        Expression::StringLiteral(_) => "string literal",
+        Expression::TemplateLiteral(_) => "template literal",
+        Expression::Identifier(_) => "identifier",
+        Expression::Super(_) => "super",
+        Expression::ArrayExpression(_) => "array",
+        Expression::ArrowFunctionExpression(_) => "arrow function",
+        Expression::AssignmentExpression(_) => "assignment",
+        Expression::AwaitExpression(_) => "await",
+        Expression::BinaryExpression(_) => "binary",
+        Expression::CallExpression(_) => "call",
+        Expression::ChainExpression(_) => "chain",
+        Expression::ClassExpression(_) => "class",
+        Expression::ConditionalExpression(_) => "conditional",
+        Expression::FunctionExpression(_) => "function",
+        Expression::ImportExpression(_) => "import",
+        Expression::LogicalExpression(_) => "logical",
+        Expression::NewExpression(_) => "new",
+        Expression::ObjectExpression(_) => "object",
+        Expression::ParenthesizedExpression(_) => "parenthesized",
+        Expression::SequenceExpression(_) => "sequence",
+        Expression::TaggedTemplateExpression(_) => "tagged template",
+        Expression::ThisExpression(_) => "this",
+        Expression::UnaryExpression(_) => "unary",
+        Expression::UpdateExpression(_) => "update",
+        Expression::YieldExpression(_) => "yield",
+        Expression::PrivateInExpression(_) => "private-in",
+        Expression::ComputedMemberExpression(_) => "computed member",
+        Expression::StaticMemberExpression(_) => "static member",
+        Expression::PrivateFieldExpression(_) => "private field",
+        _ => "expression",
+    }
+}
