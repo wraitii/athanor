@@ -1,24 +1,28 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use cranelift_codegen::Context;
 use cranelift_codegen::ir::{AbiParam, Signature, types};
 use cranelift_frontend::FunctionBuilderContext;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module, default_libcall_names};
-use oxc_ast::ast::{BindingPattern, Function, Program, Statement, VariableDeclarationKind};
-use oxc_semantic::Scoping;
+use oxc_ast::AstKind;
+use oxc_ast::ast::{
+    BindingPattern, Expression, FormalParameters, Function, Program, Statement,
+    VariableDeclarationKind,
+};
+use oxc_semantic::{AstNodes, Scoping};
 use oxc_span::GetSpan;
 use oxc_syntax::symbol::SymbolId;
 
 use crate::EngineOptions;
 use crate::error::{Error, compile_at, unsupported_at};
 
-use super::{emit, helpers};
+use super::{analysis::CaptureAnalysis, emit, helpers};
 
 pub(crate) struct CompiledFunction {
     pub(crate) name: String,
-    pub(crate) entry: usize,
     pub(crate) arity: usize,
+    pub(crate) code: u64,
 }
 
 pub(crate) struct Compiler {
@@ -44,6 +48,7 @@ impl Compiler {
         let call_conv = target.default_call_conv;
         let mut signature = Signature::new(call_conv);
         signature.params.push(AbiParam::new(pointer));
+        signature.params.push(AbiParam::new(types::I64));
         signature.params.push(AbiParam::new(pointer));
         signature.params.push(AbiParam::new(types::I64));
         signature.returns.push(AbiParam::new(types::I64));
@@ -74,8 +79,17 @@ impl Compiler {
         &mut self,
         program: &'a Program<'a>,
         scoping: &Scoping,
-    ) -> Result<(Vec<CompiledFunction>, Vec<String>, Option<usize>), Error> {
-        let result = self.compile_program_inner(program, scoping);
+        nodes: &AstNodes<'a>,
+    ) -> Result<
+        (
+            Vec<CompiledFunction>,
+            Vec<String>,
+            Option<usize>,
+            Vec<(u64, usize)>,
+        ),
+        Error,
+    > {
+        let result = self.compile_program_inner(program, scoping, nodes);
         if result.is_err() {
             self.context.clear();
             self.builder_context = FunctionBuilderContext::new();
@@ -87,7 +101,16 @@ impl Compiler {
         &mut self,
         program: &'a Program<'a>,
         scoping: &Scoping,
-    ) -> Result<(Vec<CompiledFunction>, Vec<String>, Option<usize>), Error> {
+        nodes: &AstNodes<'a>,
+    ) -> Result<
+        (
+            Vec<CompiledFunction>,
+            Vec<String>,
+            Option<usize>,
+            Vec<(u64, usize)>,
+        ),
+        Error,
+    > {
         let mut globals = Vec::new();
         let mut declarations = Vec::new();
         for statement in &program.body {
@@ -121,7 +144,6 @@ impl Compiler {
 
         let mut ids = self.functions.clone();
         let mut ordered = Vec::new();
-        let mut function_symbols = HashMap::<SymbolId, FuncId>::new();
         for (name, function) in declarations {
             if ids.contains_key(&name) {
                 return Err(compile_at(
@@ -136,15 +158,90 @@ impl Compiler {
                 .declare_function(&internal, Linkage::Local, &self.signature)
                 .map_err(|error| Error::Compile(error.to_string()))?;
             ids.insert(name.clone(), id);
-            function_symbols.insert(function.id.as_ref().unwrap().symbol_id.get().unwrap(), id);
             ordered.push((name, function));
         }
 
+        let analysis = CaptureAnalysis::analyze(program, scoping);
+        let mut closures = HashMap::new();
+        let mut nested = Vec::new();
+        for node in nodes.iter() {
+            let (span, params, statements, expression) = match node.kind() {
+                AstKind::ArrowFunctionExpression(function) => {
+                    if function.r#async {
+                        return Err(unsupported_at(function.span, "async arrow"));
+                    }
+                    let (statements, expression) = match &function.body {
+                        oxc_ast::ast::ArrowFunctionBody::FunctionBody(body) => {
+                            (body.statements.as_slice(), None)
+                        }
+                        body => (&[][..], body.as_expression()),
+                    };
+                    (function.span, &*function.params, statements, expression)
+                }
+                AstKind::Function(function)
+                    if !ordered.iter().any(|(_, top)| top.span == function.span) =>
+                {
+                    if function.id.is_some()
+                        || function.generator
+                        || function.r#async
+                        || function.body.is_none()
+                    {
+                        return Err(unsupported_at(
+                            function.span,
+                            "named, async, generator or bodyless nested function",
+                        ));
+                    }
+                    (
+                        function.span,
+                        &*function.params,
+                        function.body.as_ref().unwrap().statements.as_slice(),
+                        None,
+                    )
+                }
+                _ => continue,
+            };
+            validate_params(params, span)?;
+            let internal = format!("jsclosure_{}", self.next_id);
+            self.next_id += 1;
+            let id = self
+                .module
+                .declare_function(&internal, Linkage::Local, &self.signature)
+                .map_err(|error| Error::Compile(error.to_string()))?;
+            let captures = analysis
+                .functions
+                .get(&span.start)
+                .map(|f| f.captures.clone())
+                .unwrap_or_default();
+            closures.insert(span.start, (id, captures));
+            nested.push((id, span, params, statements, expression));
+        }
         let mut pending = Vec::new();
         for (name, function) in &ordered {
-            let code = self.compile_function(function, &ids, scoping, &function_symbols)?;
+            let code = self.compile_function(
+                &function.params,
+                &function.body.as_ref().unwrap().statements,
+                None,
+                &[],
+                &analysis.captured,
+                &closures,
+                scoping,
+            )?;
             pending.push((ids[name], code));
         }
+        for (id, span, params, statements, expression) in nested {
+            let captures = &closures[&span.start].1;
+            let code = self.compile_function(
+                params,
+                statements,
+                expression,
+                captures,
+                &analysis.captured,
+                &closures,
+                scoping,
+            )?;
+            pending.push((id, code));
+        }
+        let compiled_ids: Vec<_> = pending.iter().map(|(id, _)| *id).collect();
 
         let initializer = if !program.body.iter().any(|s| {
             matches!(
@@ -170,12 +267,12 @@ impl Compiler {
                 emit::build_global(
                     &mut builder,
                     &mut self.module,
-                    &ids,
                     scoping,
-                    &function_symbols,
                     &self.helpers,
                     &mut self.names,
                     &program.body,
+                    &analysis.captured,
+                    &closures,
                 )?;
                 builder.seal_all_blocks();
                 builder.finalize();
@@ -203,11 +300,10 @@ impl Compiler {
 
         let mut functions = Vec::with_capacity(ordered.len());
         for (name, function) in ordered {
-            let entry = self.module.get_finalized_function(ids[&name]);
             functions.push(CompiledFunction {
-                name,
-                entry: entry as usize,
+                name: name.clone(),
                 arity: function.params.items.len(),
+                code: ids[&name].as_u32() as u64,
             });
         }
         self.functions = ids;
@@ -215,15 +311,27 @@ impl Compiler {
             functions,
             globals,
             initializer.map(|id| self.module.get_finalized_function(id) as usize),
+            compiled_ids
+                .into_iter()
+                .map(|id| {
+                    (
+                        id.as_u32() as u64,
+                        self.module.get_finalized_function(id) as usize,
+                    )
+                })
+                .collect(),
         ))
     }
 
     fn compile_function(
         &mut self,
-        function: &Function<'_>,
-        functions: &HashMap<String, FuncId>,
+        params: &FormalParameters<'_>,
+        statements: &[Statement<'_>],
+        expression: Option<&Expression<'_>>,
+        captures: &[SymbolId],
+        captured: &HashSet<SymbolId>,
+        closures: &HashMap<u32, (FuncId, Vec<SymbolId>)>,
         scoping: &Scoping,
-        function_symbols: &HashMap<SymbolId, FuncId>,
     ) -> Result<cranelift_codegen::ir::Function, Error> {
         self.context.clear();
         self.context.func.signature = self.signature.clone();
@@ -235,12 +343,15 @@ impl Compiler {
             emit::build_function(
                 &mut builder,
                 &mut self.module,
-                functions,
                 scoping,
-                function_symbols,
                 &self.helpers,
                 &mut self.names,
-                function,
+                params,
+                statements,
+                expression,
+                captures,
+                captured,
+                closures,
             )?;
             builder.seal_all_blocks();
             builder.finalize();
@@ -293,4 +404,20 @@ fn validate_function(function: &Function<'_>) -> Result<String, Error> {
         }
     }
     Ok(name)
+}
+
+fn validate_params(params: &FormalParameters<'_>, span: oxc_span::Span) -> Result<(), Error> {
+    if params.items.iter().any(|p| {
+        p.initializer.is_some() || !matches!(p.pattern, BindingPattern::BindingIdentifier(_))
+    }) || params
+        .rest
+        .as_ref()
+        .is_some_and(|p| !matches!(p.rest.argument, BindingPattern::BindingIdentifier(_)))
+    {
+        return Err(unsupported_at(
+            span,
+            "function parameter pattern or default",
+        ));
+    }
+    Ok(())
 }

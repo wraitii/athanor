@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::environment::Environment;
 use crate::error::Error;
 use crate::value::Value;
@@ -9,19 +11,25 @@ struct Frame {
 }
 
 #[repr(C)]
-pub(crate) struct JitCtx {
+pub(crate) struct JitCtx<'a> {
     pub(crate) global: Environment,
     pub(crate) error: Option<Error>,
     frames: Vec<Frame>,
+    code: &'a HashMap<u64, usize>,
 }
 
-impl JitCtx {
-    fn new(global: &Environment) -> Self {
+impl<'a> JitCtx<'a> {
+    fn new(global: &Environment, code: &'a HashMap<u64, usize>) -> Self {
         Self {
             global: global.clone(),
             error: None,
             frames: Vec::new(),
+            code,
         }
+    }
+
+    pub(crate) fn entry(&self, code: u64) -> Option<usize> {
+        self.code.get(&code).copied()
     }
 
     pub(crate) fn enter(&mut self) {
@@ -77,16 +85,18 @@ pub(crate) unsafe fn call(
     entry: usize,
     args: &[Value],
     global: &Environment,
+    code: &HashMap<u64, usize>,
+    closure: Value,
 ) -> Result<Value, Error> {
-    let mut ctx = JitCtx::new(global);
+    let mut ctx = JitCtx::new(global, code);
     let argv = if args.is_empty() {
         std::ptr::null()
     } else {
         args.as_ptr().cast::<u64>()
     };
-    let function: extern "C" fn(*mut JitCtx, *const u64, u64) -> u64 =
+    let function: extern "C" fn(*mut JitCtx, Value, *const u64, u64) -> u64 =
         unsafe { std::mem::transmute(entry) };
-    let value = Value::from_bits(function(&mut ctx, argv, args.len() as u64));
+    let value = Value::from_bits(function(&mut ctx, closure, argv, args.len() as u64));
     match ctx.error {
         Some(error) => {
             global.heap().release(value);

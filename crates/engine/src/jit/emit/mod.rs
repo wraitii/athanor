@@ -3,7 +3,7 @@ mod ops;
 mod scope;
 mod statement;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
@@ -12,7 +12,7 @@ use cranelift_codegen::ir::{
 use cranelift_frontend::FunctionBuilder;
 use cranelift_jit::JITModule;
 use cranelift_module::{FuncId, Module};
-use oxc_ast::ast::Function;
+use oxc_ast::ast::{Expression, FormalParameters, Statement};
 use oxc_semantic::Scoping;
 use oxc_syntax::symbol::SymbolId;
 
@@ -28,14 +28,14 @@ pub(super) struct FunctionCompiler<'a, 'f> {
     names: &'a mut Vec<Box<str>>,
     b: &'a mut FunctionBuilder<'f>,
     module: &'a mut JITModule,
-    functions: &'a HashMap<String, FuncId>,
     helpers: &'a [FuncId],
     scoping: &'a Scoping,
-    function_symbols: &'a HashMap<SymbolId, FuncId>,
     pointer: Type,
     ctx: ClifValue,
     argv: ClifValue,
     argc: ClifValue,
+    captured: &'a HashSet<SymbolId>,
+    closures: &'a HashMap<u32, (FuncId, Vec<SymbolId>)>,
     scopes: ScopeStack,
     return_block: Block,
     terminated: bool,
@@ -44,17 +44,20 @@ pub(super) struct FunctionCompiler<'a, 'f> {
 pub(super) fn build_function(
     b: &mut FunctionBuilder<'_>,
     module: &mut JITModule,
-    functions: &HashMap<String, FuncId>,
     scoping: &Scoping,
-    function_symbols: &HashMap<SymbolId, FuncId>,
     helpers: &[FuncId],
     names: &mut Vec<Box<str>>,
-    function: &Function<'_>,
+    params: &FormalParameters<'_>,
+    statements: &[Statement<'_>],
+    expression: Option<&Expression<'_>>,
+    captures: &[SymbolId],
+    captured: &HashSet<SymbolId>,
+    closures: &HashMap<u32, (FuncId, Vec<SymbolId>)>,
 ) -> Result<(), Error> {
     let entry = b.create_block();
     b.switch_to_block(entry);
     b.append_block_params_for_function_params(entry);
-    let [ctx, argv, argc] = b.block_params(entry).try_into().unwrap();
+    let [ctx, closure, argv, argc] = b.block_params(entry).try_into().unwrap();
     let return_block = b.create_block();
     b.append_block_param(return_block, types::I64);
 
@@ -63,24 +66,34 @@ pub(super) fn build_function(
         names,
         b,
         module,
-        functions,
         helpers,
         scoping,
-        function_symbols,
         pointer,
         ctx,
         argv,
         argc,
+        captured,
+        closures,
         scopes: ScopeStack::new(),
         return_block,
         terminated: false,
     };
 
-    let body = function.body.as_ref().unwrap();
     compiler.enter_frame();
-    compiler.initialize_function(function)?;
+    compiler.initialize_function(params, statements)?;
+    for (index, symbol) in captures.iter().enumerate() {
+        let index = compiler.b.ins().iconst(types::I64, index as i64);
+        let cell = compiler.call_helper(Helper::CaptureGet, &[closure, index]);
+        compiler.check_error();
+        compiler.install_capture(*symbol, cell);
+    }
     compiler.clear_temporaries();
-    compiler.emit_block(&body.statements)?;
+    if let Some(expression) = expression {
+        let value = compiler.emit_expression(expression)?;
+        compiler.jump(return_block, &[BlockArg::Value(value)]);
+    } else {
+        compiler.emit_block(statements)?;
+    }
     if !compiler.terminated {
         let undefined = compiler.constant(Value::UNDEFINED);
         compiler.jump(return_block, &[BlockArg::Value(undefined)]);
@@ -94,17 +107,17 @@ pub(super) fn build_function(
 pub(super) fn build_global(
     b: &mut FunctionBuilder<'_>,
     module: &mut JITModule,
-    functions: &HashMap<String, FuncId>,
     scoping: &Scoping,
-    function_symbols: &HashMap<SymbolId, FuncId>,
     helpers: &[FuncId],
     names: &mut Vec<Box<str>>,
     statements: &[oxc_ast::ast::Statement<'_>],
+    captured: &HashSet<SymbolId>,
+    closures: &HashMap<u32, (FuncId, Vec<SymbolId>)>,
 ) -> Result<(), Error> {
     let entry = b.create_block();
     b.switch_to_block(entry);
     b.append_block_params_for_function_params(entry);
-    let [ctx, argv, argc] = b.block_params(entry).try_into().unwrap();
+    let [ctx, _closure, argv, argc] = b.block_params(entry).try_into().unwrap();
     let return_block = b.create_block();
     b.append_block_param(return_block, types::I64);
     let pointer = module.target_config().pointer_type();
@@ -112,14 +125,14 @@ pub(super) fn build_global(
         names,
         b,
         module,
-        functions,
         helpers,
         scoping,
-        function_symbols,
         pointer,
         ctx,
         argv,
         argc,
+        captured,
+        closures,
         scopes: ScopeStack::new(),
         return_block,
         terminated: false,

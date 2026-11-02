@@ -1,3 +1,4 @@
+mod analysis;
 mod compiler;
 mod emit;
 mod helpers;

@@ -133,6 +133,17 @@ impl FunctionCompiler<'_, '_> {
             Some(ForStatementInit::VariableDeclaration(declaration))
                 if declaration.kind != VariableDeclarationKind::Var
         );
+        if lexical_scope {
+            if let Some(ForStatementInit::VariableDeclaration(declaration)) = &statement.init {
+                for declarator in &declaration.declarations {
+                    if let BindingPattern::BindingIdentifier(identifier) = &declarator.id {
+                        if self.captured.contains(&identifier.symbol_id.get().unwrap()) {
+                            return Err(unsupported_at(declarator.span, "captured loop binding"));
+                        }
+                    }
+                }
+            }
+        }
         if let Some(init) = &statement.init {
             match init {
                 ForStatementInit::VariableDeclaration(declaration) => {
@@ -213,7 +224,7 @@ impl FunctionCompiler<'_, '_> {
                 None if declaration.kind == VariableDeclarationKind::Var => continue,
                 None => self.constant(Value::UNDEFINED),
             };
-            self.store_local(variable, value);
+            self.initialize_local(variable, value);
             self.clear_temporaries();
         }
         Ok(())

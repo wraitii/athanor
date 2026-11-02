@@ -5,13 +5,12 @@ use oxc_semantic::SemanticBuilder;
 
 use crate::environment::Environment;
 use crate::error::Error;
-use crate::heap::OwnedValue;
+use crate::heap::{CodeId, OwnedValue};
 use crate::jit::{self, Compiler};
 use crate::parse;
 use crate::value::Value;
 
 struct Function {
-    entry: usize,
     arity: usize,
 }
 
@@ -40,6 +39,7 @@ pub struct Engine {
     compiler: Compiler,
     global: Environment,
     functions: HashMap<String, Function>,
+    code: HashMap<u64, usize>,
 }
 
 impl Engine {
@@ -54,6 +54,7 @@ impl Engine {
             compiler: Compiler::new(options)?,
             global,
             functions: HashMap::new(),
+            code: HashMap::new(),
         })
     }
 
@@ -64,7 +65,9 @@ impl Engine {
     pub fn compile(&mut self, source: &str, filename: &str) -> Result<(), Error> {
         let allocator = Allocator::default();
         let program = parse::parse(&allocator, source, filename)?;
-        let analysis = SemanticBuilder::new_compiler().build(&program);
+        let analysis = SemanticBuilder::new_compiler()
+            .with_build_nodes(true)
+            .build(&program);
         if analysis.diagnostics.has_errors() {
             let message = analysis
                 .diagnostics
@@ -74,14 +77,25 @@ impl Engine {
                 .join("\n");
             return Err(Error::Parse(message));
         }
-        let (functions, globals, initializer) = self
-            .compiler
-            .compile_program(&program, analysis.semantic.scoping())?;
+        let (functions, globals, initializer, code) = self.compiler.compile_program(
+            &program,
+            analysis.semantic.scoping(),
+            analysis.semantic.nodes(),
+        )?;
+        self.code.extend(code);
         for function in functions {
+            let value = self
+                .global
+                .heap()
+                .closure(CodeId(function.code), &[])
+                .ok_or_else(|| Error::Runtime("heap exhausted".into()))?;
+            if !self.global.set(&function.name, value) {
+                self.global.define(function.name.clone(), value);
+            }
+            self.global.heap().release(value);
             self.functions.insert(
                 function.name,
                 Function {
-                    entry: function.entry,
                     arity: function.arity,
                 },
             );
@@ -91,7 +105,8 @@ impl Engine {
         }
         if let Some(initializer) = initializer {
             unsafe {
-                let value = jit::call(initializer, &[], &self.global)?;
+                let value =
+                    jit::call(initializer, &[], &self.global, &self.code, Value::UNDEFINED)?;
                 self.global.heap().release(value);
             }
         }
@@ -103,11 +118,19 @@ impl Engine {
         if !args.iter().all(|value| self.global.heap().valid(*value)) {
             return Err(Error::Runtime("invalid or foreign heap value".into()));
         }
-        let function = self
-            .functions
+        let callable = self
+            .global
             .get(name)
             .ok_or_else(|| Error::Runtime(format!("unknown function {name}")))?;
-        let value = unsafe { jit::call(function.entry, args, &self.global)? };
+        let entry = self
+            .global
+            .heap()
+            .closure_code(callable.value())
+            .and_then(|code| self.code.get(&code.0).copied())
+            .ok_or_else(|| {
+                Error::Runtime(format!("value `{name}` is not callable in this engine"))
+            })?;
+        let value = unsafe { jit::call(entry, args, &self.global, &self.code, callable.value())? };
         self.global.heap().drain(64);
         Ok(OwnedValue::from_owned(value, self.global.heap().clone()))
     }

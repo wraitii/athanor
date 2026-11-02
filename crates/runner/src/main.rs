@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::{self, BufRead, Write};
 
 use js_engine::{Engine, Error, Value};
 
@@ -15,6 +16,7 @@ fn run() -> Result<(), String> {
     let mut eval = None;
     let mut function = String::from("main");
     let mut values = Vec::new();
+    let mut repl = false;
 
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -28,6 +30,7 @@ fn run() -> Result<(), String> {
                 let value = arguments.next().ok_or("--arg expects a value")?;
                 values.push(parse_value(&value)?);
             }
+            "--repl" => repl = true,
             "--help" | "-h" => {
                 usage();
                 return Ok(());
@@ -37,6 +40,13 @@ fn run() -> Result<(), String> {
             }
             other => script = Some(other.to_string()),
         }
+    }
+
+    if repl {
+        if eval.is_some() || script.is_some() || function != "main" || !values.is_empty() {
+            return Err("--repl cannot be combined with script options".to_string());
+        }
+        return run_repl();
     }
 
     let (source, filename) = match (eval, script) {
@@ -62,6 +72,51 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
+fn run_repl() -> Result<(), String> {
+    let mut engine = Engine::new().map_err(display)?;
+    let stdin = io::stdin();
+    let mut lines = stdin.lock().lines();
+    loop {
+        print!("> ");
+        io::stdout().flush().map_err(|error| error.to_string())?;
+        let Some(line) = lines.next() else {
+            break;
+        };
+        let line = line.map_err(|error| error.to_string())?;
+        let input = line.trim();
+        if input == "exit" || input == ".exit" {
+            break;
+        }
+        if input.is_empty() {
+            continue;
+        }
+
+        let expression = input.trim_end_matches(';').trim_end();
+        let result = if input
+            .strip_prefix("function")
+            .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+        {
+            engine.compile(input, "<repl>")
+        } else {
+            let source = format!("var __repl_result = ({expression});");
+            match engine.compile(&source, "<repl>") {
+                Ok(()) => {
+                    if let Some(value) = engine.global().get("__repl_result") {
+                        println!("{}", value.value());
+                    }
+                    Ok(())
+                }
+                Err(Error::Parse(_)) => engine.compile(input, "<repl>"),
+                Err(error) => Err(error),
+            }
+        };
+        if let Err(error) = result {
+            eprintln!("{error}");
+        }
+    }
+    Ok(())
+}
+
 fn parse_value(value: &str) -> Result<Value, String> {
     match value {
         "undefined" => Ok(Value::UNDEFINED),
@@ -81,6 +136,6 @@ fn display(error: Error) -> String {
 
 fn usage() {
     eprintln!(
-        "usage: js-runner [--function NAME] [--arg VALUE]... <script>\n       js-runner [--function NAME] [--arg VALUE]... --eval SOURCE"
+        "usage: js-runner [--function NAME] [--arg VALUE]... <script>\n       js-runner [--function NAME] [--arg VALUE]... --eval SOURCE\n       js-runner --repl"
     );
 }

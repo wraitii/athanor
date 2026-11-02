@@ -403,14 +403,10 @@ fn semantic_binding_resolution() {
         "function f(){ return 1; } function main(){ let f = 2; return f(); }",
         "var f = 2; function main(){ return f(); }",
     ] {
-        let error = Engine::new()
-            .unwrap()
-            .compile(source, "semantic.js")
-            .unwrap_err();
-        assert!(
-            matches!(error, Error::Compile(ref message) if message.contains("non-callable function `f`")),
-            "{source}: {error}"
-        );
+        let mut engine = Engine::new().unwrap();
+        engine.compile(source, "semantic.js").unwrap();
+        let error = engine.call("main", &[Value::number(2.0)]).err().unwrap();
+        assert!(matches!(error, Error::Runtime(_)), "{source}: {error}");
     }
     let error = Engine::new()
         .unwrap()
@@ -429,11 +425,9 @@ fn prior_function_cannot_override_current_binding() {
         engine
             .compile("function f(){ return 1; }", "first.js")
             .unwrap();
-        let error = engine.compile(source, "second.js").unwrap_err();
-        assert!(
-            matches!(error, Error::Compile(ref message) if message.contains("non-callable function `f`")),
-            "{source}: {error}"
-        );
+        engine.compile(source, "second.js").unwrap();
+        let error = engine.call("main", &[Value::number(2.0)]).err().unwrap();
+        assert!(matches!(error, Error::Runtime(_)), "{source}: {error}");
     }
 }
 

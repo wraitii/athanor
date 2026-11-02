@@ -1,7 +1,6 @@
 use cranelift_codegen::ir::{
     BlockArg, InstBuilder, MemFlags, StackSlotData, StackSlotKind, Value as ClifValue, types,
 };
-use cranelift_module::Module;
 use oxc_ast::ast::{AssignmentTarget, CallExpression, Expression, SimpleAssignmentTarget};
 use oxc_span::{GetSpan, Span};
 use oxc_syntax::operator::{AssignmentOperator, LogicalOperator, UnaryOperator, UpdateOperator};
@@ -43,6 +42,12 @@ impl FunctionCompiler<'_, '_> {
                     .and_then(|id| self.scoping.get_reference(id).symbol_id());
                 if let Some(variable) = symbol.and_then(|id| self.local(id)) {
                     return Ok(self.read_local(variable));
+                }
+                if identifier.name == "arguments" {
+                    return Err(unsupported_at(
+                        identifier.span,
+                        "implicit arguments binding",
+                    ));
                 }
                 if identifier.name == "undefined" && symbol.is_none() {
                     return Ok(self.constant(Value::UNDEFINED));
@@ -105,6 +110,9 @@ impl FunctionCompiler<'_, '_> {
                         return Err(unsupported_at(other.span(), "this update target"));
                     }
                 };
+                if symbol.is_some_and(|id| self.scoping.symbol_flags(id).is_const_variable()) {
+                    return Err(unsupported_at(expression.span, "assignment to const"));
+                }
                 let variable = symbol.and_then(|id| self.local(id));
                 let previous = match variable {
                     Some(variable) => self.read_local(variable),
@@ -236,6 +244,9 @@ impl FunctionCompiler<'_, '_> {
                         return Err(unsupported_at(other.span(), "this assignment target"));
                     }
                 };
+                if symbol.is_some_and(|id| self.scoping.symbol_flags(id).is_const_variable()) {
+                    return Err(unsupported_at(expression.span, "assignment to const"));
+                }
                 let variable = symbol.and_then(|id| self.local(id));
                 let compound = match expression.operator {
                     AssignmentOperator::Assign => None,
@@ -262,6 +273,8 @@ impl FunctionCompiler<'_, '_> {
                 }
                 Ok(value)
             }
+            Expression::ArrowFunctionExpression(function) => self.make_closure(function.span),
+            Expression::FunctionExpression(function) => self.make_closure(function.span),
             Expression::CallExpression(expression) => self.emit_call(expression),
             other => Err(unsupported_at(
                 other.span(),
@@ -271,31 +284,13 @@ impl FunctionCompiler<'_, '_> {
     }
 
     fn emit_call(&mut self, expression: &CallExpression<'_>) -> Result<ClifValue, Error> {
-        let identifier = match &expression.callee {
-            Expression::Identifier(identifier) => identifier,
-            _ => {
-                return Err(unsupported_at(
-                    expression.span,
-                    "only direct function calls are supported",
-                ));
-            }
-        };
-        let name = identifier.name.as_str();
-        let symbol = identifier
-            .reference_id
-            .get()
-            .and_then(|id| self.scoping.get_reference(id).symbol_id());
-        let function = match symbol {
-            Some(id) => self.function_symbols.get(&id),
-            None => self.functions.get(name),
+        if matches!(
+            &expression.callee,
+            Expression::StaticMemberExpression(_) | Expression::ComputedMemberExpression(_)
+        ) {
+            return Err(unsupported_at(expression.span, "method call"));
         }
-        .copied()
-        .ok_or_else(|| {
-            compile_at(
-                expression.span,
-                format!("unknown or non-callable function `{name}`"),
-            )
-        })?;
+        let callable = self.emit_expression(&expression.callee)?;
         let mut args = Vec::with_capacity(expression.arguments.len());
         for argument in &expression.arguments {
             let argument: &Expression<'_> = argument
@@ -306,10 +301,28 @@ impl FunctionCompiler<'_, '_> {
         let argc = args.len();
         let argv = self.stack_values(&args, expression.span)?;
         let argc = self.b.ins().iconst(types::I64, argc as i64);
-        let callee = self.module.declare_func_in_func(function, self.b.func);
-        let call = self.b.ins().call(callee, &[self.ctx, argv, argc]);
-        let result = self.b.inst_results(call)[0];
-        let result = self.call_helper(Helper::TempOwn, &[result]);
+        let result = self.call_helper(Helper::Call, &[callable, argv, argc]);
+        self.check_error();
+        Ok(result)
+    }
+
+    fn make_closure(&mut self, span: Span) -> Result<ClifValue, Error> {
+        let (id, captures) = self
+            .closures
+            .get(&span.start)
+            .cloned()
+            .ok_or_else(|| compile_at(span, "missing closure code"))?;
+        let mut cells = Vec::with_capacity(captures.len());
+        for symbol in captures {
+            cells.push(
+                self.capture_cell(symbol)
+                    .ok_or_else(|| compile_at(span, "missing captured binding"))?,
+            );
+        }
+        let argv = self.stack_values(&cells, span)?;
+        let count = self.b.ins().iconst(types::I64, cells.len() as i64);
+        let code = self.b.ins().iconst(types::I64, id.as_u32() as i64);
+        let result = self.call_helper(Helper::ClosureNew, &[code, argv, count]);
         self.check_error();
         Ok(result)
     }

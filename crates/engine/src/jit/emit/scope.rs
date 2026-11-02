@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use cranelift_codegen::ir::{InstBuilder, Value as ClifValue, types};
 use cranelift_frontend::Variable;
 use oxc_ast::ast::{
-    BindingPattern, ForStatementInit, Function, Statement, VariableDeclaration,
+    BindingPattern, ForStatementInit, FormalParameters, Statement, VariableDeclaration,
     VariableDeclarationKind,
 };
 use oxc_syntax::symbol::SymbolId;
@@ -21,11 +21,15 @@ struct Scope {
 
 pub(super) struct ScopeStack {
     scopes: Vec<Scope>,
+    cells: HashSet<u32>,
 }
 
 impl ScopeStack {
     pub(super) fn new() -> Self {
-        Self { scopes: Vec::new() }
+        Self {
+            scopes: Vec::new(),
+            cells: HashSet::new(),
+        }
     }
 
     pub(super) fn push(&mut self) {
@@ -69,32 +73,32 @@ impl ScopeStack {
 }
 
 impl FunctionCompiler<'_, '_> {
-    pub(super) fn initialize_function(&mut self, function: &Function<'_>) -> Result<(), Error> {
-        let body = function.body.as_ref().unwrap();
+    pub(super) fn initialize_function(
+        &mut self,
+        params: &FormalParameters<'_>,
+        statements: &[Statement<'_>],
+    ) -> Result<(), Error> {
         self.scopes.push();
 
         let mut var_symbols = Vec::new();
-        collect_var_symbols(&body.statements, &mut var_symbols);
+        collect_var_symbols(statements, &mut var_symbols);
         for symbol in var_symbols {
             self.declare_function_binding(symbol);
         }
 
-        for (index, parameter) in function.params.items.iter().enumerate() {
+        for (index, parameter) in params.items.iter().enumerate() {
             let symbol = param_symbol(&parameter.pattern);
             let variable = self.declare_function_binding(symbol);
             let value = self.load_arg(index);
-            self.store_local(variable, value);
+            self.initialize_local(variable, value);
         }
-        if let Some(rest) = &function.params.rest {
+        if let Some(rest) = &params.rest {
             let symbol = param_symbol(&rest.rest.argument);
             let variable = self.declare_function_binding(symbol);
-            let start = self
-                .b
-                .ins()
-                .iconst(types::I64, function.params.items.len() as i64);
+            let start = self.b.ins().iconst(types::I64, params.items.len() as i64);
             let value = self.call_helper(Helper::Rest, &[self.argv, self.argc, start]);
             self.check_error();
-            self.store_local(variable, value);
+            self.initialize_local(variable, value);
         }
         Ok(())
     }
@@ -115,16 +119,41 @@ impl FunctionCompiler<'_, '_> {
         }
         for variable in variables {
             let undefined = self.constant(Value::UNDEFINED);
-            self.store_local(variable, undefined);
+            if self.scopes.cells.remove(&variable.as_u32()) {
+                let slot = self.b.ins().iconst(types::I64, variable.as_u32() as i64);
+                self.call_helper(Helper::LocalSet, &[slot, undefined]);
+            } else {
+                self.store_local(variable, undefined);
+            }
         }
     }
 
     pub(super) fn read_local(&mut self, variable: Variable) -> ClifValue {
         let value = self.b.use_var(variable);
+        if self.scopes.cells.contains(&variable.as_u32()) {
+            let result = self.call_helper(Helper::CellGet, &[value]);
+            self.check_error();
+            return result;
+        }
         self.call_helper(Helper::TempRetain, &[value])
     }
 
     pub(super) fn store_local(&mut self, variable: Variable, value: ClifValue) {
+        if self.scopes.cells.contains(&variable.as_u32()) {
+            let cell = self.b.use_var(variable);
+            self.call_helper(Helper::CellGet, &[cell]);
+            self.check_error();
+        }
+        self.initialize_local(variable, value);
+    }
+
+    pub(super) fn initialize_local(&mut self, variable: Variable, value: ClifValue) {
+        if self.scopes.cells.contains(&variable.as_u32()) {
+            let cell = self.b.use_var(variable);
+            self.call_helper(Helper::CellSet, &[cell, value]);
+            self.check_error();
+            return;
+        }
         let slot = self.b.ins().iconst(types::I64, variable.as_u32() as i64);
         self.call_helper(Helper::LocalSet, &[slot, value]);
         self.b.def_var(variable, value);
@@ -159,6 +188,7 @@ impl FunctionCompiler<'_, '_> {
         self.scopes.insert_function(symbol, variable);
         let undefined = self.constant(Value::UNDEFINED);
         self.b.def_var(variable, undefined);
+        self.initialize_cell(symbol, variable, undefined);
         variable
     }
 
@@ -170,7 +200,36 @@ impl FunctionCompiler<'_, '_> {
         self.scopes.insert_current(symbol, variable);
         let uninitialized = self.constant(Value::UNINITIALIZED);
         self.b.def_var(variable, uninitialized);
+        self.initialize_cell(symbol, variable, uninitialized);
         variable
+    }
+    fn initialize_cell(&mut self, symbol: SymbolId, variable: Variable, value: ClifValue) {
+        if !self.captured.contains(&symbol) {
+            return;
+        }
+        let cell = self.call_helper(Helper::CellNew, &[value]);
+        self.check_error();
+        let slot = self.b.ins().iconst(types::I64, variable.as_u32() as i64);
+        self.call_helper(Helper::LocalSet, &[slot, cell]);
+        self.b.def_var(variable, cell);
+        self.scopes.cells.insert(variable.as_u32());
+    }
+
+    pub(super) fn install_capture(&mut self, symbol: SymbolId, cell: ClifValue) {
+        let variable = self.b.declare_var(types::I64);
+        self.scopes.insert_function(symbol, variable);
+        let slot = self.b.ins().iconst(types::I64, variable.as_u32() as i64);
+        self.call_helper(Helper::LocalSet, &[slot, cell]);
+        self.b.def_var(variable, cell);
+        self.scopes.cells.insert(variable.as_u32());
+    }
+
+    pub(super) fn capture_cell(&mut self, symbol: SymbolId) -> Option<ClifValue> {
+        let variable = self.local(symbol)?;
+        self.scopes
+            .cells
+            .contains(&variable.as_u32())
+            .then(|| self.b.use_var(variable))
     }
 }
 

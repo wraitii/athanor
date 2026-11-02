@@ -2,6 +2,17 @@
 
 Experimental JavaScript engine runners.
 
+## Rust runner
+
+From this directory, run a script's `main` function with
+`cargo run -p js-runner -- <script>`, or
+use `--eval SOURCE`, `--function NAME`, and `--arg VALUE` to select source,
+function, and arguments. Run `cargo run -p js-runner -- --repl` for an
+interactive session. Each line is compiled separately, and global declarations
+persist between lines. Expressions print their value; enter `exit`, `.exit`, or
+EOF to leave. The REPL uses the global name `__repl_result` for expression
+results. The engine currently supports only a subset of JavaScript.
+
 ## cpp
 
 The C++ runner embeds SpiderMonkey directly and executes 0 A.D. random-map

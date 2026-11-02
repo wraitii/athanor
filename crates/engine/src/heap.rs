@@ -13,12 +13,28 @@ pub(crate) struct Heap(Rc<RefCell<HeapData>>);
 #[derive(Default)]
 struct HeapData {
     arrays: HashMap<u64, Box<Array>>,
+    cells: HashMap<u64, Box<Cell>>,
+    closures: HashMap<u64, Box<Closure>>,
     pending: VecDeque<u64>,
 }
 
 struct Array {
     references: usize,
     elements: Vec<Value>,
+}
+
+struct Cell {
+    references: usize,
+    value: Value,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CodeId(pub(crate) u64);
+
+struct Closure {
+    references: usize,
+    code: CodeId,
+    captures: Vec<Value>,
 }
 
 impl Heap {
@@ -28,12 +44,7 @@ impl Heap {
         if !elements.iter().all(|value| data.valid(*value)) {
             return None;
         }
-        #[allow(deprecated)]
-        let id = NEXT_ID
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
-                (id < (1 << 48)).then_some(id + 1)
-            })
-            .ok()?;
+        let id = next_id()?;
         for value in elements {
             data.retain(*value);
         }
@@ -45,6 +56,89 @@ impl Heap {
             }),
         );
         Some(Value::from_bits(TAG_OBJECT | id))
+    }
+
+    pub(crate) fn cell(&self, value: Value) -> Option<Value> {
+        self.drain(64);
+        let mut data = self.0.borrow_mut();
+        let id = next_id()?;
+        if !data.retain(value) {
+            return None;
+        }
+        data.cells.insert(
+            id,
+            Box::new(Cell {
+                references: 1,
+                value,
+            }),
+        );
+        Some(Value::from_bits(TAG_OBJECT | id))
+    }
+
+    pub(crate) fn closure(&self, code: CodeId, captures: &[Value]) -> Option<Value> {
+        self.drain(64);
+        let mut data = self.0.borrow_mut();
+        if !captures.iter().all(|value| {
+            heap_id(*value)
+                .and_then(|id| data.cells.get(&id))
+                .is_some_and(|cell| cell.references != 0)
+        }) {
+            return None;
+        }
+        let id = next_id()?;
+        for value in captures {
+            data.retain(*value);
+        }
+        data.closures.insert(
+            id,
+            Box::new(Closure {
+                references: 1,
+                code,
+                captures: captures.to_vec(),
+            }),
+        );
+        Some(Value::from_bits(TAG_OBJECT | id))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn closure_parts(&self, closure: Value) -> Option<(CodeId, Vec<Value>)> {
+        let data = self.0.borrow();
+        let closure = data.closures.get(&heap_id(closure)?)?;
+        (closure.references != 0).then(|| (closure.code, closure.captures.clone()))
+    }
+
+    pub(crate) fn closure_code(&self, closure: Value) -> Option<CodeId> {
+        let data = self.0.borrow();
+        let closure = data.closures.get(&heap_id(closure)?)?;
+        (closure.references != 0).then_some(closure.code)
+    }
+
+    pub(crate) fn capture(&self, closure: Value, index: usize) -> Option<Value> {
+        let data = self.0.borrow();
+        let closure = data.closures.get(&heap_id(closure)?)?;
+        if closure.references == 0 {
+            return None;
+        }
+        closure.captures.get(index).copied()
+    }
+
+    pub(crate) fn cell_get(&self, cell: Value) -> Option<Value> {
+        let data = self.0.borrow();
+        let cell = data.cells.get(&heap_id(cell)?)?;
+        (cell.references != 0).then_some(cell.value)
+    }
+
+    pub(crate) fn cell_set(&self, cell: Value, value: Value) -> bool {
+        let mut data = self.0.borrow_mut();
+        let Some(id) = heap_id(cell) else {
+            return false;
+        };
+        if !data.cells.get(&id).is_some_and(|cell| cell.references != 0) || !data.retain(value) {
+            return false;
+        }
+        let old = std::mem::replace(&mut data.cells.get_mut(&id).unwrap().value, value);
+        data.release(old);
+        true
     }
 
     pub(crate) fn valid(&self, value: Value) -> bool {
@@ -70,7 +164,7 @@ impl Heap {
 
     pub(crate) fn get(&self, array: Value, index: usize) -> Option<Value> {
         let data = self.0.borrow();
-        let array = data.arrays.get(&array_id(array)?)?;
+        let array = data.arrays.get(&heap_id(array)?)?;
         if array.references == 0 {
             return None;
         }
@@ -85,13 +179,13 @@ impl Heap {
 
     pub(crate) fn len(&self, array: Value) -> Option<usize> {
         let data = self.0.borrow();
-        let array = data.arrays.get(&array_id(array)?)?;
+        let array = data.arrays.get(&heap_id(array)?)?;
         (array.references != 0).then_some(array.elements.len())
     }
 
     pub(crate) fn set(&self, array: Value, index: usize, value: Value) -> bool {
         let mut data = self.0.borrow_mut();
-        let Some(id) = array_id(array) else {
+        let Some(id) = heap_id(array) else {
             return false;
         };
         let Some(len) = data
@@ -117,7 +211,7 @@ impl Heap {
 
     pub(crate) fn truncate(&self, array: Value, length: usize) -> bool {
         let mut data = self.0.borrow_mut();
-        let Some(id) = array_id(array) else {
+        let Some(id) = heap_id(array) else {
             return false;
         };
         let Some(array) = data.arrays.get_mut(&id) else {
@@ -139,44 +233,81 @@ impl Heap {
             let Some(id) = data.pending.pop_front() else {
                 break;
             };
-            let Some(array) = data.arrays.get_mut(&id) else {
-                continue;
-            };
-            if array.references != 0 {
-                continue;
-            }
-            if let Some(value) = array.elements.pop() {
-                data.pending.push_back(id);
-                data.release(value);
-            } else {
-                data.arrays.remove(&id);
+            if let Some(array) = data.arrays.get_mut(&id) {
+                if array.references != 0 {
+                    continue;
+                }
+                if let Some(value) = array.elements.pop() {
+                    data.pending.push_back(id);
+                    data.release(value);
+                } else {
+                    data.arrays.remove(&id);
+                }
+            } else if let Some(cell) = data.cells.remove(&id) {
+                if cell.references != 0 {
+                    data.cells.insert(id, cell);
+                    continue;
+                }
+                data.release(cell.value);
+            } else if let Some(closure) = data.closures.get_mut(&id) {
+                if closure.references != 0 {
+                    continue;
+                }
+                if let Some(value) = closure.captures.pop() {
+                    data.pending.push_back(id);
+                    data.release(value);
+                } else {
+                    data.closures.remove(&id);
+                }
             }
             budget -= 1;
         }
     }
 }
 
-fn array_id(value: Value) -> Option<u64> {
+fn next_id() -> Option<u64> {
+    #[allow(deprecated)]
+    NEXT_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
+            (id < (1 << 48)).then_some(id + 1)
+        })
+        .ok()
+}
+
+fn heap_id(value: Value) -> Option<u64> {
     let bits = value.bits();
     (value.is_object() && bits != TAG_OBJECT).then_some(bits & 0x0000_ffff_ffff_ffff)
 }
 
 impl HeapData {
+    fn references(&mut self, id: u64) -> Option<&mut usize> {
+        if let Some(array) = self.arrays.get_mut(&id) {
+            return Some(&mut array.references);
+        }
+        if let Some(cell) = self.cells.get_mut(&id) {
+            return Some(&mut cell.references);
+        }
+        self.closures
+            .get_mut(&id)
+            .map(|closure| &mut closure.references)
+    }
+
     fn valid(&self, value: Value) -> bool {
-        match array_id(value) {
-            Some(id) => self
-                .arrays
-                .get(&id)
-                .is_some_and(|array| array.references != 0),
+        match heap_id(value) {
+            Some(id) => {
+                self.arrays.get(&id).is_some_and(|v| v.references != 0)
+                    || self.cells.get(&id).is_some_and(|v| v.references != 0)
+                    || self.closures.get(&id).is_some_and(|v| v.references != 0)
+            }
             None => !value.is_string(),
         }
     }
 
     fn retain(&mut self, value: Value) -> bool {
-        match array_id(value) {
-            Some(id) => match self.arrays.get_mut(&id) {
-                Some(array) if array.references != 0 => {
-                    array.references += 1;
+        match heap_id(value) {
+            Some(id) => match self.references(id) {
+                Some(references) if *references != 0 => {
+                    *references += 1;
                     true
                 }
                 _ => false,
@@ -186,13 +317,13 @@ impl HeapData {
     }
 
     fn release(&mut self, value: Value) {
-        let Some(id) = array_id(value) else { return };
-        let Some(array) = self.arrays.get_mut(&id) else {
+        let Some(id) = heap_id(value) else { return };
+        let Some(references) = self.references(id) else {
             return;
         };
-        assert!(array.references > 0);
-        array.references -= 1;
-        if array.references == 0 {
+        assert!(*references > 0);
+        *references -= 1;
+        if *references == 0 {
             self.pending.push_back(id);
         }
     }
@@ -236,6 +367,93 @@ mod tests {
     use super::*;
 
     #[test]
+    fn closures_share_cells_and_retain_captured_values() {
+        let heap = Heap::default();
+        let first = heap.array(&[]).unwrap();
+        let cell = heap.cell(first).unwrap();
+        let left = heap.closure(CodeId(1), &[cell]).unwrap();
+        let right = heap.closure(CodeId(2), &[cell]).unwrap();
+        heap.release(first);
+        heap.release(cell);
+        let captured = heap.closure_parts(left).unwrap().1[0];
+        let replacement = heap.array(&[]).unwrap();
+        assert!(heap.cell_set(captured, replacement));
+        heap.release(replacement);
+        heap.drain(100);
+        assert!(!heap.valid(first));
+        assert_eq!(
+            heap.cell_get(heap.closure_parts(right).unwrap().1[0]),
+            Some(replacement)
+        );
+        assert!(heap.cell_set(captured, replacement));
+        heap.release(left);
+        heap.drain(100);
+        assert!(heap.valid(replacement));
+        heap.release(right);
+        heap.drain(100);
+        assert!(!heap.valid(captured));
+        assert!(!heap.valid(replacement));
+    }
+
+    #[test]
+    fn closure_disposal_is_budgeted_by_capture_edges() {
+        let heap = Heap::default();
+        let cells: Vec<_> = (0..100)
+            .map(|_| heap.cell(Value::UNDEFINED).unwrap())
+            .collect();
+        let closure = heap.closure(CodeId(1), &cells).unwrap();
+        for cell in &cells {
+            heap.release(*cell);
+        }
+        heap.release(closure);
+        heap.drain(1);
+        assert_eq!(
+            heap.0
+                .borrow()
+                .closures
+                .get(&heap_id(closure).unwrap())
+                .unwrap()
+                .captures
+                .len(),
+            99
+        );
+        assert!(cells.iter().any(|cell| heap.valid(*cell)));
+        heap.drain(1000);
+        assert!(cells.iter().all(|cell| !heap.valid(*cell)));
+        assert!(heap.0.borrow().closures.is_empty());
+        assert!(heap.0.borrow().cells.is_empty());
+    }
+
+    #[test]
+    fn closure_cell_cycle_does_not_keep_heap_alive() {
+        let heap = Heap::default();
+        let weak = Rc::downgrade(&heap.0);
+        let cell = heap.cell(Value::UNDEFINED).unwrap();
+        let closure = heap.closure(CodeId(1), &[cell]).unwrap();
+        assert!(heap.cell_set(cell, closure));
+        heap.release(cell);
+        heap.release(closure);
+        heap.drain(100);
+        assert!(heap.valid(cell));
+        assert!(heap.valid(closure));
+        drop(heap);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn closure_rejects_invalid_or_foreign_captures() {
+        let heap = Heap::default();
+        let other = Heap::default();
+        let cell = heap.cell(Value::UNDEFINED).unwrap();
+        let array = heap.array(&[]).unwrap();
+        assert!(heap.closure(CodeId(1), &[array]).is_none());
+        assert!(other.closure(CodeId(1), &[cell]).is_none());
+        heap.release(cell);
+        assert!(heap.closure(CodeId(1), &[cell]).is_none());
+        heap.release(array);
+    }
+
+    #[test]
     fn arrays_retain_edges_and_replace_safely() {
         let heap = Heap::default();
         let child = heap.array(&[]).unwrap();
@@ -263,12 +481,7 @@ mod tests {
         heap.drain(1);
         assert!(!heap.valid(root));
         assert!(!heap.retain(root));
-        assert!(
-            heap.0
-                .borrow()
-                .arrays
-                .contains_key(&array_id(root).unwrap())
-        );
+        assert!(heap.0.borrow().arrays.contains_key(&heap_id(root).unwrap()));
         heap.drain(30000);
         assert!(!heap.valid(root));
         assert!(heap.0.borrow().arrays.is_empty());

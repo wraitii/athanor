@@ -22,19 +22,19 @@ aliasing, and cycles; document deliberate semantic restrictions.
   globally unique handles; `OwnedValue` keeps a value and its runtime alive on
   the host. Heap arrays have stable allocations and own their elements. The
   special `globalThis` object remains separate; strings are not implemented.
-- Generated functions use `(ctx, argv, argc) -> Value`. Calls resolve named
-  functions at compile time and place argument values on the stack. Resolved
-  non-function bindings cannot be called; unresolved names can refer to a
-  function compiled in an earlier source file. Reassignment of a function
-  binding is not reflected by direct calls. Missing arguments become undefined.
-  Functions are not yet first-class values.
+  Binding cells and closures use the same checked heap handles.
+- Generated functions use `(ctx, closure, argv, argc) -> Value`. Functions are
+  first-class heap values; calls evaluate the callee before arguments and resolve
+  its code ID through the active engine registry. Global function bindings are
+  materialized before initializers run, and reassignment affects subsequent
+  calls, including `Engine::call`. Missing arguments become undefined.
 - Local bindings use Cranelift variables and compiler-managed scopes. Globals
   use runtime helpers and an `Rc<RefCell<...>>` environment containing a string
   map. `globalThis` property access shares those bindings. Each frame retains
   local slots until replacement or return and owns temporary values until the
   end of a full expression or frame; error exits release both.
 - The supported subset includes numeric/boolean/null expressions, assignments,
-  selected operators, conditionals, basic loops, returns, and direct calls.
+  selected operators, conditionals, basic loops, returns, and dynamic calls.
   Common arithmetic and comparisons have inline numeric paths with helper
   fallbacks. This is not yet a complete implementation of JS binding or coercion
   semantics. Array-to-primitive conversion is not implemented: numeric coercion
@@ -43,7 +43,7 @@ aliasing, and cycles; document deliberate semantic restrictions.
   through the function's return block. Parse, compile, unsupported-feature, and
   runtime errors are distinct. Unsupported constructs generally include spans.
 
-Ordinary objects, strings, closures, method calls, and generators are still
+Ordinary objects, strings, method calls, and generators are still
 missing; arrays and rest alone will not make the bootstrap runnable. The C++
 runner independently embeds SpiderMonkey and provides a workload reference,
 not Rust-engine bindings.
@@ -51,8 +51,9 @@ not Rust-engine bindings.
 ## Values, objects, and arrays
 
 Heap values use globally unique checked handles in the NaN-box payload. The
-runtime maps handles to stable boxed array allocations, each with a reference
-count and contiguous `Value` elements. Environments and host handles share the
+runtime maps handles to stable boxed allocations with reference counts. Arrays
+contain contiguous `Value` elements; binding cells and closures have separate
+heap kinds. Environments and host handles share the
 runtime; raw `Value` tokens do not keep it alive. A common object header and
 collection metadata are future work for additional heap kinds.
 
@@ -69,6 +70,44 @@ separate from named properties. Typed arrays provide contiguous numeric storage
 without per-element reference counting.
 
 Ordinary prototype methods are needed by existing map code.
+
+## Closures and global environments
+
+Arrow functions and anonymous function expressions compile to callable heap
+values. Capture analysis follows Oxc binding identities, including transitive
+captures used only by a nested closure. Captured bindings use heap cells;
+uncaptured locals retain their existing Cranelift variable representation.
+Sibling closures share cells, while separate activations allocate separate cells.
+Closure allocations own their capture cells, and cells own their current values.
+Reads become owned temporaries before side effects can replace their source.
+
+Captured lexical reads and writes check initialization; declarations initialize
+cells separately from assignment. Assignment to const bindings is rejected.
+Block-local captures get fresh cells each time the block executes. Captured
+lexical bindings in a for-loop initializer are explicitly rejected until
+per-iteration environments are implemented. Nested named functions/declarations,
+`this`, implicit `arguments`, methods, async functions and generators remain
+unsupported. Recursion through a captured variable works but can create cycles.
+
+Each engine has one global environment and one code registry. A closure's heap
+identity ties it to that engine; foreign heap handles are rejected before code
+lookup. Code IDs are engine-local, never executable pointers, and resolve only
+against the live engine's registry. Compilations within that engine share global
+bindings, so existing closures observe subsequent global writes. A caller's
+local bindings do not replace the closure's defining globals.
+
+Execution borrows the engine's code registry and retains its global environment.
+Heap closures retain neither the engine nor an Environment, avoiding an external
+Rc cycle through the heap. Host handles may outlive the engine and keep captured
+values alive, but cannot execute the retired code or transfer it to another
+engine. Multiple global environments within one engine are not supported; adding
+realms will require explicit originating-environment identity and lifetime rules.
+The function metadata queries still describe registered declarations, while
+`Engine::call` resolves the current global binding.
+
+Disposal releases capture edges incrementally and releases each cell's value
+when that cell is reclaimed. Closure cycles remain allocated until runtime
+teardown; cycle collection is still required for persistent workloads.
 
 ## Ownership and reclamation
 
@@ -148,9 +187,8 @@ translate errors without unwinding Rust panics or C++ exceptions through JIT cod
 Retain the generic argument-vector convention as a fallback. For registered
 native functions, describe signatures once and generate typed adapters so known
 calls avoid name lookup and generic dispatch. C++ should likewise resolve and
-retain JS callable handles rather than repeatedly looking them up. First-class
-functions and methods will require explicit closure and receiver information;
-the current direct-call ABI is a starting point.
+retain JS callable handles rather than repeatedly looking them up. The call ABI now passes the closure explicitly; methods still need receiver
+information.
 
 Pass scalars and IDs directly, copy small value records, and use borrowed numeric
 buffers or ownership transfer for bulk data. Borrowing prevents incompatible
@@ -166,7 +204,7 @@ property behavior. Further restrictions, such as frozen library prototypes,
 remain choices to validate against workloads. Unsupported features should fail
 clearly rather than accidentally acquiring different semantics.
 
-Implement strings, objects, methods, callable values, and native bindings as
+Implement strings, objects, methods, and native bindings as
 workloads require. Add cycle collection before treating the engine
 as suitable for persistent arbitrary object graphs; refine pause behavior later.
 

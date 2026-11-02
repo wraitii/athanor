@@ -16,6 +16,7 @@ pub(crate) enum HelperShape {
     ArrayNew,
     Rest,
     IndexSet,
+    Callable,
 }
 
 pub(crate) struct HelperSpec {
@@ -43,11 +44,16 @@ macro_rules! define_helpers {
 }
 
 define_helpers! {
+    CellNew => Unary, js_cell_new;
+    CellGet => Unary, js_cell_get;
+    CellSet => Binary, js_cell_set;
+    CaptureGet => Binary, js_capture_get;
+    ClosureNew => Callable, js_closure_new;
+    Call => Callable, js_call;
     FrameEnter => Unary, js_frame_enter;
     FrameExit => Unary, js_frame_exit;
     LocalSet => Binary, js_local_set;
     TempClear => Unary, js_temp_clear;
-    TempOwn => Unary, js_temp_own;
     TempRetain => Unary, js_temp_retain;
     ArrayNew => ArrayNew, js_array_new;
     Rest => Rest, js_rest;
@@ -86,6 +92,11 @@ pub(crate) fn signature(shape: HelperShape, call_conv: CallConv, pointer: Type) 
     let mut signature = Signature::new(call_conv);
     signature.params.push(AbiParam::new(pointer));
     match shape {
+        HelperShape::Callable => {
+            signature.params.push(AbiParam::new(types::I64));
+            signature.params.push(AbiParam::new(pointer));
+            signature.params.push(AbiParam::new(types::I64));
+        }
         HelperShape::Binary => {
             signature.params.push(AbiParam::new(types::I64));
             signature.params.push(AbiParam::new(types::I64));
@@ -375,9 +386,6 @@ extern "C" fn js_temp_clear(ctx: *mut JitCtx, _: Value) -> Value {
     unsafe { &mut *ctx }.clear();
     Value::UNDEFINED
 }
-extern "C" fn js_temp_own(ctx: *mut JitCtx, value: Value) -> Value {
-    unsafe { &mut *ctx }.own(value)
-}
 extern "C" fn js_temp_retain(ctx: *mut JitCtx, value: Value) -> Value {
     unsafe { &mut *ctx }.retain_temp(value)
 }
@@ -433,4 +441,108 @@ extern "C" fn js_index_set(ctx: *mut JitCtx, array: Value, index: Value, value: 
         ));
     }
     value
+}
+
+extern "C" fn js_cell_new(ctx: *mut JitCtx, value: Value) -> Value {
+    let ctx = unsafe { &mut *ctx };
+    match ctx.global.heap().cell(value) {
+        Some(cell) => ctx.own(cell),
+        None => {
+            ctx.error = Some(crate::Error::Runtime(
+                "invalid cell value or heap exhausted".into(),
+            ));
+            Value::UNDEFINED
+        }
+    }
+}
+
+extern "C" fn js_cell_get(ctx: *mut JitCtx, cell: Value) -> Value {
+    let ctx = unsafe { &mut *ctx };
+    match ctx.global.heap().cell_get(cell) {
+        Some(Value::UNINITIALIZED) => {
+            ctx.error = Some(crate::Error::Runtime(
+                "binding accessed before initialization".into(),
+            ));
+            Value::UNDEFINED
+        }
+        Some(value) => ctx.retain_temp(value),
+        None => {
+            ctx.error = Some(crate::Error::Runtime("invalid capture cell".into()));
+            Value::UNDEFINED
+        }
+    }
+}
+
+extern "C" fn js_cell_set(ctx: *mut JitCtx, cell: Value, value: Value) -> Value {
+    let ctx = unsafe { &mut *ctx };
+    if !ctx.global.heap().cell_set(cell, value) {
+        ctx.error = Some(crate::Error::Runtime(
+            "invalid capture cell or value".into(),
+        ));
+    }
+    value
+}
+
+extern "C" fn js_capture_get(ctx: *mut JitCtx, closure: Value, index: u64) -> Value {
+    let ctx = unsafe { &mut *ctx };
+    match ctx.global.heap().capture(closure, index as usize) {
+        Some(cell) => ctx.retain_temp(cell),
+        None => {
+            ctx.error = Some(crate::Error::Runtime("invalid closure capture".into()));
+            Value::UNDEFINED
+        }
+    }
+}
+
+extern "C" fn js_closure_new(
+    ctx: *mut JitCtx,
+    code: u64,
+    captures: *const Value,
+    count: u64,
+) -> Value {
+    let ctx = unsafe { &mut *ctx };
+    if ctx.entry(code).is_none() {
+        ctx.error = Some(crate::Error::Runtime("unknown closure code".into()));
+        return Value::UNDEFINED;
+    }
+    let captures = if count == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(captures, count as usize) }
+    };
+    match ctx
+        .global
+        .heap()
+        .closure(crate::heap::CodeId(code), captures)
+    {
+        Some(value) => ctx.own(value),
+        None => {
+            ctx.error = Some(crate::Error::Runtime(
+                "invalid captures or heap exhausted".into(),
+            ));
+            Value::UNDEFINED
+        }
+    }
+}
+
+extern "C" fn js_call(ctx: *mut JitCtx, closure: Value, argv: *const Value, argc: u64) -> Value {
+    let entry = {
+        let context = unsafe { &mut *ctx };
+        let entry = context
+            .global
+            .heap()
+            .closure_code(closure)
+            .and_then(|code| context.entry(code.0));
+        let Some(entry) = entry else {
+            context.error = Some(crate::Error::Runtime(
+                "value is not callable in this engine".into(),
+            ));
+            return Value::UNDEFINED;
+        };
+        entry
+    };
+    let function: extern "C" fn(*mut JitCtx, Value, *const Value, u64) -> Value =
+        unsafe { std::mem::transmute(entry) };
+    let value = function(ctx, closure, argv, argc);
+    unsafe { &mut *ctx }.own(value)
 }
