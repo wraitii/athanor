@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use oxc_ast::ast::{
-    ArrowFunctionExpression, Function, IdentifierReference, Program, ThisExpression,
+    ArrowFunctionExpression, Class, Function, IdentifierReference, Program, ThisExpression,
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_semantic::Scoping;
@@ -15,6 +15,9 @@ use oxc_syntax::{
 pub(super) struct CaptureAnalysis {
     pub(super) functions: HashMap<u32, FunctionCaptures>,
     pub(super) captured: HashSet<SymbolId>,
+    pub(super) class_name_writes: Vec<Span>,
+    pub(super) arguments_bindings: HashMap<u32, SymbolId>,
+    pub(super) arguments_references: HashMap<u32, SymbolId>,
 }
 
 pub(super) struct FunctionCaptures {
@@ -31,6 +34,7 @@ struct ActiveFunction {
 struct Analyzer<'s> {
     scoping: &'s Scoping,
     active: Vec<ActiveFunction>,
+    classes: Vec<SymbolId>,
     result: CaptureAnalysis,
 }
 
@@ -39,9 +43,20 @@ impl CaptureAnalysis {
         let mut analyzer = Analyzer {
             scoping,
             active: Vec::new(),
+            classes: Vec::new(),
             result: Self::default(),
         };
         analyzer.visit_program(program);
+        let used: HashSet<_> = analyzer
+            .result
+            .arguments_references
+            .values()
+            .copied()
+            .collect();
+        analyzer
+            .result
+            .arguments_bindings
+            .retain(|_, symbol| used.contains(symbol));
         analyzer.result
     }
 }
@@ -55,6 +70,11 @@ impl Analyzer<'_> {
                 lexical_this: false,
             },
         );
+        if !arrow {
+            let symbol =
+                SymbolId::new(self.scoping.symbols_len() + self.result.arguments_bindings.len());
+            self.result.arguments_bindings.insert(span.start, symbol);
+        }
         self.active.push(ActiveFunction {
             scope,
             start: span.start,
@@ -64,6 +84,17 @@ impl Analyzer<'_> {
 }
 
 impl<'a> Visit<'a> for Analyzer<'_> {
+    fn visit_class(&mut self, class: &Class<'a>) {
+        let symbol = class.id.as_ref().and_then(|id| id.symbol_id.get());
+        if let Some(symbol) = symbol {
+            self.classes.push(symbol);
+        }
+        walk::walk_class(self, class);
+        if symbol.is_some() {
+            self.classes.pop();
+        }
+    }
+
     fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
         self.enter(function.scope_id.get().unwrap(), function.span, false);
         walk::walk_function(self, function, flags);
@@ -92,6 +123,38 @@ impl<'a> Visit<'a> for Analyzer<'_> {
     }
 
     fn visit_identifier_reference(&mut self, identifier: &IdentifierReference<'a>) {
+        let resolved = identifier
+            .reference_id
+            .get()
+            .and_then(|id| self.scoping.get_reference(id).symbol_id());
+        if identifier.name == "arguments" {
+            if let Some(owner_index) = self.active.iter().rposition(|function| !function.arrow) {
+                let owner = &self.active[owner_index];
+                let is_local = resolved.is_some_and(|symbol| {
+                    let scope = self.scoping.symbol_scope_id(symbol);
+                    scope == owner.scope || self.scoping.scope_is_descendant_of(scope, owner.scope)
+                });
+                if !is_local {
+                    let symbol = self.result.arguments_bindings[&owner.start];
+                    self.result
+                        .arguments_references
+                        .insert(identifier.span.start, symbol);
+                    for function in &self.active[owner_index + 1..] {
+                        let captures = &mut self
+                            .result
+                            .functions
+                            .get_mut(&function.start)
+                            .unwrap()
+                            .captures;
+                        if !captures.contains(&symbol) {
+                            captures.push(symbol);
+                        }
+                        self.result.captured.insert(symbol);
+                    }
+                    return;
+                }
+            }
+        }
         let Some(symbol) = identifier
             .reference_id
             .get()
@@ -99,8 +162,16 @@ impl<'a> Visit<'a> for Analyzer<'_> {
         else {
             return;
         };
+        if self.classes.contains(&symbol)
+            && identifier
+                .reference_id
+                .get()
+                .is_some_and(|id| self.scoping.get_reference(id).is_write())
+        {
+            self.result.class_name_writes.push(identifier.span);
+        }
         let binding_scope = self.scoping.symbol_scope_id(symbol);
-        if binding_scope == self.scoping.root_scope_id() {
+        if binding_scope == self.scoping.root_scope_id() && !self.classes.contains(&symbol) {
             return;
         }
         for function in self.active.iter().rev() {

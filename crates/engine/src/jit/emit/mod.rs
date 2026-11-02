@@ -1,3 +1,4 @@
+pub(super) mod class;
 mod expression;
 mod loops;
 mod ops;
@@ -43,6 +44,7 @@ pub(super) struct FunctionCompiler<'a, 'f> {
     argv: ClifValue,
     argc: ClifValue,
     captured: &'a HashSet<SymbolId>,
+    arguments_references: &'a HashMap<u32, SymbolId>,
     closures: &'a HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
     scopes: ScopeStack,
     return_block: Block,
@@ -63,6 +65,8 @@ pub(super) fn build_function(
     params: &FormalParameters<'_>,
     statements: &[Statement<'_>],
     expression: Option<&Expression<'_>>,
+    arguments_binding: Option<SymbolId>,
+    arguments_references: &HashMap<u32, SymbolId>,
     captures: &[SymbolId],
     captured: &HashSet<SymbolId>,
     closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
@@ -88,6 +92,7 @@ pub(super) fn build_function(
         argv,
         argc,
         captured,
+        arguments_references,
         closures,
         scopes: ScopeStack::new(),
         return_block,
@@ -128,7 +133,7 @@ pub(super) fn build_function(
         compiler.return_value(result);
         return Ok(());
     }
-    compiler.initialize_function(params, statements)?;
+    compiler.scopes.push();
     let closure = if compiler.generator.is_some() {
         compiler.call_helper(Helper::GeneratorClosure, &[closure])
     } else {
@@ -140,12 +145,19 @@ pub(super) fn build_function(
         compiler.check_error();
         compiler.install_capture(*symbol, cell);
     }
+    if let Some(symbol) = arguments_binding {
+        let variable = compiler.declare_function_binding(symbol);
+        let value = compiler.call_helper(Helper::ArrayNew, &[compiler.argv, compiler.argc]);
+        compiler.check_error();
+        compiler.initialize_local(variable, value);
+    }
+    compiler.initialize_function(params, statements)?;
     compiler.clear_temporaries();
     if let Some(expression) = expression {
         let value = compiler.emit_expression(expression)?;
         compiler.jump(return_block, &[BlockArg::Value(value)]);
     } else {
-        compiler.emit_block(statements)?;
+        compiler.emit_function_body(statements)?;
     }
     if !compiler.terminated {
         let undefined = compiler.constant(Value::UNDEFINED);
@@ -180,6 +192,7 @@ pub(super) fn build_global(
     statements: &[oxc_ast::ast::Statement<'_>],
     captured: &HashSet<SymbolId>,
     closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
+    arguments_references: &HashMap<u32, SymbolId>,
 ) -> Result<(), Error> {
     let entry = b.create_block();
     b.switch_to_block(entry);
@@ -200,6 +213,7 @@ pub(super) fn build_global(
         argv,
         argc,
         captured,
+        arguments_references,
         closures,
         scopes: ScopeStack::new(),
         return_block,
@@ -212,21 +226,36 @@ pub(super) fn build_global(
     };
     compiler.enter_frame();
     for statement in statements {
+        if let oxc_ast::ast::Statement::ClassDeclaration(class) = statement {
+            let undefined = compiler.constant(Value::UNINITIALIZED);
+            compiler.global_access(class.id.as_ref().unwrap().name.as_str(), Some(undefined));
+        }
+    }
+    for statement in statements {
+        if let oxc_ast::ast::Statement::ClassDeclaration(class) = statement {
+            compiler.emit_class_declaration(class)?;
+        }
         if let oxc_ast::ast::Statement::ExpressionStatement(expression) = statement {
             compiler.emit_expression(&expression.expression)?;
             compiler.clear_temporaries();
         }
         if let oxc_ast::ast::Statement::VariableDeclaration(declaration) = statement {
             for declarator in &declaration.declarations {
+                let oxc_ast::ast::BindingPattern::BindingIdentifier(identifier) = &declarator.id
+                else {
+                    unreachable!()
+                };
                 if let Some(initializer) = &declarator.init {
-                    let oxc_ast::ast::BindingPattern::BindingIdentifier(identifier) =
-                        &declarator.id
-                    else {
-                        unreachable!()
-                    };
                     let value = compiler.emit_expression(initializer)?;
-                    compiler.global_access(identifier.name.as_str(), Some(value));
+                    if declaration.kind == oxc_ast::ast::VariableDeclarationKind::Var {
+                        compiler.global_access(identifier.name.as_str(), Some(value));
+                    } else {
+                        compiler.global_initialize(identifier.name.as_str(), value);
+                    }
                     compiler.clear_temporaries();
+                } else if declaration.kind != oxc_ast::ast::VariableDeclarationKind::Var {
+                    let value = compiler.constant(Value::UNDEFINED);
+                    compiler.global_initialize(identifier.name.as_str(), value);
                 }
             }
         }

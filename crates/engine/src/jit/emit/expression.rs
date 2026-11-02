@@ -2,7 +2,7 @@ use cranelift_codegen::ir::{
     BlockArg, InstBuilder, MemFlags, StackSlotData, StackSlotKind, Value as ClifValue, types,
 };
 use oxc_ast::ast::{
-    AssignmentTarget, CallExpression, Expression, ObjectPropertyKind, PropertyKind,
+    Argument, AssignmentTarget, CallExpression, Expression, ObjectPropertyKind, PropertyKind,
     SimpleAssignmentTarget,
 };
 use oxc_span::{GetSpan, Span};
@@ -95,14 +95,13 @@ impl FunctionCompiler<'_, '_> {
                     .reference_id
                     .get()
                     .and_then(|id| self.scoping.get_reference(id).symbol_id());
+                let symbol = self
+                    .arguments_references
+                    .get(&identifier.span.start)
+                    .copied()
+                    .or(symbol);
                 if let Some(variable) = symbol.and_then(|id| self.local(id)) {
                     return Ok(self.read_local(variable));
-                }
-                if identifier.name == "arguments" {
-                    return Err(unsupported_at(
-                        identifier.span,
-                        "implicit arguments binding",
-                    ));
                 }
                 if identifier.name == "undefined" && symbol.is_none() {
                     return Ok(self.constant(Value::UNDEFINED));
@@ -130,9 +129,12 @@ impl FunctionCompiler<'_, '_> {
                             .reference_id
                             .get()
                             .and_then(|id| self.scoping.get_reference(id).symbol_id());
-                        if symbol.is_none() && identifier.name != "arguments" {
-                            let global = self.constant(Value::GLOBAL_OBJECT);
-                            self.property_access(global, identifier.name.as_str(), None)
+                        if symbol.is_none()
+                            && !self
+                                .arguments_references
+                                .contains_key(&identifier.span.start)
+                        {
+                            self.global_get_optional(identifier.name.as_str())
                         } else {
                             self.emit_expression(argument)?
                         }
@@ -159,6 +161,21 @@ impl FunctionCompiler<'_, '_> {
                 Ok(self.unary_helper(op, value))
             }
             Expression::UpdateExpression(expression) => {
+                if let SimpleAssignmentTarget::StaticMemberExpression(member) = &expression.argument
+                {
+                    let object = self.emit_expression(&member.object)?;
+                    let name = member.property.name.as_str();
+                    let previous = self.property_access(object, name, None);
+                    let number = to_number(self, previous);
+                    let one = self.constant(Value::number(1.0));
+                    let op = match expression.operator {
+                        UpdateOperator::Increment => BinaryOp::Add,
+                        UpdateOperator::Decrement => BinaryOp::Sub,
+                    };
+                    let value = self.binary(op, number, one);
+                    self.property_access(object, name, Some(value));
+                    return Ok(if expression.prefix { value } else { number });
+                }
                 if let SimpleAssignmentTarget::ComputedMemberExpression(member) =
                     &expression.argument
                 {
@@ -187,9 +204,18 @@ impl FunctionCompiler<'_, '_> {
                         return Err(unsupported_at(other.span(), "this update target"));
                     }
                 };
-                if symbol.is_some_and(|id| self.scoping.symbol_flags(id).is_const_variable()) {
+                if !self
+                    .arguments_references
+                    .contains_key(&expression.argument.span().start)
+                    && symbol.is_some_and(|id| self.scoping.symbol_flags(id).is_const_variable())
+                {
                     return Err(unsupported_at(expression.span, "assignment to const"));
                 }
+                let symbol = self
+                    .arguments_references
+                    .get(&expression.argument.span().start)
+                    .copied()
+                    .or(symbol);
                 let variable = symbol.and_then(|id| self.local(id));
                 let previous = match variable {
                     Some(variable) => self.read_local(variable),
@@ -209,9 +235,7 @@ impl FunctionCompiler<'_, '_> {
                 Ok(if expression.prefix { value } else { number })
             }
             Expression::BinaryExpression(expression) => {
-                let op = binary_operator(expression.operator).ok_or_else(|| {
-                    unsupported_at(expression.span, "binary operator in binary expression")
-                })?;
+                let op = binary_operator(expression.operator);
                 let left = self.emit_expression(&expression.left)?;
                 let right = self.emit_expression(&expression.right)?;
                 Ok(self.binary(op, left, right))
@@ -321,9 +345,18 @@ impl FunctionCompiler<'_, '_> {
                         return Err(unsupported_at(other.span(), "this assignment target"));
                     }
                 };
-                if symbol.is_some_and(|id| self.scoping.symbol_flags(id).is_const_variable()) {
+                if !self
+                    .arguments_references
+                    .contains_key(&expression.left.span().start)
+                    && symbol.is_some_and(|id| self.scoping.symbol_flags(id).is_const_variable())
+                {
                     return Err(unsupported_at(expression.span, "assignment to const"));
                 }
+                let symbol = self
+                    .arguments_references
+                    .get(&expression.left.span().start)
+                    .copied()
+                    .or(symbol);
                 let variable = symbol.and_then(|id| self.local(id));
                 let compound = match expression.operator {
                     AssignmentOperator::Assign => None,
@@ -359,6 +392,11 @@ impl FunctionCompiler<'_, '_> {
             Expression::CallExpression(expression) => self.emit_call(expression),
             Expression::NewExpression(expression) => {
                 let callable = self.emit_expression(&expression.callee)?;
+                if let Some(arguments) = self.emit_spread_arguments(&expression.arguments)? {
+                    let result = self.call_helper(Helper::ConstructSpread, &[callable, arguments]);
+                    self.check_error();
+                    return Ok(result);
+                }
                 let mut args = Vec::new();
                 for argument in &expression.arguments {
                     let argument = argument
@@ -402,6 +440,11 @@ impl FunctionCompiler<'_, '_> {
                 (callable, receiver)
             }
         };
+        if let Some(arguments) = self.emit_spread_arguments(&expression.arguments)? {
+            let result = self.call_helper(Helper::CallSpread, &[callable, receiver, arguments]);
+            self.check_error();
+            return Ok(result);
+        }
         let mut args = Vec::with_capacity(expression.arguments.len());
         for argument in &expression.arguments {
             let argument: &Expression<'_> = argument
@@ -417,7 +460,33 @@ impl FunctionCompiler<'_, '_> {
         Ok(result)
     }
 
-    fn make_closure(
+    fn emit_spread_arguments(
+        &mut self,
+        arguments: &[Argument<'_>],
+    ) -> Result<Option<ClifValue>, Error> {
+        if !arguments
+            .iter()
+            .any(|argument| matches!(argument, Argument::SpreadElement(_)))
+        {
+            return Ok(None);
+        }
+        let ptr = self.b.ins().iconst(self.pointer, 0);
+        let zero = self.b.ins().iconst(types::I64, 0);
+        let values = self.call_helper(Helper::ArrayNew, &[ptr, zero]);
+        self.check_error();
+        for argument in arguments {
+            let (expression, helper) = match argument {
+                Argument::SpreadElement(spread) => (&spread.argument, Helper::ArgumentSpread),
+                _ => (argument.as_expression().unwrap(), Helper::ArgumentPush),
+            };
+            let value = self.emit_expression(expression)?;
+            self.call_helper(helper, &[values, value]);
+            self.check_error();
+        }
+        Ok(Some(values))
+    }
+
+    pub(super) fn make_closure(
         &mut self,
         span: Span,
         arrow: bool,

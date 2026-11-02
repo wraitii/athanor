@@ -22,18 +22,21 @@ To try the map workload from the repository root:
 ```sh
 cargo run --manifest-path cranelift-exp/Cargo.toml -- \
   --load cranelift-exp/bootstrap.js --eval '
-    modRoot = "binaries/data/mods/public";
-    hostEvaluateSource(
-      hostReadFile(modRoot + "/maps/random/new_rms_test.js")
-        .replace("export function* generateMap", "function* generateMap"),
-      "new_rms_test.js");
-    function main() { return runGenerator(generateMap()); }
+    function main()
+    {
+      return run(
+        "binaries/data/mods/public/maps/random/new_rms_test.js",
+        "binaries/data/mods/public",
+        "{\"Size\":128,\"Seed\":0,\"PlayerData\":[null,{\"Civ\":\"athen\"},{\"Civ\":\"brit\"}]}");
+    }
   '
 ```
 
-This exercises file loading and nested source evaluation, but still stops on
-unsupported language features in the map libraries; it does not yet generate a
-complete map.
+This uses the same bootstrap `run` entry point and default settings as the C++
+runner: settings initialization, global scripts, map libraries, generation, and
+summary output. It still stops on unsupported engine features and does not yet
+generate a complete map. The current first blocker on this path is a regular expression literal in
+`globalscripts/FSM.js`.
 
 ## cpp
 

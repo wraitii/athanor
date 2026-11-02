@@ -65,6 +65,70 @@ impl Engine {
             .ok_or_else(|| Error::Runtime("heap exhausted".into()))?;
         global.define("Set", constructor);
         global.heap().release(constructor);
+        let constructor = global
+            .heap()
+            .native_function(crate::heap::NativeFunction::Array)
+            .ok_or_else(|| Error::Runtime("heap exhausted".into()))?;
+        global.define("Array", constructor);
+        global.heap().release(constructor);
+        let math = global
+            .heap()
+            .object()
+            .ok_or_else(|| Error::Runtime("heap exhausted".into()))?;
+        for (name, value) in [("PI", std::f64::consts::PI), ("E", std::f64::consts::E)] {
+            global
+                .heap()
+                .define_property(math, name, Value::number(value), false);
+        }
+        use crate::heap::{MathFunction as M, NativeFunction};
+        for (name, function) in [
+            ("abs", M::Abs),
+            ("ceil", M::Ceil),
+            ("floor", M::Floor),
+            ("round", M::Round),
+            ("trunc", M::Trunc),
+            ("sqrt", M::Sqrt),
+            ("sin", M::Sin),
+            ("cos", M::Cos),
+            ("tan", M::Tan),
+            ("asin", M::Asin),
+            ("acos", M::Acos),
+            ("atan", M::Atan),
+            ("atan2", M::Atan2),
+            ("exp", M::Exp),
+            ("log", M::Log),
+            ("pow", M::Pow),
+            ("min", M::Min),
+            ("max", M::Max),
+            ("imul", M::Imul),
+            ("sign", M::Sign),
+        ] {
+            let value = global
+                .heap()
+                .native_function(NativeFunction::Math(function))
+                .ok_or_else(|| Error::Runtime("heap exhausted".into()))?;
+            global.heap().define_property(math, name, value, false);
+            global.heap().release(value);
+        }
+        global.define("Math", math);
+        global.heap().release(math);
+        let json = global
+            .heap()
+            .object()
+            .ok_or_else(|| Error::Runtime("heap exhausted".into()))?;
+        for (name, function) in [
+            ("parse", NativeFunction::JsonParse),
+            ("stringify", NativeFunction::JsonStringify),
+        ] {
+            let value = global
+                .heap()
+                .native_function(function)
+                .ok_or_else(|| Error::Runtime("heap exhausted".into()))?;
+            global.heap().define_property(json, name, value, false);
+            global.heap().release(value);
+        }
+        global.define("JSON", json);
+        global.heap().release(json);
         Ok(Self {
             compiler: RefCell::new(Compiler::new(options)?),
             global,
@@ -138,11 +202,74 @@ impl Engine {
                 .join("\n");
             return Err(Error::Parse(message));
         }
-        let (functions, globals, initializer, code) = self.compiler.borrow_mut().compile_program(
-            &program,
-            analysis.semantic.scoping(),
-            analysis.semantic.nodes(),
-        )?;
+        let mut lexical = Vec::new();
+        for statement in &program.body {
+            match statement {
+                oxc_ast::ast::Statement::VariableDeclaration(declaration) => {
+                    for declarator in &declaration.declarations {
+                        if let oxc_ast::ast::BindingPattern::BindingIdentifier(identifier) =
+                            &declarator.id
+                        {
+                            let name = identifier.name.as_str();
+                            if declaration.kind == oxc_ast::ast::VariableDeclarationKind::Var {
+                                if self.global.has_lexical(name) {
+                                    return Err(Error::Compile(format!(
+                                        "{filename}: global binding `{name}` already declared"
+                                    )));
+                                }
+                            } else {
+                                if self.global.get_raw(name).is_some() {
+                                    return Err(Error::Compile(format!(
+                                        "{filename}: global binding `{name}` already declared"
+                                    )));
+                                }
+                                lexical.push((
+                                    name.to_string(),
+                                    declaration.kind == oxc_ast::ast::VariableDeclarationKind::Let,
+                                ));
+                            }
+                        }
+                    }
+                }
+                oxc_ast::ast::Statement::FunctionDeclaration(function) => {
+                    if let Some(identifier) = &function.id
+                        && self.global.has_lexical(identifier.name.as_str())
+                    {
+                        return Err(Error::Compile(format!(
+                            "{filename}: global binding `{}` already declared",
+                            identifier.name
+                        )));
+                    }
+                }
+                oxc_ast::ast::Statement::ClassDeclaration(class) => {
+                    if let Some(identifier) = &class.id
+                        && self.global.has_lexical(identifier.name.as_str())
+                    {
+                        return Err(Error::Compile(format!(
+                            "{filename}: global binding `{}` already declared",
+                            identifier.name
+                        )));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let (functions, globals, initializer, code) = self
+            .compiler
+            .borrow_mut()
+            .compile_program(
+                &program,
+                analysis.semantic.scoping(),
+                analysis.semantic.nodes(),
+            )
+            .map_err(|error| match error {
+                Error::Unsupported(message) => Error::Unsupported(format!("{filename}: {message}")),
+                Error::Compile(message) => Error::Compile(format!("{filename}: {message}")),
+                other => other,
+            })?;
+        for (name, mutable) in lexical {
+            self.global.define_lexical(name, mutable);
+        }
         self.code.borrow_mut().extend(code);
         for function in functions {
             let value = self
@@ -179,6 +306,9 @@ impl Engine {
             .global
             .get(name)
             .ok_or_else(|| Error::Runtime(format!("unknown function {name}")))?;
+        if self.global.heap().is_class(callable.value()) {
+            return Err(Error::Runtime("class constructor requires new".into()));
+        }
         let entry = self
             .global
             .heap()

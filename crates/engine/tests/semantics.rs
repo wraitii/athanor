@@ -1159,3 +1159,277 @@ fn native_set_methods_require_receivers_and_constructors() {
         assert!(matches!(engine.call("main", &[]), Err(Error::Runtime(_))));
     }
 }
+
+#[test]
+fn array_destructuring_declarations() {
+    check(
+        "function main(){ const [x, y] = [3, 4]; return x * 10 + y; }",
+        Value::number(34.0),
+    );
+    check(
+        "function main(){ var [x, , y, z] = [1, 2, 3]; return x + y + (z === undefined); }",
+        Value::number(5.0),
+    );
+    check(
+        "function main(){ let [x, y] = 'éa'; return x + y === 'éa'; }",
+        Value::TRUE,
+    );
+    check(
+        "function main(){ let [x] = [[7]]; let f = () => x[0]; return f(); }",
+        Value::number(7.0),
+    );
+    check(
+        "function main(){ let n = 0; const [a, b] = (n++, [n, n]); return n + a + b; }",
+        Value::number(3.0),
+    );
+}
+
+#[test]
+fn array_destructuring_rejects_unsupported_forms() {
+    for source in [
+        "function main(){ const [x = 1] = []; }",
+        "function main(){ const [...x] = []; }",
+        "function main(){ const [[x]] = [[1]]; }",
+        "function main(){ for (let [x] = [1]; x; x--) { let f = () => x; } }",
+    ] {
+        let mut engine = Engine::new().unwrap();
+        assert!(engine.compile(source, "test.js").is_err(), "{source}");
+    }
+    let mut engine = Engine::new().unwrap();
+    engine
+        .compile("function main(){ const [x] = 1; return x; }", "test.js")
+        .unwrap();
+    assert!(engine.call("main", &[]).is_err());
+}
+
+#[test]
+fn top_level_lexicals_are_shared_and_separate_from_global_object() {
+    let mut engine = Engine::new().unwrap();
+    engine
+        .compile("let x = 2; const y = 3; let empty;", "first.js")
+        .unwrap();
+    engine.compile("function main(){ x += y; return x; } function inspect(){ return typeof y === 'number' && empty === undefined && globalThis.x === undefined && !('y' in globalThis); }", "second.js").unwrap();
+    assert_eq!(
+        engine.call("main", &[]).unwrap().value(),
+        Value::number(5.0)
+    );
+    assert_eq!(engine.call("inspect", &[]).unwrap().value(), Value::TRUE);
+    engine
+        .compile("function write(){ y = 4; }", "third.js")
+        .unwrap();
+    assert!(engine.call("write", &[]).is_err());
+    assert!(engine.compile("var x;", "duplicate.js").is_err());
+    assert!(engine.compile("let y;", "duplicate.js").is_err());
+}
+
+#[test]
+fn top_level_lexical_bindings_have_tdz() {
+    for source in ["let x = x;", "typeof x; let x;", "x = 1; let x;"] {
+        let mut engine = Engine::new().unwrap();
+        assert!(engine.compile(source, "tdz.js").is_err(), "{source}");
+    }
+    let mut engine = Engine::new().unwrap();
+    assert!(engine.compile("let x = missing;", "failed.js").is_err());
+    engine
+        .compile("function main(){ return typeof x; }", "later.js")
+        .unwrap();
+    assert!(engine.call("main", &[]).is_err());
+}
+
+#[test]
+fn call_and_constructor_arguments_support_spread() {
+    check(
+        "function f(a,b,c,d){ return a*1000+b*100+c*10+d; } function main(){ return f(1,...[2,3],4); }",
+        Value::number(1234.0),
+    );
+    check(
+        "function f(a,b,c){ return a+b+c === 'éab'; } function main(){ return f(...'éa', ...[], 'b'); }",
+        Value::TRUE,
+    );
+    check(
+        "function C(a,b,c){ this.value = a*100+b*10+c; } function main(){ return new C(1,...[2,3]).value; }",
+        Value::number(123.0),
+    );
+}
+
+#[test]
+fn spread_arguments_preserve_order_receivers_and_values() {
+    check(
+        "function main(){ let n = 0; let o = {x: 5, f: function(a,b){ return this.x + a*10 + b; }}; let get = () => (n++, o); return get().f(...[(n++, 2)], (n++, n)) + n*100; }",
+        Value::number(328.0),
+    );
+    check(
+        "function main(){ let a = [{x: 7}]; let f = (x,y) => x.x + y; return f(...a, (a[0] = {x: 9}, 2)); }",
+        Value::number(9.0),
+    );
+    check(
+        "function main(){ let o = {x: 7, f: function(a){ return this.x + a; }}; let old = o; return o.f(...[(o = {x: 20}, 2)]); }",
+        Value::number(9.0),
+    );
+}
+
+#[test]
+fn spread_arguments_reject_non_iterables() {
+    for source in [
+        "function f(){} function main(){ return f(...1); }",
+        "function C(){} function main(){ return new C(...null); }",
+    ] {
+        let mut engine = Engine::new().unwrap();
+        engine.compile(source, "spread.js").unwrap();
+        assert!(engine.call("main", &[]).is_err(), "{source}");
+    }
+}
+
+#[test]
+fn arguments_snapshot_and_lexical_arrows() {
+    check(
+        "function main(a){ a=8; return arguments.length*100 + (arguments[0] === undefined) + (arguments[1] === undefined); }",
+        Value::number(2.0),
+    );
+    check(
+        "function f(a){ a=8; arguments[0]=4; return a*10 + arguments[0]; } function main(){ return f(3); }",
+        Value::number(84.0),
+    );
+    check(
+        "function f(a){ return () => () => arguments[0]; } function main(){ let g=f(7); return g()(); }",
+        Value::number(7.0),
+    );
+    check(
+        "function f(a){ let g = (arguments) => arguments; return g(9) + (() => arguments[0])(); } function main(){ return f(3); }",
+        Value::number(12.0),
+    );
+    check(
+        "var arguments = 99; function f(){ let g = () => arguments[0]; arguments = [8]; return g(); } function main(){ return f(4); }",
+        Value::number(8.0),
+    );
+    check(
+        "function f(arguments){ return (() => arguments)(); } function main(){ return f(11); }",
+        Value::number(11.0),
+    );
+    check(
+        "function C(){ this.x = arguments[0]; } function main(){ return new C(6).x; }",
+        Value::number(6.0),
+    );
+    check(
+        "function* f(){ yield arguments[0]; return arguments.length; } function main(){ let g=f(5,6); return g.next().value*10 + g.next().value; }",
+        Value::number(52.0),
+    );
+    check(
+        "function f(a = arguments[0]){ return a; } function main(){ return f(4); }",
+        Value::number(4.0),
+    );
+}
+
+#[test]
+fn nested_function_declarations_are_hoisted_and_capture_bindings() {
+    check(
+        "function main(){ var f; return f(); function f(){ return 6; } }",
+        Value::number(6.0),
+    );
+    check(
+        "function main(){ let g = f(); return g.next().value; function* f(){ yield 4; } }",
+        Value::number(4.0),
+    );
+    check(
+        "function main(){ return f(3); function f(x){ return x + 4; } }",
+        Value::number(7.0),
+    );
+    check(
+        "function main(){ let x = 5; let f = make(); x = 8; return f(); function make(){ return () => x; } }",
+        Value::number(8.0),
+    );
+    check(
+        "function main(){ return fact(5); function fact(x){ return x <= 1 ? 1 : x * fact(x-1); } }",
+        Value::number(120.0),
+    );
+    check(
+        "function main(){ return even(6) && odd(5); function even(x){ return x === 0 || odd(x-1); } function odd(x){ return x !== 0 && even(x-1); } }",
+        Value::TRUE,
+    );
+    check(
+        "function main(){ let f = () => 1; { let x = 3; let n = g(); function g(){ return x; } if (n !== 3) return 0; } return f(); }",
+        Value::number(1.0),
+    );
+    check(
+        "function main(){ let f; { let x = 9; f = g; function g(){ return x; } } return f(); }",
+        Value::number(9.0),
+    );
+    check(
+        "function main(){ let f = 2; { function f(){ return 8; } if (f() !== 8) return 0; } return f; }",
+        Value::number(2.0),
+    );
+}
+
+#[test]
+fn for_in_orders_and_snapshots_properties() {
+    check(
+        r#"function main(){ let o = {b:1, '10':1, '2':1, '01':1, '4294967295':1, '4294967294':1, a:1}; o.b = 2; let s = ''; for (let k in o) { s += k + ','; o.newkey = 1; } return s === '2,10,4294967294,b,01,4294967295,a,'; }"#,
+        Value::TRUE,
+    );
+    check(
+        r#"function main(){ let o = JSON.parse('{"z":1,"2":2,"a":3,"1":4}'); return JSON.stringify(o) === '{"1":4,"2":2,"z":1,"a":3}'; }"#,
+        Value::TRUE,
+    );
+    check(
+        "function main(){ let a = [1,2,3].map((x,i,a) => { if (i === 0) a.length = 1; return x; }); let s = ''; for (let k in a) s += k; return s === '0'; }",
+        Value::TRUE,
+    );
+    check(
+        "function main(){ let a = [1,2,3]; let s = ''; for (let k in a){ s += k; a.length = 1; } return s === '0'; }",
+        Value::TRUE,
+    );
+}
+
+#[test]
+fn for_in_scopes_control_flow_and_prototypes() {
+    check(
+        "function main(){ function A(){} A.prototype.x=1; A.prototype.y=2; let a=new A(); a.x=3; a.z=4; let s=''; for (const k in a) s+=k; return s === 'xzy'; }",
+        Value::TRUE,
+    );
+    check(
+        "function main(){ let calls=0; let f=[]; let o={a:1,b:2,c:3}; for (let k in (calls++,o)) { f[f.length]=()=>k; if (k==='b') continue; if (k==='c') break; } return calls===1 && f[0]()==='a' && f[1]()==='b' && f[2]()==='c'; }",
+        Value::TRUE,
+    );
+    check(
+        "function main(){ function A(){} A.prototype.p=1; let a=new A(); a.x=1; let s=''; for (let k in a){ s+=k; if (k==='x') A.prototype.q=2; } return s === 'xpq'; }",
+        Value::TRUE,
+    );
+    check(
+        "function main(){ for (var k in {a:1}) {} return k === 'a'; }",
+        Value::TRUE,
+    );
+    check(
+        "function main(){ let n=0; for (let k in null) n++; for (let k in undefined) n++; for (let k in 3) n++; for (let k in false) n++; return n; }",
+        Value::number(0.0),
+    );
+    check(
+        "function main(){ class C { method(){} } let c=new C(); c.x=1; let s=''; for (let k in c) s+=k; for (let k in C) s+=k; for (let k in Math) s+=k; for (let k in JSON) s+=k; for (let k in new Error('x')) s+=k; return s === 'x'; }",
+        Value::TRUE,
+    );
+    check(
+        "function* f(){ let s=''; for (let k in {a:1,b:2}) s+=k; yield s; } function main(){ return f().next().value === 'ab'; }",
+        Value::TRUE,
+    );
+}
+
+#[test]
+fn for_in_rejects_unsupported_forms() {
+    for source in [
+        "function main(){ let k; for (k in {}) {} }",
+        "function main(){ for (let [k] in {}) {} }",
+        "function* f(){ for (let k in {}) { yield k; } }",
+    ] {
+        assert!(
+            Engine::new().unwrap().compile(source, "forin.js").is_err(),
+            "{source}"
+        );
+    }
+    for source in [
+        "function main(){ for (let k in 'abc') {} }",
+        "function main(){ for (let k in new Set()) {} }",
+    ] {
+        let mut engine = Engine::new().unwrap();
+        engine.compile(source, "forin.js").unwrap();
+        assert!(engine.call("main", &[]).is_err(), "{source}");
+    }
+}

@@ -11,9 +11,39 @@ use super::FunctionCompiler;
 impl FunctionCompiler<'_, '_> {
     pub(super) fn emit_block(&mut self, statements: &[Statement<'_>]) -> Result<(), Error> {
         self.enter_block(statements);
-        let result = self.emit_statements(statements);
+        self.declare_block_functions(statements);
+        let result = self
+            .initialize_function_declarations(statements)
+            .and_then(|_| self.emit_statements(statements));
         self.leave_block();
         result
+    }
+
+    pub(super) fn emit_function_body(&mut self, statements: &[Statement<'_>]) -> Result<(), Error> {
+        self.enter_block(statements);
+        let result = self
+            .initialize_function_declarations(statements)
+            .and_then(|_| self.emit_statements(statements));
+        self.leave_block();
+        result
+    }
+
+    fn initialize_function_declarations(
+        &mut self,
+        statements: &[Statement<'_>],
+    ) -> Result<(), Error> {
+        for statement in statements {
+            if let Statement::FunctionDeclaration(function) = statement {
+                let symbol = function.id.as_ref().unwrap().symbol_id.get().unwrap();
+                let variable = self
+                    .local(symbol)
+                    .expect("function declaration binding must exist");
+                let value = self.make_closure(function.span, false, function.generator)?;
+                self.initialize_local(variable, value);
+                self.clear_temporaries();
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn emit_statements(&mut self, statements: &[Statement<'_>]) -> Result<(), Error> {
@@ -21,13 +51,16 @@ impl FunctionCompiler<'_, '_> {
             if self.terminated {
                 break;
             }
-            self.emit_statement(statement)?;
+            if !matches!(statement, Statement::FunctionDeclaration(_)) {
+                self.emit_statement(statement)?;
+            }
         }
         Ok(())
     }
 
     pub(super) fn emit_statement(&mut self, statement: &Statement<'_>) -> Result<(), Error> {
         match statement {
+            Statement::ClassDeclaration(class) => self.emit_class_declaration(class),
             Statement::BlockStatement(block) => self.emit_block(&block.body),
             Statement::EmptyStatement(_) | Statement::DebuggerStatement(_) => Ok(()),
             Statement::ExpressionStatement(statement) => {
@@ -149,6 +182,7 @@ impl FunctionCompiler<'_, '_> {
             Statement::DoWhileStatement(statement) => self.emit_do_while(statement),
             Statement::ForStatement(statement) => self.emit_for(statement),
             Statement::ForOfStatement(statement) => self.emit_for_of(statement),
+            Statement::ForInStatement(statement) => self.emit_for_in(statement),
             Statement::BreakStatement(statement) => {
                 if statement.label.is_some() {
                     return Err(unsupported_at(statement.span, "labeled break"));
@@ -175,9 +209,10 @@ impl FunctionCompiler<'_, '_> {
                 self.jump(target, &[]);
                 Ok(())
             }
-            Statement::FunctionDeclaration(function) => {
-                Err(unsupported_at(function.span, "nested function declaration"))
-            }
+            Statement::FunctionDeclaration(function) => Err(unsupported_at(
+                function.span,
+                "function declaration outside a block",
+            )),
             other => Err(unsupported_at(
                 other.span(),
                 format!("{} statement", statement_kind(other)),
@@ -190,14 +225,56 @@ impl FunctionCompiler<'_, '_> {
         declaration: &VariableDeclaration<'_>,
     ) -> Result<(), Error> {
         for declarator in &declaration.declarations {
-            let symbol = match &declarator.id {
-                BindingPattern::BindingIdentifier(identifier) => {
-                    identifier.symbol_id.get().unwrap()
+            if let BindingPattern::ArrayPattern(pattern) = &declarator.id {
+                if pattern.rest.is_some()
+                    || pattern
+                        .elements
+                        .iter()
+                        .flatten()
+                        .any(|element| !matches!(element, BindingPattern::BindingIdentifier(_)))
+                {
+                    return Err(unsupported_at(
+                        declarator.span,
+                        "array destructuring pattern",
+                    ));
                 }
-                _ => {
-                    return Err(unsupported_at(declarator.span, "destructuring declaration"));
+                let Some(initializer) = &declarator.init else {
+                    return Err(unsupported_at(
+                        declarator.span,
+                        "array destructuring without initializer",
+                    ));
+                };
+                let iterable = self.emit_expression(initializer)?;
+                let state = self.call_helper(Helper::IterateNew, &[iterable]);
+                self.check_error();
+                for element in &pattern.elements {
+                    let value = self.call_helper(Helper::IterateNext, &[state]);
+                    self.check_error();
+                    if let Some(BindingPattern::BindingIdentifier(identifier)) = element {
+                        let exhausted = self.b.ins().icmp_imm(
+                            cranelift_codegen::ir::condcodes::IntCC::Equal,
+                            value,
+                            Value::UNINITIALIZED.bits() as i64,
+                        );
+                        let undefined = self.constant(Value::UNDEFINED);
+                        let value = self.b.ins().select(exhausted, undefined, value);
+                        let symbol = identifier.symbol_id.get().unwrap();
+                        let variable = if declaration.kind == VariableDeclarationKind::Var {
+                            self.resolve_function_binding(symbol)
+                        } else {
+                            self.resolve_lexical_binding(symbol)
+                        }
+                        .expect("destructuring binding must be declared");
+                        self.initialize_local(variable, value);
+                    }
                 }
+                self.clear_temporaries();
+                continue;
+            }
+            let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
+                return Err(unsupported_at(declarator.span, "destructuring declaration"));
             };
+            let symbol = identifier.symbol_id.get().unwrap();
             let variable = if declaration.kind == VariableDeclarationKind::Var {
                 self.resolve_function_binding(symbol)
                     .expect("function binding must be hoisted")

@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
-use cranelift_codegen::ir::{InstBuilder, Value as ClifValue, types};
+use cranelift_codegen::ir::condcodes::IntCC;
+use cranelift_codegen::ir::{BlockArg, InstBuilder, Value as ClifValue, types};
 use cranelift_frontend::Variable;
 use oxc_ast::ast::{
     BindingPattern, ForStatementInit, ForStatementLeft, FormalParameters, Statement,
@@ -85,7 +86,18 @@ impl FunctionCompiler<'_, '_> {
         params: &FormalParameters<'_>,
         statements: &[Statement<'_>],
     ) -> Result<(), Error> {
-        self.scopes.push();
+        let has_defaults = params
+            .items
+            .iter()
+            .any(|parameter| parameter.initializer.is_some());
+        if has_defaults {
+            for parameter in &params.items {
+                self.declare_lexical_binding(param_symbol(&parameter.pattern));
+            }
+            if let Some(rest) = &params.rest {
+                self.declare_lexical_binding(param_symbol(&rest.rest.argument));
+            }
+        }
 
         let mut var_symbols = Vec::new();
         collect_var_symbols(statements, &mut var_symbols);
@@ -93,10 +105,38 @@ impl FunctionCompiler<'_, '_> {
             self.declare_function_binding(symbol);
         }
 
+        for statement in statements {
+            if let Statement::FunctionDeclaration(function) = statement {
+                self.declare_function_binding(
+                    function.id.as_ref().unwrap().symbol_id.get().unwrap(),
+                );
+            }
+        }
+
         for (index, parameter) in params.items.iter().enumerate() {
             let symbol = param_symbol(&parameter.pattern);
             let variable = self.declare_function_binding(symbol);
             let value = self.load_arg(index);
+            let value = if let Some(initializer) = &parameter.initializer {
+                let missing =
+                    self.b
+                        .ins()
+                        .icmp_imm(IntCC::Equal, value, Value::UNDEFINED.bits() as i64);
+                let default = self.b.create_block();
+                let provided = self.b.create_block();
+                let done = self.b.create_block();
+                self.b.append_block_param(done, types::I64);
+                self.brif(missing, default, &[], provided, &[]);
+                self.switch(default);
+                let result = self.emit_expression(initializer)?;
+                self.jump(done, &[BlockArg::Value(result)]);
+                self.switch(provided);
+                self.jump(done, &[BlockArg::Value(value)]);
+                self.switch(done);
+                self.b.block_params(done)[0]
+            } else {
+                value
+            };
             self.initialize_local(variable, value);
         }
         if let Some(rest) = &params.rest {
@@ -116,6 +156,16 @@ impl FunctionCompiler<'_, '_> {
         collect_lexical_symbols(statements, &mut symbols);
         for symbol in symbols {
             self.declare_lexical_binding(symbol);
+        }
+    }
+
+    pub(super) fn declare_block_functions(&mut self, statements: &[Statement<'_>]) {
+        for statement in statements {
+            if let Statement::FunctionDeclaration(function) = statement {
+                self.declare_lexical_binding(
+                    function.id.as_ref().unwrap().symbol_id.get().unwrap(),
+                );
+            }
         }
     }
 
@@ -142,7 +192,9 @@ impl FunctionCompiler<'_, '_> {
             self.check_error();
             return result;
         }
-        self.call_helper(Helper::TempRetain, &[value])
+        let value = self.call_helper(Helper::TempRetain, &[value]);
+        self.check_error();
+        value
     }
 
     pub(super) fn store_local(&mut self, variable: Variable, value: ClifValue) {
@@ -187,7 +239,7 @@ impl FunctionCompiler<'_, '_> {
         self.scopes.resolve_current(symbol)
     }
 
-    fn declare_function_binding(&mut self, symbol: SymbolId) -> Variable {
+    pub(super) fn declare_function_binding(&mut self, symbol: SymbolId) -> Variable {
         if let Some(variable) = self.scopes.resolve_function(symbol) {
             return variable;
         }
@@ -282,6 +334,14 @@ pub(super) fn collect_var_symbols(statements: &[Statement<'_>], symbols: &mut Ve
                     collect_var_symbols(&handler.body.body, symbols);
                 }
             }
+            Statement::ForInStatement(statement) => {
+                if let ForStatementLeft::VariableDeclaration(declaration) = &statement.left {
+                    if declaration.kind == VariableDeclarationKind::Var {
+                        collect_declaration_symbols(declaration, symbols);
+                    }
+                }
+                collect_var_symbols(std::slice::from_ref(&statement.body), symbols);
+            }
             Statement::ForOfStatement(statement) => {
                 if let ForStatementLeft::VariableDeclaration(declaration) = &statement.left {
                     if declaration.kind == VariableDeclarationKind::Var {
@@ -305,6 +365,9 @@ pub(super) fn collect_var_symbols(statements: &[Statement<'_>], symbols: &mut Ve
 
 fn collect_lexical_symbols(statements: &[Statement<'_>], symbols: &mut Vec<SymbolId>) {
     for statement in statements {
+        if let Statement::ClassDeclaration(class) = statement {
+            symbols.push(class.id.as_ref().unwrap().symbol_id.get().unwrap());
+        }
         if let Statement::VariableDeclaration(declaration) = statement
             && declaration.kind != VariableDeclarationKind::Var
         {
@@ -315,8 +378,18 @@ fn collect_lexical_symbols(statements: &[Statement<'_>], symbols: &mut Vec<Symbo
 
 fn collect_declaration_symbols(declaration: &VariableDeclaration<'_>, symbols: &mut Vec<SymbolId>) {
     for declarator in &declaration.declarations {
-        if let BindingPattern::BindingIdentifier(identifier) = &declarator.id {
-            symbols.push(identifier.symbol_id.get().unwrap());
+        match &declarator.id {
+            BindingPattern::BindingIdentifier(identifier) => {
+                symbols.push(identifier.symbol_id.get().unwrap())
+            }
+            BindingPattern::ArrayPattern(pattern) => {
+                for element in pattern.elements.iter().flatten() {
+                    if let BindingPattern::BindingIdentifier(identifier) = element {
+                        symbols.push(identifier.symbol_id.get().unwrap());
+                    }
+                }
+            }
+            _ => {}
         }
     }
 }

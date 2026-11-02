@@ -121,10 +121,12 @@ impl Compiler {
                     let name = validate_function(function)?;
                     declarations.push((name, function));
                 }
+                Statement::ClassDeclaration(class) => {
+                    emit::class::validate_class(class)?;
+                    globals.push(class.id.as_ref().unwrap().name.to_string());
+                }
                 Statement::EmptyStatement(_) | Statement::ExpressionStatement(_) => {}
-                Statement::VariableDeclaration(declaration)
-                    if declaration.kind == VariableDeclarationKind::Var =>
-                {
+                Statement::VariableDeclaration(declaration) => {
                     for declarator in &declaration.declarations {
                         let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
                             return Err(unsupported_at(
@@ -132,7 +134,9 @@ impl Compiler {
                                 "destructuring declaration",
                             ));
                         };
-                        globals.push(identifier.name.to_string());
+                        if declaration.kind == VariableDeclarationKind::Var {
+                            globals.push(identifier.name.to_string());
+                        }
                     }
                 }
                 other => {
@@ -164,6 +168,9 @@ impl Compiler {
         }
 
         let analysis = CaptureAnalysis::analyze(program, scoping);
+        if let Some(span) = analysis.class_name_writes.first() {
+            return Err(unsupported_at(*span, "assignment to inner class name"));
+        }
         let mut closures = HashMap::new();
         let mut nested = Vec::new();
         for node in nodes.iter() {
@@ -189,7 +196,11 @@ impl Compiler {
                 AstKind::Function(function)
                     if !ordered.iter().any(|(_, top)| top.span == function.span) =>
                 {
-                    if function.id.is_some() || function.r#async || function.body.is_none() {
+                    if (function.id.is_some()
+                        && function.r#type != oxc_ast::ast::FunctionType::FunctionDeclaration)
+                        || function.r#async
+                        || function.body.is_none()
+                    {
                         return Err(unsupported_at(
                             function.span,
                             "named, async or bodyless nested function",
@@ -225,11 +236,58 @@ impl Compiler {
             nested.push((id, span, params, statements, expression, generator));
         }
         let mut pending = Vec::new();
+        for node in nodes.iter() {
+            if let AstKind::Class(class) = node.kind() {
+                emit::class::validate_class(class)?;
+                if class.body.body.iter().any(|element| {
+                    matches!(element,
+                    oxc_ast::ast::ClassElement::MethodDefinition(method)
+                        if method.kind == oxc_ast::ast::MethodDefinitionKind::Constructor)
+                }) {
+                    continue;
+                }
+                let allocator = oxc_allocator::Allocator::default();
+                let builder = oxc_ast::builder::AstBuilder::new(&allocator);
+                let params = FormalParameters::new(
+                    class.span,
+                    oxc_ast::ast::FormalParameterKind::FormalParameter,
+                    oxc_allocator::Vec::new_in(&builder),
+                    None,
+                    &builder,
+                );
+                let internal = format!("jsclass_{}", self.next_id);
+                self.next_id += 1;
+                let id = self
+                    .module
+                    .declare_function(&internal, Linkage::Local, &self.signature)
+                    .map_err(|error| Error::Compile(error.to_string()))?;
+                let (code, _) = self.compile_callable(
+                    &params,
+                    &[],
+                    None,
+                    None,
+                    &analysis.arguments_references,
+                    &[],
+                    &analysis.captured,
+                    &closures,
+                    scoping,
+                    false,
+                )?;
+                closures.insert(class.span.start, (id, Vec::new(), false));
+                pending.push((id, code));
+            }
+        }
+
         for (name, function) in &ordered {
             let (code, resume) = self.compile_callable(
                 &function.params,
                 &function.body.as_ref().unwrap().statements,
                 None,
+                analysis
+                    .arguments_bindings
+                    .get(&function.span.start)
+                    .copied(),
+                &analysis.arguments_references,
                 &[],
                 &analysis.captured,
                 &closures,
@@ -247,6 +305,8 @@ impl Compiler {
                 params,
                 statements,
                 expression,
+                analysis.arguments_bindings.get(&span.start).copied(),
+                &analysis.arguments_references,
                 captures,
                 &analysis.captured,
                 &closures,
@@ -263,7 +323,9 @@ impl Compiler {
         let initializer = if !program.body.iter().any(|s| {
             matches!(
                 s,
-                Statement::VariableDeclaration(_) | Statement::ExpressionStatement(_)
+                Statement::VariableDeclaration(_)
+                    | Statement::ExpressionStatement(_)
+                    | Statement::ClassDeclaration(_)
             )
         }) {
             None
@@ -290,6 +352,7 @@ impl Compiler {
                     &program.body,
                     &analysis.captured,
                     &closures,
+                    &analysis.arguments_references,
                 )?;
                 builder.seal_all_blocks();
                 builder.finalize();
@@ -346,6 +409,8 @@ impl Compiler {
         params: &FormalParameters<'_>,
         statements: &[Statement<'_>],
         expression: Option<&Expression<'_>>,
+        arguments_binding: Option<SymbolId>,
+        arguments_references: &HashMap<u32, SymbolId>,
         captures: &[SymbolId],
         captured: &HashSet<SymbolId>,
         closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
@@ -364,6 +429,8 @@ impl Compiler {
                     params,
                     statements,
                     expression,
+                    arguments_binding,
+                    arguments_references,
                     captures,
                     captured,
                     closures,
@@ -384,6 +451,8 @@ impl Compiler {
             params,
             statements,
             None,
+            arguments_binding,
+            arguments_references,
             captures,
             captured,
             closures,
@@ -394,6 +463,8 @@ impl Compiler {
             params,
             &[],
             None,
+            None,
+            arguments_references,
             &[],
             captured,
             closures,
@@ -408,6 +479,8 @@ impl Compiler {
         params: &FormalParameters<'_>,
         statements: &[Statement<'_>],
         expression: Option<&Expression<'_>>,
+        arguments_binding: Option<SymbolId>,
+        arguments_references: &HashMap<u32, SymbolId>,
         captures: &[SymbolId],
         captured: &HashSet<SymbolId>,
         closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
@@ -430,6 +503,8 @@ impl Compiler {
                 params,
                 statements,
                 expression,
+                arguments_binding,
+                arguments_references,
                 captures,
                 captured,
                 closures,
@@ -472,10 +547,10 @@ fn validate_function(function: &Function<'_>) -> Result<String, Error> {
         ));
     }
     for parameter in &function.params.items {
-        if parameter.initializer.is_some() {
+        if function.generator && parameter.initializer.is_some() {
             return Err(unsupported_at(
                 parameter.span,
-                format!("default parameter in function `{name}`"),
+                "generator default parameter",
             ));
         }
         if !matches!(parameter.pattern, BindingPattern::BindingIdentifier(_)) {
@@ -489,12 +564,14 @@ fn validate_function(function: &Function<'_>) -> Result<String, Error> {
 }
 
 fn validate_params(params: &FormalParameters<'_>, span: oxc_span::Span) -> Result<(), Error> {
-    if params.items.iter().any(|p| {
-        p.initializer.is_some() || !matches!(p.pattern, BindingPattern::BindingIdentifier(_))
-    }) || params
-        .rest
-        .as_ref()
-        .is_some_and(|p| !matches!(p.rest.argument, BindingPattern::BindingIdentifier(_)))
+    if params
+        .items
+        .iter()
+        .any(|p| !matches!(p.pattern, BindingPattern::BindingIdentifier(_)))
+        || params
+            .rest
+            .as_ref()
+            .is_some_and(|p| !matches!(p.rest.argument, BindingPattern::BindingIdentifier(_)))
     {
         return Err(unsupported_at(
             span,

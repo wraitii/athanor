@@ -13,6 +13,7 @@ pub(crate) struct Heap(Rc<RefCell<HeapData>>);
 #[derive(Default)]
 struct HeapData {
     generators: HashMap<u64, Generator>,
+    enumerators: HashMap<u64, Enumerator>,
     natives: HashMap<u64, (usize, NativeFunction)>,
     sets: HashMap<u64, Set>,
     objects: HashMap<u64, Object>,
@@ -26,6 +27,14 @@ struct HeapData {
 pub(crate) const GENERATOR_DONE: usize = usize::MAX;
 pub(crate) const GENERATOR_RUNNING: usize = usize::MAX - 1;
 
+struct Enumerator {
+    references: usize,
+    current: Option<Value>,
+    keys: Vec<String>,
+    cursor: usize,
+    visited: HashSet<String>,
+}
+
 struct Generator {
     references: usize,
     code: CodeId,
@@ -36,14 +45,100 @@ struct Generator {
     locals: Vec<Value>,
 }
 
+#[derive(Default)]
+struct PropertyTable {
+    slots: Vec<PropertySlot>,
+    index: HashMap<String, usize>,
+    revision: u64,
+}
+
+struct PropertySlot {
+    name: String,
+    value: Value,
+    enumerable: bool,
+}
+
+fn array_index_name(name: &str) -> Option<u32> {
+    name.parse::<u32>()
+        .ok()
+        .filter(|index| *index != u32::MAX && index.to_string() == name)
+}
+
+impl PropertyTable {
+    fn get(&self, name: &str) -> Option<&Value> {
+        self.index.get(name).map(|index| &self.slots[*index].value)
+    }
+
+    fn contains_key(&self, name: &str) -> bool {
+        self.index.contains_key(name)
+    }
+
+    fn set(&mut self, name: &str, value: Value, enumerable: Option<bool>) -> Option<Value> {
+        if let Some(index) = self.index.get(name).copied() {
+            let slot = &mut self.slots[index];
+            if let Some(enumerable) = enumerable
+                && slot.enumerable != enumerable
+            {
+                slot.enumerable = enumerable;
+                self.revision = self.revision.wrapping_add(1);
+            }
+            return Some(std::mem::replace(&mut slot.value, value));
+        }
+        self.index.insert(name.to_owned(), self.slots.len());
+        self.slots.push(PropertySlot {
+            name: name.to_owned(),
+            value,
+            enumerable: enumerable.unwrap_or(true),
+        });
+        self.revision = self.revision.wrapping_add(1);
+        None
+    }
+
+    fn keys(&self) -> Vec<String> {
+        let mut indices: Vec<_> = self
+            .slots
+            .iter()
+            .filter_map(|slot| array_index_name(&slot.name).map(|index| (index, slot.name.clone())))
+            .collect();
+        indices.sort_unstable_by_key(|(index, _)| *index);
+        indices
+            .into_iter()
+            .map(|(_, name)| name)
+            .chain(
+                self.slots
+                    .iter()
+                    .filter(|slot| array_index_name(&slot.name).is_none())
+                    .map(|slot| slot.name.clone()),
+            )
+            .collect()
+    }
+
+    fn enumerable(&self, name: &str) -> Option<bool> {
+        self.index
+            .get(name)
+            .map(|index| self.slots[*index].enumerable)
+    }
+
+    fn pop(&mut self) -> Option<Value> {
+        let slot = self.slots.pop()?;
+        self.index.remove(&slot.name);
+        Some(slot.value)
+    }
+}
+
 struct Object {
     references: usize,
-    properties: HashMap<String, Value>,
+    properties: PropertyTable,
     error: bool,
+    prototype: Option<Value>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeFunction {
+    Array,
+    Math(MathFunction),
+    JsonParse,
+    JsonStringify,
     HostReadFile,
     HostListFiles,
     HostEvaluateSource,
@@ -61,6 +156,30 @@ pub(crate) enum NativeFunction {
     StringSplit,
     StringStartsWith,
     StringReplace,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MathFunction {
+    Abs,
+    Ceil,
+    Floor,
+    Round,
+    Trunc,
+    Sqrt,
+    Sin,
+    Cos,
+    Tan,
+    Asin,
+    Acos,
+    Atan,
+    Atan2,
+    Exp,
+    Log,
+    Pow,
+    Min,
+    Max,
+    Imul,
+    Sign,
 }
 
 #[derive(Hash, PartialEq, Eq)]
@@ -94,6 +213,8 @@ struct Closure {
     captures: Vec<Value>,
     lexical_this: Option<Value>,
     constructable: bool,
+    class: bool,
+    properties: PropertyTable,
 }
 
 impl Heap {
@@ -308,8 +429,9 @@ impl Heap {
             id,
             Object {
                 references: 1,
-                properties: HashMap::new(),
+                properties: PropertyTable::default(),
                 error: false,
+                prototype: None,
             },
         );
         Some(Value::from_bits(TAG_OBJECT | id))
@@ -334,52 +456,288 @@ impl Heap {
         let id = next_id()?;
         data.retain(message);
         data.retain(name);
+        let mut properties = PropertyTable::default();
+        properties.set("message", message, Some(false));
+        properties.set("name", name, Some(false));
         data.objects.insert(
             id,
             Object {
                 references: 1,
-                properties: HashMap::from([("message".into(), message), ("name".into(), name)]),
+                properties,
                 error: true,
+                prototype: None,
             },
         );
         Some(Value::from_bits(TAG_OBJECT | id))
     }
 
     pub(crate) fn property(&self, object: Value, name: &str) -> Option<Value> {
+        let id = heap_id(object)?;
+        let needs_prototype = {
+            let data = self.0.borrow();
+            data.closures.get(&id).is_some_and(|closure| {
+                closure.references != 0
+                    && closure.constructable
+                    && name == "prototype"
+                    && !closure.properties.contains_key(name)
+            })
+        };
+        if needs_prototype {
+            let prototype = self.object()?;
+            self.define_property(object, name, prototype, false);
+            self.release(prototype);
+        }
         let data = self.0.borrow();
-        let object = data.objects.get(&heap_id(object)?)?;
-        (object.references != 0).then(|| {
+        if let Some(closure) = data.closures.get(&id) {
+            return (closure.references != 0).then(|| {
+                closure
+                    .properties
+                    .get(name)
+                    .copied()
+                    .unwrap_or(Value::UNDEFINED)
+            });
+        }
+        let mut current = object;
+        loop {
+            let object = data.objects.get(&heap_id(current)?)?;
+            if object.references == 0 {
+                return None;
+            }
+            if let Some(value) = object.properties.get(name) {
+                return Some(*value);
+            }
+            let Some(prototype) = object.prototype else {
+                return Some(Value::UNDEFINED);
+            };
+            current = prototype;
+        }
+    }
+
+    pub(crate) fn own_properties(&self, value: Value) -> Option<Vec<(String, Value)>> {
+        let data = self.0.borrow();
+        let object = data.objects.get(&heap_id(value)?)?;
+        if object.references == 0 {
+            return None;
+        }
+        Some(
             object
                 .properties
-                .get(name)
-                .copied()
-                .unwrap_or(Value::UNDEFINED)
-        })
+                .keys()
+                .into_iter()
+                .filter_map(|name| {
+                    (object.properties.enumerable(&name) == Some(true))
+                        .then(|| (name.clone(), *object.properties.get(&name).unwrap()))
+                })
+                .collect(),
+        )
     }
 
     pub(crate) fn set_property(&self, object: Value, name: &str, value: Value) -> bool {
+        self.write_property(object, name, value, None)
+    }
+
+    pub(crate) fn define_property(
+        &self,
+        object: Value,
+        name: &str,
+        value: Value,
+        enumerable: bool,
+    ) -> bool {
+        self.write_property(object, name, value, Some(enumerable))
+    }
+
+    fn write_property(
+        &self,
+        object: Value,
+        name: &str,
+        value: Value,
+        enumerable: Option<bool>,
+    ) -> bool {
         let Some(id) = heap_id(object) else {
             return false;
         };
         let mut data = self.0.borrow_mut();
-        if !data
+        let supported = data
             .objects
             .get(&id)
             .is_some_and(|object| object.references != 0)
-            || !data.retain(value)
-        {
+            || data
+                .closures
+                .get(&id)
+                .is_some_and(|closure| closure.references != 0);
+        if !supported || !data.retain(value) {
             return false;
         }
-        if let Some(old) = data
-            .objects
-            .get_mut(&id)
-            .unwrap()
-            .properties
-            .insert(name.into(), value)
-        {
+        let enumerable = if enumerable.is_none()
+            && name == "prototype"
+            && data.closures.get(&id).is_some_and(|closure| {
+                closure.constructable && !closure.properties.contains_key(name)
+            }) {
+            Some(false)
+        } else {
+            enumerable
+        };
+        let properties = if let Some(object) = data.objects.get_mut(&id) {
+            &mut object.properties
+        } else {
+            &mut data.closures.get_mut(&id).unwrap().properties
+        };
+        if let Some(old) = properties.set(name, value, enumerable) {
             data.release(old);
         }
         true
+    }
+
+    pub(crate) fn enumerate(&self, value: Value) -> Option<Value> {
+        self.drain(64);
+        let mut data = self.0.borrow_mut();
+        let (current, keys) = if value.is_nullish()
+            || value.is_number()
+            || value == Value::TRUE
+            || value == Value::FALSE
+        {
+            (None, Vec::new())
+        } else {
+            let keys = data.enumeration_keys(value)?;
+            if !data.retain(value) {
+                return None;
+            }
+            (Some(value), keys)
+        };
+        let Some(id) = next_id() else {
+            if let Some(value) = current {
+                data.release(value);
+            }
+            return None;
+        };
+        data.enumerators.insert(
+            id,
+            Enumerator {
+                references: 1,
+                current,
+                keys,
+                cursor: 0,
+                visited: HashSet::new(),
+            },
+        );
+        Some(Value::from_bits(TAG_OBJECT | id))
+    }
+
+    pub(crate) fn enumerate_next(&self, state: Value) -> Option<Option<Value>> {
+        let mut data = self.0.borrow_mut();
+        let id = heap_id(state)?;
+        loop {
+            let state = data.enumerators.get_mut(&id)?;
+            if state.references == 0 {
+                return None;
+            }
+            let Some(current) = state.current else {
+                return Some(None);
+            };
+            if state.cursor < state.keys.len() {
+                let name = state.keys[state.cursor].clone();
+                state.cursor += 1;
+                if state.visited.contains(&name) {
+                    continue;
+                }
+                let Some(enumerable) = data.enumeration_presence(current, &name) else {
+                    continue;
+                };
+                data.enumerators
+                    .get_mut(&id)
+                    .unwrap()
+                    .visited
+                    .insert(name.clone());
+                if !enumerable {
+                    continue;
+                }
+                drop(data);
+                return self.string(&name).map(Some);
+            }
+            let next = data.enumeration_prototype(current);
+            let keys = next
+                .and_then(|value| data.enumeration_keys(value))
+                .unwrap_or_default();
+            if let Some(next) = next {
+                if !data.retain(next) {
+                    return None;
+                }
+            }
+            let state = data.enumerators.get_mut(&id).unwrap();
+            state.current = next;
+            state.keys = keys;
+            state.cursor = 0;
+            data.release(current);
+        }
+    }
+
+    pub(crate) fn has_property(&self, value: Value, name: &str) -> Option<bool> {
+        let data = self.0.borrow();
+        let id = heap_id(value)?;
+        if let Some(closure) = data.closures.get(&id) {
+            return (closure.references != 0).then(|| {
+                closure.properties.contains_key(name)
+                    || (closure.constructable && name == "prototype")
+            });
+        }
+        if let Some(array) = data.arrays.get(&id) {
+            if array.references == 0 {
+                return None;
+            }
+            if matches!(name, "length" | "filter" | "map" | "join") {
+                return Some(true);
+            }
+            let index = name
+                .parse::<u32>()
+                .ok()
+                .filter(|index| *index != u32::MAX && index.to_string() == name);
+            return Some(index.is_some_and(|index| {
+                (index as usize) < array.elements.len() && !array.holes.contains(&(index as usize))
+            }));
+        }
+        let mut current = value;
+        loop {
+            let object = data.objects.get(&heap_id(current)?)?;
+            if object.references == 0 {
+                return None;
+            }
+            if object.properties.contains_key(name) {
+                return Some(true);
+            }
+            let Some(prototype) = object.prototype else {
+                return Some(false);
+            };
+            current = prototype;
+        }
+    }
+
+    pub(crate) fn inherits(&self, value: Value, prototype: Value) -> bool {
+        let data = self.0.borrow();
+        let mut current = value;
+        while let Some(object) = heap_id(current).and_then(|id| data.objects.get(&id)) {
+            let Some(parent) = object.prototype else {
+                return false;
+            };
+            if parent == prototype {
+                return true;
+            }
+            current = parent;
+        }
+        false
+    }
+
+    pub(crate) fn constructed_object(&self, constructor: Value) -> Option<Value> {
+        let prototype = self.property(constructor, "prototype")?;
+        if prototype.is_object() && !self.has_properties(prototype) {
+            return None;
+        }
+        let instance = self.object()?;
+        if prototype.is_object() {
+            let mut data = self.0.borrow_mut();
+            data.retain(prototype);
+            data.objects.get_mut(&heap_id(instance)?).unwrap().prototype = Some(prototype);
+        }
+        Some(instance)
     }
 
     pub(crate) fn error_text(&self, value: Value) -> Option<String> {
@@ -507,6 +865,8 @@ impl Heap {
                 captures: captures.to_vec(),
                 lexical_this: None,
                 constructable: true,
+                class: false,
+                properties: PropertyTable::default(),
             }),
         );
         Some(Value::from_bits(TAG_OBJECT | id))
@@ -548,6 +908,27 @@ impl Heap {
             .get_mut(&heap_id(closure).unwrap())
             .unwrap()
             .constructable = false;
+    }
+
+    pub(crate) fn mark_class(&self, closure: Value) {
+        self.0
+            .borrow_mut()
+            .closures
+            .get_mut(&heap_id(closure).unwrap())
+            .unwrap()
+            .class = true;
+    }
+
+    pub(crate) fn is_class(&self, closure: Value) -> bool {
+        heap_id(closure)
+            .and_then(|id| {
+                self.0
+                    .borrow()
+                    .closures
+                    .get(&id)
+                    .map(|closure| closure.references != 0 && closure.class)
+            })
+            .unwrap_or(false)
     }
 
     pub(crate) fn constructable(&self, closure: Value) -> bool {
@@ -725,7 +1106,15 @@ impl Heap {
             let Some(id) = data.pending.pop_front() else {
                 break;
             };
-            if let Some(generator) = data.generators.get_mut(&id) {
+            if let Some(state) = data.enumerators.get(&id) {
+                if state.references != 0 {
+                    continue;
+                }
+                let state = data.enumerators.remove(&id).unwrap();
+                if let Some(current) = state.current {
+                    data.release(current);
+                }
+            } else if let Some(generator) = data.generators.get_mut(&id) {
                 if generator.references != 0 {
                     continue;
                 }
@@ -753,12 +1142,14 @@ impl Heap {
                 if object.references != 0 {
                     continue;
                 }
-                if let Some(name) = object.properties.keys().next().cloned() {
-                    let value = object.properties.remove(&name).unwrap();
+                if let Some(value) = object.properties.pop() {
                     data.pending.push_back(id);
                     data.release(value);
                 } else {
-                    data.objects.remove(&id);
+                    let object = data.objects.remove(&id).unwrap();
+                    if let Some(prototype) = object.prototype {
+                        data.release(prototype);
+                    }
                 }
             } else if data
                 .strings
@@ -786,7 +1177,10 @@ impl Heap {
                 if closure.references != 0 {
                     continue;
                 }
-                if let Some(value) = closure.captures.pop() {
+                if let Some(value) = closure.properties.pop() {
+                    data.pending.push_back(id);
+                    data.release(value);
+                } else if let Some(value) = closure.captures.pop() {
                     data.pending.push_back(id);
                     data.release(value);
                 } else {
@@ -817,9 +1211,85 @@ fn heap_id(value: Value) -> Option<u64> {
 }
 
 impl HeapData {
+    fn enumeration_keys(&self, value: Value) -> Option<Vec<String>> {
+        let id = heap_id(value)?;
+        if let Some(object) = self
+            .objects
+            .get(&id)
+            .filter(|object| object.references != 0)
+        {
+            return Some(object.properties.keys());
+        }
+        if let Some(closure) = self
+            .closures
+            .get(&id)
+            .filter(|closure| closure.references != 0)
+        {
+            let mut keys = closure.properties.keys();
+            if closure.constructable && !closure.properties.contains_key("prototype") {
+                keys.push("prototype".into());
+            }
+            return Some(keys);
+        }
+        if let Some(array) = self.arrays.get(&id).filter(|array| array.references != 0) {
+            let mut keys: Vec<_> = (0..array.elements.len())
+                .filter(|index| !array.holes.contains(index))
+                .map(|index| index.to_string())
+                .collect();
+            keys.extend(
+                ["length", "filter", "map", "join"]
+                    .into_iter()
+                    .map(str::to_owned),
+            );
+            return Some(keys);
+        }
+        None
+    }
+
+    fn enumeration_presence(&self, value: Value, name: &str) -> Option<bool> {
+        let id = heap_id(value)?;
+        if let Some(object) = self
+            .objects
+            .get(&id)
+            .filter(|object| object.references != 0)
+        {
+            return object.properties.enumerable(name);
+        }
+        if let Some(closure) = self
+            .closures
+            .get(&id)
+            .filter(|closure| closure.references != 0)
+        {
+            return closure
+                .properties
+                .enumerable(name)
+                .or_else(|| (closure.constructable && name == "prototype").then_some(false));
+        }
+        if let Some(array) = self.arrays.get(&id).filter(|array| array.references != 0) {
+            if matches!(name, "length" | "filter" | "map" | "join") {
+                return Some(false);
+            }
+            return array_index_name(name).and_then(|index| {
+                ((index as usize) < array.elements.len()
+                    && !array.holes.contains(&(index as usize)))
+                .then_some(true)
+            });
+        }
+        None
+    }
+
+    fn enumeration_prototype(&self, value: Value) -> Option<Value> {
+        self.objects
+            .get(&heap_id(value)?)
+            .and_then(|object| object.prototype)
+    }
+
     fn references(&mut self, id: u64) -> Option<&mut usize> {
         if let Some(generator) = self.generators.get_mut(&id) {
             return Some(&mut generator.references);
+        }
+        if let Some(enumerator) = self.enumerators.get_mut(&id) {
+            return Some(&mut enumerator.references);
         }
         if let Some((references, _)) = self.natives.get_mut(&id) {
             return Some(references);
@@ -847,9 +1317,13 @@ impl HeapData {
     fn valid(&self, value: Value) -> bool {
         match heap_id(value) {
             Some(id) => {
-                self.generators
+                self.enumerators
                     .get(&id)
-                    .is_some_and(|generator| generator.references != 0)
+                    .is_some_and(|state| state.references != 0)
+                    || self
+                        .generators
+                        .get(&id)
+                        .is_some_and(|generator| generator.references != 0)
                     || self
                         .natives
                         .get(&id)
@@ -933,6 +1407,100 @@ impl Drop for OwnedValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enumeration_respects_hidden_shadowing_and_releases_receivers() {
+        let heap = Heap::default();
+        let prototype = heap.object().unwrap();
+        let object = heap.object().unwrap();
+        assert!(heap.set_property(prototype, "hidden", Value::TRUE));
+        assert!(heap.set_property(prototype, "inherited", Value::TRUE));
+        assert!(heap.define_property(object, "hidden", Value::TRUE, false));
+        assert!(heap.set_property(object, "own", Value::TRUE));
+        {
+            let mut data = heap.0.borrow_mut();
+            assert!(data.retain(prototype));
+            data.objects
+                .get_mut(&heap_id(object).unwrap())
+                .unwrap()
+                .prototype = Some(prototype);
+        }
+        let state = heap.enumerate(object).unwrap();
+        heap.release(object);
+        heap.release(prototype);
+        let first = heap.enumerate_next(state).unwrap().unwrap();
+        assert_eq!(heap.text(first).as_deref(), Some("own"));
+        heap.release(first);
+        let second = heap.enumerate_next(state).unwrap().unwrap();
+        assert_eq!(heap.text(second).as_deref(), Some("inherited"));
+        heap.release(second);
+        assert_eq!(heap.enumerate_next(state), Some(None));
+        heap.release(state);
+        heap.drain(100);
+        assert!(heap.0.borrow().objects.is_empty());
+        assert!(heap.0.borrow().enumerators.is_empty());
+    }
+
+    #[test]
+    fn unfinished_enumeration_releases_receiver_and_property_values() {
+        let heap = Heap::default();
+        let object = heap.object().unwrap();
+        let child = heap.object().unwrap();
+        assert!(heap.set_property(object, "child", child));
+        let state = heap.enumerate(object).unwrap();
+        heap.release(object);
+        heap.release(child);
+        heap.drain(100);
+        assert!(heap.valid(object));
+        assert!(heap.valid(child));
+        heap.release(state);
+        heap.drain(100);
+        assert!(!heap.valid(object));
+        assert!(!heap.valid(child));
+        assert!(heap.0.borrow().enumerators.is_empty());
+    }
+
+    #[test]
+    fn property_layout_revision_ignores_replacement() {
+        let mut table = PropertyTable::default();
+        table.set("x", Value::TRUE, None);
+        let revision = table.revision;
+        table.set("x", Value::FALSE, None);
+        assert_eq!(table.revision, revision);
+        table.set("x", Value::TRUE, Some(false));
+        assert_ne!(table.revision, revision);
+    }
+
+    #[test]
+    fn array_presence_distinguishes_holes_and_undefined() {
+        let heap = Heap::default();
+        let array = heap.array(&[Value::UNDEFINED, Value::UNDEFINED]).unwrap();
+        heap.mark_hole(array, 0);
+        assert_eq!(heap.has_property(array, "0"), Some(false));
+        assert_eq!(heap.has_property(array, "1"), Some(true));
+        assert_eq!(heap.has_property(array, "2"), Some(false));
+        heap.release(array);
+        heap.drain(100);
+    }
+
+    #[test]
+    fn instances_retain_prototypes_and_release_their_properties() {
+        let heap = Heap::default();
+        let constructor = heap.closure(CodeId(1), &[]).unwrap();
+        let prototype = heap.property(constructor, "prototype").unwrap();
+        let child = heap.object().unwrap();
+        assert!(heap.set_property(prototype, "child", child));
+        heap.release(child);
+        let instance = heap.constructed_object(constructor).unwrap();
+        heap.release(constructor);
+        heap.drain(100);
+        assert!(heap.valid(prototype));
+        assert_eq!(heap.property(instance, "child"), Some(child));
+        heap.release(instance);
+        heap.drain(100);
+        assert!(!heap.valid(prototype));
+        assert!(!heap.valid(child));
+    }
 
     #[test]
     fn arrow_and_generator_receivers_are_owned_and_released() {

@@ -60,7 +60,7 @@ fn host_file_results_and_errors_use_runtime_values() {
 #[test]
 fn compilation_errors_during_evaluation_leave_the_engine_usable() {
     let mut engine = engine();
-    engine.compile("function main() { hostEvaluateSource('class Unsupported {}', 'unsupported.js'); } function good() { return 42; }", "main.js").unwrap();
+    engine.compile("function main() { hostEvaluateSource('class Unsupported extends Base {}', 'unsupported.js'); } function good() { return 42; }", "main.js").unwrap();
     assert!(matches!(
         engine.call("main", &[]),
         Err(Error::Unsupported(_))

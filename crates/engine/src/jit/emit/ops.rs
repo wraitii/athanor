@@ -11,6 +11,8 @@ use super::FunctionCompiler;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum BinaryOp {
+    Instanceof,
+    In,
     BitwiseAnd,
     BitwiseOr,
     BitwiseXor,
@@ -46,6 +48,8 @@ pub(super) enum UnaryOp {
 impl BinaryOp {
     fn helper(self) -> Helper {
         match self {
+            Self::Instanceof => Helper::Instanceof,
+            Self::In => Helper::In,
             Self::BitwiseAnd => Helper::BitwiseAnd,
             Self::BitwiseOr => Helper::BitwiseOr,
             Self::BitwiseXor => Helper::BitwiseXor,
@@ -82,29 +86,30 @@ impl UnaryOp {
     }
 }
 
-pub(super) fn binary_operator(operator: BinaryOperator) -> Option<BinaryOp> {
+pub(super) fn binary_operator(operator: BinaryOperator) -> BinaryOp {
     match operator {
-        BinaryOperator::Equality => Some(BinaryOp::LooseEqual),
-        BinaryOperator::Inequality => Some(BinaryOp::LooseNotEqual),
-        BinaryOperator::StrictEquality => Some(BinaryOp::StrictEqual),
-        BinaryOperator::StrictInequality => Some(BinaryOp::StrictNotEqual),
-        BinaryOperator::LessThan => Some(BinaryOp::Less),
-        BinaryOperator::LessEqualThan => Some(BinaryOp::LessEqual),
-        BinaryOperator::GreaterThan => Some(BinaryOp::Greater),
-        BinaryOperator::GreaterEqualThan => Some(BinaryOp::GreaterEqual),
-        BinaryOperator::Addition => Some(BinaryOp::Add),
-        BinaryOperator::Subtraction => Some(BinaryOp::Sub),
-        BinaryOperator::Multiplication => Some(BinaryOp::Mul),
-        BinaryOperator::Division => Some(BinaryOp::Div),
-        BinaryOperator::Remainder => Some(BinaryOp::Rem),
-        BinaryOperator::Exponential => Some(BinaryOp::Pow),
-        BinaryOperator::BitwiseAnd => Some(BinaryOp::BitwiseAnd),
-        BinaryOperator::BitwiseOR => Some(BinaryOp::BitwiseOr),
-        BinaryOperator::BitwiseXOR => Some(BinaryOp::BitwiseXor),
-        BinaryOperator::ShiftLeft => Some(BinaryOp::ShiftLeft),
-        BinaryOperator::ShiftRight => Some(BinaryOp::ShiftRight),
-        BinaryOperator::ShiftRightZeroFill => Some(BinaryOp::ShiftRightUnsigned),
-        _ => None,
+        BinaryOperator::Instanceof => BinaryOp::Instanceof,
+        BinaryOperator::In => BinaryOp::In,
+        BinaryOperator::Equality => BinaryOp::LooseEqual,
+        BinaryOperator::Inequality => BinaryOp::LooseNotEqual,
+        BinaryOperator::StrictEquality => BinaryOp::StrictEqual,
+        BinaryOperator::StrictInequality => BinaryOp::StrictNotEqual,
+        BinaryOperator::LessThan => BinaryOp::Less,
+        BinaryOperator::LessEqualThan => BinaryOp::LessEqual,
+        BinaryOperator::GreaterThan => BinaryOp::Greater,
+        BinaryOperator::GreaterEqualThan => BinaryOp::GreaterEqual,
+        BinaryOperator::Addition => BinaryOp::Add,
+        BinaryOperator::Subtraction => BinaryOp::Sub,
+        BinaryOperator::Multiplication => BinaryOp::Mul,
+        BinaryOperator::Division => BinaryOp::Div,
+        BinaryOperator::Remainder => BinaryOp::Rem,
+        BinaryOperator::Exponential => BinaryOp::Pow,
+        BinaryOperator::BitwiseAnd => BinaryOp::BitwiseAnd,
+        BinaryOperator::BitwiseOR => BinaryOp::BitwiseOr,
+        BinaryOperator::BitwiseXOR => BinaryOp::BitwiseXor,
+        BinaryOperator::ShiftLeft => BinaryOp::ShiftLeft,
+        BinaryOperator::ShiftRight => BinaryOp::ShiftRight,
+        BinaryOperator::ShiftRightZeroFill => BinaryOp::ShiftRightUnsigned,
     }
 }
 
@@ -320,6 +325,25 @@ impl FunctionCompiler<'_, '_> {
         result
     }
 
+    pub(super) fn global_get_optional(&mut self, name: &str) -> ClifValue {
+        let name: Box<str> = name.into();
+        let ptr = self.b.ins().iconst(self.pointer, name.as_ptr() as i64);
+        let len = self.b.ins().iconst(types::I64, name.len() as i64);
+        self.names.push(name);
+        let value = self.call_helper(Helper::GlobalGetOptional, &[ptr, len]);
+        self.check_error();
+        value
+    }
+
+    pub(super) fn global_initialize(&mut self, name: &str, value: ClifValue) {
+        let name: Box<str> = name.into();
+        let ptr = self.b.ins().iconst(self.pointer, name.as_ptr() as i64);
+        let len = self.b.ins().iconst(types::I64, name.len() as i64);
+        self.names.push(name);
+        self.call_helper(Helper::GlobalInitialize, &[ptr, len, value]);
+        self.check_error();
+    }
+
     pub(super) fn property_access(
         &mut self,
         object: ClifValue,
@@ -336,6 +360,20 @@ impl FunctionCompiler<'_, '_> {
         };
         self.check_error();
         result
+    }
+
+    pub(super) fn define_hidden_property(
+        &mut self,
+        object: ClifValue,
+        name: &str,
+        value: ClifValue,
+    ) {
+        let name: Box<str> = name.into();
+        let ptr = self.b.ins().iconst(self.pointer, name.as_ptr() as i64);
+        let len = self.b.ins().iconst(types::I64, name.len() as i64);
+        self.names.push(name);
+        self.call_helper(Helper::PropertyDefineHidden, &[object, ptr, len, value]);
+        self.check_error();
     }
 
     pub(super) fn check_error(&mut self) {

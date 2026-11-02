@@ -79,9 +79,9 @@ with `(value, index, array)`, observing intervening writes and truncation. Their
 optional `thisArg` is unsupported except for undefined. `join` supports primitive
 values and separators; object-to-string conversion is unsupported.
 
-Ordinary object literals currently use reference-counted allocations containing
-a map of UTF-8 names to owned values, sharing property storage and incremental
-disposal with Error instances. Literals evaluate properties in source order;
+Ordinary object literals use reference-counted allocations with ordered property
+slots and a hash index, sharing property storage and incremental disposal with
+Error instances and closures. Literals evaluate properties in source order;
 shorthand, nested values, primitive computed keys, and duplicate-key replacement
 are supported. Dot and bracket reads return undefined for absent properties;
 stores retain the new value before releasing the old one. Objects preserve
@@ -89,8 +89,9 @@ identity and aliasing, and cycles share the existing collection limitation.
 
 Accessors, method shorthand, spread, and prototype-setting literal properties
 are explicitly rejected. Computed and shorthand __proto__ keys are ordinary
-properties. Object-to-property-key conversion remains unsupported. No prototype
-lookup, property descriptors, or enumeration order is implemented.
+properties. Object-to-property-key conversion remains unsupported. Ordinary objects follow internal prototype links on reads; own properties,
+including undefined values, stop lookup. Property enumerability is tracked;
+other property descriptor attributes remain unsupported.
 
 The intended optimized layout is interned property names, shared
 shapes mapping names to slots, and contiguous value slots. Begin with helper
@@ -167,8 +168,7 @@ Captured lexical reads and writes check initialization; declarations initialize
 cells separately from assignment. Assignment to const bindings is rejected.
 Block-local captures get fresh cells each time the block executes. Captured
 lexical bindings in a for-loop initializer are explicitly rejected until
-per-iteration environments are implemented. Nested named functions/declarations,
-implicit `arguments`, and async functions remain unsupported. Recursion through a
+per-iteration environments are implemented. Named function expressions and async functions remain unsupported. Recursion through a
 captured variable works but can create cycles.
 
 Each engine has one global environment and one code registry. A closure's heap
@@ -216,9 +216,14 @@ invoke next. Completion releases it after protecting the return value; abandoned
 generators release it during disposal. Arrows created in generator bodies follow
 the same lexical capture rules and can outlive completion.
 
-Function.prototype.call, apply, bind, prototype lookup, and super remain
-unsupported. Basic construction binds a fresh object but does not yet establish
-a prototype chain. Array callbacks still reject a non-undefined thisArg.
+Function.prototype.call, apply, bind, and super remain unsupported. Ordinary
+closures have writable named properties and lazily materialize a stable prototype
+object. Construction links the instance to the current constructor prototype;
+primitive prototype values fall back to a null internal prototype. Object.prototype
+and the default prototype.constructor back-reference remain unimplemented.
+Exotic constructor prototype values (arrays, functions, and native heap kinds)
+remain unsupported. Prototype links and function properties own their values
+and participate in incremental disposal; cycles retain the existing limitation. Array callbacks still reject a non-undefined thisArg.
 
 ## Limited synchronous generators
 
@@ -283,8 +288,7 @@ functions, represented by checked heap handles carrying a NativeFunction enum.
 Constructor aliases and reassignment use the same global bindings as other
 functions. Calling Error without new also creates an error. Ordinary compiled
 functions can also construct a fresh object and receive it as this. An object return replaces that instance; primitive returns keep it.
-Arrow and generator functions reject construction. Prototype links remain
-unsupported.
+Arrow and generator functions reject construction.
 
 Error instances have identity and reference-counted named properties, initially
 name and message. Both are writable; absent properties read as undefined.
@@ -292,7 +296,7 @@ The default name is Error, and an omitted or undefined message becomes an empty
 string. Primitive messages convert to strings; arbitrary object conversion is
 still unsupported. Errors support string concatenation and uncaught diagnostics
 using the current name and message. Stack traces, Error.prototype, explicit
-toString methods, subclassing, and instanceof remain unsupported.
+toString methods and subclassing remain unsupported.
 
 Error property stores retain before releasing overwritten values. Disposal
 processes one outgoing property edge at a time, under the existing budget.
@@ -453,3 +457,181 @@ SpiderMonkey runner. Measure allocation volume, retained/pending bytes,
 retain/release traffic, native-call overhead, and worst collection slices on
 long-lived workloads; a successful small map does not establish simulation
 latency or memory behavior.
+
+## Instance checks and diagnostics
+
+Ordinary instanceof checks walk internal object prototype links against the
+right operand's current prototype property. Primitive left operands return false
+for compiled functions. Invalid right operands and non-object prototypes report
+engine runtime errors rather than catchable TypeErrors. Bound functions, proxies,
+and Symbol.hasInstance are unsupported. Native Array has a global callable
+identity for instanceof checks, including aliases; these checks use the array
+heap kind. Array construction, mutable Array.prototype, and builtin inheritance
+remain unsupported, as do instanceof checks against other native constructors.
+
+Compilation errors and unsupported-feature errors include the source filename
+and byte span. All parsed binary operator kinds now have lowering paths.
+Runtime errors do not yet carry source locations or stack traces.
+
+## Default parameters
+
+Identifier parameters support lazy default expressions for missing or undefined
+arguments, in left-to-right order. Defaults can use earlier parameters, globals,
+and captured bindings. Captures are installed before parameter initialization.
+Parameter bindings in functions with defaults begin uninitialized. Destructured
+parameters remain unsupported. Generator default parameters are explicitly
+rejected until initialization can run at factory call time rather than first next.
+
+## Property presence
+
+The in operator uses a runtime presence lookup, preserving properties whose
+values are undefined and following ordinary object prototype links. Closures
+expose named properties and their lazy constructor prototype. Arrays recognize
+present canonical indices, excluding holes, and the supported length, filter,
+map, and join properties. globalThis checks global binding presence. Primitive
+right operands, unsupported native receivers, and object-to-key conversion
+report explicit engine errors. Proxies and additional builtin prototypes remain
+unsupported.
+
+## Basic classes
+
+Named class declarations at script and block scope lower to ordinary closures
+and prototype objects. Explicit constructors and synthesized empty constructors
+require new; instance methods are shared non-constructable closures. Class-name
+references capture a separate inner binding, retaining the original constructor
+when the outer binding is reassigned. Assignments to the inner name are rejected
+at compilation rather than producing a catchable TypeError. Outer bindings remain
+uninitialized until declaration evaluation; local reads check initialization.
+
+Inheritance, super, class expressions, static methods and blocks, fields,
+accessors, private names, computed or literal method names, decorators, async
+methods, and generator methods remain unsupported. Methods and the prototype constructor back-reference are nonenumerable and use
+ordinary writable property storage; the class prototype property remains writable.
+Other property descriptor attributes are not implemented.
+Top-level class bindings currently share the global object binding storage.
+
+The prototype constructor back-reference forms a strong cycle. Class graphs,
+including their captures, therefore share the existing limitation of remaining
+allocated until runtime teardown unless their cycles are explicitly broken.
+They do not retain the engine or runtime itself. Cycle collection remains
+required before persistent workloads can reclaim these graphs automatically.
+
+## Array destructuring declarations
+
+Function-local var, let, and const declarations accept flat array patterns with
+identifier bindings and elisions. The initializer is evaluated once and uses
+the same array and scalar-string iteration as for-of; exhausted elements become
+undefined. Captured bindings use the existing cells. Defaults, rest, nested
+patterns, assignment patterns, custom iterables, and top-level destructuring
+remain unsupported. Iterator closing is not implemented.
+
+## Top-level lexical declarations
+
+Top-level identifier let and const declarations have a separate global lexical
+store shared by subsequent source evaluations. Bindings are installed before
+initializers execute, remain uninitialized until their declaration executes,
+and reject reads or writes in the temporal dead zone. Let bindings are mutable;
+const assignments fail. Same-source const writes may be rejected at compilation,
+while cross-source writes fail at runtime. Neither binding appears as a
+property of globalThis. Host Environment::get resolves lexical bindings, while
+Environment::set and define operate on object bindings.
+
+Cross-source redeclarations conflicting with lexical bindings are rejected.
+Lexical declarations also reject existing object bindings, including builtins;
+this is stricter than JavaScript's property-descriptor-dependent rules. Failed
+initializers leave their bindings installed and possibly uninitialized. Global
+class declarations still use the older global object storage. Top-level
+destructuring and catchable TypeErrors for const writes remain unsupported.
+
+## Spread arguments
+
+Calls and construction accept spread arguments mixed with ordinary arguments.
+The callee and receiver are evaluated once, then arguments expand in source
+order into an owned temporary array before invocation. Arrays and strings use
+the existing iteration behavior; other iterables fail explicitly. Expanded
+values remain owned through later argument evaluation and the call. Custom
+iterators, iterator closing, and array or object literal spread remain
+unsupported. Calls without spread retain the fixed-argument path.
+
+
+## Implicit arguments
+
+Ordinary functions that reference implicit arguments create an owned snapshot of
+the supplied arguments, independently of parameter bindings. Nested arrows
+share that binding through capture cells, including after the outer call exits.
+Constructors and generator resumes use the same mechanism. Explicit bindings
+named arguments follow ordinary name resolution.
+
+The snapshot uses the supported array representation, so it exposes array
+identity and methods and inherits its dense index and length restrictions; it is
+not a JavaScript arguments exotic object. Parameter aliasing, descriptors, callee,
+and the complete arguments prototype and iterator semantics are unsupported.
+
+## Math
+
+The global Math object has stable native methods for abs, ceil, floor, round,
+trunc, sqrt, sin, cos, tan, asin, acos, atan, atan2, exp, log, pow, min, max,
+imul, and sign, plus PI and E. Methods ignore their receiver. Numeric, boolean,
+null, and undefined arguments use the engine's primitive number conversion;
+string and object coercions are explicitly unsupported. Min and max preserve
+signed zero and propagate NaN; round uses ties toward positive infinity.
+
+Math and its properties use ordinary mutable global and object storage; the
+standard property descriptors are not implemented. Transcendental results use
+Rust's platform math implementation. Other Math operations, including random,
+are unsupported; deterministic random state and seeding need a separate design.
+The game's square and clamp helpers are defined by its globalscript rather than
+being native Math methods.
+
+## JSON
+
+JSON.parse accepts string input and constructs owned primitive values, arrays,
+and ordinary objects. JSON.stringify supports these values, omits undefined and
+callable object properties, substitutes null for undefined or callable array
+entries and non-finite numbers, and rejects cycles. Repeated references that do
+not form cycles are supported. JSON and its two native methods have stable
+identity and use ordinary mutable object properties.
+
+Object properties are emitted in the engine's ordered enumerable own-property
+order. Number formatting follows serde_json and can differ
+from ECMAScript exponent formatting. Parsing uses serde_json's nesting and
+numeric-range limits; lone surrogate escapes cannot be represented. Stringify
+limits nesting to 128. Revivers, replacers, spacing, callable toJSON methods,
+non-string parse input, and exotic heap objects are explicitly unsupported.
+Errors are engine errors rather than catchable JavaScript exceptions.
+
+
+## Nested function declarations
+
+Function-body declarations are initialized after parameters and before body
+statements, sharing function bindings with var declarations. Declarations in
+nested blocks are initialized on block entry and have lexical block scope.
+Closures share captured cells, supporting self recursion, mutual recursion, and
+escaping declarations; recursive closure cycles retain the existing collection
+limitation. Nested generators use the existing generator machinery. Named
+function expressions and declarations used directly as non-block statements
+remain unsupported, and sloppy Annex B block-function semantics are not modeled.
+
+
+## Ordered properties and for-in
+
+Objects and closures use insertion-ordered property slots indexed by name.
+Canonical array indices through 4294967294 enumerate first in numeric order;
+other names follow insertion order. Replacing a value preserves order and
+enumerability. Layout revision changes when a property is added or its
+enumerability changes. Function prototypes, class methods and constructor,
+Math and JSON builtins, and Error name and message are nonenumerable. Other
+descriptor attributes and property deletion are unsupported.
+
+For-in snapshots each receiver's own keys as it is reached, checks presence and
+enumerability when visiting each key, and suppresses previously seen names
+across the prototype chain. Nonenumerable own names suppress inherited names.
+The owned enumeration state retains its current receiver and is released with
+the frame or loop slot. Added keys need not appear after their receiver has
+been snapshotted. Arrays expose present indices; truncation and holes are
+observed. Null, undefined, numbers, and booleans have no keys. Strings and
+exotic receivers are rejected. Identifier var, let, and const loop bindings
+are supported, including fresh captured lexical bindings. Assignment targets,
+destructuring, proxies, symbols, and prototype mutation are unsupported.
+Generator loops without suspension are supported; nested yields are rejected by
+the generator planner.

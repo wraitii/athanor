@@ -1,5 +1,7 @@
 mod array;
 mod host;
+pub(super) mod json;
+pub(super) mod math;
 mod string;
 
 use super::session::JitCtx;
