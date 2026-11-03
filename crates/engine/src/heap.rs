@@ -45,6 +45,12 @@ pub(crate) enum PropertyRead {
     Prototype,
 }
 
+pub(crate) enum IndexRead {
+    Primitive(Value),
+    Borrowed(Value),
+    Character(char),
+}
+
 pub(crate) const GENERATOR_DONE: usize = usize::MAX;
 pub(crate) const GENERATOR_RUNNING: usize = usize::MAX - 1;
 
@@ -1441,6 +1447,40 @@ impl Heap {
         self.0.borrow_mut().release(value);
     }
 
+    pub(crate) fn read_numeric_index(&self, receiver: Value, number: f64) -> Option<IndexRead> {
+        let data = self.0.borrow();
+        let payload = &data.live(heap_id(receiver)?)?.payload;
+        match payload {
+            Payload::TypedArray(array) => {
+                let value = element_index(number, usize::MAX as f64)
+                    .and_then(|index| array.storage.get(index))
+                    .map(Value::number)
+                    .unwrap_or(Value::UNDEFINED);
+                Some(IndexRead::Primitive(value))
+            }
+            Payload::Array(array) => {
+                let index = element_index(number, u32::MAX as f64)?;
+                let value = array
+                    .elements
+                    .get(index)
+                    .copied()
+                    .unwrap_or(Value::UNDEFINED);
+                Some(if value.is_string() || value.is_object() {
+                    IndexRead::Borrowed(value)
+                } else {
+                    IndexRead::Primitive(value)
+                })
+            }
+            Payload::String(text) => Some(
+                element_index(number, u32::MAX as f64)
+                    .and_then(|index| text.chars().nth(index))
+                    .map(IndexRead::Character)
+                    .unwrap_or(IndexRead::Primitive(Value::UNDEFINED)),
+            ),
+            _ => None,
+        }
+    }
+
     pub(crate) fn get(&self, array: Value, index: usize) -> Option<Value> {
         let data = self.0.borrow();
         let id = heap_id(array)?;
@@ -1622,6 +1662,11 @@ impl Heap {
             budget -= 1;
         }
     }
+}
+
+fn element_index(number: f64, limit: f64) -> Option<usize> {
+    (number.is_finite() && number >= 0.0 && number < limit && number.fract() == 0.0)
+        .then_some(number as usize)
 }
 
 fn heap_id(value: Value) -> Option<u64> {

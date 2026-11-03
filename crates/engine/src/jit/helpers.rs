@@ -1,7 +1,7 @@
 use cranelift_codegen::ir::{AbiParam, Signature, Type, types};
 use cranelift_codegen::isa::CallConv;
 
-use crate::heap::PropertyRead;
+use crate::heap::{IndexRead, PropertyRead};
 use crate::value::Value;
 
 use super::session::JitCtx;
@@ -674,6 +674,22 @@ fn typed_numeric_index(ctx: &JitCtx, key: Value) -> Option<Option<usize>> {
 
 extern "C" fn js_index_get(ctx: *mut JitCtx, array: Value, index: Value) -> Value {
     let ctx = unsafe { &mut *ctx };
+    if let Some(number) = index.as_number() {
+        match ctx.global.heap().read_numeric_index(array, number) {
+            Some(IndexRead::Primitive(value)) => return value,
+            Some(IndexRead::Borrowed(value)) => return ctx.retain_temp(value),
+            Some(IndexRead::Character(character)) => {
+                return match ctx.global.heap().string(character.encode_utf8(&mut [0; 4])) {
+                    Some(value) => ctx.own(value),
+                    None => {
+                        ctx.error = Some(crate::Error::Runtime("string heap exhausted".into()));
+                        Value::UNDEFINED
+                    }
+                };
+            }
+            None => {}
+        }
+    }
     if ctx.global.heap().typed_kind(array).is_some() {
         if let Some(index) = typed_numeric_index(ctx, index) {
             return index
