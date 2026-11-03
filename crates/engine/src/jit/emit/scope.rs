@@ -212,6 +212,8 @@ impl FunctionCompiler<'_, '_> {
             .b
             .ins()
             .icmp_imm(IntCC::UnsignedLessThanOrEqual, offset, 2);
+        let inst = self.b.func.dfg.value_def(needs_helper).unwrap_inst();
+        self.annotations.retain_guards.insert(inst, value);
         let fast = self.b.create_block();
         let slow = self.b.create_block();
         let done = self.b.create_block();

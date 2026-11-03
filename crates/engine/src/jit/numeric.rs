@@ -1,7 +1,9 @@
+use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use std::collections::VecDeque;
 
 use cranelift_codegen::ir::{
-    Block, Function, Inst, InstBuilder, InstructionData, Opcode, Value, ValueDef,
+    Block, FuncRef, Function, Inst, InstBuilder, InstructionData, MemFlags, Opcode, Value,
+    ValueDef, types,
 };
 use rustc_hash::FxHashMap as HashMap;
 
@@ -10,14 +12,50 @@ use super::helpers::Helper;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Kind {
     Number,
+    Int32,
+    OtherNumber,
+    NaN,
     Other,
+}
+
+impl Kind {
+    pub(super) fn of_constant(value: crate::value::Value) -> Self {
+        let Some(number) = value.as_number() else {
+            return Self::Other;
+        };
+        if number.is_nan() {
+            return Self::NaN;
+        }
+        if number == (number as i32) as f64 && !(number == 0.0 && number.is_sign_negative()) {
+            return Self::Int32;
+        }
+        Self::OtherNumber
+    }
+
+    pub(super) fn is_number(self) -> bool {
+        self != Self::Other
+    }
+}
+
+fn join(left: Option<Kind>, right: Option<Kind>) -> Option<Kind> {
+    let (Some(left), Some(right)) = (left, right) else {
+        return None;
+    };
+    if left == right {
+        return Some(left);
+    }
+    (left.is_number() && right.is_number()).then_some(Kind::Number)
 }
 
 #[derive(Clone, Default)]
 pub(super) struct Annotations {
     pub constants: HashMap<Value, Kind>,
+    pub results: HashMap<Value, Kind>,
+    pub continuations: HashMap<Block, Vec<(Value, Kind)>>,
     pub helpers: HashMap<Inst, Helper>,
     pub guards: HashMap<Inst, Value>,
+    pub int32_guards: HashMap<Inst, Value>,
+    pub retain_guards: HashMap<Inst, Value>,
 }
 
 #[derive(Clone)]
@@ -32,6 +70,9 @@ pub(super) struct Analysis {
     // A missing block is unreachable; a missing value kind is unknown.
     entries: Vec<Option<Facts>>,
     guards: Vec<(Inst, Value, Option<Kind>)>,
+    retain_guards: Vec<Inst>,
+    int32_guards: Vec<(Inst, bool)>,
+    numeric_index_gets: Vec<Inst>,
 }
 
 fn value_kind(function: &Function, facts: &Facts, value: Value) -> Option<Kind> {
@@ -47,7 +88,12 @@ fn set_kind(function: &Function, facts: &mut Facts, value: Value, kind: Option<K
     }
 }
 
-fn block_facts(function: &Function, block: Block, entry: &Facts) -> Facts {
+fn block_facts(
+    function: &Function,
+    annotations: &Annotations,
+    block: Block,
+    entry: &Facts,
+) -> Facts {
     let mut facts = entry.clone();
     // Backedges must not reuse facts from this block's previous execution.
     for inst in function.layout.block_insts(block) {
@@ -55,12 +101,17 @@ fn block_facts(function: &Function, block: Block, entry: &Facts) -> Facts {
             facts.remove(&function.dfg.resolve_aliases(result));
         }
     }
+    if let Some(values) = annotations.continuations.get(&block) {
+        for &(value, kind) in values {
+            set_kind(function, &mut facts, value, Some(kind));
+        }
+    }
     facts
 }
 
 fn helper_kind(function: &Function, facts: &Facts, inst: Inst, helper: Helper) -> Option<Kind> {
     let args = function.dfg.inst_args(inst);
-    let number = |index| value_kind(function, facts, args[index]) == Some(Kind::Number);
+    let number = |index| value_kind(function, facts, args[index]).is_some_and(Kind::is_number);
     match helper {
         Helper::Add | Helper::Sub | Helper::Mul | Helper::Div | Helper::Rem | Helper::Pow
             if number(1) && number(2) =>
@@ -92,14 +143,18 @@ fn transfer(function: &Function, annotations: &Annotations, facts: &mut Facts, i
     let Some(&result) = function.dfg.inst_results(inst).first() else {
         return;
     };
-    let kind = if let Some(kind) = annotations.constants.get(&result) {
+    let kind = if let Some(kind) = annotations
+        .constants
+        .get(&result)
+        .or_else(|| annotations.results.get(&result))
+    {
         Some(*kind)
     } else if let Some(&helper) = annotations.helpers.get(&inst) {
         helper_kind(function, facts, inst, helper)
     } else if function.dfg.insts[inst].opcode() == Opcode::Select {
         let args = function.dfg.inst_args(inst);
         let left = value_kind(function, facts, args[1]);
-        left.filter(|_| left == value_kind(function, facts, args[2]))
+        join(left, value_kind(function, facts, args[2]))
     } else {
         None
     };
@@ -122,8 +177,18 @@ fn assume_condition(
             function,
             facts,
             value,
-            Some(if truth { Kind::Number } else { Kind::Other }),
+            Some(if truth {
+                value_kind(function, facts, value)
+                    .filter(|kind| kind.is_number())
+                    .unwrap_or(Kind::Number)
+            } else {
+                Kind::Other
+            }),
         );
+    } else if let Some(&value) = annotations.int32_guards.get(&inst) {
+        if truth {
+            set_kind(function, facts, value, Some(Kind::Int32));
+        }
     } else if truth && function.dfg.insts[inst].opcode() == Opcode::Band {
         for &arg in function.dfg.inst_args(inst) {
             assume_condition(function, annotations, facts, arg, true);
@@ -136,9 +201,17 @@ fn meet(target: &mut Option<Facts>, incoming: Facts) -> bool {
         *target = Some(incoming);
         return true;
     };
-    let previous = target.len();
-    target.retain(|value, kind| incoming.get(value) == Some(kind));
-    target.len() != previous
+    let mut changed = false;
+    target.retain(|value, kind| {
+        let merged = join(Some(*kind), incoming.get(value).copied());
+        changed |= merged != Some(*kind);
+        if let Some(merged) = merged {
+            *kind = merged;
+            return true;
+        }
+        false
+    });
+    changed
 }
 
 impl Analysis {
@@ -148,6 +221,9 @@ impl Analysis {
             return Self {
                 entries,
                 guards: Vec::new(),
+                retain_guards: Vec::new(),
+                int32_guards: Vec::new(),
+                numeric_index_gets: Vec::new(),
             };
         };
         entries[entry.as_u32() as usize] = Some(Facts::default());
@@ -158,6 +234,7 @@ impl Analysis {
             queued[block.as_u32() as usize] = false;
             let mut facts = block_facts(
                 function,
+                annotations,
                 block,
                 entries[block.as_u32() as usize].as_ref().unwrap(),
             );
@@ -192,12 +269,21 @@ impl Analysis {
             }
         }
         let mut guards = Vec::new();
+        let mut retain_guards = Vec::new();
+        let mut int32_guards = Vec::new();
+        let mut numeric_index_gets = Vec::new();
         for block in function.layout.blocks() {
             let Some(entry) = &entries[block.as_u32() as usize] else {
                 continue;
             };
-            let mut facts = block_facts(function, block, entry);
+            let mut facts = block_facts(function, annotations, block, entry);
             for inst in function.layout.block_insts(block) {
+                if annotations.helpers.get(&inst) == Some(&Helper::IndexGet) {
+                    let index = function.dfg.inst_args(inst)[2];
+                    if value_kind(function, &facts, index).is_some_and(Kind::is_number) {
+                        numeric_index_gets.push(inst);
+                    }
+                }
                 if let Some(&value) = annotations.guards.get(&inst) {
                     guards.push((
                         inst,
@@ -205,10 +291,42 @@ impl Analysis {
                         value_kind(function, &facts, value),
                     ));
                 }
+                if let Some(&value) = annotations.int32_guards.get(&inst) {
+                    if let Some(kind) = value_kind(function, &facts, value) {
+                        if kind != Kind::Number {
+                            int32_guards.push((inst, kind == Kind::Int32));
+                        }
+                    }
+                }
+                if let Some(&value) = annotations.retain_guards.get(&inst) {
+                    if value_kind(function, &facts, value).is_some_and(Kind::is_number) {
+                        retain_guards.push(inst);
+                    }
+                }
                 transfer(function, annotations, &mut facts, inst);
             }
         }
-        Self { entries, guards }
+        Self {
+            entries,
+            guards,
+            retain_guards,
+            int32_guards,
+            numeric_index_gets,
+        }
+    }
+
+    pub fn specialize_index_gets(&self, function: &mut Function, helper: FuncRef) {
+        for &inst in &self.numeric_index_gets {
+            let args = function.dfg.inst_args(inst).to_vec();
+            let mut cursor = FuncCursor::new(function).at_inst(inst);
+            cursor.use_srcloc(inst);
+            let index = cursor.ins().bitcast(types::F64, MemFlags::new(), args[2]);
+            cursor
+                .func
+                .dfg
+                .replace(inst)
+                .call(helper, &[args[0], args[1], index]);
+        }
     }
 
     pub fn simplify(&self, function: &mut Function) -> usize {
@@ -219,7 +337,17 @@ impl Analysis {
             function
                 .dfg
                 .replace(inst)
-                .iconst(ty, i64::from(kind == Kind::Number));
+                .iconst(ty, i64::from(kind.is_number()));
+            count += 1;
+        }
+        for &(inst, exact) in &self.int32_guards {
+            let ty = function.dfg.value_type(function.dfg.first_result(inst));
+            function.dfg.replace(inst).iconst(ty, i64::from(exact));
+            count += 1;
+        }
+        for &inst in &self.retain_guards {
+            let ty = function.dfg.value_type(function.dfg.first_result(inst));
+            function.dfg.replace(inst).iconst(ty, 0);
             count += 1;
         }
         count
@@ -235,6 +363,12 @@ impl Analysis {
                 .count(),
             annotations.helpers.len()
         );
+        eprintln!(
+            "  {} numeric local reads need no retain",
+            self.retain_guards.len()
+        );
+        eprintln!("  {} int32 guards proven", self.int32_guards.len());
+        eprintln!("  {} numeric index getters", self.numeric_index_gets.len());
         for block in function.layout.blocks() {
             let Some(facts) = &self.entries[block.as_u32() as usize] else {
                 continue;
@@ -266,14 +400,9 @@ mod tests {
         value: JsValue,
     ) -> Value {
         let result = b.ins().iconst(types::I64, value.bits() as i64);
-        annotations.constants.insert(
-            result,
-            if value.is_number() {
-                Kind::Number
-            } else {
-                Kind::Other
-            },
-        );
+        annotations
+            .constants
+            .insert(result, Kind::of_constant(value));
         result
     }
 
@@ -323,6 +452,110 @@ mod tests {
     }
 
     #[test]
+    fn classifies_numeric_constants_without_losing_negative_zero() {
+        for number in [0.0, -1.0, i32::MIN as f64, i32::MAX as f64] {
+            assert_eq!(Kind::of_constant(JsValue::number(number)), Kind::Int32);
+        }
+        for number in [
+            -0.0,
+            0.5,
+            i32::MIN as f64 - 1.0,
+            i32::MAX as f64 + 1.0,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            assert_eq!(
+                Kind::of_constant(JsValue::number(number)),
+                Kind::OtherNumber
+            );
+        }
+        assert_eq!(Kind::of_constant(JsValue::number(f64::NAN)), Kind::NaN);
+        assert_eq!(Kind::of_constant(JsValue::UNINITIALIZED), Kind::Other);
+    }
+
+    #[test]
+    fn bitwise_contracts_distinguish_signed_and_unsigned_results() {
+        for helper in [
+            Helper::BitwiseAnd,
+            Helper::BitwiseOr,
+            Helper::BitwiseXor,
+            Helper::ShiftLeft,
+            Helper::ShiftRight,
+            Helper::BitwiseNot,
+        ] {
+            assert_eq!(helper.result_kind_on_success(), Some(Kind::Int32));
+        }
+        assert_eq!(
+            Helper::ShiftRightUnsigned.result_kind_on_success(),
+            Some(Kind::Number)
+        );
+        assert_eq!(Helper::Add.result_kind_on_success(), None);
+    }
+
+    #[test]
+    fn joins_numeric_subtypes_and_reports_widening() {
+        let value = Value::from_u32(0);
+        for left in [
+            Kind::Int32,
+            Kind::OtherNumber,
+            Kind::NaN,
+            Kind::Number,
+            Kind::Other,
+        ] {
+            for right in [
+                Kind::Int32,
+                Kind::OtherNumber,
+                Kind::NaN,
+                Kind::Number,
+                Kind::Other,
+            ] {
+                let expected = if left == right {
+                    Some(left)
+                } else if left.is_number() && right.is_number() {
+                    Some(Kind::Number)
+                } else {
+                    None
+                };
+                assert_eq!(join(Some(left), Some(right)), expected);
+                let mut target = Some(HashMap::from_iter([(value, left)]));
+                assert_eq!(
+                    meet(&mut target, HashMap::from_iter([(value, right)])),
+                    expected != Some(left)
+                );
+                assert_eq!(target.unwrap().get(&value).copied(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn numeric_guard_preserves_subtype_on_success() {
+        for number in [3.0, -0.0, f64::NAN] {
+            let body = build(|b, annotations| {
+                let value = constant(b, annotations, JsValue::number(number));
+                let yes = b.create_block();
+                let no = b.create_block();
+                let condition = guard(b, annotations, value);
+                b.ins().brif(condition, yes, &[], no, &[]);
+                b.switch_to_block(yes);
+                let condition = guard(b, annotations, value);
+                b.ins().return_(&[condition]);
+                b.switch_to_block(no);
+                let condition = b.ins().iconst(types::I8, 0);
+                b.ins().return_(&[condition]);
+            });
+            assert_eq!(
+                kinds(&body),
+                [Some(Kind::of_constant(JsValue::number(number))); 2]
+            );
+            let mut function = body.function.clone();
+            assert_eq!(
+                Analysis::compute(&function, &body.annotations).simplify(&mut function),
+                2
+            );
+        }
+    }
+
+    #[test]
     fn distinguishes_boxed_constants_from_raw_integers() {
         let body = build(|b, annotations| {
             let number = constant(b, annotations, JsValue::number(3.0));
@@ -333,7 +566,7 @@ mod tests {
             let condition = guard(b, annotations, raw);
             b.ins().return_(&[condition]);
         });
-        assert_eq!(kinds(&body), [Some(Kind::Number), Some(Kind::Other), None]);
+        assert_eq!(kinds(&body), [Some(Kind::Int32), Some(Kind::Other), None]);
         let mut copy = body.clone();
         let analysis = Analysis::compute(&copy.function, &copy.annotations);
         assert_eq!(analysis.simplify(&mut copy.function), 2);
@@ -342,7 +575,66 @@ mod tests {
             &cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder()),
         )
         .unwrap();
-        assert_eq!(kinds(&body), [Some(Kind::Number), Some(Kind::Other), None]);
+        assert_eq!(kinds(&body), [Some(Kind::Int32), Some(Kind::Other), None]);
+    }
+
+    #[test]
+    fn continuation_facts_do_not_escape_failure_or_merge() {
+        let body = build(|b, annotations| {
+            let params = b.block_params(b.current_block().unwrap()).to_vec();
+            let success = b.create_block();
+            let failure = b.create_block();
+            let join = b.create_block();
+            annotations
+                .continuations
+                .insert(success, vec![(params[0], Kind::Number)]);
+            guard(b, annotations, params[0]);
+            b.ins().brif(params[2], success, &[], failure, &[]);
+            b.switch_to_block(success);
+            guard(b, annotations, params[0]);
+            b.ins().jump(join, &[]);
+            b.switch_to_block(failure);
+            guard(b, annotations, params[0]);
+            b.ins().jump(join, &[]);
+            b.switch_to_block(join);
+            let condition = guard(b, annotations, params[0]);
+            b.ins().return_(&[condition]);
+        });
+        assert_eq!(kinds(&body), [None, Some(Kind::Number), None, None]);
+    }
+
+    #[test]
+    fn removes_retain_guards_only_for_proven_numbers() {
+        let body = build(|b, annotations| {
+            let unknown = b.block_params(b.current_block().unwrap())[0];
+            let number = constant(b, annotations, JsValue::number(3.0));
+            let uninitialized = constant(b, annotations, JsValue::UNINITIALIZED);
+            for value in [number, uninitialized, unknown] {
+                let tag = b.ins().ushr_imm(value, TAG_SHIFT as i64);
+                let offset = b
+                    .ins()
+                    .iadd_imm(tag, -((crate::value::TAG_OBJECT >> TAG_SHIFT) as i64));
+                let condition = b.ins().icmp_imm(
+                    cranelift_codegen::ir::condcodes::IntCC::UnsignedLessThanOrEqual,
+                    offset,
+                    2,
+                );
+                annotations
+                    .retain_guards
+                    .insert(b.func.dfg.value_def(condition).unwrap_inst(), value);
+            }
+            let condition = guard(b, annotations, unknown);
+            b.ins().return_(&[condition]);
+        });
+        let analysis = Analysis::compute(&body.function, &body.annotations);
+        assert_eq!(analysis.retain_guards.len(), 1);
+        let mut function = body.function.clone();
+        assert_eq!(analysis.simplify(&mut function), 1);
+        cranelift_codegen::verify_function(
+            &function,
+            &cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder()),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -385,7 +677,7 @@ mod tests {
         });
         let value = *body.annotations.guards.values().next().unwrap();
         assert_ne!(value, body.function.dfg.resolve_aliases(value));
-        assert_eq!(kinds(&body), [Some(Kind::Number)]);
+        assert_eq!(kinds(&body), [Some(Kind::Int32)]);
     }
 
     #[test]
@@ -414,7 +706,12 @@ mod tests {
 
     #[test]
     fn loop_facts_include_backedges_and_frontend_aliases() {
-        for mixed in [false, true] {
+        for (next_value, expected) in [
+            (JsValue::number(1.0), Some(Kind::Int32)),
+            (JsValue::number(-0.0), Some(Kind::Number)),
+            (JsValue::number(f64::NAN), Some(Kind::Number)),
+            (JsValue::FALSE, None),
+        ] {
             let body = build(|b, annotations| {
                 let flag = b.block_params(b.current_block().unwrap())[2];
                 let variable = b.declare_var(types::I64);
@@ -429,24 +726,13 @@ mod tests {
                 let condition = guard(b, annotations, value);
                 b.ins().brif(flag, backedge, &[], exit, &[]);
                 b.switch_to_block(backedge);
-                let next = constant(
-                    b,
-                    annotations,
-                    if mixed {
-                        JsValue::FALSE
-                    } else {
-                        JsValue::number(1.0)
-                    },
-                );
+                let next = constant(b, annotations, next_value);
                 b.def_var(variable, next);
                 b.ins().jump(header, &[]);
                 b.switch_to_block(exit);
                 b.ins().return_(&[condition]);
             });
-            assert_eq!(
-                kinds(&body),
-                [if mixed { None } else { Some(Kind::Number) }]
-            );
+            assert_eq!(kinds(&body), [expected]);
         }
     }
 }

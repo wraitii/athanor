@@ -23,8 +23,14 @@ temporary directory. `samply` and `perf` can consume the dump, and debug
 information points at the original JavaScript source so they show JavaScript
 lines alongside the assembly. Set `JS_JIT_JITDUMP=2` to also write one `.jsir`
 listing per evaluated source file; debug information then points at these
-listings, which preserve the JavaScript line numbers and add the Cranelift IR
-for each line beneath it.
+listings, which contain the JavaScript source followed by complete Cranelift IR
+in block order. Instructions with a source location indicate its JavaScript line.
+
+Use `--compile --eval SOURCE` or `--compile SCRIPT` to print Cranelift IR
+without executing the source. Add `--ast` for the analyzed Oxc AST and generator
+resume plans, or `--asm` for Cranelift machine-instruction output. Use `--no-ir`
+to omit IR. The compiler emits IR directly from the AST rather than constructing
+a separate lowered AST. `JS_JIT_SSA=0` disables numeric SSA simplification.
 Both runners provide deterministic `Math.random()` without a Boost dependency.
 The shared bootstrap calls `hostSeedRandom(settings.Seed)` before loading scripts;
 a missing seed defaults to zero. The generator matches the game's rand48 sequence.

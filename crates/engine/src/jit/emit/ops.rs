@@ -8,7 +8,7 @@ use crate::jit::numeric::Kind;
 use crate::value::Value;
 use crate::value::{TAG_FIRST, TAG_SHIFT, TAG_SPAN, TAG_STRING};
 
-use super::FunctionCompiler;
+use super::{FunctionCompiler, ir_helpers};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum BinaryOp {
@@ -135,14 +135,9 @@ pub(super) fn compound_operator(operator: AssignmentOperator) -> Option<BinaryOp
 impl FunctionCompiler<'_, '_> {
     pub(super) fn constant(&mut self, value: Value) -> ClifValue {
         let result = self.b.ins().iconst(types::I64, value.bits() as i64);
-        self.annotations.constants.insert(
-            result,
-            if value.is_number() {
-                Kind::Number
-            } else {
-                Kind::Other
-            },
-        );
+        self.annotations
+            .constants
+            .insert(result, Kind::of_constant(value));
         result
     }
 
@@ -245,6 +240,7 @@ impl FunctionCompiler<'_, '_> {
 
     pub(super) fn binary(&mut self, op: BinaryOp, left: ClifValue, right: ClifValue) -> ClifValue {
         match op {
+            BinaryOp::BitwiseAnd => self.bitwise_and(left, right),
             BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
                 self.numeric_binary(op, left, right)
             }
@@ -264,6 +260,34 @@ impl FunctionCompiler<'_, '_> {
         let call = self.b.ins().call(callee, &call_args);
         self.annotations.helpers.insert(call, helper);
         self.b.inst_results(call)[0]
+    }
+
+    fn bitwise_and(&mut self, left: ClifValue, right: ClifValue) -> ClifValue {
+        let (left_int, left_guard) = ir_helpers::unbox_int32(self.b, left);
+        let (right_int, right_guard) = ir_helpers::unbox_int32(self.b, right);
+        for (guard, value) in [(left_guard, left), (right_guard, right)] {
+            let inst = self.b.func.dfg.value_def(guard).unwrap_inst();
+            self.annotations.int32_guards.insert(inst, value);
+        }
+        let both = self.b.ins().band(left_guard, right_guard);
+        let fast = self.b.create_block();
+        let slow = self.b.create_block();
+        let done = self.b.create_block();
+        self.b.append_block_param(done, types::I64);
+        self.brif(both, fast, &[], slow, &[]);
+
+        self.switch(fast);
+        let integer = self.b.ins().band(left_int, right_int);
+        let result = ir_helpers::box_int32(self.b, integer);
+        self.annotations.results.insert(result, Kind::Int32);
+        self.jump(done, &[BlockArg::Value(result)]);
+
+        self.switch(slow);
+        let result = self.binary_helper(BinaryOp::BitwiseAnd, left, right);
+        self.jump(done, &[BlockArg::Value(result)]);
+
+        self.switch(done);
+        self.b.block_params(done)[0]
     }
 
     fn numeric_fast_path(
@@ -308,10 +332,15 @@ impl FunctionCompiler<'_, '_> {
                     BinaryOp::Div => compiler.b.ins().fdiv(left_float, right_float),
                     _ => unreachable!(),
                 };
-                compiler
+                let unordered = compiler.b.ins().fcmp(FloatCC::Unordered, result, result);
+                let bits = compiler
                     .b
                     .ins()
-                    .bitcast(types::I64, MemFlags::new(), result)
+                    .bitcast(types::I64, MemFlags::new(), result);
+                let nan = compiler.constant(Value::number(f64::NAN));
+                let boxed = compiler.b.ins().select(unordered, nan, bits);
+                compiler.annotations.results.insert(boxed, Kind::Number);
+                boxed
             },
             |compiler| compiler.binary_helper(op, left, right),
         )
@@ -441,6 +470,23 @@ impl FunctionCompiler<'_, '_> {
     }
 
     pub(super) fn check_error(&mut self) {
+        // Execution reaches a helper with no pending exception; catch entry clears it.
+        let helper_call = self
+            .b
+            .current_block()
+            .and_then(|block| self.b.func.layout.last_inst(block))
+            .and_then(|inst| {
+                self.annotations
+                    .helpers
+                    .get(&inst)
+                    .map(|&helper| (inst, helper))
+            });
+        let can_throw = helper_call.is_none_or(|(_, helper)| helper.can_throw());
+        let numeric_result = helper_call.and_then(|(inst, helper)| {
+            helper
+                .result_kind_on_success()
+                .map(|kind| (self.b.func.dfg.first_result(inst), kind))
+        });
         let dummy = self.constant(Value::UNDEFINED);
         let pending = self.call_helper(Helper::ErrorPending, &[dummy]);
         let condition = self
@@ -461,6 +507,16 @@ impl FunctionCompiler<'_, '_> {
         self.call_helper(Helper::ErrorOrigin, &[ptr, len, start, end]);
         self.jump(self.return_block, &[BlockArg::Value(dummy)]);
         self.switch(done);
+        if !can_throw {
+            if let Some((result, kind)) = numeric_result {
+                self.annotations
+                    .continuations
+                    .entry(done)
+                    .or_default()
+                    .push((result, kind));
+            }
+            return;
+        }
         let pending = self.call_helper(Helper::ExceptionPending, &[dummy]);
         let condition = self
             .b

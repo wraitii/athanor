@@ -27,6 +27,11 @@ fn run() -> Result<(), String> {
     let mut values = Vec::new();
     let mut repl = false;
     let mut map = false;
+    let mut compile = false;
+    let mut compile_ir = true;
+    let mut compile_ast = false;
+    let mut output_option = false;
+    let mut compile_asm = false;
     let mut data = None;
     let mut settings = None;
     let mut bootstrap = None;
@@ -45,6 +50,23 @@ fn run() -> Result<(), String> {
             }
             "--load" => preloads.push(arguments.next().ok_or("--load expects a path")?),
             "--map" => map = true,
+            "--compile" => compile = true,
+            "--no-ir" => {
+                compile_ir = false;
+                output_option = true;
+            }
+            "--ir" => {
+                compile_ir = true;
+                output_option = true;
+            }
+            "--ast" => {
+                compile_ast = true;
+                output_option = true;
+            }
+            "--asm" => {
+                compile_asm = true;
+                output_option = true;
+            }
             "--data" => data = Some(arguments.next().ok_or("--data expects a path")?),
             "--settings" => settings = Some(arguments.next().ok_or("--settings expects JSON")?),
             "--bootstrap" => {
@@ -62,8 +84,13 @@ fn run() -> Result<(), String> {
         }
     }
 
+    if output_option && !compile {
+        return Err("--ir, --no-ir, --ast and --asm require --compile".into());
+    }
+
     if map {
-        if repl
+        if compile
+            || repl
             || eval.is_some()
             || function != "main"
             || !values.is_empty()
@@ -75,7 +102,8 @@ fn run() -> Result<(), String> {
     }
 
     if repl {
-        if eval.is_some()
+        if compile
+            || eval.is_some()
             || script.is_some()
             || function != "main"
             || !values.is_empty()
@@ -108,7 +136,20 @@ fn run() -> Result<(), String> {
         }
     };
 
-    let mut engine = Engine::new().map_err(display)?;
+    if compile && (!preloads.is_empty() || function != "main" || !values.is_empty()) {
+        return Err("--compile cannot be combined with execution options".into());
+    }
+    let options = js_engine::EngineOptions {
+        compile_dump: compile,
+        compile_ir,
+        compile_ast,
+        compile_asm,
+        ..Default::default()
+    };
+    let mut engine = Engine::with_options(options).map_err(display)?;
+    if compile {
+        return engine.compile_only(&source, &filename).map_err(display);
+    }
     engine.install_host(host::FileHost).map_err(display)?;
     for path in preloads {
         let preload = fs::read_to_string(&path).map_err(|error| format!("{path}: {error}"))?;
@@ -217,6 +258,7 @@ fn display(error: Error) -> String {
 
 fn usage() {
     eprintln!(
-        "usage: js-runner [--load SCRIPT]... [--function NAME] [--arg VALUE]... <script>\n       js-runner [--function NAME] [--arg VALUE]... --eval SOURCE\n       js-runner --map [--data ROOT] [--settings JSON] [--bootstrap SCRIPT] [SCRIPT]\n       js-runner --repl"
+        "usage: js-runner [--load SCRIPT]... [--function NAME] [--arg VALUE]... <script>\n       js-runner [--function NAME] [--arg VALUE]... --eval SOURCE\n       js-runner --map [--data ROOT] [--settings JSON] [--bootstrap SCRIPT] [SCRIPT]\n       js-runner --compile [--no-ir] [--ast] [--asm] (--eval SOURCE | SCRIPT)
+       js-runner --repl"
     );
 }

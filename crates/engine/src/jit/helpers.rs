@@ -4,11 +4,13 @@ use cranelift_codegen::isa::CallConv;
 use crate::heap::{IndexRead, PropertyRead};
 use crate::value::Value;
 
+use super::numeric::Kind;
 use super::session::JitCtx;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HelperShape {
     Binary,
+    NumericIndex,
     Unary,
     GlobalGet,
     GlobalSet,
@@ -88,6 +90,7 @@ define_helpers! {
     ArrayNew => ArrayNew, js_array_new;
     Rest => Rest, js_rest;
     IndexGet => Binary, js_index_get;
+    IndexGetNumeric => NumericIndex, js_index_get_numeric;
     IndexSet => IndexSet, js_index_set;
     PropertyGet => PropertyGet, js_property_get;
     PropertySet => PropertySet, js_property_set;
@@ -127,6 +130,65 @@ define_helpers! {
     BitwiseNot => Unary, js_bitwise_not;
 }
 
+impl Helper {
+    pub(super) fn result_kind_on_success(self) -> Option<Kind> {
+        match self {
+            Self::BitwiseAnd
+            | Self::BitwiseOr
+            | Self::BitwiseXor
+            | Self::ShiftLeft
+            | Self::ShiftRight
+            | Self::BitwiseNot => Some(Kind::Int32),
+            Self::Sub
+            | Self::Mul
+            | Self::Div
+            | Self::Rem
+            | Self::Pow
+            | Self::ShiftRightUnsigned
+            | Self::UnaryPlus
+            | Self::UnaryNegation => Some(Kind::Number),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn can_throw(self) -> bool {
+        // These helpers may report engine errors, but never execute JavaScript or throw.
+        !matches!(
+            self,
+            Self::TempRetain
+                | Self::IndexGet
+                | Self::IndexGetNumeric
+                | Self::PropertyGet
+                | Self::GlobalGet
+                | Self::GlobalGetOptional
+                | Self::BitwiseAnd
+                | Self::BitwiseOr
+                | Self::BitwiseXor
+                | Self::ShiftLeft
+                | Self::ShiftRight
+                | Self::ShiftRightUnsigned
+                | Self::Add
+                | Self::Sub
+                | Self::Mul
+                | Self::Div
+                | Self::Rem
+                | Self::Pow
+                | Self::LooseEqual
+                | Self::LooseNotEqual
+                | Self::StrictEqual
+                | Self::StrictNotEqual
+                | Self::Less
+                | Self::LessEqual
+                | Self::Greater
+                | Self::GreaterEqual
+                | Self::UnaryPlus
+                | Self::UnaryNegation
+                | Self::LogicalNot
+                | Self::BitwiseNot
+        )
+    }
+}
+
 pub(crate) fn symbols() -> impl Iterator<Item = (&'static str, *const u8)> {
     HELPERS.iter().map(|spec| (spec.name, spec.pointer))
 }
@@ -145,6 +207,10 @@ pub(crate) fn signature(shape: HelperShape, call_conv: CallConv, pointer: Type) 
             signature.params.push(AbiParam::new(types::I64));
             signature.params.push(AbiParam::new(pointer));
             signature.params.push(AbiParam::new(types::I64));
+        }
+        HelperShape::NumericIndex => {
+            signature.params.push(AbiParam::new(types::I64));
+            signature.params.push(AbiParam::new(types::F64));
         }
         HelperShape::Binary => {
             signature.params.push(AbiParam::new(types::I64));
@@ -673,23 +739,37 @@ fn typed_numeric_index(ctx: &JitCtx, key: Value) -> Option<Option<usize>> {
 }
 
 extern "C" fn js_index_get(ctx: *mut JitCtx, array: Value, index: Value) -> Value {
-    let ctx = unsafe { &mut *ctx };
     if let Some(number) = index.as_number() {
-        match ctx.global.heap().read_numeric_index(array, number) {
-            Some(IndexRead::Primitive(value)) => return value,
-            Some(IndexRead::Borrowed(value)) => return ctx.retain_temp(value),
-            Some(IndexRead::Character(character)) => {
-                return match ctx.global.heap().string(character.encode_utf8(&mut [0; 4])) {
-                    Some(value) => ctx.own(value),
-                    None => {
-                        ctx.error = Some(crate::Error::Runtime("string heap exhausted".into()));
-                        Value::UNDEFINED
-                    }
-                };
-            }
-            None => {}
+        return js_index_get_numeric(ctx, array, number);
+    }
+    index_get_slow(unsafe { &mut *ctx }, array, index)
+}
+
+extern "C" fn js_index_get_numeric(ctx: *mut JitCtx, array: Value, index: f64) -> Value {
+    let ctx = unsafe { &mut *ctx };
+    match ctx.global.heap().read_numeric_index(array, index) {
+        Some(IndexRead::Primitive(value)) => value,
+        Some(IndexRead::Borrowed(value)) => ctx.retain_temp(value),
+        Some(IndexRead::Character(character)) => index_get_character(ctx, character),
+        None => index_get_slow(ctx, array, Value::number(index)),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn index_get_character(ctx: &mut JitCtx, character: char) -> Value {
+    match ctx.global.heap().string(character.encode_utf8(&mut [0; 4])) {
+        Some(value) => ctx.own(value),
+        None => {
+            ctx.error = Some(crate::Error::Runtime("string heap exhausted".into()));
+            Value::UNDEFINED
         }
     }
+}
+
+#[cold]
+#[inline(never)]
+fn index_get_slow(ctx: &mut JitCtx, array: Value, index: Value) -> Value {
     if ctx.global.heap().typed_kind(array).is_some() {
         if let Some(index) = typed_numeric_index(ctx, index) {
             return index

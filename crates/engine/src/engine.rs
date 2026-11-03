@@ -39,6 +39,10 @@ pub struct EngineOptions {
     pub jitdump_ir: bool,
     pub ssa_opt: bool,
     pub ssa_dump: bool,
+    pub compile_dump: bool,
+    pub compile_ir: bool,
+    pub compile_ast: bool,
+    pub compile_asm: bool,
 }
 
 impl Default for EngineOptions {
@@ -51,6 +55,10 @@ impl Default for EngineOptions {
             jitdump_ir: jitdump == Some("2"),
             ssa_opt: std::env::var("JS_JIT_SSA").as_deref() != Ok("0"),
             ssa_dump: std::env::var("JS_JIT_SSA_DUMP").as_deref() == Ok("1"),
+            compile_dump: false,
+            compile_ir: false,
+            compile_ast: false,
+            compile_asm: false,
         }
     }
 }
@@ -304,6 +312,10 @@ impl Engine {
             self.global.heap().release(value);
         }
         Ok(())
+    }
+
+    pub fn compile_only(&self, source: &str, filename: &str) -> Result<(), Error> {
+        self.prepare_source(source, filename).map(|_| ())
     }
 
     pub(crate) fn prepare_source(

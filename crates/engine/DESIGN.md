@@ -73,9 +73,11 @@ Oxc AST -> emission -> finalized SSA CLIF + annotations
 ```
 
 `FunctionBody` pairs a CLIF `Function` with its `Annotations`. Emission records
-boxed JS constants by SSA value, helper identities by instruction, and numeric
-tests by instruction and tested value. Emission does not propagate kinds through
-locals or control flow. Raw internal `i64` values, such as frame-slot indices
+boxed JS constants and guaranteed result kinds by SSA value, helper identities
+by instruction, and numeric and retain tests by instruction and tested value.
+Successful helper continuations carry result facts that become valid only after
+the error check. These blocks must remain exclusive to their successful edge. Emission does not
+propagate kinds through locals or control flow. Raw internal `i64` values, such as frame-slot indices
 and generator states, are not classified by interpreting their bits as JS
 values. The side tables require no executable marker instructions or fake
 locals.
@@ -87,29 +89,41 @@ preserve or rebuild the affected metadata. The annotations are consumed before
 Cranelift optimization and are not expected to describe the backend's rewritten
 IR. Source locations remain available separately for debugging and profiling.
 
-The abstract kinds are Number, Other, and unknown; Other means a boxed JS value
-that is not numeric, including an uninitialized-binding sentinel. Each reachable
+The abstract kinds are Number, its subtypes Int32, OtherNumber, and NaN,
+plus Other and unknown. Int32 describes an exactly representable signed 32-bit
+integer, excluding negative zero. OtherNumber includes fractions, larger
+integers, infinities, and negative zero. Other means a boxed JS value that is
+not numeric, including an uninitialized-binding sentinel. These are value facts;
+Int32 values still use the boxed-double representation. Constants get their
+narrowest kind. Signed bitwise results are Int32 after their error check;
+unsigned right shift remains Number because its result may exceed INT32_MAX. Each reachable
 block has an incoming fact map. An absent value fact means unknown, while an
 absent block state means unreachable in the traversed control-flow graph.
 A worklist propagates facts through branch arguments and block parameters until
-they stabilize, including loop backedges. Joins retain only facts shared by all
-incoming paths. Facts about instruction results are cleared before processing
+they stabilize, including loop backedges. Joins retain equal kinds, widen differing numeric kinds to Number, and discard
+incompatible facts. Facts about instruction results are cleared before processing
 their defining block again, so a loop cannot reuse a previous iteration's facts.
 
-A numeric test refines its operand to Number on the true edge and Other on the
-false edge. A successful conjunction can refine both operands' numeric tests;
+A numeric test refines its operand to Number on the true edge, preserving any
+known numeric subtype, and Other on the false edge. A successful conjunction can refine both operands' numeric tests;
 a failed conjunction does not identify which operand failed. This gives runtime
 guards and statically known constants the same fact-propagation path. Selects
-propagate a kind when both alternatives agree. A small helper-contract table
+use the same join rule as control-flow merges. A small helper-contract table
 also propagates kinds where the result is guaranteed, including numeric
-arithmetic with proven numeric operands. Unrecognized results remain unknown;
+arithmetic with proven numeric operands. Subtraction, multiplication, division,
+remainder, exponentiation, numeric unary operations, and bitwise operations
+produce numeric results on their successful continuation without constraining
+the original operands. Inline arithmetic canonicalizes NaNs before boxing and
+records its result as numeric. Unrecognized results remain unknown;
 the pass does not infer types from mutable heap contents or arbitrary calls.
 
 After reaching a fixed point, the pass replaces proven numeric-test instructions
-with boolean constants. Cranelift performs the subsequent control-flow and dead
-code simplification. Ownership operations, frame-local tracking, and error and
-exception checks remain unchanged. This is a numeric-guard experiment, not yet
-receiver specialization, guard hoisting, ownership analysis, or a tiered JIT.
+with boolean constants. Proven numeric local reads also have their retain
+guards replaced with false. Cranelift handles subsequent control-flow
+simplification. Frame-local tracking and engine-error checks remain unchanged.
+Helper effect contracts let emission omit JS-exception checks for helpers that
+cannot throw. This does not yet specialize receivers, hoist guards, or provide
+a tiered JIT.
 
 `EngineOptions::ssa_opt` enables rewriting and defaults to true unless
 `JS_JIT_SSA=0`. `EngineOptions::ssa_dump` defaults to false unless
@@ -907,3 +921,21 @@ constructor identities support the existing brand-based `instanceof` path;
 Shared ArrayBuffer storage, views, offsets, detachment, typed-array prototypes,
 custom properties, and other constructor or method forms are unsupported.
 This initial implementation stores each typed array independently.
+
+Bitwise AND has a guarded int32 IR path emitted through shared boxing and
+unboxing routines in `jit/emit/ir_helpers.rs`. Unboxing uses saturating conversion
+and compares the boxed round trip, rejecting nonnumeric values, fractions,
+out-of-range numbers, and negative zero. Proven Int32 facts eliminate the guard;
+other known kinds except Number prove it false. The fallback retains the existing
+helper and its error check. Successful guard edges establish Int32 facts.
+
+After numeric analysis, index-get calls whose index is proven numeric are
+redirected to `IndexGetNumeric`, passing the unboxed index as f64. The generic
+and numeric entrypoints share the numeric read implementation and the slow
+receiver/property fallback. Specialization removes the boxed-index type test
+without assuming an array receiver, integer index, or valid bounds. Ownership
+and engine-error checks remain in place. Unknown index kinds keep IndexGet.
+
+The numeric getter keeps primitive and borrowed reads in its main body. Character
+allocation and the general property fallback are cold, non-inlined functions so
+those paths do not inflate the common getter's register saves and stack frame.

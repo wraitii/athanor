@@ -1,5 +1,6 @@
 pub(super) mod class;
 mod expression;
+mod ir_helpers;
 mod loops;
 mod ops;
 mod optional;

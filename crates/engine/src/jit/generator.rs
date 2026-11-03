@@ -5,6 +5,7 @@ use oxc_ast_visit::{Visit, walk};
 
 use crate::error::{Error, unsupported_at};
 
+#[derive(Debug)]
 pub(super) struct ResumePlan {
     pub(super) suspensions: Vec<u32>,
 }

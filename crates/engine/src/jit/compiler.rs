@@ -39,6 +39,10 @@ pub(crate) struct Compiler {
     dump_ir: bool,
     ssa_opt: bool,
     ssa_dump: bool,
+    compile_dump: bool,
+    compile_ir: bool,
+    compile_ast: bool,
+    compile_asm: bool,
     next_id: u64,
     context: Context,
     builder_context: FunctionBuilderContext,
@@ -86,6 +90,10 @@ impl Compiler {
             dump_ir,
             ssa_opt: options.ssa_opt,
             ssa_dump: options.ssa_dump,
+            compile_dump: options.compile_dump,
+            compile_ir: options.compile_ir,
+            compile_ast: options.compile_ast,
+            compile_asm: options.compile_asm,
             next_id: 0,
             context,
             builder_context: FunctionBuilderContext::new(),
@@ -123,6 +131,9 @@ impl Compiler {
         ),
         Error,
     > {
+        if self.compile_dump && self.compile_ast {
+            println!("[{filename}] analyzed AST\n{program:#?}");
+        }
         let source_path = filename;
         let filename: Box<str> = filename.into();
         self.source_name = (filename.as_ptr() as usize, filename.len());
@@ -151,11 +162,11 @@ impl Compiler {
         ),
         Error,
     > {
-        let lines = self
-            .dump
-            .as_ref()
-            .map(|_| line_starts(source))
-            .unwrap_or_default();
+        let lines = if self.dump.is_some() || self.compile_dump {
+            line_starts(source)
+        } else {
+            Vec::new()
+        };
         let mut globals = Vec::new();
         let mut declarations = Vec::new();
         for statement in &program.body {
@@ -421,8 +432,8 @@ impl Compiler {
         };
 
         let mut dumped = Vec::new();
-        let mut annotations = BTreeMap::new();
         let mut next_ir = 1;
+        let mut complete_ir = Vec::new();
         for (id, code) in pending {
             self.context.clear();
             self.context.func = code.function;
@@ -438,21 +449,39 @@ impl Compiler {
                 }
                 if self.ssa_opt {
                     analysis.simplify(&mut self.context.func);
+                    let numeric_get = self.module.declare_func_in_func(
+                        self.helpers[helpers::Helper::IndexGetNumeric as usize],
+                        &mut self.context.func,
+                    );
+                    analysis.specialize_index_gets(&mut self.context.func, numeric_get);
                     self.context
                         .verify(self.module.isa())
                         .map_err(|error| Error::Compile(error.to_string()))?;
                 }
             }
             if self.dump_ir {
-                for (line, instructions) in ir_lines(&mut self.context.func, &lines, &mut next_ir) {
-                    let entries = annotations.entry(line).or_insert_with(Vec::new);
-                    entries.push((0, format!("[{name}]")));
-                    entries.extend(instructions);
+                complete_ir.push((0, format!("[{name}]")));
+                complete_ir.extend(ir_lines(&mut self.context.func, &lines, &mut next_ir));
+            }
+            if self.compile_dump {
+                if self.compile_ir {
+                    println!("[{name}] IR\n{}", self.context.func.display());
                 }
+                self.context.set_disasm(self.compile_asm);
             }
             self.module
                 .define_function(id, &mut self.context)
                 .map_err(|error| Error::Compile(error.to_string()))?;
+            if self.compile_dump && self.compile_asm {
+                let compiled = self
+                    .context
+                    .compiled_code()
+                    .ok_or_else(|| Error::Compile("missing compiled code".into()))?;
+                println!(
+                    "[{name}] machine code\n{}",
+                    compiled.vcode.as_deref().unwrap_or("unavailable")
+                );
+            }
             if self.dump.is_some() {
                 let Some(compiled) = self.context.compiled_code() else {
                     return Err(Error::Compile("missing compiled code".into()));
@@ -481,7 +510,7 @@ impl Compiler {
             .map_err(|error| Error::Compile(error.to_string()))?;
         let listing = if self.dump_ir {
             if let Some(dump) = self.dump.as_mut() {
-                match dump.listing(source, &annotations) {
+                match dump.listing(source, &complete_ir) {
                     Ok(listing) => Some(listing),
                     Err(error) => {
                         eprintln!("js jit: source listing write failed: {error}");
@@ -579,6 +608,9 @@ impl Compiler {
             ));
         }
         let plan = super::generator::ResumePlan::lower(statements)?;
+        if self.compile_dump && self.compile_ast {
+            println!("[{label}@{line}] generator resume plan\n{plan:#?}");
+        }
         let internal = format!("{label}.resume");
         let id = self.declare_js(&internal, line)?;
         let resume = self.compile_function(
@@ -756,28 +788,61 @@ fn ir_lines(
     function: &mut cranelift_codegen::ir::Function,
     starts: &[u32],
     next_ir: &mut u32,
-) -> BTreeMap<u32, Vec<(u32, String)>> {
-    let mut lines = BTreeMap::new();
+) -> Vec<(u32, String)> {
+    let mut result = Vec::new();
     let blocks: Vec<_> = function.layout.blocks().collect();
+    let display = function.display().to_string();
+    if let Some(first) = blocks.first() {
+        let header = format!("{first}(");
+        for line in display
+            .lines()
+            .take_while(|line| !line.trim_start().starts_with(&header))
+        {
+            result.push((0, line.to_owned()));
+        }
+    }
     for block in blocks {
+        let params = function
+            .dfg
+            .block_params(block)
+            .iter()
+            .map(|value| format!("{value}: {}", function.dfg.value_type(*value)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        result.push((0, format!("{block}({params}):")));
+        let header = format!("{block}(");
+        let plain_header = format!("{block}:");
+        let mut in_block = false;
+        for line in display.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with(&header) || trimmed == plain_header {
+                in_block = true;
+                continue;
+            }
+            if in_block && trimmed.starts_with("block") && trimmed.ends_with(':') {
+                break;
+            }
+            if in_block && trimmed.contains(" -> ") {
+                result.push((0, format!("    {trimmed}")));
+            }
+        }
         let insts: Vec<_> = function.layout.block_insts(block).collect();
         for inst in insts {
             let location = function.srcloc(inst);
-            if location.is_default() {
-                continue;
-            }
-            let line = line_at(starts, location.bits());
-            let text = function.dfg.display_inst(inst).to_string();
+            let source = if location.is_default() {
+                String::new()
+            } else {
+                format!("  ; source line {}", line_at(starts, location.bits()))
+            };
+            let text = format!("    {}{source}", function.dfg.display_inst(inst));
             let index = *next_ir;
             *next_ir += 1;
             function.set_srcloc(inst, SourceLoc::new(index));
-            lines
-                .entry(line)
-                .or_insert_with(Vec::new)
-                .push((index, text));
+            result.push((index, text));
         }
     }
-    lines
+    result.push((0, "}".into()));
+    result
 }
 
 fn validate_function(function: &Function<'_>) -> Result<String, Error> {
