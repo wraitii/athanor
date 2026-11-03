@@ -177,6 +177,7 @@ fn functions_can_call_across_compile_calls() {
 fn optimization_level_is_configurable() {
     let mut engine = Engine::with_options(js_engine::EngineOptions {
         opt_level: js_engine::OptLevel::None,
+        ..Default::default()
     })
     .unwrap();
     engine
@@ -927,7 +928,7 @@ fn for_of_rejects_unsupported_iterables_and_binding_forms() {
         assert!(matches!(engine.call("main", &[]), Err(Error::Runtime(_))));
     }
     for source in [
-        "function main() { for (const [x] of [[1]]) {} }",
+        "function main() { for (const [[x]] of [[[1]]]) {} }",
         "function main() { let x; for (x of [1]) {} }",
         "function main() { outer: while (true) { break outer; } }",
     ] {
@@ -1185,6 +1186,56 @@ fn array_destructuring_declarations() {
 }
 
 #[test]
+fn object_destructuring_declarations() {
+    check(
+        "function main(){ const {x, y} = {x: 3, y: 4}; return x * 10 + y; }",
+        Value::number(34.0),
+    );
+    check(
+        "function main(){ const {a: x, b: y} = {a: 1, b: 2}; return x + y; }",
+        Value::number(3.0),
+    );
+    check(
+        "function main(){ const {'a-b': value, 7: seven} = {'a-b': 8, 7: 9}; return value + seven; }",
+        Value::number(17.0),
+    );
+    check(
+        "function main(){ const {missing} = {}; return missing === undefined; }",
+        Value::TRUE,
+    );
+    check(
+        "function main(){ let n = 0; const {x, y} = (n++, {x: 2, y: 3}); return n === 1 && x + y === 5; }",
+        Value::TRUE,
+    );
+    check(
+        "function main(){ const {x} = {x: 7}; let f = () => x; return f(); }",
+        Value::number(7.0),
+    );
+    check(
+        "function main(){ var {x} = {x: 1}; { let {x} = {x: 2}; if (x !== 2) return false; } return x === 1; }",
+        Value::TRUE,
+    );
+}
+
+#[test]
+fn object_destructuring_rejects_unsupported_forms() {
+    for source in [
+        "function main(){ const {x = 1} = {}; }",
+        "function main(){ const {...x} = {}; }",
+        "function main(){ const {a: {x}} = {a: {x: 1}}; }",
+        "function main(){ const {[name]: x} = {}; }",
+    ] {
+        let mut engine = Engine::new().unwrap();
+        assert!(engine.compile(source, "test.js").is_err(), "{source}");
+    }
+    let mut engine = Engine::new().unwrap();
+    engine
+        .compile("function main(){ const {x} = null; return x; }", "test.js")
+        .unwrap();
+    assert!(engine.call("main", &[]).is_err());
+}
+
+#[test]
 fn array_destructuring_rejects_unsupported_forms() {
     for source in [
         "function main(){ const [x = 1] = []; }",
@@ -1432,4 +1483,165 @@ fn for_in_rejects_unsupported_forms() {
         engine.compile(source, "forin.js").unwrap();
         assert!(engine.call("main", &[]).is_err(), "{source}");
     }
+}
+
+#[test]
+fn for_of_destructures_array_and_string_elements() {
+    check(
+        "function main(){ let total=0; let calls=0; let f=[];
+         for (const [a,,b] of (calls++, [[1,9,2],[3]])) {
+             f[f.length]=()=>a; total+=a; if (b !== undefined) total+=b;
+         }
+         for (var [x,y] of ['é😀']) { total+=y === '😀' ? 1 : 0; }
+         return total === 7 && calls === 1 && f[0]() === 1 && f[1]() === 3 && x === 'é'; }",
+        Value::TRUE,
+    );
+    check(
+        "function main(){ let s=0;
+         for (let [a,b] of [[1,2],[3,4],[5,6]]) {
+             if (a===1) continue; s+=a+b; break;
+         }
+         for (const [] of [[],[]]) s++;
+         return s===9; }",
+        Value::TRUE,
+    );
+}
+
+#[test]
+fn for_of_destructuring_reports_unsupported_patterns_and_tdz() {
+    for source in [
+        "function main(){ for (const [[a]] of []) {} }",
+        "function main(){ for (const [a=1] of []) {} }",
+        "function main(){ for (const [...a] of []) {} }",
+    ] {
+        assert!(Engine::new().unwrap().compile(source, "for-of.js").is_err());
+    }
+    for source in [
+        "function main(){ for (let [a,b] of a) {} }",
+        "function main(){ for (let [a,b] of [1]) {} }",
+    ] {
+        let mut engine = Engine::new().unwrap();
+        engine.compile(source, "for-of.js").unwrap();
+        assert!(engine.call("main", &[]).is_err());
+    }
+}
+
+#[test]
+fn array_spread_preserves_order_values_and_unicode_characters() {
+    check(
+        "function main(){ let a=[{x:7},2]; let n=0;
+         let b=[(n++,0), ...(n++,a), (a[1]=9), ...'é😀', ...[]];
+         a=undefined;
+         return n===2 && b.length===6 && b[0]===0 && b[1].x===7 &&
+             b[2]===2 && b[3]===9 && b[4]==='é' && b[5]==='😀'; }",
+        Value::TRUE,
+    );
+    check(
+        "function main(){ let a=[1,2,3].map((x,i,a)=>{ if(i===0) a.length=1; return x; });
+         let b=[...a]; return b.length===3 && b[0]===1 &&
+             b[1]===undefined && (1 in b) && (2 in b); }",
+        Value::TRUE,
+    );
+}
+
+#[test]
+fn array_spread_errors_propagate_and_engine_remains_usable() {
+    let mut engine = Engine::new().unwrap();
+    engine
+        .compile(
+            "function fail(){ return [{x:1}, ...null, 2]; }
+         function main(){ return [...[3], ...[4]][1]; }",
+            "spread.js",
+        )
+        .unwrap();
+    for _ in 0..20 {
+        assert!(engine.call("fail", &[]).is_err());
+        engine.drain_disposals(100);
+        assert_eq!(
+            engine.call("main", &[]).unwrap().value(),
+            Value::number(4.0)
+        );
+    }
+    assert!(
+        engine
+            .compile("function holes(){ return [,...[]]; }", "holes.js")
+            .is_err()
+    );
+}
+
+#[test]
+fn array_parameter_bindings_initialize_left_to_right() {
+    check(
+        "function sum([a,,b], c=a){ return a+b+c; } function main(){ return sum([2,8,3]); }",
+        Value::number(7.0),
+    );
+    check(
+        "function main(){ let f = ([a,b]) => a + (b === undefined); return f([3]); }",
+        Value::number(4.0),
+    );
+    check(
+        "function main(){ let f = ([a,b] = [2,3]) => a+b; return f(); }",
+        Value::number(5.0),
+    );
+    check(
+        "function f([x], y=x){ var x; return () => x+y; } function main(){ let g=f([7]); return g(); }",
+        Value::number(14.0),
+    );
+    check(
+        "function main(){ let n=4; let f = ([x] = [n], y=x) => () => x+y; return f()(); }",
+        Value::number(8.0),
+    );
+    check(
+        "function outer(){ let f = ([x]) => x + arguments[0]; return f([3]); } function main(){ return outer(5); }",
+        Value::number(8.0),
+    );
+    check(
+        "function main(){ let f = ([a,b]) => a+b; return f('éa') === 'éa'; }",
+        Value::TRUE,
+    );
+}
+
+#[test]
+fn array_parameter_tdz_and_unsupported_patterns() {
+    for source in [
+        "function f([x]=[y], y=1){ return x; } function main(){ return f(); }",
+        "function f([x], y=x){ return y; } function main(){ return f(); }",
+        "function f([x]=[x]){ return x; } function main(){ return f(); }",
+        "function f([x], y=z, z=1){ return y; } function main(){ return f([1]); }",
+    ] {
+        let mut engine = Engine::new().unwrap();
+        engine.compile(source, "parameters.js").unwrap();
+        assert!(engine.call("main", &[]).is_err(), "{source}");
+    }
+    for source in [
+        "function f([[x]]){}",
+        "function f([x=1]){}",
+        "function f([...x]){}",
+        "function f({x}){}",
+        "function* f([x]){}",
+        "function* f([x]=[]){}",
+        "function main(){ return function*([x]){}; }",
+    ] {
+        let mut engine = Engine::new().unwrap();
+        assert!(engine.compile(source, "parameters.js").is_err(), "{source}");
+    }
+}
+
+#[test]
+fn string_numeric_conversion_handles_complete_numeric_strings() {
+    check(
+        r#"function main(){
+        let invalid=+'1.2x'; let inf=1/0;
+        return +'1.20'===1.2 && +((3*1.1).toFixed(8))===3.3 &&
+            +''===0 && +'  \t\n'===0 && +'\uFEFF2\u00A0'===2 &&
+            +'0xff'===255 && +'0b101'===5 && +'0o17'===15 &&
+            +'.5e2'===50 && +'1.'===1 && +'Infinity'===inf &&
+            +'-Infinity'===-inf && 1/+'-0'===-inf && invalid!==invalid &&
+            +'+0x1'!==+'+0x1' && +'inf'!==+'inf' && +'\u00851'!==+'\u00851' &&
+            '4'-1===3 && '2'*3===6 && -'2'===-2 && ~'1'===-2 &&
+            ('8'>>1)===4 && '2'==2 && '1'==true && ''==false &&
+            '2'+3==='23' && '2'>'10' && '2'<10;
+    }"#,
+        Value::TRUE,
+    );
 }

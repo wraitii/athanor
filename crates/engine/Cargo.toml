@@ -17,3 +17,6 @@ oxc_semantic = "=0.156.0"
 oxc_span = "=0.156.0"
 oxc_syntax = "=0.156.0"
 serde_json = { version = "=1.0.140", features = ["preserve_order"] }
+regress = "=0.12.0"
+dragonbox_ecma = "=0.1.12"
+num-bigint = "=0.5.1"

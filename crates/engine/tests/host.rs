@@ -84,3 +84,68 @@ fn nested_source_evaluation_keeps_script_this_separate_from_method_this() {
     engine.compile("function main() { let o = { f: function() { hostEvaluateSource('var scriptThis = this;', 'nested.js'); return this === o && scriptThis === globalThis; } }; return o.f(); }", "main.js").unwrap();
     assert_eq!(engine.call("main", &[]).unwrap().value(), Value::TRUE);
 }
+
+#[test]
+fn runtime_errors_preserve_innermost_source_location() {
+    let mut first = engine();
+    let inner = "function inner(){ return [1].missing; }";
+    first.compile(inner, "inner.js").unwrap();
+    first
+        .compile("function main(){ return inner(); }", "outer.js")
+        .unwrap();
+    let error = first.call("main", &[]).err().unwrap().to_string();
+    let start = inner.find("[1].missing").unwrap();
+    assert!(
+        error.contains(&format!(
+            "inner.js:{start}..{}",
+            start + "[1].missing".len()
+        )),
+        "{error}"
+    );
+    assert!(error.contains("property \"missing\" of array"), "{error}");
+
+    let mut engine = engine();
+    engine
+        .compile(
+            "function main(){ hostEvaluateSource('var q = /x/.missing;', 'loaded.js'); }",
+            "caller.js",
+        )
+        .unwrap();
+    let error = engine.call("main", &[]).err().unwrap().to_string();
+    assert!(error.contains("loaded.js:8..19"), "{error}");
+    assert!(error.contains("property \"missing\" of regexp"), "{error}");
+}
+
+#[test]
+fn print_and_console_log_write_to_the_host() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    struct PrintHost(Rc<RefCell<String>>);
+
+    impl Host for PrintHost {
+        fn read_file(&self, path: &str) -> Result<String, String> {
+            Err(path.to_string())
+        }
+
+        fn list_files(&self, _: &str, _: &str, _: bool) -> Result<String, String> {
+            Ok(String::new())
+        }
+
+        fn print(&self, message: &str) {
+            self.0.borrow_mut().push_str(message);
+        }
+    }
+
+    let output = Rc::new(RefCell::new(String::new()));
+    let mut engine = Engine::new().unwrap();
+    engine.install_host(PrintHost(output.clone())).unwrap();
+    engine
+        .compile(
+            "function main() { print('a', 1, true); console.log(); console.log('x', 2, null, [1, 'y']); }",
+            "print.js",
+        )
+        .unwrap();
+    assert_eq!(engine.call("main", &[]).unwrap().value(), Value::UNDEFINED);
+    assert_eq!(*output.borrow(), "a1true\nx 2 null [1, y]\n");
+}

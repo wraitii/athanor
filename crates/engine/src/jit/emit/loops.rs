@@ -24,9 +24,9 @@ impl FunctionCompiler<'_, '_> {
         self.brif(condition, body, &[], done, &[]);
 
         self.switch(body);
-        self.loops.push((done, header));
+        self.control_targets.push((done, Some(header)));
         self.emit_statement(&statement.body)?;
-        self.loops.pop();
+        self.control_targets.pop();
         if !self.terminated {
             self.jump(header, &[]);
         }
@@ -41,9 +41,9 @@ impl FunctionCompiler<'_, '_> {
         self.jump(body, &[]);
 
         self.switch(body);
-        self.loops.push((done, test));
+        self.control_targets.push((done, Some(test)));
         self.emit_statement(&statement.body)?;
-        self.loops.pop();
+        self.control_targets.pop();
         if !self.terminated {
             self.jump(test, &[]);
         }
@@ -126,9 +126,9 @@ impl FunctionCompiler<'_, '_> {
         self.brif(condition, body, &[], done, &[]);
 
         self.switch(body);
-        self.loops.push((done, update));
+        self.control_targets.push((done, Some(update)));
         self.emit_statement(&statement.body)?;
-        self.loops.pop();
+        self.control_targets.pop();
         if !self.terminated {
             self.jump(update, &[]);
         }
@@ -195,9 +195,9 @@ impl FunctionCompiler<'_, '_> {
             self.initialize_local(variable, value);
         }
         self.clear_temporaries();
-        self.loops.push((done, header));
+        self.control_targets.push((done, Some(header)));
         self.emit_statement(&statement.body)?;
-        self.loops.pop();
+        self.control_targets.pop();
         if lexical {
             self.leave_block();
         }
@@ -226,14 +226,34 @@ impl FunctionCompiler<'_, '_> {
         let [declarator] = declaration.declarations.as_slice() else {
             return Err(unsupported_at(declaration.span, "for-of declaration"));
         };
-        let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
-            return Err(unsupported_at(declarator.span, "for-of destructuring"));
+        let identifiers = match &declarator.id {
+            BindingPattern::BindingIdentifier(identifier) => vec![identifier.as_ref()],
+            BindingPattern::ArrayPattern(pattern) if pattern.rest.is_none() => {
+                let mut identifiers = Vec::new();
+                for element in pattern.elements.iter().flatten() {
+                    let BindingPattern::BindingIdentifier(identifier) = element else {
+                        return Err(unsupported_at(
+                            declarator.span,
+                            "for-of destructuring pattern",
+                        ));
+                    };
+                    identifiers.push(identifier.as_ref());
+                }
+                identifiers
+            }
+            _ => {
+                return Err(unsupported_at(
+                    declarator.span,
+                    "for-of destructuring pattern",
+                ));
+            }
         };
-        let symbol = identifier.symbol_id.get().unwrap();
         let lexical = declaration.kind != VariableDeclarationKind::Var;
         if lexical {
             self.scopes.push();
-            self.declare_lexical_binding(symbol);
+            for identifier in &identifiers {
+                self.declare_lexical_binding(identifier.symbol_id.get().unwrap());
+            }
         }
         let iterable = self.emit_expression(&statement.right)?;
         let state = self.call_helper(Helper::IterateNew, &[iterable]);
@@ -257,16 +277,30 @@ impl FunctionCompiler<'_, '_> {
         self.switch(body);
         if lexical {
             self.scopes.push();
-            let variable = self.declare_lexical_binding(symbol);
-            self.initialize_local(variable, value);
-        } else {
-            let variable = self.resolve_function_binding(symbol).unwrap();
-            self.initialize_local(variable, value);
+            for identifier in &identifiers {
+                self.declare_lexical_binding(identifier.symbol_id.get().unwrap());
+            }
+        }
+        match &declarator.id {
+            BindingPattern::BindingIdentifier(identifier) => {
+                let symbol = identifier.symbol_id.get().unwrap();
+                let variable = if lexical {
+                    self.resolve_lexical_binding(symbol)
+                } else {
+                    self.resolve_function_binding(symbol)
+                }
+                .unwrap();
+                self.initialize_local(variable, value);
+            }
+            BindingPattern::ArrayPattern(pattern) => {
+                self.emit_array_binding(pattern, value, declaration.kind)?;
+            }
+            _ => unreachable!(),
         }
         self.clear_temporaries();
-        self.loops.push((done, header));
+        self.control_targets.push((done, Some(header)));
         self.emit_statement(&statement.body)?;
-        self.loops.pop();
+        self.control_targets.pop();
         if lexical {
             self.leave_block();
         }

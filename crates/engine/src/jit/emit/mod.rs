@@ -2,8 +2,10 @@ pub(super) mod class;
 mod expression;
 mod loops;
 mod ops;
+mod optional;
 mod scope;
 mod statement;
+mod switch;
 
 use std::collections::{HashMap, HashSet};
 
@@ -16,6 +18,7 @@ use cranelift_jit::JITModule;
 use cranelift_module::{FuncId, Module};
 use oxc_ast::ast::{Expression, FormalParameters, Statement};
 use oxc_semantic::Scoping;
+use oxc_span::Span;
 use oxc_syntax::symbol::SymbolId;
 
 use crate::error::Error;
@@ -34,6 +37,8 @@ pub(super) enum FunctionKind {
 
 pub(super) struct FunctionCompiler<'a, 'f> {
     names: &'a mut Vec<Box<str>>,
+    source_name: (usize, usize),
+    source_span: Span,
     b: &'a mut FunctionBuilder<'f>,
     module: &'a mut JITModule,
     helpers: &'a [FuncId],
@@ -49,7 +54,7 @@ pub(super) struct FunctionCompiler<'a, 'f> {
     scopes: ScopeStack,
     return_block: Block,
     handlers: Vec<Block>,
-    loops: Vec<(Block, Block)>,
+    control_targets: Vec<(Block, Option<Block>)>,
     generator: Option<ClifValue>,
     resume_blocks: Vec<Block>,
     suspensions: HashMap<u32, (usize, Block)>,
@@ -62,6 +67,7 @@ pub(super) fn build_function(
     scoping: &Scoping,
     helpers: &[FuncId],
     names: &mut Vec<Box<str>>,
+    source_name: (usize, usize),
     params: &FormalParameters<'_>,
     statements: &[Statement<'_>],
     expression: Option<&Expression<'_>>,
@@ -82,6 +88,8 @@ pub(super) fn build_function(
     let pointer = module.target_config().pointer_type();
     let mut compiler = FunctionCompiler {
         names,
+        source_name,
+        source_span: params.span,
         b,
         module,
         helpers,
@@ -97,7 +105,7 @@ pub(super) fn build_function(
         scopes: ScopeStack::new(),
         return_block,
         handlers: Vec::new(),
-        loops: Vec::new(),
+        control_targets: Vec::new(),
         generator: None,
         resume_blocks: Vec::new(),
         suspensions: HashMap::new(),
@@ -189,6 +197,7 @@ pub(super) fn build_global(
     scoping: &Scoping,
     helpers: &[FuncId],
     names: &mut Vec<Box<str>>,
+    source_name: (usize, usize),
     statements: &[oxc_ast::ast::Statement<'_>],
     captured: &HashSet<SymbolId>,
     closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
@@ -203,6 +212,8 @@ pub(super) fn build_global(
     let pointer = module.target_config().pointer_type();
     let mut compiler = FunctionCompiler {
         names,
+        source_name,
+        source_span: Span::new(0, 0),
         b,
         module,
         helpers,
@@ -218,7 +229,7 @@ pub(super) fn build_global(
         scopes: ScopeStack::new(),
         return_block,
         handlers: Vec::new(),
-        loops: Vec::new(),
+        control_targets: Vec::new(),
         generator: None,
         resume_blocks: Vec::new(),
         suspensions: HashMap::new(),

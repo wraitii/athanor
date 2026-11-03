@@ -44,7 +44,7 @@ aliasing, and cycles; document deliberate semantic restrictions.
   helpers with 32-bit integer conversion and shift counts masked to five bits.
   Unsigned right shift returns a nonnegative number. Compound assignments share
   binary operations and evaluate the target and its old value before the right
-  operand. Full string-to-number coercion remains unimplemented.
+  operand. Numeric operators use heap-aware primitive string conversion.
 - `typeof` returns heap strings for supported values, identifying closures and
   built-in Error as functions. Undeclared identifier operands return undefined
   as a type name; uninitialized lexical bindings still report an error.
@@ -74,10 +74,32 @@ internal holes for positions removed before visitation; reads return undefined,
 and subsequent `map` and `filter` calls skip them. Array literals with holes,
 length growth, string keys, descriptors, and prototype mutation remain unsupported.
 
-Array `filter` and `map` snapshot the initial length and visit present positions
-with `(value, index, array)`, observing intervening writes and truncation. Their
-optional `thisArg` is unsupported except for undefined. `join` supports primitive
-values and separators; object-to-string conversion is unsupported.
+Array `filter`, `map`, `every`, and `some` snapshot the initial length and visit
+present positions with `(value, index, array)`, observing intervening writes and
+truncation. `every` and `some` short-circuit and skip holes. Their optional
+`thisArg` is unsupported except for undefined. `sort` is stable and in place;
+the default order compares string conversions, undefined values follow sorted
+elements, and holes follow undefined. Comparators may return numbers or numeric
+strings; object conversions are unsupported. `join` supports primitive
+values and separators; object-to-string conversion is unsupported. `pop` removes
+the last element and returns an owned value, or undefined for an empty array or
+hole. `indexOf` uses strict equality, skips holes, and accepts numeric or
+undefined start positions; other start-position coercions are unsupported.
+`concat` shallow-copies arrays and appends scalar arguments, preserving holes and
+referenced value identity. Array-like objects, species constructors, and
+Symbol.isConcatSpreadable are unsupported. `push` appends values, `reverse`
+reorders the receiver in place, and `slice` creates a shallow copy; reverse and
+slice preserve holes. `includes` uses SameValueZero and treats holes as
+undefined. Slice bounds and the includes start position accept numbers or
+undefined; other coercions are unsupported. `flat` supports numeric depths
+through infinity and skips source holes. `flatMap` maps present positions and
+flattens each returned array one level. `fill` writes a value across numeric
+bounds, clears holes, and returns the receiver. `Array.from` consumes the same
+iterables as for-of (arrays, typed arrays, and strings), or array-like objects
+with a numeric `length`; it supports an optional mapper and receiver. The
+`Array` constructor accepts a numeric length or a value list. Set iteration,
+sparse array allocation beyond internal holes, and other iterable protocols
+remain unsupported.
 
 Ordinary object literals use reference-counted allocations with ordered property
 slots and a hash index, sharing property storage and incremental disposal with
@@ -106,7 +128,8 @@ Ordinary prototype methods are needed by existing map code.
 String `slice` and the optional `startsWith` position use scalar indices and
 require numeric indices. `split` supports literal string separators or undefined,
 without a limit. `replace` supports literal string search and replacement without
-`$` substitution patterns. These methods reject unsupported coercions.
+`$` substitution patterns. `padStart` pads by Unicode scalars with a literal
+string. These methods reject unsupported coercions.
 
 Strings will use valid UTF-8 storage rather than JavaScript's UTF-16 code units.
 This is a deliberate language restriction, not a transparent representation
@@ -133,12 +156,15 @@ remain future work.
 
 `jit/emit/loops.rs` lowers loops directly into Cranelift blocks, preserving Oxc
 binding identities and capture analysis. While, do-while, and for loops share a
-stack of break and continue targets; unlabeled transfers select the innermost
-loop. Continue targets the test for while/do-while and the update for for loops.
+stack of break and optional continue targets. Break selects the innermost
+loop or switch; continue selects the innermost loop. Continue targets the test for while/do-while and the update for for loops.
 Labeled statements and transfers remain unsupported.
 
-For-of currently accepts arrays and strings with a single identifier declared
-using var, let, or const. Evaluate the iterable once, then retain an internal
+For-of currently accepts arrays and strings with an identifier or flat array
+binding pattern declared using var, let, or const. Array patterns reuse declaration
+destructuring, including elisions and undefined for exhausted elements. Each
+iteration has fresh lexical bindings. Defaults, rest, and nested patterns remain
+unsupported. Evaluate the iterable once, then retain an internal
 iteration state in a compiler-managed local across temporary cleanup. Arrays
 read their current length and elements each step, observing growth, shrinking,
 and replacements. Strings advance a UTF-8 byte cursor and yield one scalar as a
@@ -471,16 +497,26 @@ remain unsupported, as do instanceof checks against other native constructors.
 
 Compilation errors and unsupported-feature errors include the source filename
 and byte span. All parsed binary operator kinds now have lowering paths.
-Runtime errors do not yet carry source locations or stack traces.
+Generated error checks attach the innermost active filename and byte span to
+runtime errors, preserving an origin already reported by nested functions or
+source evaluation. This runs only on error paths. Errors raised outside checked
+operations, including uncaught JS exceptions, may lack a location; stack traces
+are not implemented. Unsupported property diagnostics identify the receiver kind.
 
 ## Default parameters
 
-Identifier parameters support lazy default expressions for missing or undefined
-arguments, in left-to-right order. Defaults can use earlier parameters, globals,
-and captured bindings. Captures are installed before parameter initialization.
-Parameter bindings in functions with defaults begin uninitialized. Destructured
-parameters remain unsupported. Generator default parameters are explicitly
-rejected until initialization can run at factory call time rather than first next.
+Identifier and flat array-pattern parameters support lazy whole-parameter defaults
+for missing or undefined arguments. Array patterns accept identifiers and
+elisions, and iterate arrays or strings using the same binding logic as array
+declarations. Parameter bindings in non-simple lists begin uninitialized and are
+initialized left to right; defaults can use earlier parameters, globals, and
+captured bindings. Captures are installed before parameter initialization.
+
+Nested patterns, element defaults, array rest patterns, and object patterns are
+unsupported. Generator default and destructured parameters are rejected until
+initialization can run at factory call time rather than first next. Parameter
+and body var environments do not fully model JavaScript's separate environments
+for non-simple parameter lists.
 
 ## Property presence
 
@@ -488,7 +524,9 @@ The in operator uses a runtime presence lookup, preserving properties whose
 values are undefined and following ordinary object prototype links. Closures
 expose named properties and their lazy constructor prototype. Arrays recognize
 present canonical indices, excluding holes, and the supported length, filter,
-map, and join properties. globalThis checks global binding presence. Primitive
+map, every, some, sort, join, pop, indexOf, concat, push, includes, reverse,
+slice, flat, flatMap, and fill properties.
+globalThis checks global binding presence. Primitive
 right operands, unsupported native receivers, and object-to-key conversion
 report explicit engine errors. Proxies and additional builtin prototypes remain
 unsupported.
@@ -516,14 +554,17 @@ allocated until runtime teardown unless their cycles are explicitly broken.
 They do not retain the engine or runtime itself. Cycle collection remains
 required before persistent workloads can reclaim these graphs automatically.
 
-## Array destructuring declarations
+## Destructuring declarations
 
 Function-local var, let, and const declarations accept flat array patterns with
-identifier bindings and elisions. The initializer is evaluated once and uses
-the same array and scalar-string iteration as for-of; exhausted elements become
-undefined. Captured bindings use the existing cells. Defaults, rest, nested
-patterns, assignment patterns, custom iterables, and top-level destructuring
-remain unsupported. Iterator closing is not implemented.
+identifier bindings and elisions, and object patterns with static keys and
+identifier bindings. The initializer is evaluated once. Array patterns use the
+same array and scalar-string iteration as for-of; exhausted elements become
+undefined. Object patterns read properties in source order with the ordinary
+property lookup path. Captured bindings use the existing cells. Defaults, rest,
+nested patterns, assignment patterns, computed object keys, custom iterables,
+and top-level destructuring remain unsupported. Iterator closing is not
+implemented.
 
 ## Top-level lexical declarations
 
@@ -550,8 +591,13 @@ The callee and receiver are evaluated once, then arguments expand in source
 order into an owned temporary array before invocation. Arrays and strings use
 the existing iteration behavior; other iterables fail explicitly. Expanded
 values remain owned through later argument evaluation and the call. Custom
-iterators, iterator closing, and array or object literal spread remain
-unsupported. Calls without spread retain the fixed-argument path.
+iterators, iterator closing, and object literal spread remain unsupported.
+Calls without spread retain the fixed-argument path.
+
+Array literals also accept spread mixed with ordinary elements, using the same
+append and iteration helpers in source order. Array holes read during spread
+become present undefined elements. Literal elisions remain unsupported. Arrays
+without spread retain their fixed-size construction path.
 
 
 ## Implicit arguments
@@ -571,17 +617,30 @@ and the complete arguments prototype and iterator semantics are unsupported.
 
 The global Math object has stable native methods for abs, ceil, floor, round,
 trunc, sqrt, sin, cos, tan, asin, acos, atan, atan2, exp, log, pow, min, max,
-imul, and sign, plus PI and E. Methods ignore their receiver. Numeric, boolean,
+imul, sign, and random, plus PI and E. Methods ignore their receiver. Numeric, boolean,
 null, and undefined arguments use the engine's primitive number conversion;
 string and object coercions are explicitly unsupported. Min and max preserve
 signed zero and propagate NaN; round uses ties toward positive infinity.
 
 Math and its properties use ordinary mutable global and object storage; the
 standard property descriptors are not implemented. Transcendental results use
-Rust's platform math implementation. Other Math operations, including random,
-are unsupported; deterministic random state and seeding need a separate design.
+Rust's platform math implementation. Other Math operations are unsupported.
 The game's square and clamp helpers are defined by its globalscript rather than
 being native Math methods.
+
+Math.random uses per-engine 48-bit linear congruential state, initialized with
+seed zero and preserved across calls and source evaluation. Seeding sets the
+state to `(uint32(seed) << 16) | 0x330e`. Each draw multiplies by 0x5deece66d,
+adds 11, and keeps the low 48 bits; the result is the upper 31 bits divided by
+2147483648. This matches the game's rand48 sequence without depending on Boost.
+The method ignores its arguments and receiver.
+
+The hostSeedRandom binding resets the state using primitive ToUint32 conversion;
+object conversion remains unsupported in the Rust engine. The shared map
+bootstrap seeds from settings.Seed before loading global or map scripts, with
+undefined selecting zero. The C++ runner implements the same generator and
+seeding binding. Identical random sequences do not guarantee identical complete
+maps when other engine behavior or transcendental results differ.
 
 ## JSON
 
@@ -635,3 +694,144 @@ are supported, including fresh captured lexical bindings. Assignment targets,
 destructuring, proxies, symbols, and prototype mutation are unsupported.
 Generator loops without suspension are supported; nested yields are rejected by
 the generator planner.
+
+
+## Regular expression literals
+
+Regular expression literals use regress 0.12.0. Each evaluation produces a fresh
+heap object, while its compiled pattern is shared through a per-heap cache keyed
+by source and flags. The cache owns compiled patterns, not JS heap values, and
+persists for the heap lifetime. The supported flags are g, i, m, s, and u;
+y, d, and v are rejected at compilation. Named captures are also rejected.
+
+RegExp test and exec accept string input. Global regexes use a numeric lastIndex
+measured in Unicode scalar values, update it on success, and reset it on failure;
+zero-width success does not advance it. Non-global matching leaves it unchanged.
+Exec and non-global String match return null or an array containing the whole
+match and positional captures, using undefined for unmatched groups. Global
+String match returns all full matches or null, resets lastIndex, and advances one
+scalar after an empty match. Result metadata including index, input, and groups
+is not implemented.
+
+String replace supports regex search and a literal string replacement; global
+replacement resets lastIndex and advances after empty matches. Dollar
+substitutions and replacement callbacks are rejected. Matching and capture
+ranges operate on UTF-8 Unicode scalar values even without u, rather than
+JavaScript's UTF-16 code units; u still affects regex syntax and matching rules.
+The RegExp constructor, arbitrary property mutation, and regex integration with
+split remain unsupported. Regress is a backtracking engine and its execution is
+not bounded by the runtime.
+
+
+## Switch statements
+
+Switch evaluates its discriminant once before entering the shared case scope.
+Case expressions are evaluated in source order using strict equality until a
+match is found; default is selected only after all tests fail. Case bodies use
+ordinary Cranelift blocks with fallthrough. There is no new runtime operation
+or jump-table specialization.
+
+Let, const, class, and function declarations share one lexical scope across all
+cases. Lexical bindings start uninitialized; functions are initialized before
+case tests. Var declarations are hoisted to the enclosing function. Break exits
+the innermost switch or loop, while continue targets the enclosing loop.
+Labeled control transfers and suspension inside a switch remain unsupported.
+
+
+## Object helpers and deferred freezing
+
+Object is currently a mutable namespace with stable native keys, values,
+getOwnPropertyNames, freeze, and isFrozen methods. It is not yet a callable
+constructor, and Object.prototype is not implemented.
+
+Keys and values enumerate own enumerable properties in numeric-index and then
+insertion order. GetOwnPropertyNames includes nonenumerable own properties.
+Ordinary objects, closures, arrays, and primitive strings are supported. Arrays
+include present indices and a nonenumerable own length, excluding inherited
+methods. String indices use Unicode scalar values. Numbers and booleans have
+no own keys; null and undefined are rejected. Other exotic receivers and the
+global object are unsupported. Closure name and length properties are not yet
+modeled; the existing lazy prototype property is included. Result arrays own
+their elements. Computed array and string reads accept canonical numeric string
+keys; named reads such as array["length"] use ordinary property lookup.
+
+Freezing enforcement is intentionally deferred for this experiment: freeze
+returns its argument unchanged and objects remain mutable. IsFrozen returns
+false for objects and true for primitives. The bootstrap deepfreeze traversal
+can run, but does not provide immutability. This is an explicit deviation from
+JavaScript and must be revisited before relying on frozen-object guarantees.
+
+
+## Optional chaining
+
+Optional named members, computed members, and calls lower to nullish checks
+and branches. A null or undefined receiver skips the rest of its chain and
+returns undefined. Computed keys and call arguments, including spreads, are
+only evaluated on the live path. Bases and callees are evaluated once.
+Calls preserve the receiver for both ordinary and optional method references,
+including parenthesized chain references. Parentheses otherwise delimit the
+short-circuit region: (a?.b).c still reads c after the inner chain finishes.
+Unresolved variables, uninitialized bindings, noncallable values, and errors
+on the live path retain their normal diagnostics. Existing primitive-property
+boxing limitations still apply. Private fields, optional delete, and tagged
+templates remain unsupported. No new runtime operation is required.
+
+## Number formatting
+
+Numeric primitives expose stable native `toFixed` and `toString` methods.
+`toFixed` accepts numeric or undefined precision, truncates it to an integer
+from 0 through 100, and rounds the exact binary64 value with ties toward the
+larger magnitude. Values of magnitude at least 1e21 use shortest decimal output.
+Decimal `toString` uses ECMAScript shortest formatting; nondecimal radices from
+2 through 36 support integral finite values, zero, NaN, and infinities. Fractional
+nondecimal values and non-numeric formatting arguments are rejected. Errors are
+engine errors rather than catchable RangeErrors.
+
+Unary plus now converts formatted strings through the primitive numeric
+conversion path, including `toFixed` output.
+
+
+## Primitive numeric conversion
+
+Numeric operators read heap strings before conversion instead of using the
+heap-independent Value conversion. Complete decimal strings, exponents, signed
+Infinity, unsigned hexadecimal/binary/octal prefixes, empty strings, and
+ECMAScript whitespace are supported. Invalid strings return NaN and negative
+zero is preserved. Arithmetic, unary numeric operators, bitwise operators, mixed
+primitive comparisons and loose equality share this conversion. Two-string
+relational comparisons use the runtime's Unicode scalar string order. Addition
+with a string remains concatenation. Object-to-primitive conversion remains
+unsupported, and builtin-specific argument coercion restrictions still apply.
+
+## Date.now
+
+The global Date namespace exposes a stable, receiver-independent `now` native
+returning the current wall-clock Unix time in integer milliseconds. Times before
+the epoch are floored to the preceding millisecond. The wall clock is not
+monotonic. Date construction, instances, parsing, and other Date methods remain
+unsupported; Date is currently an ordinary namespace object.
+
+## Typed arrays
+
+Uint8Array, Uint16Array, Uint32Array, Int8Array, Int16Array, Int32Array,
+Float32Array, and Float64Array construct fixed-length, zero-initialized packed
+storage from a numeric length or undefined. Lengths use truncation, with NaN
+as zero; negative integral lengths and infinities fail. Allocations use fallible
+reservation and are limited to 256 MiB per array. Static `from` accepts the same
+iterable, array-like, mapper, and receiver inputs as `Array.from`, then converts
+elements numerically. Other constructor forms and Uint8ClampedArray are
+unsupported.
+
+Indexed reads and writes use canonical numeric indices. Out-of-range and
+invalid canonical reads return undefined and writes are ignored after value
+conversion. Noncanonical named properties are unsupported, and length is
+read-only. Integer stores truncate and wrap to their width; float stores use
+binary32 or binary64. Primitive values use the engine's numeric conversion;
+object-to-primitive conversion remains unsupported. `fill` mutates in place,
+and typed arrays support indexed own keys, for-in, for-of, and spread. Their
+constructor identities support the existing brand-based `instanceof` path;
+`Array.isArray` returns false for them.
+
+Shared ArrayBuffer storage, views, offsets, detachment, typed-array prototypes,
+custom properties, and other constructor or method forms are unsupported.
+This initial implementation stores each typed array independently.

@@ -86,13 +86,16 @@ impl FunctionCompiler<'_, '_> {
         params: &FormalParameters<'_>,
         statements: &[Statement<'_>],
     ) -> Result<(), Error> {
-        let has_defaults = params
-            .items
-            .iter()
-            .any(|parameter| parameter.initializer.is_some());
-        if has_defaults {
+        let non_simple = params.rest.is_some()
+            || params.items.iter().any(|parameter| {
+                parameter.initializer.is_some()
+                    || !matches!(parameter.pattern, BindingPattern::BindingIdentifier(_))
+            });
+        if non_simple {
             for parameter in &params.items {
-                self.declare_lexical_binding(param_symbol(&parameter.pattern));
+                for symbol in parameter_symbols(&parameter.pattern) {
+                    self.declare_lexical_binding(symbol);
+                }
             }
             if let Some(rest) = &params.rest {
                 self.declare_lexical_binding(param_symbol(&rest.rest.argument));
@@ -114,8 +117,6 @@ impl FunctionCompiler<'_, '_> {
         }
 
         for (index, parameter) in params.items.iter().enumerate() {
-            let symbol = param_symbol(&parameter.pattern);
-            let variable = self.declare_function_binding(symbol);
             let value = self.load_arg(index);
             let value = if let Some(initializer) = &parameter.initializer {
                 let missing =
@@ -137,7 +138,17 @@ impl FunctionCompiler<'_, '_> {
             } else {
                 value
             };
-            self.initialize_local(variable, value);
+            match &parameter.pattern {
+                BindingPattern::BindingIdentifier(identifier) => {
+                    let variable =
+                        self.declare_function_binding(identifier.symbol_id.get().unwrap());
+                    self.initialize_local(variable, value);
+                }
+                BindingPattern::ArrayPattern(pattern) => {
+                    self.emit_array_binding(pattern, value, VariableDeclarationKind::Var)?;
+                }
+                _ => unreachable!("validated parameter pattern"),
+            }
         }
         if let Some(rest) = &params.rest {
             let symbol = param_symbol(&rest.rest.argument);
@@ -300,6 +311,19 @@ impl FunctionCompiler<'_, '_> {
     }
 }
 
+fn parameter_symbols(pattern: &BindingPattern<'_>) -> Vec<SymbolId> {
+    match pattern {
+        BindingPattern::BindingIdentifier(identifier) => vec![identifier.symbol_id.get().unwrap()],
+        BindingPattern::ArrayPattern(pattern) => pattern
+            .elements
+            .iter()
+            .flatten()
+            .map(param_symbol)
+            .collect(),
+        _ => unreachable!("validated parameter pattern"),
+    }
+}
+
 pub(super) fn param_symbol(pattern: &BindingPattern<'_>) -> SymbolId {
     match pattern {
         BindingPattern::BindingIdentifier(identifier) => identifier.symbol_id.get().unwrap(),
@@ -316,6 +340,11 @@ pub(super) fn collect_var_symbols(statements: &[Statement<'_>], symbols: &mut Ve
                 collect_declaration_symbols(declaration, symbols);
             }
             Statement::BlockStatement(block) => collect_var_symbols(&block.body, symbols),
+            Statement::SwitchStatement(statement) => {
+                for case in &statement.cases {
+                    collect_var_symbols(&case.consequent, symbols);
+                }
+            }
             Statement::IfStatement(statement) => {
                 collect_var_symbols(std::slice::from_ref(&statement.consequent), symbols);
                 if let Some(alternate) = &statement.alternate {
@@ -363,7 +392,7 @@ pub(super) fn collect_var_symbols(statements: &[Statement<'_>], symbols: &mut Ve
     }
 }
 
-fn collect_lexical_symbols(statements: &[Statement<'_>], symbols: &mut Vec<SymbolId>) {
+pub(super) fn collect_lexical_symbols(statements: &[Statement<'_>], symbols: &mut Vec<SymbolId>) {
     for statement in statements {
         if let Statement::ClassDeclaration(class) = statement {
             symbols.push(class.id.as_ref().unwrap().symbol_id.get().unwrap());
@@ -385,6 +414,13 @@ fn collect_declaration_symbols(declaration: &VariableDeclaration<'_>, symbols: &
             BindingPattern::ArrayPattern(pattern) => {
                 for element in pattern.elements.iter().flatten() {
                     if let BindingPattern::BindingIdentifier(identifier) = element {
+                        symbols.push(identifier.symbol_id.get().unwrap());
+                    }
+                }
+            }
+            BindingPattern::ObjectPattern(pattern) => {
+                for property in &pattern.properties {
+                    if let BindingPattern::BindingIdentifier(identifier) = &property.value {
                         symbols.push(identifier.symbol_id.get().unwrap());
                     }
                 }

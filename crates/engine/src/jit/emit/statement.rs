@@ -1,5 +1,8 @@
+use cranelift_codegen::ir::SourceLoc;
 use cranelift_codegen::ir::{BlockArg, InstBuilder, types};
-use oxc_ast::ast::{BindingPattern, Statement, VariableDeclaration, VariableDeclarationKind};
+use oxc_ast::ast::{
+    BindingPattern, ObjectPattern, Statement, VariableDeclaration, VariableDeclarationKind,
+};
 use oxc_span::GetSpan;
 
 use crate::error::{Error, unsupported_at};
@@ -28,7 +31,7 @@ impl FunctionCompiler<'_, '_> {
         result
     }
 
-    fn initialize_function_declarations(
+    pub(super) fn initialize_function_declarations(
         &mut self,
         statements: &[Statement<'_>],
     ) -> Result<(), Error> {
@@ -59,6 +62,15 @@ impl FunctionCompiler<'_, '_> {
     }
 
     pub(super) fn emit_statement(&mut self, statement: &Statement<'_>) -> Result<(), Error> {
+        let previous = std::mem::replace(&mut self.source_span, statement.span());
+        self.b.set_srcloc(SourceLoc::new(self.source_span.start));
+        let result = self.emit_statement_inner(statement);
+        self.b.set_srcloc(SourceLoc::new(previous.start));
+        self.source_span = previous;
+        result
+    }
+
+    fn emit_statement_inner(&mut self, statement: &Statement<'_>) -> Result<(), Error> {
         match statement {
             Statement::ClassDeclaration(class) => self.emit_class_declaration(class),
             Statement::BlockStatement(block) => self.emit_block(&block.body),
@@ -178,6 +190,7 @@ impl FunctionCompiler<'_, '_> {
                 self.switch(done);
                 Ok(())
             }
+            Statement::SwitchStatement(statement) => self.emit_switch(statement),
             Statement::WhileStatement(statement) => self.emit_while(statement),
             Statement::DoWhileStatement(statement) => self.emit_do_while(statement),
             Statement::ForStatement(statement) => self.emit_for(statement),
@@ -188,7 +201,7 @@ impl FunctionCompiler<'_, '_> {
                     return Err(unsupported_at(statement.span, "labeled break"));
                 }
                 let target = self
-                    .loops
+                    .control_targets
                     .last()
                     .ok_or_else(|| unsupported_at(statement.span, "break outside loop"))?
                     .0;
@@ -201,10 +214,11 @@ impl FunctionCompiler<'_, '_> {
                     return Err(unsupported_at(statement.span, "labeled continue"));
                 }
                 let target = self
-                    .loops
-                    .last()
-                    .ok_or_else(|| unsupported_at(statement.span, "continue outside loop"))?
-                    .1;
+                    .control_targets
+                    .iter()
+                    .rev()
+                    .find_map(|(_, target)| *target)
+                    .ok_or_else(|| unsupported_at(statement.span, "continue outside loop"))?;
                 self.clear_temporaries();
                 self.jump(target, &[]);
                 Ok(())
@@ -220,11 +234,112 @@ impl FunctionCompiler<'_, '_> {
         }
     }
 
+    pub(super) fn emit_array_binding(
+        &mut self,
+        pattern: &oxc_ast::ast::ArrayPattern<'_>,
+        iterable: cranelift_codegen::ir::Value,
+        kind: VariableDeclarationKind,
+    ) -> Result<(), Error> {
+        let state = self.call_helper(Helper::IterateNew, &[iterable]);
+        self.check_error();
+        for element in &pattern.elements {
+            let value = self.call_helper(Helper::IterateNext, &[state]);
+            self.check_error();
+            if let Some(BindingPattern::BindingIdentifier(identifier)) = element {
+                let exhausted = self.b.ins().icmp_imm(
+                    cranelift_codegen::ir::condcodes::IntCC::Equal,
+                    value,
+                    Value::UNINITIALIZED.bits() as i64,
+                );
+                let undefined = self.constant(Value::UNDEFINED);
+                let value = self.b.ins().select(exhausted, undefined, value);
+                let symbol = identifier.symbol_id.get().unwrap();
+                let variable = if kind == VariableDeclarationKind::Var {
+                    self.resolve_function_binding(symbol)
+                } else {
+                    self.resolve_lexical_binding(symbol)
+                }
+                .expect("destructuring binding must be declared");
+                self.initialize_local(variable, value);
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_object_binding(pattern: &ObjectPattern<'_>) -> Result<(), Error> {
+        for property in &pattern.properties {
+            if property.computed {
+                return Err(unsupported_at(
+                    property.key.span(),
+                    "computed object destructuring key",
+                ));
+            }
+            let name = property
+                .key
+                .static_name()
+                .ok_or_else(|| unsupported_at(property.key.span(), "object destructuring key"))?;
+            if name.as_str().is_none() {
+                return Err(unsupported_at(
+                    property.key.span(),
+                    "lone surrogate in object destructuring key",
+                ));
+            }
+            if !matches!(property.value, BindingPattern::BindingIdentifier(_)) {
+                return Err(unsupported_at(
+                    property.value.span(),
+                    "object destructuring pattern",
+                ));
+            }
+        }
+        if let Some(rest) = &pattern.rest {
+            return Err(unsupported_at(rest.span, "object destructuring rest"));
+        }
+        Ok(())
+    }
+
+    pub(super) fn emit_object_binding(
+        &mut self,
+        pattern: &ObjectPattern<'_>,
+        object: cranelift_codegen::ir::Value,
+        kind: VariableDeclarationKind,
+    ) -> Result<(), Error> {
+        Self::validate_object_binding(pattern)?;
+        for property in &pattern.properties {
+            let name = property.key.static_name().unwrap();
+            let name = name.as_str().unwrap();
+            let BindingPattern::BindingIdentifier(identifier) = &property.value else {
+                unreachable!()
+            };
+            let value = self.property_access(object, name, None);
+            let symbol = identifier.symbol_id.get().unwrap();
+            let variable = if kind == VariableDeclarationKind::Var {
+                self.resolve_function_binding(symbol)
+            } else {
+                self.resolve_lexical_binding(symbol)
+            }
+            .expect("destructuring binding must be declared");
+            self.initialize_local(variable, value);
+        }
+        Ok(())
+    }
+
     pub(super) fn emit_variable_declaration(
         &mut self,
         declaration: &VariableDeclaration<'_>,
     ) -> Result<(), Error> {
         for declarator in &declaration.declarations {
+            if let BindingPattern::ObjectPattern(pattern) = &declarator.id {
+                let Some(initializer) = &declarator.init else {
+                    return Err(unsupported_at(
+                        declarator.span,
+                        "object destructuring without initializer",
+                    ));
+                };
+                let object = self.emit_expression(initializer)?;
+                self.emit_object_binding(pattern, object, declaration.kind)?;
+                self.clear_temporaries();
+                continue;
+            }
             if let BindingPattern::ArrayPattern(pattern) = &declarator.id {
                 if pattern.rest.is_some()
                     || pattern
@@ -245,29 +360,7 @@ impl FunctionCompiler<'_, '_> {
                     ));
                 };
                 let iterable = self.emit_expression(initializer)?;
-                let state = self.call_helper(Helper::IterateNew, &[iterable]);
-                self.check_error();
-                for element in &pattern.elements {
-                    let value = self.call_helper(Helper::IterateNext, &[state]);
-                    self.check_error();
-                    if let Some(BindingPattern::BindingIdentifier(identifier)) = element {
-                        let exhausted = self.b.ins().icmp_imm(
-                            cranelift_codegen::ir::condcodes::IntCC::Equal,
-                            value,
-                            Value::UNINITIALIZED.bits() as i64,
-                        );
-                        let undefined = self.constant(Value::UNDEFINED);
-                        let value = self.b.ins().select(exhausted, undefined, value);
-                        let symbol = identifier.symbol_id.get().unwrap();
-                        let variable = if declaration.kind == VariableDeclarationKind::Var {
-                            self.resolve_function_binding(symbol)
-                        } else {
-                            self.resolve_lexical_binding(symbol)
-                        }
-                        .expect("destructuring binding must be declared");
-                        self.initialize_local(variable, value);
-                    }
-                }
+                self.emit_array_binding(pattern, iterable, declaration.kind)?;
                 self.clear_temporaries();
                 continue;
             }

@@ -2,7 +2,11 @@ use js_engine::{Engine, EngineOptions, Error, OptLevel, Value};
 
 fn check(source: &str) {
     for opt_level in [OptLevel::None, OptLevel::Speed] {
-        let mut engine = Engine::with_options(EngineOptions { opt_level }).unwrap();
+        let mut engine = Engine::with_options(EngineOptions {
+            opt_level,
+            ..Default::default()
+        })
+        .unwrap();
         engine.compile(source, "classes.js").unwrap();
         assert_eq!(engine.call("main", &[]).unwrap().value(), Value::TRUE);
     }

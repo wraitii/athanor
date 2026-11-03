@@ -1,5 +1,5 @@
 use crate::host::Host;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use oxc_allocator::Allocator;
@@ -32,13 +32,24 @@ impl OptLevel {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EngineOptions {
     pub opt_level: OptLevel,
+    pub jitdump: bool,
+}
+
+impl Default for EngineOptions {
+    fn default() -> Self {
+        Self {
+            opt_level: OptLevel::default(),
+            jitdump: std::env::var("JS_JIT_JITDUMP").as_deref() == Ok("1"),
+        }
+    }
 }
 
 pub struct Engine {
     compiler: RefCell<Compiler>,
+    random_state: Cell<u64>,
     global: Environment,
     functions: RefCell<HashMap<String, Function>>,
     code: RefCell<HashMap<u64, usize>>,
@@ -53,6 +64,7 @@ impl Engine {
     pub fn with_options(options: EngineOptions) -> Result<Self, Error> {
         let global = Environment::new();
         global.define("globalThis", Value::GLOBAL_OBJECT);
+        global.define("Infinity", Value::number(f64::INFINITY));
         let constructor = global
             .heap()
             .native_function(crate::heap::NativeFunction::Error)
@@ -71,6 +83,42 @@ impl Engine {
             .ok_or_else(|| Error::Runtime("heap exhausted".into()))?;
         global.define("Array", constructor);
         global.heap().release(constructor);
+        let print = global
+            .heap()
+            .native_function(crate::heap::NativeFunction::Print)
+            .ok_or_else(|| Error::Runtime("heap exhausted".into()))?;
+        global.define("print", print);
+        global.heap().release(print);
+        let console = global
+            .heap()
+            .object()
+            .ok_or_else(|| Error::Runtime("heap exhausted".into()))?;
+        let log = global
+            .heap()
+            .native_function(crate::heap::NativeFunction::ConsoleLog)
+            .ok_or_else(|| Error::Runtime("heap exhausted".into()))?;
+        global.heap().define_property(console, "log", log, false);
+        global.heap().release(log);
+        global.define("console", console);
+        global.heap().release(console);
+        use crate::heap::{NativeFunction as Native, TypedKind};
+        for (name, kind) in [
+            ("Uint8Array", TypedKind::Uint8),
+            ("Uint16Array", TypedKind::Uint16),
+            ("Uint32Array", TypedKind::Uint32),
+            ("Int8Array", TypedKind::Int8),
+            ("Int16Array", TypedKind::Int16),
+            ("Int32Array", TypedKind::Int32),
+            ("Float32Array", TypedKind::Float32),
+            ("Float64Array", TypedKind::Float64),
+        ] {
+            let value = global
+                .heap()
+                .native_function(Native::TypedConstructor(kind))
+                .ok_or_else(|| Error::Runtime("heap exhausted".into()))?;
+            global.define(name, value);
+            global.heap().release(value);
+        }
         let math = global
             .heap()
             .object()
@@ -82,6 +130,7 @@ impl Engine {
         }
         use crate::heap::{MathFunction as M, NativeFunction};
         for (name, function) in [
+            ("random", M::Random),
             ("abs", M::Abs),
             ("ceil", M::Ceil),
             ("floor", M::Floor),
@@ -129,13 +178,70 @@ impl Engine {
         }
         global.define("JSON", json);
         global.heap().release(json);
+        let object = global
+            .heap()
+            .object()
+            .ok_or_else(|| Error::Runtime("heap exhausted".into()))?;
+        for (name, function) in [
+            ("keys", NativeFunction::ObjectKeys),
+            ("values", NativeFunction::ObjectValues),
+            (
+                "getOwnPropertyNames",
+                NativeFunction::ObjectGetOwnPropertyNames,
+            ),
+            ("freeze", NativeFunction::ObjectFreeze),
+            ("isFrozen", NativeFunction::ObjectIsFrozen),
+        ] {
+            let value = global
+                .heap()
+                .native_function(function)
+                .ok_or_else(|| Error::Runtime("heap exhausted".into()))?;
+            global.heap().define_property(object, name, value, false);
+            global.heap().release(value);
+        }
+        global.define("Object", object);
+        global.heap().release(object);
+        let date = global
+            .heap()
+            .object()
+            .ok_or_else(|| Error::Runtime("heap exhausted".into()))?;
+        let now = global
+            .heap()
+            .native_function(NativeFunction::DateNow)
+            .ok_or_else(|| Error::Runtime("heap exhausted".into()))?;
+        global.heap().define_property(date, "now", now, false);
+        global.heap().release(now);
+        global.define("Date", date);
+        global.heap().release(date);
+        let seed_random = global
+            .heap()
+            .native_function(NativeFunction::HostSeedRandom)
+            .ok_or_else(|| Error::Runtime("heap exhausted".into()))?;
+        global.define("hostSeedRandom", seed_random);
+        global.heap().release(seed_random);
         Ok(Self {
             compiler: RefCell::new(Compiler::new(options)?),
+            random_state: Cell::new(0x330e),
             global,
             functions: RefCell::new(HashMap::new()),
             code: RefCell::new(HashMap::new()),
             host: None,
         })
+    }
+
+    pub(crate) fn seed_random(&self, seed: u32) {
+        self.random_state.set(((seed as u64) << 16) | 0x330e);
+    }
+
+    pub(crate) fn random(&self) -> f64 {
+        let state = self
+            .random_state
+            .get()
+            .wrapping_mul(0x5deece66d)
+            .wrapping_add(11)
+            & ((1_u64 << 48) - 1);
+        self.random_state.set(state);
+        (state >> 17) as f64 / 2147483648.0
     }
 
     pub fn install_host(&mut self, host: impl Host + 'static) -> Result<(), Error> {
@@ -165,6 +271,15 @@ impl Engine {
 
     pub fn global(&self) -> &Environment {
         &self.global
+    }
+
+    pub fn string(&self, text: &str) -> Result<OwnedValue, Error> {
+        let value = self
+            .global
+            .heap()
+            .string(text)
+            .ok_or_else(|| Error::Runtime("heap exhausted".into()))?;
+        Ok(OwnedValue::from_owned(value, self.global.heap().clone()))
     }
 
     pub fn compile(&mut self, source: &str, filename: &str) -> Result<(), Error> {
@@ -261,6 +376,8 @@ impl Engine {
                 &program,
                 analysis.semantic.scoping(),
                 analysis.semantic.nodes(),
+                source,
+                filename,
             )
             .map_err(|error| match error {
                 Error::Unsupported(message) => Error::Unsupported(format!("{filename}: {message}")),

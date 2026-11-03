@@ -383,14 +383,19 @@ impl FunctionCompiler<'_, '_> {
             .b
             .ins()
             .icmp_imm(IntCC::Equal, pending, Value::TRUE.bits() as i64);
+        let failed = self.b.create_block();
         let done = self.b.create_block();
-        self.brif(
-            condition,
-            self.return_block,
-            &[BlockArg::Value(dummy)],
-            done,
-            &[],
-        );
+        self.brif(condition, failed, &[], done, &[]);
+        self.switch(failed);
+        let ptr = self.b.ins().iconst(self.pointer, self.source_name.0 as i64);
+        let len = self.b.ins().iconst(types::I64, self.source_name.1 as i64);
+        let start = self
+            .b
+            .ins()
+            .iconst(types::I64, self.source_span.start as i64);
+        let end = self.b.ins().iconst(types::I64, self.source_span.end as i64);
+        self.call_helper(Helper::ErrorOrigin, &[ptr, len, start, end]);
+        self.jump(self.return_block, &[BlockArg::Value(dummy)]);
         self.switch(done);
         let pending = self.call_helper(Helper::ExceptionPending, &[dummy]);
         let condition = self

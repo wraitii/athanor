@@ -15,28 +15,28 @@ persist between lines. Expressions print their value; enter `exit`, `.exit`, or
 EOF to leave. The REPL uses the global name `__repl_result` for expression
 results. The engine currently supports only a subset of JavaScript.
 
-The runner installs `hostReadFile`, `hostListFiles`, and `hostEvaluateSource`.
-Source evaluation shares the active engine, including nested library loads.
+The runner installs `hostReadFile`, `hostListFiles`, and `hostEvaluateSource`,
+and provides `print` plus a basic `console.log`. Source evaluation shares the
+active engine, including nested library loads.
+Set `JS_JIT_JITDUMP=1` to write a `jit-<pid>-<timestamp>-js.dump` file to the
+temporary directory. `samply` and `perf` can consume it, with generated code
+attributed to JavaScript source lines.
+Both runners provide deterministic `Math.random()` without a Boost dependency.
+The shared bootstrap calls `hostSeedRandom(settings.Seed)` before loading scripts;
+a missing seed defaults to zero. The generator matches the game's rand48 sequence.
 To try the map workload from the repository root:
 
 ```sh
-cargo run --manifest-path cranelift-exp/Cargo.toml -- \
-  --load cranelift-exp/bootstrap.js --eval '
-    function main()
-    {
-      return run(
-        "binaries/data/mods/public/maps/random/new_rms_test.js",
-        "binaries/data/mods/public",
-        "{\"Size\":128,\"Seed\":0,\"PlayerData\":[null,{\"Civ\":\"athen\"},{\"Civ\":\"brit\"}]}");
-    }
-  '
+cargo run --quiet --manifest-path cranelift-exp/Cargo.toml -- --map
 ```
 
-This uses the same bootstrap `run` entry point and default settings as the C++
-runner: settings initialization, global scripts, map libraries, generation, and
-summary output. It still stops on unsupported engine features and does not yet
-generate a complete map. The current first blocker on this path is a regular expression literal in
-`globalscripts/FSM.js`.
+`--map` loads the shared bootstrap and calls its `run` entry point with the
+same defaults as the C++ runner. Pass a script path positionally, or use
+`--data ROOT`, `--settings JSON`, and `--bootstrap SCRIPT` to override the
+defaults. This workload now completes and prints the map summary. The dev
+profile uses `opt-level = 1`; use `--release` for performance measurements.
+Release builds include line tables for profiling.
+
 
 ## cpp
 

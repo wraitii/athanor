@@ -92,6 +92,9 @@ pub(super) fn call(
             };
         }
         StringReplace => {
+            if heap.regexp_state(arg(0)).is_some() {
+                return super::regexp::replace(context, &text, arg(0), arg(1));
+            }
             let (Some(search), Some(replacement)) = (string_arg(arg(0)), string_arg(arg(1))) else {
                 return fail(context, "replace requires literal string arguments");
             };
@@ -99,6 +102,47 @@ pub(super) fn call(
                 return fail(context, "replace substitution patterns are unsupported");
             }
             text.replacen(&search, &replacement, 1)
+        }
+        StringPadStart => {
+            let target = if arg(0).is_undefined() {
+                0
+            } else if let Some(number) = arg(0).as_number() {
+                if number.is_nan() || number <= 0.0 {
+                    0
+                } else if !number.is_finite() || number > usize::MAX as f64 {
+                    return fail(context, "invalid padStart length");
+                } else {
+                    number.floor() as usize
+                }
+            } else {
+                return fail(context, "padStart length must be a number or undefined");
+            };
+            let length = text.chars().count();
+            if target <= length {
+                return match heap.string(&text) {
+                    Some(value) => context.own(value),
+                    None => fail(context, "heap exhausted"),
+                };
+            }
+            let padding = if arg(1).is_undefined() {
+                " ".to_owned()
+            } else if let Some(padding) = string_arg(arg(1)) {
+                padding
+            } else {
+                return fail(context, "padStart padding must be a string or undefined");
+            };
+            if padding.is_empty() {
+                return match heap.string(&text) {
+                    Some(value) => context.own(value),
+                    None => fail(context, "heap exhausted"),
+                };
+            }
+            let padding = padding
+                .chars()
+                .cycle()
+                .take(target - length)
+                .collect::<String>();
+            format!("{padding}{text}")
         }
         _ => unreachable!(),
     };

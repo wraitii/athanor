@@ -153,7 +153,11 @@ fn failing_closures_release_frames_and_preserve_host_capture() {
 #[test]
 fn recursive_closures_and_captured_rest_work_at_each_optimization_level() {
     for opt_level in [js_engine::OptLevel::None, js_engine::OptLevel::Speed] {
-        let mut engine = Engine::with_options(js_engine::EngineOptions { opt_level }).unwrap();
+        let mut engine = Engine::with_options(js_engine::EngineOptions {
+            opt_level,
+            ..Default::default()
+        })
+        .unwrap();
         engine
             .compile(
                 "function make(...values){ return function(){ return values[0]; }; }

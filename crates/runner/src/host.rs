@@ -66,6 +66,13 @@ impl js_engine::Host for FileHost {
         fs::read_to_string(path).map_err(|error| format!("Unable to read {path}: {error}"))
     }
 
+    fn print(&self, message: &str) {
+        use std::io::Write;
+        let mut stdout = std::io::stdout().lock();
+        let _ = stdout.write_all(message.as_bytes());
+        let _ = stdout.flush();
+    }
+
     fn list_files(&self, path: &str, filter: &str, recursive: bool) -> Result<String, String> {
         let mut files = Vec::new();
         list(Path::new(path), filter, recursive, &mut files)?;

@@ -6,3 +6,9 @@ members = ["crates/engine", "crates/runner"]
 edition = "2024"
 license = "GPL-2.0-or-later"
 version = "0.1.0"
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+debug = "line-tables-only"

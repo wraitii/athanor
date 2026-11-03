@@ -6,6 +6,9 @@ use crate::value::Value;
 
 pub(in crate::jit) fn call(ctx: &mut JitCtx, function: MathFunction, args: &[Value]) -> Value {
     use MathFunction::*;
+    if function == Random {
+        return Value::number(ctx.engine.random());
+    }
     let count = match function {
         Min | Max => args.len(),
         Atan2 | Pow | Imul => 2,
@@ -22,6 +25,7 @@ pub(in crate::jit) fn call(ctx: &mut JitCtx, function: MathFunction, args: &[Val
     let x = numbers.first().copied().unwrap_or(f64::NAN);
     let y = numbers.get(1).copied().unwrap_or(f64::NAN);
     let result = match function {
+        Random => unreachable!(),
         Abs => x.abs(),
         Ceil => x.ceil(),
         Floor => x.floor(),

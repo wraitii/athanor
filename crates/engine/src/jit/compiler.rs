@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use cranelift_codegen::Context;
 use cranelift_codegen::ir::{AbiParam, Signature, types};
@@ -17,7 +17,7 @@ use oxc_syntax::symbol::SymbolId;
 use crate::EngineOptions;
 use crate::error::{Error, compile_at, unsupported_at};
 
-use super::{analysis::CaptureAnalysis, emit, helpers};
+use super::{analysis::CaptureAnalysis, emit, helpers, jitdump};
 
 pub(crate) struct CompiledFunction {
     pub(crate) name: String,
@@ -28,10 +28,13 @@ pub(crate) struct CompiledFunction {
 
 pub(crate) struct Compiler {
     names: Vec<Box<str>>,
+    source_name: (usize, usize),
     module: JITModule,
     signature: Signature,
     helpers: Vec<FuncId>,
     functions: HashMap<String, FuncId>,
+    function_names: HashMap<FuncId, String>,
+    dump: Option<jitdump::Writer>,
     next_id: u64,
     context: Context,
     builder_context: FunctionBuilderContext,
@@ -67,14 +70,26 @@ impl Compiler {
         let context = module.make_context();
         Ok(Self {
             names: Vec::new(),
+            source_name: (0, 0),
             module,
             signature,
             helpers: helper_ids,
             functions: HashMap::new(),
+            function_names: HashMap::new(),
+            dump: options.jitdump.then(jitdump::Writer::new).flatten(),
             next_id: 0,
             context,
             builder_context: FunctionBuilderContext::new(),
         })
+    }
+
+    fn declare(&mut self, name: &str) -> Result<FuncId, Error> {
+        let id = self
+            .module
+            .declare_function(name, Linkage::Local, &self.signature)
+            .map_err(|error| Error::Compile(error.to_string()))?;
+        self.function_names.insert(id, name.to_string());
+        Ok(id)
     }
 
     pub(crate) fn compile_program<'a>(
@@ -82,6 +97,8 @@ impl Compiler {
         program: &'a Program<'a>,
         scoping: &Scoping,
         nodes: &AstNodes<'a>,
+        source: &str,
+        filename: &str,
     ) -> Result<
         (
             Vec<CompiledFunction>,
@@ -91,7 +108,11 @@ impl Compiler {
         ),
         Error,
     > {
-        let result = self.compile_program_inner(program, scoping, nodes);
+        let source_path = filename;
+        let filename: Box<str> = filename.into();
+        self.source_name = (filename.as_ptr() as usize, filename.len());
+        self.names.push(filename);
+        let result = self.compile_program_inner(program, scoping, nodes, source, source_path);
         if result.is_err() {
             self.context.clear();
             self.builder_context = FunctionBuilderContext::new();
@@ -104,6 +125,8 @@ impl Compiler {
         program: &'a Program<'a>,
         scoping: &Scoping,
         nodes: &AstNodes<'a>,
+        source: &str,
+        source_path: &str,
     ) -> Result<
         (
             Vec<CompiledFunction>,
@@ -113,6 +136,11 @@ impl Compiler {
         ),
         Error,
     > {
+        let lines = self
+            .dump
+            .as_ref()
+            .map(|_| line_starts(source))
+            .unwrap_or_default();
         let mut globals = Vec::new();
         let mut declarations = Vec::new();
         for statement in &program.body {
@@ -159,10 +187,7 @@ impl Compiler {
             }
             let internal = format!("jsfn_{}_{}", self.next_id, name);
             self.next_id += 1;
-            let id = self
-                .module
-                .declare_function(&internal, Linkage::Local, &self.signature)
-                .map_err(|error| Error::Compile(error.to_string()))?;
+            let id = self.declare(&internal)?;
             ids.insert(name.clone(), id);
             ordered.push((name, function));
         }
@@ -216,13 +241,10 @@ impl Compiler {
                 }
                 _ => continue,
             };
-            validate_params(params, span)?;
+            validate_params(params, span, generator)?;
             let internal = format!("jsclosure_{}", self.next_id);
             self.next_id += 1;
-            let id = self
-                .module
-                .declare_function(&internal, Linkage::Local, &self.signature)
-                .map_err(|error| Error::Compile(error.to_string()))?;
+            let id = self.declare(&internal)?;
             let captures = analysis
                 .functions
                 .get(&span.start)
@@ -257,10 +279,7 @@ impl Compiler {
                 );
                 let internal = format!("jsclass_{}", self.next_id);
                 self.next_id += 1;
-                let id = self
-                    .module
-                    .declare_function(&internal, Linkage::Local, &self.signature)
-                    .map_err(|error| Error::Compile(error.to_string()))?;
+                let id = self.declare(&internal)?;
                 let (code, _) = self.compile_callable(
                     &params,
                     &[],
@@ -332,10 +351,7 @@ impl Compiler {
         } else {
             let internal = format!("jsinit_{}", self.next_id);
             self.next_id += 1;
-            let id = self
-                .module
-                .declare_function(&internal, Linkage::Local, &self.signature)
-                .map_err(|error| Error::Compile(error.to_string()))?;
+            let id = self.declare(&internal)?;
             self.context.clear();
             self.context.func.signature = self.signature.clone();
             {
@@ -349,6 +365,7 @@ impl Compiler {
                     scoping,
                     &self.helpers,
                     &mut self.names,
+                    self.source_name,
                     &program.body,
                     &analysis.captured,
                     &closures,
@@ -367,16 +384,47 @@ impl Compiler {
             Some(id)
         };
 
+        let mut dumped = Vec::new();
         for (id, code) in pending {
             self.context.clear();
             self.context.func = code;
             self.module
                 .define_function(id, &mut self.context)
                 .map_err(|error| Error::Compile(error.to_string()))?;
+            if self.dump.is_some() {
+                let Some(compiled) = self.context.compiled_code() else {
+                    return Err(Error::Compile("missing compiled code".into()));
+                };
+                let size = compiled.code_buffer().len();
+                let mut locations = BTreeMap::new();
+                let mut default_line = None;
+                for location in compiled.buffer.get_srclocs_sorted() {
+                    if location.loc.is_default() {
+                        continue;
+                    }
+                    let line = line_at(&lines, location.loc.bits());
+                    default_line.get_or_insert(line);
+                    locations.insert(location.start, line);
+                }
+                locations.insert(0, default_line.unwrap_or(1));
+                let name = self
+                    .function_names
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("jsfn_{}", id.as_u32()));
+                dumped.push((id, name, size, locations.into_iter().collect::<Vec<_>>()));
+            }
         }
         self.module
             .finalize_definitions()
             .map_err(|error| Error::Compile(error.to_string()))?;
+        if let Some(dump) = self.dump.as_mut() {
+            for (id, name, size, locations) in dumped {
+                let code = self.module.get_finalized_function(id);
+                let bytes = unsafe { std::slice::from_raw_parts(code, size) };
+                dump.record(&name, source_path, &locations, bytes);
+            }
+        }
 
         let mut functions = Vec::with_capacity(ordered.len());
         for (name, function) in ordered {
@@ -443,10 +491,7 @@ impl Compiler {
         let plan = super::generator::ResumePlan::lower(statements)?;
         let internal = format!("jsresume_{}", self.next_id);
         self.next_id += 1;
-        let id = self
-            .module
-            .declare_function(&internal, Linkage::Local, &self.signature)
-            .map_err(|error| Error::Compile(error.to_string()))?;
+        let id = self.declare(&internal)?;
         let resume = self.compile_function(
             params,
             statements,
@@ -500,6 +545,7 @@ impl Compiler {
                 scoping,
                 &self.helpers,
                 &mut self.names,
+                self.source_name,
                 params,
                 statements,
                 expression,
@@ -520,6 +566,20 @@ impl Compiler {
     }
 }
 
+fn line_starts(source: &str) -> Vec<u32> {
+    let mut starts = vec![0];
+    for (index, byte) in source.bytes().enumerate() {
+        if byte == b'\n' {
+            starts.push(index as u32 + 1);
+        }
+    }
+    starts
+}
+
+fn line_at(starts: &[u32], offset: u32) -> u32 {
+    starts.partition_point(|&start| start <= offset) as u32
+}
+
 fn validate_function(function: &Function<'_>) -> Result<String, Error> {
     let name = function
         .id
@@ -538,45 +598,44 @@ fn validate_function(function: &Function<'_>) -> Result<String, Error> {
             format!("function `{name}` has no body"),
         ));
     }
-    if let Some(rest) = &function.params.rest
-        && !matches!(rest.rest.argument, BindingPattern::BindingIdentifier(_))
-    {
-        return Err(unsupported_at(
-            rest.span,
-            format!("rest parameter pattern in function `{name}`"),
-        ));
-    }
-    for parameter in &function.params.items {
-        if function.generator && parameter.initializer.is_some() {
-            return Err(unsupported_at(
-                parameter.span,
-                "generator default parameter",
-            ));
-        }
-        if !matches!(parameter.pattern, BindingPattern::BindingIdentifier(_)) {
-            return Err(unsupported_at(
-                parameter.span,
-                format!("parameter pattern in function `{name}`"),
-            ));
-        }
-    }
+    validate_params(&function.params, function.span, function.generator)?;
     Ok(name)
 }
 
-fn validate_params(params: &FormalParameters<'_>, span: oxc_span::Span) -> Result<(), Error> {
+fn validate_params(
+    params: &FormalParameters<'_>,
+    span: oxc_span::Span,
+    generator: bool,
+) -> Result<(), Error> {
     if params
-        .items
-        .iter()
-        .any(|p| !matches!(p.pattern, BindingPattern::BindingIdentifier(_)))
-        || params
-            .rest
-            .as_ref()
-            .is_some_and(|p| !matches!(p.rest.argument, BindingPattern::BindingIdentifier(_)))
+        .rest
+        .as_ref()
+        .is_some_and(|p| !matches!(p.rest.argument, BindingPattern::BindingIdentifier(_)))
     {
-        return Err(unsupported_at(
-            span,
-            "function parameter pattern or default",
-        ));
+        return Err(unsupported_at(span, "rest parameter pattern"));
+    }
+    for parameter in &params.items {
+        if generator
+            && (parameter.initializer.is_some()
+                || !matches!(parameter.pattern, BindingPattern::BindingIdentifier(_)))
+        {
+            return Err(unsupported_at(
+                parameter.span,
+                "generator default or destructured parameter",
+            ));
+        }
+        match &parameter.pattern {
+            BindingPattern::BindingIdentifier(_) => {}
+            BindingPattern::ArrayPattern(pattern)
+                if pattern.rest.is_none()
+                    && pattern
+                        .elements
+                        .iter()
+                        .flatten()
+                        .all(|element| matches!(element, BindingPattern::BindingIdentifier(_))) => {
+            }
+            _ => return Err(unsupported_at(parameter.span, "function parameter pattern")),
+        }
     }
     Ok(())
 }

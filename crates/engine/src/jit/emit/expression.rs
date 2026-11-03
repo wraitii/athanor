@@ -1,9 +1,10 @@
 use cranelift_codegen::ir::{
-    BlockArg, InstBuilder, MemFlags, StackSlotData, StackSlotKind, Value as ClifValue, types,
+    BlockArg, InstBuilder, MemFlags, SourceLoc, StackSlotData, StackSlotKind, Value as ClifValue,
+    types,
 };
 use oxc_ast::ast::{
-    Argument, AssignmentTarget, CallExpression, Expression, ObjectPropertyKind, PropertyKind,
-    SimpleAssignmentTarget,
+    Argument, ArrayExpressionElement, AssignmentTarget, CallExpression, Expression,
+    ObjectPropertyKind, PropertyKind, SimpleAssignmentTarget,
 };
 use oxc_span::{GetSpan, Span};
 use oxc_syntax::operator::{AssignmentOperator, LogicalOperator, UnaryOperator, UpdateOperator};
@@ -20,6 +21,15 @@ impl FunctionCompiler<'_, '_> {
         &mut self,
         expression: &Expression<'_>,
     ) -> Result<ClifValue, Error> {
+        let previous = std::mem::replace(&mut self.source_span, expression.span());
+        self.b.set_srcloc(SourceLoc::new(self.source_span.start));
+        let result = self.emit_expression_inner(expression);
+        self.b.set_srcloc(SourceLoc::new(previous.start));
+        self.source_span = previous;
+        result
+    }
+
+    fn emit_expression_inner(&mut self, expression: &Expression<'_>) -> Result<ClifValue, Error> {
         match expression {
             Expression::StringLiteral(literal) => {
                 let text: Box<str> = literal
@@ -34,6 +44,42 @@ impl FunctionCompiler<'_, '_> {
                 self.check_error();
                 Ok(result)
             }
+            Expression::RegExpLiteral(literal) => {
+                use oxc_ast::ast::RegExpFlags;
+                let flags = literal.regex.flags;
+                if flags.intersects(RegExpFlags::Y | RegExpFlags::D | RegExpFlags::V) {
+                    return Err(unsupported_at(
+                        literal.span,
+                        "regular expression flags y, d, and v",
+                    ));
+                }
+                let pattern = literal.regex.pattern.text.as_str();
+                if has_named_capture(pattern) {
+                    return Err(unsupported_at(
+                        literal.span,
+                        "named regular expression capture",
+                    ));
+                }
+                let bits = u8::from(flags.contains(RegExpFlags::I))
+                    | (u8::from(flags.contains(RegExpFlags::M)) << 1)
+                    | (u8::from(flags.contains(RegExpFlags::S)) << 2)
+                    | (u8::from(flags.contains(RegExpFlags::U)) << 3)
+                    | (u8::from(flags.contains(RegExpFlags::G)) << 4);
+                regress::Regex::with_flags(pattern, crate::heap::regexp_flags(bits)).map_err(
+                    |error| {
+                        compile_at(literal.span, format!("invalid regular expression: {error}"))
+                    },
+                )?;
+                let pattern: Box<str> = pattern.into();
+                let ptr = self.b.ins().iconst(self.pointer, pattern.as_ptr() as i64);
+                let len = self.b.ins().iconst(types::I64, pattern.len() as i64);
+                let flags = self.b.ins().iconst(types::I64, bits as i64);
+                self.names.push(pattern);
+                let result = self.call_helper(Helper::RegExpNew, &[flags, ptr, len]);
+                self.check_error();
+                Ok(result)
+            }
+            Expression::ChainExpression(chain) => Ok(self.emit_optional_chain(chain)?.0),
             Expression::ThisExpression(_) => Ok(self.receiver),
             Expression::NumericLiteral(literal) => Ok(self.constant(Value::number(literal.value))),
             Expression::BooleanLiteral(literal) => Ok(self.constant(Value::boolean(literal.value))),
@@ -77,11 +123,40 @@ impl FunctionCompiler<'_, '_> {
                 Ok(object)
             }
             Expression::ArrayExpression(array) => {
+                if array
+                    .elements
+                    .iter()
+                    .any(|element| matches!(element, ArrayExpressionElement::SpreadElement(_)))
+                {
+                    if array
+                        .elements
+                        .iter()
+                        .any(|element| matches!(element, ArrayExpressionElement::Elision(_)))
+                    {
+                        return Err(unsupported_at(array.span, "array literal holes"));
+                    }
+                    let ptr = self.b.ins().iconst(self.pointer, 0);
+                    let zero = self.b.ins().iconst(types::I64, 0);
+                    let result = self.call_helper(Helper::ArrayNew, &[ptr, zero]);
+                    self.check_error();
+                    for element in &array.elements {
+                        let (expression, helper) = match element {
+                            ArrayExpressionElement::SpreadElement(spread) => {
+                                (&spread.argument, Helper::ArrayExtend)
+                            }
+                            _ => (element.as_expression().unwrap(), Helper::ArrayAppend),
+                        };
+                        let value = self.emit_expression(expression)?;
+                        self.call_helper(helper, &[result, value]);
+                        self.check_error();
+                    }
+                    return Ok(result);
+                }
                 let mut elements = Vec::with_capacity(array.elements.len());
                 for element in &array.elements {
-                    let expression = element.as_expression().ok_or_else(|| {
-                        unsupported_at(element.span(), "array holes and spread elements")
-                    })?;
+                    let expression = element
+                        .as_expression()
+                        .ok_or_else(|| unsupported_at(element.span(), "array literal holes"))?;
                     elements.push(self.emit_expression(expression)?);
                 }
                 let argv = self.stack_values(&elements, array.span)?;
@@ -418,11 +493,19 @@ impl FunctionCompiler<'_, '_> {
     }
 
     fn emit_call(&mut self, expression: &CallExpression<'_>) -> Result<ClifValue, Error> {
-        let mut callee = &expression.callee;
+        let (callable, receiver) = self.emit_call_reference(&expression.callee)?;
+        self.emit_call_arguments(expression, callable, receiver)
+    }
+
+    pub(super) fn emit_call_reference(
+        &mut self,
+        expression: &Expression<'_>,
+    ) -> Result<(ClifValue, ClifValue), Error> {
+        let mut callee = expression;
         while let Expression::ParenthesizedExpression(expression) = callee {
             callee = &expression.expression;
         }
-        let (callable, receiver) = match callee {
+        let result = match callee {
             Expression::StaticMemberExpression(member) => {
                 let receiver = self.emit_expression(&member.object)?;
                 let callable = self.property_access(receiver, member.property.name.as_str(), None);
@@ -434,12 +517,22 @@ impl FunctionCompiler<'_, '_> {
                 let callable = self.index_access(receiver, key, None);
                 (callable, receiver)
             }
+            Expression::ChainExpression(chain) => return self.emit_optional_chain(chain),
             _ => {
                 let callable = self.emit_expression(callee)?;
                 let receiver = self.constant(Value::UNDEFINED);
                 (callable, receiver)
             }
         };
+        Ok(result)
+    }
+
+    pub(super) fn emit_call_arguments(
+        &mut self,
+        expression: &CallExpression<'_>,
+        callable: ClifValue,
+        receiver: ClifValue,
+    ) -> Result<ClifValue, Error> {
         if let Some(arguments) = self.emit_spread_arguments(&expression.arguments)? {
             let result = self.call_helper(Helper::CallSpread, &[callable, receiver, arguments]);
             self.check_error();
@@ -476,8 +569,8 @@ impl FunctionCompiler<'_, '_> {
         self.check_error();
         for argument in arguments {
             let (expression, helper) = match argument {
-                Argument::SpreadElement(spread) => (&spread.argument, Helper::ArgumentSpread),
-                _ => (argument.as_expression().unwrap(), Helper::ArgumentPush),
+                Argument::SpreadElement(spread) => (&spread.argument, Helper::ArrayExtend),
+                _ => (argument.as_expression().unwrap(), Helper::ArrayAppend),
             };
             let value = self.emit_expression(expression)?;
             self.call_helper(helper, &[values, value]);
@@ -546,6 +639,36 @@ impl FunctionCompiler<'_, '_> {
         }
         Ok(self.b.ins().stack_addr(self.pointer, slot, 0))
     }
+}
+
+fn has_named_capture(pattern: &str) -> bool {
+    let bytes = pattern.as_bytes();
+    let mut index = 0;
+    let mut class = false;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index += 2,
+            b'[' if !class => {
+                class = true;
+                index += 1;
+            }
+            b']' if class => {
+                class = false;
+                index += 1;
+            }
+            b'(' if !class
+                && bytes.get(index + 1) == Some(&b'?')
+                && bytes.get(index + 2) == Some(&b'<') =>
+            {
+                if !matches!(bytes.get(index + 3), Some(b'=') | Some(b'!')) {
+                    return true;
+                }
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    false
 }
 
 fn expression_kind(expression: &Expression<'_>) -> &'static str {

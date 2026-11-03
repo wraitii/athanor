@@ -15,6 +15,7 @@
 #include <jsapi.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -34,11 +35,33 @@ constexpr const char* DEFAULT_SETTINGS{"{\"Size\":128,\"Seed\":0,\"PlayerData\":
 struct HostContext
 {
 	std::string dataRoot;
+	std::uint64_t randomState = 0x330e;
 };
 
 HostContext* GetHost(JSContext* cx)
 {
 	return static_cast<HostContext*>(JS_GetContextPrivate(cx));
+}
+
+bool HostSeedRandom(JSContext* cx, unsigned argc, JS::Value* vp)
+{
+	JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+	std::uint32_t seed;
+	if (!JS::ToUint32(cx, args.get(0), &seed))
+		return false;
+
+	GetHost(cx)->randomState = (std::uint64_t{seed} << 16) | 0x330e;
+	args.rval().setUndefined();
+	return true;
+}
+
+bool MathRandom(JSContext* cx, unsigned argc, JS::Value* vp)
+{
+	JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+	std::uint64_t& state = GetHost(cx)->randomState;
+	state = (state * 0x5deece66dULL + 11) & ((1ULL << 48) - 1);
+	args.rval().setDouble(static_cast<double>(state >> 17) / 2147483648.0);
+	return true;
 }
 
 bool ToUTF8(JSContext* cx, JS::HandleValue value, std::string& out)
@@ -317,7 +340,18 @@ int main(int argc, char** argv)
 		return 1;
 	}
 
-	if (!JS_DefineFunction(cx, global, "print", HostPrint, 1, 0) ||
+	JS::RootedValue mathValue(cx);
+	if (!JS_GetProperty(cx, global, "Math", &mathValue) || !mathValue.isObject())
+	{
+		PrintException(cx);
+		JS_DestroyContext(cx);
+		JS_ShutDown();
+		return 1;
+	}
+	JS::RootedObject math(cx, &mathValue.toObject());
+	if (!JS_DefineFunction(cx, math, "random", MathRandom, 0, 0) ||
+		!JS_DefineFunction(cx, global, "hostSeedRandom", HostSeedRandom, 1, 0) ||
+		!JS_DefineFunction(cx, global, "print", HostPrint, 1, 0) ||
 		!JS_DefineFunction(cx, global, "hostReadFile", HostReadFile, 1, 0) ||
 		!JS_DefineFunction(cx, global, "hostListFiles", HostListFiles, 3, 0) ||
 		!JS_DefineFunction(cx, global, "hostEvaluateSource", HostEvaluateSource, 2, 0))

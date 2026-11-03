@@ -13,12 +13,15 @@ pub(crate) struct Heap(Rc<RefCell<HeapData>>);
 #[derive(Default)]
 struct HeapData {
     generators: HashMap<u64, Generator>,
+    regexps: HashMap<u64, RegExp>,
+    regexp_cache: HashMap<(String, u8), Rc<regress::Regex>>,
     enumerators: HashMap<u64, Enumerator>,
     natives: HashMap<u64, (usize, NativeFunction)>,
     sets: HashMap<u64, Set>,
     objects: HashMap<u64, Object>,
     strings: HashMap<u64, (usize, String)>,
     arrays: HashMap<u64, Box<Array>>,
+    typed_arrays: HashMap<u64, TypedArray>,
     cells: HashMap<u64, Box<Cell>>,
     closures: HashMap<u64, Box<Closure>>,
     pending: VecDeque<u64>,
@@ -26,6 +29,13 @@ struct HeapData {
 
 pub(crate) const GENERATOR_DONE: usize = usize::MAX;
 pub(crate) const GENERATOR_RUNNING: usize = usize::MAX - 1;
+
+struct RegExp {
+    references: usize,
+    regex: Rc<regress::Regex>,
+    global: bool,
+    last_index: f64,
+}
 
 struct Enumerator {
     references: usize,
@@ -135,11 +145,28 @@ struct Object {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeFunction {
+    DateNow,
+    ObjectKeys,
+    ObjectValues,
+    ObjectGetOwnPropertyNames,
+    ObjectFreeze,
+    ObjectIsFrozen,
     Array,
+    ArrayFrom,
+    ArrayIsArray,
+    TypedConstructor(TypedKind),
+    TypedFrom(TypedKind),
+    TypedFill,
     Math(MathFunction),
     JsonParse,
     JsonStringify,
+    RegExpTest,
+    RegExpExec,
+    StringMatch,
+    HostSeedRandom,
     HostReadFile,
+    Print,
+    ConsoleLog,
     HostListFiles,
     HostEvaluateSource,
     Error,
@@ -151,15 +178,32 @@ pub(crate) enum NativeFunction {
     GeneratorNext,
     ArrayFilter,
     ArrayMap,
+    ArrayEvery,
+    ArraySome,
+    ArraySort,
     ArrayJoin,
+    ArrayPop,
+    ArrayIndexOf,
+    ArrayConcat,
+    ArrayPush,
+    ArrayIncludes,
+    ArrayReverse,
+    ArraySlice,
+    ArrayFlat,
+    ArrayFlatMap,
+    ArrayFill,
+    NumberToFixed,
+    NumberToString,
     StringSlice,
     StringSplit,
     StringStartsWith,
     StringReplace,
+    StringPadStart,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MathFunction {
+    Random,
     Abs,
     Ceil,
     Floor,
@@ -193,6 +237,153 @@ struct Set {
     entries: HashMap<SetKey, Value>,
 }
 
+pub(crate) const MAX_TYPED_ARRAY_BYTES: usize = 256 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TypedKind {
+    Uint8,
+    Uint16,
+    Uint32,
+    Int8,
+    Int16,
+    Int32,
+    Float32,
+    Float64,
+}
+
+struct TypedArray {
+    references: usize,
+    kind: TypedKind,
+    storage: TypedStorage,
+}
+
+enum TypedStorage {
+    Uint8(Vec<u8>),
+    Uint16(Vec<u16>),
+    Uint32(Vec<u32>),
+    Int8(Vec<i8>),
+    Int16(Vec<i16>),
+    Int32(Vec<i32>),
+    Float32(Vec<f32>),
+    Float64(Vec<f64>),
+}
+
+impl TypedStorage {
+    fn new(kind: TypedKind, length: usize) -> Option<Self> {
+        macro_rules! allocate {
+            ($variant:ident, $ty:ty) => {{
+                if length.checked_mul(std::mem::size_of::<$ty>())? > MAX_TYPED_ARRAY_BYTES {
+                    return None;
+                }
+                let mut values = Vec::<$ty>::new();
+                values.try_reserve_exact(length).ok()?;
+                values.resize(length, 0 as $ty);
+                Some(Self::$variant(values))
+            }};
+        }
+        match kind {
+            TypedKind::Uint8 => allocate!(Uint8, u8),
+            TypedKind::Uint16 => allocate!(Uint16, u16),
+            TypedKind::Uint32 => allocate!(Uint32, u32),
+            TypedKind::Int8 => allocate!(Int8, i8),
+            TypedKind::Int16 => allocate!(Int16, i16),
+            TypedKind::Int32 => allocate!(Int32, i32),
+            TypedKind::Float32 => allocate!(Float32, f32),
+            TypedKind::Float64 => allocate!(Float64, f64),
+        }
+    }
+    fn len(&self) -> usize {
+        match self {
+            Self::Uint8(values) => values.len(),
+            Self::Uint16(values) => values.len(),
+            Self::Uint32(values) => values.len(),
+            Self::Int8(values) => values.len(),
+            Self::Int16(values) => values.len(),
+            Self::Int32(values) => values.len(),
+            Self::Float32(values) => values.len(),
+            Self::Float64(values) => values.len(),
+        }
+    }
+    fn get(&self, index: usize) -> Option<f64> {
+        match self {
+            Self::Uint8(values) => values.get(index).map(|value| *value as f64),
+            Self::Uint16(values) => values.get(index).map(|value| *value as f64),
+            Self::Uint32(values) => values.get(index).map(|value| *value as f64),
+            Self::Int8(values) => values.get(index).map(|value| *value as f64),
+            Self::Int16(values) => values.get(index).map(|value| *value as f64),
+            Self::Int32(values) => values.get(index).map(|value| *value as f64),
+            Self::Float32(values) => values.get(index).map(|value| *value as f64),
+            Self::Float64(values) => values.get(index).map(|value| *value as f64),
+        }
+    }
+    fn integer(number: f64) -> u32 {
+        if number.is_finite() && number != 0.0 {
+            number.trunc().rem_euclid(4294967296.0) as u32
+        } else {
+            0
+        }
+    }
+    fn set(&mut self, index: usize, number: f64) {
+        match self {
+            Self::Uint8(values) => {
+                if let Some(value) = values.get_mut(index) {
+                    *value = Self::integer(number) as u8;
+                }
+            }
+            Self::Uint16(values) => {
+                if let Some(value) = values.get_mut(index) {
+                    *value = Self::integer(number) as u16;
+                }
+            }
+            Self::Uint32(values) => {
+                if let Some(value) = values.get_mut(index) {
+                    *value = Self::integer(number) as u32;
+                }
+            }
+            Self::Int8(values) => {
+                if let Some(value) = values.get_mut(index) {
+                    *value = Self::integer(number) as i8;
+                }
+            }
+            Self::Int16(values) => {
+                if let Some(value) = values.get_mut(index) {
+                    *value = Self::integer(number) as i16;
+                }
+            }
+            Self::Int32(values) => {
+                if let Some(value) = values.get_mut(index) {
+                    *value = Self::integer(number) as i32;
+                }
+            }
+            Self::Float32(values) => {
+                if let Some(value) = values.get_mut(index) {
+                    *value = number as f32;
+                }
+            }
+            Self::Float64(values) => {
+                if let Some(value) = values.get_mut(index) {
+                    *value = number as f64;
+                }
+            }
+        }
+    }
+    fn fill(&mut self, start: usize, end: usize, number: f64) {
+        if start >= end {
+            return;
+        }
+        match self {
+            Self::Uint8(values) => values[start..end].fill(Self::integer(number) as u8),
+            Self::Uint16(values) => values[start..end].fill(Self::integer(number) as u16),
+            Self::Uint32(values) => values[start..end].fill(Self::integer(number) as u32),
+            Self::Int8(values) => values[start..end].fill(Self::integer(number) as i8),
+            Self::Int16(values) => values[start..end].fill(Self::integer(number) as i16),
+            Self::Int32(values) => values[start..end].fill(Self::integer(number) as i32),
+            Self::Float32(values) => values[start..end].fill(number as f32),
+            Self::Float64(values) => values[start..end].fill(number as f64),
+        }
+    }
+}
+
 struct Array {
     references: usize,
     elements: Vec<Value>,
@@ -217,7 +408,156 @@ struct Closure {
     properties: PropertyTable,
 }
 
+pub(crate) fn regexp_flags(bits: u8) -> regress::Flags {
+    regress::Flags {
+        icase: bits & 1 != 0,
+        multiline: bits & 2 != 0,
+        dot_all: bits & 4 != 0,
+        unicode: bits & 8 != 0,
+        ..Default::default()
+    }
+}
+
 impl Heap {
+    pub(crate) fn regexp(&self, pattern: &str, flags: u8) -> Result<Value, String> {
+        self.drain(64);
+        let mut data = self.0.borrow_mut();
+        let key = (pattern.to_owned(), flags);
+        let regex = if let Some(regex) = data.regexp_cache.get(&key) {
+            regex.clone()
+        } else {
+            let regex = Rc::new(
+                regress::Regex::with_flags(pattern, regexp_flags(flags))
+                    .map_err(|error| error.to_string())?,
+            );
+            data.regexp_cache.insert(key, regex.clone());
+            regex
+        };
+        let id = next_id().ok_or("heap exhausted")?;
+        data.regexps.insert(
+            id,
+            RegExp {
+                references: 1,
+                regex,
+                global: flags & 16 != 0,
+                last_index: 0.0,
+            },
+        );
+        Ok(Value::from_bits(TAG_OBJECT | id))
+    }
+
+    pub(crate) fn regexp_compiled(&self, value: Value) -> Option<Rc<regress::Regex>> {
+        let data = self.0.borrow();
+        let regexp = data.regexps.get(&heap_id(value)?)?;
+        (regexp.references != 0).then(|| regexp.regex.clone())
+    }
+
+    pub(crate) fn regexp_state(&self, value: Value) -> Option<(bool, f64)> {
+        let data = self.0.borrow();
+        let regexp = data.regexps.get(&heap_id(value)?)?;
+        (regexp.references != 0).then_some((regexp.global, regexp.last_index))
+    }
+
+    pub(crate) fn regexp_set_last_index(&self, value: Value, index: f64) -> bool {
+        let Some(id) = heap_id(value) else {
+            return false;
+        };
+        let mut data = self.0.borrow_mut();
+        let Some(regexp) = data
+            .regexps
+            .get_mut(&id)
+            .filter(|regexp| regexp.references != 0)
+        else {
+            return false;
+        };
+        regexp.last_index = index;
+        true
+    }
+
+    pub(crate) fn receiver_kind(&self, value: Value) -> &'static str {
+        if self.is_array(value) {
+            return "array";
+        }
+        if self.typed_kind(value).is_some() {
+            return "typed array";
+        }
+        if self.regexp_state(value).is_some() {
+            return "regexp";
+        }
+        if self.closure_code(value).is_some() {
+            return "function";
+        }
+        if self.native(value).is_some() {
+            return "native function";
+        }
+        if self.set_size(value).is_some() {
+            return "set";
+        }
+        if self.generator_state(value).is_some() {
+            return "generator";
+        }
+        if value == Value::GLOBAL_OBJECT {
+            return "global object";
+        }
+        if value.is_null() {
+            return "null";
+        }
+        value.type_name()
+    }
+
+    pub(crate) fn typed_new(&self, kind: TypedKind, length: usize) -> Option<Value> {
+        let storage = TypedStorage::new(kind, length)?;
+        self.drain(64);
+        let id = next_id()?;
+        self.0.borrow_mut().typed_arrays.insert(
+            id,
+            TypedArray {
+                references: 1,
+                kind,
+                storage,
+            },
+        );
+        Some(Value::from_bits(TAG_OBJECT | id))
+    }
+
+    pub(crate) fn typed_kind(&self, value: Value) -> Option<TypedKind> {
+        let data = self.0.borrow();
+        let array = data.typed_arrays.get(&heap_id(value)?)?;
+        (array.references != 0).then_some(array.kind)
+    }
+
+    pub(crate) fn typed_set(&self, value: Value, index: usize, number: f64) -> bool {
+        let Some(id) = heap_id(value) else {
+            return false;
+        };
+        let mut data = self.0.borrow_mut();
+        let Some(array) = data
+            .typed_arrays
+            .get_mut(&id)
+            .filter(|array| array.references != 0)
+        else {
+            return false;
+        };
+        array.storage.set(index, number);
+        true
+    }
+
+    pub(crate) fn typed_fill(&self, value: Value, start: usize, end: usize, number: f64) -> bool {
+        let Some(id) = heap_id(value) else {
+            return false;
+        };
+        let mut data = self.0.borrow_mut();
+        let Some(array) = data
+            .typed_arrays
+            .get_mut(&id)
+            .filter(|array| array.references != 0)
+        else {
+            return false;
+        };
+        array.storage.fill(start, end, number);
+        true
+    }
+
     pub(crate) fn generator(
         &self,
         code: CodeId,
@@ -513,6 +853,52 @@ impl Heap {
         }
     }
 
+    pub(crate) fn own_property_names(
+        &self,
+        value: Value,
+        enumerable_only: bool,
+    ) -> Option<Vec<String>> {
+        if value.is_number() || value == Value::TRUE || value == Value::FALSE {
+            return Some(Vec::new());
+        }
+        let data = self.0.borrow();
+        let id = heap_id(value)?;
+        if let Some((references, text)) = data.strings.get(&id) {
+            if *references == 0 {
+                return None;
+            }
+            let mut keys: Vec<_> = (0..text.chars().count())
+                .map(|index| index.to_string())
+                .collect();
+            if !enumerable_only {
+                keys.push("length".into());
+            }
+            return Some(keys);
+        }
+        let mut keys = data.enumeration_keys(value)?;
+        if data.arrays.contains_key(&id) {
+            keys.retain(|name| {
+                array_index_name(name).is_some() || (!enumerable_only && name == "length")
+            });
+        } else if enumerable_only {
+            keys.retain(|name| data.enumeration_presence(value, name) == Some(true));
+        } else if data
+            .closures
+            .get(&id)
+            .is_some_and(|closure| closure.constructable)
+        {
+            if let Some(index) = keys.iter().position(|name| name == "prototype") {
+                let name = keys.remove(index);
+                let first_string = keys
+                    .iter()
+                    .take_while(|name| array_index_name(name).is_some())
+                    .count();
+                keys.insert(first_string, name);
+            }
+        }
+        Some(keys)
+    }
+
     pub(crate) fn own_properties(&self, value: Value) -> Option<Vec<(String, Value)>> {
         let data = self.0.borrow();
         let object = data.objects.get(&heap_id(value)?)?;
@@ -674,6 +1060,17 @@ impl Heap {
     pub(crate) fn has_property(&self, value: Value, name: &str) -> Option<bool> {
         let data = self.0.borrow();
         let id = heap_id(value)?;
+        if let Some(array) = data.typed_arrays.get(&id) {
+            if array.references == 0 {
+                return None;
+            }
+            if matches!(name, "length" | "fill") {
+                return Some(true);
+            }
+            return Some(
+                array_index_name(name).is_some_and(|index| (index as usize) < array.storage.len()),
+            );
+        }
         if let Some(closure) = data.closures.get(&id) {
             return (closure.references != 0).then(|| {
                 closure.properties.contains_key(name)
@@ -684,7 +1081,26 @@ impl Heap {
             if array.references == 0 {
                 return None;
             }
-            if matches!(name, "length" | "filter" | "map" | "join") {
+            if matches!(
+                name,
+                "length"
+                    | "filter"
+                    | "map"
+                    | "every"
+                    | "some"
+                    | "sort"
+                    | "join"
+                    | "pop"
+                    | "indexOf"
+                    | "concat"
+                    | "push"
+                    | "includes"
+                    | "reverse"
+                    | "slice"
+                    | "flat"
+                    | "flatMap"
+                    | "fill"
+            ) {
                 return Some(true);
             }
             let index = name
@@ -821,6 +1237,27 @@ impl Heap {
                 references: 1,
                 elements: elements.to_vec(),
                 holes: HashSet::new(),
+            }),
+        );
+        Some(Value::from_bits(TAG_OBJECT | id))
+    }
+
+    pub(crate) fn array_of_length(&self, length: usize) -> Option<Value> {
+        self.drain(64);
+        let mut data = self.0.borrow_mut();
+        let id = next_id()?;
+        let mut elements = Vec::new();
+        elements.try_reserve_exact(length).ok()?;
+        elements.resize(length, Value::UNDEFINED);
+        let mut holes = HashSet::new();
+        holes.try_reserve(length).ok()?;
+        holes.extend(0..length);
+        data.arrays.insert(
+            id,
+            Box::new(Array {
+                references: 1,
+                elements,
+                holes,
             }),
         );
         Some(Value::from_bits(TAG_OBJECT | id))
@@ -1007,7 +1444,20 @@ impl Heap {
 
     pub(crate) fn get(&self, array: Value, index: usize) -> Option<Value> {
         let data = self.0.borrow();
-        let array = data.arrays.get(&heap_id(array)?)?;
+        let id = heap_id(array)?;
+        if let Some(array) = data.typed_arrays.get(&id) {
+            if array.references == 0 {
+                return None;
+            }
+            return Some(
+                array
+                    .storage
+                    .get(index)
+                    .map(Value::number)
+                    .unwrap_or(Value::UNDEFINED),
+            );
+        }
+        let array = data.arrays.get(&id)?;
         if array.references == 0 {
             return None;
         }
@@ -1050,7 +1500,11 @@ impl Heap {
             let (references, text) = data.strings.get(&heap_id(array)?)?;
             return (*references != 0).then(|| text.chars().count());
         }
-        let array = data.arrays.get(&heap_id(array)?)?;
+        let id = heap_id(array)?;
+        if let Some(array) = data.typed_arrays.get(&id) {
+            return (array.references != 0).then_some(array.storage.len());
+        }
+        let array = data.arrays.get(&id)?;
         (array.references != 0).then_some(array.elements.len())
     }
 
@@ -1081,6 +1535,34 @@ impl Heap {
         true
     }
 
+    pub(crate) fn reverse_array(&self, value: Value) -> bool {
+        let Some(id) = heap_id(value) else {
+            return false;
+        };
+        let mut data = self.0.borrow_mut();
+        let Some(array) = data
+            .arrays
+            .get_mut(&id)
+            .filter(|array| array.references != 0)
+        else {
+            return false;
+        };
+        let length = array.elements.len();
+        array.elements.reverse();
+        for left in 0..length / 2 {
+            let right = length - 1 - left;
+            let left_hole = array.holes.remove(&left);
+            let right_hole = array.holes.remove(&right);
+            if left_hole {
+                array.holes.insert(right);
+            }
+            if right_hole {
+                array.holes.insert(left);
+            }
+        }
+        true
+    }
+
     pub(crate) fn truncate(&self, array: Value, length: usize) -> bool {
         let mut data = self.0.borrow_mut();
         let Some(id) = heap_id(array) else {
@@ -1106,7 +1588,19 @@ impl Heap {
             let Some(id) = data.pending.pop_front() else {
                 break;
             };
-            if let Some(state) = data.enumerators.get(&id) {
+            if data
+                .typed_arrays
+                .get(&id)
+                .is_some_and(|array| array.references == 0)
+            {
+                data.typed_arrays.remove(&id);
+            } else if data
+                .regexps
+                .get(&id)
+                .is_some_and(|regexp| regexp.references == 0)
+            {
+                data.regexps.remove(&id);
+            } else if let Some(state) = data.enumerators.get(&id) {
                 if state.references != 0 {
                     continue;
                 }
@@ -1231,15 +1725,29 @@ impl HeapData {
             }
             return Some(keys);
         }
+        if let Some(array) = self
+            .typed_arrays
+            .get(&id)
+            .filter(|array| array.references != 0)
+        {
+            return Some(
+                (0..array.storage.len())
+                    .map(|index| index.to_string())
+                    .collect(),
+            );
+        }
         if let Some(array) = self.arrays.get(&id).filter(|array| array.references != 0) {
             let mut keys: Vec<_> = (0..array.elements.len())
                 .filter(|index| !array.holes.contains(index))
                 .map(|index| index.to_string())
                 .collect();
             keys.extend(
-                ["length", "filter", "map", "join"]
-                    .into_iter()
-                    .map(str::to_owned),
+                [
+                    "length", "filter", "map", "join", "pop", "indexOf", "concat", "push",
+                    "includes", "reverse", "slice",
+                ]
+                .into_iter()
+                .map(str::to_owned),
             );
             return Some(keys);
         }
@@ -1265,8 +1773,29 @@ impl HeapData {
                 .enumerable(name)
                 .or_else(|| (closure.constructable && name == "prototype").then_some(false));
         }
+        if let Some(array) = self
+            .typed_arrays
+            .get(&id)
+            .filter(|array| array.references != 0)
+        {
+            return array_index_name(name)
+                .and_then(|index| ((index as usize) < array.storage.len()).then_some(true));
+        }
         if let Some(array) = self.arrays.get(&id).filter(|array| array.references != 0) {
-            if matches!(name, "length" | "filter" | "map" | "join") {
+            if matches!(
+                name,
+                "length"
+                    | "filter"
+                    | "map"
+                    | "join"
+                    | "pop"
+                    | "indexOf"
+                    | "concat"
+                    | "push"
+                    | "includes"
+                    | "reverse"
+                    | "slice"
+            ) {
                 return Some(false);
             }
             return array_index_name(name).and_then(|index| {
@@ -1285,6 +1814,12 @@ impl HeapData {
     }
 
     fn references(&mut self, id: u64) -> Option<&mut usize> {
+        if let Some(array) = self.typed_arrays.get_mut(&id) {
+            return Some(&mut array.references);
+        }
+        if let Some(regexp) = self.regexps.get_mut(&id) {
+            return Some(&mut regexp.references);
+        }
         if let Some(generator) = self.generators.get_mut(&id) {
             return Some(&mut generator.references);
         }
@@ -1317,9 +1852,17 @@ impl HeapData {
     fn valid(&self, value: Value) -> bool {
         match heap_id(value) {
             Some(id) => {
-                self.enumerators
+                self.typed_arrays
                     .get(&id)
-                    .is_some_and(|state| state.references != 0)
+                    .is_some_and(|array| array.references != 0)
+                    || self
+                        .regexps
+                        .get(&id)
+                        .is_some_and(|regexp| regexp.references != 0)
+                    || self
+                        .enumerators
+                        .get(&id)
+                        .is_some_and(|state| state.references != 0)
                     || self
                         .generators
                         .get(&id)
@@ -1384,6 +1927,10 @@ impl OwnedValue {
     /// Returns a borrowed token; keep this handle alive while using the token.
     pub fn value(&self) -> Value {
         self.value
+    }
+
+    pub fn text(&self) -> Option<String> {
+        self.heap.text(self.value)
     }
 }
 
@@ -1458,6 +2005,23 @@ mod tests {
         assert!(!heap.valid(object));
         assert!(!heap.valid(child));
         assert!(heap.0.borrow().enumerators.is_empty());
+    }
+
+    #[test]
+    fn regexp_cache_shares_code_without_retaining_objects() {
+        let heap = Heap::default();
+        let a = heap.regexp("x+", 0).unwrap();
+        let b = heap.regexp("x+", 0).unwrap();
+        assert_ne!(a, b);
+        assert!(Rc::ptr_eq(
+            &heap.regexp_compiled(a).unwrap(),
+            &heap.regexp_compiled(b).unwrap()
+        ));
+        heap.release(a);
+        heap.release(b);
+        heap.drain(100);
+        assert!(heap.0.borrow().regexps.is_empty());
+        assert_eq!(heap.0.borrow().regexp_cache.len(), 1);
     }
 
     #[test]

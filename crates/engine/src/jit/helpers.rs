@@ -19,6 +19,7 @@ pub(crate) enum HelperShape {
     Callable,
     MethodCallable,
     Quaternary,
+    SourceLocation,
 }
 
 pub(crate) struct HelperSpec {
@@ -65,8 +66,8 @@ define_helpers! {
     Construct => Callable, js_construct;
     ConstructSpread => Binary, js_construct_spread;
     CallSpread => IndexSet, js_call_spread;
-    ArgumentPush => Binary, js_argument_push;
-    ArgumentSpread => Binary, js_argument_spread;
+    ArrayAppend => Binary, js_array_append;
+    ArrayExtend => Binary, js_array_extend;
     Call => MethodCallable, js_call;
     FrameEnter => Unary, js_frame_enter;
     FrameExit => Unary, js_frame_exit;
@@ -82,6 +83,7 @@ define_helpers! {
     ObjectNew => Unary, js_object_new;
     PropertyKey => Unary, js_property_key;
     StringNew => ArrayNew, js_string_new;
+    RegExpNew => PropertyGet, js_regexp_new;
     ArrayNew => ArrayNew, js_array_new;
     Rest => Rest, js_rest;
     IndexGet => Binary, js_index_get;
@@ -97,6 +99,7 @@ define_helpers! {
     Catch => Unary, js_catch;
     ExceptionPending => Unary, js_exception_pending;
     ErrorPending => Unary, js_error_pending;
+    ErrorOrigin => SourceLocation, js_error_origin;
     BitwiseAnd => Binary, js_bitwise_and;
     BitwiseOr => Binary, js_bitwise_or;
     BitwiseXor => Binary, js_bitwise_xor;
@@ -154,6 +157,12 @@ pub(crate) fn signature(shape: HelperShape, call_conv: CallConv, pointer: Type) 
                 signature.params.push(AbiParam::new(types::I64));
             }
         }
+        HelperShape::SourceLocation => {
+            signature.params.push(AbiParam::new(pointer));
+            for _ in 0..3 {
+                signature.params.push(AbiParam::new(types::I64));
+            }
+        }
         HelperShape::Quaternary => {
             for _ in 0..4 {
                 signature.params.push(AbiParam::new(types::I64));
@@ -182,6 +191,17 @@ pub(crate) fn signature(shape: HelperShape, call_conv: CallConv, pointer: Type) 
     signature
 }
 
+fn primitive_number(ctx: *mut JitCtx, value: Value) -> f64 {
+    if value.is_string() {
+        let heap = unsafe { &*ctx }.global.heap();
+        return heap
+            .text(value)
+            .map(|text| super::conversion::string_number(&text))
+            .unwrap_or(f64::NAN);
+    }
+    value.to_number()
+}
+
 fn numeric_operands(ctx: *mut JitCtx, values: &[Value]) -> bool {
     if values.iter().any(|value| value.is_object()) {
         unsafe { &mut *ctx }.error = Some(crate::Error::Runtime(
@@ -201,7 +221,10 @@ fn number_binary(
     if !numeric_operands(ctx, &[left, right]) {
         return Value::UNDEFINED;
     }
-    Value::number(operation(left.to_number(), right.to_number()))
+    Value::number(operation(
+        primitive_number(ctx, left),
+        primitive_number(ctx, right),
+    ))
 }
 
 fn number_compare(
@@ -210,10 +233,24 @@ fn number_compare(
     right: Value,
     operation: impl FnOnce(f64, f64) -> bool,
 ) -> Value {
+    if left.is_string() && right.is_string() {
+        let heap = unsafe { &*ctx }.global.heap();
+        let left = heap.text(left).unwrap();
+        let right = heap.text(right).unwrap();
+        let order = match left.cmp(&right) {
+            std::cmp::Ordering::Less => -1.0,
+            std::cmp::Ordering::Equal => 0.0,
+            std::cmp::Ordering::Greater => 1.0,
+        };
+        return Value::boolean(operation(order, 0.0));
+    }
     if !numeric_operands(ctx, &[left, right]) {
         return Value::UNDEFINED;
     }
-    Value::boolean(operation(left.to_number(), right.to_number()))
+    Value::boolean(operation(
+        primitive_number(ctx, left),
+        primitive_number(ctx, right),
+    ))
 }
 
 pub(super) fn to_int32(number: f64) -> i32 {
@@ -230,7 +267,7 @@ pub(super) fn to_int32(number: f64) -> i32 {
 
 fn loose_equals(ctx: *mut JitCtx, left: Value, right: Value) -> bool {
     if left.is_string() && right.is_string() {
-        return strict_equals(ctx, left, right);
+        return strict_equals(unsafe { &*ctx }.global.heap(), left, right);
     }
     if left.is_object() != right.is_object()
         && !left.is_nullish()
@@ -249,16 +286,15 @@ fn loose_equals(ctx: *mut JitCtx, left: Value, right: Value) -> bool {
         if left.bits() == right.bits() {
             return true;
         }
-        if left.is_string() || right.is_string() || left.is_object() || right.is_object() {
+        if left.is_object() || right.is_object() {
             return false;
         }
     }
-    left.to_number() == right.to_number()
+    primitive_number(ctx, left) == primitive_number(ctx, right)
 }
 
-fn strict_equals(ctx: *mut JitCtx, left: Value, right: Value) -> bool {
+pub(super) fn strict_equals(heap: &crate::heap::Heap, left: Value, right: Value) -> bool {
     if left.is_string() && right.is_string() {
-        let heap = unsafe { &*ctx }.global.heap();
         return heap.text(left) == heap.text(right);
     }
     if left.is_number() && right.is_number() {
@@ -330,11 +366,11 @@ pub(crate) extern "C" fn js_loose_not_equal(ctx: *mut JitCtx, left: Value, right
 }
 
 pub(crate) extern "C" fn js_strict_equal(ctx: *mut JitCtx, left: Value, right: Value) -> Value {
-    Value::boolean(strict_equals(ctx, left, right))
+    Value::boolean(strict_equals(unsafe { &*ctx }.global.heap(), left, right))
 }
 
 pub(crate) extern "C" fn js_strict_not_equal(ctx: *mut JitCtx, left: Value, right: Value) -> Value {
-    Value::boolean(!strict_equals(ctx, left, right))
+    Value::boolean(!strict_equals(unsafe { &*ctx }.global.heap(), left, right))
 }
 
 pub(crate) extern "C" fn js_less(ctx: *mut JitCtx, left: Value, right: Value) -> Value {
@@ -357,14 +393,14 @@ pub(crate) extern "C" fn js_unary_plus(ctx: *mut JitCtx, value: Value) -> Value 
     if !numeric_operands(ctx, &[value]) {
         return Value::UNDEFINED;
     }
-    Value::number(value.to_number())
+    Value::number(primitive_number(ctx, value))
 }
 
 pub(crate) extern "C" fn js_unary_negation(ctx: *mut JitCtx, value: Value) -> Value {
     if !numeric_operands(ctx, &[value]) {
         return Value::UNDEFINED;
     }
-    Value::number(-value.to_number())
+    Value::number(-primitive_number(ctx, value))
 }
 
 pub(crate) extern "C" fn js_logical_not(ctx: *mut JitCtx, value: Value) -> Value {
@@ -375,7 +411,7 @@ pub(crate) extern "C" fn js_bitwise_not(ctx: *mut JitCtx, value: Value) -> Value
     if !numeric_operands(ctx, &[value]) {
         return Value::UNDEFINED;
     }
-    let value = value.to_number();
+    let value = primitive_number(ctx, value);
     Value::number(f64::from(!to_int32(value)))
 }
 
@@ -434,6 +470,22 @@ extern "C" fn js_global_initialize(
     value
 }
 
+extern "C" fn js_error_origin(
+    ctx: *mut JitCtx,
+    ptr: *const u8,
+    len: u64,
+    start: u64,
+    end: u64,
+) -> Value {
+    let ctx = unsafe { &mut *ctx };
+    if ctx.error_origin.is_none() && matches!(ctx.error, Some(crate::Error::Runtime(_))) {
+        let filename =
+            unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len as usize)) };
+        ctx.error_origin = Some((filename.to_owned(), start as u32, end as u32));
+    }
+    Value::UNDEFINED
+}
+
 extern "C" fn js_error_pending(ctx: *mut JitCtx, _unused: Value) -> Value {
     Value::boolean(unsafe { &*ctx }.error.is_some())
 }
@@ -452,6 +504,11 @@ extern "C" fn js_property_get(ctx: *mut JitCtx, object: Value, ptr: *const u8, l
         return value;
     }
     if object != Value::GLOBAL_OBJECT {
+        if name == "lastIndex" {
+            if let Some((_, index)) = ctx.global.heap().regexp_state(object) {
+                return Value::number(index);
+            }
+        }
         if let Some(value) = ctx.global.heap().property(object, name) {
             return ctx.retain_temp(value);
         }
@@ -461,8 +518,8 @@ extern "C" fn js_property_get(ctx: *mut JitCtx, object: Value, ptr: *const u8, l
             }
         }
         ctx.error = Some(crate::Error::Runtime(format!(
-            "cannot read property {name:?} of {object} (type: {})",
-            object.type_name()
+            "cannot read property {name:?} of {}",
+            ctx.global.heap().receiver_kind(object)
         )));
         return Value::UNDEFINED;
     }
@@ -481,6 +538,16 @@ extern "C" fn js_property_set(
     let name =
         unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len as usize)) };
     if object != Value::GLOBAL_OBJECT {
+        if name == "lastIndex" && ctx.global.heap().regexp_state(object).is_some() {
+            if let Some(index) = value.as_number() {
+                ctx.global.heap().regexp_set_last_index(object, index);
+            } else {
+                ctx.error = Some(crate::Error::Runtime(
+                    "RegExp lastIndex requires a number".into(),
+                ));
+            }
+            return value;
+        }
         if ctx.global.heap().set_property(object, name, value) {
             return value;
         }
@@ -489,9 +556,10 @@ extern "C" fn js_property_set(
         {
             return value;
         }
-        ctx.error = Some(crate::Error::Runtime(
-            "property assignment on unsupported value".into(),
-        ));
+        ctx.error = Some(crate::Error::Runtime(format!(
+            "cannot assign property {name:?} of {}",
+            ctx.global.heap().receiver_kind(object)
+        )));
         return Value::UNDEFINED;
     }
     if !ctx.global.set(name, value) {
@@ -575,8 +643,79 @@ fn array_index(value: Value) -> Option<usize> {
     (number.is_finite() && number >= 0.0 && number.fract() == 0.0 && number < u32::MAX as f64)
         .then_some(number as usize)
 }
+fn typed_numeric_index(ctx: &JitCtx, key: Value) -> Option<Option<usize>> {
+    let number = if let Some(number) = key.as_number() {
+        number
+    } else {
+        let text = ctx.global.heap().text(key)?;
+        if text == "-0" {
+            return Some(None);
+        }
+        let number = super::conversion::string_number(&text);
+        let canonical = if number == 0.0 {
+            "0".to_owned()
+        } else {
+            dragonbox_ecma::Buffer::new().format(number).to_owned()
+        };
+        if text != canonical {
+            return None;
+        }
+        number
+    };
+    Some(
+        if number.is_finite()
+            && number >= 0.0
+            && number.fract() == 0.0
+            && number < usize::MAX as f64
+        {
+            Some(number as usize)
+        } else {
+            None
+        },
+    )
+}
+
 extern "C" fn js_index_get(ctx: *mut JitCtx, array: Value, index: Value) -> Value {
     let ctx = unsafe { &mut *ctx };
+    if ctx.global.heap().typed_kind(array).is_some() {
+        if let Some(index) = typed_numeric_index(ctx, index) {
+            return index
+                .and_then(|index| ctx.global.heap().get(array, index))
+                .unwrap_or(Value::UNDEFINED);
+        }
+        let Some(name) = property_key(ctx, index) else {
+            return Value::UNDEFINED;
+        };
+        return js_property_get(ctx, array, name.as_ptr(), name.len() as u64);
+    }
+    let index = if index.is_string()
+        && (ctx.global.heap().is_array(array) || array.is_string() || array.is_number())
+    {
+        let name = ctx.global.heap().text(index).unwrap();
+        match name
+            .parse::<u32>()
+            .ok()
+            .filter(|index| *index != u32::MAX && index.to_string() == name)
+        {
+            Some(index) => Value::number(index as f64),
+            None => return js_property_get(ctx, array, name.as_ptr(), name.len() as u64),
+        }
+    } else {
+        index
+    };
+    if ctx.global.heap().regexp_state(array).is_some() {
+        let Some(name) = property_key(ctx, index) else {
+            return Value::UNDEFINED;
+        };
+        if name == "lastIndex" {
+            return Value::number(ctx.global.heap().regexp_state(array).unwrap().1);
+        }
+        if let Some(value) = super::builtins::property_get(ctx, array, &name) {
+            return value;
+        }
+        ctx.error = Some(crate::Error::Runtime("unsupported RegExp property".into()));
+        return Value::UNDEFINED;
+    }
     if ctx.global.heap().generator_state(array).is_some() {
         let Some(name) = property_key(ctx, index) else {
             return Value::UNDEFINED;
@@ -619,15 +758,48 @@ extern "C" fn js_index_get(ctx: *mut JitCtx, array: Value, index: Value) -> Valu
     match result {
         Some(value) => ctx.retain_temp(value),
         None => {
-            ctx.error = Some(crate::Error::Runtime(
-                "unsupported array index or receiver".into(),
-            ));
+            ctx.error = Some(crate::Error::Runtime(format!(
+                "unsupported index or receiver: {}",
+                ctx.global.heap().receiver_kind(array)
+            )));
             Value::UNDEFINED
         }
     }
 }
 extern "C" fn js_index_set(ctx: *mut JitCtx, array: Value, index: Value, value: Value) -> Value {
     let ctx = unsafe { &mut *ctx };
+    if ctx.global.heap().typed_kind(array).is_some() {
+        if let Some(index) = typed_numeric_index(ctx, index) {
+            let Some(number) = super::builtins::typed_array::numeric(ctx, value) else {
+                return Value::UNDEFINED;
+            };
+            if let Some(index) = index {
+                ctx.global.heap().typed_set(array, index, number);
+            }
+            return value;
+        }
+        let Some(name) = property_key(ctx, index) else {
+            return Value::UNDEFINED;
+        };
+        return js_property_set(ctx, array, name.as_ptr(), name.len() as u64, value);
+    }
+    if ctx.global.heap().regexp_state(array).is_some() {
+        let Some(name) = property_key(ctx, index) else {
+            return Value::UNDEFINED;
+        };
+        if name == "lastIndex" {
+            if let Some(index) = value.as_number() {
+                ctx.global.heap().regexp_set_last_index(array, index);
+            } else {
+                ctx.error = Some(crate::Error::Runtime(
+                    "RegExp lastIndex requires a number".into(),
+                ));
+            }
+        } else {
+            ctx.error = Some(crate::Error::Runtime("unsupported RegExp property".into()));
+        }
+        return value;
+    }
     if ctx.global.heap().has_properties(array) || array == Value::GLOBAL_OBJECT {
         let Some(name) = property_key(ctx, index) else {
             return Value::UNDEFINED;
@@ -759,16 +931,16 @@ extern "C" fn js_construct_spread(ctx: *mut JitCtx, callable: Value, arguments: 
     js_construct(ctx, callable, values.as_ptr(), values.len() as u64)
 }
 
-extern "C" fn js_argument_push(ctx: *mut JitCtx, arguments: Value, value: Value) -> Value {
+extern "C" fn js_array_append(ctx: *mut JitCtx, arguments: Value, value: Value) -> Value {
     let context = unsafe { &mut *ctx };
     let heap = context.global.heap();
     if !heap.set(arguments, heap.len(arguments).unwrap(), value) {
-        context.error = Some(crate::Error::Runtime("cannot append call argument".into()));
+        context.error = Some(crate::Error::Runtime("cannot append array element".into()));
     }
     Value::UNDEFINED
 }
 
-extern "C" fn js_argument_spread(ctx: *mut JitCtx, arguments: Value, iterable: Value) -> Value {
+extern "C" fn js_array_extend(ctx: *mut JitCtx, arguments: Value, iterable: Value) -> Value {
     let state = js_iterate_new(ctx, iterable);
     if unsafe { &*ctx }.error.is_some() {
         return Value::UNDEFINED;
@@ -778,7 +950,7 @@ extern "C" fn js_argument_spread(ctx: *mut JitCtx, arguments: Value, iterable: V
         if unsafe { &*ctx }.error.is_some() || value == Value::UNINITIALIZED {
             break;
         }
-        js_argument_push(ctx, arguments, value);
+        js_array_append(ctx, arguments, value);
         if unsafe { &*ctx }.error.is_some() {
             break;
         }
@@ -838,6 +1010,21 @@ fn invoke(
     unsafe { &mut *ctx }.own(value)
 }
 
+extern "C" fn js_regexp_new(ctx: *mut JitCtx, flags: u64, ptr: *const u8, len: u64) -> Value {
+    let ctx = unsafe { &mut *ctx };
+    let pattern =
+        unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len as usize)) };
+    match ctx.global.heap().regexp(pattern, flags as u8) {
+        Ok(value) => ctx.own(value),
+        Err(message) => {
+            ctx.error = Some(crate::Error::Runtime(format!(
+                "invalid regular expression: {message}"
+            )));
+            Value::UNDEFINED
+        }
+    }
+}
+
 extern "C" fn js_string_new(ctx: *mut JitCtx, ptr: *const u8, len: u64) -> Value {
     let ctx = unsafe { &mut *ctx };
     let text =
@@ -879,6 +1066,24 @@ extern "C" fn js_construct(
     argc: u64,
 ) -> Value {
     let ctx = unsafe { &mut *ctx };
+    if ctx.global.heap().native(constructor) == Some(crate::heap::NativeFunction::Array) {
+        let args = if argc == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(argv, argc as usize) }
+        };
+        return super::builtins::array::construct(ctx, args);
+    }
+    if let Some(crate::heap::NativeFunction::TypedConstructor(kind)) =
+        ctx.global.heap().native(constructor)
+    {
+        let args = if argc == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(argv, argc as usize) }
+        };
+        return super::builtins::typed_array::construct(ctx, kind, args);
+    }
     if ctx.global.heap().constructable(constructor) {
         let Some(instance) = ctx.global.heap().constructed_object(constructor) else {
             ctx.error = Some(crate::Error::Runtime("heap exhausted".into()));
@@ -983,6 +1188,9 @@ extern "C" fn js_in(ctx: *mut JitCtx, key: Value, object: Value) -> Value {
 extern "C" fn js_instanceof(ctx: *mut JitCtx, value: Value, constructor: Value) -> Value {
     let ctx = unsafe { &mut *ctx };
     let heap = ctx.global.heap();
+    if let Some(crate::heap::NativeFunction::TypedConstructor(kind)) = heap.native(constructor) {
+        return Value::boolean(heap.typed_kind(value) == Some(kind));
+    }
     if heap.native(constructor) == Some(crate::heap::NativeFunction::Array) {
         return Value::boolean(heap.is_array(value));
     }
@@ -1056,11 +1264,11 @@ extern "C" fn js_enumerate_next(ctx: *mut JitCtx, state: Value) -> Value {
     }
 }
 
-extern "C" fn js_iterate_new(ctx: *mut JitCtx, iterable: Value) -> Value {
+pub(super) extern "C" fn js_iterate_new(ctx: *mut JitCtx, iterable: Value) -> Value {
     let ctx = unsafe { &mut *ctx };
     if ctx.global.heap().len(iterable).is_none() {
         ctx.error = Some(crate::Error::Runtime(
-            "iteration requires an array or string".into(),
+            "iteration requires an array, typed array, or string".into(),
         ));
         return Value::UNDEFINED;
     }
@@ -1073,7 +1281,7 @@ extern "C" fn js_iterate_new(ctx: *mut JitCtx, iterable: Value) -> Value {
     }
 }
 
-extern "C" fn js_iterate_next(ctx: *mut JitCtx, state: Value) -> Value {
+pub(super) extern "C" fn js_iterate_next(ctx: *mut JitCtx, state: Value) -> Value {
     let ctx = unsafe { &mut *ctx };
     let heap = ctx.global.heap();
     let iterable = heap.get(state, 0).unwrap();
@@ -1108,7 +1316,10 @@ fn bitwise_binary(
     if !numeric_operands(ctx, &[left, right]) {
         return Value::UNDEFINED;
     }
-    Value::number(operation(to_int32(left.to_number()), to_int32(right.to_number())) as f64)
+    Value::number(operation(
+        to_int32(primitive_number(ctx, left)),
+        to_int32(primitive_number(ctx, right)),
+    ) as f64)
 }
 
 extern "C" fn js_bitwise_and(ctx: *mut JitCtx, left: Value, right: Value) -> Value {
@@ -1223,6 +1434,21 @@ fn native_call(
         };
         return super::builtins::json::call(unsafe { &mut *ctx }, function, args);
     }
+    if matches!(
+        function,
+        NativeFunction::ObjectKeys
+            | NativeFunction::ObjectValues
+            | NativeFunction::ObjectGetOwnPropertyNames
+            | NativeFunction::ObjectFreeze
+            | NativeFunction::ObjectIsFrozen
+    ) {
+        let args = if argc == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(argv, argc as usize) }
+        };
+        return super::builtins::object::call(unsafe { &mut *ctx }, function, args);
+    }
     if let NativeFunction::Math(operation) = function {
         let args = if argc == 0 {
             &[]
@@ -1230,6 +1456,33 @@ fn native_call(
             unsafe { std::slice::from_raw_parts(argv, argc as usize) }
         };
         return super::builtins::math::call(unsafe { &mut *ctx }, operation, args);
+    }
+    if matches!(function, NativeFunction::TypedConstructor(_)) {
+        unsafe { &mut *ctx }.error = Some(crate::Error::Runtime(
+            "typed array constructor requires new".into(),
+        ));
+        return Value::UNDEFINED;
+    }
+    if function == NativeFunction::Array {
+        let args = if argc == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(argv, argc as usize) }
+        };
+        return super::builtins::array::construct(unsafe { &mut *ctx }, args);
+    }
+    if function == NativeFunction::HostSeedRandom {
+        let argument = if argc == 0 {
+            Value::UNDEFINED
+        } else {
+            unsafe { *argv }
+        };
+        if !numeric_operands(ctx, &[argument]) {
+            return Value::UNDEFINED;
+        }
+        let seed = to_int32(primitive_number(ctx, argument)) as u32;
+        unsafe { &*ctx }.engine.seed_random(seed);
+        return Value::UNDEFINED;
     }
     if function == NativeFunction::Error {
         let constructor = unsafe { &*ctx }
@@ -1252,16 +1505,42 @@ fn native_call(
     }
     if matches!(
         function,
-        NativeFunction::HostReadFile
+        NativeFunction::DateNow
+            | NativeFunction::ArrayFrom
+            | NativeFunction::ArrayIsArray
+            | NativeFunction::TypedFrom(_)
+            | NativeFunction::TypedFill
+            | NativeFunction::HostReadFile
             | NativeFunction::HostListFiles
             | NativeFunction::HostEvaluateSource
+            | NativeFunction::Print
+            | NativeFunction::ConsoleLog
             | NativeFunction::ArrayFilter
             | NativeFunction::ArrayMap
+            | NativeFunction::ArrayEvery
+            | NativeFunction::ArraySome
+            | NativeFunction::ArraySort
             | NativeFunction::ArrayJoin
+            | NativeFunction::ArrayPop
+            | NativeFunction::ArrayIndexOf
+            | NativeFunction::ArrayConcat
+            | NativeFunction::ArrayPush
+            | NativeFunction::ArrayIncludes
+            | NativeFunction::ArrayReverse
+            | NativeFunction::ArraySlice
+            | NativeFunction::ArrayFlat
+            | NativeFunction::ArrayFlatMap
+            | NativeFunction::ArrayFill
+            | NativeFunction::NumberToFixed
+            | NativeFunction::NumberToString
+            | NativeFunction::RegExpTest
+            | NativeFunction::RegExpExec
+            | NativeFunction::StringMatch
             | NativeFunction::StringSlice
             | NativeFunction::StringSplit
             | NativeFunction::StringStartsWith
             | NativeFunction::StringReplace
+            | NativeFunction::StringPadStart
     ) {
         let args = if argc == 0 {
             &[]

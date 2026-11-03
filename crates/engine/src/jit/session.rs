@@ -15,6 +15,7 @@ struct Frame {
 pub(crate) struct JitCtx<'a> {
     pub(crate) global: Environment,
     pub(crate) error: Option<Error>,
+    pub(crate) error_origin: Option<(String, u32, u32)>,
     exception: Option<Value>,
     frames: Vec<Frame>,
     pub(crate) engine: &'a Engine,
@@ -25,6 +26,7 @@ impl<'a> JitCtx<'a> {
         Self {
             global: engine.global().clone(),
             error: None,
+            error_origin: None,
             exception: None,
             frames: Vec::new(),
             engine,
@@ -199,7 +201,12 @@ pub(crate) unsafe fn call(
     match ctx.error {
         Some(error) => {
             global.heap().release(value);
-            Err(error)
+            match (error, ctx.error_origin) {
+                (Error::Runtime(message), Some((filename, start, end))) => Err(Error::Runtime(
+                    format!("{filename}:{start}..{end}: {message}"),
+                )),
+                (error, _) => Err(error),
+            }
         }
         None => Ok(value),
     }

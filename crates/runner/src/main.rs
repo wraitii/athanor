@@ -5,6 +5,12 @@ use std::io::{self, BufRead, Write};
 
 use js_engine::{Engine, Error, Value};
 
+const DEFAULT_SCRIPT: &str = "binaries/data/mods/public/maps/random/new_rms_test.js";
+const DEFAULT_DATA: &str = "binaries/data/mods/public";
+const DEFAULT_SETTINGS: &str =
+    "{\"Size\":128,\"Seed\":0,\"PlayerData\":[null,{\"Civ\":\"athen\"},{\"Civ\":\"brit\"}]}";
+const DEFAULT_BOOTSTRAP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../bootstrap.js");
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("js-runner: {error}");
@@ -20,6 +26,10 @@ fn run() -> Result<(), String> {
     let mut function = String::from("main");
     let mut values = Vec::new();
     let mut repl = false;
+    let mut map = false;
+    let mut data = None;
+    let mut settings = None;
+    let mut bootstrap = None;
 
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -34,6 +44,12 @@ fn run() -> Result<(), String> {
                 values.push(parse_value(&value)?);
             }
             "--load" => preloads.push(arguments.next().ok_or("--load expects a path")?),
+            "--map" => map = true,
+            "--data" => data = Some(arguments.next().ok_or("--data expects a path")?),
+            "--settings" => settings = Some(arguments.next().ok_or("--settings expects JSON")?),
+            "--bootstrap" => {
+                bootstrap = Some(arguments.next().ok_or("--bootstrap expects a path")?)
+            }
             "--repl" => repl = true,
             "--help" | "-h" => {
                 usage();
@@ -46,16 +62,35 @@ fn run() -> Result<(), String> {
         }
     }
 
+    if map {
+        if repl
+            || eval.is_some()
+            || function != "main"
+            || !values.is_empty()
+            || !preloads.is_empty()
+        {
+            return Err("--map cannot be combined with script options".to_string());
+        }
+        return run_map(script, data, settings, bootstrap);
+    }
+
     if repl {
         if eval.is_some()
             || script.is_some()
             || function != "main"
             || !values.is_empty()
             || !preloads.is_empty()
+            || data.is_some()
+            || settings.is_some()
+            || bootstrap.is_some()
         {
             return Err("--repl cannot be combined with script options".to_string());
         }
         return run_repl();
+    }
+
+    if data.is_some() || settings.is_some() || bootstrap.is_some() {
+        return Err("--data, --settings, and --bootstrap require --map".to_string());
     }
 
     let (source, filename) = match (eval, script) {
@@ -81,8 +116,39 @@ fn run() -> Result<(), String> {
     }
     engine.compile(&source, &filename).map_err(display)?;
     let result = engine.call(&function, &values).map_err(display)?;
-    let result = result.value();
-    println!("{result}");
+    print_value(&result);
+    Ok(())
+}
+
+fn print_value(value: &js_engine::OwnedValue) {
+    match value.text() {
+        Some(text) => println!("{text}"),
+        None => println!("{}", value.value()),
+    }
+}
+
+fn run_map(
+    script: Option<String>,
+    data: Option<String>,
+    settings: Option<String>,
+    bootstrap: Option<String>,
+) -> Result<(), String> {
+    let script = script.unwrap_or_else(|| DEFAULT_SCRIPT.to_string());
+    let data = data.unwrap_or_else(|| DEFAULT_DATA.to_string());
+    let settings = settings.unwrap_or_else(|| DEFAULT_SETTINGS.to_string());
+    let bootstrap = bootstrap.unwrap_or_else(|| DEFAULT_BOOTSTRAP.to_string());
+
+    let mut engine = Engine::new().map_err(display)?;
+    engine.install_host(host::FileHost).map_err(display)?;
+    let source = fs::read_to_string(&bootstrap).map_err(|error| format!("{bootstrap}: {error}"))?;
+    engine.compile(&source, &bootstrap).map_err(display)?;
+
+    let script = engine.string(&script).map_err(display)?;
+    let data = engine.string(&data).map_err(display)?;
+    let settings = engine.string(&settings).map_err(display)?;
+    let arguments = [script.value(), data.value(), settings.value()];
+    let result = engine.call("run", &arguments).map_err(display)?;
+    print_value(&result);
     Ok(())
 }
 
@@ -117,7 +183,7 @@ fn run_repl() -> Result<(), String> {
             match engine.compile(&source, "<repl>") {
                 Ok(()) => {
                     if let Some(value) = engine.global().get("__repl_result") {
-                        println!("{}", value.value());
+                        print_value(&value);
                     }
                     Ok(())
                 }
@@ -151,6 +217,6 @@ fn display(error: Error) -> String {
 
 fn usage() {
     eprintln!(
-        "usage: js-runner [--load SCRIPT]... [--function NAME] [--arg VALUE]... <script>\n       js-runner [--function NAME] [--arg VALUE]... --eval SOURCE\n       js-runner --repl"
+        "usage: js-runner [--load SCRIPT]... [--function NAME] [--arg VALUE]... <script>\n       js-runner [--function NAME] [--arg VALUE]... --eval SOURCE\n       js-runner --map [--data ROOT] [--settings JSON] [--bootstrap SCRIPT] [SCRIPT]\n       js-runner --repl"
     );
 }

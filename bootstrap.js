@@ -324,6 +324,7 @@ function run(scriptPath, dataRoot, settingsJson)
 	Engine.loadedLibraries.clear();
 
 	const settings = JSON.parse(settingsJson);
+	hostSeedRandom(settings.Seed);
 	globalThis.g_MapSettings = settings;
 
 	loadGlobalScripts();
