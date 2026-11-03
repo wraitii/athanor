@@ -8,9 +8,10 @@ mod generator;
 mod helpers;
 mod jitdump;
 mod lifetime;
-mod math_guard;
+mod math;
 mod numeric;
 mod read_scope;
+mod semantic;
 mod session;
 
 pub(crate) use compiler::Compiler;

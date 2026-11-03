@@ -1,9 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use cranelift_codegen::Context;
-use cranelift_codegen::ir::{
-    AbiParam, InstBuilder, Signature, SourceLoc, StackSlotData, StackSlotKind, types,
-};
+use cranelift_codegen::ir::{AbiParam, Signature, SourceLoc, types};
 use cranelift_frontend::FunctionBuilderContext;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module, default_libcall_names};
@@ -20,7 +18,7 @@ use crate::EngineOptions;
 use crate::error::{Error, compile_at, unsupported_at};
 
 use super::numeric::{Annotations, FunctionBody};
-use super::{analysis::CaptureAnalysis, effects, emit, helpers, jitdump, math_guard, numeric};
+use super::{analysis::CaptureAnalysis, effects, emit, helpers, jitdump, numeric};
 
 pub(crate) struct CompiledFunction {
     pub(crate) name: String,
@@ -44,6 +42,7 @@ pub(crate) struct Compiler {
     compile_dump: bool,
     compile_ir: bool,
     compile_ast: bool,
+    compile_semantic_ir: bool,
     compile_asm: bool,
     next_id: u64,
     context: Context,
@@ -95,6 +94,7 @@ impl Compiler {
             compile_dump: options.compile_dump,
             compile_ir: options.compile_ir,
             compile_ast: options.compile_ast,
+            compile_semantic_ir: options.compile_semantic_ir,
             compile_asm: options.compile_asm,
             next_id: 0,
             context,
@@ -326,9 +326,56 @@ impl Compiler {
                     false,
                     &label,
                     line,
+                    Some(class.span),
                 )?;
                 closures.insert(class.span.start, (id, Vec::new(), false));
                 pending.push((id, code));
+            }
+        }
+
+        if self.compile_dump && self.compile_semantic_ir {
+            for (name, function) in &ordered {
+                let graph = super::semantic::lower_for_emission(
+                    &function.params,
+                    &function.body.as_ref().unwrap().statements,
+                    None,
+                    function.span,
+                    scoping,
+                    &analysis.captured,
+                    &[],
+                    &closures,
+                    analysis
+                        .arguments_bindings
+                        .get(&function.span.start)
+                        .copied(),
+                    &analysis.arguments_references,
+                    function.generator,
+                    self.ssa_opt,
+                );
+                match graph {
+                    Ok(graph) => println!("[{source_path}] semantic IR {name}\n{}", graph),
+                    Err(error) => println!("[{source_path}] semantic IR {name}: {error}"),
+                }
+            }
+            for (_, span, params, statements, expression, generator, label, _) in &nested {
+                let graph = super::semantic::lower_for_emission(
+                    params,
+                    statements,
+                    *expression,
+                    *span,
+                    scoping,
+                    &analysis.captured,
+                    &closures[&span.start].1,
+                    &closures,
+                    analysis.arguments_bindings.get(&span.start).copied(),
+                    &analysis.arguments_references,
+                    *generator,
+                    self.ssa_opt,
+                );
+                match graph {
+                    Ok(graph) => println!("[{source_path}] semantic IR {label}\n{}", graph),
+                    Err(error) => println!("[{source_path}] semantic IR {label}: {error}"),
+                }
             }
         }
 
@@ -350,6 +397,7 @@ impl Compiler {
                 function.generator,
                 name,
                 line,
+                Some(function.span),
             )?;
             if let Some(resume) = resume {
                 pending.push(resume);
@@ -371,6 +419,7 @@ impl Compiler {
                 generator,
                 &label,
                 line,
+                Some(span),
             )?;
             if let Some(resume) = resume {
                 pending.push(resume);
@@ -397,6 +446,16 @@ impl Compiler {
             self.context.clear();
             self.context.func.signature = self.signature.clone();
             let mut annotations = Annotations::default();
+            let graph = super::semantic::lower_global(
+                &program.body,
+                program.span,
+                scoping,
+                &analysis.captured,
+                &closures,
+                &analysis.arguments_references,
+                self.ssa_opt,
+            )
+            .map_err(Error::Unsupported)?;
             {
                 let mut builder = cranelift_frontend::FunctionBuilder::new(
                     &mut self.context.func,
@@ -405,15 +464,12 @@ impl Compiler {
                 emit::build_global(
                     &mut builder,
                     &mut self.module,
-                    scoping,
                     &self.helpers,
                     &mut annotations,
                     &mut self.names,
                     self.source_name,
-                    &program.body,
-                    &analysis.captured,
                     &closures,
-                    &analysis.arguments_references,
+                    &graph.graph,
                 )?;
                 builder.seal_all_blocks();
                 builder.finalize();
@@ -431,63 +487,6 @@ impl Compiler {
             Some(id)
         };
 
-        if self.ssa_opt {
-            let mut versioned = Vec::new();
-            for (id, body) in pending {
-                let Some(candidate) = math_guard::analyze(&body) else {
-                    versioned.push((id, body));
-                    continue;
-                };
-                let label = self.function_names[&id].clone();
-                let property = math_guard::receiver_property(&candidate);
-                let fast_name = format!("{label}.math-fast");
-                let fast_id = if property.is_some() {
-                    let mut signature = self.signature.clone();
-                    signature.params.push(AbiParam::new(types::I64));
-                    let id = self
-                        .module
-                        .declare_function(&fast_name, Linkage::Local, &signature)
-                        .map_err(|error| Error::Compile(error.to_string()))?;
-                    self.function_names.insert(id, fast_name);
-                    id
-                } else {
-                    self.declare(&fast_name)?
-                };
-                let fallback_id = self.declare(&format!("{label}.math-fallback"))?;
-                let mut fast = body.clone();
-                math_guard::specialize(
-                    &mut fast,
-                    &candidate,
-                    &mut self.module,
-                    self.helpers[helpers::Helper::MathDirect as usize],
-                );
-                let dispatcher = self.math_dispatcher(
-                    fast_id,
-                    fallback_id,
-                    math_guard::mask(&candidate),
-                    property.map(|(name, _)| name),
-                );
-                if self.compile_dump {
-                    println!(
-                        "[{label}] Math guard: {} distinct targets, {} specialized calls; fallback on mismatch; targets: {}",
-                        math_guard::mask(&candidate).count_ones(),
-                        math_guard::count(&candidate),
-                        math_guard::target_names(&candidate)
-                    );
-                }
-                if self.compile_dump {
-                    if let Some((name, count)) = property {
-                        println!(
-                            "[{label}] receiver property guard: {name}, {count} cached reads; fallback on probe failure"
-                        );
-                    }
-                }
-                versioned.push((id, dispatcher));
-                versioned.push((fast_id, fast));
-                versioned.push((fallback_id, body));
-            }
-            pending = versioned;
-        }
         let compiled_ids: Vec<_> = pending
             .iter()
             .map(|(id, _)| *id)
@@ -682,137 +681,6 @@ impl Compiler {
         ))
     }
 
-    fn math_dispatcher(
-        &mut self,
-        fast: FuncId,
-        fallback: FuncId,
-        mask: u64,
-        property: Option<&str>,
-    ) -> FunctionBody {
-        self.context.clear();
-        self.context.func.signature = self.signature.clone();
-        let guard = self.module.declare_func_in_func(
-            self.helpers[helpers::Helper::MathGuard as usize],
-            &mut self.context.func,
-        );
-        let fast = self
-            .module
-            .declare_func_in_func(fast, &mut self.context.func);
-        let fallback = self
-            .module
-            .declare_func_in_func(fallback, &mut self.context.func);
-        let property = property.map(|name| {
-            let name: Box<str> = name.into();
-            let ptr = name.as_ptr() as i64;
-            let len = name.len() as i64;
-            self.names.push(name);
-            (ptr, len)
-        });
-        let probe = property.map(|_| {
-            self.module.declare_func_in_func(
-                self.helpers[helpers::Helper::PropertyProbe as usize],
-                &mut self.context.func,
-            )
-        });
-        let release = property.map(|_| {
-            self.module.declare_func_in_func(
-                self.helpers[helpers::Helper::PropertyRelease as usize],
-                &mut self.context.func,
-            )
-        });
-        let pointer = self.module.target_config().pointer_type();
-        let mut annotations = Annotations::default();
-        {
-            let mut builder = cranelift_frontend::FunctionBuilder::new(
-                &mut self.context.func,
-                &mut self.builder_context,
-            );
-            let entry = builder.create_block();
-            let fast_block = builder.create_block();
-            let fallback_block = builder.create_block();
-            builder.switch_to_block(entry);
-            builder.append_block_params_for_function_params(entry);
-            let args = builder.block_params(entry).to_vec();
-            let mask = builder.ins().iconst(types::I64, mask as i64);
-            let dummy = builder.ins().iconst(types::I64, 0);
-            let call = builder.ins().call(guard, &[args[0], mask, dummy]);
-            annotations.helpers.insert(call, helpers::Helper::MathGuard);
-            let checked = builder.inst_results(call)[0];
-            let condition = builder.ins().icmp_imm(
-                cranelift_codegen::ir::condcodes::IntCC::Equal,
-                checked,
-                crate::value::Value::TRUE.bits() as i64,
-            );
-            let probe_block = property.map(|_| builder.create_block());
-            builder.ins().brif(
-                condition,
-                probe_block.unwrap_or(fast_block),
-                &[],
-                fallback_block,
-                &[],
-            );
-            let slot = if let (Some((ptr, len)), Some(probe), Some(probe_block)) =
-                (property, probe, probe_block)
-            {
-                builder.switch_to_block(probe_block);
-                let slot = builder.create_sized_stack_slot(StackSlotData::new(
-                    StackSlotKind::ExplicitSlot,
-                    8,
-                    3,
-                ));
-                let address = builder.ins().stack_addr(pointer, slot, 0);
-                let ptr = builder.ins().iconst(pointer, ptr);
-                let len = builder.ins().iconst(types::I64, len);
-                let call = builder
-                    .ins()
-                    .call(probe, &[args[0], args[2], ptr, len, address]);
-                annotations
-                    .helpers
-                    .insert(call, helpers::Helper::PropertyProbe);
-                let checked = builder.inst_results(call)[0];
-                let condition = builder.ins().icmp_imm(
-                    cranelift_codegen::ir::condcodes::IntCC::Equal,
-                    checked,
-                    crate::value::Value::TRUE.bits() as i64,
-                );
-                builder
-                    .ins()
-                    .brif(condition, fast_block, &[], fallback_block, &[]);
-                Some(slot)
-            } else {
-                None
-            };
-            builder.switch_to_block(fast_block);
-            let mut fast_args = args.clone();
-            let cached = slot.map(|slot| builder.ins().stack_load(types::I64, slot, 0));
-            if let Some(cached) = cached {
-                fast_args.push(cached);
-            }
-            let call = builder.ins().call(fast, &fast_args);
-            let result = builder.inst_results(call)[0];
-            if let (Some(cached), Some(release)) = (cached, release) {
-                let call = builder.ins().call(release, &[args[0], cached]);
-                annotations
-                    .helpers
-                    .insert(call, helpers::Helper::PropertyRelease);
-            }
-            builder.ins().return_(&[result]);
-            builder.switch_to_block(fallback_block);
-            let call = builder.ins().call(fallback, &args);
-            let result = builder.inst_results(call)[0];
-            builder.ins().return_(&[result]);
-            builder.seal_all_blocks();
-            builder.finalize();
-        }
-        FunctionBody {
-            function: std::mem::replace(
-                &mut self.context.func,
-                cranelift_codegen::ir::Function::new(),
-            ),
-            annotations,
-        }
-    }
-
     fn compile_callable(
         &mut self,
         params: &FormalParameters<'_>,
@@ -827,6 +695,7 @@ impl Compiler {
         generator: bool,
         label: &str,
         line: u32,
+        semantic_function: Option<oxc_span::Span>,
     ) -> Result<(FunctionBody, Option<(FuncId, FunctionBody)>), Error> {
         if !generator {
             return Ok((
@@ -841,6 +710,7 @@ impl Compiler {
                     closures,
                     scoping,
                     emit::FunctionKind::Ordinary,
+                    semantic_function,
                 )?,
                 None,
             ));
@@ -862,6 +732,7 @@ impl Compiler {
             closures,
             scoping,
             emit::FunctionKind::Generator(plan),
+            semantic_function,
         )?;
         let factory = self.compile_function(
             params,
@@ -874,6 +745,7 @@ impl Compiler {
             closures,
             scoping,
             emit::FunctionKind::Factory(id),
+            None,
         )?;
         Ok((factory, Some((id, resume))))
     }
@@ -890,7 +762,27 @@ impl Compiler {
         closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
         scoping: &Scoping,
         kind: emit::FunctionKind,
+        semantic_function: Option<oxc_span::Span>,
     ) -> Result<FunctionBody, Error> {
+        let graph = semantic_function
+            .map(|span| {
+                super::semantic::lower_for_emission(
+                    params,
+                    statements,
+                    expression,
+                    span,
+                    scoping,
+                    captured,
+                    captures,
+                    closures,
+                    arguments_binding,
+                    arguments_references,
+                    matches!(kind, emit::FunctionKind::Generator(_)),
+                    self.ssa_opt,
+                )
+                .map_err(Error::Unsupported)
+            })
+            .transpose()?;
         let mut annotations = Annotations::default();
         self.context.clear();
         self.context.func.signature = self.signature.clone();
@@ -899,25 +791,32 @@ impl Compiler {
                 &mut self.context.func,
                 &mut self.builder_context,
             );
-            emit::build_function(
-                &mut builder,
-                &mut self.module,
-                scoping,
-                &self.helpers,
-                &mut annotations,
-                &mut self.names,
-                self.source_name,
-                params,
-                statements,
-                expression,
-                arguments_binding,
-                arguments_references,
-                captures,
-                captured,
-                closures,
-                kind,
-                self.ssa_opt,
-            )?;
+            if let Some(graph) = &graph {
+                emit::build_function(
+                    &mut builder,
+                    &mut self.module,
+                    &self.helpers,
+                    &mut annotations,
+                    &mut self.names,
+                    self.source_name,
+                    params,
+                    closures,
+                    kind,
+                    &graph.graph,
+                )?;
+            } else if let emit::FunctionKind::Factory(resume) = kind {
+                emit::build_factory(
+                    &mut builder,
+                    &mut self.module,
+                    &self.helpers,
+                    &mut annotations,
+                    &mut self.names,
+                    self.source_name,
+                    params,
+                    closures,
+                    resume,
+                )?;
+            }
             builder.seal_all_blocks();
             builder.finalize();
         }

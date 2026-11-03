@@ -9,7 +9,28 @@ use super::numeric::Annotations;
 pub(super) struct Effects {
     pub(super) reentry: Reentry,
     pub(super) flags: u16,
-    pub(super) assumption: Option<&'static str>,
+    pub(super) assumptions: &'static [Assumption],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Assumption {
+    NoAccessors,
+    NoCoercionCallbacks,
+    DirectIteration,
+    StableIndexStorage,
+    GuardedMathIdentity,
+}
+
+impl std::fmt::Display for Assumption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NoAccessors => "property access does not invoke accessors",
+            Self::NoCoercionCallbacks => "coercion does not invoke JS callbacks",
+            Self::DirectIteration => "iteration and enumeration use direct engine state",
+            Self::StableIndexStorage => "direct numeric array reads have stable storage",
+            Self::GuardedMathIdentity => "native Math identity is checked by the entry guard",
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,53 +47,47 @@ pub(super) const GLOBAL_WRITE: u16 = 8;
 pub(super) const INTERNAL: u16 = 16;
 pub(super) const ALLOCATION: u16 = 32;
 pub(super) const ERROR: u16 = 64;
-const UNKNOWN: u16 =
+pub(super) const UNKNOWN: u16 =
     HEAP_READ | HEAP_WRITE | GLOBAL_READ | GLOBAL_WRITE | INTERNAL | ALLOCATION | ERROR;
 
 pub(super) fn effects(helper: Helper) -> Effects {
     use Helper::*;
-    let (reentry, flags, assumption) = match helper {
-        Call | CallSpread | Construct | ConstructSpread => (Reentry::Arbitrary, UNKNOWN, None),
+    let (reentry, flags, assumptions): (_, _, &'static [Assumption]) = match helper {
+        Call | CallSpread | Construct | ConstructSpread => (Reentry::Arbitrary, UNKNOWN, &[]),
         FrameEnter | FrameExit | LocalSet | LocalGet | TempClear | TempRetain | ErrorPending
         | ExceptionPending | ErrorOrigin | Catch | Throw => {
-            (Reentry::Closed, INTERNAL | ERROR, None)
+            (Reentry::Closed, INTERNAL | ERROR, &[])
         }
-        MathGuard => (Reentry::Closed, HEAP_READ | GLOBAL_READ, None),
+        SemanticGlobalProbe => (Reentry::Closed, GLOBAL_READ, &[]),
+        SemanticPropertyProbe | SemanticMathNative => (Reentry::Closed, HEAP_READ, &[]),
         IndexRoot | IndexProbe => (
             Reentry::Closed,
             HEAP_READ | INTERNAL,
-            Some("direct numeric array read has stable storage"),
+            &[Assumption::StableIndexStorage],
         ),
-        PropertyProbe => (
-            Reentry::Closed,
-            HEAP_READ | INTERNAL,
-            Some("direct property probe does not invoke accessors"),
-        ),
-        PropertyRelease => (Reentry::Closed, INTERNAL, None),
         MathDirect => (
             Reentry::Closed,
             ALLOCATION | INTERNAL | ERROR,
-            Some(
-                "native identity checked by entry guard; current coercion does not invoke JS callbacks",
-            ),
+            &[
+                Assumption::GuardedMathIdentity,
+                Assumption::NoCoercionCallbacks,
+            ],
         ),
-        Truthy => (Reentry::Closed, HEAP_READ, None),
+        Truthy => (Reentry::Closed, HEAP_READ, &[]),
         ArrayNew | Rest | ObjectNew | StringNew => {
-            (Reentry::Closed, ALLOCATION | INTERNAL | ERROR, None)
+            (Reentry::Closed, ALLOCATION | INTERNAL | ERROR, &[])
         }
-        GlobalGet | GlobalGetOptional => (Reentry::Closed, GLOBAL_READ | INTERNAL | ERROR, None),
-        GlobalSet | GlobalInitialize => (Reentry::Closed, GLOBAL_WRITE | INTERNAL | ERROR, None),
+        GlobalGet | GlobalGetOptional => (Reentry::Closed, GLOBAL_READ | INTERNAL | ERROR, &[]),
+        GlobalSet | GlobalInitialize => (Reentry::Closed, GLOBAL_WRITE | INTERNAL | ERROR, &[]),
         PropertyGet | IndexGet | IndexGetNumeric => (
             Reentry::Closed,
             HEAP_READ | GLOBAL_READ | ALLOCATION | INTERNAL | ERROR,
-            Some("current property access has no getters or coercion callbacks"),
+            &[Assumption::NoAccessors, Assumption::NoCoercionCallbacks],
         ),
         IterateNew | IterateNext | EnumerateNew | EnumerateNext => (
             Reentry::Closed,
             HEAP_READ | INTERNAL | ALLOCATION | ERROR,
-            Some(
-                "current iteration/enumeration uses direct engine state, not JS iterator callbacks",
-            ),
+            &[Assumption::DirectIteration],
         ),
         BitwiseAnd | BitwiseOr | BitwiseXor | ShiftLeft | ShiftRight | ShiftRightUnsigned | Add
         | Sub | Mul | Div | Rem | Pow | LooseEqual | LooseNotEqual | StrictEqual
@@ -80,14 +95,14 @@ pub(super) fn effects(helper: Helper) -> Effects {
         | UnaryNegation | LogicalNot | BitwiseNot => (
             Reentry::Closed,
             HEAP_READ | ALLOCATION | INTERNAL | ERROR,
-            Some("current coercion does not invoke JS callbacks"),
+            &[Assumption::NoCoercionCallbacks],
         ),
-        _ => (Reentry::Unknown, UNKNOWN, None),
+        _ => (Reentry::Unknown, UNKNOWN, &[]),
     };
     Effects {
         reentry,
         flags,
-        assumption,
+        assumptions,
     }
 }
 
@@ -109,12 +124,11 @@ pub(super) fn temporary_effect(helper: Helper) -> TemporaryEffect {
         TempClear => Clear,
         TempRetain => RetainArgument,
         Add => NumericAdd,
-        LocalSet | ErrorPending | ExceptionPending | ErrorOrigin | Throw | MathGuard
-        | MathDirect | IndexRoot | IndexProbe | PropertyRelease | Truthy | BitwiseAnd
-        | BitwiseOr | BitwiseXor | ShiftLeft | ShiftRight | ShiftRightUnsigned | Sub | Mul
-        | Div | Rem | Pow | LooseEqual | LooseNotEqual | StrictEqual | StrictNotEqual | Less
-        | LessEqual | Greater | GreaterEqual | UnaryPlus | UnaryNegation | LogicalNot
-        | BitwiseNot => None,
+        LocalSet | ErrorPending | ExceptionPending | ErrorOrigin | Throw | MathDirect
+        | IndexRoot | IndexProbe | Truthy | BitwiseAnd | BitwiseOr | BitwiseXor | ShiftLeft
+        | ShiftRight | ShiftRightUnsigned | Sub | Mul | Div | Rem | Pow | LooseEqual
+        | LooseNotEqual | StrictEqual | StrictNotEqual | Less | LessEqual | Greater
+        | GreaterEqual | UnaryPlus | UnaryNegation | LogicalNot | BitwiseNot => None,
         _ => MayRegister,
     }
 }
@@ -226,8 +240,9 @@ fn report(function: &Function, annotations: &Annotations, lines: &[u32]) -> Stri
         if effect.reentry == Reentry::Arbitrary {
             result.push_str("; obligation: establish this generic call target and its effects");
         }
-        if let Some(assumption) = effect.assumption {
-            result.push_str(&format!("; assumes {assumption}"));
+        if !effect.assumptions.is_empty() {
+            let assumptions: Vec<_> = effect.assumptions.iter().map(ToString::to_string).collect();
+            result.push_str(&format!("; assumes {}", assumptions.join("; ")));
         }
         result.push('\n');
     }

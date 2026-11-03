@@ -193,7 +193,6 @@ fn block_captures_are_fresh_but_var_loop_captures_are_shared() {
 #[test]
 fn unsupported_closure_semantics_fail_explicitly() {
     for source in [
-        "function main(){ for (let i = 0; i < 3; i++){ let f = () => i; } }",
         "function main(){ const x = 1; return () => ++x; }",
         "function main(){ return function named(){ return 1; }; }",
     ] {

@@ -1,0 +1,534 @@
+use js_engine::{Engine, EngineOptions, Value};
+
+fn run(source: &str, ssa_opt: bool) -> Result<Value, String> {
+    let options = EngineOptions {
+        ssa_opt,
+        ..Default::default()
+    };
+    let mut engine = Engine::with_options(options).unwrap();
+    engine
+        .compile(source, "semantic-lowering.js")
+        .map_err(|e| e.to_string())?;
+    engine
+        .call("main", &[])
+        .map(|value| value.value())
+        .map_err(|e| e.to_string())
+}
+
+#[test]
+fn heightmap_runs_through_semantic_graph() {
+    let source = r#"
+        function getMinAndMaxHeight(heightmap = g_Map.height) {
+            const height = { "min": Infinity, "max": -Infinity };
+            for (let x = 0; x < heightmap.length; ++x)
+                for (let y = 0; y < heightmap[x].length; ++y) {
+                    height.min = Math.min(height.min, heightmap[x][y]);
+                    height.max = Math.max(height.max, heightmap[x][y]);
+                }
+            return height;
+        }
+        function main() {
+            let result = getMinAndMaxHeight([[3, -4], [8, 2]]);
+            return result.min * 100 + result.max;
+        }
+    "#;
+    assert_eq!(run(source, true).unwrap(), Value::number(-392.0));
+    assert_eq!(run(source, true), run(source, false));
+}
+
+#[test]
+fn graph_ownership_and_errors_match_existing_emitter() {
+    for source in [
+        "function main(){ let a = [7]; let b = [9]; for (let i = 0; i < 10; ++i) { let c = a; a = b; b = c; } return a[0] * 10 + b[0]; }",
+        "function main(){ let result = 0; for (let i = 0; i < 3; ++i) { result += x; let x = i; } return result; }",
+        "function main(){ return null.missing; }",
+        "function main(){ let x = { value: 3 }; let y = x; x = [1, 2]; return y.value + x[1]; }",
+        "var g_Map = { height: [[-2, 5], [9, 3]] }; function range(heightmap = g_Map.height){ return heightmap[0][0] + heightmap[1][0]; } function main(){ return range(); }",
+        "function substitute(a, b){ return a + b; } function main(){ Math.min = substitute; return Math.min(3, 5); }",
+    ] {
+        assert_eq!(run(source, true), run(source, false), "{source}");
+    }
+}
+
+#[test]
+fn versioned_heightmap_matches_fallbacks_and_errors() {
+    let function = r#"
+        function getMinAndMaxHeight(heightmap = g_Map.height) {
+            const height = { min: Infinity, max: -Infinity };
+            for (let x = 0; x < heightmap.length; ++x)
+                for (let y = 0; y < heightmap[x].length; ++y) {
+                    height.min = Math.min(height.min, heightmap[x][y]);
+                    height.max = Math.max(height.max, heightmap[x][y]);
+                }
+            return height;
+        }
+    "#;
+    for suffix in [
+        "function main(){ let h = getMinAndMaxHeight([]); return h.min; }",
+        "function main(){ let h = getMinAndMaxHeight([[3, -4], [8, 2]]); return h.min * 100 + h.max; }",
+        "function replace(a, b){ return a + b; } function main(){ Math.min = replace; let h = getMinAndMaxHeight([[1, 2]]); return h.min; }",
+        "function replace(a, b){ return a + b; } function main(){ Math.max = replace; let h = getMinAndMaxHeight([[1, 2]]); return h.max; }",
+        "function main(){ return getMinAndMaxHeight([null]); }",
+        "function main(){ return getMinAndMaxHeight([[{}]]); }",
+        "function main(){ return getMinAndMaxHeight(); }",
+    ] {
+        let source = format!("{function}\n{suffix}");
+        assert_eq!(run(&source, true), run(&source, false), "{suffix}");
+    }
+}
+
+#[test]
+fn versioned_loop_preserves_heap_values_across_phi_swaps() {
+    let source = r#"
+        function run(a, b) {
+            for (let i = 0; i < 11; ++i) {
+                let previous = a;
+                a = b;
+                b = previous;
+                Math.min(i, 9);
+            }
+            return a[0] * 10 + b[0];
+        }
+        function main(){ return run([7], [9]); }
+    "#;
+    assert_eq!(run(source, true), Ok(Value::number(97.0)));
+    assert_eq!(run(source, true), run(source, false));
+}
+
+#[test]
+fn tdz_is_checked_only_when_binding_is_accessed() {
+    for source in [
+        "function main(){ for(let i=0;i<2;i++){ if(i) return x; let x=1; } return 0; }",
+        "function main(){ for(let i=0;i<2;i++){ if(i > 1) return x; let x=1; } return 0; }",
+        "function main(){ let n = 0; for(let i=0;i<3;i++){ if(i == 3) n += x; let x = i; n += x; } return n; }",
+        "function main(){ if(false) return x; if(true) return 8; let x = 1; return x; }",
+    ] {
+        assert_eq!(run(source, true), run(source, false), "{source}");
+    }
+}
+
+#[test]
+fn semantic_construction_and_receivers_match_existing_emitter() {
+    for (source, expected) in [
+        (
+            "function Point(x, y){ this.x = x; this.y = y; } function main(){ let p = new Point(3, 5); return p.x * 10 + p.y; }",
+            Value::number(35.0),
+        ),
+        (
+            "function Point(x){ this.x = x; return 7; } function main(){ return (new Point(6)).x; }",
+            Value::number(6.0),
+        ),
+        (
+            "function Point(x){ this.x = x; return { x: 9 }; } function main(){ return (new Point(6)).x; }",
+            Value::number(9.0),
+        ),
+        (
+            "function receiver(){ return this === undefined; } function main(){ return receiver(); }",
+            Value::TRUE,
+        ),
+        (
+            "function receiver(){ return this.value; } function main(){ let o = {value: 7, method: receiver}; return o.method(); }",
+            Value::number(7.0),
+        ),
+        (
+            "function C(a, b){ this.value = a * 10 + b; } function main(){ let i = 0; let makers = { ctor: C }; let v = new makers[(i = 1, 'ctor')]((i = i + 2), i); return v.value * 10 + i; }",
+            Value::number(333.0),
+        ),
+    ] {
+        assert_eq!(run(source, true), Ok(expected), "{source}");
+        assert_eq!(run(source, true), run(source, false), "{source}");
+    }
+    let source = "function main(){ return new 42(); }";
+    assert!(run(source, true).is_err());
+    assert_eq!(run(source, true), run(source, false));
+}
+
+#[test]
+fn semantic_noise_constructor_executes_real_map_library_code() {
+    let library = include_str!("../../../../binaries/data/mods/public/maps/random/rmgen/Noise.js");
+    let start = library.find("function Noise2D(freq)").unwrap();
+    let end = library[start..].find("\nNoise2D.prototype.get").unwrap() + start;
+    let source = format!(
+        r#"
+        function Vector2D(x, y) {{ this.x = x; this.y = y; }}
+        function randomAngle() {{ return 0; }}
+        {}
+        function main() {{ let noise = new Noise2D(2); return noise.freq * 10 + noise.grads[1][1].x; }}
+    "#,
+        &library[start..end]
+    );
+    assert_eq!(run(&source, true), Ok(Value::number(21.0)));
+    assert_eq!(run(&source, true), run(&source, false));
+}
+
+#[test]
+fn semantic_global_writes_match_existing_emitter() {
+    for (source, expected) in [
+        ("var x = 2; function main(){ return x = 9; }", 9.0),
+        ("var x = 2; function main(){ x += (x = 5); return x; }", 7.0),
+        (
+            "var x = 2; function main(){ return x++ * 100 + ++x * 10 + x; }",
+            244.0,
+        ),
+        (
+            "var saved = [1]; function main(){ let old = saved; saved = [2]; return old[0] * 10 + saved[0]; }",
+            12.0,
+        ),
+        (
+            "var x = 1; function main(){ x = Math.min(5, 3); return x; }",
+            3.0,
+        ),
+    ] {
+        assert_eq!(run(source, true), Ok(Value::number(expected)), "{source}");
+        assert_eq!(run(source, true), run(source, false), "{source}");
+    }
+    for source in [
+        "function main(){ missing = 3; }",
+        "function main(){ missing++; }",
+        "function main(){ Infinity = 4; }",
+        "function main(){ NaN++; }",
+        "function main(){ undefined = 1; }",
+        "const fixed = 1; function main(){ fixed = 2; }",
+    ] {
+        assert!(run(source, true).is_err(), "{source}");
+        assert!(run(source, false).is_err(), "{source}");
+    }
+}
+
+#[test]
+fn semantic_global_write_evaluates_rhs_before_reporting_error() {
+    let source = "var count = 0; function main(){ missing = (count = count + 1); } function read(){ return count; }";
+    for ssa_opt in [false, true] {
+        let mut engine = Engine::with_options(EngineOptions {
+            ssa_opt,
+            ..Default::default()
+        })
+        .unwrap();
+        engine.compile(source, "global-write.js").unwrap();
+        assert!(engine.call("main", &[]).is_err());
+        assert_eq!(
+            engine.call("read", &[]).unwrap().value(),
+            Value::number(1.0)
+        );
+    }
+}
+
+#[test]
+fn semantic_global_write_checks_lexical_initialization() {
+    let source = "let x = initialize(); function initialize(){ x = 1; return 0; } function main(){ return x; }";
+    for ssa_opt in [false, true] {
+        let mut engine = Engine::with_options(EngineOptions {
+            ssa_opt,
+            ..Default::default()
+        })
+        .unwrap();
+        let error = engine
+            .compile(source, "global-tdz.js")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("before initialization"), "{error}");
+    }
+}
+
+#[test]
+fn semantic_for_of_matches_existing_emitter() {
+    for (source, expected) in [
+        (
+            "function main(){ let sum = 0; for (const x of [1, 2, 3]) sum += x; return sum; }",
+            Value::number(6.0),
+        ),
+        (
+            "function main(){ let sum = 5; for (const x of []) sum += x; return sum; }",
+            Value::number(5.0),
+        ),
+        (
+            "function main(){ let sum = 0; for (let x of [1, 2, 3, 4]) { if (x == 2) continue; if (x == 4) break; sum += x; } return sum; }",
+            Value::number(4.0),
+        ),
+        (
+            "function main(){ for (const x of [5, 6]) { let y = [x]; if (x == 5) continue; return y[0]; } return 0; }",
+            Value::number(6.0),
+        ),
+        (
+            "function main(){ let a = [[3], [7]]; let sum = 0; for (const x of a) { a = []; sum += x[0]; } return sum; }",
+            Value::number(10.0),
+        ),
+        (
+            "function main(){ let a = new Uint8Array(2); a[0] = 2; a[1] = 4; let sum = 0; for (const x of a) sum += x; return sum; }",
+            Value::number(6.0),
+        ),
+        (
+            "function main(){ let s = ''; for (const x of 'a🌍') s += x; return s === 'a🌍'; }",
+            Value::TRUE,
+        ),
+    ] {
+        assert_eq!(run(source, true), Ok(expected), "{source}");
+        assert_eq!(run(source, true), run(source, false), "{source}");
+    }
+    for source in [
+        "function main(){ for (let x of x) return x; return 0; }",
+        "function main(){ for (const x of [1]) x = 3; return 0; }",
+        "function main(){ for (const x of null) return x; return 0; }",
+    ] {
+        assert!(run(source, true).is_err(), "{source}");
+        assert!(run(source, false).is_err(), "{source}");
+    }
+}
+
+#[test]
+fn semantic_noncapturing_nested_callables() {
+    for (source, expected) in [
+        (
+            "function main(){ return add(2, 3); function add(a, b){ return a + b; } }",
+            5.0,
+        ),
+        (
+            "function main(){ let f = function(x){ return x * 2; }; return f(4); }",
+            8.0,
+        ),
+        ("function main(){ let f = (x) => x + 3; return f(4); }", 7.0),
+        (
+            "function main(){ let o = { x: 9, f: function(){ let f = () => this.x; return f(); } }; return o.f(); }",
+            9.0,
+        ),
+        (
+            "function main(){ let f = (x = 4) => { return x * 2; }; return f(); }",
+            8.0,
+        ),
+    ] {
+        assert_eq!(run(source, true), Ok(Value::number(expected)), "{source}");
+        assert_eq!(run(source, true), run(source, false), "{source}");
+    }
+}
+
+#[test]
+fn semantic_closure_cells_and_loop_environments() {
+    for (source, expected) in [
+        ("function main(){ let x = 3; return (() => x)(); }", 3.0),
+        (
+            "function main(){let a=[];for(let i=0;i<2;i++){ {let x=i+4; a[i]=()=>x;} } return a[0]()*10+a[1]();}",
+            45.0,
+        ),
+        (
+            "function main(){ function f(n){ if (n) return f(n - 1) + 1; return 0; } return f(3); }",
+            3.0,
+        ),
+        (
+            "function make(){ let x = 0; return [() => ++x, () => x]; } function main(){ let pair = make(); pair[0](); pair[0](); return pair[1](); }",
+            2.0,
+        ),
+        (
+            "function make(){ let x = 7; return () => () => ++x; } function main(){ let outer = make(); let inner = outer(); return inner() * 10 + inner(); }",
+            89.0,
+        ),
+        (
+            "function main(){ let a = []; for (let i = 0; i < 3; ++i) a[i] = () => i; return a[0]() * 100 + a[1]() * 10 + a[2](); }",
+            12.0,
+        ),
+        (
+            "function main(){ let a = []; let i = 0; for (const x of [4, 5, 6]) { a[i++] = () => x; if (x == 5) continue; } return a[0]() * 100 + a[1]() * 10 + a[2](); }",
+            456.0,
+        ),
+        (
+            "function f(a = () => b, b = 7){ return a(); } function main(){ return f(); }",
+            7.0,
+        ),
+    ] {
+        assert_eq!(run(source, true), Ok(Value::number(expected)), "{source}");
+    }
+    for source in [
+        "function f(a = (() => b)(), b = 7){ return a; } function main(){ return f(); }",
+        "function main(){ let f = () => x; return f(); let x = 1; }",
+    ] {
+        let error = run(source, true).unwrap_err();
+        assert!(error.contains("before initialization"), "{source}: {error}");
+    }
+}
+
+#[test]
+fn semantic_var_rest_and_destructuring() {
+    for (source, expected) in [
+        (
+            "function main(){ if (x !== undefined) return 0; if (true) { var x = 5; } return x; }",
+            5.0,
+        ),
+        (
+            "function f(x){ var x; var x; return x; } function main(){ return f(8); }",
+            8.0,
+        ),
+        ("function main(){ var x = 3; { var x; } return x; }", 3.0),
+        (
+            "function main(){ let f = () => x; var x = 8; return f(); }",
+            8.0,
+        ),
+        (
+            "function f(a, ...rest){ return a * 100 + rest[0] * 10 + rest.length; } function main(){ return f(2, 4, 8); }",
+            242.0,
+        ),
+        (
+            "function f([a,,b]){ return a * 10 + b; } function main(){ return f([3,4,5]); }",
+            35.0,
+        ),
+        (
+            "function main(){ let [a,,b] = [3,4,5]; const {x:y} = {x:7}; return a*100 + b*10 + y; }",
+            357.0,
+        ),
+        (
+            "function main(){ let sum=0; for (const [x,y] of [[1,2],[3,4]]) sum += x*10+y; return sum; }",
+            46.0,
+        ),
+        (
+            "function main(){ var sum=0; for (var x of [1,2,3]) sum += x; return sum*10+x; }",
+            63.0,
+        ),
+        (
+            "function f([a,b] = [2,3]){ return a*10+b; } function main(){ return f(); }",
+            23.0,
+        ),
+    ] {
+        assert_eq!(run(source, true), Ok(Value::number(expected)), "{source}");
+        assert_eq!(run(source, true), run(source, false), "{source}");
+    }
+    for source in [
+        "function main(){ let [x] = null; return x; }",
+        "function f([a] = b, b = [1]){ return a; } function main(){ return f(); }",
+    ] {
+        assert!(run(source, true).is_err(), "{source}");
+        assert!(run(source, false).is_err(), "{source}");
+    }
+}
+
+#[test]
+fn exceptions_preserve_values_bindings_and_error_boundaries() {
+    for (source, expected) in [
+        (
+            "function main(){ try { throw undefined; } catch(e) { return e; } }",
+            Value::UNDEFINED,
+        ),
+        (
+            "function main(){ try { throw [42]; } catch(e) { return e[0]; } }",
+            Value::number(42.0),
+        ),
+        (
+            "function fail(){ throw 'é'; } function main(){ try { fail(); } catch(e) { return e === 'é'; } }",
+            Value::TRUE,
+        ),
+        (
+            "function main(){ try { try { throw 1; } catch(e) { throw e+1; } } catch(e) { return e; } }",
+            Value::number(2.0),
+        ),
+        (
+            "function main(){ let f; try { throw [42]; } catch(e) { f=()=>e[0]; } return f(); }",
+            Value::number(42.0),
+        ),
+        (
+            "function main(){ let n=0; for(let i=0;i<10;++i) { try { throw [i]; } catch(e) { n+=e[0]; } } return n; }",
+            Value::number(45.0),
+        ),
+        (
+            "function main(){ let x=1; try { x=2; throw 3; } catch(e) { return x+e; } }",
+            Value::number(5.0),
+        ),
+        (
+            "function main(){ try { throw 1; } catch {} return 42; }",
+            Value::number(42.0),
+        ),
+    ] {
+        for semantic in [false, true] {
+            assert_eq!(run(source, semantic).unwrap(), expected, "{source}");
+        }
+    }
+    for semantic in [false, true] {
+        assert!(
+            run(
+                "function main(){ try { undefined(); } catch { return 42; } }",
+                semantic
+            )
+            .is_err()
+        );
+        assert!(
+            run(
+                "function main(){ try { return 1; } finally { return 2; } }",
+                semantic
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn semantic_arguments_snapshot_and_arrow_captures() {
+    for (source, expected) in [
+        (
+            "function main(a){ a=8; return arguments.length*100+(arguments[0]===undefined)+(arguments[1]===undefined); }",
+            2.0,
+        ),
+        (
+            "function f(a){ a=8; arguments[0]=4; return a*10+arguments[0]; } function main(){ return f(3); }",
+            84.0,
+        ),
+        (
+            "function f(a){ return ()=>()=>arguments[0]; } function main(){ return f(7)()(); }",
+            7.0,
+        ),
+        (
+            "function f(a){ let g=(arguments)=>arguments; return g(9)+(()=>arguments[0])(); } function main(){ return f(3); }",
+            12.0,
+        ),
+        (
+            "var arguments=99; function f(){ let g=()=>arguments[0]; arguments=[8]; return g(); } function main(){ return f(4); }",
+            8.0,
+        ),
+        (
+            "function f(arguments){ return (()=>arguments)(); } function main(){ return f(11); }",
+            11.0,
+        ),
+        (
+            "function C(){ this.x=arguments[0]; } function main(){ return new C(6).x; }",
+            6.0,
+        ),
+        (
+            "function f(a=arguments[0]){ return a; } function main(){ return f(4); }",
+            4.0,
+        ),
+    ] {
+        for semantic in [false, true] {
+            assert_eq!(
+                run(source, semantic).unwrap(),
+                Value::number(expected),
+                "{source}"
+            );
+        }
+    }
+}
+
+#[test]
+fn semantic_script_initializers_match_global_order_and_tdz() {
+    for source in [
+        "var x=1; let y=x+2; const z=y+3; class A { value(){return z;} } function main(){return new A().value()+x;}",
+        "var x; var x=3; let y; y=4; function main(){return x+y;}",
+        "class A { self(){return A;} } var Original=A; A=undefined; function main(){return new Original().self()===Original;}",
+    ] {
+        assert_eq!(
+            run(source, true).unwrap(),
+            run(source, false).unwrap(),
+            "{source}"
+        );
+    }
+    for source in [
+        "let x=x; function main(){}",
+        "typeof x; let x; function main(){}",
+        "var early=A; class A {} function main(){}",
+    ] {
+        assert!(run(source, false).is_err(), "{source}");
+        assert!(run(source, true).is_err(), "{source}");
+    }
+}
+
+#[test]
+fn function_and_var_share_storage() {
+    let source = "function main() { var f; function f() { return 1; } let read = () => f; f = 7; return read() === 7; }";
+    for enabled in [false, true] {
+        assert_eq!(run(source, enabled).unwrap(), Value::TRUE);
+    }
+}

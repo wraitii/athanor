@@ -23,7 +23,6 @@ pub(crate) enum HelperShape {
     MethodCallable,
     Quaternary,
     SourceLocation,
-    PropertyProbe,
 }
 
 pub(crate) struct HelperSpec {
@@ -73,10 +72,10 @@ define_helpers! {
     ArrayAppend => Binary, js_array_append;
     ArrayExtend => Binary, js_array_extend;
     Call => MethodCallable, js_call;
-    MathGuard => Binary, js_math_guard;
+    SemanticGlobalProbe => GlobalGet, js_semantic_global_probe;
+    SemanticPropertyProbe => PropertyGet, js_semantic_property_probe;
+    SemanticMathNative => Binary, js_semantic_math_native;
     MathDirect => MethodCallable, js_math_direct;
-    PropertyProbe => PropertyProbe, js_property_probe;
-    PropertyRelease => Unary, js_property_release;
     FrameEnter => Unary, js_frame_enter;
     FrameExit => Unary, js_frame_exit;
     LocalSet => Binary, js_local_set;
@@ -236,12 +235,6 @@ pub(crate) fn signature(shape: HelperShape, call_conv: CallConv, pointer: Type) 
             for _ in 0..3 {
                 signature.params.push(AbiParam::new(types::I64));
             }
-        }
-        HelperShape::PropertyProbe => {
-            signature.params.push(AbiParam::new(types::I64));
-            signature.params.push(AbiParam::new(pointer));
-            signature.params.push(AbiParam::new(types::I64));
-            signature.params.push(AbiParam::new(pointer));
         }
         HelperShape::Quaternary => {
             for _ in 0..4 {
@@ -1082,54 +1075,38 @@ extern "C" fn js_array_extend(ctx: *mut JitCtx, arguments: Value, iterable: Valu
     Value::UNDEFINED
 }
 
-extern "C" fn js_property_probe(
-    ctx: *mut JitCtx,
-    receiver: Value,
-    ptr: *const u8,
-    len: u64,
-    output: *mut Value,
-) -> Value {
-    let ctx = unsafe { &*ctx };
-    if receiver == Value::GLOBAL_OBJECT {
-        return Value::FALSE;
-    }
+extern "C" fn js_semantic_global_probe(ctx: *mut JitCtx, ptr: *const u8, len: u64) -> Value {
     let name =
         unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len as usize)) };
-    let Some(PropertyRead::Value(value)) = ctx.global.heap().read_property(receiver, name) else {
-        return Value::FALSE;
-    };
-    if !ctx.global.heap().retain(value) {
-        return Value::FALSE;
+    match unsafe { &*ctx }.global.get_raw(name) {
+        Some(value) if value != Value::UNINITIALIZED => value,
+        _ => Value::UNDEFINED,
     }
-    unsafe { output.write(value) };
-    Value::TRUE
 }
 
-extern "C" fn js_property_release(ctx: *mut JitCtx, value: Value) -> Value {
-    unsafe { &*ctx }.global.heap().release(value);
-    Value::UNDEFINED
+extern "C" fn js_semantic_property_probe(
+    ctx: *mut JitCtx,
+    object: Value,
+    ptr: *const u8,
+    len: u64,
+) -> Value {
+    let name =
+        unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len as usize)) };
+    if object == Value::GLOBAL_OBJECT {
+        return Value::UNDEFINED;
+    }
+    match unsafe { &*ctx }.global.heap().read_property(object, name) {
+        Some(PropertyRead::Value(value)) => value,
+        _ => Value::UNDEFINED,
+    }
 }
 
-extern "C" fn js_math_guard(ctx: *mut JitCtx, mask: u64, _: u64) -> Value {
-    let ctx = unsafe { &*ctx };
-    let Some(math) = ctx.global.get_raw("Math") else {
-        return Value::boolean(false);
-    };
-    if math == Value::GLOBAL_OBJECT {
-        return Value::boolean(false);
-    }
-    for (index, (name, operation)) in super::math_guard::METHODS.iter().enumerate() {
-        if mask & (1 << index) == 0 {
-            continue;
-        }
-        let Some(PropertyRead::Value(value)) = ctx.global.heap().read_property(math, name) else {
-            return Value::boolean(false);
-        };
-        if ctx.global.heap().native(value) != Some(crate::heap::NativeFunction::Math(*operation)) {
-            return Value::boolean(false);
-        }
-    }
-    Value::boolean(true)
+extern "C" fn js_semantic_math_native(ctx: *mut JitCtx, value: Value, operation: u64) -> Value {
+    let expected = super::math::METHODS[operation as usize].1;
+    Value::boolean(
+        unsafe { &*ctx }.global.heap().native(value)
+            == Some(crate::heap::NativeFunction::Math(expected)),
+    )
 }
 
 extern "C" fn js_math_direct(
@@ -1139,7 +1116,7 @@ extern "C" fn js_math_direct(
     argv: *const Value,
     argc: u64,
 ) -> Value {
-    let operation = super::math_guard::METHODS[operation as usize].1;
+    let operation = super::math::METHODS[operation as usize].1;
     let args = if argc == 0 {
         &[]
     } else {

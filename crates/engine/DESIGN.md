@@ -11,7 +11,7 @@ aliasing, and cycles; document deliberate semantic restrictions.
 ## Current implementation
 
 - `parse.rs` uses Oxc to produce an arena-allocated AST. `jit/compiler.rs` compiles
-  it directly to Cranelift native code; there is no interpreter or bytecode tier.
+  it through a semantic graph to Cranelift native code; there is no interpreter or bytecode tier.
   Parsing storage is temporary, while the compiler retains generated code and
   names referenced by that code. Oxc semantic analysis reports early errors and
   resolves references to binding identities used by the compiler.
@@ -68,7 +68,7 @@ This applies to ordinary functions, module initializers, generator factories,
 and generator resume functions.
 
 ```text
-Oxc AST -> emission -> finalized SSA CLIF + annotations
+Oxc AST -> semantic graph -> finalized SSA CLIF + annotations
                                 -> numeric analysis
                                 -> guard simplification and verification
                                 -> Cranelift optimization and code generation
@@ -104,25 +104,7 @@ not guards. Admission only describes closure against reentry under those
 assumptions: it does not imply purity, establish call identity, or analyze raw
 memory effects.
 
-When SSA optimization is enabled, the compiler may also version functions with
-only supported `Math` calls. It traces each call through annotated property and
-global reads, rejects unknown effects, observable writes and non-stack stores,
-and checks that the replaced values have no other uses. An entry guard reads
-`Math` once and checks each distinct method against its expected native identity
-without invoking JS or throwing. A mismatch takes the original body; otherwise a
-specialized clone calls the existing Math implementation directly. The guard and
-clone depend on the current runtime's lack of getter and coercion callbacks. This
-initial specialization covers `ceil`, `floor`, `min`, `max`, and `sqrt` and does
-not establish any persistent realm-wide assumption. For such a function, one
-repeated named property read directly from the entry receiver can also be cached;
-the compiler selects the most frequent such read by static site count. A
-nonthrowing probe accepts only direct data results; a failed probe takes the
-original body before any observable operation. The dispatcher retains the probed
-value across the fast body and releases it afterward, including on error exits.
-A successful read of `undefined` is distinct from probe failure. This relies on
-the closed-effect proof and on property lookup not invoking JS callbacks; future
-accessor support must reject accessor probes. `JS_JIT_SSA=0` disables both
-specializations.
+Math specialization now runs on the semantic graph, as described below.
 
 The abstract kinds are Number, its subtypes Int32, OtherNumber, and NaN,
 plus Other and unknown. Int32 describes an exactly representable signed 32-bit
@@ -185,11 +167,7 @@ held by the receiver; it does not imply numeric array elements. Other receivers
 and keys keep the original read. The later site compares receiver and key bits
 in CLIF and falls back to its original helper on mismatch.
 
-Storage and lifetime are separate facts. The dispatcher explicitly roots its
-probed property throughout the specialized call; aliases and identity copies
-preserve that lifetime. For such a receiver, the probe needs no additional frame
-root: the receiver owns any borrowed result and the numeric key is nonowning.
-Otherwise one bounded frame root holds the receiver, key, and result across
+Storage and lifetime are separate facts. One bounded frame root holds the receiver, key, and result across
 temporary clears, replacing the previous root or releasing it at frame exit.
 This extends their lifetimes; the current runtime has no finalizers. The storage
 probe must reject accessor or proxy behavior if introduced. Only one pair per
@@ -200,23 +178,8 @@ the scope. A typed-array element-domain fact could further specialize numeric
 representation. Loop peeling could establish facts on the first iteration for a
 later specialized loop, but is not implemented here.
 
-For a narrow loop shape, emission also builds a semantic region containing an
-indexed value, inclusive induction, shifted-bit test, and counter increment.
-The first indexed read and its existing error check execute normally. A
-nonthrowing direct-index storage probe runs before that expression's temporary
-clear. On its truthy branch, exact Int32 word and bounds guards, bounds within
-0 through 31, and a numeric counter guard select a call-free CLIF loop; failure
-executes the original loop. The loop uses an Int32 induction and bit mask, while
-the counter remains an IEEE double updated once per set bit, preserving
-floating-point rounding. The counter is boxed and NaN is canonicalized on exit. The recognizer requires
-matching local or `this` property receivers and local key expressions, excludes captured or
-modified dependencies, and relies on the current absence of accessors, proxies,
-and coercion callbacks. It does not hoist the first read or assume typed arrays.
-This frontend region is enabled with SSA optimization and currently handles one
-specific operation shape; it is not a general semantic IR or loop optimizer.
-
 Helper effect contracts let emission omit JS-exception checks for helpers that
-cannot throw. General receiver specialization, property hoisting, and tiered
+cannot throw. General receiver specialization and tiered
 compilation remain unimplemented.
 
 `EngineOptions::ssa_opt` enables rewriting and defaults to true unless
@@ -373,8 +336,8 @@ Reads become owned temporaries before side effects can replace their source.
 Captured lexical reads and writes check initialization; declarations initialize
 cells separately from assignment. Assignment to const bindings is rejected.
 Block-local captures get fresh cells each time the block executes. Captured
-lexical bindings in a for-loop initializer are explicitly rejected until
-per-iteration environments are implemented. Named function expressions and async functions remain unsupported. Recursion through a
+lexical loop bindings use per-iteration environments. Named function expressions
+and async functions remain unsupported. Recursion through a
 captured variable works but can create cycles.
 
 Each engine has one global environment and one code registry. A closure belongs
@@ -1035,3 +998,109 @@ through `usize` to reject fractions; negative zero is accepted as index zero.
 The numeric getter keeps primitive and borrowed reads in its main body. Character
 allocation and the general property fallback are cold, non-inlined functions so
 those paths do not inflate the common getter's register saves and stack frame.
+
+## Semantic graph
+
+The compiler lowers supported functions, nested callables, generator resumes,
+and script initializers through `jit/semantic/` before emitting Cranelift IR.
+`--compile --semantic-ir` prints callable graphs with inferred types and pass
+notes. The graph verifier checks scope and control-flow invariants. Semantic
+optimization is disabled by `JS_JIT_SSA=0`, for graphs with exception handlers and for
+generator graphs; the shared CLIF optimization passes still apply.
+
+```text
+Oxc AST -> build -> promote -> simplify -> version -> reuse loads -> hoist -> simplify
+```
+
+### Representation
+
+Values are SSA: each is defined once, by an instruction result or a block
+parameter, and every use is dominated by its definition. Control-flow merges
+(default parameters, `||`, `&&`, `??`, `?:`) pass values as branch arguments.
+Blocks, instructions, values, bindings and scopes are Cranelift entity IDs, so
+instruction IDs are stable within a graph and could later name operation sites.
+Instructions and terminators carry source byte spans and preserve source
+evaluation order. Calls record the receiver separately and resolve member
+callees before evaluating arguments.
+
+Bindings are interned per graph with their kind, owning scope, whether a closure
+captures them (from `CaptureAnalysis`).
+`Read`, `Write` and `Initialize` act on binding storage and check
+initialization. Unresolved references and references to script-level
+declarations use `GlobalRead`. Unresolved `undefined`, `Infinity` and `NaN` fold
+to constants; the runtime defines `Infinity` and `NaN` as read-only globals, and
+top-level lexical declarations cannot shadow existing global bindings.
+
+A scope is created only when it declares bindings. `EnterScope(s)` creates its
+bindings uninitialized; parameters, the function body, blocks and lexical `for`
+heads each have their own scope. `NextIteration(s)` creates the next loop
+environment, copying its bindings, before the first test and before each update.
+Every normal or abrupt exit (`return`, `break`, `continue`) emits `LeaveScope`
+for each open scope it leaves, innermost first; a return evaluates its value
+first and leaves all scopes. The verifier checks that each block is entered with
+a single scope stack, that scope operations nest, and that returns close every
+scope.
+
+Exception handlers have explicit exceptional successors that unwind lexical
+scopes before entering a catch block; runtime errors bypass JavaScript catches.
+Generator yields have resume successors and restore graph values and bindings
+from the generator frame. The supported subset includes closures, `var`, `this`,
+construction, classes, switch, do-while, and selected destructuring forms.
+Labels, templates, `finally`, and more general destructuring remain unsupported.
+
+### Contracts and facts
+
+`Graph::contract(op, facts)` describes an operation: reentry, heap and global
+effects, allocation, internal bookkeeping, whether it may throw, its runtime
+assumptions and the ownership of its result (unowned, borrowed, owned, or maybe
+owned). Runtime assumptions use the `Assumption` enum shared with the helper
+effect report. Property writes are classified as closed under the same accessor
+and coercion assumptions as property reads. `Define` only targets the object
+literal being built, so it does not count as a write to existing heap state. It retains the property
+read and callback assumptions of the shared property setter.
+
+Facts are sets of possible value types: int32, other doubles, boolean,
+undefined, null, string, object, other values (symbols and BigInts) and the
+uninitialized-binding sentinel. They are computed flow-insensitively over SSA
+values to a fixed point; block parameters join their incoming arguments. Facts
+refine contracts: a coercing operation on numbers is pure, one on other
+primitives needs no callback assumption, and an initialization check of a value
+that cannot be uninitialized is pure.
+
+### Passes
+
+Promotion turns every non-captured binding into SSA values, adding block
+parameters at merges and removing trivial ones. Each promoted read or write
+becomes a `CheckInitialized` of the reaching value; the entry value is an
+explicit uninitialized sentinel. Simplification removes pure operations whose
+results are unused, including checks of initialized values and the scope
+operations of scopes without captured bindings, and replaces numeric coercions
+of numbers by their operand.
+
+A call whose callee is a property read of a global, such as `Math.min`, reenters
+unless the callee is the expected native function. Versioning collects these
+requirements for the initial `Math` natives. It copies the function and
+rewrites the copy's calls to `CallNative`. The copy's global and method reads
+are replaced by non-throwing probes in a new entry block. The probes take the
+original body if any identity check fails. Versioning only commits if the copy
+is closed: no reentry, no global writes, and heap writes only to allocations
+that do not escape. An allocation escapes when it is used other than as the
+receiver of a property access, in an identity test, or returned. Under these
+conditions the probed values remain valid throughout the copy. A function
+without requirements that is already closed is optimized in place.
+
+Within a closed region, a property, index or global read reuses an equal
+dominating read if no write in the region may alias its receiver. Writes to
+unescaped allocations alias only that allocation. Loop hoisting moves reads and
+pure operations with loop-invariant operands from a loop header to its single
+preheader. It stops at the first operation it cannot move, so the hoisted
+operations still run first, and exceptions occur in the same order.
+
+The emitter probes globals and properties without invoking JavaScript or raising
+an error, checks native Math identities, and selects the original graph on guard
+failure. Graph values and block parameters are rooted in frame slots; incoming
+block parameters are retained before replacing those slots. Temporary values are
+cleared after each operation and frame exit releases the slots. This conservative
+scheme keeps each value rooted until it is overwritten or the frame exits. Scalar
+replacement of unescaped objects, branch-sensitive facts and guards on values
+computed inside the function are not implemented.

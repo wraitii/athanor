@@ -1,9 +1,13 @@
 use js_engine::{Engine, EngineOptions, Error, OptLevel, Value};
 
 fn check(source: &str) {
-    for opt_level in [OptLevel::None, OptLevel::Speed] {
+    for (opt_level, ssa_opt) in [OptLevel::None, OptLevel::Speed]
+        .into_iter()
+        .flat_map(|level| [false, true].map(|semantic| (level, semantic)))
+    {
         let mut engine = Engine::with_options(EngineOptions {
             opt_level,
+            ssa_opt,
             ..Default::default()
         })
         .unwrap();
@@ -37,19 +41,38 @@ fn class_calls_method_construction_and_early_access_fail() {
         "function main() { let a = A; class A {} return a; }",
         "var early = A; class A {} function main() {}",
     ] {
-        let mut engine = Engine::new().unwrap();
-        match engine.compile(source, "classes.js") {
-            Err(Error::Runtime(_)) => {}
-            Ok(()) => assert!(
-                matches!(engine.call("main", &[]), Err(Error::Runtime(_))),
-                "{source}"
-            ),
-            Err(error) => panic!("{source}: {error}"),
+        for (opt_level, ssa_opt) in [OptLevel::None, OptLevel::Speed]
+            .into_iter()
+            .flat_map(|level| [false, true].map(|semantic| (level, semantic)))
+        {
+            let mut engine = Engine::with_options(EngineOptions {
+                opt_level,
+                ssa_opt,
+                ..Default::default()
+            })
+            .unwrap();
+            match engine.compile(source, "classes.js") {
+                Err(Error::Runtime(_)) => {}
+                Ok(()) => assert!(
+                    matches!(engine.call("main", &[]), Err(Error::Runtime(_))),
+                    "{source}"
+                ),
+                Err(error) => panic!("{source}: {error}"),
+            }
         }
     }
-    let mut engine = Engine::new().unwrap();
-    engine.compile("class A {}", "classes.js").unwrap();
-    assert!(matches!(engine.call("A", &[]), Err(Error::Runtime(_))));
+    for opt_level in [OptLevel::None, OptLevel::Speed] {
+        for ssa_opt in [false, true] {
+            let mut engine = Engine::with_options(EngineOptions {
+                opt_level,
+                ssa_opt,
+                ..Default::default()
+            })
+            .unwrap();
+            engine.compile("class A {}", "classes.js").unwrap();
+            assert!(matches!(engine.call("A", &[]), Err(Error::Runtime(_))));
+        }
+    }
 }
 
 #[test]
@@ -64,14 +87,24 @@ fn unsupported_class_features_fail_explicitly() {
         "class A { #method() {} }",
         "class A { static {} }",
     ] {
-        let mut engine = Engine::new().unwrap();
-        assert!(
-            matches!(
-                engine.compile(source, "classes.js"),
-                Err(Error::Unsupported(_))
-            ),
-            "{source}"
-        );
+        for (opt_level, ssa_opt) in [OptLevel::None, OptLevel::Speed]
+            .into_iter()
+            .flat_map(|level| [false, true].map(|semantic| (level, semantic)))
+        {
+            let mut engine = Engine::with_options(EngineOptions {
+                opt_level,
+                ssa_opt,
+                ..Default::default()
+            })
+            .unwrap();
+            assert!(
+                matches!(
+                    engine.compile(source, "classes.js"),
+                    Err(Error::Unsupported(_))
+                ),
+                "{source}"
+            );
+        }
     }
 }
 

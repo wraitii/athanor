@@ -42,6 +42,7 @@ pub struct EngineOptions {
     pub compile_dump: bool,
     pub compile_ir: bool,
     pub compile_ast: bool,
+    pub compile_semantic_ir: bool,
     pub compile_asm: bool,
 }
 
@@ -58,6 +59,7 @@ impl Default for EngineOptions {
             compile_dump: false,
             compile_ir: false,
             compile_ast: false,
+            compile_semantic_ir: false,
             compile_asm: false,
         }
     }
@@ -80,7 +82,8 @@ impl Engine {
     pub fn with_options(options: EngineOptions) -> Result<Self, Error> {
         let global = Environment::new();
         global.define("globalThis", Value::GLOBAL_OBJECT);
-        global.define("Infinity", Value::number(f64::INFINITY));
+        global.define_readonly("Infinity", Value::number(f64::INFINITY));
+        global.define_readonly("NaN", Value::number(f64::NAN));
         let constructor = global
             .heap()
             .native_function(crate::heap::NativeFunction::Error)

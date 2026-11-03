@@ -30,6 +30,7 @@ fn run() -> Result<(), String> {
     let mut compile = false;
     let mut compile_ir = true;
     let mut compile_ast = false;
+    let mut compile_semantic_ir = false;
     let mut output_option = false;
     let mut compile_asm = false;
     let mut data = None;
@@ -63,6 +64,10 @@ fn run() -> Result<(), String> {
                 compile_ast = true;
                 output_option = true;
             }
+            "--semantic-ir" => {
+                compile_semantic_ir = true;
+                output_option = true;
+            }
             "--asm" => {
                 compile_asm = true;
                 output_option = true;
@@ -85,7 +90,7 @@ fn run() -> Result<(), String> {
     }
 
     if output_option && !compile {
-        return Err("--ir, --no-ir, --ast and --asm require --compile".into());
+        return Err("--ir, --no-ir, --ast, --semantic-ir and --asm require --compile".into());
     }
 
     if map {
@@ -143,6 +148,7 @@ fn run() -> Result<(), String> {
         compile_dump: compile,
         compile_ir,
         compile_ast,
+        compile_semantic_ir,
         compile_asm,
         ..Default::default()
     };
@@ -258,7 +264,7 @@ fn display(error: Error) -> String {
 
 fn usage() {
     eprintln!(
-        "usage: js-runner [--load SCRIPT]... [--function NAME] [--arg VALUE]... <script>\n       js-runner [--function NAME] [--arg VALUE]... --eval SOURCE\n       js-runner --map [--data ROOT] [--settings JSON] [--bootstrap SCRIPT] [SCRIPT]\n       js-runner --compile [--no-ir] [--ast] [--asm] (--eval SOURCE | SCRIPT)
+        "usage: js-runner [--load SCRIPT]... [--function NAME] [--arg VALUE]... <script>\n       js-runner [--function NAME] [--arg VALUE]... --eval SOURCE\n       js-runner --map [--data ROOT] [--settings JSON] [--bootstrap SCRIPT] [SCRIPT]\n       js-runner --compile [--no-ir] [--ast] [--semantic-ir] [--asm] (--eval SOURCE | SCRIPT)
        js-runner --repl"
     );
 }

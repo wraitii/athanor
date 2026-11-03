@@ -1,15 +1,12 @@
 pub(super) mod class;
-mod expression;
+pub(in crate::jit) mod expression;
 mod ir_helpers;
-mod loops;
 mod ops;
-mod optional;
-mod scope;
-mod semantic_loop;
+pub(in crate::jit) mod scope;
+mod semantic_graph;
 mod statement;
-mod switch;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
@@ -18,8 +15,7 @@ use cranelift_codegen::ir::{
 use cranelift_frontend::{FunctionBuilder, Switch};
 use cranelift_jit::JITModule;
 use cranelift_module::{FuncId, Module};
-use oxc_ast::ast::{Expression, FormalParameters, Statement};
-use oxc_semantic::Scoping;
+use oxc_ast::ast::FormalParameters;
 use oxc_span::Span;
 use oxc_syntax::symbol::SymbolId;
 
@@ -27,8 +23,6 @@ use crate::error::Error;
 use crate::jit::helpers::Helper;
 use crate::jit::numeric::Annotations;
 use crate::value::Value;
-
-use scope::ScopeStack;
 
 pub(crate) use statement::statement_kind;
 
@@ -42,24 +36,18 @@ pub(super) struct FunctionCompiler<'a, 'f> {
     names: &'a mut Vec<Box<str>>,
     source_name: (usize, usize),
     source_span: Span,
-    semantic_loops: bool,
     b: &'a mut FunctionBuilder<'f>,
     module: &'a mut JITModule,
     helpers: &'a [FuncId],
     annotations: &'a mut Annotations,
-    scoping: &'a Scoping,
     pointer: Type,
     ctx: ClifValue,
     receiver: ClifValue,
     argv: ClifValue,
     argc: ClifValue,
-    captured: &'a HashSet<SymbolId>,
-    arguments_references: &'a HashMap<u32, SymbolId>,
     closures: &'a HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
-    scopes: ScopeStack,
     return_block: Block,
     handlers: Vec<Block>,
-    control_targets: Vec<(Block, Option<Block>)>,
     generator: Option<ClifValue>,
     resume_blocks: Vec<Block>,
     suspensions: HashMap<u32, (usize, Block)>,
@@ -69,21 +57,70 @@ pub(super) struct FunctionCompiler<'a, 'f> {
 pub(super) fn build_function(
     b: &mut FunctionBuilder<'_>,
     module: &mut JITModule,
-    scoping: &Scoping,
     helpers: &[FuncId],
     annotations: &mut Annotations,
     names: &mut Vec<Box<str>>,
     source_name: (usize, usize),
     params: &FormalParameters<'_>,
-    statements: &[Statement<'_>],
-    expression: Option<&Expression<'_>>,
-    arguments_binding: Option<SymbolId>,
-    arguments_references: &HashMap<u32, SymbolId>,
-    captures: &[SymbolId],
-    captured: &HashSet<SymbolId>,
     closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
     kind: FunctionKind,
-    semantic_loops: bool,
+    graph: &super::semantic::Graph,
+) -> Result<(), Error> {
+    build_callable(
+        b,
+        module,
+        helpers,
+        annotations,
+        names,
+        source_name,
+        params,
+        closures,
+        kind,
+        CallableBody::Graph(graph),
+    )
+}
+
+pub(super) fn build_factory(
+    b: &mut FunctionBuilder<'_>,
+    module: &mut JITModule,
+    helpers: &[FuncId],
+    annotations: &mut Annotations,
+    names: &mut Vec<Box<str>>,
+    source_name: (usize, usize),
+    params: &FormalParameters<'_>,
+    closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
+    resume: FuncId,
+) -> Result<(), Error> {
+    build_callable(
+        b,
+        module,
+        helpers,
+        annotations,
+        names,
+        source_name,
+        params,
+        closures,
+        FunctionKind::Factory(resume),
+        CallableBody::Factory(resume),
+    )
+}
+
+enum CallableBody<'g> {
+    Graph(&'g super::semantic::Graph),
+    Factory(FuncId),
+}
+
+fn build_callable(
+    b: &mut FunctionBuilder<'_>,
+    module: &mut JITModule,
+    helpers: &[FuncId],
+    annotations: &mut Annotations,
+    names: &mut Vec<Box<str>>,
+    source_name: (usize, usize),
+    params: &FormalParameters<'_>,
+    closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
+    kind: FunctionKind,
+    body: CallableBody<'_>,
 ) -> Result<(), Error> {
     let entry = b.create_block();
     b.switch_to_block(entry);
@@ -97,24 +134,18 @@ pub(super) fn build_function(
         names,
         source_name,
         source_span: params.span,
-        semantic_loops,
         b,
         module,
         helpers,
         annotations,
-        scoping,
         pointer,
         ctx,
         receiver,
         argv,
         argc,
-        captured,
-        arguments_references,
         closures,
-        scopes: ScopeStack::new(),
         return_block,
         handlers: Vec::new(),
-        control_targets: Vec::new(),
         generator: None,
         resume_blocks: Vec::new(),
         suspensions: HashMap::new(),
@@ -137,7 +168,7 @@ pub(super) fn build_function(
         compiler.enter_frame();
         None
     };
-    if let FunctionKind::Factory(resume) = kind {
+    if let CallableBody::Factory(resume) = body {
         let args = compiler.call_helper(Helper::ArrayNew, &[argv, argc]);
         compiler.check_error();
         let code = compiler.b.ins().iconst(types::I64, resume.as_u32() as i64);
@@ -150,52 +181,28 @@ pub(super) fn build_function(
         compiler.return_value(result);
         return Ok(());
     }
-    compiler.scopes.push();
-    let closure = if compiler.generator.is_some() {
-        compiler.call_helper(Helper::GeneratorClosure, &[closure])
-    } else {
-        closure
-    };
-    for (index, symbol) in captures.iter().enumerate() {
-        let index = compiler.b.ins().iconst(types::I64, index as i64);
-        let cell = compiler.call_helper(Helper::CaptureGet, &[closure, index]);
-        compiler.check_error();
-        compiler.install_capture(*symbol, cell);
-    }
-    if let Some(symbol) = arguments_binding {
-        let variable = compiler.declare_function_binding(symbol);
-        let value = compiler.call_helper(Helper::ArrayNew, &[compiler.argv, compiler.argc]);
-        compiler.check_error();
-        compiler.initialize_local(variable, value);
-    }
-    compiler.initialize_function(params, statements)?;
-    compiler.clear_temporaries();
-    if let Some(expression) = expression {
-        let value = compiler.emit_expression(expression)?;
-        compiler.jump(return_block, &[BlockArg::Value(value)]);
-    } else {
-        compiler.emit_function_body(statements)?;
-    }
-    if !compiler.terminated {
-        let undefined = compiler.constant(Value::UNDEFINED);
-        compiler.jump(return_block, &[BlockArg::Value(undefined)]);
-    }
-    compiler.switch(return_block);
-    let result = compiler.b.block_params(return_block)[0];
-    compiler.return_value(result);
-    if let Some(dispatch) = dispatch {
-        compiler.switch(dispatch);
-        let dummy = compiler.constant(Value::UNDEFINED);
-        let state = compiler.call_helper(Helper::GeneratorState, &[dummy]);
-        let mut switch = Switch::new();
-        for (state, block) in compiler.resume_blocks.iter().enumerate() {
-            switch.set_entry(state as u128, *block);
+    if let CallableBody::Graph(graph) = body {
+        let graph_closure = if compiler.generator.is_some() {
+            compiler.call_helper(Helper::GeneratorClosure, &[closure])
+        } else {
+            closure
+        };
+        compiler.emit_semantic_graph(graph, graph_closure)?;
+        if let Some(dispatch) = dispatch {
+            compiler.switch(dispatch);
+            let dummy = compiler.constant(Value::UNDEFINED);
+            let state = compiler.call_helper(Helper::GeneratorState, &[dummy]);
+            let mut switch = Switch::new();
+            for (state, block) in compiler.resume_blocks.iter().enumerate() {
+                switch.set_entry(state as u128, *block);
+            }
+            let invalid = compiler.b.create_block();
+            switch.emit(compiler.b, state, invalid);
+            compiler.switch(invalid);
+            let undefined = compiler.constant(Value::UNDEFINED);
+            compiler.jump(return_block, &[BlockArg::Value(undefined)]);
         }
-        let invalid = compiler.b.create_block();
-        switch.emit(compiler.b, state, invalid);
-        compiler.switch(invalid);
-        let undefined = compiler.constant(Value::UNDEFINED);
-        compiler.jump(return_block, &[BlockArg::Value(undefined)]);
+        return Ok(());
     }
     Ok(())
 }
@@ -203,20 +210,17 @@ pub(super) fn build_function(
 pub(super) fn build_global(
     b: &mut FunctionBuilder<'_>,
     module: &mut JITModule,
-    scoping: &Scoping,
     helpers: &[FuncId],
     annotations: &mut Annotations,
     names: &mut Vec<Box<str>>,
     source_name: (usize, usize),
-    statements: &[oxc_ast::ast::Statement<'_>],
-    captured: &HashSet<SymbolId>,
     closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
-    arguments_references: &HashMap<u32, SymbolId>,
+    graph: &super::semantic::Graph,
 ) -> Result<(), Error> {
     let entry = b.create_block();
     b.switch_to_block(entry);
     b.append_block_params_for_function_params(entry);
-    let [ctx, _closure, receiver, argv, argc] = b.block_params(entry).try_into().unwrap();
+    let [ctx, closure, receiver, argv, argc] = b.block_params(entry).try_into().unwrap();
     let return_block = b.create_block();
     b.append_block_param(return_block, types::I64);
     let pointer = module.target_config().pointer_type();
@@ -224,71 +228,25 @@ pub(super) fn build_global(
         names,
         source_name,
         source_span: Span::new(0, 0),
-        semantic_loops: false,
         b,
         module,
         helpers,
         annotations,
-        scoping,
         pointer,
         ctx,
         receiver,
         argv,
         argc,
-        captured,
-        arguments_references,
         closures,
-        scopes: ScopeStack::new(),
         return_block,
         handlers: Vec::new(),
-        control_targets: Vec::new(),
         generator: None,
         resume_blocks: Vec::new(),
         suspensions: HashMap::new(),
         terminated: false,
     };
     compiler.enter_frame();
-    for statement in statements {
-        if let oxc_ast::ast::Statement::ClassDeclaration(class) = statement {
-            let undefined = compiler.constant(Value::UNINITIALIZED);
-            compiler.global_access(class.id.as_ref().unwrap().name.as_str(), Some(undefined));
-        }
-    }
-    for statement in statements {
-        if let oxc_ast::ast::Statement::ClassDeclaration(class) = statement {
-            compiler.emit_class_declaration(class)?;
-        }
-        if let oxc_ast::ast::Statement::ExpressionStatement(expression) = statement {
-            compiler.emit_expression(&expression.expression)?;
-            compiler.clear_temporaries();
-        }
-        if let oxc_ast::ast::Statement::VariableDeclaration(declaration) = statement {
-            for declarator in &declaration.declarations {
-                let oxc_ast::ast::BindingPattern::BindingIdentifier(identifier) = &declarator.id
-                else {
-                    unreachable!()
-                };
-                if let Some(initializer) = &declarator.init {
-                    let value = compiler.emit_expression(initializer)?;
-                    if declaration.kind == oxc_ast::ast::VariableDeclarationKind::Var {
-                        compiler.global_access(identifier.name.as_str(), Some(value));
-                    } else {
-                        compiler.global_initialize(identifier.name.as_str(), value);
-                    }
-                    compiler.clear_temporaries();
-                } else if declaration.kind != oxc_ast::ast::VariableDeclarationKind::Var {
-                    let value = compiler.constant(Value::UNDEFINED);
-                    compiler.global_initialize(identifier.name.as_str(), value);
-                }
-            }
-        }
-    }
-    let undefined = compiler.constant(Value::UNDEFINED);
-    compiler.jump(return_block, &[BlockArg::Value(undefined)]);
-    compiler.switch(return_block);
-    let result = compiler.b.block_params(return_block)[0];
-    compiler.return_value(result);
-    Ok(())
+    compiler.emit_semantic_graph(graph, closure)
 }
 
 impl FunctionCompiler<'_, '_> {

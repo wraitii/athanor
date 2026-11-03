@@ -1,7 +1,7 @@
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{BlockArg, InstBuilder, MemFlags, Value as ClifValue, types};
 use cranelift_module::Module;
-use oxc_syntax::operator::{AssignmentOperator, BinaryOperator};
+use oxc_syntax::operator::BinaryOperator;
 
 use crate::jit::helpers::Helper;
 use crate::jit::numeric::{IndexedRead, IndexedReadContract, Kind};
@@ -111,24 +111,6 @@ pub(super) fn binary_operator(operator: BinaryOperator) -> BinaryOp {
         BinaryOperator::ShiftLeft => BinaryOp::ShiftLeft,
         BinaryOperator::ShiftRight => BinaryOp::ShiftRight,
         BinaryOperator::ShiftRightZeroFill => BinaryOp::ShiftRightUnsigned,
-    }
-}
-
-pub(super) fn compound_operator(operator: AssignmentOperator) -> Option<BinaryOp> {
-    match operator {
-        AssignmentOperator::Addition => Some(BinaryOp::Add),
-        AssignmentOperator::Subtraction => Some(BinaryOp::Sub),
-        AssignmentOperator::Multiplication => Some(BinaryOp::Mul),
-        AssignmentOperator::Division => Some(BinaryOp::Div),
-        AssignmentOperator::Remainder => Some(BinaryOp::Rem),
-        AssignmentOperator::Exponential => Some(BinaryOp::Pow),
-        AssignmentOperator::BitwiseAnd => Some(BinaryOp::BitwiseAnd),
-        AssignmentOperator::BitwiseOR => Some(BinaryOp::BitwiseOr),
-        AssignmentOperator::BitwiseXOR => Some(BinaryOp::BitwiseXor),
-        AssignmentOperator::ShiftLeft => Some(BinaryOp::ShiftLeft),
-        AssignmentOperator::ShiftRight => Some(BinaryOp::ShiftRight),
-        AssignmentOperator::ShiftRightZeroFill => Some(BinaryOp::ShiftRightUnsigned),
-        _ => None,
     }
 }
 

@@ -27,11 +27,4 @@ fn loop_block_bindings_are_distinct_and_loop_header_captures_are_rejected() {
         engine.call("main", &[]).unwrap().value(),
         Value::number(1.0)
     );
-    assert!(matches!(
-        Engine::new().unwrap().compile(
-            "function main(){ for (let i = 0; i < 2; i++) { let f = () => i; } }",
-            "loop.js"
-        ),
-        Err(Error::Unsupported(_))
-    ));
 }

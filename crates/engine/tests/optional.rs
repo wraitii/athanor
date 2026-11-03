@@ -1,9 +1,13 @@
 use js_engine::{Engine, EngineOptions, OptLevel, Value};
 
 fn check(source: &str) {
-    for opt_level in [OptLevel::None, OptLevel::Speed] {
+    for (opt_level, ssa_opt) in [OptLevel::None, OptLevel::Speed]
+        .into_iter()
+        .flat_map(|level| [false, true].map(|semantic| (level, semantic)))
+    {
         let mut engine = Engine::with_options(EngineOptions {
             opt_level,
+            ssa_opt,
             ..Default::default()
         })
         .unwrap();
@@ -57,9 +61,15 @@ fn chain_boundaries_and_non_nullish_errors_are_preserved() {
         "function main(){ return ({x:null})?.x.y; }",
         "function main(){ return a?.x; let a; }",
     ] {
-        let mut engine = Engine::new().unwrap();
-        engine.compile(source, "optional-errors.js").unwrap();
-        assert!(engine.call("main", &[]).is_err(), "{source}");
+        for ssa_opt in [false, true] {
+            let mut engine = Engine::with_options(EngineOptions {
+                ssa_opt,
+                ..Default::default()
+            })
+            .unwrap();
+            engine.compile(source, "optional-errors.js").unwrap();
+            assert!(engine.call("main", &[]).is_err(), "{source}");
+        }
     }
     check(
         r#"function main(){
@@ -69,4 +79,72 @@ fn chain_boundaries_and_non_nullish_errors_are_preserved() {
         return a===8 && b===9 && (null?.x ?? 4)===4;
     }"#,
     );
+}
+
+#[test]
+fn spread_calls_snapshot_values_and_preserve_order() {
+    check(
+        r#"function main() {
+        let a = [{x: 7}];
+        let o = {x: 5, f: function(a,b) { return this.x + a.x + b; }};
+        let saved = o;
+        let result = o.f(...a, (a[0] = {x: 9}, o = null, 2));
+        function C(a,b,c) { this.value = a*100+b*10+c; }
+        return result === 14 && saved.x === 5 && new C(1,...[2,3]).value === 123;
+    }"#,
+    );
+    for source in [
+        "function f(){} function main(){ return f(...1); }",
+        "function C(){} function main(){ return new C(...null); }",
+    ] {
+        for ssa_opt in [false, true] {
+            let mut engine = Engine::with_options(EngineOptions {
+                ssa_opt,
+                ..Default::default()
+            })
+            .unwrap();
+            engine.compile(source, "spread.js").unwrap();
+            assert!(engine.call("main", &[]).is_err(), "{source}");
+        }
+    }
+}
+
+#[test]
+fn remaining_expression_forms_preserve_results_and_order() {
+    check(
+        r#"function main() {
+        let n = 0; let a = [{x:7}, 2];
+        let b = [(n++, 0), ...a, (a[1] = 9), ...'é😀'];
+        let o = {[(n++, 'key')]: (n++, 42)};
+        let r = /ab+/gi;
+        return typeof missing === 'undefined' && typeof Math === 'object' &&
+            n === 3 && b.length === 6 && b[1].x === 7 && b[2] === 2 &&
+            b[3] === 9 && b[4] === 'é' && b[5] === '😀' && o.key === 42 &&
+            r.test('ABBB');
+    }"#,
+    );
+    for ssa_opt in [false, true] {
+        let mut engine = Engine::with_options(EngineOptions {
+            ssa_opt,
+            ..Default::default()
+        })
+        .unwrap();
+        engine
+            .compile("function main(){ return typeof x; let x = 1; }", "tdz.js")
+            .unwrap();
+        assert!(engine.call("main", &[]).is_err());
+        for source in [
+            "function main(){return [,...[]];}",
+            "function main(){return /(?<name>a)/;}",
+        ] {
+            assert!(
+                engine.compile(source, "unsupported.js").is_err(),
+                "{source}"
+            );
+        }
+        engine
+            .compile("function fail(){return [...null];}", "spread-error.js")
+            .unwrap();
+        assert!(engine.call("fail", &[]).is_err());
+    }
 }

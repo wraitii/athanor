@@ -1236,7 +1236,6 @@ fn array_destructuring_rejects_unsupported_forms() {
         "function main(){ const [x = 1] = []; }",
         "function main(){ const [...x] = []; }",
         "function main(){ const [[x]] = [[1]]; }",
-        "function main(){ for (let [x] = [1]; x; x--) { let f = () => x; } }",
     ] {
         let mut engine = Engine::new().unwrap();
         assert!(engine.compile(source, "test.js").is_err(), "{source}");

@@ -1,9 +1,13 @@
 use js_engine::{Engine, EngineOptions, OptLevel, Value};
 
 fn check(source: &str) {
-    for opt_level in [OptLevel::None, OptLevel::Speed] {
+    for (opt_level, ssa_opt) in [OptLevel::None, OptLevel::Speed]
+        .into_iter()
+        .flat_map(|level| [false, true].map(|semantic| (level, semantic)))
+    {
         let mut engine = Engine::with_options(EngineOptions {
             opt_level,
+            ssa_opt,
             ..Default::default()
         })
         .unwrap();
@@ -96,8 +100,52 @@ fn cases_share_lexical_scope_and_hoist_functions_and_vars() {
         "function main(){ switch(1){ case x: break; default: let x=2; } }",
         "function main(){ switch(1){ case 1: return x; case 2: let x=2; } }",
     ] {
-        let mut engine = Engine::new().unwrap();
-        engine.compile(source, "switch-tdz.js").unwrap();
+        for ssa_opt in [false, true] {
+            let mut engine = Engine::with_options(EngineOptions {
+                ssa_opt,
+                ..Default::default()
+            })
+            .unwrap();
+            engine.compile(source, "switch-tdz.js").unwrap();
+            assert!(engine.call("main", &[]).is_err());
+        }
+    }
+}
+
+#[test]
+fn do_while_for_in_and_testless_for() {
+    check(
+        r#"function main() {
+        let n = 0; let sum = 0;
+        do { n++; if (n < 3) continue; sum += n; } while (n < 4);
+        for (;;) { sum++; break; }
+        let closures = []; let count = 0;
+        for (let key in {a: 1, b: 2}) {
+            closures[count++] = () => key;
+        }
+        let keys = closures[0]() + closures[1]();
+        var last;
+        for (var key in {x: 1}) { last = key; }
+        return n === 4 && sum === 8 && count === 2 &&
+            (keys === 'ab' || keys === 'ba') && last === 'x' && key === 'x';
+    }"#,
+    );
+}
+
+#[test]
+fn for_in_errors_propagate() {
+    for ssa_opt in [false, true] {
+        let mut engine = Engine::with_options(EngineOptions {
+            ssa_opt,
+            ..Default::default()
+        })
+        .unwrap();
+        engine
+            .compile(
+                "function main() { for (let key in missing) {} }",
+                "for-in-error.js",
+            )
+            .unwrap();
         assert!(engine.call("main", &[]).is_err());
     }
 }

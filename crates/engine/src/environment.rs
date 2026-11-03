@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::Value;
@@ -14,6 +14,7 @@ pub struct Environment {
 struct EnvironmentData {
     bindings: HashMap<String, Value>,
     lexical: HashMap<String, (Value, bool)>,
+    readonly: HashSet<String>,
     parent: Option<Environment>,
     heap: Heap,
 }
@@ -25,6 +26,7 @@ impl Default for Environment {
             data: Rc::new(RefCell::new(EnvironmentData {
                 bindings: HashMap::new(),
                 lexical: HashMap::new(),
+                readonly: HashSet::new(),
                 parent: None,
                 heap: heap.clone(),
             })),
@@ -54,6 +56,7 @@ impl Environment {
             data: Rc::new(RefCell::new(EnvironmentData {
                 bindings: HashMap::new(),
                 lexical: HashMap::new(),
+                readonly: HashSet::new(),
                 parent: Some(self.clone()),
                 heap: self.heap.clone(),
             })),
@@ -70,6 +73,24 @@ impl Environment {
             }
             _ => false,
         }
+    }
+
+    pub(crate) fn define_readonly(&self, name: &str, value: Value) -> bool {
+        if !self.define(name, value) {
+            return false;
+        }
+        self.data.borrow_mut().readonly.insert(name.to_owned());
+        true
+    }
+
+    fn is_readonly(&self, name: &str) -> bool {
+        let data = self.data.borrow();
+        if data.bindings.contains_key(name) {
+            return data.readonly.contains(name);
+        }
+        data.parent
+            .as_ref()
+            .is_some_and(|parent| parent.is_readonly(name))
     }
 
     /// Returns an owning handle to the binding, if present.
@@ -144,6 +165,8 @@ impl Environment {
         drop(data);
         if self.set(name, value) {
             Ok(())
+        } else if self.is_readonly(name) {
+            Err("is constant")
         } else {
             Err("is unknown")
         }
@@ -151,6 +174,9 @@ impl Environment {
 
     pub fn set(&self, name: &str, value: Value) -> bool {
         let mut data = self.data.borrow_mut();
+        if data.readonly.contains(name) {
+            return false;
+        }
         if let Some(binding) = data.bindings.get_mut(name) {
             if !self.heap.retain(value) {
                 return false;

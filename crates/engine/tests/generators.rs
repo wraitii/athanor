@@ -1,9 +1,13 @@
 use js_engine::{Engine, EngineOptions, Error, OptLevel, Value};
 
 fn check(source: &str, expected: Value) {
-    for opt_level in [OptLevel::None, OptLevel::Speed] {
+    for (opt_level, ssa_opt) in [OptLevel::None, OptLevel::Speed]
+        .into_iter()
+        .flat_map(|level| [false, true].map(|semantic| (level, semantic)))
+    {
         let mut engine = Engine::with_options(EngineOptions {
             opt_level,
+            ssa_opt,
             ..Default::default()
         })
         .unwrap();
@@ -73,11 +77,17 @@ fn unsupported_generator_forms_are_rejected() {
         "function* gen() { yield* []; }",
         "async function* gen() { yield 1; }",
     ] {
-        let mut engine = Engine::new().unwrap();
-        assert!(matches!(
-            engine.compile(source, "unsupported.js"),
-            Err(Error::Unsupported(_))
-        ));
+        for ssa_opt in [false, true] {
+            let mut engine = Engine::with_options(EngineOptions {
+                ssa_opt,
+                ..Default::default()
+            })
+            .unwrap();
+            assert!(matches!(
+                engine.compile(source, "unsupported.js"),
+                Err(Error::Unsupported(_))
+            ));
+        }
     }
 }
 
@@ -88,16 +98,22 @@ fn generator_runtime_restrictions_fail_without_corrupting_the_engine() {
         "function* gen() { yield 1; } function main() { gen().next(42); }",
         "var g; function* gen() { g.next(); } function main() { g = gen(); g.next(); }",
     ] {
-        let mut engine = Engine::new().unwrap();
-        engine.compile(source, "invalid-generator.js").unwrap();
-        assert!(matches!(engine.call("main", &[]), Err(Error::Runtime(_))));
-        engine
-            .compile("function good() { return 42; }", "good.js")
+        for ssa_opt in [false, true] {
+            let mut engine = Engine::with_options(EngineOptions {
+                ssa_opt,
+                ..Default::default()
+            })
             .unwrap();
-        assert_eq!(
-            engine.call("good", &[]).unwrap().value(),
-            Value::number(42.0)
-        );
+            engine.compile(source, "invalid-generator.js").unwrap();
+            assert!(matches!(engine.call("main", &[]), Err(Error::Runtime(_))));
+            engine
+                .compile("function good() { return 42; }", "good.js")
+                .unwrap();
+            assert_eq!(
+                engine.call("good", &[]).unwrap().value(),
+                Value::number(42.0)
+            );
+        }
     }
 }
 
@@ -123,4 +139,25 @@ fn yielded_closures_survive_generator_completion() {
         "function* gen() { let a = [42]; yield () => a[0]; return 0; } function main() { let g = gen(); let f = g.next().value; g.next(); g = undefined; return f(); }",
         Value::number(42.0),
     );
+}
+
+#[test]
+fn generator_resume_preserves_tdz_and_arguments() {
+    check(
+        "function* f(x){ yield 1; return x ? 42 : 0; } function main(){ let g=f(true); g.next(); return g.next().value; }",
+        Value::number(42.0),
+    );
+    check(
+        "function* f(){ yield arguments[0]; return arguments.length; } function main(){ let g=f(5,6); return g.next().value*10+g.next().value; }",
+        Value::number(52.0),
+    );
+    for ssa_opt in [false, true] {
+        let mut engine = Engine::with_options(EngineOptions {
+            ssa_opt,
+            ..Default::default()
+        })
+        .unwrap();
+        engine.compile("function* f(){ yield 1; return x; let x=2; } function main(){ let g=f(); g.next(); return g.next(); }", "generator-tdz.js").unwrap();
+        assert!(engine.call("main", &[]).is_err());
+    }
 }

@@ -28,17 +28,15 @@ interspersed whenever it changes.
 
 Use `--compile --eval SOURCE` or `--compile SCRIPT` to print Cranelift IR
 and a per-function helper effect and reentry admission report without executing
-the source. Recognized semantic loops are also printed with their fast-path
-guards and fallback. The report identifies unresolved calls and current runtime assumptions;
+the source. Add `--semantic-ir` to print the semantic graph, inferred types,
+and optimization notes. The report identifies unresolved calls and current runtime assumptions;
 its admission status does not establish purity or analyze raw memory effects.
 Add `--ast` for the analyzed Oxc AST and generator resume plans, or `--asm` for
 Cranelift machine-instruction output. Use `--no-ir` to omit IR while retaining
-the effect report. The compiler emits IR directly from the AST rather than
-constructing a separate lowered AST. Eligible functions get a guarded Math fast
-path that resolves each distinct native target once per invocation and falls
-back to the original body on mismatch. A nonthrowing probe can also cache one
-repeated receiver property for the fast body. `JS_JIT_SSA=0` disables these
-specializations and numeric SSA simplification.
+the effect report. The compiler lowers the AST to a semantic graph before
+emitting Cranelift IR. Eligible functions get a guarded Math fast path that
+checks native identities once per invocation and falls back on mismatch.
+`JS_JIT_SSA=0` disables semantic graph optimization and CLIF SSA optimization.
 Both runners provide deterministic `Math.random()` without a Boost dependency.
 The shared bootstrap calls `hostSeedRandom(settings.Seed)` before loading scripts;
 a missing seed defaults to zero. The generator matches the game's rand48 sequence.
