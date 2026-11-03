@@ -50,22 +50,6 @@ fn transitive_captures_preserve_shadowed_binding_identity() {
 }
 
 #[test]
-fn foreign_closures_are_rejected() {
-    let mut first = Engine::new().unwrap();
-    first
-        .compile("function make(){ return () => 3; }", "first.js")
-        .unwrap();
-    let closure = first.call("make", &[]).unwrap();
-    let mut second = Engine::new().unwrap();
-    second
-        .compile("function invoke(f){ return f(); }", "second.js")
-        .unwrap();
-    assert!(second.call("invoke", &[closure.value()]).is_err());
-    drop(first);
-    assert!(second.call("invoke", &[closure.value()]).is_err());
-}
-
-#[test]
 fn closures_observe_origin_globals_across_compilation() {
     let mut engine = Engine::new().unwrap();
     engine

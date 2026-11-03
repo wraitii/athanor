@@ -467,6 +467,7 @@ dependencies = [
  "oxc_span",
  "oxc_syntax",
  "regress",
+ "rustc-hash",
  "serde_json",
 ]
 

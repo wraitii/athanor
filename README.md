@@ -19,8 +19,12 @@ The runner installs `hostReadFile`, `hostListFiles`, and `hostEvaluateSource`,
 and provides `print` plus a basic `console.log`. Source evaluation shares the
 active engine, including nested library loads.
 Set `JS_JIT_JITDUMP=1` to write a `jit-<pid>-<timestamp>-js.dump` file to the
-temporary directory. `samply` and `perf` can consume it, with generated code
-attributed to JavaScript source lines.
+temporary directory. `samply` and `perf` can consume the dump, and debug
+information points at the original JavaScript source so they show JavaScript
+lines alongside the assembly. Set `JS_JIT_JITDUMP=2` to also write one `.jsir`
+listing per evaluated source file; debug information then points at these
+listings, which preserve the JavaScript line numbers and add the Cranelift IR
+for each line beneath it.
 Both runners provide deterministic `Math.random()` without a Boost dependency.
 The shared bootstrap calls `hostSeedRandom(settings.Seed)` before loading scripts;
 a missing seed defaults to zero. The generator matches the game's rand48 sequence.

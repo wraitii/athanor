@@ -598,6 +598,105 @@ fn array_flat_map_flattens_returned_arrays_one_level() {
 }
 
 #[test]
+fn array_for_each_visits_present_values_and_returns_undefined() {
+    let source = r#"function main() {
+        let a = [1, 2, 3];
+        let seen = [];
+        let returned = a.forEach((value, index, array) => {
+            seen.push(value + index);
+            return {ignored: true};
+        });
+        let holes = [1, 2, 3].map((value, index, array) => {
+            if (index === 0) array.length = 1;
+            return value;
+        });
+        let holeCalls = 0;
+        let holeResult = holes.forEach(() => { holeCalls++; });
+        let truncatedCalls = 0;
+        [1, 2, 3].forEach((value, index, array) => {
+            truncatedCalls++;
+            if (index === 0) array.length = 1;
+        });
+        return returned === undefined && seen.join() === "1,3,5" &&
+            holeCalls === 1 && holeResult === undefined && truncatedCalls === 1 &&
+            a.forEach === a.forEach && "forEach" in a;
+    }"#;
+    assert_eq!(run(source).unwrap(), Value::TRUE);
+    for source in [
+        "function main(){ return [1].forEach(1); }",
+        "function main(){ return [1].forEach(value => value, {}); }",
+        "function main(){ let forEach = [].forEach; return forEach(() => {}); }",
+        "function main(){ return [1].forEach(() => { throw 5; }); }",
+    ] {
+        assert!(run(source).is_err(), "{source}");
+    }
+}
+
+#[test]
+fn array_at_reads_relative_indices_and_preserves_holes() {
+    let source = r#"function main() {
+        let a = [1, 2, 3];
+        let holes = [1, 2, 3].map((value, index, array) => {
+            if (index === 0) array.length = 1;
+            return value;
+        });
+        return a.at(0) === 1 && a.at(1) === 2 && a.at(-1) === 3 &&
+            a.at() === 1 && a.at(9) === undefined && a.at(-9) === undefined &&
+            a.at(1 / 0) === undefined && a.at(-1 / 0) === undefined &&
+            holes.at(0) === 1 && holes.at(1) === undefined && holes.at(-1) === undefined &&
+            a.at === a.at && "at" in a;
+    }"#;
+    assert_eq!(run(source).unwrap(), Value::TRUE);
+    for source in [
+        "function main(){ return [1].at('0'); }",
+        "function main(){ let at = [].at; return at(0); }",
+    ] {
+        assert!(run(source).is_err(), "{source}");
+    }
+}
+
+#[test]
+fn array_find_visits_holes_and_short_circuits() {
+    let source = r#"function main() {
+        let a = [1, 2, 3, 4];
+        let calls = 0;
+        let found = a.find((value, index, array) => {
+            calls++;
+            return array === a && value === index + 1 && index === 2;
+        });
+        let object = {x: 7};
+        let objectFound = [object].find(value => value === object);
+        let none = a.find(value => value > 9);
+        let zero = [0, 1].find(value => value === 0);
+        let holes = [1, 2, 3, 4].map((value, index, array) => {
+            if (index === 0) array.length = 1;
+            return value;
+        });
+        let holeCalls = 0;
+        let holeFound = holes.find(value => { holeCalls++; return value === undefined; });
+        let truncatedCalls = 0;
+        let truncated = [1, 2, 3].find((value, index, array) => {
+            truncatedCalls++;
+            if (index === 0) array.length = 1;
+            return index === 2;
+        });
+        return found === 3 && calls === 3 && objectFound === object &&
+            none === undefined && zero === 0 && holeCalls === 2 &&
+            holeFound === undefined && truncatedCalls === 3 &&
+            [].find(() => true) === undefined && a.find === a.find && "find" in a;
+    }"#;
+    assert_eq!(run(source).unwrap(), Value::TRUE);
+    for source in [
+        "function main(){ return [1].find(1); }",
+        "function main(){ return [1].find(value => value, {}); }",
+        "function main(){ let find = [].find; return find(() => true); }",
+        "function main(){ return [1].find(() => { throw 5; }); }",
+    ] {
+        assert!(run(source).is_err(), "{source}");
+    }
+}
+
+#[test]
 fn array_sort_is_stable_and_preserves_undefined_and_holes() {
     let source = r#"function main() {
         let a = [3, 1, 2];

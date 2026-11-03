@@ -5,7 +5,7 @@ use oxc_syntax::operator::{AssignmentOperator, BinaryOperator};
 
 use crate::jit::helpers::Helper;
 use crate::value::Value;
-use crate::value::{TAG_FIRST, TAG_SHIFT, TAG_SPAN};
+use crate::value::{TAG_FIRST, TAG_SHIFT, TAG_SPAN, TAG_STRING};
 
 use super::FunctionCompiler;
 
@@ -145,10 +145,59 @@ impl FunctionCompiler<'_, '_> {
     }
 
     pub(super) fn truthy(&mut self, value: ClifValue) -> ClifValue {
-        let truth = self.call_helper(Helper::Truthy, &[value]);
-        self.b
+        let number = self.is_number(value);
+        let number_block = self.b.create_block();
+        let other_block = self.b.create_block();
+        let string_block = self.b.create_block();
+        let primitive_block = self.b.create_block();
+        let done = self.b.create_block();
+        self.b.append_block_param(done, types::I8);
+        self.brif(number, number_block, &[], other_block, &[]);
+
+        self.switch(number_block);
+        let float = self.b.ins().bitcast(types::F64, MemFlags::new(), value);
+        let zero = self.b.ins().f64const(0.0);
+        let negative = self.b.ins().fcmp(FloatCC::LessThan, float, zero);
+        let positive = self.b.ins().fcmp(FloatCC::GreaterThan, float, zero);
+        let truth = self.b.ins().bor(negative, positive);
+        self.jump(done, &[BlockArg::Value(truth)]);
+
+        self.switch(other_block);
+        let tag = self.b.ins().ushr_imm(value, TAG_SHIFT as i64);
+        let is_string = self
+            .b
             .ins()
-            .icmp_imm(IntCC::Equal, truth, Value::TRUE.bits() as i64)
+            .icmp_imm(IntCC::Equal, tag, (TAG_STRING >> TAG_SHIFT) as i64);
+        self.brif(is_string, string_block, &[], primitive_block, &[]);
+
+        self.switch(string_block);
+        let truth = self.call_helper(Helper::Truthy, &[value]);
+        let truth = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, truth, Value::TRUE.bits() as i64);
+        self.jump(done, &[BlockArg::Value(truth)]);
+
+        self.switch(primitive_block);
+        let undefined = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, value, Value::UNDEFINED.bits() as i64);
+        let null = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, value, Value::NULL.bits() as i64);
+        let false_value = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, value, Value::FALSE.bits() as i64);
+        let falsy = self.b.ins().bor(undefined, null);
+        let falsy = self.b.ins().bor(falsy, false_value);
+        let truth = self.b.ins().icmp_imm(IntCC::Equal, falsy, 0);
+        self.jump(done, &[BlockArg::Value(truth)]);
+
+        self.switch(done);
+        self.b.block_params(done)[0]
     }
 
     pub(super) fn is_nullish(&mut self, value: ClifValue) -> ClifValue {

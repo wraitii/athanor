@@ -7,8 +7,8 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module, default_libcall_names};
 use oxc_ast::AstKind;
 use oxc_ast::ast::{
-    BindingPattern, Expression, FormalParameters, Function, Program, Statement,
-    VariableDeclarationKind,
+    AssignmentTarget, BindingPattern, Expression, FormalParameters, Function, Program, PropertyKey,
+    Statement, VariableDeclarationKind,
 };
 use oxc_semantic::{AstNodes, Scoping};
 use oxc_span::GetSpan;
@@ -35,6 +35,7 @@ pub(crate) struct Compiler {
     functions: HashMap<String, FuncId>,
     function_names: HashMap<FuncId, String>,
     dump: Option<jitdump::Writer>,
+    dump_ir: bool,
     next_id: u64,
     context: Context,
     builder_context: FunctionBuilderContext,
@@ -68,6 +69,8 @@ impl Compiler {
         }
 
         let context = module.make_context();
+        let dump = options.jitdump.then(jitdump::Writer::new).flatten();
+        let dump_ir = dump.is_some() && options.jitdump_ir;
         Ok(Self {
             names: Vec::new(),
             source_name: (0, 0),
@@ -76,7 +79,8 @@ impl Compiler {
             helpers: helper_ids,
             functions: HashMap::new(),
             function_names: HashMap::new(),
-            dump: options.jitdump.then(jitdump::Writer::new).flatten(),
+            dump,
+            dump_ir,
             next_id: 0,
             context,
             builder_context: FunctionBuilderContext::new(),
@@ -90,6 +94,12 @@ impl Compiler {
             .map_err(|error| Error::Compile(error.to_string()))?;
         self.function_names.insert(id, name.to_string());
         Ok(id)
+    }
+
+    fn declare_js(&mut self, label: &str, line: u32) -> Result<FuncId, Error> {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.declare(&format!("{label}@{line}#{id}"))
     }
 
     pub(crate) fn compile_program<'a>(
@@ -185,9 +195,8 @@ impl Compiler {
                     format!("duplicate function `{name}`"),
                 ));
             }
-            let internal = format!("jsfn_{}_{}", self.next_id, name);
-            self.next_id += 1;
-            let id = self.declare(&internal)?;
+            let line = line_at(&lines, function.span.start);
+            let id = self.declare_js(&name, line)?;
             ids.insert(name.clone(), id);
             ordered.push((name, function));
         }
@@ -242,9 +251,13 @@ impl Compiler {
                 _ => continue,
             };
             validate_params(params, span, generator)?;
-            let internal = format!("jsclosure_{}", self.next_id);
-            self.next_id += 1;
-            let id = self.declare(&internal)?;
+            let self_name = match node.kind() {
+                AstKind::Function(function) => function.id.as_ref().map(|id| id.name.as_str()),
+                _ => None,
+            };
+            let label = function_label(nodes, node.id(), self_name);
+            let line = line_at(&lines, span.start);
+            let id = self.declare_js(&label, line)?;
             let captures = analysis
                 .functions
                 .get(&span.start)
@@ -255,7 +268,9 @@ impl Compiler {
                 .get(&span.start)
                 .is_some_and(|function| function.lexical_this);
             closures.insert(span.start, (id, captures, lexical_this));
-            nested.push((id, span, params, statements, expression, generator));
+            nested.push((
+                id, span, params, statements, expression, generator, label, line,
+            ));
         }
         let mut pending = Vec::new();
         for node in nodes.iter() {
@@ -277,9 +292,9 @@ impl Compiler {
                     None,
                     &builder,
                 );
-                let internal = format!("jsclass_{}", self.next_id);
-                self.next_id += 1;
-                let id = self.declare(&internal)?;
+                let label = format!("{}.constructor", class.id.as_ref().unwrap().name.as_str());
+                let line = line_at(&lines, class.span.start);
+                let id = self.declare_js(&label, line)?;
                 let (code, _) = self.compile_callable(
                     &params,
                     &[],
@@ -291,6 +306,8 @@ impl Compiler {
                     &closures,
                     scoping,
                     false,
+                    &label,
+                    line,
                 )?;
                 closures.insert(class.span.start, (id, Vec::new(), false));
                 pending.push((id, code));
@@ -298,6 +315,7 @@ impl Compiler {
         }
 
         for (name, function) in &ordered {
+            let line = line_at(&lines, function.span.start);
             let (code, resume) = self.compile_callable(
                 &function.params,
                 &function.body.as_ref().unwrap().statements,
@@ -312,13 +330,15 @@ impl Compiler {
                 &closures,
                 scoping,
                 function.generator,
+                name,
+                line,
             )?;
             if let Some(resume) = resume {
                 pending.push(resume);
             }
             pending.push((ids[name], code));
         }
-        for (id, span, params, statements, expression, generator) in nested {
+        for (id, span, params, statements, expression, generator, label, line) in nested {
             let captures = &closures[&span.start].1;
             let (code, resume) = self.compile_callable(
                 params,
@@ -331,6 +351,8 @@ impl Compiler {
                 &closures,
                 scoping,
                 generator,
+                &label,
+                line,
             )?;
             if let Some(resume) = resume {
                 pending.push(resume);
@@ -349,9 +371,13 @@ impl Compiler {
         }) {
             None
         } else {
-            let internal = format!("jsinit_{}", self.next_id);
-            self.next_id += 1;
-            let id = self.declare(&internal)?;
+            let line = line_at(&lines, program.span.start);
+            let module = std::path::Path::new(source_path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("module");
+            let label = format!("{module}.module");
+            let id = self.declare_js(&label, line)?;
             self.context.clear();
             self.context.func.signature = self.signature.clone();
             {
@@ -385,9 +411,22 @@ impl Compiler {
         };
 
         let mut dumped = Vec::new();
+        let mut annotations = BTreeMap::new();
         for (id, code) in pending {
             self.context.clear();
             self.context.func = code;
+            let name = self
+                .function_names
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| format!("jsfn_{}", id.as_u32()));
+            if self.dump_ir {
+                for (line, instructions) in ir_lines(&self.context.func, &lines) {
+                    let entries = annotations.entry(line).or_insert_with(Vec::new);
+                    entries.push(format!("[{name}]"));
+                    entries.extend(instructions);
+                }
+            }
             self.module
                 .define_function(id, &mut self.context)
                 .map_err(|error| Error::Compile(error.to_string()))?;
@@ -407,22 +446,44 @@ impl Compiler {
                     locations.insert(location.start, line);
                 }
                 locations.insert(0, default_line.unwrap_or(1));
-                let name = self
-                    .function_names
-                    .get(&id)
-                    .cloned()
-                    .unwrap_or_else(|| format!("jsfn_{}", id.as_u32()));
                 dumped.push((id, name, size, locations.into_iter().collect::<Vec<_>>()));
             }
         }
         self.module
             .finalize_definitions()
             .map_err(|error| Error::Compile(error.to_string()))?;
+        let listing = if self.dump_ir {
+            if let Some(dump) = self.dump.as_mut() {
+                match dump.listing(source, &annotations) {
+                    Ok(listing) => Some(listing),
+                    Err(error) => {
+                        eprintln!("js jit: source listing write failed: {error}");
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         if let Some(dump) = self.dump.as_mut() {
             for (id, name, size, locations) in dumped {
                 let code = self.module.get_finalized_function(id);
                 let bytes = unsafe { std::slice::from_raw_parts(code, size) };
-                dump.record(&name, source_path, &locations, bytes);
+                if let Some((path, mapping)) = &listing {
+                    let filename = path.to_str().unwrap_or(source_path);
+                    let locations = locations
+                        .iter()
+                        .map(|&(offset, line)| {
+                            let line = mapping.get(line as usize - 1).copied().unwrap_or(1);
+                            (offset, line)
+                        })
+                        .collect::<Vec<_>>();
+                    dump.record(&name, filename, &locations, bytes);
+                } else {
+                    dump.record(&name, source_path, &locations, bytes);
+                }
             }
         }
 
@@ -464,6 +525,8 @@ impl Compiler {
         closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
         scoping: &Scoping,
         generator: bool,
+        label: &str,
+        line: u32,
     ) -> Result<
         (
             cranelift_codegen::ir::Function,
@@ -489,9 +552,8 @@ impl Compiler {
             ));
         }
         let plan = super::generator::ResumePlan::lower(statements)?;
-        let internal = format!("jsresume_{}", self.next_id);
-        self.next_id += 1;
-        let id = self.declare(&internal)?;
+        let internal = format!("{label}.resume");
+        let id = self.declare_js(&internal, line)?;
         let resume = self.compile_function(
             params,
             statements,
@@ -576,8 +638,107 @@ fn line_starts(source: &str) -> Vec<u32> {
     starts
 }
 
+fn function_label(
+    nodes: &AstNodes<'_>,
+    node_id: oxc_semantic::NodeId,
+    name: Option<&str>,
+) -> String {
+    let mut parts = Vec::new();
+    if let Some(name) = name {
+        parts.push(name.to_string());
+    }
+    for ancestor in nodes.ancestor_kinds(node_id) {
+        match ancestor {
+            AstKind::VariableDeclarator(declarator) if parts.is_empty() => {
+                if let BindingPattern::BindingIdentifier(identifier) = &declarator.id {
+                    parts.push(identifier.name.to_string());
+                }
+            }
+            AstKind::AssignmentExpression(assignment) if parts.is_empty() => {
+                if let Some(name) = assignment_target_label(&assignment.left) {
+                    parts.push(name);
+                }
+            }
+            AstKind::ObjectProperty(property) if parts.is_empty() => {
+                if let PropertyKey::StaticIdentifier(key) = &property.key {
+                    parts.push(key.name.to_string());
+                }
+            }
+            AstKind::MethodDefinition(method) => {
+                if let PropertyKey::StaticIdentifier(key) = &method.key {
+                    parts.push(key.name.to_string());
+                }
+            }
+            AstKind::Function(function) => {
+                if let Some(identifier) = &function.id {
+                    parts.push(identifier.name.to_string());
+                }
+            }
+            AstKind::Class(class) => {
+                if let Some(identifier) = &class.id {
+                    parts.push(identifier.name.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    parts.reverse();
+    if parts.is_empty() {
+        parts.push("anonymous".into());
+    }
+    parts.join(".")
+}
+
+fn expression_label(expression: &Expression<'_>) -> Option<String> {
+    match expression {
+        Expression::Identifier(identifier) => Some(identifier.name.to_string()),
+        Expression::ThisExpression(_) => Some("this".into()),
+        Expression::StaticMemberExpression(member) => Some(format!(
+            "{}.{}",
+            expression_label(&member.object)?,
+            member.property.name
+        )),
+        _ => None,
+    }
+}
+
+fn assignment_target_label(target: &AssignmentTarget<'_>) -> Option<String> {
+    match target {
+        AssignmentTarget::AssignmentTargetIdentifier(identifier) => {
+            Some(identifier.name.to_string())
+        }
+        AssignmentTarget::StaticMemberExpression(member) => Some(format!(
+            "{}.{}",
+            expression_label(&member.object)?,
+            member.property.name
+        )),
+        _ => None,
+    }
+}
+
 fn line_at(starts: &[u32], offset: u32) -> u32 {
     starts.partition_point(|&start| start <= offset) as u32
+}
+
+fn ir_lines(
+    function: &cranelift_codegen::ir::Function,
+    starts: &[u32],
+) -> BTreeMap<u32, Vec<String>> {
+    let mut lines = BTreeMap::new();
+    for block in function.layout.blocks() {
+        for inst in function.layout.block_insts(block) {
+            let location = function.srcloc(inst);
+            if location.is_default() {
+                continue;
+            }
+            let line = line_at(starts, location.bits());
+            lines
+                .entry(line)
+                .or_insert_with(Vec::new)
+                .push(function.dfg.display_inst(inst).to_string());
+        }
+    }
+    lines
 }
 
 fn validate_function(function: &Function<'_>) -> Result<String, Error> {

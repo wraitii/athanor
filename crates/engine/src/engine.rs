@@ -36,13 +36,17 @@ impl OptLevel {
 pub struct EngineOptions {
     pub opt_level: OptLevel,
     pub jitdump: bool,
+    pub jitdump_ir: bool,
 }
 
 impl Default for EngineOptions {
     fn default() -> Self {
+        let jitdump = std::env::var("JS_JIT_JITDUMP").ok();
+        let jitdump = jitdump.as_deref();
         Self {
             opt_level: OptLevel::default(),
-            jitdump: std::env::var("JS_JIT_JITDUMP").as_deref() == Ok("1"),
+            jitdump: matches!(jitdump, Some("1" | "2")),
+            jitdump_ir: jitdump == Some("2"),
         }
     }
 }
@@ -415,9 +419,10 @@ impl Engine {
     }
 
     /// Calls a function with borrowed arguments and returns an owning handle.
+    /// Heap arguments must be live tokens from this engine.
     pub fn call(&self, name: &str, args: &[Value]) -> Result<OwnedValue, Error> {
         if !args.iter().all(|value| self.global.heap().valid(*value)) {
-            return Err(Error::Runtime("invalid or foreign heap value".into()));
+            return Err(Error::Runtime("invalid heap value".into()));
         }
         let callable = self
             .global

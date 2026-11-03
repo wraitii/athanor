@@ -11,7 +11,7 @@ use oxc_syntax::symbol::SymbolId;
 
 use crate::error::Error;
 use crate::jit::helpers::Helper;
-use crate::value::Value;
+use crate::value::{TAG_OBJECT, TAG_SHIFT, Value};
 
 use super::FunctionCompiler;
 
@@ -203,9 +203,31 @@ impl FunctionCompiler<'_, '_> {
             self.check_error();
             return result;
         }
-        let value = self.call_helper(Helper::TempRetain, &[value]);
+        let tag = self.b.ins().ushr_imm(value, TAG_SHIFT as i64);
+        let offset = self
+            .b
+            .ins()
+            .iadd_imm(tag, -((TAG_OBJECT >> TAG_SHIFT) as i64));
+        let needs_helper = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::UnsignedLessThanOrEqual, offset, 2);
+        let fast = self.b.create_block();
+        let slow = self.b.create_block();
+        let done = self.b.create_block();
+        self.b.append_block_param(done, types::I64);
+        self.brif(needs_helper, slow, &[], fast, &[]);
+
+        self.switch(fast);
+        self.jump(done, &[BlockArg::Value(value)]);
+
+        self.switch(slow);
+        let retained = self.call_helper(Helper::TempRetain, &[value]);
         self.check_error();
-        value
+        self.jump(done, &[BlockArg::Value(retained)]);
+
+        self.switch(done);
+        self.b.block_params(done)[0]
     }
 
     pub(super) fn store_local(&mut self, variable: Variable, value: ClifValue) {

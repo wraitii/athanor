@@ -1,5 +1,7 @@
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
+use std::path::PathBuf;
 
 const JITDUMP_MAGIC: u32 = 0x4a69_5444;
 const JITDUMP_VERSION: u32 = 1;
@@ -70,7 +72,31 @@ mod sys {
 pub(super) struct Writer {
     pid: u32,
     file: File,
+    path: PathBuf,
     next_index: u64,
+    next_listing: u64,
+}
+
+fn write_listing(
+    source: &str,
+    annotations: &BTreeMap<u32, Vec<String>>,
+    out: &mut impl Write,
+) -> io::Result<Vec<u32>> {
+    let mut mapping = Vec::new();
+    let mut next_line = 1;
+    for (index, line) in source.split('\n').enumerate() {
+        let line_number = index as u32 + 1;
+        mapping.push(next_line);
+        writeln!(out, "{line_number:>5} | {line}")?;
+        next_line += 1;
+        if let Some(entries) = annotations.get(&line_number) {
+            for entry in entries {
+                writeln!(out, "      | IR: {entry}")?;
+                next_line += 1;
+            }
+        }
+    }
+    Ok(mapping)
 }
 
 fn push_u32(out: &mut Vec<u8>, value: u32) {
@@ -79,6 +105,17 @@ fn push_u32(out: &mut Vec<u8>, value: u32) {
 
 fn push_u64(out: &mut Vec<u8>, value: u64) {
     out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn absolute_filename(filename: &str) -> String {
+    let path = std::path::Path::new(filename);
+    if path.is_absolute() {
+        return filename.to_string();
+    }
+    std::path::absolute(path)
+        .ok()
+        .and_then(|path| path.to_str().map(str::to_owned))
+        .unwrap_or_else(|| filename.to_string())
 }
 
 impl Writer {
@@ -118,18 +155,37 @@ impl Writer {
         Ok(Self {
             pid,
             file,
+            path,
             next_index: 0,
+            next_listing: 0,
         })
+    }
+
+    pub(super) fn listing(
+        &mut self,
+        source: &str,
+        annotations: &BTreeMap<u32, Vec<String>>,
+    ) -> io::Result<(PathBuf, Vec<u32>)> {
+        let path = self
+            .path
+            .with_extension(format!("{}.jsir", self.next_listing));
+        self.next_listing += 1;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        let mapping = write_listing(source, annotations, &mut file)?;
+        Ok((path, mapping))
     }
 
     pub(super) fn record(
         &mut self,
         name: &str,
-        source: &str,
+        filename: &str,
         locations: &[(u32, u32)],
         code: &[u8],
     ) {
-        if let Err(error) = self.try_record(name, source, locations, code) {
+        if let Err(error) = self.try_record(name, filename, locations, code) {
             eprintln!("js jit: jitdump write failed: {error}");
         }
     }
@@ -137,15 +193,17 @@ impl Writer {
     fn try_record(
         &mut self,
         name: &str,
-        source: &str,
+        filename: &str,
         locations: &[(u32, u32)],
         code: &[u8],
     ) -> io::Result<()> {
+        let filename = absolute_filename(filename);
+        let filename = filename.as_str();
         let timestamp = sys::clock_ns();
         let address = code.as_ptr() as u64;
 
         let debug_size =
-            DEBUG_INFO_HEADER_SIZE + locations.len() * (DEBUG_ENTRY_SIZE + source.len() + 1);
+            DEBUG_INFO_HEADER_SIZE + locations.len() * (DEBUG_ENTRY_SIZE + filename.len() + 1);
         let mut debug = Vec::with_capacity(debug_size);
         push_u32(&mut debug, CODE_DEBUG_INFO);
         push_u32(&mut debug, debug_size as u32);
@@ -156,7 +214,7 @@ impl Writer {
             push_u64(&mut debug, address + u64::from(offset));
             push_u32(&mut debug, line);
             push_u32(&mut debug, 0);
-            debug.extend_from_slice(source.as_bytes());
+            debug.extend_from_slice(filename.as_bytes());
             debug.push(0);
         }
         self.file.write_all(&debug)?;
@@ -178,5 +236,30 @@ impl Writer {
         self.file.write_all(&record)?;
         self.next_index += 1;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_filenames_are_absolute() {
+        let relative = absolute_filename("relative.js");
+        assert!(std::path::Path::new(&relative).is_absolute());
+        assert_eq!(absolute_filename(&relative), relative);
+    }
+
+    #[test]
+    fn listing_preserves_source_lines_and_maps_annotations() {
+        let mut annotations = BTreeMap::new();
+        annotations.insert(2, vec!["[jsfn_0]".into(), "v0 = iconst.i64 1".into()]);
+        let mut listing = Vec::new();
+        let mapping = write_listing("let a;\nlet b;\n", &annotations, &mut listing).unwrap();
+        assert_eq!(mapping, vec![1, 2, 5]);
+        assert_eq!(
+            String::from_utf8(listing).unwrap(),
+            "    1 | let a;\n    2 | let b;\n      | IR: [jsfn_0]\n      | IR: v0 = iconst.i64 1\n    3 | \n"
+        );
     }
 }

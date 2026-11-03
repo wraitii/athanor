@@ -482,20 +482,15 @@ fn host_roots_and_globals_keep_arrays_alive() {
 }
 
 #[test]
-fn arrays_reject_foreign_and_stale_host_values() {
-    let mut first = Engine::new().unwrap();
-    let mut second = Engine::new().unwrap();
-    first
-        .compile("function make() { return [1]; }", "first.js")
+fn arrays_reject_stale_host_values_before_slot_reuse() {
+    let mut engine = Engine::new().unwrap();
+    engine
+        .compile("function make() { return [1]; }", "roots.js")
         .unwrap();
-    second
-        .compile("function id(x) { return x; }", "second.js")
-        .unwrap();
-    let root = first.call("make", &[]).unwrap();
+    let root = engine.call("make", &[]).unwrap();
     let raw = root.value();
-    assert!(second.call("id", &[raw]).is_err());
     drop(root);
-    assert!(first.call("make", &[raw]).is_err());
+    assert!(engine.call("make", &[raw]).is_err());
 }
 
 #[test]

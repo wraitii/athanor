@@ -508,6 +508,33 @@ pub(super) fn call(
         heap.truncate(receiver, length - 1);
         return value;
     }
+    if function == ArrayAt {
+        let index = if arg(0).is_undefined() {
+            0.0
+        } else if let Some(number) = arg(0).as_number() {
+            if number.is_nan() { 0.0 } else { number.trunc() }
+        } else {
+            return fail(context, "at index must be a number or undefined");
+        };
+        if !index.is_finite() {
+            return Value::UNDEFINED;
+        }
+        let index = if index < 0.0 {
+            length as f64 + index
+        } else {
+            index
+        };
+        if index < 0.0 || index >= length as f64 {
+            return Value::UNDEFINED;
+        }
+        let index = index as usize;
+        let value = if heap.present(receiver, index) {
+            heap.get(receiver, index).unwrap()
+        } else {
+            Value::UNDEFINED
+        };
+        return context.retain_temp(value);
+    }
     if function == ArrayJoin {
         let separator = if arg(0) == Value::UNDEFINED {
             ",".to_owned()
@@ -543,7 +570,7 @@ pub(super) fn call(
     if args.len() > 1 && arg(1) != Value::UNDEFINED {
         return fail(context, "array callback thisArg is unsupported");
     }
-    let result = if matches!(function, ArrayEvery | ArraySome) {
+    let result = if matches!(function, ArrayEvery | ArraySome | ArrayFind | ArrayForEach) {
         None
     } else {
         let initial = if function == ArrayMap {
@@ -563,10 +590,15 @@ pub(super) fn call(
         Some(result)
     };
     for index in 0..length {
-        if !heap.present(receiver, index) {
+        let present = heap.present(receiver, index);
+        if !present && function != ArrayFind {
             continue;
         }
-        let value = heap.get(receiver, index).unwrap();
+        let value = if present {
+            heap.get(receiver, index).unwrap()
+        } else {
+            Value::UNDEFINED
+        };
         unsafe { &mut *ctx }.retain_temp(value);
         let callback_args = [value, Value::number(index as f64), receiver];
         let mapped = js_call(ctx, callback, Value::UNDEFINED, callback_args.as_ptr(), 3);
@@ -594,6 +626,11 @@ pub(super) fn call(
             if js_truthy(ctx, mapped) == Value::TRUE {
                 return Value::TRUE;
             }
+        } else if function == ArrayFind {
+            if js_truthy(ctx, mapped) == Value::TRUE {
+                return context.retain_temp(value);
+            }
+        } else if function == ArrayForEach {
         } else if js_truthy(ctx, mapped) == Value::TRUE {
             let result = result.unwrap();
             heap.set(result, heap.len(result).unwrap(), value);
@@ -602,6 +639,7 @@ pub(super) fn call(
     match function {
         ArrayEvery => Value::TRUE,
         ArraySome => Value::FALSE,
+        ArrayFind | ArrayForEach => Value::UNDEFINED,
         _ => result.unwrap(),
     }
 }

@@ -1,44 +1,60 @@
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::value::{TAG_OBJECT, TAG_STRING, Value};
-
-static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Default)]
 pub(crate) struct Heap(Rc<RefCell<HeapData>>);
 
 #[derive(Default)]
 struct HeapData {
-    generators: HashMap<u64, Generator>,
-    regexps: HashMap<u64, RegExp>,
+    slots: Vec<Slot>,
+    free: Vec<usize>,
+    natives: Vec<(NativeFunction, u64)>,
     regexp_cache: HashMap<(String, u8), Rc<regress::Regex>>,
-    enumerators: HashMap<u64, Enumerator>,
-    natives: HashMap<u64, (usize, NativeFunction)>,
-    sets: HashMap<u64, Set>,
-    objects: HashMap<u64, Object>,
-    strings: HashMap<u64, (usize, String)>,
-    arrays: HashMap<u64, Box<Array>>,
-    typed_arrays: HashMap<u64, TypedArray>,
-    cells: HashMap<u64, Box<Cell>>,
-    closures: HashMap<u64, Box<Closure>>,
     pending: VecDeque<u64>,
+}
+
+struct Slot {
+    references: usize,
+    payload: Payload,
+}
+
+enum Payload {
+    Vacant,
+    Reserved,
+    Native(NativeFunction),
+    String(String),
+    Generator(Box<Generator>),
+    RegExp(Box<RegExp>),
+    Enumerator(Box<Enumerator>),
+    Set(Box<Set>),
+    Object(Box<Object>),
+    Array(Box<Array>),
+    TypedArray(Box<TypedArray>),
+    Cell(Box<Cell>),
+    Closure(Box<Closure>),
+}
+
+pub(crate) enum PropertyRead {
+    Value(Value),
+    Native(NativeFunction),
+    Prototype,
 }
 
 pub(crate) const GENERATOR_DONE: usize = usize::MAX;
 pub(crate) const GENERATOR_RUNNING: usize = usize::MAX - 1;
 
 struct RegExp {
-    references: usize,
     regex: Rc<regress::Regex>,
     global: bool,
     last_index: f64,
 }
 
 struct Enumerator {
-    references: usize,
     current: Option<Value>,
     keys: Vec<String>,
     cursor: usize,
@@ -46,7 +62,6 @@ struct Enumerator {
 }
 
 struct Generator {
-    references: usize,
     code: CodeId,
     closure: Value,
     arguments: Value,
@@ -137,7 +152,6 @@ impl PropertyTable {
 }
 
 struct Object {
-    references: usize,
     properties: PropertyTable,
     error: bool,
     prototype: Option<Value>,
@@ -180,6 +194,9 @@ pub(crate) enum NativeFunction {
     ArrayMap,
     ArrayEvery,
     ArraySome,
+    ArrayFind,
+    ArrayForEach,
+    ArrayAt,
     ArraySort,
     ArrayJoin,
     ArrayPop,
@@ -233,7 +250,6 @@ enum SetKey {
 }
 
 struct Set {
-    references: usize,
     entries: HashMap<SetKey, Value>,
 }
 
@@ -252,7 +268,6 @@ pub(crate) enum TypedKind {
 }
 
 struct TypedArray {
-    references: usize,
     kind: TypedKind,
     storage: TypedStorage,
 }
@@ -385,13 +400,11 @@ impl TypedStorage {
 }
 
 struct Array {
-    references: usize,
     elements: Vec<Value>,
     holes: HashSet<usize>,
 }
 
 struct Cell {
-    references: usize,
     value: Value,
 }
 
@@ -399,7 +412,6 @@ struct Cell {
 pub(crate) struct CodeId(pub(crate) u64);
 
 struct Closure {
-    references: usize,
     code: CodeId,
     captures: Vec<Value>,
     lexical_this: Option<Value>,
@@ -433,29 +445,25 @@ impl Heap {
             data.regexp_cache.insert(key, regex.clone());
             regex
         };
-        let id = next_id().ok_or("heap exhausted")?;
-        data.regexps.insert(
-            id,
-            RegExp {
-                references: 1,
-                regex,
-                global: flags & 16 != 0,
-                last_index: 0.0,
-            },
-        );
+        let id = data.reserve().ok_or("heap exhausted")?;
+        data.slots[(id - 1) as usize].payload = Payload::RegExp(Box::new(RegExp {
+            regex,
+            global: flags & 16 != 0,
+            last_index: 0.0,
+        }));
         Ok(Value::from_bits(TAG_OBJECT | id))
     }
 
     pub(crate) fn regexp_compiled(&self, value: Value) -> Option<Rc<regress::Regex>> {
         let data = self.0.borrow();
-        let regexp = data.regexps.get(&heap_id(value)?)?;
-        (regexp.references != 0).then(|| regexp.regex.clone())
+        let regexp = data.regexp(heap_id(value)?)?;
+        Some(regexp.regex.clone())
     }
 
     pub(crate) fn regexp_state(&self, value: Value) -> Option<(bool, f64)> {
         let data = self.0.borrow();
-        let regexp = data.regexps.get(&heap_id(value)?)?;
-        (regexp.references != 0).then_some((regexp.global, regexp.last_index))
+        let regexp = data.regexp(heap_id(value)?)?;
+        Some((regexp.global, regexp.last_index))
     }
 
     pub(crate) fn regexp_set_last_index(&self, value: Value, index: f64) -> bool {
@@ -463,11 +471,7 @@ impl Heap {
             return false;
         };
         let mut data = self.0.borrow_mut();
-        let Some(regexp) = data
-            .regexps
-            .get_mut(&id)
-            .filter(|regexp| regexp.references != 0)
-        else {
+        let Some(regexp) = data.regexp_mut(id) else {
             return false;
         };
         regexp.last_index = index;
@@ -508,22 +512,17 @@ impl Heap {
     pub(crate) fn typed_new(&self, kind: TypedKind, length: usize) -> Option<Value> {
         let storage = TypedStorage::new(kind, length)?;
         self.drain(64);
-        let id = next_id()?;
-        self.0.borrow_mut().typed_arrays.insert(
-            id,
-            TypedArray {
-                references: 1,
-                kind,
-                storage,
-            },
-        );
+        let mut data = self.0.borrow_mut();
+        let id = data.reserve()?;
+        data.slots[(id - 1) as usize].payload =
+            Payload::TypedArray(Box::new(TypedArray { kind, storage }));
         Some(Value::from_bits(TAG_OBJECT | id))
     }
 
     pub(crate) fn typed_kind(&self, value: Value) -> Option<TypedKind> {
         let data = self.0.borrow();
-        let array = data.typed_arrays.get(&heap_id(value)?)?;
-        (array.references != 0).then_some(array.kind)
+        let array = data.typed_array(heap_id(value)?)?;
+        Some(array.kind)
     }
 
     pub(crate) fn typed_set(&self, value: Value, index: usize, number: f64) -> bool {
@@ -531,11 +530,7 @@ impl Heap {
             return false;
         };
         let mut data = self.0.borrow_mut();
-        let Some(array) = data
-            .typed_arrays
-            .get_mut(&id)
-            .filter(|array| array.references != 0)
-        else {
+        let Some(array) = data.typed_array_mut(id) else {
             return false;
         };
         array.storage.set(index, number);
@@ -547,11 +542,7 @@ impl Heap {
             return false;
         };
         let mut data = self.0.borrow_mut();
-        let Some(array) = data
-            .typed_arrays
-            .get_mut(&id)
-            .filter(|array| array.references != 0)
-        else {
+        let Some(array) = data.typed_array_mut(id) else {
             return false;
         };
         array.storage.fill(start, end, number);
@@ -570,51 +561,43 @@ impl Heap {
         if !data.valid(closure) || !data.valid(arguments) || !data.valid(receiver) {
             return None;
         }
-        let id = next_id()?;
+        let id = data.reserve()?;
         data.retain(closure);
         data.retain(arguments);
         data.retain(receiver);
-        data.generators.insert(
-            id,
-            Generator {
-                references: 1,
-                code,
-                closure,
-                arguments,
-                receiver,
-                state: 0,
-                locals: Vec::new(),
-            },
-        );
+        data.slots[(id - 1) as usize].payload = Payload::Generator(Box::new(Generator {
+            code,
+            closure,
+            arguments,
+            receiver,
+            state: 0,
+            locals: Vec::new(),
+        }));
         Some(Value::from_bits(TAG_OBJECT | id))
     }
 
     pub(crate) fn generator_receiver(&self, value: Value) -> Option<Value> {
         let data = self.0.borrow();
-        let generator = data.generators.get(&heap_id(value)?)?;
-        (generator.references != 0).then_some(generator.receiver)
+        let generator = data.generator(heap_id(value)?)?;
+        Some(generator.receiver)
     }
 
     pub(crate) fn generator_state(&self, value: Value) -> Option<usize> {
         let data = self.0.borrow();
-        let generator = data.generators.get(&heap_id(value)?)?;
-        (generator.references != 0).then_some(generator.state)
+        let generator = data.generator(heap_id(value)?)?;
+        Some(generator.state)
     }
 
     pub(crate) fn generator_parts(&self, value: Value) -> Option<(CodeId, Value, Value)> {
         let data = self.0.borrow();
-        let generator = data.generators.get(&heap_id(value)?)?;
-        (generator.references != 0).then_some((
-            generator.code,
-            generator.closure,
-            generator.arguments,
-        ))
+        let generator = data.generator(heap_id(value)?)?;
+        Some((generator.code, generator.closure, generator.arguments))
     }
 
     pub(crate) fn generator_begin(&self, value: Value) -> Option<(usize, Vec<Value>)> {
         let mut data = self.0.borrow_mut();
-        let generator = data.generators.get_mut(&heap_id(value)?)?;
-        if generator.references == 0 || generator.state >= GENERATOR_RUNNING {
+        let generator = data.generator_mut(heap_id(value)?)?;
+        if generator.state >= GENERATOR_RUNNING {
             return None;
         }
         let state = std::mem::replace(&mut generator.state, GENERATOR_RUNNING);
@@ -623,14 +606,14 @@ impl Heap {
 
     pub(crate) fn generator_suspend(&self, value: Value, state: usize, locals: Vec<Value>) {
         let mut data = self.0.borrow_mut();
-        let generator = data.generators.get_mut(&heap_id(value).unwrap()).unwrap();
+        let generator = data.generator_mut(heap_id(value).unwrap()).unwrap();
         generator.state = state;
         generator.locals = locals;
     }
 
     pub(crate) fn generator_complete(&self, value: Value) {
         let mut data = self.0.borrow_mut();
-        let generator = data.generators.get_mut(&heap_id(value).unwrap()).unwrap();
+        let generator = data.generator_mut(heap_id(value).unwrap()).unwrap();
         generator.state = GENERATOR_DONE;
         let closure = std::mem::replace(&mut generator.closure, Value::UNDEFINED);
         let arguments = std::mem::replace(&mut generator.arguments, Value::UNDEFINED);
@@ -642,43 +625,41 @@ impl Heap {
 
     pub(crate) fn native_function(&self, function: NativeFunction) -> Option<Value> {
         let mut data = self.0.borrow_mut();
-        let id =
-            if let Some((&id, _)) = data.natives.iter().find(|(_, (_, kind))| *kind == function) {
-                id
-            } else {
-                let id = next_id()?;
-                data.natives.insert(id, (1, function));
-                id
-            };
-        data.natives.get_mut(&id).unwrap().0 += 1;
+        let id = if let Some((_, id)) = data.natives.iter().find(|(kind, _)| *kind == function) {
+            *id
+        } else {
+            let id = data.reserve()?;
+            data.slots[(id - 1) as usize].payload = Payload::Native(function);
+            data.natives.push((function, id));
+            id
+        };
+        data.slots[(id - 1) as usize].references += 1;
         Some(Value::from_bits(TAG_OBJECT | id))
     }
 
     pub(crate) fn native(&self, value: Value) -> Option<NativeFunction> {
-        self.0
-            .borrow()
-            .natives
-            .get(&heap_id(value)?)
-            .map(|(_, function)| *function)
+        let data = self.0.borrow();
+        let slot = data.live(heap_id(value)?)?;
+        match &slot.payload {
+            Payload::Native(function) => Some(*function),
+            _ => None,
+        }
     }
 
     pub(crate) fn set_new(&self) -> Option<Value> {
         self.drain(64);
-        let id = next_id()?;
-        self.0.borrow_mut().sets.insert(
-            id,
-            Set {
-                references: 1,
-                entries: HashMap::new(),
-            },
-        );
+        let mut data = self.0.borrow_mut();
+        let id = data.reserve()?;
+        data.slots[(id - 1) as usize].payload = Payload::Set(Box::new(Set {
+            entries: HashMap::default(),
+        }));
         Some(Value::from_bits(TAG_OBJECT | id))
     }
 
     pub(crate) fn set_size(&self, value: Value) -> Option<usize> {
         let data = self.0.borrow();
-        let set = data.sets.get(&heap_id(value)?)?;
-        (set.references != 0).then_some(set.entries.len())
+        let set = data.set(heap_id(value)?)?;
+        Some(set.entries.len())
     }
 
     fn set_key(&self, value: Value) -> Option<SetKey> {
@@ -697,8 +678,8 @@ impl Heap {
     pub(crate) fn set_has(&self, set: Value, value: Value) -> Option<bool> {
         let key = self.set_key(value)?;
         let data = self.0.borrow();
-        let set = data.sets.get(&heap_id(set)?)?;
-        (set.references != 0).then(|| set.entries.contains_key(&key))
+        let set = data.set(heap_id(set)?)?;
+        Some(set.entries.contains_key(&key))
     }
 
     pub(crate) fn set_add(&self, set: Value, value: Value) -> bool {
@@ -709,7 +690,7 @@ impl Heap {
             return false;
         };
         let mut data = self.0.borrow_mut();
-        let Some(set) = data.sets.get(&id).filter(|set| set.references != 0) else {
+        let Some(set) = data.set(id) else {
             return false;
         };
         if set.entries.contains_key(&key) {
@@ -718,17 +699,14 @@ impl Heap {
         if !data.retain(value) {
             return false;
         }
-        data.sets.get_mut(&id).unwrap().entries.insert(key, value);
+        data.set_mut(id).unwrap().entries.insert(key, value);
         true
     }
 
     pub(crate) fn set_delete(&self, set: Value, value: Value) -> Option<bool> {
         let key = self.set_key(value)?;
         let mut data = self.0.borrow_mut();
-        let set = data
-            .sets
-            .get_mut(&heap_id(set)?)
-            .filter(|set| set.references != 0)?;
+        let set = data.set_mut(heap_id(set)?)?;
         let removed = set.entries.remove(&key);
         if let Some(value) = removed {
             data.release(value);
@@ -737,54 +715,39 @@ impl Heap {
     }
 
     pub(crate) fn set_clear(&self, set: Value) -> bool {
-        let Some(id) = heap_id(set) else {
-            return false;
-        };
+        let Some(id) = heap_id(set) else { return false };
         let mut data = self.0.borrow_mut();
-        let Some(set) = data.sets.get_mut(&id).filter(|set| set.references != 0) else {
+        let Some(set) = data.set(id) else {
             return false;
         };
         if set.entries.is_empty() {
             return true;
         }
-        let Some(disposal) = next_id() else {
+        let Some(disposal) = data.reserve() else {
             return false;
         };
-        let entries = std::mem::take(&mut set.entries);
-        data.sets.insert(
-            disposal,
-            Set {
-                references: 0,
-                entries,
-            },
-        );
+        let entries = std::mem::take(&mut data.set_mut(id).unwrap().entries);
+        let slot = &mut data.slots[(disposal - 1) as usize];
+        slot.references = 0;
+        slot.payload = Payload::Set(Box::new(Set { entries }));
         data.pending.push_back(disposal);
         true
     }
 
     pub(crate) fn object(&self) -> Option<Value> {
         self.drain(64);
-        let id = next_id()?;
-        self.0.borrow_mut().objects.insert(
-            id,
-            Object {
-                references: 1,
-                properties: PropertyTable::default(),
-                error: false,
-                prototype: None,
-            },
-        );
+        let mut data = self.0.borrow_mut();
+        let id = data.reserve()?;
+        data.slots[(id - 1) as usize].payload = Payload::Object(Box::new(Object {
+            properties: PropertyTable::default(),
+            error: false,
+            prototype: None,
+        }));
         Some(Value::from_bits(TAG_OBJECT | id))
     }
 
     pub(crate) fn has_properties(&self, value: Value) -> bool {
-        heap_id(value).is_some_and(|id| {
-            self.0
-                .borrow()
-                .objects
-                .get(&id)
-                .is_some_and(|object| object.references != 0)
-        })
+        heap_id(value).is_some_and(|id| self.0.borrow().object(id).is_some())
     }
 
     pub(crate) fn error(&self, message: Value, name: Value) -> Option<Value> {
@@ -793,31 +756,137 @@ impl Heap {
         if !data.valid(message) || !data.valid(name) {
             return None;
         }
-        let id = next_id()?;
+        let id = data.reserve()?;
         data.retain(message);
         data.retain(name);
         let mut properties = PropertyTable::default();
         properties.set("message", message, Some(false));
         properties.set("name", name, Some(false));
-        data.objects.insert(
-            id,
-            Object {
-                references: 1,
-                properties,
-                error: true,
-                prototype: None,
-            },
-        );
+        data.slots[(id - 1) as usize].payload = Payload::Object(Box::new(Object {
+            properties,
+            error: true,
+            prototype: None,
+        }));
         Some(Value::from_bits(TAG_OBJECT | id))
+    }
+
+    /// Returned values are borrowed; native functions and lazy prototypes are resolved by the caller.
+    pub(crate) fn read_property(&self, receiver: Value, name: &str) -> Option<PropertyRead> {
+        use NativeFunction::*;
+
+        if receiver.is_number() {
+            return Some(PropertyRead::Native(match name {
+                "toFixed" => NumberToFixed,
+                "toString" => NumberToString,
+                _ => return None,
+            }));
+        }
+        let data = self.0.borrow();
+        let payload = &data.live(heap_id(receiver)?)?.payload;
+        let function = match payload {
+            Payload::Object(object) => {
+                return data.object_property(object, name).map(PropertyRead::Value);
+            }
+            Payload::Closure(closure) => {
+                if let Some(value) = closure.properties.get(name) {
+                    return Some(PropertyRead::Value(*value));
+                }
+                return Some(if closure.constructable && name == "prototype" {
+                    PropertyRead::Prototype
+                } else {
+                    PropertyRead::Value(Value::UNDEFINED)
+                });
+            }
+            Payload::Native(Array) => match name {
+                "from" => ArrayFrom,
+                "isArray" => ArrayIsArray,
+                _ => return None,
+            },
+            Payload::Native(TypedConstructor(kind)) => match name {
+                "from" => TypedFrom(*kind),
+                _ => return None,
+            },
+            Payload::TypedArray(array) => match name {
+                "length" => {
+                    return Some(PropertyRead::Value(Value::number(
+                        array.storage.len() as f64
+                    )));
+                }
+                "fill" => TypedFill,
+                _ => return None,
+            },
+            Payload::RegExp(regexp) => match name {
+                "lastIndex" => return Some(PropertyRead::Value(Value::number(regexp.last_index))),
+                "test" => RegExpTest,
+                "exec" => RegExpExec,
+                _ => return None,
+            },
+            Payload::Array(array) => match name {
+                "length" => {
+                    return Some(PropertyRead::Value(Value::number(
+                        array.elements.len() as f64
+                    )));
+                }
+                "filter" => ArrayFilter,
+                "map" => ArrayMap,
+                "every" => ArrayEvery,
+                "some" => ArraySome,
+                "find" => ArrayFind,
+                "forEach" => ArrayForEach,
+                "at" => ArrayAt,
+                "sort" => ArraySort,
+                "join" => ArrayJoin,
+                "pop" => ArrayPop,
+                "indexOf" => ArrayIndexOf,
+                "concat" => ArrayConcat,
+                "push" => ArrayPush,
+                "includes" => ArrayIncludes,
+                "reverse" => ArrayReverse,
+                "slice" => ArraySlice,
+                "flat" => ArrayFlat,
+                "flatMap" => ArrayFlatMap,
+                "fill" => ArrayFill,
+                _ => return None,
+            },
+            Payload::String(text) => match name {
+                "length" => {
+                    return Some(PropertyRead::Value(Value::number(
+                        text.chars().count() as f64
+                    )));
+                }
+                "match" => StringMatch,
+                "slice" => StringSlice,
+                "split" => StringSplit,
+                "startsWith" => StringStartsWith,
+                "replace" => StringReplace,
+                "padStart" => StringPadStart,
+                _ => return None,
+            },
+            Payload::Set(set) => match name {
+                "size" => {
+                    return Some(PropertyRead::Value(Value::number(set.entries.len() as f64)));
+                }
+                "add" => SetAdd,
+                "has" => SetHas,
+                "delete" => SetDelete,
+                "clear" => SetClear,
+                _ => return Some(PropertyRead::Value(Value::UNDEFINED)),
+            },
+            Payload::Generator(_) => match name {
+                "next" => GeneratorNext,
+                _ => return Some(PropertyRead::Value(Value::UNDEFINED)),
+            },
+            _ => return None,
+        };
+        Some(PropertyRead::Native(function))
     }
 
     pub(crate) fn property(&self, object: Value, name: &str) -> Option<Value> {
         let id = heap_id(object)?;
         let needs_prototype = {
             let data = self.0.borrow();
-            data.closures.get(&id).is_some_and(|closure| {
-                closure.references != 0
-                    && closure.constructable
+            data.closure(id).is_some_and(|closure| {
+                closure.constructable
                     && name == "prototype"
                     && !closure.properties.contains_key(name)
             })
@@ -828,8 +897,8 @@ impl Heap {
             self.release(prototype);
         }
         let data = self.0.borrow();
-        if let Some(closure) = data.closures.get(&id) {
-            return (closure.references != 0).then(|| {
+        if let Some(closure) = data.closure(id) {
+            return Some({
                 closure
                     .properties
                     .get(name)
@@ -837,20 +906,7 @@ impl Heap {
                     .unwrap_or(Value::UNDEFINED)
             });
         }
-        let mut current = object;
-        loop {
-            let object = data.objects.get(&heap_id(current)?)?;
-            if object.references == 0 {
-                return None;
-            }
-            if let Some(value) = object.properties.get(name) {
-                return Some(*value);
-            }
-            let Some(prototype) = object.prototype else {
-                return Some(Value::UNDEFINED);
-            };
-            current = prototype;
-        }
+        data.object_property(data.object(id)?, name)
     }
 
     pub(crate) fn own_property_names(
@@ -863,10 +919,7 @@ impl Heap {
         }
         let data = self.0.borrow();
         let id = heap_id(value)?;
-        if let Some((references, text)) = data.strings.get(&id) {
-            if *references == 0 {
-                return None;
-            }
+        if let Some(text) = data.string(id) {
             let mut keys: Vec<_> = (0..text.chars().count())
                 .map(|index| index.to_string())
                 .collect();
@@ -876,15 +929,14 @@ impl Heap {
             return Some(keys);
         }
         let mut keys = data.enumeration_keys(value)?;
-        if data.arrays.contains_key(&id) {
+        if data.is_array(id) {
             keys.retain(|name| {
                 array_index_name(name).is_some() || (!enumerable_only && name == "length")
             });
         } else if enumerable_only {
             keys.retain(|name| data.enumeration_presence(value, name) == Some(true));
         } else if data
-            .closures
-            .get(&id)
+            .closure(id)
             .is_some_and(|closure| closure.constructable)
         {
             if let Some(index) = keys.iter().position(|name| name == "prototype") {
@@ -901,10 +953,8 @@ impl Heap {
 
     pub(crate) fn own_properties(&self, value: Value) -> Option<Vec<(String, Value)>> {
         let data = self.0.borrow();
-        let object = data.objects.get(&heap_id(value)?)?;
-        if object.references == 0 {
-            return None;
-        }
+        let object = data.object(heap_id(value)?)?;
+
         Some(
             object
                 .properties
@@ -943,30 +993,23 @@ impl Heap {
             return false;
         };
         let mut data = self.0.borrow_mut();
-        let supported = data
-            .objects
-            .get(&id)
-            .is_some_and(|object| object.references != 0)
-            || data
-                .closures
-                .get(&id)
-                .is_some_and(|closure| closure.references != 0);
+        let supported = data.object(id).is_some() || data.closure(id).is_some();
         if !supported || !data.retain(value) {
             return false;
         }
         let enumerable = if enumerable.is_none()
             && name == "prototype"
-            && data.closures.get(&id).is_some_and(|closure| {
+            && data.closure(id).is_some_and(|closure| {
                 closure.constructable && !closure.properties.contains_key(name)
             }) {
             Some(false)
         } else {
             enumerable
         };
-        let properties = if let Some(object) = data.objects.get_mut(&id) {
+        let properties = if let Some(object) = data.object_mut(id) {
             &mut object.properties
         } else {
-            &mut data.closures.get_mut(&id).unwrap().properties
+            &mut data.closure_mut(id).unwrap().properties
         };
         if let Some(old) = properties.set(name, value, enumerable) {
             data.release(old);
@@ -990,22 +1033,18 @@ impl Heap {
             }
             (Some(value), keys)
         };
-        let Some(id) = next_id() else {
+        let Some(id) = data.reserve() else {
             if let Some(value) = current {
                 data.release(value);
             }
             return None;
         };
-        data.enumerators.insert(
-            id,
-            Enumerator {
-                references: 1,
-                current,
-                keys,
-                cursor: 0,
-                visited: HashSet::new(),
-            },
-        );
+        data.slots[(id - 1) as usize].payload = Payload::Enumerator(Box::new(Enumerator {
+            current,
+            keys,
+            cursor: 0,
+            visited: HashSet::default(),
+        }));
         Some(Value::from_bits(TAG_OBJECT | id))
     }
 
@@ -1013,10 +1052,8 @@ impl Heap {
         let mut data = self.0.borrow_mut();
         let id = heap_id(state)?;
         loop {
-            let state = data.enumerators.get_mut(&id)?;
-            if state.references == 0 {
-                return None;
-            }
+            let state = data.enumerator_mut(id)?;
+
             let Some(current) = state.current else {
                 return Some(None);
             };
@@ -1029,8 +1066,7 @@ impl Heap {
                 let Some(enumerable) = data.enumeration_presence(current, &name) else {
                     continue;
                 };
-                data.enumerators
-                    .get_mut(&id)
+                data.enumerator_mut(id)
                     .unwrap()
                     .visited
                     .insert(name.clone());
@@ -1049,7 +1085,7 @@ impl Heap {
                     return None;
                 }
             }
-            let state = data.enumerators.get_mut(&id).unwrap();
+            let state = data.enumerator_mut(id).unwrap();
             state.current = next;
             state.keys = keys;
             state.cursor = 0;
@@ -1060,10 +1096,7 @@ impl Heap {
     pub(crate) fn has_property(&self, value: Value, name: &str) -> Option<bool> {
         let data = self.0.borrow();
         let id = heap_id(value)?;
-        if let Some(array) = data.typed_arrays.get(&id) {
-            if array.references == 0 {
-                return None;
-            }
+        if let Some(array) = data.typed_array(id) {
             if matches!(name, "length" | "fill") {
                 return Some(true);
             }
@@ -1071,16 +1104,13 @@ impl Heap {
                 array_index_name(name).is_some_and(|index| (index as usize) < array.storage.len()),
             );
         }
-        if let Some(closure) = data.closures.get(&id) {
-            return (closure.references != 0).then(|| {
+        if let Some(closure) = data.closure(id) {
+            return Some({
                 closure.properties.contains_key(name)
                     || (closure.constructable && name == "prototype")
             });
         }
-        if let Some(array) = data.arrays.get(&id) {
-            if array.references == 0 {
-                return None;
-            }
+        if let Some(array) = data.array(id) {
             if matches!(
                 name,
                 "length"
@@ -1088,6 +1118,9 @@ impl Heap {
                     | "map"
                     | "every"
                     | "some"
+                    | "find"
+                    | "forEach"
+                    | "at"
                     | "sort"
                     | "join"
                     | "pop"
@@ -1113,10 +1146,8 @@ impl Heap {
         }
         let mut current = value;
         loop {
-            let object = data.objects.get(&heap_id(current)?)?;
-            if object.references == 0 {
-                return None;
-            }
+            let object = data.object(heap_id(current)?)?;
+
             if object.properties.contains_key(name) {
                 return Some(true);
             }
@@ -1130,7 +1161,7 @@ impl Heap {
     pub(crate) fn inherits(&self, value: Value, prototype: Value) -> bool {
         let data = self.0.borrow();
         let mut current = value;
-        while let Some(object) = heap_id(current).and_then(|id| data.objects.get(&id)) {
+        while let Some(object) = heap_id(current).and_then(|id| data.object(id)) {
             let Some(parent) = object.prototype else {
                 return false;
             };
@@ -1151,15 +1182,15 @@ impl Heap {
         if prototype.is_object() {
             let mut data = self.0.borrow_mut();
             data.retain(prototype);
-            data.objects.get_mut(&heap_id(instance)?).unwrap().prototype = Some(prototype);
+            data.object_mut(heap_id(instance)?).unwrap().prototype = Some(prototype);
         }
         Some(instance)
     }
 
     pub(crate) fn error_text(&self, value: Value) -> Option<String> {
         let data = self.0.borrow();
-        let object = data.objects.get(&heap_id(value)?)?;
-        if object.references == 0 || !object.error {
+        let object = data.object(heap_id(value)?)?;
+        if !object.error {
             return None;
         }
         let name = object
@@ -1194,8 +1225,9 @@ impl Heap {
 
     pub(crate) fn string(&self, text: &str) -> Option<Value> {
         self.drain(64);
-        let id = next_id()?;
-        self.0.borrow_mut().strings.insert(id, (1, text.into()));
+        let mut data = self.0.borrow_mut();
+        let id = data.reserve()?;
+        data.slots[(id - 1) as usize].payload = Payload::String(text.into());
         Some(Value::from_bits(TAG_STRING | id))
     }
 
@@ -1204,12 +1236,18 @@ impl Heap {
             return None;
         }
         let data = self.0.borrow();
-        let (references, text) = data.strings.get(&heap_id(value)?)?;
-        if *references == 0 {
-            return None;
-        }
+        let text = data.string(heap_id(value)?)?;
         let character = text.get(offset..)?.chars().next()?;
         Some((character, offset + character.len_utf8()))
+    }
+
+    pub(crate) fn string_is_empty(&self, value: Value) -> Option<bool> {
+        if !value.is_string() {
+            return None;
+        }
+        let data = self.0.borrow();
+        let text = data.string(heap_id(value)?)?;
+        Some(text.is_empty())
     }
 
     pub(crate) fn text(&self, value: Value) -> Option<String> {
@@ -1217,8 +1255,8 @@ impl Heap {
             return None;
         }
         let data = self.0.borrow();
-        let (references, text) = data.strings.get(&heap_id(value)?)?;
-        (*references != 0).then(|| text.clone())
+        let text = data.string(heap_id(value)?)?;
+        Some(text.clone())
     }
 
     pub(crate) fn array(&self, elements: &[Value]) -> Option<Value> {
@@ -1227,93 +1265,72 @@ impl Heap {
         if !elements.iter().all(|value| data.valid(*value)) {
             return None;
         }
-        let id = next_id()?;
+        let id = data.reserve()?;
         for value in elements {
             data.retain(*value);
         }
-        data.arrays.insert(
-            id,
-            Box::new(Array {
-                references: 1,
-                elements: elements.to_vec(),
-                holes: HashSet::new(),
-            }),
-        );
+        data.slots[(id - 1) as usize].payload = Payload::Array(Box::new(Array {
+            elements: elements.to_vec(),
+            holes: HashSet::default(),
+        }));
         Some(Value::from_bits(TAG_OBJECT | id))
     }
 
     pub(crate) fn array_of_length(&self, length: usize) -> Option<Value> {
         self.drain(64);
         let mut data = self.0.borrow_mut();
-        let id = next_id()?;
         let mut elements = Vec::new();
         elements.try_reserve_exact(length).ok()?;
         elements.resize(length, Value::UNDEFINED);
-        let mut holes = HashSet::new();
+        let mut holes = HashSet::default();
         holes.try_reserve(length).ok()?;
         holes.extend(0..length);
-        data.arrays.insert(
-            id,
-            Box::new(Array {
-                references: 1,
-                elements,
-                holes,
-            }),
-        );
+        let id = data.reserve()?;
+        data.slots[(id - 1) as usize].payload = Payload::Array(Box::new(Array { elements, holes }));
         Some(Value::from_bits(TAG_OBJECT | id))
     }
 
     pub(crate) fn cell(&self, value: Value) -> Option<Value> {
         self.drain(64);
         let mut data = self.0.borrow_mut();
-        let id = next_id()?;
-        if !data.retain(value) {
+        if !data.valid(value) {
             return None;
         }
-        data.cells.insert(
-            id,
-            Box::new(Cell {
-                references: 1,
-                value,
-            }),
-        );
+        let id = data.reserve()?;
+        data.retain(value);
+        data.slots[(id - 1) as usize].payload = Payload::Cell(Box::new(Cell { value }));
         Some(Value::from_bits(TAG_OBJECT | id))
     }
 
     pub(crate) fn closure(&self, code: CodeId, captures: &[Value]) -> Option<Value> {
         self.drain(64);
         let mut data = self.0.borrow_mut();
-        if !captures.iter().all(|value| {
-            heap_id(*value)
-                .and_then(|id| data.cells.get(&id))
-                .is_some_and(|cell| cell.references != 0)
-        }) {
+        if !captures
+            .iter()
+            .all(|value| heap_id(*value).and_then(|id| data.cell(id)).is_some())
+        {
             return None;
         }
-        let id = next_id()?;
+        let id = data.reserve()?;
         for value in captures {
             data.retain(*value);
         }
-        data.closures.insert(
-            id,
-            Box::new(Closure {
-                references: 1,
-                code,
-                captures: captures.to_vec(),
-                lexical_this: None,
-                constructable: true,
-                class: false,
-                properties: PropertyTable::default(),
-            }),
-        );
+        data.slots[(id - 1) as usize].payload = Payload::Closure(Box::new(Closure {
+            code,
+            captures: captures.to_vec(),
+            lexical_this: None,
+            constructable: true,
+            class: false,
+            properties: PropertyTable::default(),
+        }));
         Some(Value::from_bits(TAG_OBJECT | id))
     }
 
     #[cfg(test)]
     pub(crate) fn closure_parts(&self, closure: Value) -> Option<(CodeId, Vec<Value>)> {
         let data = self.0.borrow();
-        let closure = data.closures.get(&heap_id(closure)?)?;
-        (closure.references != 0).then(|| (closure.code, closure.captures.clone()))
+        let closure = data.closure(heap_id(closure)?)?;
+        Some((closure.code, closure.captures.clone()))
     }
 
     pub(crate) fn bind_this(&self, closure: Value, receiver: Value) -> bool {
@@ -1321,15 +1338,10 @@ impl Heap {
             return false;
         };
         let mut data = self.0.borrow_mut();
-        if !data
-            .closures
-            .get(&id)
-            .is_some_and(|closure| closure.references != 0)
-            || !data.retain(receiver)
-        {
+        if data.closure(id).is_none() || !data.retain(receiver) {
             return false;
         }
-        let closure = data.closures.get_mut(&id).unwrap();
+        let closure = data.closure_mut(id).unwrap();
         closure.constructable = false;
         let old = closure.lexical_this.replace(receiver);
         if let Some(old) = old {
@@ -1341,8 +1353,7 @@ impl Heap {
     pub(crate) fn disable_constructor(&self, closure: Value) {
         self.0
             .borrow_mut()
-            .closures
-            .get_mut(&heap_id(closure).unwrap())
+            .closure_mut(heap_id(closure).unwrap())
             .unwrap()
             .constructable = false;
     }
@@ -1350,21 +1361,14 @@ impl Heap {
     pub(crate) fn mark_class(&self, closure: Value) {
         self.0
             .borrow_mut()
-            .closures
-            .get_mut(&heap_id(closure).unwrap())
+            .closure_mut(heap_id(closure).unwrap())
             .unwrap()
             .class = true;
     }
 
     pub(crate) fn is_class(&self, closure: Value) -> bool {
         heap_id(closure)
-            .and_then(|id| {
-                self.0
-                    .borrow()
-                    .closures
-                    .get(&id)
-                    .map(|closure| closure.references != 0 && closure.class)
-            })
+            .and_then(|id| self.0.borrow().closure(id).map(|closure| closure.class))
             .unwrap_or(false)
     }
 
@@ -1372,40 +1376,35 @@ impl Heap {
         heap_id(closure).is_some_and(|id| {
             self.0
                 .borrow()
-                .closures
-                .get(&id)
-                .is_some_and(|closure| closure.references != 0 && closure.constructable)
+                .closure(id)
+                .is_some_and(|closure| closure.constructable)
         })
     }
 
     pub(crate) fn lexical_this(&self, closure: Value) -> Option<Value> {
         let data = self.0.borrow();
-        let closure = data.closures.get(&heap_id(closure)?)?;
-        if closure.references == 0 {
-            return None;
-        }
+        let closure = data.closure(heap_id(closure)?)?;
+
         closure.lexical_this
     }
 
     pub(crate) fn closure_code(&self, closure: Value) -> Option<CodeId> {
         let data = self.0.borrow();
-        let closure = data.closures.get(&heap_id(closure)?)?;
-        (closure.references != 0).then_some(closure.code)
+        let closure = data.closure(heap_id(closure)?)?;
+        Some(closure.code)
     }
 
     pub(crate) fn capture(&self, closure: Value, index: usize) -> Option<Value> {
         let data = self.0.borrow();
-        let closure = data.closures.get(&heap_id(closure)?)?;
-        if closure.references == 0 {
-            return None;
-        }
+        let closure = data.closure(heap_id(closure)?)?;
+
         closure.captures.get(index).copied()
     }
 
     pub(crate) fn cell_get(&self, cell: Value) -> Option<Value> {
         let data = self.0.borrow();
-        let cell = data.cells.get(&heap_id(cell)?)?;
-        (cell.references != 0).then_some(cell.value)
+        let cell = data.cell(heap_id(cell)?)?;
+        Some(cell.value)
     }
 
     pub(crate) fn cell_set(&self, cell: Value, value: Value) -> bool {
@@ -1413,10 +1412,10 @@ impl Heap {
         let Some(id) = heap_id(cell) else {
             return false;
         };
-        if !data.cells.get(&id).is_some_and(|cell| cell.references != 0) || !data.retain(value) {
+        if data.cell(id).is_none() || !data.retain(value) {
             return false;
         }
-        let old = std::mem::replace(&mut data.cells.get_mut(&id).unwrap().value, value);
+        let old = std::mem::replace(&mut data.cell_mut(id).unwrap().value, value);
         data.release(old);
         true
     }
@@ -1445,10 +1444,7 @@ impl Heap {
     pub(crate) fn get(&self, array: Value, index: usize) -> Option<Value> {
         let data = self.0.borrow();
         let id = heap_id(array)?;
-        if let Some(array) = data.typed_arrays.get(&id) {
-            if array.references == 0 {
-                return None;
-            }
+        if let Some(array) = data.typed_array(id) {
             return Some(
                 array
                     .storage
@@ -1457,10 +1453,8 @@ impl Heap {
                     .unwrap_or(Value::UNDEFINED),
             );
         }
-        let array = data.arrays.get(&id)?;
-        if array.references == 0 {
-            return None;
-        }
+        let array = data.array(id)?;
+
         Some(
             array
                 .elements
@@ -1473,39 +1467,33 @@ impl Heap {
     pub(crate) fn present(&self, array: Value, index: usize) -> bool {
         let data = self.0.borrow();
         heap_id(array)
-            .and_then(|id| data.arrays.get(&id))
-            .is_some_and(|array| {
-                array.references != 0
-                    && index < array.elements.len()
-                    && !array.holes.contains(&index)
-            })
+            .and_then(|id| data.array(id))
+            .is_some_and(|array| index < array.elements.len() && !array.holes.contains(&index))
     }
 
     pub(crate) fn mark_hole(&self, array: Value, index: usize) {
         let mut data = self.0.borrow_mut();
-        let array = data.arrays.get_mut(&heap_id(array).unwrap()).unwrap();
+        let array = data.array_mut(heap_id(array).unwrap()).unwrap();
         array.holes.insert(index);
     }
 
     pub(crate) fn is_array(&self, value: Value) -> bool {
         let data = self.0.borrow();
-        heap_id(value)
-            .and_then(|id| data.arrays.get(&id))
-            .is_some_and(|array| array.references != 0)
+        heap_id(value).and_then(|id| data.array(id)).is_some()
     }
 
     pub(crate) fn len(&self, array: Value) -> Option<usize> {
         let data = self.0.borrow();
         if array.is_string() {
-            let (references, text) = data.strings.get(&heap_id(array)?)?;
-            return (*references != 0).then(|| text.chars().count());
+            let text = data.string(heap_id(array)?)?;
+            return Some(text.chars().count());
         }
         let id = heap_id(array)?;
-        if let Some(array) = data.typed_arrays.get(&id) {
-            return (array.references != 0).then_some(array.storage.len());
+        if let Some(array) = data.typed_array(id) {
+            return Some(array.storage.len());
         }
-        let array = data.arrays.get(&id)?;
-        (array.references != 0).then_some(array.elements.len())
+        let array = data.array(id)?;
+        Some(array.elements.len())
     }
 
     pub(crate) fn set(&self, array: Value, index: usize, value: Value) -> bool {
@@ -1513,18 +1501,13 @@ impl Heap {
         let Some(id) = heap_id(array) else {
             return false;
         };
-        let Some(len) = data
-            .arrays
-            .get(&id)
-            .filter(|array| array.references != 0)
-            .map(|array| array.elements.len())
-        else {
+        let Some(len) = data.array(id).map(|array| array.elements.len()) else {
             return false;
         };
         if index > len || !data.retain(value) {
             return false;
         }
-        let array = data.arrays.get_mut(&id).unwrap();
+        let array = data.array_mut(id).unwrap();
         array.holes.remove(&index);
         if index == len {
             array.elements.push(value);
@@ -1540,11 +1523,7 @@ impl Heap {
             return false;
         };
         let mut data = self.0.borrow_mut();
-        let Some(array) = data
-            .arrays
-            .get_mut(&id)
-            .filter(|array| array.references != 0)
-        else {
+        let Some(array) = data.array_mut(id) else {
             return false;
         };
         let length = array.elements.len();
@@ -1568,10 +1547,10 @@ impl Heap {
         let Some(id) = heap_id(array) else {
             return false;
         };
-        let Some(array) = data.arrays.get_mut(&id) else {
+        let Some(array) = data.array_mut(id) else {
             return false;
         };
-        if array.references == 0 || length > array.elements.len() {
+        if length > array.elements.len() {
             return false;
         }
         array.holes.retain(|index| *index < length);
@@ -1588,114 +1567,61 @@ impl Heap {
             let Some(id) = data.pending.pop_front() else {
                 break;
             };
-            if data
-                .typed_arrays
-                .get(&id)
-                .is_some_and(|array| array.references == 0)
-            {
-                data.typed_arrays.remove(&id);
-            } else if data
-                .regexps
-                .get(&id)
-                .is_some_and(|regexp| regexp.references == 0)
-            {
-                data.regexps.remove(&id);
-            } else if let Some(state) = data.enumerators.get(&id) {
-                if state.references != 0 {
-                    continue;
+            let Some(slot) = data.slots.get_mut((id - 1) as usize) else {
+                continue;
+            };
+            if slot.references != 0 {
+                continue;
+            }
+            let edge = match &mut slot.payload {
+                Payload::Generator(generator) => generator.locals.pop(),
+                Payload::Set(set) => set
+                    .entries
+                    .extract_if(|_, _| true)
+                    .next()
+                    .map(|(_, value)| value),
+                Payload::Object(object) => object.properties.pop(),
+                Payload::Array(array) => array.elements.pop(),
+                Payload::Closure(closure) => {
+                    closure.properties.pop().or_else(|| closure.captures.pop())
                 }
-                let state = data.enumerators.remove(&id).unwrap();
-                if let Some(current) = state.current {
-                    data.release(current);
-                }
-            } else if let Some(generator) = data.generators.get_mut(&id) {
-                if generator.references != 0 {
-                    continue;
-                }
-                if let Some(value) = generator.locals.pop() {
-                    data.pending.push_back(id);
-                    data.release(value);
-                } else {
-                    let generator = data.generators.remove(&id).unwrap();
-                    data.release(generator.closure);
-                    data.release(generator.arguments);
-                    data.release(generator.receiver);
-                }
-            } else if let Some(set) = data.sets.get_mut(&id) {
-                if set.references != 0 {
-                    continue;
-                }
-                let entry = set.entries.extract_if(|_, _| true).next();
-                if let Some((_, value)) = entry {
-                    data.pending.push_back(id);
-                    data.release(value);
-                } else {
-                    data.sets.remove(&id);
-                }
-            } else if let Some(object) = data.objects.get_mut(&id) {
-                if object.references != 0 {
-                    continue;
-                }
-                if let Some(value) = object.properties.pop() {
-                    data.pending.push_back(id);
-                    data.release(value);
-                } else {
-                    let object = data.objects.remove(&id).unwrap();
-                    if let Some(prototype) = object.prototype {
-                        data.release(prototype);
+                _ => None,
+            };
+            if let Some(value) = edge {
+                data.pending.push_back(id);
+                data.release(value);
+            } else {
+                let payload =
+                    std::mem::replace(&mut data.slots[(id - 1) as usize].payload, Payload::Vacant);
+                match payload {
+                    Payload::Enumerator(state) => {
+                        if let Some(value) = state.current {
+                            data.release(value);
+                        }
                     }
-                }
-            } else if data
-                .strings
-                .get(&id)
-                .is_some_and(|(references, _)| *references == 0)
-            {
-                data.strings.remove(&id);
-            } else if let Some(array) = data.arrays.get_mut(&id) {
-                if array.references != 0 {
-                    continue;
-                }
-                if let Some(value) = array.elements.pop() {
-                    data.pending.push_back(id);
-                    data.release(value);
-                } else {
-                    data.arrays.remove(&id);
-                }
-            } else if let Some(cell) = data.cells.remove(&id) {
-                if cell.references != 0 {
-                    data.cells.insert(id, cell);
-                    continue;
-                }
-                data.release(cell.value);
-            } else if let Some(closure) = data.closures.get_mut(&id) {
-                if closure.references != 0 {
-                    continue;
-                }
-                if let Some(value) = closure.properties.pop() {
-                    data.pending.push_back(id);
-                    data.release(value);
-                } else if let Some(value) = closure.captures.pop() {
-                    data.pending.push_back(id);
-                    data.release(value);
-                } else {
-                    let closure = data.closures.remove(&id).unwrap();
-                    if let Some(receiver) = closure.lexical_this {
-                        data.release(receiver);
+                    Payload::Generator(generator) => {
+                        data.release(generator.closure);
+                        data.release(generator.arguments);
+                        data.release(generator.receiver);
                     }
+                    Payload::Object(object) => {
+                        if let Some(value) = object.prototype {
+                            data.release(value);
+                        }
+                    }
+                    Payload::Cell(cell) => data.release(cell.value),
+                    Payload::Closure(closure) => {
+                        if let Some(value) = closure.lexical_this {
+                            data.release(value);
+                        }
+                    }
+                    _ => {}
                 }
+                data.free.push((id - 1) as usize);
             }
             budget -= 1;
         }
     }
-}
-
-fn next_id() -> Option<u64> {
-    #[allow(deprecated)]
-    NEXT_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
-            (id < (1 << 48)).then_some(id + 1)
-        })
-        .ok()
 }
 
 fn heap_id(value: Value) -> Option<u64> {
@@ -1705,38 +1631,38 @@ fn heap_id(value: Value) -> Option<u64> {
 }
 
 impl HeapData {
+    fn object_property<'a>(&'a self, mut object: &'a Object, name: &str) -> Option<Value> {
+        loop {
+            if let Some(value) = object.properties.get(name) {
+                return Some(*value);
+            }
+            let Some(prototype) = object.prototype else {
+                return Some(Value::UNDEFINED);
+            };
+            object = self.object(heap_id(prototype)?)?;
+        }
+    }
+
     fn enumeration_keys(&self, value: Value) -> Option<Vec<String>> {
         let id = heap_id(value)?;
-        if let Some(object) = self
-            .objects
-            .get(&id)
-            .filter(|object| object.references != 0)
-        {
+        if let Some(object) = self.object(id) {
             return Some(object.properties.keys());
         }
-        if let Some(closure) = self
-            .closures
-            .get(&id)
-            .filter(|closure| closure.references != 0)
-        {
+        if let Some(closure) = self.closure(id) {
             let mut keys = closure.properties.keys();
             if closure.constructable && !closure.properties.contains_key("prototype") {
                 keys.push("prototype".into());
             }
             return Some(keys);
         }
-        if let Some(array) = self
-            .typed_arrays
-            .get(&id)
-            .filter(|array| array.references != 0)
-        {
+        if let Some(array) = self.typed_array(id) {
             return Some(
                 (0..array.storage.len())
                     .map(|index| index.to_string())
                     .collect(),
             );
         }
-        if let Some(array) = self.arrays.get(&id).filter(|array| array.references != 0) {
+        if let Some(array) = self.array(id) {
             let mut keys: Vec<_> = (0..array.elements.len())
                 .filter(|index| !array.holes.contains(index))
                 .map(|index| index.to_string())
@@ -1756,32 +1682,20 @@ impl HeapData {
 
     fn enumeration_presence(&self, value: Value, name: &str) -> Option<bool> {
         let id = heap_id(value)?;
-        if let Some(object) = self
-            .objects
-            .get(&id)
-            .filter(|object| object.references != 0)
-        {
+        if let Some(object) = self.object(id) {
             return object.properties.enumerable(name);
         }
-        if let Some(closure) = self
-            .closures
-            .get(&id)
-            .filter(|closure| closure.references != 0)
-        {
+        if let Some(closure) = self.closure(id) {
             return closure
                 .properties
                 .enumerable(name)
                 .or_else(|| (closure.constructable && name == "prototype").then_some(false));
         }
-        if let Some(array) = self
-            .typed_arrays
-            .get(&id)
-            .filter(|array| array.references != 0)
-        {
+        if let Some(array) = self.typed_array(id) {
             return array_index_name(name)
                 .and_then(|index| ((index as usize) < array.storage.len()).then_some(true));
         }
-        if let Some(array) = self.arrays.get(&id).filter(|array| array.references != 0) {
+        if let Some(array) = self.array(id) {
             if matches!(
                 name,
                 "length"
@@ -1808,107 +1722,197 @@ impl HeapData {
     }
 
     fn enumeration_prototype(&self, value: Value) -> Option<Value> {
-        self.objects
-            .get(&heap_id(value)?)
+        self.object(heap_id(value)?)
             .and_then(|object| object.prototype)
     }
 
-    fn references(&mut self, id: u64) -> Option<&mut usize> {
-        if let Some(array) = self.typed_arrays.get_mut(&id) {
-            return Some(&mut array.references);
+    fn generator(&self, id: u64) -> Option<&Generator> {
+        match &self.live(id)?.payload {
+            Payload::Generator(value) => Some(value),
+            _ => None,
         }
-        if let Some(regexp) = self.regexps.get_mut(&id) {
-            return Some(&mut regexp.references);
+    }
+    fn generator_mut(&mut self, id: u64) -> Option<&mut Generator> {
+        match &mut self.live_mut(id)?.payload {
+            Payload::Generator(value) => Some(value),
+            _ => None,
         }
-        if let Some(generator) = self.generators.get_mut(&id) {
-            return Some(&mut generator.references);
+    }
+    fn regexp(&self, id: u64) -> Option<&RegExp> {
+        match &self.live(id)?.payload {
+            Payload::RegExp(value) => Some(value),
+            _ => None,
         }
-        if let Some(enumerator) = self.enumerators.get_mut(&id) {
-            return Some(&mut enumerator.references);
+    }
+    fn regexp_mut(&mut self, id: u64) -> Option<&mut RegExp> {
+        match &mut self.live_mut(id)?.payload {
+            Payload::RegExp(value) => Some(value),
+            _ => None,
         }
-        if let Some((references, _)) = self.natives.get_mut(&id) {
-            return Some(references);
+    }
+    fn enumerator_mut(&mut self, id: u64) -> Option<&mut Enumerator> {
+        match &mut self.live_mut(id)?.payload {
+            Payload::Enumerator(value) => Some(value),
+            _ => None,
         }
-        if let Some(set) = self.sets.get_mut(&id) {
-            return Some(&mut set.references);
+    }
+    fn set(&self, id: u64) -> Option<&Set> {
+        match &self.live(id)?.payload {
+            Payload::Set(value) => Some(value),
+            _ => None,
         }
-        if let Some(object) = self.objects.get_mut(&id) {
-            return Some(&mut object.references);
+    }
+    fn set_mut(&mut self, id: u64) -> Option<&mut Set> {
+        match &mut self.live_mut(id)?.payload {
+            Payload::Set(value) => Some(value),
+            _ => None,
         }
-        if let Some((references, _)) = self.strings.get_mut(&id) {
-            return Some(references);
+    }
+    fn object(&self, id: u64) -> Option<&Object> {
+        match &self.live(id)?.payload {
+            Payload::Object(value) => Some(value),
+            _ => None,
         }
-        if let Some(array) = self.arrays.get_mut(&id) {
-            return Some(&mut array.references);
+    }
+    fn object_mut(&mut self, id: u64) -> Option<&mut Object> {
+        match &mut self.live_mut(id)?.payload {
+            Payload::Object(value) => Some(value),
+            _ => None,
         }
-        if let Some(cell) = self.cells.get_mut(&id) {
-            return Some(&mut cell.references);
+    }
+    fn array(&self, id: u64) -> Option<&Array> {
+        match &self.live(id)?.payload {
+            Payload::Array(value) => Some(value),
+            _ => None,
         }
-        self.closures
-            .get_mut(&id)
-            .map(|closure| &mut closure.references)
+    }
+    fn array_mut(&mut self, id: u64) -> Option<&mut Array> {
+        match &mut self.live_mut(id)?.payload {
+            Payload::Array(value) => Some(value),
+            _ => None,
+        }
+    }
+    fn is_array(&self, id: u64) -> bool {
+        self.array(id).is_some()
+    }
+    fn typed_array(&self, id: u64) -> Option<&TypedArray> {
+        match &self.live(id)?.payload {
+            Payload::TypedArray(value) => Some(value),
+            _ => None,
+        }
+    }
+    fn typed_array_mut(&mut self, id: u64) -> Option<&mut TypedArray> {
+        match &mut self.live_mut(id)?.payload {
+            Payload::TypedArray(value) => Some(value),
+            _ => None,
+        }
+    }
+    fn cell(&self, id: u64) -> Option<&Cell> {
+        match &self.live(id)?.payload {
+            Payload::Cell(value) => Some(value),
+            _ => None,
+        }
+    }
+    fn cell_mut(&mut self, id: u64) -> Option<&mut Cell> {
+        match &mut self.live_mut(id)?.payload {
+            Payload::Cell(value) => Some(value),
+            _ => None,
+        }
+    }
+    fn closure(&self, id: u64) -> Option<&Closure> {
+        match &self.live(id)?.payload {
+            Payload::Closure(value) => Some(value),
+            _ => None,
+        }
+    }
+    fn closure_mut(&mut self, id: u64) -> Option<&mut Closure> {
+        match &mut self.live_mut(id)?.payload {
+            Payload::Closure(value) => Some(value),
+            _ => None,
+        }
+    }
+    fn string(&self, id: u64) -> Option<&String> {
+        match &self.live(id)?.payload {
+            Payload::String(value) => Some(value),
+            _ => None,
+        }
+    }
+    // Handle payload zero denotes the global object; slot indices are encoded as index + 1.
+    fn reserve(&mut self) -> Option<u64> {
+        let id = if let Some(index) = self.free.pop() {
+            index
+        } else {
+            let index = self.slots.len();
+            if index as u64 >= (1u64 << 48) - 1 {
+                return None;
+            }
+            self.slots.push(Slot {
+                references: 0,
+                payload: Payload::Vacant,
+            });
+            index
+        };
+        self.slots[id] = Slot {
+            references: 1,
+            payload: Payload::Reserved,
+        };
+        Some(id as u64 + 1)
+    }
+
+    // Zero-reference slots remain present until incremental destruction finishes.
+    fn live(&self, id: u64) -> Option<&Slot> {
+        self.slots
+            .get(id.checked_sub(1)? as usize)
+            .filter(|slot| slot.references != 0)
+    }
+
+    fn live_mut(&mut self, id: u64) -> Option<&mut Slot> {
+        self.slots
+            .get_mut(id.checked_sub(1)? as usize)
+            .filter(|slot| slot.references != 0)
     }
 
     fn valid(&self, value: Value) -> bool {
         match heap_id(value) {
-            Some(id) => {
-                self.typed_arrays
-                    .get(&id)
-                    .is_some_and(|array| array.references != 0)
-                    || self
-                        .regexps
-                        .get(&id)
-                        .is_some_and(|regexp| regexp.references != 0)
-                    || self
-                        .enumerators
-                        .get(&id)
-                        .is_some_and(|state| state.references != 0)
-                    || self
-                        .generators
-                        .get(&id)
-                        .is_some_and(|generator| generator.references != 0)
-                    || self
-                        .natives
-                        .get(&id)
-                        .is_some_and(|(references, _)| *references != 0)
-                    || self.sets.get(&id).is_some_and(|set| set.references != 0)
-                    || self
-                        .objects
-                        .get(&id)
-                        .is_some_and(|object| object.references != 0)
-                    || self
-                        .strings
-                        .get(&id)
-                        .is_some_and(|(references, _)| *references != 0)
-                    || self.arrays.get(&id).is_some_and(|v| v.references != 0)
-                    || self.cells.get(&id).is_some_and(|v| v.references != 0)
-                    || self.closures.get(&id).is_some_and(|v| v.references != 0)
-            }
+            Some(id) => self.live(id).is_some_and(|slot| {
+                matches!(
+                    (&slot.payload, value.is_string()),
+                    (Payload::String(_), true)
+                ) || (!value.is_string()
+                    && !matches!(
+                        slot.payload,
+                        Payload::String(_) | Payload::Vacant | Payload::Reserved
+                    ))
+            }),
             None => !value.is_string(),
         }
     }
 
     fn retain(&mut self, value: Value) -> bool {
-        match heap_id(value) {
-            Some(id) => match self.references(id) {
-                Some(references) if *references != 0 => {
-                    *references += 1;
-                    true
-                }
-                _ => false,
-            },
-            None => !value.is_string(),
-        }
+        let Some(id) = heap_id(value) else {
+            return !value.is_string();
+        };
+        let Some(slot) = self.live_mut(id) else {
+            return false;
+        };
+        slot.references += 1;
+        true
     }
 
     fn release(&mut self, value: Value) {
         let Some(id) = heap_id(value) else { return };
-        let Some(references) = self.references(id) else {
+        let Some(slot) = id
+            .checked_sub(1)
+            .and_then(|index| self.slots.get_mut(index as usize))
+        else {
             return;
         };
-        assert!(*references > 0);
-        *references -= 1;
-        if *references == 0 {
+        if matches!(slot.payload, Payload::Vacant | Payload::Reserved) {
+            return;
+        }
+        assert!(slot.references > 0);
+        slot.references -= 1;
+        if slot.references == 0 {
             self.pending.push_back(id);
         }
     }
@@ -1924,7 +1928,7 @@ impl OwnedValue {
     pub(crate) fn from_owned(value: Value, heap: Heap) -> Self {
         Self { value, heap }
     }
-    /// Returns a borrowed token; keep this handle alive while using the token.
+    /// Returns a borrowed token; keep this handle alive and use the token only with its engine.
     pub fn value(&self) -> Value {
         self.value
     }
@@ -1952,6 +1956,16 @@ impl Drop for OwnedValue {
 }
 
 #[cfg(test)]
+impl Payload {
+    fn capture_count(&self) -> usize {
+        match self {
+            Self::Closure(closure) => closure.captures.len(),
+            _ => panic!("expected closure"),
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1967,10 +1981,7 @@ mod tests {
         {
             let mut data = heap.0.borrow_mut();
             assert!(data.retain(prototype));
-            data.objects
-                .get_mut(&heap_id(object).unwrap())
-                .unwrap()
-                .prototype = Some(prototype);
+            data.object_mut(heap_id(object).unwrap()).unwrap().prototype = Some(prototype);
         }
         let state = heap.enumerate(object).unwrap();
         heap.release(object);
@@ -1984,8 +1995,20 @@ mod tests {
         assert_eq!(heap.enumerate_next(state), Some(None));
         heap.release(state);
         heap.drain(100);
-        assert!(heap.0.borrow().objects.is_empty());
-        assert!(heap.0.borrow().enumerators.is_empty());
+        assert!(
+            heap.0
+                .borrow()
+                .slots
+                .iter()
+                .all(|slot| !matches!(slot.payload, Payload::Object(_)))
+        );
+        assert!(
+            heap.0
+                .borrow()
+                .slots
+                .iter()
+                .all(|slot| !matches!(slot.payload, Payload::Enumerator(_)))
+        );
     }
 
     #[test]
@@ -2004,7 +2027,13 @@ mod tests {
         heap.drain(100);
         assert!(!heap.valid(object));
         assert!(!heap.valid(child));
-        assert!(heap.0.borrow().enumerators.is_empty());
+        assert!(
+            heap.0
+                .borrow()
+                .slots
+                .iter()
+                .all(|slot| !matches!(slot.payload, Payload::Enumerator(_)))
+        );
     }
 
     #[test]
@@ -2020,7 +2049,13 @@ mod tests {
         heap.release(a);
         heap.release(b);
         heap.drain(100);
-        assert!(heap.0.borrow().regexps.is_empty());
+        assert!(
+            heap.0
+                .borrow()
+                .slots
+                .iter()
+                .all(|slot| !matches!(slot.payload, Payload::RegExp(_)))
+        );
         assert_eq!(heap.0.borrow().regexp_cache.len(), 1);
     }
 
@@ -2094,7 +2129,13 @@ mod tests {
         assert!(!heap.valid(receiver));
         heap.release(generator);
         heap.drain(100);
-        assert!(heap.0.borrow().generators.is_empty());
+        assert!(
+            heap.0
+                .borrow()
+                .slots
+                .iter()
+                .all(|slot| !matches!(slot.payload, Payload::Generator(_)))
+        );
     }
 
     #[test]
@@ -2123,7 +2164,13 @@ mod tests {
         assert!(!heap.valid(closure));
         assert!(!heap.valid(arguments));
         assert!(!heap.valid(argument));
-        assert!(heap.0.borrow().generators.is_empty());
+        assert!(
+            heap.0
+                .borrow()
+                .slots
+                .iter()
+                .all(|slot| !matches!(slot.payload, Payload::Generator(_)))
+        );
     }
 
     #[test]
@@ -2154,7 +2201,13 @@ mod tests {
         assert!(!heap.valid(value));
         heap.release(set);
         heap.drain(100);
-        assert!(heap.0.borrow().sets.is_empty());
+        assert!(
+            heap.0
+                .borrow()
+                .slots
+                .iter()
+                .all(|slot| !matches!(slot.payload, Payload::Set(_)))
+        );
     }
 
     #[test]
@@ -2170,23 +2223,24 @@ mod tests {
         let child = heap.array(&[]).unwrap();
         assert!(heap.set_property(error, "extra", child));
         heap.release(child);
-        let other = Heap::default();
-        assert!(!other.valid(error));
-        assert!(!other.set_property(error, "message", Value::NULL));
         heap.release(error);
         heap.drain(1);
         assert!(!heap.valid(error));
-        assert!(
-            heap.0
-                .borrow()
-                .objects
-                .contains_key(&heap_id(error).unwrap())
-        );
+        assert!(matches!(
+            heap.0.borrow().slots[(heap_id(error).unwrap() - 1) as usize].payload,
+            Payload::Object(_)
+        ));
         heap.drain(100);
         assert!(!heap.valid(message));
         assert!(!heap.valid(name));
         assert!(!heap.valid(child));
-        assert!(heap.0.borrow().objects.is_empty());
+        assert!(
+            heap.0
+                .borrow()
+                .slots
+                .iter()
+                .all(|slot| !matches!(slot.payload, Payload::Object(_)))
+        );
     }
 
     #[test]
@@ -2231,20 +2285,28 @@ mod tests {
         heap.release(closure);
         heap.drain(1);
         assert_eq!(
-            heap.0
-                .borrow()
-                .closures
-                .get(&heap_id(closure).unwrap())
-                .unwrap()
-                .captures
-                .len(),
+            heap.0.borrow().slots[(heap_id(closure).unwrap() - 1) as usize]
+                .payload
+                .capture_count(),
             99
         );
         assert!(cells.iter().any(|cell| heap.valid(*cell)));
         heap.drain(1000);
         assert!(cells.iter().all(|cell| !heap.valid(*cell)));
-        assert!(heap.0.borrow().closures.is_empty());
-        assert!(heap.0.borrow().cells.is_empty());
+        assert!(
+            heap.0
+                .borrow()
+                .slots
+                .iter()
+                .all(|slot| !matches!(slot.payload, Payload::Closure(_)))
+        );
+        assert!(
+            heap.0
+                .borrow()
+                .slots
+                .iter()
+                .all(|slot| !matches!(slot.payload, Payload::Cell(_)))
+        );
     }
 
     #[test]
@@ -2264,13 +2326,11 @@ mod tests {
     }
 
     #[test]
-    fn closure_rejects_invalid_or_foreign_captures() {
+    fn closure_rejects_invalid_captures() {
         let heap = Heap::default();
-        let other = Heap::default();
         let cell = heap.cell(Value::UNDEFINED).unwrap();
         let array = heap.array(&[]).unwrap();
         assert!(heap.closure(CodeId(1), &[array]).is_none());
-        assert!(other.closure(CodeId(1), &[cell]).is_none());
         heap.release(cell);
         assert!(heap.closure(CodeId(1), &[cell]).is_none());
         heap.release(array);
@@ -2304,10 +2364,19 @@ mod tests {
         heap.drain(1);
         assert!(!heap.valid(root));
         assert!(!heap.retain(root));
-        assert!(heap.0.borrow().arrays.contains_key(&heap_id(root).unwrap()));
+        assert!(matches!(
+            heap.0.borrow().slots[(heap_id(root).unwrap() - 1) as usize].payload,
+            Payload::Array(_)
+        ));
         heap.drain(30000);
         assert!(!heap.valid(root));
-        assert!(heap.0.borrow().arrays.is_empty());
+        assert!(
+            heap.0
+                .borrow()
+                .slots
+                .iter()
+                .all(|slot| !matches!(slot.payload, Payload::Array(_)))
+        );
     }
 
     #[test]
@@ -2325,11 +2394,40 @@ mod tests {
     }
 
     #[test]
-    fn handles_are_checked_across_heaps() {
-        let first = Heap::default();
-        let second = Heap::default();
-        let value = first.array(&[]).unwrap();
-        assert!(!second.valid(value));
-        assert!(second.array(&[value]).is_none());
+    fn pending_slots_are_reused_only_after_their_edges_are_released() {
+        let heap = Heap::default();
+        let child = heap.object().unwrap();
+        let parent = heap.array(&vec![child; 100]).unwrap();
+        heap.release(child);
+        heap.release(parent);
+        heap.drain(1);
+        assert!(!heap.valid(parent));
+        assert!(heap.valid(child));
+        let other = heap.string("other").unwrap();
+        assert_ne!(heap_id(parent), heap_id(other));
+        assert!(heap.valid(child));
+        heap.drain(1000);
+        assert!(!heap.valid(child));
+        heap.release(other);
+        heap.drain(100);
+    }
+
+    #[test]
+    fn freed_slots_are_reused_across_kinds_and_allocation_churn_is_bounded() {
+        let heap = Heap::default();
+        let array = heap.array(&[]).unwrap();
+        heap.release(array);
+        heap.drain(100);
+        let object = heap.object().unwrap();
+        assert_eq!(heap_id(array), heap_id(object));
+        assert!(heap.set_property(object, "value", Value::TRUE));
+        heap.release(object);
+        heap.drain(100);
+        for _ in 0..1000 {
+            let value = heap.string("temporary").unwrap();
+            heap.release(value);
+        }
+        heap.drain(100);
+        assert_eq!(heap.0.borrow().slots.len(), 1);
     }
 }

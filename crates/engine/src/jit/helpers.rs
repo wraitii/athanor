@@ -1,6 +1,7 @@
 use cranelift_codegen::ir::{AbiParam, Signature, Type, types};
 use cranelift_codegen::isa::CallConv;
 
+use crate::heap::PropertyRead;
 use crate::value::Value;
 
 use super::session::JitCtx;
@@ -494,37 +495,33 @@ extern "C" fn js_property_get(ctx: *mut JitCtx, object: Value, ptr: *const u8, l
     let ctx = unsafe { &mut *ctx };
     let name =
         unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len as usize)) };
-    if ctx.global.heap().generator_state(object).is_some() {
-        return generator_property(ctx, name);
+    if object == Value::GLOBAL_OBJECT {
+        let value = ctx.global.get_object_raw(name).unwrap_or(Value::UNDEFINED);
+        return ctx.retain_temp(value);
     }
-    if let Some(value) = super::builtins::property_get(ctx, object, name) {
-        return value;
-    }
-    if let Some(value) = set_property_get(ctx, object, name) {
-        return value;
-    }
-    if object != Value::GLOBAL_OBJECT {
-        if name == "lastIndex" {
-            if let Some((_, index)) = ctx.global.heap().regexp_state(object) {
-                return Value::number(index);
+    match ctx.global.heap().read_property(object, name) {
+        Some(PropertyRead::Value(value)) => return ctx.retain_temp(value),
+        Some(PropertyRead::Native(function)) => {
+            return match ctx.global.heap().native_function(function) {
+                Some(value) => ctx.own(value),
+                None => {
+                    ctx.error = Some(crate::Error::Runtime("heap exhausted".into()));
+                    Value::UNDEFINED
+                }
+            };
+        }
+        Some(PropertyRead::Prototype) => {
+            if let Some(value) = ctx.global.heap().property(object, name) {
+                return ctx.retain_temp(value);
             }
         }
-        if let Some(value) = ctx.global.heap().property(object, name) {
-            return ctx.retain_temp(value);
-        }
-        if name == "length" {
-            if let Some(length) = ctx.global.heap().len(object) {
-                return Value::number(length as f64);
-            }
-        }
-        ctx.error = Some(crate::Error::Runtime(format!(
-            "cannot read property {name:?} of {}",
-            ctx.global.heap().receiver_kind(object)
-        )));
-        return Value::UNDEFINED;
+        None => {}
     }
-    let value = ctx.global.get_object_raw(name).unwrap_or(Value::UNDEFINED);
-    ctx.retain_temp(value)
+    ctx.error = Some(crate::Error::Runtime(format!(
+        "cannot read property {name:?} of {}",
+        ctx.global.heap().receiver_kind(object)
+    )));
+    Value::UNDEFINED
 }
 
 extern "C" fn js_property_set(
@@ -1040,8 +1037,8 @@ extern "C" fn js_string_new(ctx: *mut JitCtx, ptr: *const u8, len: u64) -> Value
 
 pub(super) extern "C" fn js_truthy(ctx: *mut JitCtx, value: Value) -> Value {
     let ctx = unsafe { &*ctx };
-    Value::boolean(match ctx.global.heap().text(value) {
-        Some(text) => !text.is_empty(),
+    Value::boolean(match ctx.global.heap().string_is_empty(value) {
+        Some(empty) => !empty,
         None => value.to_boolean(),
     })
 }
@@ -1519,6 +1516,9 @@ fn native_call(
             | NativeFunction::ArrayMap
             | NativeFunction::ArrayEvery
             | NativeFunction::ArraySome
+            | NativeFunction::ArrayFind
+            | NativeFunction::ArrayForEach
+            | NativeFunction::ArrayAt
             | NativeFunction::ArraySort
             | NativeFunction::ArrayJoin
             | NativeFunction::ArrayPop

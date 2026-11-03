@@ -18,8 +18,7 @@ aliasing, and cycles; document deliberate semantic restrictions.
 - `Engine` owns the compiler, shared global environment, and named function
   registry. Compilation can add functions across source files and execute a
   top-level initializer. Duplicate function names are rejected.
-- `Value` is a copyable, NaN-boxed 64-bit word. Heap values contain checked,
-  globally unique handles; `OwnedValue` keeps a value and its runtime alive on
+- `Value` is a copyable, NaN-boxed 64-bit word. Heap values contain per-runtime slot indices; `OwnedValue` keeps a value and its runtime alive on
   the host. Heap arrays have stable allocations and own their elements. The
   special `globalThis` object remains separate; immutable UTF-8 strings use
   reference-counted heap handles.
@@ -59,12 +58,13 @@ not Rust-engine bindings.
 
 ## Values, objects, and arrays
 
-Heap values use globally unique checked handles in the NaN-box payload. The
-runtime maps handles to stable boxed allocations with reference counts. Arrays
+Heap values use per-runtime slot indices in the NaN-box payload. Each slot has
+a reference count and an allocation kind; large payloads are boxed at stable
+addresses. Vacant slots are reused after incremental destruction completes. Arrays
 contain contiguous `Value` elements; binding cells and closures have separate
-heap kinds. Environments and host handles share the
-runtime; raw `Value` tokens do not keep it alive. A common object header and
-collection metadata are future work for additional heap kinds.
+heap kinds. Environments and host handles share the runtime; raw `Value` tokens
+do not keep it alive; their owner must remain alive while they are used, and
+tokens must only be passed to their originating engine.
 
 Dense array literals and rest parameters allocate arrays; rest copies trailing
 arguments and retains referenced values. Numeric index reads return undefined
@@ -76,11 +76,15 @@ length growth, string keys, descriptors, and prototype mutation remain unsupport
 
 Array `filter`, `map`, `every`, and `some` snapshot the initial length and visit
 present positions with `(value, index, array)`, observing intervening writes and
-truncation. `every` and `some` short-circuit and skip holes. Their optional
-`thisArg` is unsupported except for undefined. `sort` is stable and in place;
+truncation. `every` and `some` short-circuit and skip holes. `find` instead
+visits every index, passing undefined for holes, and returns the first matching
+value or undefined. `forEach` visits present positions and returns undefined.
+Their optional `thisArg` is unsupported except for undefined.
+`sort` is stable and in place;
 the default order compares string conversions, undefined values follow sorted
 elements, and holes follow undefined. Comparators may return numbers or numeric
-strings; object conversions are unsupported. `join` supports primitive
+strings; object conversions are unsupported. `at` accepts numeric or undefined
+relative indices. `join` supports primitive
 values and separators; object-to-string conversion is unsupported. `pop` removes
 the last element and returns an owned value, or undefined for an empty array or
 hole. `indexOf` uses strict equality, skips holes, and accepts numeric or
@@ -197,10 +201,10 @@ lexical bindings in a for-loop initializer are explicitly rejected until
 per-iteration environments are implemented. Named function expressions and async functions remain unsupported. Recursion through a
 captured variable works but can create cycles.
 
-Each engine has one global environment and one code registry. A closure's heap
-identity ties it to that engine; foreign heap handles are rejected before code
-lookup. Code IDs are engine-local, never executable pointers, and resolve only
-against the live engine's registry. Compilations within that engine share global
+Each engine has one global environment and one code registry. A closure belongs
+to that engine; callers must not pass its value token to another engine. Code IDs
+are engine-local, never executable pointers, and resolve only against the live
+engine's registry. Compilations within that engine share global
 bindings, so existing closures observe subsequent global writes. A caller's
 local bindings do not replace the closure's defining globals.
 
@@ -524,8 +528,8 @@ The in operator uses a runtime presence lookup, preserving properties whose
 values are undefined and following ordinary object prototype links. Closures
 expose named properties and their lazy constructor prototype. Arrays recognize
 present canonical indices, excluding holes, and the supported length, filter,
-map, every, some, sort, join, pop, indexOf, concat, push, includes, reverse,
-slice, flat, flatMap, and fill properties.
+map, every, some, find, forEach, at, sort, join, pop, indexOf, concat, push,
+includes, reverse, slice, flat, flatMap, and fill properties.
 globalThis checks global binding presence. Primitive
 right operands, unsupported native receivers, and object-to-key conversion
 report explicit engine errors. Proxies and additional builtin prototypes remain
