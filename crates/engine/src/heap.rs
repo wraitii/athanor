@@ -1665,8 +1665,11 @@ impl Heap {
 }
 
 fn element_index(number: f64, limit: f64) -> Option<usize> {
-    (number.is_finite() && number >= 0.0 && number < limit && number.fract() == 0.0)
-        .then_some(number as usize)
+    if !(number >= 0.0 && number < limit) {
+        return None;
+    }
+    let index = number as usize;
+    (index as f64 == number).then_some(index)
 }
 
 fn heap_id(value: Value) -> Option<u64> {
@@ -2013,6 +2016,40 @@ impl Payload {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn numeric_element_indices_respect_limits_and_exactness() {
+        let cases = [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            -1.0,
+            -0.0,
+            0.0,
+            0.5,
+            1.0,
+            1.5,
+            4294967294.0,
+            4294967295.0,
+            4294967296.0,
+            (usize::MAX as f64) - 4096.0,
+            usize::MAX as f64,
+        ];
+        for limit in [u32::MAX as f64, usize::MAX as f64] {
+            for number in cases {
+                let expected = (number.is_finite()
+                    && number >= 0.0
+                    && number < limit
+                    && number.fract() == 0.0)
+                    .then_some(number as usize);
+                assert_eq!(
+                    element_index(number, limit),
+                    expected,
+                    "{number} with limit {limit}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn enumeration_respects_hidden_shadowing_and_releases_receivers() {

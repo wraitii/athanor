@@ -161,6 +161,73 @@ fn bitwise_and_preserves_conversion_boundaries_and_fallbacks() {
 }
 
 #[test]
+fn integer_binary_operations_preserve_conversion_and_shift_counts() {
+    let cases = [
+        0.0,
+        -0.0,
+        1.0,
+        -1.0,
+        31.0,
+        32.0,
+        33.0,
+        -33.0,
+        i32::MIN as f64,
+        i32::MAX as f64,
+        4294967295.0,
+        4294967296.0,
+        1.5,
+        -1.5,
+        f64::NAN,
+        f64::INFINITY,
+    ];
+    for mut engine in engines() {
+        engine
+            .compile(
+                r#"
+            function shl(a, b) { return a << b; }
+            function shr(a, b) { return a >> b; }
+            function ushr(a, b) { return a >>> b; }
+            function or(a, b) { return a | b; }
+            function xor(a, b) { return a ^ b; }
+            function fallback() { return ('8' << '2') === 32 && (true >> null) === 1; }
+            function fail() { return {} << 1; }
+        "#,
+                "ssa-integer-binary.js",
+            )
+            .unwrap();
+        for left in cases {
+            for right in cases {
+                let to_int = |n: f64| -> i32 {
+                    if !n.is_finite() || n == 0.0 {
+                        return 0;
+                    }
+                    n.trunc().rem_euclid(4294967296.0) as u32 as i32
+                };
+                let (a, b) = (to_int(left), to_int(right));
+                for (name, expected) in [
+                    ("shl", a.wrapping_shl(b as u32) as f64),
+                    ("shr", a.wrapping_shr(b as u32) as f64),
+                    ("ushr", (a as u32).wrapping_shr(b as u32) as f64),
+                    ("or", (a | b) as f64),
+                    ("xor", (a ^ b) as f64),
+                ] {
+                    assert_eq!(
+                        engine
+                            .call(name, &[Value::number(left), Value::number(right)])
+                            .unwrap()
+                            .value(),
+                        Value::number(expected),
+                        "{name} {left} {right}"
+                    );
+                }
+            }
+        }
+        assert_eq!(engine.call("fallback", &[]).unwrap().value(), Value::TRUE);
+        assert!(matches!(engine.call("fail", &[]), Err(Error::Runtime(_))));
+    }
+}
+
+#[test]
 fn numeric_index_getters_preserve_receivers_keys_and_ownership() {
     let source = r#"
         function read(receiver, index) { return receiver[index * 1]; }
@@ -188,5 +255,108 @@ fn numeric_index_getters_preserve_receivers_keys_and_ownership() {
         engine.compile(source, "ssa-numeric-index.js").unwrap();
         assert_eq!(engine.call("main", &[]).unwrap().value(), Value::TRUE);
         assert!(matches!(engine.call("fail", &[]), Err(Error::Runtime(_))));
+    }
+}
+
+#[test]
+fn guarded_math_preserves_mutation_and_fallback_semantics() {
+    let source = r#"
+        function calculate(x) { return Math.floor(x) + Math.ceil(x); }
+        function conditional(x) { if (x) return Math.sqrt(1); return 42; }
+        function ceilValue(x) { return Math.ceil(x); }
+        function breakMath() { Math = 1; }
+        function local(Math) { return Math.floor(2); }
+        function main() {
+            const originalMath = Math;
+            const floor = Math.floor;
+            const ceil = Math.ceil;
+            if (calculate(2.2) !== 5) return false;
+            Math.floor = function(x) { Math.ceil = function(x) { return 20; }; return 10; };
+            if (calculate(2.2) !== 30) return false;
+            Math.floor = floor;
+            Math.ceil = ceil;
+            if (calculate(2.2) !== 5) return false;
+            if (1 / ceilValue(-0.1) !== -Infinity) return false;
+            let nan = calculate(0 / 0);
+            if (nan === nan) return false;
+            Math = null;
+            if (conditional(false) !== 42) return false;
+            Math = originalMath;
+            return local({floor: function(x) { return 7; }}) === 7;
+        }
+    "#;
+    for mut engine in engines() {
+        engine.compile(source, "math-guard.js").unwrap();
+        assert_eq!(engine.call("main", &[]).unwrap().value(), Value::TRUE);
+        assert!(matches!(
+            engine
+                .call("ceilValue", &[Value::NULL])
+                .unwrap()
+                .value()
+                .as_number(),
+            Some(0.0)
+        ));
+        engine.call("breakMath", &[]).unwrap();
+        assert_eq!(
+            engine
+                .call("conditional", &[Value::FALSE])
+                .unwrap()
+                .value()
+                .as_number(),
+            Some(42.0)
+        );
+        assert!(matches!(
+            engine.call("conditional", &[Value::TRUE]),
+            Err(Error::Runtime(_))
+        ));
+    }
+}
+
+#[test]
+fn guarded_receiver_property_preserves_errors_and_lifetimes() {
+    let source = r#"
+        function sum(active) {
+            if (!active) return 9;
+            let total = 0;
+            for (let i = 0; i < Math.floor(3); ++i)
+                total += this.items[i] + this.items[i];
+            return total;
+        }
+        function test() {
+            const holder = {items: [1, 2, 3], sum: sum};
+            const detached = holder.sum;
+            return holder.sum(true) === 12 && detached(false) === 9;
+        }
+        function missing() { const holder = {sum: sum}; return holder.sum(true); }
+        function invalid() { return sum(true); }
+        function order() { return {} * 2 + this.items[0] + this.items[0] + Math.floor(1); }
+        function errorOrder() { const holder = {items: [1], run: order}; return holder.run(); }
+        function change() { this.items = [9]; return 0; }
+        function mutate() { let x = this.items[0]; this.change(); return x + this.items[0] + Math.floor(0); }
+        function testMutation() { const holder = {items: [1], change: change, run: mutate}; return holder.run() === 10; }
+        function returnItems() { let first = this.items; if (Math.floor(1)) return this.items; return first; }
+        function testReturned() { const result = {items: [4, 5], run: returnItems}.run(); return result[0] === 4 && result[1] === 5; }
+    "#;
+    let mut errors = None;
+    for mut engine in engines() {
+        engine.compile(source, "receiver-guard.js").unwrap();
+        assert_eq!(engine.call("test", &[]).unwrap().value(), Value::TRUE);
+        assert_eq!(
+            engine.call("testMutation", &[]).unwrap().value(),
+            Value::TRUE
+        );
+        assert_eq!(
+            engine.call("testReturned", &[]).unwrap().value(),
+            Value::TRUE
+        );
+        let actual: Vec<_> = ["missing", "invalid", "errorOrder"]
+            .into_iter()
+            .map(|name| format!("{:?}", engine.call(name, &[]).err().unwrap()))
+            .collect();
+        if let Some(expected) = &errors {
+            assert_eq!(&actual, expected);
+        } else {
+            errors = Some(actual);
+        }
     }
 }

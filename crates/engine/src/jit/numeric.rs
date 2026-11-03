@@ -53,6 +53,7 @@ pub(super) struct Annotations {
     pub results: HashMap<Value, Kind>,
     pub continuations: HashMap<Block, Vec<(Value, Kind)>>,
     pub helpers: HashMap<Inst, Helper>,
+    pub names: HashMap<Inst, String>,
     pub guards: HashMap<Inst, Value>,
     pub int32_guards: HashMap<Inst, Value>,
     pub retain_guards: HashMap<Inst, Value>,
@@ -73,6 +74,78 @@ pub(super) struct Analysis {
     retain_guards: Vec<Inst>,
     int32_guards: Vec<(Inst, bool)>,
     numeric_index_gets: Vec<Inst>,
+    unowned_local_stores: Vec<Inst>,
+}
+
+fn unowned_local_stores(
+    function: &Function,
+    annotations: &Annotations,
+    entries: &[Option<Facts>],
+) -> Vec<Inst> {
+    // Generators restore SSA locals from these slots after suspension.
+    if annotations
+        .helpers
+        .values()
+        .any(|helper| matches!(helper, Helper::GeneratorState | Helper::LocalGet))
+    {
+        return Vec::new();
+    }
+    let mut slots: HashMap<i64, (bool, Vec<Inst>)> = HashMap::default();
+    for block in function.layout.blocks() {
+        let mut facts = entries[block.as_u32() as usize]
+            .as_ref()
+            .map(|entry| block_facts(function, annotations, block, entry))
+            .unwrap_or_default();
+        for inst in function.layout.block_insts(block) {
+            if annotations.helpers.get(&inst) == Some(&Helper::LocalSet) {
+                let args = function.dfg.inst_args(inst);
+                let slot = function.dfg.resolve_aliases(args[1]);
+                let ValueDef::Result(slot_inst, _) = function.dfg.value_def(slot) else {
+                    return Vec::new();
+                };
+                let InstructionData::UnaryImm {
+                    opcode: Opcode::Iconst,
+                    imm,
+                } = function.dfg.insts[slot_inst]
+                else {
+                    return Vec::new();
+                };
+                let value = function.dfg.resolve_aliases(args[2]);
+                let unowned = value_kind(function, &facts, value).is_some_and(Kind::is_number)
+                    || is_unowned_constant(function, annotations, value);
+                let entry = slots
+                    .entry(imm.bits())
+                    .or_insert_with(|| (true, Vec::new()));
+                // A primitive store must still release any previous owning value.
+                entry.0 &= unowned;
+                entry.1.push(inst);
+            }
+            transfer(function, annotations, &mut facts, inst);
+        }
+    }
+    slots
+        .into_values()
+        .filter(|(unowned, _)| *unowned)
+        .flat_map(|(_, stores)| stores)
+        .collect()
+}
+
+fn is_unowned_constant(function: &Function, annotations: &Annotations, value: Value) -> bool {
+    if !annotations.constants.contains_key(&value) {
+        return false;
+    }
+    let ValueDef::Result(inst, _) = function.dfg.value_def(value) else {
+        return false;
+    };
+    let InstructionData::UnaryImm {
+        opcode: Opcode::Iconst,
+        imm,
+    } = function.dfg.insts[inst]
+    else {
+        return false;
+    };
+    let value = crate::value::Value::from_bits(imm.bits() as u64);
+    !value.is_object() && !value.is_string()
 }
 
 fn value_kind(function: &Function, facts: &Facts, value: Value) -> Option<Kind> {
@@ -224,6 +297,7 @@ impl Analysis {
                 retain_guards: Vec::new(),
                 int32_guards: Vec::new(),
                 numeric_index_gets: Vec::new(),
+                unowned_local_stores: Vec::new(),
             };
         };
         entries[entry.as_u32() as usize] = Some(Facts::default());
@@ -306,12 +380,14 @@ impl Analysis {
                 transfer(function, annotations, &mut facts, inst);
             }
         }
+        let unowned_local_stores = unowned_local_stores(function, annotations, &entries);
         Self {
             entries,
             guards,
             retain_guards,
             int32_guards,
             numeric_index_gets,
+            unowned_local_stores,
         }
     }
 
@@ -350,6 +426,14 @@ impl Analysis {
             function.dfg.replace(inst).iconst(ty, 0);
             count += 1;
         }
+        for &inst in &self.unowned_local_stores {
+            let value = function.dfg.inst_args(inst)[2];
+            let result = function.dfg.first_result(inst);
+            function.dfg.clear_results(inst);
+            function.dfg.change_to_alias(result, value);
+            function.layout.remove_inst(inst);
+            count += 1;
+        }
         count
     }
 
@@ -369,6 +453,10 @@ impl Analysis {
         );
         eprintln!("  {} int32 guards proven", self.int32_guards.len());
         eprintln!("  {} numeric index getters", self.numeric_index_gets.len());
+        eprintln!(
+            "  {} unowned local stores removable",
+            self.unowned_local_stores.len()
+        );
         for block in function.layout.blocks() {
             let Some(facts) = &self.entries[block.as_u32() as usize] else {
                 continue;
@@ -449,6 +537,54 @@ mod tests {
             .into_iter()
             .map(|(_, _, kind)| kind)
             .collect()
+    }
+
+    #[test]
+    fn removes_local_stores_only_when_the_entire_slot_is_unowned() {
+        for mixed in [false, true] {
+            let body = build(|b, annotations| {
+                let ctx = b.block_params(b.current_block().unwrap())[0];
+                let unknown = b.block_params(b.current_block().unwrap())[1];
+                let mut signature = cranelift_codegen::ir::Signature::new(
+                    cranelift_codegen::isa::CallConv::SystemV,
+                );
+                signature.params = vec![AbiParam::new(types::I64); 3];
+                signature.returns.push(AbiParam::new(types::I64));
+                let signature = b.func.import_signature(signature);
+                let helper = b.import_function(cranelift_codegen::ir::ExtFuncData {
+                    name: cranelift_codegen::ir::ExternalName::testcase("local_set"),
+                    signature,
+                    colocated: false,
+                    patchable: false,
+                });
+                for slot in [0, 1] {
+                    let slot_value = b.ins().iconst(types::I64, slot);
+                    let initial = if mixed && slot == 0 {
+                        unknown
+                    } else {
+                        constant(b, annotations, JsValue::UNINITIALIZED)
+                    };
+                    let number = constant(b, annotations, JsValue::number(7.0));
+                    let undefined = constant(b, annotations, JsValue::UNDEFINED);
+                    for value in [initial, number, undefined] {
+                        let call = b.ins().call(helper, &[ctx, slot_value, value]);
+                        annotations.helpers.insert(call, Helper::LocalSet);
+                    }
+                }
+                let result = b.ins().iconst(types::I8, 1);
+                b.ins().return_(&[result]);
+            });
+            let analysis = Analysis::compute(&body.function, &body.annotations);
+            let expected = if mixed { 3 } else { 6 };
+            assert_eq!(analysis.unowned_local_stores.len(), expected);
+            let mut function = body.function;
+            assert_eq!(analysis.simplify(&mut function), expected);
+            cranelift_codegen::verify_function(
+                &function,
+                &cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder()),
+            )
+            .unwrap();
+        }
     }
 
     #[test]

@@ -240,7 +240,12 @@ impl FunctionCompiler<'_, '_> {
 
     pub(super) fn binary(&mut self, op: BinaryOp, left: ClifValue, right: ClifValue) -> ClifValue {
         match op {
-            BinaryOp::BitwiseAnd => self.bitwise_and(left, right),
+            BinaryOp::BitwiseAnd
+            | BinaryOp::BitwiseOr
+            | BinaryOp::BitwiseXor
+            | BinaryOp::ShiftLeft
+            | BinaryOp::ShiftRight
+            | BinaryOp::ShiftRightUnsigned => self.integer_binary(op, left, right),
             BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
                 self.numeric_binary(op, left, right)
             }
@@ -262,7 +267,7 @@ impl FunctionCompiler<'_, '_> {
         self.b.inst_results(call)[0]
     }
 
-    fn bitwise_and(&mut self, left: ClifValue, right: ClifValue) -> ClifValue {
+    fn integer_binary(&mut self, op: BinaryOp, left: ClifValue, right: ClifValue) -> ClifValue {
         let (left_int, left_guard) = ir_helpers::unbox_int32(self.b, left);
         let (right_int, right_guard) = ir_helpers::unbox_int32(self.b, right);
         for (guard, value) in [(left_guard, left), (right_guard, right)] {
@@ -277,13 +282,29 @@ impl FunctionCompiler<'_, '_> {
         self.brif(both, fast, &[], slow, &[]);
 
         self.switch(fast);
-        let integer = self.b.ins().band(left_int, right_int);
-        let result = ir_helpers::box_int32(self.b, integer);
-        self.annotations.results.insert(result, Kind::Int32);
+        let integer = match op {
+            BinaryOp::BitwiseAnd => self.b.ins().band(left_int, right_int),
+            BinaryOp::BitwiseOr => self.b.ins().bor(left_int, right_int),
+            BinaryOp::BitwiseXor => self.b.ins().bxor(left_int, right_int),
+            BinaryOp::ShiftLeft => self.b.ins().ishl(left_int, right_int),
+            BinaryOp::ShiftRight => self.b.ins().sshr(left_int, right_int),
+            BinaryOp::ShiftRightUnsigned => self.b.ins().ushr(left_int, right_int),
+            _ => unreachable!(),
+        };
+        let (result, kind) = if matches!(op, BinaryOp::ShiftRightUnsigned) {
+            let float = self.b.ins().fcvt_from_uint(types::F64, integer);
+            (
+                self.b.ins().bitcast(types::I64, MemFlags::new(), float),
+                Kind::Number,
+            )
+        } else {
+            (ir_helpers::box_int32(self.b, integer), Kind::Int32)
+        };
+        self.annotations.results.insert(result, kind);
         self.jump(done, &[BlockArg::Value(result)]);
 
         self.switch(slow);
-        let result = self.binary_helper(BinaryOp::BitwiseAnd, left, right);
+        let result = self.binary_helper(op, left, right);
         self.jump(done, &[BlockArg::Value(result)]);
 
         self.switch(done);
@@ -406,6 +427,7 @@ impl FunctionCompiler<'_, '_> {
     }
 
     pub(super) fn global_access(&mut self, name: &str, value: Option<ClifValue>) -> ClifValue {
+        let annotation_name = name.to_owned();
         let name: Box<str> = name.into();
         let ptr = self.b.ins().iconst(self.pointer, name.as_ptr() as i64);
         let len = self.b.ins().iconst(types::I64, name.len() as i64);
@@ -414,6 +436,10 @@ impl FunctionCompiler<'_, '_> {
             Some(value) => self.call_helper(Helper::GlobalSet, &[ptr, len, value]),
             None => self.call_helper(Helper::GlobalGet, &[ptr, len]),
         };
+        if value.is_none() {
+            let call = self.b.func.dfg.value_def(result).unwrap_inst();
+            self.annotations.names.insert(call, annotation_name);
+        }
         self.check_error();
         result
     }
@@ -443,6 +469,7 @@ impl FunctionCompiler<'_, '_> {
         name: &str,
         value: Option<ClifValue>,
     ) -> ClifValue {
+        let annotation_name = name.to_owned();
         let name: Box<str> = name.into();
         let ptr = self.b.ins().iconst(self.pointer, name.as_ptr() as i64);
         let len = self.b.ins().iconst(types::I64, name.len() as i64);
@@ -451,6 +478,10 @@ impl FunctionCompiler<'_, '_> {
             Some(value) => self.call_helper(Helper::PropertySet, &[object, ptr, len, value]),
             None => self.call_helper(Helper::PropertyGet, &[object, ptr, len]),
         };
+        if value.is_none() {
+            let call = self.b.func.dfg.value_def(result).unwrap_inst();
+            self.annotations.names.insert(call, annotation_name);
+        }
         self.check_error();
         result
     }

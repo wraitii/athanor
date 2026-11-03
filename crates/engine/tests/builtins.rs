@@ -104,6 +104,9 @@ fn math_edge_cases() {
             Math.round(1.5) === 2 && 1/Math.ceil(-0.1) === -1/0 &&
             1/Math.min(0, -0) === -1/0 && 1/Math.max(-0, 0) === 1/0 &&
             Math.min() === 1/0 && Math.max() === -1/0 &&
+            Math.min(3, null, -2, true) === -2 && Math.max(-3, null, 2, true) === 2 &&
+            Math.sqrt(9, {}) === 3 && Math.pow(2, 3, {}) === 8 &&
+            Math.pow(2) !== Math.pow(2) && Math.sqrt() !== Math.sqrt() &&
             Math.min(1, nan) !== Math.min(1, nan) && Math.pow(1, 1/0) !== Math.pow(1, 1/0) &&
             Math.abs() !== Math.abs() && Math.abs(null) === 0 && Math.sign(true) === 1;
     }"#;
@@ -111,6 +114,9 @@ fn math_edge_cases() {
     for source in [
         "function main(){ return Math.abs('1'); }",
         "function main(){ return Math.max(1, {}); }",
+        "function main(){ return Math.min(0/0, '1'); }",
+        "function main(){ return Math.max(0/0, {}); }",
+        "function main(){ return Math.pow(0/0, {}); }",
     ] {
         assert!(run(source).is_err(), "{source}");
     }

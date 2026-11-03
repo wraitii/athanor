@@ -39,9 +39,11 @@ aliasing, and cycles; document deliberate semantic restrictions.
   fallbacks. This is not yet a complete implementation of JS binding or coercion
   semantics. Array-to-primitive conversion is not implemented: numeric coercion
   reports a runtime error when object conversion would be required.
-- Bitwise and shift operators, including compound assignments, use runtime
-  helpers with 32-bit integer conversion and shift counts masked to five bits.
-  Unsigned right shift returns a nonnegative number. Compound assignments share
+- Bitwise and shift operators, including compound assignments, use guarded
+  native operations for exact Int32 operands and runtime helpers for other
+  conversions. Shift counts are masked to five bits; unsigned right shift
+  returns a nonnegative number. These emission-time fast paths remain enabled
+  with `JS_JIT_SSA=0`, though SSA-based guard elimination is disabled. Compound assignments share
   binary operations and evaluate the target and its old value before the right
   operand. Numeric operators use heap-aware primitive string conversion.
 - `typeof` returns heap strings for supported values, identifying closures and
@@ -89,6 +91,39 @@ preserve or rebuild the affected metadata. The annotations are consumed before
 Cranelift optimization and are not expected to describe the backend's rewritten
 IR. Source locations remain available separately for debugging and profiling.
 
+The `--compile` effect report consumes helper annotations before numeric SSA
+simplification. Its structured helper summaries distinguish heap and global
+reads and writes, internal bookkeeping and ownership, allocation, errors, and
+reentry. Heap writes describe changes to existing JS-visible heap state;
+internal effects include ownership, freeing, and iterator bookkeeping, while
+allocation is separate. Unclassified helpers and unannotated calls remain
+unresolved. Property and numeric summaries depend on the current runtime lacking
+getter and coercion callbacks; iteration and enumeration currently use direct
+engine state rather than JS iterator callbacks. These are runtime assumptions,
+not guards. Admission only describes closure against reentry under those
+assumptions: it does not imply purity, establish call identity, or analyze raw
+memory effects.
+
+When SSA optimization is enabled, the compiler may also version functions with
+only supported `Math` calls. It traces each call through annotated property and
+global reads, rejects unknown effects, observable writes and non-stack stores,
+and checks that the replaced values have no other uses. An entry guard reads
+`Math` once and checks each distinct method against its expected native identity
+without invoking JS or throwing. A mismatch takes the original body; otherwise a
+specialized clone calls the existing Math implementation directly. The guard and
+clone depend on the current runtime's lack of getter and coercion callbacks. This
+initial specialization covers `ceil`, `floor`, `min`, `max`, and `sqrt` and does
+not establish any persistent realm-wide assumption. For such a function, one
+repeated named property read directly from the entry receiver can also be cached;
+the compiler selects the most frequent such read by static site count. A
+nonthrowing probe accepts only direct data results; a failed probe takes the
+original body before any observable operation. The dispatcher retains the probed
+value across the fast body and releases it afterward, including on error exits.
+A successful read of `undefined` is distinct from probe failure. This relies on
+the closed-effect proof and on property lookup not invoking JS callbacks; future
+accessor support must reject accessor probes. `JS_JIT_SSA=0` disables both
+specializations.
+
 The abstract kinds are Number, its subtypes Int32, OtherNumber, and NaN,
 plus Other and unknown. Int32 describes an exactly representable signed 32-bit
 integer, excluding negative zero. OtherNumber includes fractions, larger
@@ -120,10 +155,14 @@ the pass does not infer types from mutable heap contents or arbitrary calls.
 After reaching a fixed point, the pass replaces proven numeric-test instructions
 with boolean constants. Proven numeric local reads also have their retain
 guards replaced with false. Cranelift handles subsequent control-flow
-simplification. Frame-local tracking and engine-error checks remain unchanged.
+simplification. Frame-local stores are removed for slots whose stores are all
+proven numeric values or non-owning boxed constants. Slots with any unknown or
+owning store keep all stores, including primitive overwrites that release the
+previous value. Generator resume functions keep their frame slots for suspension
+and restoration. Slot numbering and engine-error checks remain unchanged.
 Helper effect contracts let emission omit JS-exception checks for helpers that
-cannot throw. This does not yet specialize receivers, hoist guards, or provide
-a tiered JIT.
+cannot throw. General receiver specialization, property hoisting, and tiered
+compilation remain unimplemented.
 
 `EngineOptions::ssa_opt` enables rewriting and defaults to true unless
 `JS_JIT_SSA=0`. `EngineOptions::ssa_dump` defaults to false unless
@@ -922,7 +961,7 @@ Shared ArrayBuffer storage, views, offsets, detachment, typed-array prototypes,
 custom properties, and other constructor or method forms are unsupported.
 This initial implementation stores each typed array independently.
 
-Bitwise AND has a guarded int32 IR path emitted through shared boxing and
+Bitwise and shift operators have guarded int32 IR paths emitted through shared boxing and
 unboxing routines in `jit/emit/ir_helpers.rs`. Unboxing uses saturating conversion
 and compares the boxed round trip, rejecting nonnumeric values, fractions,
 out-of-range numbers, and negative zero. Proven Int32 facts eliminate the guard;
@@ -935,6 +974,8 @@ and numeric entrypoints share the numeric read implementation and the slow
 receiver/property fallback. Specialization removes the boxed-index type test
 without assuming an array receiver, integer index, or valid bounds. Ownership
 and engine-error checks remain in place. Unknown index kinds keep IndexGet.
+Numeric element indices are checked against the receiver's limit and round-trip
+through `usize` to reject fractions; negative zero is accepted as index zero.
 
 The numeric getter keeps primitive and borrowed reads in its main body. Character
 allocation and the general property fallback are cold, non-inlined functions so
