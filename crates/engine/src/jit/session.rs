@@ -8,6 +8,7 @@ use crate::value::Value;
 struct Frame {
     locals: Vec<Value>,
     temps: Vec<Value>,
+    index_roots: Vec<Option<[Value; 3]>>,
     resume_state: usize,
 }
 
@@ -82,6 +83,7 @@ impl<'a> JitCtx<'a> {
         self.frames.push(Frame {
             locals,
             temps: Vec::new(),
+            index_roots: Vec::new(),
             resume_state: state,
         });
     }
@@ -109,6 +111,11 @@ impl<'a> JitCtx<'a> {
         }
         self.clear();
         let frame = self.frames.pop().unwrap();
+        for values in frame.index_roots.into_iter().flatten() {
+            for value in values {
+                self.global.heap().release(value);
+            }
+        }
         self.global
             .heap()
             .generator_suspend(generator, state, frame.locals);
@@ -136,6 +143,42 @@ impl<'a> JitCtx<'a> {
             self.global.heap().release(value);
         }
     }
+    pub(crate) fn root_index_read(
+        &mut self,
+        slot: usize,
+        receiver: Value,
+        key: Value,
+        result: Value,
+    ) -> bool {
+        let heap = self.global.heap();
+        if !heap.supports_indexed_storage(
+            receiver,
+            key,
+            crate::heap::IndexedStorageContract::DirectNumericIndexStorage,
+        ) {
+            return false;
+        }
+        let values = [receiver, key, result];
+        let mut retained = 0;
+        for value in values {
+            if !heap.retain(value) {
+                for value in values.into_iter().take(retained) {
+                    heap.release(value);
+                }
+                return false;
+            }
+            retained += 1;
+        }
+        let roots = &mut self.frames.last_mut().unwrap().index_roots;
+        roots.resize(roots.len().max(slot + 1), None);
+        if let Some(old) = roots[slot].replace(values) {
+            for value in old {
+                heap.release(value);
+            }
+        }
+        true
+    }
+
     pub(crate) fn local_set(&mut self, slot: usize, value: Value) -> Value {
         if !self.global.heap().retain(value) {
             self.error = Some(Error::Runtime("invalid heap value".into()));
@@ -157,7 +200,12 @@ impl<'a> JitCtx<'a> {
             Value::UNDEFINED
         };
         let frame = self.frames.pop().unwrap();
-        for owned in frame.locals.into_iter().chain(frame.temps) {
+        for owned in frame
+            .locals
+            .into_iter()
+            .chain(frame.temps)
+            .chain(frame.index_roots.into_iter().flatten().flatten())
+        {
             self.global.heap().release(owned);
         }
         value
@@ -209,5 +257,96 @@ pub(crate) unsafe fn call(
             }
         }
         None => Ok(value),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn indexed_read_roots_replace_and_release_on_error_exit() {
+        let engine = Engine::new().unwrap();
+        let mut ctx = JitCtx::new(&engine);
+        let heap = engine.global().heap();
+        let first = heap.object().unwrap();
+        let first_array = heap.array(&[first]).unwrap();
+        let second = heap.object().unwrap();
+        let second_array = heap.array(&[second]).unwrap();
+        let key = Value::number(0.0);
+        ctx.enter();
+        assert!(ctx.root_index_read(0, first_array, key, first));
+        heap.release(first_array);
+        heap.release(first);
+        heap.drain(100);
+        assert!(heap.valid(first_array) && heap.valid(first));
+        assert!(ctx.root_index_read(0, second_array, key, second));
+        assert_eq!(ctx.frames.last().unwrap().index_roots.len(), 1);
+        heap.drain(100);
+        assert!(!heap.valid(first_array) && !heap.valid(first));
+        heap.release(second_array);
+        heap.release(second);
+        ctx.error = Some(Error::Runtime("test error".into()));
+        ctx.exit(Value::UNDEFINED);
+        heap.drain(100);
+        assert!(!heap.valid(second_array) && !heap.valid(second));
+    }
+
+    #[test]
+    fn dispatcher_releases_rooted_index_receiver_on_return_and_error() {
+        let mut engine = Engine::new().unwrap();
+        engine
+            .compile(
+                r#"
+            function run(n) {
+                if (!this.items[0]) return 0;
+                let sum = 0;
+                for (let i = 0; i < Math.floor(n); ++i) sum += this.items[0].value;
+                return sum;
+            }
+            function fail(n) {
+                if (!this.items[0]) return 0;
+                for (let i = 0; i < Math.floor(n); ++i) this.items[0] * {};
+                return 0;
+            }
+            function invoke(holder) { return holder.run(2); }
+        "#,
+                "rooted-index-release.js",
+            )
+            .unwrap();
+        let heap = engine.global().heap();
+        for (name, error) in [("run", false), ("fail", true)] {
+            let item = heap.object().unwrap();
+            assert!(heap.set_property(item, "value", Value::number(7.0)));
+            let array = heap.array(&[item]).unwrap();
+            let holder = heap.object().unwrap();
+            assert!(heap.set_property(holder, "items", array));
+            assert!(heap.set_property(holder, "run", engine.global().get_raw(name).unwrap()));
+            assert_eq!(engine.call("invoke", &[holder]).is_err(), error);
+            heap.release(holder);
+            heap.release(array);
+            heap.release(item);
+            heap.drain(1000);
+            assert!(!heap.valid(holder) && !heap.valid(array) && !heap.valid(item));
+        }
+    }
+
+    #[test]
+    fn indexed_read_roots_reject_native_method_and_string_keys() {
+        let engine = Engine::new().unwrap();
+        let mut ctx = JitCtx::new(&engine);
+        let heap = engine.global().heap();
+        let array = heap.array(&[]).unwrap();
+        let key = heap.string("map").unwrap();
+        let method = heap
+            .native_function(crate::heap::NativeFunction::ArrayMap)
+            .unwrap();
+        ctx.enter();
+        assert!(!ctx.root_index_read(0, array, key, method));
+        assert!(ctx.frames.last().unwrap().index_roots.is_empty());
+        heap.release(array);
+        heap.release(key);
+        heap.release(method);
+        ctx.exit(Value::UNDEFINED);
     }
 }

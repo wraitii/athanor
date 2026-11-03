@@ -140,6 +140,7 @@ pub(super) fn specialize(
             .push(cranelift_codegen::ir::AbiParam::new(types::I64));
         let entry = body.function.layout.entry_block().unwrap();
         let cached = body.function.dfg.append_block_param(entry, types::I64);
+        body.annotations.invocation_roots.insert(cached);
         for &site in sites {
             body.function.dfg.replace(site).iadd_imm(cached, 0);
             body.annotations.helpers.remove(&site);

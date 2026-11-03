@@ -360,3 +360,296 @@ fn guarded_receiver_property_preserves_errors_and_lifetimes() {
         }
     }
 }
+
+#[test]
+fn temporary_clears_preserve_calls_branches_loops_and_exceptions() {
+    let source = r#"
+        function make(n) { return { value: n, text: 'value' + n }; }
+        function testBranch(flag) {
+            let item = flag ? make(7) : { value: 8, text: 'other' };
+            1 + 2;
+            return item.value + ':' + item.text;
+        }
+        function testLoop() {
+            let item = make(0);
+            for (let i = 0; i < 20; ++i) {
+                if (i % 2) item = make(i);
+                else 1 + i;
+            }
+            return item.value === 19 && item.text === 'value19';
+        }
+        function numberCall() { return [1, 2, 3].push(4); }
+        function testCall() { let a = make(11); numberCall(); return a.value === 11 && a.text === 'value11'; }
+        function testCatch() {
+            try { throw make(23); }
+            catch (value) { 1 + 2; return value.value === 23 && value.text === 'value23'; }
+        }
+        function* values() { yield make(31); yield make(32); }
+        function testGenerator() {
+            let g = values(); let a = g.next().value; let b = g.next().value;
+            return a.value === 31 && a.text === 'value31' && b.value === 32 && b.text === 'value32';
+        }
+        function failAdd() { return 'text' + {}; }
+        function main() {
+            return testBranch(true) === '7:value7' && testBranch(false) === '8:other' &&
+                testLoop() && testCall() && testCatch() && testGenerator();
+        }
+    "#;
+    for mut engine in engines() {
+        engine.compile(source, "ssa-temporary-clears.js").unwrap();
+        assert_eq!(engine.call("main", &[]).unwrap().value(), Value::TRUE);
+        assert!(matches!(
+            engine.call("failAdd", &[]),
+            Err(Error::Runtime(_))
+        ));
+    }
+}
+
+#[test]
+fn scoped_index_reads_preserve_values_guards_and_errors() {
+    let source = r#"
+        function repeat(a, key, count) {
+            let first = a[key];
+            let sum = 0;
+            for (let i = 0; i < count; ++i) {
+                if (a[key]) ++sum;
+            }
+            return first ? sum : -1;
+        }
+        function objects(a, count) {
+            let first = a[0];
+            let sum = 0;
+            for (let i = 0; i < count; ++i) sum += a[0].value;
+            return first.value + sum;
+        }
+        function methodReads(a) {
+            let first = a['map'];
+            let equal = true;
+            for (let i = 0; i < 3; ++i) equal = equal && a['map'] === first;
+            return equal;
+        }
+        function differing(a) {
+            let first = a[0];
+            let sum = 0;
+            for (let i = 0; i < 3; ++i) sum += a[i];
+            return first + sum;
+        }
+        function maybeFail(a, b, count) {
+            let first = a[0];
+            for (let i = 0; i < count; ++i) b[0];
+            return first;
+        }
+        function mutate(a) {
+            let first = a[0];
+            for (let i = 0; i < 2; ++i) { a[0] = i + 2; }
+            return first + a[0];
+        }
+        function callback(a, f) {
+            let first = a[0];
+            for (let i = 0; i < 2; ++i) f(a);
+            return first + a[0];
+        }
+        function main() {
+            let typed = new Uint16Array(1); typed[0] = 4;
+            let a = [{value: 7}];
+            return repeat(typed, 0, 5) === 5 && repeat([3], 0, 4) === 4 &&
+                repeat('hello', 0, 3) === 3 && repeat({'0': 9}, 0, 2) === 2 &&
+                repeat([0], 0, 3) === -1 && objects(a, 4) === 35 &&
+                differing([2, 3, 4]) === 11 && methodReads([]) && maybeFail([9], null, 0) === 9 &&
+                mutate([1]) === 4 && callback([1], function(a) { a[0] += 1; }) === 4;
+        }
+        function fail() { return maybeFail([9], null, 1); }
+        function failFirst() { return repeat(null, 0, 0); }
+    "#;
+    for mut engine in engines() {
+        engine.compile(source, "ssa-index-scope.js").unwrap();
+        assert_eq!(engine.call("main", &[]).unwrap().value(), Value::TRUE);
+        assert!(matches!(engine.call("fail", &[]), Err(Error::Runtime(_))));
+        assert!(matches!(
+            engine.call("failFirst", &[]),
+            Err(Error::Runtime(_))
+        ));
+    }
+}
+
+#[test]
+fn rooted_receiver_scope_preserves_borrowed_values_and_errors() {
+    let source = r#"
+        function read(n) {
+            if (!this.items[0]) return null;
+            let total = 0;
+            for (let i = 0; i < Math.floor(n); ++i) total += this.items[0].value;
+            if (total < 0) return null;
+            return this.items[0];
+        }
+        function fail(n) {
+            if (!this.items[0]) return 0;
+            for (let i = 0; i < Math.floor(n); ++i) this.items[0] * {};
+            return 1;
+        }
+        function run() {
+            const value = {items: [{value: 7}], read: read}.read(5);
+            return value.value === 7;
+        }
+        function runFailure() { return {items: [{value: 7}], read: fail}.read(1); }
+    "#;
+    let mut expected_error = None;
+    for mut engine in engines() {
+        engine.compile(source, "rooted-index-scope.js").unwrap();
+        assert_eq!(engine.call("run", &[]).unwrap().value(), Value::TRUE);
+        let error = format!("{:?}", engine.call("runFailure", &[]).err().unwrap());
+        if let Some(expected) = &expected_error {
+            assert_eq!(&error, expected);
+        } else {
+            expected_error = Some(error);
+        }
+    }
+}
+
+#[test]
+fn semantic_bit_loop_accepts_local_indexed_receivers() {
+    let source = r#"
+        function count(data, key, start, end, initial) {
+            let result = initial;
+            if (data[key])
+                for (let i = start; i <= end; ++i)
+                    if (data[key] & (1 << i)) ++result;
+            return result;
+        }
+        function run() {
+            let data = new Uint16Array(1); data[0] = 257;
+            return count(data, 0, 0, 8, 0) === 2 &&
+                count([257], 0, 0, 8, 0) === 2 &&
+                count(['257'], 0, 0, 8, 0) === 2 &&
+                count({'0': 257}, 0, 0, 8, 0) === 2 &&
+                count(data, 0, 32, 32, 0) === 1 &&
+                count(data, 0, 0, 8, '2') === 4;
+        }
+        function fail() { return count(null, 0, 0, 0, 0); }
+    "#;
+    let mut expected = None;
+    for mut engine in engines() {
+        engine
+            .compile(source, "semantic-local-receiver.js")
+            .unwrap();
+        assert_eq!(engine.call("run", &[]).unwrap().value(), Value::TRUE);
+        let error = format!("{:?}", engine.call("fail", &[]).err().unwrap());
+        if let Some(expected) = &expected {
+            assert_eq!(&error, expected);
+        } else {
+            expected = Some(error);
+        }
+    }
+}
+
+#[test]
+fn semantic_bit_loop_preserves_numeric_boundaries_and_fallbacks() {
+    let source = r#"
+        function count(start, end, initial) {
+            let result = initial;
+            const key = 0;
+            if (this.data[key])
+                for (let i = start; i <= end; ++i)
+                    if (this.data[key] & (1 << i)) ++result;
+            return result;
+        }
+        function aliasKey(start, end) {
+            let result = 0;
+            if (this.data[result])
+                for (let i = start; i <= end; ++i)
+                    if (this.data[result] & (1 << i)) ++result;
+            return result;
+        }
+        function aliasBound(start) {
+            let result = 0;
+            const key = 0;
+            if (this.data[key])
+                for (let i = start; i <= result; ++i)
+                    if (this.data[key] & (1 << i)) ++result;
+            return result;
+        }
+        function run() {
+            let data = new Uint16Array(1); data[0] = 257;
+            let unsigned = new Uint32Array(1); unsigned[0] = 2147483648;
+            let full = new Uint32Array(1); full[0] = 4294967295;
+            let holder = { data: data, count: count };
+            let big = 9007199254740992;
+            let nan = holder.count(0, 0, 0/0);
+            return holder.count(0, 8, 0) === 2 && holder.count(0, 8, big) === big &&
+                holder.count(0, 8, 9007199254740991) === big &&
+                1 / holder.count(1, 7, -0) === -Infinity &&
+                holder.count(8, 0, 5) === 5 && holder.count(-32, -32, 5) === 6 &&
+                holder.count(32, 32, 5) === 6 && holder.count(0.5, 0.5, 5) === 6 &&
+                holder.count(0, 0, '2') === 3 && holder.count(0, 0, Infinity) === Infinity &&
+                nan !== nan && {data: [257], count: count}.count(0, 8, 0) === 2 &&
+                {data: ['257'], count: count}.count(0, 8, 0) === 2 &&
+                {data: {'0': 257}, count: count}.count(0, 8, 0) === 2 &&
+                {data: [-2147483648], count: count}.count(31, 31, 0) === 1 &&
+                {data: unsigned, count: count}.count(31, 31, 0) === 1 &&
+                {data: full, count: count}.count(0, 31, 0) === 32 &&
+                {data: [7, 0], count: aliasKey}.count(0, 2) === 1 &&
+                {data: [1], count: aliasBound}.count(0) === 1;
+        }
+        function fail() { return {data: [1], count: count}.count(0, 0, {}); }
+        function badSource() { return {data: null, count: count}.count(0, 0, 0); }
+    "#;
+    let mut expected = None;
+    for mut engine in engines() {
+        engine.compile(source, "semantic-bit-loop.js").unwrap();
+        assert_eq!(engine.call("run", &[]).unwrap().value(), Value::TRUE);
+        let errors: Vec<_> = ["fail", "badSource"]
+            .into_iter()
+            .map(|name| format!("{:?}", engine.call(name, &[]).err().unwrap()))
+            .collect();
+        if let Some(expected) = &expected {
+            assert_eq!(&errors, expected);
+        } else {
+            expected = Some(errors);
+        }
+    }
+}
+
+#[test]
+fn semantic_bit_loop_preserves_tdz_and_const_errors() {
+    let source = r#"
+        function tdzBound() {
+            let result = 0; const key = 0; const end = 0;
+            if (this.data[key])
+                for (let i = start; i <= end; ++i)
+                    if (this.data[key] & (1 << i)) ++result;
+            let start = 0;
+            return result;
+        }
+        function tdzCounter() {
+            const key = 0; const start = 0; const end = 0;
+            if (this.data[key])
+                for (let i = start; i <= end; ++i)
+                    if (this.data[key] & (1 << i)) ++result;
+            let result = 9;
+            return result;
+        }
+        function firstError() { return {data: null, run: tdzBound}.run(); }
+        function boundError() { return {data: [1], run: tdzBound}.run(); }
+        function counterError() { return {data: [1], run: tdzCounter}.run(); }
+        function noCounterRead() { return {data: [2], run: tdzCounter}.run(); }
+    "#;
+    let invalid = r#"function f() { const result = 0; const key = 0; const start = 0; const end = 0; if (this.data[key]) for (let i = start; i <= end; ++i) if (this.data[key] & (1 << i)) ++result; }"#;
+    let mut expected = None;
+    for mut engine in engines() {
+        engine.compile(source, "semantic-bit-tdz.js").unwrap();
+        assert_eq!(
+            engine.call("noCounterRead", &[]).unwrap().value(),
+            Value::number(9.0)
+        );
+        let errors: Vec<_> = ["firstError", "boundError", "counterError"]
+            .into_iter()
+            .map(|name| format!("{:?}", engine.call(name, &[]).err().unwrap()))
+            .collect();
+        if let Some(expected) = &expected {
+            assert_eq!(&errors, expected);
+        } else {
+            expected = Some(errors);
+        }
+        assert!(engine.compile(invalid, "semantic-bit-const.js").is_err());
+    }
+}

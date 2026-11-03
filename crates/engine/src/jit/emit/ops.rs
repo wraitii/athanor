@@ -4,7 +4,7 @@ use cranelift_module::Module;
 use oxc_syntax::operator::{AssignmentOperator, BinaryOperator};
 
 use crate::jit::helpers::Helper;
-use crate::jit::numeric::Kind;
+use crate::jit::numeric::{IndexedRead, IndexedReadContract, Kind};
 use crate::value::Value;
 use crate::value::{TAG_FIRST, TAG_SHIFT, TAG_SPAN, TAG_STRING};
 
@@ -423,6 +423,17 @@ impl FunctionCompiler<'_, '_> {
             None => self.call_helper(Helper::IndexGet, &[object, index]),
         };
         self.check_error();
+        if value.is_none() {
+            self.annotations.indexed_reads.push(IndexedRead {
+                call: self.b.func.dfg.value_def(result).unwrap_inst(),
+                receiver: object,
+                key: index,
+                result,
+                success: self.b.current_block().unwrap(),
+                source: (self.source_span.start, self.source_span.end),
+                contract: IndexedReadContract::RuntimeValue,
+            });
+        }
         result
     }
 

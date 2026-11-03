@@ -495,9 +495,8 @@ impl Compiler {
             .collect();
 
         let mut dumped = Vec::new();
-        let mut next_ir = 1;
-        let mut complete_ir = Vec::new();
-        for (id, code) in pending {
+        for (id, mut code) in pending {
+            let mut listing = None;
             self.context.clear();
             self.context.func = code.function;
             let name = self
@@ -507,6 +506,9 @@ impl Compiler {
                 .unwrap_or_else(|| format!("jsfn_{}", id.as_u32()));
             if self.compile_dump {
                 effects::dump(&self.context.func, &code.annotations, &name, &lines);
+                for region in &code.annotations.semantic_regions {
+                    println!("[{name}] semantic loop (before CLIF optimization)\n{region}");
+                }
             }
             if self.ssa_opt || self.ssa_dump {
                 let analysis = numeric::Analysis::compute(&self.context.func, &code.annotations);
@@ -514,20 +516,75 @@ impl Compiler {
                     analysis.dump(&self.context.func, &name, &code.annotations);
                 }
                 if self.ssa_opt {
-                    analysis.simplify(&mut self.context.func);
+                    let mut analysis = analysis;
+                    let mut rewritten = 0;
+                    loop {
+                        analysis.simplify(&mut self.context.func);
+                        code.annotations.prune(&self.context.func);
+                        let count = numeric::simplify_constant_branches(&mut self.context.func);
+                        rewritten += count;
+                        if count == 0 {
+                            break;
+                        }
+                        self.context.flowgraph();
+                        self.context
+                            .eliminate_unreachable_code(self.module.isa())
+                            .map_err(|error| Error::Compile(error.to_string()))?;
+                        code.annotations.prune(&self.context.func);
+                        analysis =
+                            numeric::Analysis::compute(&self.context.func, &code.annotations);
+                    }
+                    if self.ssa_dump {
+                        eprintln!("js ssa [{name}]: simplified {rewritten} constant branches");
+                    }
+                    let reused = super::read_scope::specialize(
+                        &mut self.context,
+                        &mut code.annotations,
+                        &mut self.module,
+                        self.helpers[helpers::Helper::IndexRoot as usize],
+                        self.helpers[helpers::Helper::IndexProbe as usize],
+                    );
+                    if self.ssa_dump {
+                        let count = usize::from(reused.is_some());
+                        let lifetime = reused.map(|(lifetime, _)| lifetime);
+                        eprintln!(
+                            "js ssa [{name}]: {count} scoped indexed reads reused; lifetime: {lifetime:?}"
+                        );
+                        if reused.is_some_and(|(_, shared)| shared) {
+                            eprintln!("js ssa [{name}]: shared existing indexed storage guard");
+                        }
+                    }
+                    let analysis =
+                        numeric::Analysis::compute(&self.context.func, &code.annotations);
                     let numeric_get = self.module.declare_func_in_func(
                         self.helpers[helpers::Helper::IndexGetNumeric as usize],
                         &mut self.context.func,
                     );
-                    analysis.specialize_index_gets(&mut self.context.func, numeric_get);
+                    analysis.specialize_index_gets(
+                        &mut self.context.func,
+                        &mut code.annotations,
+                        numeric_get,
+                    );
+                    let analysis =
+                        numeric::Analysis::compute(&self.context.func, &code.annotations);
+                    let removed = analysis
+                        .remove_empty_temp_clears(&mut self.context.func, &mut code.annotations);
+                    if self.ssa_dump {
+                        eprintln!("js ssa [{name}]: removed {removed} empty temporary clears");
+                    }
                     self.context
                         .verify(self.module.isa())
                         .map_err(|error| Error::Compile(error.to_string()))?;
                 }
             }
             if self.dump_ir {
-                complete_ir.push((0, format!("[{name}]")));
-                complete_ir.extend(ir_lines(&mut self.context.func, &lines, &mut next_ir));
+                let ir = ir_lines(&mut self.context.func, source, &lines);
+                if let Some(dump) = self.dump.as_mut() {
+                    match dump.listing(&name, &ir) {
+                        Ok(written) => listing = Some(written),
+                        Err(error) => eprintln!("js jit: listing write failed: {error}"),
+                    }
+                }
             }
             if self.compile_dump {
                 if self.compile_ir {
@@ -568,43 +625,27 @@ impl Compiler {
                     locations.insert(location.start, line);
                 }
                 locations.insert(0, default_line.unwrap_or(1));
-                dumped.push((id, name, size, locations.into_iter().collect::<Vec<_>>()));
+                dumped.push((
+                    id,
+                    name,
+                    size,
+                    locations.into_iter().collect::<Vec<_>>(),
+                    listing,
+                ));
             }
         }
         self.module
             .finalize_definitions()
             .map_err(|error| Error::Compile(error.to_string()))?;
-        let listing = if self.dump_ir {
-            if let Some(dump) = self.dump.as_mut() {
-                match dump.listing(source, &complete_ir) {
-                    Ok(listing) => Some(listing),
-                    Err(error) => {
-                        eprintln!("js jit: source listing write failed: {error}");
-                        None
-                    }
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
         if let Some(dump) = self.dump.as_mut() {
-            for (id, name, size, locations) in dumped {
+            for (id, name, size, locations, listing) in dumped {
                 let code = self.module.get_finalized_function(id);
                 let bytes = unsafe { std::slice::from_raw_parts(code, size) };
-                if let Some((path, mapping, ir_mapping)) = &listing {
+                if let Some((path, ir_mapping)) = &listing {
                     let filename = path.to_str().unwrap_or(source_path);
                     let locations = locations
                         .iter()
-                        .filter_map(|&(offset, line)| {
-                            let line = if self.dump_ir {
-                                ir_mapping.get(&line).copied()
-                            } else {
-                                mapping.get(line as usize - 1).copied()
-                            };
-                            line.map(|line| (offset, line))
-                        })
+                        .filter_map(|&(offset, id)| ir_mapping.get(&id).map(|&line| (offset, line)))
                         .collect::<Vec<_>>();
                     dump.record(&name, filename, &locations, bytes);
                 } else if self.dump_ir {
@@ -875,6 +916,7 @@ impl Compiler {
                 captured,
                 closures,
                 kind,
+                self.ssa_opt,
             )?;
             builder.seal_all_blocks();
             builder.finalize();
@@ -983,10 +1025,12 @@ fn line_at(starts: &[u32], offset: u32) -> u32 {
 
 fn ir_lines(
     function: &mut cranelift_codegen::ir::Function,
+    source: &str,
     starts: &[u32],
-    next_ir: &mut u32,
 ) -> Vec<(u32, String)> {
     let mut result = Vec::new();
+    let mut next_ir = 1;
+    let mut last_line = 0;
     let blocks: Vec<_> = function.layout.blocks().collect();
     let display = function.display().to_string();
     if let Some(first) = blocks.first() {
@@ -1026,14 +1070,24 @@ fn ir_lines(
         let insts: Vec<_> = function.layout.block_insts(block).collect();
         for inst in insts {
             let location = function.srcloc(inst);
-            let source = if location.is_default() {
-                String::new()
-            } else {
-                format!("  ; source line {}", line_at(starts, location.bits()))
-            };
-            let text = format!("    {}{source}", function.dfg.display_inst(inst));
-            let index = *next_ir;
-            *next_ir += 1;
+            if !location.is_default() {
+                let line = line_at(starts, location.bits());
+                if line != last_line {
+                    last_line = line;
+                    let start = starts[line as usize - 1] as usize;
+                    let end = starts
+                        .get(line as usize)
+                        .map_or(source.len(), |&e| e as usize);
+                    result.push((0, String::new()));
+                    result.push((
+                        0,
+                        format!("  ;;; JS {line:>5} | {}", source[start..end].trim()),
+                    ));
+                }
+            }
+            let text = format!("    {}", function.dfg.display_inst(inst));
+            let index = next_ir;
+            next_ir += 1;
             function.set_srcloc(inst, SourceLoc::new(index));
             result.push((index, text));
         }

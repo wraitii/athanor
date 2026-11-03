@@ -5,6 +5,7 @@ mod loops;
 mod ops;
 mod optional;
 mod scope;
+mod semantic_loop;
 mod statement;
 mod switch;
 
@@ -41,6 +42,7 @@ pub(super) struct FunctionCompiler<'a, 'f> {
     names: &'a mut Vec<Box<str>>,
     source_name: (usize, usize),
     source_span: Span,
+    semantic_loops: bool,
     b: &'a mut FunctionBuilder<'f>,
     module: &'a mut JITModule,
     helpers: &'a [FuncId],
@@ -81,6 +83,7 @@ pub(super) fn build_function(
     captured: &HashSet<SymbolId>,
     closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
     kind: FunctionKind,
+    semantic_loops: bool,
 ) -> Result<(), Error> {
     let entry = b.create_block();
     b.switch_to_block(entry);
@@ -94,6 +97,7 @@ pub(super) fn build_function(
         names,
         source_name,
         source_span: params.span,
+        semantic_loops,
         b,
         module,
         helpers,
@@ -220,6 +224,7 @@ pub(super) fn build_global(
         names,
         source_name,
         source_span: Span::new(0, 0),
+        semantic_loops: false,
         b,
         module,
         helpers,

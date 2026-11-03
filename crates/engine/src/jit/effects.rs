@@ -38,6 +38,11 @@ pub(super) fn effects(helper: Helper) -> Effects {
             (Reentry::Closed, INTERNAL | ERROR, None)
         }
         MathGuard => (Reentry::Closed, HEAP_READ | GLOBAL_READ, None),
+        IndexRoot | IndexProbe => (
+            Reentry::Closed,
+            HEAP_READ | INTERNAL,
+            Some("direct numeric array read has stable storage"),
+        ),
         PropertyProbe => (
             Reentry::Closed,
             HEAP_READ | INTERNAL,
@@ -83,6 +88,34 @@ pub(super) fn effects(helper: Helper) -> Effects {
         reentry,
         flags,
         assumption,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TemporaryEffect {
+    None,
+    RetainArgument,
+    NumericAdd,
+    Enter,
+    Clear,
+    MayRegister,
+}
+
+pub(super) fn temporary_effect(helper: Helper) -> TemporaryEffect {
+    use Helper::*;
+    use TemporaryEffect::*;
+    match helper {
+        FrameEnter => Enter,
+        TempClear => Clear,
+        TempRetain => RetainArgument,
+        Add => NumericAdd,
+        LocalSet | ErrorPending | ExceptionPending | ErrorOrigin | Throw | MathGuard
+        | MathDirect | IndexRoot | IndexProbe | PropertyRelease | Truthy | BitwiseAnd
+        | BitwiseOr | BitwiseXor | ShiftLeft | ShiftRight | ShiftRightUnsigned | Sub | Mul
+        | Div | Rem | Pow | LooseEqual | LooseNotEqual | StrictEqual | StrictNotEqual | Less
+        | LessEqual | Greater | GreaterEqual | UnaryPlus | UnaryNegation | LogicalNot
+        | BitwiseNot => None,
+        _ => MayRegister,
     }
 }
 

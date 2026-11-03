@@ -21,14 +21,15 @@ active engine, including nested library loads.
 Set `JS_JIT_JITDUMP=1` to write a `jit-<pid>-<timestamp>-js.dump` file to the
 temporary directory. `samply` and `perf` can consume the dump, and debug
 information points at the original JavaScript source so they show JavaScript
-lines alongside the assembly. Set `JS_JIT_JITDUMP=2` to also write one `.jsir`
-listing per evaluated source file; debug information then points at these
-listings, which contain the JavaScript source followed by complete Cranelift IR
-in block order. Instructions with a source location indicate its JavaScript line.
+lines alongside the assembly. Set `JS_JIT_JITDUMP=2` to instead write one `.jsir` listing per compiled
+function; debug information then points at these listings, which contain the
+complete Cranelift IR in block order with the originating JavaScript source line
+interspersed whenever it changes.
 
 Use `--compile --eval SOURCE` or `--compile SCRIPT` to print Cranelift IR
 and a per-function helper effect and reentry admission report without executing
-the source. The report identifies unresolved calls and current runtime assumptions;
+the source. Recognized semantic loops are also printed with their fast-path
+guards and fallback. The report identifies unresolved calls and current runtime assumptions;
 its admission status does not establish purity or analyze raw memory effects.
 Add `--ast` for the analyzed Oxc AST and generator resume plans, or `--asm` for
 Cranelift machine-instruction output. Use `--no-ir` to omit IR while retaining
@@ -57,9 +58,11 @@ Release builds include line tables for profiling.
 The JS numeric SSA pass runs after frontend SSA construction and before
 Cranelift optimization. It records boxed constants, helper identities, and
 numeric guards, propagates facts through branches and block arguments, and
-replaces proven guards with constants. It also removes frame stores for locals
-that only hold non-owning values, excluding generator resume functions.
-Error checks remain unchanged. Set `JS_JIT_SSA=0` to disable it, and `JS_JIT_SSA_DUMP=1` to print
+replaces proven guards with constants. Constant branches are rewritten and
+unreachable blocks removed before analysis repeats. It also removes frame stores for locals
+that only hold non-owning values, excluding generator resume functions. A
+separate control-flow analysis removes temporary clears proven empty; unknown
+calls and potentially owning reads remain barriers. Error checks remain unchanged. Set `JS_JIT_SSA=0` to disable it, and `JS_JIT_SSA_DUMP=1` to print
 the inferred guard and block-parameter kinds to stderr. Combining these settings
 runs the analysis without applying its transformations. The corresponding
 embedding options are `EngineOptions::ssa_opt` and `EngineOptions::ssa_dump`.

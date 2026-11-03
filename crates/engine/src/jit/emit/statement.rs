@@ -165,7 +165,9 @@ impl FunctionCompiler<'_, '_> {
                 self.emit_variable_declaration(declaration)
             }
             Statement::IfStatement(statement) => {
+                let region = self.prepare_bit_loop(statement);
                 let test = self.emit_expression(&statement.test)?;
+                let probe = region.as_ref().and_then(|_| self.probe_bit_loop(test));
                 let condition = self.truthy(test);
                 self.clear_temporaries();
                 let consequent = self.b.create_block();
@@ -174,6 +176,12 @@ impl FunctionCompiler<'_, '_> {
                 self.brif(condition, consequent, &[], alternate, &[]);
 
                 self.switch(consequent);
+                if let (Some(region), Some(probe)) = (&region, probe) {
+                    self.record_bit_loop(region);
+                    let generic = self.b.create_block();
+                    self.emit_bit_loop(region, test, probe, generic, done);
+                    self.switch(generic);
+                }
                 self.emit_statement(&statement.consequent)?;
                 if !self.terminated {
                     self.jump(done, &[]);

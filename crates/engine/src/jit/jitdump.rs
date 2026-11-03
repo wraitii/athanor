@@ -78,26 +78,30 @@ pub(super) struct Writer {
 }
 
 fn write_listing(
-    source: &str,
     instructions: &[(u32, String)],
     out: &mut impl Write,
-) -> io::Result<(Vec<u32>, BTreeMap<u32, u32>)> {
-    let mut mapping = Vec::new();
+) -> io::Result<BTreeMap<u32, u32>> {
     let mut ir_mapping = BTreeMap::new();
-    let mut next_line = 1;
-    for (index, line) in source.split('\n').enumerate() {
-        mapping.push(next_line);
-        writeln!(out, "{:>5} | {line}", index + 1)?;
-        next_line += 1;
-    }
-    for (id, instruction) in instructions {
+    for (index, (id, instruction)) in instructions.iter().enumerate() {
         writeln!(out, "{instruction}")?;
         if *id != 0 {
-            ir_mapping.insert(*id, next_line);
+            ir_mapping.insert(*id, index as u32 + 1);
         }
-        next_line += 1;
     }
-    Ok((mapping, ir_mapping))
+    Ok(ir_mapping)
+}
+
+fn sanitize(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(80)
+        .collect()
 }
 
 fn push_u32(out: &mut Vec<u8>, value: u32) {
@@ -164,19 +168,21 @@ impl Writer {
 
     pub(super) fn listing(
         &mut self,
-        source: &str,
-        complete_ir: &[(u32, String)],
-    ) -> io::Result<(PathBuf, Vec<u32>, BTreeMap<u32, u32>)> {
-        let path = self
-            .path
-            .with_extension(format!("{}.jsir", self.next_listing));
+        name: &str,
+        ir: &[(u32, String)],
+    ) -> io::Result<(PathBuf, BTreeMap<u32, u32>)> {
+        let path =
+            self.path
+                .with_extension(format!("{}.{}.jsir", self.next_listing, sanitize(name)));
         self.next_listing += 1;
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&path)?;
-        let (mapping, ir_mapping) = write_listing(source, complete_ir, &mut file)?;
-        Ok((path, mapping, ir_mapping))
+        let mut out = io::BufWriter::new(file);
+        let mapping = write_listing(ir, &mut out)?;
+        out.flush()?;
+        Ok((path, mapping))
     }
 
     pub(super) fn record(
@@ -252,16 +258,14 @@ mod tests {
     }
 
     #[test]
-    fn listing_preserves_source_lines_and_maps_annotations() {
-        let instructions = vec![(0, "block0(v0: i64):".into()), (1, "    return v0".into())];
+    fn listing_maps_annotations_to_lines() {
+        let instructions = vec![
+            (0, "block0(v0: i64):".into()),
+            (0, "  ;     1 | let a;".into()),
+            (1, "    return v0".into()),
+        ];
         let mut listing = Vec::new();
-        let (mapping, ir_mapping) =
-            write_listing("let a;\nlet b;\n", &instructions, &mut listing).unwrap();
-        assert_eq!(mapping, vec![1, 2, 3]);
-        assert_eq!(ir_mapping.get(&1), Some(&5));
-        assert_eq!(
-            String::from_utf8(listing).unwrap(),
-            "    1 | let a;\n    2 | let b;\n    3 | \nblock0(v0: i64):\n    return v0\n"
-        );
+        let mapping = write_listing(&instructions, &mut listing).unwrap();
+        assert_eq!(mapping.get(&1), Some(&3));
     }
 }

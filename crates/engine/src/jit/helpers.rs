@@ -96,6 +96,8 @@ define_helpers! {
     Rest => Rest, js_rest;
     IndexGet => Binary, js_index_get;
     IndexGetNumeric => NumericIndex, js_index_get_numeric;
+    IndexRoot => Quaternary, js_index_root;
+    IndexProbe => Binary, js_index_probe;
     IndexSet => IndexSet, js_index_set;
     PropertyGet => PropertyGet, js_property_get;
     PropertySet => PropertySet, js_property_set;
@@ -747,6 +749,24 @@ fn typed_numeric_index(ctx: &JitCtx, key: Value) -> Option<Option<usize>> {
             None
         },
     )
+}
+
+extern "C" fn js_index_root(
+    ctx: *mut JitCtx,
+    slot: u64,
+    receiver: Value,
+    key: Value,
+    result: Value,
+) -> Value {
+    Value::boolean(unsafe { &mut *ctx }.root_index_read(slot as usize, receiver, key, result))
+}
+
+extern "C" fn js_index_probe(ctx: *mut JitCtx, receiver: Value, key: Value) -> Value {
+    Value::boolean(unsafe { &*ctx }.global.heap().supports_indexed_storage(
+        receiver,
+        key,
+        crate::heap::IndexedStorageContract::DirectNumericIndexStorage,
+    ))
 }
 
 extern "C" fn js_index_get(ctx: *mut JitCtx, array: Value, index: Value) -> Value {

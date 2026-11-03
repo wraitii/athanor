@@ -154,12 +154,67 @@ the pass does not infer types from mutable heap contents or arbitrary calls.
 
 After reaching a fixed point, the pass replaces proven numeric-test instructions
 with boolean constants. Proven numeric local reads also have their retain
-guards replaced with false. Cranelift handles subsequent control-flow
-simplification. Frame-local stores are removed for slots whose stores are all
+guards replaced with false. Constant conditional branches become jumps carrying
+the selected edge's arguments, and Cranelift removes unreachable blocks. Numeric
+analysis and branch cleanup repeat while branches are simplified, before index
+specialization and temporary-clear analysis. Frame-local stores are removed for slots whose stores are all
 proven numeric values or non-owning boxed constants. Slots with any unknown or
 owning store keep all stores, including primitive overwrites that release the
 previous value. Generator resume functions keep their frame slots for suspension
 and restoration. Slot numbering and engine-error checks remain unchanged.
+After these rewrites, a forward may-register analysis removes a temporary clear
+only if every reachable path since frame entry or the preceding clear is known
+not to have registered a temporary. Joins and loop backedges combine states
+conservatively, and constant branch conditions exclude unreachable helper paths.
+Helper contracts distinguish operations that cannot register from those that
+may; numeric and nonowning operand facts refine retain and addition. Arbitrary
+calls, unclassified calls, generic property and index reads, catch, generator
+transitions, and non-stack stores remain conservative barriers. This does not
+infer receiver types or remove error checks. The analysis is disabled with
+`JS_JIT_SSA=0`.
+
+Indexed-read emission records the receiver, key, result, source location,
+successful continuation and runtime-read contract as invocation-scoped read
+descriptors. The original potentially failing read and its temporary ownership
+remain in the CFG. An SSA-enabled scope can reuse a dominating successful read
+inside a loop if the whole body has no observable writes, arbitrary reentry,
+catch, generator transitions, or unknown calls. A nonthrowing probe establishes
+the `DirectNumericIndexStorage` capability for a numeric key on an array or
+typed array. It guarantees stable direct reads and that any owning element is
+held by the receiver; it does not imply numeric array elements. Other receivers
+and keys keep the original read. The later site compares receiver and key bits
+in CLIF and falls back to its original helper on mismatch.
+
+Storage and lifetime are separate facts. The dispatcher explicitly roots its
+probed property throughout the specialized call; aliases and identity copies
+preserve that lifetime. For such a receiver, the probe needs no additional frame
+root: the receiver owns any borrowed result and the numeric key is nonowning.
+Otherwise one bounded frame root holds the receiver, key, and result across
+temporary clears, replacing the previous root or releasing it at frame exit.
+This extends their lifetimes; the current runtime has no finalizers. The storage
+probe must reject accessor or proxy behavior if introduced. Only one pair per
+function is currently selected. A future embedder type could provide equivalent
+field or method capabilities with explicit effects, result domains, ownership,
+and stability contracts; mutations outside the engine would also have to honor
+the scope. A typed-array element-domain fact could further specialize numeric
+representation. Loop peeling could establish facts on the first iteration for a
+later specialized loop, but is not implemented here.
+
+For a narrow loop shape, emission also builds a semantic region containing an
+indexed value, inclusive induction, shifted-bit test, and counter increment.
+The first indexed read and its existing error check execute normally. A
+nonthrowing direct-index storage probe runs before that expression's temporary
+clear. On its truthy branch, exact Int32 word and bounds guards, bounds within
+0 through 31, and a numeric counter guard select a call-free CLIF loop; failure
+executes the original loop. The loop uses an Int32 induction and bit mask, while
+the counter remains an IEEE double updated once per set bit, preserving
+floating-point rounding. The counter is boxed and NaN is canonicalized on exit. The recognizer requires
+matching local or `this` property receivers and local key expressions, excludes captured or
+modified dependencies, and relies on the current absence of accessors, proxies,
+and coercion callbacks. It does not hoist the first read or assume typed arrays.
+This frontend region is enabled with SSA optimization and currently handles one
+specific operation shape; it is not a general semantic IR or loop optimizer.
+
 Helper effect contracts let emission omit JS-exception checks for helpers that
 cannot throw. General receiver specialization, property hoisting, and tiered
 compilation remain unimplemented.

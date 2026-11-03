@@ -5,8 +5,9 @@ use cranelift_codegen::ir::{
     Block, FuncRef, Function, Inst, InstBuilder, InstructionData, MemFlags, Opcode, Value,
     ValueDef, types,
 };
-use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
+use super::effects::{self, TemporaryEffect};
 use super::helpers::Helper;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,8 +48,35 @@ fn join(left: Option<Kind>, right: Option<Kind>) -> Option<Kind> {
     (left.is_number() && right.is_number()).then_some(Kind::Number)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum IndexedReadContract {
+    RuntimeValue,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct IndexedRead {
+    pub call: Inst,
+    pub receiver: Value,
+    pub key: Value,
+    pub result: Value,
+    pub success: Block,
+    pub source: (u32, u32),
+    pub contract: IndexedReadContract,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct IndexedStorageGuard {
+    pub call: Inst,
+    pub result: Value,
+    pub contract: crate::heap::IndexedStorageContract,
+}
+
 #[derive(Clone, Default)]
 pub(super) struct Annotations {
+    pub semantic_regions: Vec<String>,
+    pub invocation_roots: HashSet<Value>,
+    pub indexed_storage_guards: HashMap<Inst, IndexedStorageGuard>,
+    pub indexed_reads: Vec<IndexedRead>,
     pub constants: HashMap<Value, Kind>,
     pub results: HashMap<Value, Kind>,
     pub continuations: HashMap<Block, Vec<(Value, Kind)>>,
@@ -57,6 +85,23 @@ pub(super) struct Annotations {
     pub guards: HashMap<Inst, Value>,
     pub int32_guards: HashMap<Inst, Value>,
     pub retain_guards: HashMap<Inst, Value>,
+}
+
+impl Annotations {
+    pub fn prune(&mut self, function: &Function) {
+        let live = |inst: &Inst| function.layout.inst_block(*inst).is_some();
+        self.indexed_reads
+            .retain(|read| live(&read.call) && function.layout.is_block_inserted(read.success));
+        self.indexed_storage_guards
+            .retain(|source, guard| live(source) && live(&guard.call));
+        self.helpers.retain(|inst, _| live(inst));
+        self.names.retain(|inst, _| live(inst));
+        self.guards.retain(|inst, _| live(inst));
+        self.int32_guards.retain(|inst, _| live(inst));
+        self.retain_guards.retain(|inst, _| live(inst));
+        self.continuations
+            .retain(|block, _| function.layout.is_block_inserted(*block));
+    }
 }
 
 #[derive(Clone)]
@@ -287,6 +332,106 @@ fn meet(target: &mut Option<Facts>, incoming: Facts) -> bool {
     changed
 }
 
+fn constant_bits(function: &Function, value: Value, depth: usize) -> Option<u64> {
+    if depth == 0 {
+        return None;
+    }
+    let value = function.dfg.resolve_aliases(value);
+    let ValueDef::Result(inst, _) = function.dfg.value_def(value) else {
+        return None;
+    };
+    match function.dfg.insts[inst] {
+        InstructionData::UnaryImm {
+            opcode: Opcode::Iconst,
+            imm,
+        } => {
+            let ty = function.dfg.value_type(value);
+            if !ty.is_int() || ty.bits() > 64 {
+                return None;
+            }
+            Some((imm.bits() as u64) & (u64::MAX >> (64 - ty.bits())))
+        }
+        InstructionData::Binary {
+            opcode: Opcode::Band,
+            args,
+        } => {
+            let left = constant_bits(function, args[0], depth - 1);
+            let right = constant_bits(function, args[1], depth - 1);
+            match (left, right) {
+                (Some(0), _) | (_, Some(0)) => Some(0),
+                (Some(left), Some(right)) => Some(left & right),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+pub(super) fn simplify_constant_branches(function: &mut Function) -> usize {
+    let mut branches = Vec::new();
+    for block in function.layout.blocks() {
+        for inst in function.layout.block_insts(block) {
+            let InstructionData::Brif { arg, blocks, .. } = function.dfg.insts[inst] else {
+                continue;
+            };
+            let Some(condition) = constant_bits(function, arg, 16) else {
+                continue;
+            };
+            let destination = blocks[usize::from(condition == 0)];
+            let target = destination.block(&function.dfg.value_lists);
+            let args = destination
+                .args(&function.dfg.value_lists)
+                .collect::<Vec<_>>();
+            branches.push((inst, target, args));
+        }
+    }
+    for (inst, target, args) in &branches {
+        function.dfg.replace(*inst).jump(*target, args);
+    }
+    branches.len()
+}
+
+fn temporary_state(
+    function: &Function,
+    annotations: &Annotations,
+    facts: &Facts,
+    inst: Inst,
+    dirty: bool,
+) -> bool {
+    if let Some(&helper) = annotations.helpers.get(&inst) {
+        let args = function.dfg.inst_args(inst);
+        let nonowning = |value| {
+            value_kind(function, facts, value).is_some_and(Kind::is_number)
+                || is_unowned_constant(function, annotations, value)
+        };
+        return match effects::temporary_effect(helper) {
+            TemporaryEffect::Enter | TemporaryEffect::Clear => false,
+            TemporaryEffect::None => dirty,
+            TemporaryEffect::RetainArgument => dirty || !nonowning(args[1]),
+            TemporaryEffect::NumericAdd => dirty || !(nonowning(args[1]) && nonowning(args[2])),
+            TemporaryEffect::MayRegister => true,
+        };
+    }
+    let opcode = function.dfg.insts[inst].opcode();
+    if opcode.is_call() {
+        return true;
+    }
+    if !opcode.can_store() {
+        return dirty;
+    }
+    match function.dfg.insts[inst] {
+        InstructionData::StackStore { .. } => dirty,
+        InstructionData::Store { args, .. } => {
+            let address = function.dfg.resolve_aliases(args[1]);
+            let ValueDef::Result(address_inst, _) = function.dfg.value_def(address) else {
+                return true;
+            };
+            dirty || function.dfg.insts[address_inst].opcode() != Opcode::StackAddr
+        }
+        _ => true,
+    }
+}
+
 impl Analysis {
     pub fn compute(function: &Function, annotations: &Annotations) -> Self {
         let mut entries = vec![None; function.dfg.num_blocks()];
@@ -391,7 +536,87 @@ impl Analysis {
         }
     }
 
-    pub fn specialize_index_gets(&self, function: &mut Function, helper: FuncRef) {
+    pub fn remove_empty_temp_clears(
+        &self,
+        function: &mut Function,
+        annotations: &mut Annotations,
+    ) -> usize {
+        let Some(entry) = function.layout.entry_block() else {
+            return 0;
+        };
+        let mut entries = vec![None; function.dfg.num_blocks()];
+        entries[entry.as_u32() as usize] = Some(true);
+        let mut queue = VecDeque::from([entry]);
+        let mut queued = vec![false; entries.len()];
+        queued[entry.as_u32() as usize] = true;
+        while let Some(block) = queue.pop_front() {
+            queued[block.as_u32() as usize] = false;
+            let Some(entry_facts) = &self.entries[block.as_u32() as usize] else {
+                continue;
+            };
+            let mut facts = block_facts(function, annotations, block, entry_facts);
+            let mut dirty = entries[block.as_u32() as usize].unwrap();
+            for inst in function.layout.block_insts(block) {
+                dirty = temporary_state(function, annotations, &facts, inst, dirty);
+                transfer(function, annotations, &mut facts, inst);
+                for (edge, destination) in function.dfg.insts[inst]
+                    .branch_destination(&function.dfg.jump_tables, &function.dfg.exception_tables)
+                    .iter()
+                    .enumerate()
+                {
+                    if let InstructionData::Brif { arg, .. } = function.dfg.insts[inst] {
+                        if constant_bits(function, arg, 16)
+                            .is_some_and(|value| (value != 0) != (edge == 0))
+                        {
+                            continue;
+                        }
+                    }
+                    let successor = destination.block(&function.dfg.value_lists);
+                    let index = successor.as_u32() as usize;
+                    let merged = entries[index].map_or(dirty, |previous| previous || dirty);
+                    if entries[index] != Some(merged) {
+                        entries[index] = Some(merged);
+                        if !queued[index] {
+                            queued[index] = true;
+                            queue.push_back(successor);
+                        }
+                    }
+                }
+            }
+        }
+        let mut remove = Vec::new();
+        for block in function.layout.blocks() {
+            let (Some(mut dirty), Some(entry_facts)) = (
+                entries[block.as_u32() as usize],
+                &self.entries[block.as_u32() as usize],
+            ) else {
+                continue;
+            };
+            let mut facts = block_facts(function, annotations, block, entry_facts);
+            for inst in function.layout.block_insts(block) {
+                if annotations.helpers.get(&inst) == Some(&Helper::TempClear) && !dirty {
+                    remove.push(inst);
+                }
+                dirty = temporary_state(function, annotations, &facts, inst, dirty);
+                transfer(function, annotations, &mut facts, inst);
+            }
+        }
+        for &inst in &remove {
+            annotations.helpers.remove(&inst);
+            function
+                .dfg
+                .replace(inst)
+                .iconst(types::I64, crate::value::Value::UNDEFINED.bits() as i64);
+        }
+        remove.len()
+    }
+
+    pub fn specialize_index_gets(
+        &self,
+        function: &mut Function,
+        annotations: &mut Annotations,
+        helper: FuncRef,
+    ) {
         for &inst in &self.numeric_index_gets {
             let args = function.dfg.inst_args(inst).to_vec();
             let mut cursor = FuncCursor::new(function).at_inst(inst);
@@ -402,6 +627,7 @@ impl Analysis {
                 .dfg
                 .replace(inst)
                 .call(helper, &[args[0], args[1], index]);
+            annotations.helpers.insert(inst, Helper::IndexGetNumeric);
         }
     }
 
@@ -537,6 +763,187 @@ mod tests {
             .into_iter()
             .map(|(_, _, kind)| kind)
             .collect()
+    }
+
+    #[test]
+    fn constant_branches_preserve_selected_block_arguments() {
+        use cranelift_codegen::ir::BlockArg;
+        for (left, selected) in [(1, 17), (2, 29)] {
+            let mut body = build(|b, _| {
+                let target = b.create_block();
+                b.append_block_param(target, types::I8);
+                let left = b.ins().iconst(types::I8, left);
+                let right = b.ins().iconst(types::I8, 1);
+                let condition = b.ins().band(left, right);
+                let yes = b.ins().iconst(types::I8, 17);
+                let no = b.ins().iconst(types::I8, 29);
+                b.ins().brif(
+                    condition,
+                    target,
+                    &[BlockArg::Value(yes)],
+                    target,
+                    &[BlockArg::Value(no)],
+                );
+                b.switch_to_block(target);
+                let result = b.block_params(target)[0];
+                b.ins().return_(&[result]);
+            });
+            assert_eq!(simplify_constant_branches(&mut body.function), 1);
+            let entry = body.function.layout.entry_block().unwrap();
+            let jump = body.function.layout.last_inst(entry).unwrap();
+            let destinations = body.function.dfg.insts[jump].branch_destination(
+                &body.function.dfg.jump_tables,
+                &body.function.dfg.exception_tables,
+            );
+            assert_eq!(destinations.len(), 1);
+            let arg = destinations[0]
+                .args(&body.function.dfg.value_lists)
+                .next()
+                .unwrap()
+                .as_value()
+                .unwrap();
+            assert_eq!(constant_bits(&body.function, arg, 16), Some(selected));
+            cranelift_codegen::verify_function(
+                &body.function,
+                &cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder()),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn temporary_dataflow_respects_constant_bits_and_dirty_joins() {
+        for (bits, expected) in [(Some(1), 1), (Some(2), 0), (None, 0)] {
+            let mut body = build(|b, annotations| {
+                let ctx = b.block_params(b.current_block().unwrap())[0];
+                let unknown = b.block_params(b.current_block().unwrap())[2];
+                let mut signature = cranelift_codegen::ir::Signature::new(
+                    cranelift_codegen::isa::CallConv::SystemV,
+                );
+                signature.params = vec![AbiParam::new(types::I64); 2];
+                signature.returns.push(AbiParam::new(types::I64));
+                let signature = b.func.import_signature(signature);
+                let helper = b.import_function(cranelift_codegen::ir::ExtFuncData {
+                    name: cranelift_codegen::ir::ExternalName::testcase("temporary"),
+                    signature,
+                    colocated: false,
+                    patchable: false,
+                });
+                let dummy = b.ins().iconst(types::I64, 0);
+                let enter = b.ins().call(helper, &[ctx, dummy]);
+                annotations.helpers.insert(enter, Helper::FrameEnter);
+                let yes = b.create_block();
+                let no = b.create_block();
+                let merge = b.create_block();
+                let one = b.ins().iconst(types::I8, 1);
+                let left = bits
+                    .map(|bits| b.ins().iconst(types::I8, bits))
+                    .unwrap_or(unknown);
+                let condition = b.ins().band(left, one);
+                b.ins().brif(condition, yes, &[], no, &[]);
+                b.switch_to_block(yes);
+                b.ins().jump(merge, &[]);
+                b.switch_to_block(no);
+                let call = b.ins().call(helper, &[ctx, dummy]);
+                annotations.helpers.insert(call, Helper::ObjectNew);
+                b.ins().jump(merge, &[]);
+                b.switch_to_block(merge);
+                let clear = b.ins().call(helper, &[ctx, dummy]);
+                annotations.helpers.insert(clear, Helper::TempClear);
+                b.ins().return_(&[one]);
+            });
+            let analysis = Analysis::compute(&body.function, &body.annotations);
+            assert_eq!(
+                analysis.remove_empty_temp_clears(&mut body.function, &mut body.annotations),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn temporary_dataflow_preserves_unknown_call_effects_for_numeric_results() {
+        let mut body = build(|b, annotations| {
+            let ctx = b.block_params(b.current_block().unwrap())[0];
+            let mut signature =
+                cranelift_codegen::ir::Signature::new(cranelift_codegen::isa::CallConv::SystemV);
+            signature.params = vec![AbiParam::new(types::I64); 2];
+            signature.returns.push(AbiParam::new(types::I64));
+            let signature = b.func.import_signature(signature);
+            let helper = b.import_function(cranelift_codegen::ir::ExtFuncData {
+                name: cranelift_codegen::ir::ExternalName::testcase("temporary"),
+                signature,
+                colocated: false,
+                patchable: false,
+            });
+            let dummy = b.ins().iconst(types::I64, 0);
+            let enter = b.ins().call(helper, &[ctx, dummy]);
+            annotations.helpers.insert(enter, Helper::FrameEnter);
+            let clean = b.ins().call(helper, &[ctx, dummy]);
+            annotations.helpers.insert(clean, Helper::TempClear);
+            let call = b.ins().call(helper, &[ctx, dummy]);
+            annotations.helpers.insert(call, Helper::Call);
+            annotations
+                .results
+                .insert(b.inst_results(call)[0], Kind::Int32);
+            let dirty = b.ins().call(helper, &[ctx, dummy]);
+            annotations.helpers.insert(dirty, Helper::TempClear);
+            let done = b.ins().iconst(types::I8, 1);
+            b.ins().return_(&[done]);
+        });
+        let analysis = Analysis::compute(&body.function, &body.annotations);
+        assert_eq!(
+            analysis.remove_empty_temp_clears(&mut body.function, &mut body.annotations),
+            1
+        );
+        assert_eq!(
+            body.annotations
+                .helpers
+                .values()
+                .filter(|&&helper| helper == Helper::TempClear)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn temporary_dataflow_includes_dirty_loop_backedges() {
+        let mut body = build(|b, annotations| {
+            let ctx = b.block_params(b.current_block().unwrap())[0];
+            let condition = b.block_params(b.current_block().unwrap())[2];
+            let mut signature =
+                cranelift_codegen::ir::Signature::new(cranelift_codegen::isa::CallConv::SystemV);
+            signature.params = vec![AbiParam::new(types::I64); 2];
+            signature.returns.push(AbiParam::new(types::I64));
+            let signature = b.func.import_signature(signature);
+            let helper = b.import_function(cranelift_codegen::ir::ExtFuncData {
+                name: cranelift_codegen::ir::ExternalName::testcase("temporary"),
+                signature,
+                colocated: false,
+                patchable: false,
+            });
+            let dummy = b.ins().iconst(types::I64, 0);
+            let enter = b.ins().call(helper, &[ctx, dummy]);
+            annotations.helpers.insert(enter, Helper::FrameEnter);
+            let header = b.create_block();
+            let body = b.create_block();
+            let done = b.create_block();
+            b.ins().jump(header, &[]);
+            b.switch_to_block(header);
+            let clear = b.ins().call(helper, &[ctx, dummy]);
+            annotations.helpers.insert(clear, Helper::TempClear);
+            b.ins().brif(condition, body, &[], done, &[]);
+            b.switch_to_block(body);
+            let call = b.ins().call(helper, &[ctx, dummy]);
+            annotations.helpers.insert(call, Helper::ObjectNew);
+            b.ins().jump(header, &[]);
+            b.switch_to_block(done);
+            b.ins().return_(&[condition]);
+        });
+        let analysis = Analysis::compute(&body.function, &body.annotations);
+        assert_eq!(
+            analysis.remove_empty_temp_clears(&mut body.function, &mut body.annotations),
+            0
+        );
     }
 
     #[test]
