@@ -56,6 +56,74 @@ missing; arrays and rest alone will not make the bootstrap runnable. The C++
 runner independently embeds SpiderMonkey and provides a workload reference,
 not Rust-engine bindings.
 
+## Post-SSA numeric analysis
+
+The frontend builds SSA through Cranelift's `FunctionBuilder`. After sealing
+all blocks and finalizing the builder, `jit/compiler.rs` runs the JS numeric
+analysis in `jit/numeric.rs`, applies guard simplification, and verifies the
+result before handing it to Cranelift's optimizer and machine-code generator.
+This applies to ordinary functions, module initializers, generator factories,
+and generator resume functions.
+
+```text
+Oxc AST -> emission -> finalized SSA CLIF + annotations
+                                -> numeric analysis
+                                -> guard simplification and verification
+                                -> Cranelift optimization and code generation
+```
+
+`FunctionBody` pairs a CLIF `Function` with its `Annotations`. Emission records
+boxed JS constants by SSA value, helper identities by instruction, and numeric
+tests by instruction and tested value. Emission does not propagate kinds through
+locals or control flow. Raw internal `i64` values, such as frame-slot indices
+and generator states, are not classified by interpreting their bits as JS
+values. The side tables require no executable marker instructions or fake
+locals.
+
+Annotations belong to that exact CLIF body. The analysis resolves frontend SSA
+aliases when looking up values. Cloning a `FunctionBody` preserves the entity
+IDs and matching annotations; transformations that replace definitions must
+preserve or rebuild the affected metadata. The annotations are consumed before
+Cranelift optimization and are not expected to describe the backend's rewritten
+IR. Source locations remain available separately for debugging and profiling.
+
+The abstract kinds are Number, Other, and unknown; Other means a boxed JS value
+that is not numeric, including an uninitialized-binding sentinel. Each reachable
+block has an incoming fact map. An absent value fact means unknown, while an
+absent block state means unreachable in the traversed control-flow graph.
+A worklist propagates facts through branch arguments and block parameters until
+they stabilize, including loop backedges. Joins retain only facts shared by all
+incoming paths. Facts about instruction results are cleared before processing
+their defining block again, so a loop cannot reuse a previous iteration's facts.
+
+A numeric test refines its operand to Number on the true edge and Other on the
+false edge. A successful conjunction can refine both operands' numeric tests;
+a failed conjunction does not identify which operand failed. This gives runtime
+guards and statically known constants the same fact-propagation path. Selects
+propagate a kind when both alternatives agree. A small helper-contract table
+also propagates kinds where the result is guaranteed, including numeric
+arithmetic with proven numeric operands. Unrecognized results remain unknown;
+the pass does not infer types from mutable heap contents or arbitrary calls.
+
+After reaching a fixed point, the pass replaces proven numeric-test instructions
+with boolean constants. Cranelift performs the subsequent control-flow and dead
+code simplification. Ownership operations, frame-local tracking, and error and
+exception checks remain unchanged. This is a numeric-guard experiment, not yet
+receiver specialization, guard hoisting, ownership analysis, or a tiered JIT.
+
+`EngineOptions::ssa_opt` enables rewriting and defaults to true unless
+`JS_JIT_SSA=0`. `EngineOptions::ssa_dump` defaults to false unless
+`JS_JIT_SSA_DUMP=1`; it prints per-function guard counts, inferred block-parameter
+kinds, and individual guard conclusions to stderr. Enabling dumps with rewriting disabled runs the
+analysis without changing CLIF. The existing IR listings show CLIF after this
+pass when rewriting is enabled.
+
+Future compilation tiers can build on this boundary, but canonical bodies are
+not currently retained for recompilation. Runtime feedback would need stable
+operation-site IDs independent of CLIF entity IDs, and observed types would
+require runtime guards before becoming proven facts. Recompilation, entry-point
+replacement, on-stack replacement, and deoptimization remain future work.
+
 ## Values, objects, and arrays
 
 Heap values use per-runtime slot indices in the NaN-box payload. Each slot has

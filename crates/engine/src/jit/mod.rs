@@ -6,6 +6,7 @@ mod emit;
 mod generator;
 mod helpers;
 mod jitdump;
+mod numeric;
 mod session;
 
 pub(crate) use compiler::Compiler;

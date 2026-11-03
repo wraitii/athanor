@@ -4,6 +4,7 @@ use cranelift_module::Module;
 use oxc_syntax::operator::{AssignmentOperator, BinaryOperator};
 
 use crate::jit::helpers::Helper;
+use crate::jit::numeric::Kind;
 use crate::value::Value;
 use crate::value::{TAG_FIRST, TAG_SHIFT, TAG_SPAN, TAG_STRING};
 
@@ -133,15 +134,28 @@ pub(super) fn compound_operator(operator: AssignmentOperator) -> Option<BinaryOp
 
 impl FunctionCompiler<'_, '_> {
     pub(super) fn constant(&mut self, value: Value) -> ClifValue {
-        self.b.ins().iconst(types::I64, value.bits() as i64)
+        let result = self.b.ins().iconst(types::I64, value.bits() as i64);
+        self.annotations.constants.insert(
+            result,
+            if value.is_number() {
+                Kind::Number
+            } else {
+                Kind::Other
+            },
+        );
+        result
     }
 
     pub(super) fn is_number(&mut self, value: ClifValue) -> ClifValue {
         let top = self.b.ins().ushr_imm(value, TAG_SHIFT as i64);
         let offset = self.b.ins().iadd_imm(top, -(TAG_FIRST as i64));
-        self.b
+        let condition = self
+            .b
             .ins()
-            .icmp_imm(IntCC::UnsignedGreaterThan, offset, TAG_SPAN as i64)
+            .icmp_imm(IntCC::UnsignedGreaterThan, offset, TAG_SPAN as i64);
+        let inst = self.b.func.dfg.value_def(condition).unwrap_inst();
+        self.annotations.guards.insert(inst, value);
+        condition
     }
 
     pub(super) fn truthy(&mut self, value: ClifValue) -> ClifValue {
@@ -248,6 +262,7 @@ impl FunctionCompiler<'_, '_> {
         call_args.push(self.ctx);
         call_args.extend_from_slice(args);
         let call = self.b.ins().call(callee, &call_args);
+        self.annotations.helpers.insert(call, helper);
         self.b.inst_results(call)[0]
     }
 

@@ -23,6 +23,7 @@ use oxc_syntax::symbol::SymbolId;
 
 use crate::error::Error;
 use crate::jit::helpers::Helper;
+use crate::jit::numeric::Annotations;
 use crate::value::Value;
 
 use scope::ScopeStack;
@@ -42,6 +43,7 @@ pub(super) struct FunctionCompiler<'a, 'f> {
     b: &'a mut FunctionBuilder<'f>,
     module: &'a mut JITModule,
     helpers: &'a [FuncId],
+    annotations: &'a mut Annotations,
     scoping: &'a Scoping,
     pointer: Type,
     ctx: ClifValue,
@@ -66,6 +68,7 @@ pub(super) fn build_function(
     module: &mut JITModule,
     scoping: &Scoping,
     helpers: &[FuncId],
+    annotations: &mut Annotations,
     names: &mut Vec<Box<str>>,
     source_name: (usize, usize),
     params: &FormalParameters<'_>,
@@ -93,6 +96,7 @@ pub(super) fn build_function(
         b,
         module,
         helpers,
+        annotations,
         scoping,
         pointer,
         ctx,
@@ -196,6 +200,7 @@ pub(super) fn build_global(
     module: &mut JITModule,
     scoping: &Scoping,
     helpers: &[FuncId],
+    annotations: &mut Annotations,
     names: &mut Vec<Box<str>>,
     source_name: (usize, usize),
     statements: &[oxc_ast::ast::Statement<'_>],
@@ -217,6 +222,7 @@ pub(super) fn build_global(
         b,
         module,
         helpers,
+        annotations,
         scoping,
         pointer,
         ctx,

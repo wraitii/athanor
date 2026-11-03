@@ -79,10 +79,11 @@ pub(super) struct Writer {
 
 fn write_listing(
     source: &str,
-    annotations: &BTreeMap<u32, Vec<String>>,
+    annotations: &BTreeMap<u32, Vec<(u32, String)>>,
     out: &mut impl Write,
-) -> io::Result<Vec<u32>> {
+) -> io::Result<(Vec<u32>, BTreeMap<u32, u32>)> {
     let mut mapping = Vec::new();
+    let mut ir_mapping = BTreeMap::new();
     let mut next_line = 1;
     for (index, line) in source.split('\n').enumerate() {
         let line_number = index as u32 + 1;
@@ -90,13 +91,16 @@ fn write_listing(
         writeln!(out, "{line_number:>5} | {line}")?;
         next_line += 1;
         if let Some(entries) = annotations.get(&line_number) {
-            for entry in entries {
+            for (id, entry) in entries {
                 writeln!(out, "      | IR: {entry}")?;
+                if *id != 0 {
+                    ir_mapping.insert(*id, next_line);
+                }
                 next_line += 1;
             }
         }
     }
-    Ok(mapping)
+    Ok((mapping, ir_mapping))
 }
 
 fn push_u32(out: &mut Vec<u8>, value: u32) {
@@ -164,8 +168,8 @@ impl Writer {
     pub(super) fn listing(
         &mut self,
         source: &str,
-        annotations: &BTreeMap<u32, Vec<String>>,
-    ) -> io::Result<(PathBuf, Vec<u32>)> {
+        annotations: &BTreeMap<u32, Vec<(u32, String)>>,
+    ) -> io::Result<(PathBuf, Vec<u32>, BTreeMap<u32, u32>)> {
         let path = self
             .path
             .with_extension(format!("{}.jsir", self.next_listing));
@@ -174,8 +178,8 @@ impl Writer {
             .write(true)
             .create_new(true)
             .open(&path)?;
-        let mapping = write_listing(source, annotations, &mut file)?;
-        Ok((path, mapping))
+        let (mapping, ir_mapping) = write_listing(source, annotations, &mut file)?;
+        Ok((path, mapping, ir_mapping))
     }
 
     pub(super) fn record(
@@ -253,10 +257,15 @@ mod tests {
     #[test]
     fn listing_preserves_source_lines_and_maps_annotations() {
         let mut annotations = BTreeMap::new();
-        annotations.insert(2, vec!["[jsfn_0]".into(), "v0 = iconst.i64 1".into()]);
+        annotations.insert(
+            2,
+            vec![(0, "[jsfn_0]".into()), (1, "v0 = iconst.i64 1".into())],
+        );
         let mut listing = Vec::new();
-        let mapping = write_listing("let a;\nlet b;\n", &annotations, &mut listing).unwrap();
+        let (mapping, ir_mapping) =
+            write_listing("let a;\nlet b;\n", &annotations, &mut listing).unwrap();
         assert_eq!(mapping, vec![1, 2, 5]);
+        assert_eq!(ir_mapping.get(&1), Some(&4));
         assert_eq!(
             String::from_utf8(listing).unwrap(),
             "    1 | let a;\n    2 | let b;\n      | IR: [jsfn_0]\n      | IR: v0 = iconst.i64 1\n    3 | \n"

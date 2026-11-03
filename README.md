@@ -41,6 +41,17 @@ defaults. This workload now completes and prints the map summary. The dev
 profile uses `opt-level = 1`; use `--release` for performance measurements.
 Release builds include line tables for profiling.
 
+The JS numeric SSA pass runs after frontend SSA construction and before
+Cranelift optimization. It records boxed constants, helper identities, and
+numeric guards, propagates facts through branches and block arguments, and
+replaces proven guards with constants. It leaves ownership and error checks
+unchanged. Set `JS_JIT_SSA=0` to disable it, and `JS_JIT_SSA_DUMP=1` to print
+the inferred guard and block-parameter kinds to stderr. Combining these settings
+runs the analysis without applying its transformations. The corresponding
+embedding options are `EngineOptions::ssa_opt` and `EngineOptions::ssa_dump`.
+See [Post-SSA numeric analysis](crates/engine/DESIGN.md#post-ssa-numeric-analysis)
+for the annotation model, dataflow rules, pass boundary, and future tiering work.
+
 
 ## cpp
 

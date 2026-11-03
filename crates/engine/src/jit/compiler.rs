@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use cranelift_codegen::Context;
-use cranelift_codegen::ir::{AbiParam, Signature, types};
+use cranelift_codegen::ir::{AbiParam, Signature, SourceLoc, types};
 use cranelift_frontend::FunctionBuilderContext;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module, default_libcall_names};
@@ -17,7 +17,8 @@ use oxc_syntax::symbol::SymbolId;
 use crate::EngineOptions;
 use crate::error::{Error, compile_at, unsupported_at};
 
-use super::{analysis::CaptureAnalysis, emit, helpers, jitdump};
+use super::numeric::{Annotations, FunctionBody};
+use super::{analysis::CaptureAnalysis, emit, helpers, jitdump, numeric};
 
 pub(crate) struct CompiledFunction {
     pub(crate) name: String,
@@ -36,6 +37,8 @@ pub(crate) struct Compiler {
     function_names: HashMap<FuncId, String>,
     dump: Option<jitdump::Writer>,
     dump_ir: bool,
+    ssa_opt: bool,
+    ssa_dump: bool,
     next_id: u64,
     context: Context,
     builder_context: FunctionBuilderContext,
@@ -81,6 +84,8 @@ impl Compiler {
             function_names: HashMap::new(),
             dump,
             dump_ir,
+            ssa_opt: options.ssa_opt,
+            ssa_dump: options.ssa_dump,
             next_id: 0,
             context,
             builder_context: FunctionBuilderContext::new(),
@@ -380,6 +385,7 @@ impl Compiler {
             let id = self.declare_js(&label, line)?;
             self.context.clear();
             self.context.func.signature = self.signature.clone();
+            let mut annotations = Annotations::default();
             {
                 let mut builder = cranelift_frontend::FunctionBuilder::new(
                     &mut self.context.func,
@@ -390,6 +396,7 @@ impl Compiler {
                     &mut self.module,
                     scoping,
                     &self.helpers,
+                    &mut annotations,
                     &mut self.names,
                     self.source_name,
                     &program.body,
@@ -402,28 +409,44 @@ impl Compiler {
             }
             pending.push((
                 id,
-                std::mem::replace(
-                    &mut self.context.func,
-                    cranelift_codegen::ir::Function::new(),
-                ),
+                FunctionBody {
+                    function: std::mem::replace(
+                        &mut self.context.func,
+                        cranelift_codegen::ir::Function::new(),
+                    ),
+                    annotations,
+                },
             ));
             Some(id)
         };
 
         let mut dumped = Vec::new();
         let mut annotations = BTreeMap::new();
+        let mut next_ir = 1;
         for (id, code) in pending {
             self.context.clear();
-            self.context.func = code;
+            self.context.func = code.function;
             let name = self
                 .function_names
                 .get(&id)
                 .cloned()
                 .unwrap_or_else(|| format!("jsfn_{}", id.as_u32()));
+            if self.ssa_opt || self.ssa_dump {
+                let analysis = numeric::Analysis::compute(&self.context.func, &code.annotations);
+                if self.ssa_dump {
+                    analysis.dump(&self.context.func, &name, &code.annotations);
+                }
+                if self.ssa_opt {
+                    analysis.simplify(&mut self.context.func);
+                    self.context
+                        .verify(self.module.isa())
+                        .map_err(|error| Error::Compile(error.to_string()))?;
+                }
+            }
             if self.dump_ir {
-                for (line, instructions) in ir_lines(&self.context.func, &lines) {
+                for (line, instructions) in ir_lines(&mut self.context.func, &lines, &mut next_ir) {
                     let entries = annotations.entry(line).or_insert_with(Vec::new);
-                    entries.push(format!("[{name}]"));
+                    entries.push((0, format!("[{name}]")));
                     entries.extend(instructions);
                 }
             }
@@ -441,7 +464,11 @@ impl Compiler {
                     if location.loc.is_default() {
                         continue;
                     }
-                    let line = line_at(&lines, location.loc.bits());
+                    let line = if self.dump_ir {
+                        location.loc.bits()
+                    } else {
+                        line_at(&lines, location.loc.bits())
+                    };
                     default_line.get_or_insert(line);
                     locations.insert(location.start, line);
                 }
@@ -471,16 +498,22 @@ impl Compiler {
             for (id, name, size, locations) in dumped {
                 let code = self.module.get_finalized_function(id);
                 let bytes = unsafe { std::slice::from_raw_parts(code, size) };
-                if let Some((path, mapping)) = &listing {
+                if let Some((path, mapping, ir_mapping)) = &listing {
                     let filename = path.to_str().unwrap_or(source_path);
                     let locations = locations
                         .iter()
-                        .map(|&(offset, line)| {
-                            let line = mapping.get(line as usize - 1).copied().unwrap_or(1);
-                            (offset, line)
+                        .filter_map(|&(offset, line)| {
+                            let line = if self.dump_ir {
+                                ir_mapping.get(&line).copied()
+                            } else {
+                                mapping.get(line as usize - 1).copied()
+                            };
+                            line.map(|line| (offset, line))
                         })
                         .collect::<Vec<_>>();
                     dump.record(&name, filename, &locations, bytes);
+                } else if self.dump_ir {
+                    dump.record(&name, source_path, &[], bytes);
                 } else {
                     dump.record(&name, source_path, &locations, bytes);
                 }
@@ -527,13 +560,7 @@ impl Compiler {
         generator: bool,
         label: &str,
         line: u32,
-    ) -> Result<
-        (
-            cranelift_codegen::ir::Function,
-            Option<(FuncId, cranelift_codegen::ir::Function)>,
-        ),
-        Error,
-    > {
+    ) -> Result<(FunctionBody, Option<(FuncId, FunctionBody)>), Error> {
         if !generator {
             return Ok((
                 self.compile_function(
@@ -593,7 +620,8 @@ impl Compiler {
         closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
         scoping: &Scoping,
         kind: emit::FunctionKind,
-    ) -> Result<cranelift_codegen::ir::Function, Error> {
+    ) -> Result<FunctionBody, Error> {
+        let mut annotations = Annotations::default();
         self.context.clear();
         self.context.func.signature = self.signature.clone();
         {
@@ -606,6 +634,7 @@ impl Compiler {
                 &mut self.module,
                 scoping,
                 &self.helpers,
+                &mut annotations,
                 &mut self.names,
                 self.source_name,
                 params,
@@ -621,10 +650,13 @@ impl Compiler {
             builder.seal_all_blocks();
             builder.finalize();
         }
-        Ok(std::mem::replace(
-            &mut self.context.func,
-            cranelift_codegen::ir::Function::new(),
-        ))
+        Ok(FunctionBody {
+            function: std::mem::replace(
+                &mut self.context.func,
+                cranelift_codegen::ir::Function::new(),
+            ),
+            annotations,
+        })
     }
 }
 
@@ -721,21 +753,28 @@ fn line_at(starts: &[u32], offset: u32) -> u32 {
 }
 
 fn ir_lines(
-    function: &cranelift_codegen::ir::Function,
+    function: &mut cranelift_codegen::ir::Function,
     starts: &[u32],
-) -> BTreeMap<u32, Vec<String>> {
+    next_ir: &mut u32,
+) -> BTreeMap<u32, Vec<(u32, String)>> {
     let mut lines = BTreeMap::new();
-    for block in function.layout.blocks() {
-        for inst in function.layout.block_insts(block) {
+    let blocks: Vec<_> = function.layout.blocks().collect();
+    for block in blocks {
+        let insts: Vec<_> = function.layout.block_insts(block).collect();
+        for inst in insts {
             let location = function.srcloc(inst);
             if location.is_default() {
                 continue;
             }
             let line = line_at(starts, location.bits());
+            let text = function.dfg.display_inst(inst).to_string();
+            let index = *next_ir;
+            *next_ir += 1;
+            function.set_srcloc(inst, SourceLoc::new(index));
             lines
                 .entry(line)
                 .or_insert_with(Vec::new)
-                .push(function.dfg.display_inst(inst).to_string());
+                .push((index, text));
         }
     }
     lines

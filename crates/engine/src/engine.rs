@@ -37,6 +37,8 @@ pub struct EngineOptions {
     pub opt_level: OptLevel,
     pub jitdump: bool,
     pub jitdump_ir: bool,
+    pub ssa_opt: bool,
+    pub ssa_dump: bool,
 }
 
 impl Default for EngineOptions {
@@ -47,6 +49,8 @@ impl Default for EngineOptions {
             opt_level: OptLevel::default(),
             jitdump: matches!(jitdump, Some("1" | "2")),
             jitdump_ir: jitdump == Some("2"),
+            ssa_opt: std::env::var("JS_JIT_SSA").as_deref() != Ok("0"),
+            ssa_dump: std::env::var("JS_JIT_SSA_DUMP").as_deref() == Ok("1"),
         }
     }
 }
