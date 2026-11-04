@@ -18,7 +18,7 @@ aliasing, and cycles; document deliberate semantic restrictions.
 - `Engine` owns the compiler, shared global environment, and named function
   registry. Compilation can add functions across source files and execute a
   top-level initializer. Duplicate function names are rejected.
-- `Value` is a copyable, NaN-boxed 64-bit word. Heap values contain per-runtime slot indices; `OwnedValue` keeps a value and its runtime alive on
+- `Value` is a copyable, NaN-boxed 64-bit word. Heap values contain the address of a per-runtime arena slot; `OwnedValue` keeps a value and its runtime alive on
   the host. Heap arrays have stable allocations and own their elements. The
   special `globalThis` object remains separate; immutable UTF-8 strings use
   reference-counted heap handles.
@@ -190,9 +190,19 @@ replacement, on-stack replacement, and deoptimization remain future work.
 
 ## Values, objects, and arrays
 
-Heap values use per-runtime slot indices in the NaN-box payload. Each slot has
-a reference count and an allocation kind; large payloads are boxed at stable
-addresses. Vacant slots are reused after incremental destruction completes. Arrays
+Heap values store the address of a 64-byte arena slot in the NaN-box payload.
+Arena chunks never move or shrink while the runtime lives. Each slot starts with
+a fixed `repr(C)` header: reference count, kind, shape, and flags, as 32-bit
+words. Kinds are bit families (typed array, array, holey, object, closure, ...);
+typed arrays encode their element size, float, and signed bits in the low bits.
+The header is followed by an element pointer and length at fixed offsets,
+mirrored from array and typed-array storage whenever it changes, so generated
+code reads elements without a helper. Arrays store holes in-band as the
+uninitialized sentinel and count them; the holey kind bit is set exactly while
+any hole remains. Larger payloads are boxed behind the header. Vacant slots are reused after
+incremental destruction completes. Internal lookups trust slot addresses:
+a stale value from the same runtime reaches a zero-reference slot, while host
+entry points check that an address belongs to the arena. Arrays
 contain contiguous `Value` elements; binding cells and closures have separate
 heap kinds. Environments and host handles share the runtime; raw `Value` tokens
 do not keep it alive; their owner must remain alive while they are used, and
@@ -251,11 +261,17 @@ properties. Object-to-property-key conversion remains unsupported. Ordinary obje
 including undefined values, stop lookup. Property enumerability is tracked;
 other property descriptor attributes remain unsupported.
 
-The intended optimized layout is interned property names, shared
-shapes mapping names to slots, and contiguous value slots. Begin with helper
-lookup; add guarded shape/slot fast paths when useful. Keep indexed elements
-separate from named properties. Typed arrays provide contiguous numeric storage
-without per-element reference counting.
+Ordinary objects and closures store property values in a vector indexed by
+their shape. Shapes are shared and immutable: they record the prototype, the
+ordered interned property names with enumerability, and are reached through
+transitions keyed by name and enumerability, rooted per prototype. The shape id
+lives in the slot header. Adding a property, changing its enumerability, or
+setting the prototype changes the shape; replacing a value does not. Objects
+with more than 64 properties or an array-index-like name switch to an ordered
+dictionary and a reserved shape id that no cache may match. Property access
+still goes through helpers; guarded shape/slot fast paths come next. Indexed
+elements stay separate from named properties. Typed arrays provide contiguous
+numeric storage without per-element reference counting.
 
 Ordinary prototype methods are needed by existing map code.
 
@@ -303,7 +319,11 @@ iteration has fresh lexical bindings. Defaults, rest, and nested patterns remain
 unsupported. Evaluate the iterable once, then retain an internal
 iteration state in a compiler-managed local across temporary cleanup. Arrays
 read their current length and elements each step, observing growth, shrinking,
-and replacements. Strings advance a UTF-8 byte cursor and yield one scalar as a
+and replacements. The semantic builder checks `is_indexed` once: arrays and
+typed arrays then walk a hidden index with `indexed_length` and `get_indexed`,
+without allocating iteration state, while other iterables take the iterator
+path. Both paths share one copy of the body, so the loop stays closed for
+region optimization. Strings advance a UTF-8 byte cursor and yield one scalar as a
 string, avoiding repeated scans from the start. Normal completion and break
 release the iteration state; return and uncaught exceptions use frame cleanup.
 Caught exceptions can retain skipped locals until frame exit, as described below.
@@ -508,7 +528,7 @@ stack scanning is required for this ownership model.
   and releasing the old one, including self-assignment. Primitive values skip
   reference counting. Native code follows the same ownership rules.
 - Environments and host handles retain their runtime. Raw values passed to an
-  environment or engine are checked against that runtime; host callers must keep
+  engine are checked against that runtime's arena; host callers must keep
   an owning handle alive while using a heap value token.
 
 When a count reaches zero, enqueue the object instead of recursively destroying
@@ -1136,11 +1156,15 @@ uninitialized sentinel distinguishes failure from a successful `undefined`.
 Probes support directly stored values, numeric indexed values and simple builtin
 properties such as `length`; accesses requiring materialization fall back.
 
-A loop indexing an object defined before it gets a view: one helper call at the
-preheader records the typed array's element pointer, length and element kind,
-or a zero length for other receivers. Each access then checks for an integral
-key within that length and loads or stores inline, falling back to the generic
-helper at the same point. Integer stores check integrality and the signed
+A view is the receiver's slot address, or a static all-zero slot for
+non-objects and the global object, so kind checks fail and the length is zero.
+A loop indexing an object defined before it computes the view in its preheader;
+other element reads compute it in place. Each access checks for an integral key
+within the slot length and switches on the kind: typed arrays load or store
+inline, packed and holey arrays load inline (holes read as undefined, heap
+elements are retained as temporaries like the helper result), and everything
+else falls back to the generic helper at the same point. Array `length`
+reads, `is_indexed` and `indexed_length` load the header directly. Integer stores check integrality and the signed
 64-bit conversion range before truncating to the element width; other values
 use the generic modulo conversion. Typed-array storage never moves or resizes
 (`FixedTypedStorage`), and the frame keeps the array alive while the loop runs.

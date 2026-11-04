@@ -6,6 +6,7 @@ use cranelift_codegen::ir::{BlockArg, InstBuilder, MemFlags, Value as ClifValue,
 use cranelift_frontend::Variable;
 
 use crate::error::{Error, compile_at};
+use crate::heap::kind;
 use crate::jit::helpers::Helper;
 use crate::jit::semantic::{
     Constant, Facts, Graph, Op, ScopeKind, TerminatorKind, Types, UnaryOp, Value as GraphValue,
@@ -411,14 +412,20 @@ impl FunctionCompiler<'_, '_> {
                         self.property_access(object, name, Some(value));
                         None
                     }
+                    Op::Get(object, name) if name == "length" => {
+                        let object = get(self, *object);
+                        Some(self.length_access(object))
+                    }
                     Op::Get(object, name) => {
                         let object = get(self, *object);
                         Some(self.property_access(object, name, None))
                     }
-                    Op::GetIndex(object, index) | Op::TypedIndex(object, index) => {
+                    Op::GetIndex(object, index)
+                    | Op::TypedIndex(object, index)
+                    | Op::IndexedGet(object, index) => {
                         let object = get(self, *object);
                         let index = get(self, *index);
-                        Some(self.index_access(object, index, None))
+                        Some(self.element_read(object, Operand::new(index, Repr::Boxed)))
                     }
                     Op::SetIndex(object, index, value) => {
                         let object = get(self, *object);
@@ -439,6 +446,20 @@ impl FunctionCompiler<'_, '_> {
                         Some(self.b.ins().select(condition, yes, no))
                     }
                     Op::IsTyped(_) => unreachable!(),
+                    Op::IsIndexed(value) => {
+                        let value = get(self, *value);
+                        let view = self.view(value);
+                        let condition = self.has_kind(view, kind::ARRAY | kind::TYPED);
+                        let yes = self.constant(Value::TRUE);
+                        let no = self.constant(Value::FALSE);
+                        Some(self.b.ins().select(condition, yes, no))
+                    }
+                    Op::IndexedLength(value) => {
+                        let value = get(self, *value);
+                        let view = self.view(value);
+                        let length = self.view_length(view);
+                        Some(self.b.ins().bitcast(types::I64, MemFlags::new(), length))
+                    }
                     Op::AsNumber(value) => Some(get(self, *value)),
                     Op::ToNumeric(value) => {
                         let value = get(self, *value);
@@ -898,22 +919,37 @@ impl FunctionCompiler<'_, '_> {
                 let operand = self.operand(cx, *object);
                 let object = self.convert(operand, Repr::Boxed);
                 let view = self.view(object);
-                let kind = self
-                    .b
-                    .ins()
-                    .load(types::I64, MemFlags::trusted(), view, 16);
-                let value = self.b.ins().icmp_imm(IntCC::UnsignedLessThan, kind, 8);
-                boolean(value)
+                boolean(self.has_kind(view, kind::TYPED))
             }
-            Op::GetIndex(object, key) | Op::TypedIndex(object, key) => {
-                let Some(&view) = graph.views.get(&inst) else {
-                    return Ok(None);
-                };
-                let fallback = matches!(data.op, Op::GetIndex(..));
-                let view = self.operand(cx, view).value;
+            Op::IsIndexed(object) => {
+                let operand = self.operand(cx, *object);
+                let object = self.convert(operand, Repr::Boxed);
+                let view = self.view(object);
+                boolean(self.has_kind(view, kind::ARRAY | kind::TYPED))
+            }
+            Op::IndexedLength(object) => {
+                let operand = self.operand(cx, *object);
+                let object = self.convert(operand, Repr::Boxed);
+                let view = self.view(object);
+                let length = self.view_length(view);
+                Some(Some(Operand::new(length, Repr::Float)))
+            }
+            Op::GetIndex(object, key)
+            | Op::TypedIndex(object, key)
+            | Op::IndexedGet(object, key) => {
+                let fallback = !matches!(data.op, Op::TypedIndex(..));
                 let object = self.operand(cx, *object);
                 let object = self.convert(object, Repr::Boxed);
-                let key = self.operand(cx, *key);
+                let view = match graph.views.get(&inst) {
+                    Some(&view) => self.operand(cx, view).value,
+                    None => self.view(object),
+                };
+                let key = match self.operand(cx, *key) {
+                    key if key.repr == Repr::Bool => {
+                        Operand::new(self.convert(key, Repr::Boxed), Repr::Boxed)
+                    }
+                    key => key,
+                };
                 let result = self.viewed_index_access(view, object, key, None, fallback);
                 Some(Some(Operand::new(result, Repr::Boxed)))
             }

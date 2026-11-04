@@ -191,6 +191,9 @@ pub(super) enum Op {
     ConstructSpread(Value, Value),
     IteratorNew(Value),
     IteratorNext(Value),
+    IsIndexed(Value),
+    IndexedLength(Value),
+    IndexedGet(Value, Value),
     EnumerateNew(Value),
     EnumerateNext(Value),
     IsUninitialized(Value),
@@ -326,6 +329,8 @@ impl Op {
             | Op::CheckInitialized(value)
             | Op::IteratorNew(value)
             | Op::IteratorNext(value)
+            | Op::IsIndexed(value)
+            | Op::IndexedLength(value)
             | Op::EnumerateNew(value)
             | Op::EnumerateNext(value)
             | Op::IsUninitialized(value)
@@ -348,6 +353,7 @@ impl Op {
             | Op::Set(object, _, value) => vec![object, value],
             Op::GetIndex(object, key)
             | Op::TypedIndex(object, key)
+            | Op::IndexedGet(object, key)
             | Op::ProbeIndex(object, key)
             | Op::Binary(_, object, key)
             | Op::ArrayAppend(object, key, _)
@@ -804,7 +810,9 @@ impl Graph {
             Op::GuardValid(_) => closed(GLOBAL_READ, &[], Unowned),
             Op::GuardCommit(_) => closed(INTERNAL, &[], None),
             Op::View(_) => closed(HEAP_READ, &[Assumption::FixedTypedStorage], Unowned),
-            Op::IsTyped(_) => closed(0, &[], Unowned),
+            Op::IsTyped(_) | Op::IsIndexed(_) => closed(0, &[], Unowned),
+            Op::IndexedLength(_) => closed(HEAP_READ, &[], Unowned),
+            Op::IndexedGet(..) => closed(HEAP_READ | INTERNAL, &[], Borrowed),
             Op::TypedIndex(..) => closed(HEAP_READ, &[Assumption::FixedTypedStorage], Unowned),
             Op::IsNumber(_) => closed(0, &[], Unowned),
             Op::AsNumber(_) => closed(INTERNAL, &[], Unowned),
@@ -979,6 +987,9 @@ impl Graph {
             Op::ConstructSpread(callee, args) => format!("construct_spread {callee}, {args}"),
             Op::IteratorNew(value) => format!("iterator_new {value}"),
             Op::IteratorNext(value) => format!("iterator_next {value}"),
+            Op::IsIndexed(value) => format!("is_indexed {value}"),
+            Op::IndexedLength(value) => format!("indexed_length {value}"),
+            Op::IndexedGet(object, key) => format!("get_indexed {object}[{key}]"),
             Op::EnumerateNew(value) => format!("enumerate_new {value}"),
             Op::EnumerateNext(value) => format!("enumerate_next {value}"),
             Op::IsUninitialized(value) => format!("is_uninitialized {value}"),

@@ -1,0 +1,482 @@
+use std::cell::RefCell;
+use std::collections::VecDeque;
+use std::ptr::NonNull;
+use std::rc::Rc;
+
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+
+use crate::value::{TAG_OBJECT, TAG_STRING, Value};
+
+mod arena;
+mod array;
+mod function;
+mod generator;
+pub(crate) mod kind;
+mod natives;
+mod object;
+mod owned;
+mod properties;
+mod regexp;
+mod set;
+mod shape;
+mod string;
+#[cfg(test)]
+mod tests;
+mod typed;
+
+use arena::*;
+use array::*;
+use function::*;
+use generator::*;
+use object::*;
+use properties::*;
+use regexp::*;
+use set::*;
+use shape::*;
+use typed::*;
+
+pub(crate) use arena::{DATA_OFFSET, KIND_OFFSET, LENGTH_OFFSET, NO_ELEMENTS};
+pub(crate) use array::HOLE;
+pub(crate) use natives::{MathFunction, NativeFunction};
+pub use owned::OwnedValue;
+pub(crate) use regexp::regexp_flags;
+pub(crate) use typed::TypedKind;
+
+#[derive(Clone, Default)]
+pub(crate) struct Heap(Rc<RefCell<HeapData>>);
+
+#[derive(Default)]
+struct HeapData {
+    arena: Arena,
+    atoms: Atoms,
+    shapes: Shapes,
+    natives: Vec<(NativeFunction, u64)>,
+    interned: Vec<(&'static str, u64)>,
+    regexp_cache: HashMap<(String, u8), Rc<regress::Regex>>,
+    pending: VecDeque<u64>,
+    epoch: u64,
+}
+
+enum Payload {
+    Vacant,
+    Reserved,
+    Native(NativeFunction),
+    String(String),
+    Generator(Box<Generator>),
+    RegExp(Box<RegExp>),
+    Enumerator(Box<Enumerator>),
+    Set(Box<Set>),
+    Object(Box<Object>),
+    Array(Box<Array>),
+    TypedArray(Box<TypedArray>),
+    Cell(Box<Cell>),
+    Closure(Box<Closure>),
+}
+
+impl Payload {
+    fn kind(&self) -> u32 {
+        match self {
+            Self::Vacant | Self::Reserved => 0,
+            Self::Native(_) => kind::NATIVE,
+            Self::String(_) => kind::STRING,
+            Self::Generator(_) => kind::GENERATOR,
+            Self::RegExp(_) => kind::REGEXP,
+            Self::Enumerator(_) => kind::ENUMERATOR,
+            Self::Set(_) => kind::SET,
+            Self::Object(_) => kind::OBJECT,
+            Self::Array(array) if array.holes == 0 => kind::ARRAY,
+            Self::Array(_) => kind::ARRAY | kind::HOLEY,
+            Self::TypedArray(array) => kind::TYPED | array.kind.element(),
+            Self::Cell(_) => kind::CELL,
+            Self::Closure(_) => kind::CLOSURE,
+        }
+    }
+}
+
+pub(crate) enum PropertyRead {
+    Value(Value),
+    Native(NativeFunction),
+    Prototype,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IndexedStorageContract {
+    DirectNumericIndexStorage,
+}
+
+pub(crate) enum IndexRead {
+    Primitive(Value),
+    Borrowed(Value),
+    Character(char),
+}
+
+pub(crate) const GENERATOR_DONE: usize = usize::MAX;
+pub(crate) const GENERATOR_RUNNING: usize = usize::MAX - 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CodeId(pub(crate) u64);
+
+impl Heap {
+    pub(crate) fn receiver_kind(&self, value: Value) -> &'static str {
+        if self.is_array(value) {
+            return "array";
+        }
+        if self.typed_kind(value).is_some() {
+            return "typed array";
+        }
+        if self.regexp_state(value).is_some() {
+            return "regexp";
+        }
+        if self.closure_code(value).is_some() {
+            return "function";
+        }
+        if self.native(value).is_some() {
+            return "native function";
+        }
+        if self.set_size(value).is_some() {
+            return "set";
+        }
+        if self.generator_state(value).is_some() {
+            return "generator";
+        }
+        if value == Value::GLOBAL_OBJECT {
+            return "global object";
+        }
+        if value.is_null() {
+            return "null";
+        }
+        value.type_name()
+    }
+
+    pub(crate) fn invalidate(&self) {
+        self.0.borrow_mut().epoch += 1;
+    }
+
+    pub(crate) fn epoch(&self) -> *const u64 {
+        unsafe { &raw const (*self.0.as_ptr()).epoch }
+    }
+
+    pub(crate) fn owns(&self, value: Value) -> bool {
+        let data = self.0.borrow();
+        heap_id(value).is_none_or(|id| data.arena.owns(id)) && data.valid(value)
+    }
+
+    pub(crate) fn valid(&self, value: Value) -> bool {
+        if !value.is_object() && !value.is_string() {
+            return true;
+        }
+        self.0.borrow().valid(value)
+    }
+
+    pub(crate) fn retain(&self, value: Value) -> bool {
+        if !value.is_object() && !value.is_string() {
+            return true;
+        }
+        self.0.borrow_mut().retain(value)
+    }
+
+    pub(crate) fn release(&self, value: Value) {
+        if !value.is_object() && !value.is_string() {
+            return;
+        }
+        self.0.borrow_mut().release(value);
+    }
+
+    pub(crate) fn release_all(&self, values: &[Value]) {
+        let mut owned = values
+            .iter()
+            .filter(|value| value.is_object() || value.is_string())
+            .peekable();
+        if owned.peek().is_none() {
+            return;
+        }
+        let mut data = self.0.borrow_mut();
+        for &value in owned {
+            data.release(value);
+        }
+    }
+
+    pub(crate) fn drain(&self, mut budget: usize) {
+        let mut data = self.0.borrow_mut();
+        while budget > 0 {
+            let Some(id) = data.pending.pop_front() else {
+                break;
+            };
+            let slot = data.slot_mut(id);
+            if slot.references != 0 {
+                continue;
+            }
+            let edge = match &mut slot.payload {
+                Payload::Generator(generator) => generator.locals.pop(),
+                Payload::Set(set) => set
+                    .entries
+                    .extract_if(|_, _| true)
+                    .next()
+                    .map(|(_, value)| value),
+                Payload::Object(object) => object.properties.pop(),
+                Payload::Array(array) => array.elements.pop(),
+                Payload::Closure(closure) => {
+                    closure.properties.pop().or_else(|| closure.captures.pop())
+                }
+                _ => None,
+            };
+            if let Some(value) = edge {
+                data.pending.push_back(id);
+                data.release(value);
+            } else {
+                let payload = data.vacate(id);
+                match payload {
+                    Payload::Enumerator(state) => {
+                        if let Some(value) = state.current {
+                            data.release(value);
+                        }
+                    }
+                    Payload::Generator(generator) => {
+                        data.release(generator.closure);
+                        data.release(generator.arguments);
+                        data.release(generator.receiver);
+                    }
+                    Payload::Object(object) => {
+                        if let Some(value) = object.prototype {
+                            data.release(value);
+                        }
+                    }
+                    Payload::Cell(cell) => data.release(cell.value),
+                    Payload::Closure(closure) => {
+                        if let Some(value) = closure.lexical_this {
+                            data.release(value);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            budget -= 1;
+        }
+    }
+}
+
+fn element_index(number: f64, limit: f64) -> Option<usize> {
+    if !(number >= 0.0 && number < limit) {
+        return None;
+    }
+    let index = number as usize;
+    (index as f64 == number).then_some(index)
+}
+
+fn heap_id(value: Value) -> Option<u64> {
+    let bits = value.bits();
+    ((value.is_object() && bits != TAG_OBJECT) || value.is_string())
+        .then_some(bits & 0x0000_ffff_ffff_ffff)
+        .filter(|id| *id != 0)
+}
+
+impl HeapData {
+    fn generator(&self, id: u64) -> Option<&Generator> {
+        match &self.live(id)?.payload {
+            Payload::Generator(value) => Some(value),
+            _ => None,
+        }
+    }
+    fn generator_mut(&mut self, id: u64) -> Option<&mut Generator> {
+        match &mut self.live_mut(id)?.payload {
+            Payload::Generator(value) => Some(value),
+            _ => None,
+        }
+    }
+    fn regexp(&self, id: u64) -> Option<&RegExp> {
+        match &self.live(id)?.payload {
+            Payload::RegExp(value) => Some(value),
+            _ => None,
+        }
+    }
+    fn regexp_mut(&mut self, id: u64) -> Option<&mut RegExp> {
+        match &mut self.live_mut(id)?.payload {
+            Payload::RegExp(value) => Some(value),
+            _ => None,
+        }
+    }
+    fn enumerator_mut(&mut self, id: u64) -> Option<&mut Enumerator> {
+        match &mut self.live_mut(id)?.payload {
+            Payload::Enumerator(value) => Some(value),
+            _ => None,
+        }
+    }
+    fn set(&self, id: u64) -> Option<&Set> {
+        match &self.live(id)?.payload {
+            Payload::Set(value) => Some(value),
+            _ => None,
+        }
+    }
+    fn set_mut(&mut self, id: u64) -> Option<&mut Set> {
+        match &mut self.live_mut(id)?.payload {
+            Payload::Set(value) => Some(value),
+            _ => None,
+        }
+    }
+    fn object(&self, id: u64) -> Option<&Object> {
+        match &self.live(id)?.payload {
+            Payload::Object(value) => Some(value),
+            _ => None,
+        }
+    }
+    fn array(&self, id: u64) -> Option<&Array> {
+        match &self.live(id)?.payload {
+            Payload::Array(value) => Some(value),
+            _ => None,
+        }
+    }
+    fn array_mut(&mut self, id: u64) -> Option<&mut Array> {
+        match &mut self.live_mut(id)?.payload {
+            Payload::Array(value) => Some(value),
+            _ => None,
+        }
+    }
+    fn is_array(&self, id: u64) -> bool {
+        self.array(id).is_some()
+    }
+    fn typed_array(&self, id: u64) -> Option<&TypedArray> {
+        match &self.live(id)?.payload {
+            Payload::TypedArray(value) => Some(value),
+            _ => None,
+        }
+    }
+    fn typed_array_mut(&mut self, id: u64) -> Option<&mut TypedArray> {
+        match &mut self.live_mut(id)?.payload {
+            Payload::TypedArray(value) => Some(value),
+            _ => None,
+        }
+    }
+    fn cell(&self, id: u64) -> Option<&Cell> {
+        match &self.live(id)?.payload {
+            Payload::Cell(value) => Some(value),
+            _ => None,
+        }
+    }
+    fn cell_mut(&mut self, id: u64) -> Option<&mut Cell> {
+        match &mut self.live_mut(id)?.payload {
+            Payload::Cell(value) => Some(value),
+            _ => None,
+        }
+    }
+    fn closure(&self, id: u64) -> Option<&Closure> {
+        match &self.live(id)?.payload {
+            Payload::Closure(value) => Some(value),
+            _ => None,
+        }
+    }
+    fn closure_mut(&mut self, id: u64) -> Option<&mut Closure> {
+        match &mut self.live_mut(id)?.payload {
+            Payload::Closure(value) => Some(value),
+            _ => None,
+        }
+    }
+    fn string(&self, id: u64) -> Option<&String> {
+        match &self.live(id)?.payload {
+            Payload::String(value) => Some(value),
+            _ => None,
+        }
+    }
+    fn reserve(&mut self) -> Option<u64> {
+        let slot = self.arena.allocate()?;
+        let slot = unsafe { &mut *slot.as_ptr() };
+        slot.references = 1;
+        slot.payload = Payload::Reserved;
+        Some(slot as *mut Slot as u64)
+    }
+
+    fn store(&mut self, id: u64, payload: Payload) {
+        self.slot_mut(id).payload = payload;
+        self.sync(id);
+    }
+
+    fn sync(&mut self, id: u64) {
+        let slot = self.slot_mut(id);
+        slot.kind = slot.payload.kind();
+        (slot.data, slot.length) = match &slot.payload {
+            Payload::Array(array) => (array.elements.as_ptr().cast(), array.elements.len()),
+            Payload::TypedArray(array) => array.storage.raw(),
+            _ => (std::ptr::null(), 0),
+        };
+    }
+
+    fn store_shaped(&mut self, id: u64, payload: Payload) {
+        self.store(id, payload);
+        let root = self.shapes.root(None);
+        self.slot_mut(id).shape = root;
+    }
+
+    fn vacate(&mut self, id: u64) -> Payload {
+        let slot = self.slot_mut(id);
+        slot.kind = 0;
+        slot.shape = NO_SHAPE;
+        slot.flags = 0;
+        slot.data = std::ptr::null();
+        slot.length = 0;
+        let payload = std::mem::replace(&mut slot.payload, Payload::Vacant);
+        let slot = NonNull::from(slot);
+        self.arena.free(slot);
+        payload
+    }
+
+    fn slot(&self, id: u64) -> &Slot {
+        unsafe { &*self.arena.get(id).as_ptr() }
+    }
+
+    fn slot_mut(&mut self, id: u64) -> &mut Slot {
+        unsafe { &mut *self.arena.get(id).as_ptr() }
+    }
+
+    #[cfg(test)]
+    fn slots(&self) -> impl Iterator<Item = &Slot> {
+        self.arena.slots()
+    }
+
+    // Zero-reference slots remain present until incremental destruction finishes.
+    fn live(&self, id: u64) -> Option<&Slot> {
+        Some(self.slot(id)).filter(|slot| slot.references != 0)
+    }
+
+    fn live_mut(&mut self, id: u64) -> Option<&mut Slot> {
+        Some(self.slot_mut(id)).filter(|slot| slot.references != 0)
+    }
+
+    fn valid(&self, value: Value) -> bool {
+        match heap_id(value) {
+            Some(id) => self.live(id).is_some_and(|slot| {
+                matches!(
+                    (&slot.payload, value.is_string()),
+                    (Payload::String(_), true)
+                ) || (!value.is_string()
+                    && !matches!(
+                        slot.payload,
+                        Payload::String(_) | Payload::Vacant | Payload::Reserved
+                    ))
+            }),
+            None => !value.is_string(),
+        }
+    }
+
+    fn retain(&mut self, value: Value) -> bool {
+        let Some(id) = heap_id(value) else {
+            return !value.is_string();
+        };
+        let Some(slot) = self.live_mut(id) else {
+            return false;
+        };
+        slot.references += 1;
+        true
+    }
+
+    fn release(&mut self, value: Value) {
+        let Some(id) = heap_id(value) else { return };
+        let slot = self.slot_mut(id);
+        if matches!(slot.payload, Payload::Vacant | Payload::Reserved) {
+            return;
+        }
+        assert!(slot.references > 0);
+        slot.references -= 1;
+        if slot.references == 0 {
+            self.pending.push_back(id);
+        }
+    }
+}

@@ -69,7 +69,6 @@ pub(super) fn effects(helper: Helper) -> Effects {
             ],
         ),
         Truthy => (Reentry::Closed, HEAP_READ, &[]),
-        TypedView => (Reentry::Closed, HEAP_READ, &[Assumption::FixedTypedStorage]),
         ArrayNew | Rest | ObjectNew | StringNew => {
             (Reentry::Closed, ALLOCATION | INTERNAL | ERROR, &[])
         }
@@ -120,8 +119,8 @@ pub(super) fn temporary_effect(helper: Helper) -> TemporaryEffect {
         TempClear => Clear,
         TempRetain => RetainArgument,
         Add => NumericAdd,
-        LocalSet | LocalReplace | TypedView | ErrorOrigin | Throw | MathDirect | IndexRoot
-        | IndexProbe | Truthy | BitwiseAnd | BitwiseOr | BitwiseXor | ShiftLeft | ShiftRight
+        LocalSet | LocalReplace | ErrorOrigin | Throw | MathDirect | IndexRoot | IndexProbe
+        | Truthy | BitwiseAnd | BitwiseOr | BitwiseXor | ShiftLeft | ShiftRight
         | ShiftRightUnsigned | Sub | Mul | Div | Rem | Pow | LooseEqual | LooseNotEqual
         | StrictEqual | StrictNotEqual | Less | LessEqual | Greater | GreaterEqual | UnaryPlus
         | UnaryNegation | LogicalNot | BitwiseNot => None,

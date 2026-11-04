@@ -52,10 +52,15 @@ fn contained_use(op: &Op, index: usize) -> bool {
         Op::Get(..)
         | Op::GetIndex(..)
         | Op::TypedIndex(..)
+        | Op::IndexedGet(..)
         | Op::Set(..)
         | Op::SetIndex(..)
         | Op::Define(..) => index == 0,
-        Op::IsUndefined(_) | Op::IsNullish(_) | Op::CheckInitialized(_) => true,
+        Op::IsUndefined(_)
+        | Op::IsNullish(_)
+        | Op::CheckInitialized(_)
+        | Op::IsIndexed(_)
+        | Op::IndexedLength(_) => true,
         Op::Binary(BinaryOperator::StrictEquality | BinaryOperator::StrictInequality, ..) => true,
         Op::IteratorNew(_) | Op::IteratorNext(_) | Op::EnumerateNew(_) | Op::EnumerateNext(_) => {
             true
@@ -139,7 +144,10 @@ impl Access {
     fn of(op: &Op, facts: &Facts) -> Self {
         match op {
             Op::Get(_, name) | Op::Set(_, name, _) | Op::Define(_, name, _) => Self::named(name),
-            Op::GetIndex(_, key) | Op::TypedIndex(_, key) | Op::SetIndex(_, key, _)
+            Op::GetIndex(_, key)
+            | Op::TypedIndex(_, key)
+            | Op::IndexedGet(_, key)
+            | Op::SetIndex(_, key, _)
                 if facts.of(*key).within(Types::NUMBER) =>
             {
                 Self::Elements
@@ -231,9 +239,10 @@ impl Writes {
 
     fn preserves(&self, op: &Op) -> bool {
         match op {
-            Op::Get(object, _) | Op::GetIndex(object, _) | Op::TypedIndex(object, _) => {
-                !self.clobbers(*object, &Access::of(op, &self.facts))
-            }
+            Op::Get(object, _)
+            | Op::GetIndex(object, _)
+            | Op::TypedIndex(object, _)
+            | Op::IndexedGet(object, _) => !self.clobbers(*object, &Access::of(op, &self.facts)),
             Op::GlobalRead(name) => !self.clobbers_global(name),
             _ => false,
         }
@@ -516,6 +525,7 @@ fn receiver_use(op: &Op, index: usize) -> bool {
         Op::Get(..)
         | Op::GetIndex(..)
         | Op::TypedIndex(..)
+        | Op::IndexedGet(..)
         | Op::Set(..)
         | Op::SetIndex(..)
         | Op::Define(..)
@@ -647,7 +657,7 @@ fn numeric_use(op: &Op, index: usize) -> bool {
         ),
         Op::Unary(operator, _) => !matches!(operator, UnaryOp::Not | UnaryOp::Typeof),
         Op::ToNumeric(_) | Op::CallNative(..) => true,
-        Op::GetIndex(..) | Op::TypedIndex(..) | Op::SetIndex(..) => index == 1,
+        Op::GetIndex(..) | Op::TypedIndex(..) | Op::IndexedGet(..) | Op::SetIndex(..) => index == 1,
         _ => false,
     }
 }

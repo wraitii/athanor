@@ -323,7 +323,8 @@ fn result_types(op: &Op, facts: &Facts) -> Types {
         Op::ProbeProperty(..) | Op::ProbeIndex(..) => Types::ALL,
         Op::View(_) => Types::VIEW,
         Op::TypedIndex(..) => Types::NUMBER.union(Types::UNDEFINED),
-        Op::IsTyped(_) => Types::BOOLEAN,
+        Op::IsTyped(_) | Op::IsIndexed(_) => Types::BOOLEAN,
+        Op::IndexedLength(_) => Types::NUMBER,
         Op::IsNumber(_) => Types::BOOLEAN,
         Op::AsNumber(_) => Types::NUMBER,
         Op::ToNumeric(value) | Op::Unary(UnaryOp::Plus, value)

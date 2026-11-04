@@ -100,7 +100,6 @@ define_helpers! {
     IndexRoot => Quaternary, js_index_root;
     IndexProbe => Binary, js_index_probe;
     IndexSet => IndexSet, js_index_set;
-    TypedView => Binary, js_typed_view;
     PropertyGet => PropertyGet, js_property_get;
     PropertySet => PropertySet, js_property_set;
     PropertyDefineHidden => PropertySet, js_property_define_hidden;
@@ -1097,21 +1096,6 @@ extern "C" fn js_array_extend(ctx: *mut JitCtx, arguments: Value, iterable: Valu
         if unsafe { &*ctx }.error.is_some() {
             break;
         }
-    }
-    Value::UNDEFINED
-}
-
-extern "C" fn js_typed_view(ctx: *mut JitCtx, value: Value, out: *mut u64) -> Value {
-    let (pointer, length, kind) =
-        unsafe { &*ctx }
-            .global
-            .heap()
-            .typed_view(value)
-            .unwrap_or((std::ptr::null(), 0, u64::MAX));
-    unsafe {
-        *out = pointer as u64;
-        *out.add(1) = length as u64;
-        *out.add(2) = kind;
     }
     Value::UNDEFINED
 }

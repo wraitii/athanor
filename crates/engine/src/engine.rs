@@ -440,7 +440,7 @@ impl Engine {
     /// Calls a function with borrowed arguments and returns an owning handle.
     /// Heap arguments must be live tokens from this engine.
     pub fn call(&self, name: &str, args: &[Value]) -> Result<OwnedValue, Error> {
-        if !args.iter().all(|value| self.global.heap().valid(*value)) {
+        if !args.iter().all(|value| self.global.heap().owns(*value)) {
             return Err(Error::Runtime("invalid heap value".into()));
         }
         let callable = self

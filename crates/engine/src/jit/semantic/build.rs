@@ -11,7 +11,9 @@ use oxc_ast::ast::{
 };
 use oxc_semantic::Scoping;
 use oxc_span::{GetSpan, Span};
-use oxc_syntax::operator::{AssignmentOperator, LogicalOperator, UnaryOperator, UpdateOperator};
+use oxc_syntax::operator::{
+    AssignmentOperator, BinaryOperator, LogicalOperator, UnaryOperator, UpdateOperator,
+};
 use oxc_syntax::{reference::ReferenceId, symbol::SymbolId};
 
 use super::{
@@ -1142,21 +1144,64 @@ impl<'a> Builder<'a> {
             return unsupported("for-of binding pattern", declarator.span);
         }
         pattern_bindings(&declarator.id)?;
+        let (state, position) = self.hidden_binding(span, "%position");
         let scope = if declaration.kind == VariableDeclarationKind::Var {
             None
         } else {
             self.open_scope(span, ScopeKind::Loop, declaration_bindings(declaration)?)?
         };
         let iterable = self.expression(&statement.right)?;
-        let iterator = self.emit(span, Op::IteratorNew(iterable));
+        // Arrays and typed arrays walk their elements by index; other iterables keep the
+        // iterator protocol. Both paths share one copy of the body.
+        let indexed = self.emit(span, Op::IsIndexed(iterable));
+        let zero = self.constant(span, Constant::Number(0.0));
+        self.effect(span, Op::Initialize(position, zero));
+        let direct = self.block();
+        let generic = self.block();
+        let entry = self.block();
+        let iterator = self.param(entry);
         let head = self.block();
+        self.branch(span, indexed, Target::new(direct), Target::new(generic));
+        self.switch(direct);
+        let undefined = self.constant(span, Constant::Undefined);
+        self.jump(span, entry, vec![undefined]);
+        self.switch(generic);
+        let created = self.emit(span, Op::IteratorNew(iterable));
+        self.jump(span, entry, vec![created]);
+        self.switch(entry);
+        self.jump(span, head, Vec::new());
+
+        self.switch(head);
+        let direct = self.block();
+        let generic = self.block();
+        let read = self.block();
         let body = self.block();
         let done = self.block();
-        self.jump(span, head, Vec::new());
-        self.switch(head);
-        let item = self.emit(span, Op::IteratorNext(iterator));
-        let finished = self.emit(span, Op::IsUninitialized(item));
-        self.branch(span, finished, Target::new(done), Target::new(body));
+        let item = self.param(body);
+        self.branch(span, indexed, Target::new(direct), Target::new(generic));
+        self.switch(direct);
+        let index = self.emit(span, Op::Read(position));
+        let length = self.emit(span, Op::IndexedLength(iterable));
+        let inside = self.emit(span, Op::Binary(BinaryOperator::LessThan, index, length));
+        self.branch(span, inside, Target::new(read), Target::new(done));
+        self.switch(read);
+        let element = self.emit(span, Op::IndexedGet(iterable, index));
+        let one = self.constant(span, Constant::Number(1.0));
+        let next = self.emit(span, Op::Binary(BinaryOperator::Addition, index, one));
+        self.effect(span, Op::Write(position, next));
+        self.jump(span, body, vec![element]);
+        self.switch(generic);
+        let next = self.emit(span, Op::IteratorNext(iterator));
+        let finished = self.emit(span, Op::IsUninitialized(next));
+        self.branch(
+            span,
+            finished,
+            Target::new(done),
+            Target {
+                block: body,
+                args: vec![next],
+            },
+        );
         self.switch(body);
         if let Some(scope) = scope {
             self.effect(span, Op::FreshIteration(scope));
@@ -1173,7 +1218,26 @@ impl<'a> Builder<'a> {
         )?;
         self.switch(done);
         self.close_scope(span, scope);
+        self.close_scope(span, Some(state));
         Ok(())
+    }
+
+    fn hidden_binding(&mut self, span: Span, name: &str) -> (Scope, Binding) {
+        let scope = self.graph.scopes.push(ScopeData {
+            kind: ScopeKind::Block,
+            parent: self.open.last().copied(),
+            bindings: Vec::new(),
+        });
+        let binding = self.graph.bindings.push(BindingData {
+            name: name.to_owned(),
+            kind: BindingKind::Let,
+            scope,
+            captured: false,
+        });
+        self.graph.scopes[scope].bindings.push(binding);
+        self.effect(span, Op::EnterScope(scope));
+        self.open.push(scope);
+        (scope, binding)
     }
 
     fn class_declaration(&mut self, class: &oxc_ast::ast::Class<'_>) -> Result<()> {

@@ -1,16 +1,14 @@
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
-use cranelift_codegen::ir::{
-    BlockArg, InstBuilder, MemFlags, StackSlotData, StackSlotKind, Type, Value as ClifValue, types,
-};
+use cranelift_codegen::ir::{BlockArg, InstBuilder, MemFlags, Type, Value as ClifValue, types};
 use cranelift_frontend::Switch;
 use cranelift_module::Module;
 use oxc_syntax::operator::BinaryOperator;
 
-use crate::heap::MathFunction;
+use crate::heap::{DATA_OFFSET, HOLE, KIND_OFFSET, LENGTH_OFFSET, MathFunction, NO_ELEMENTS, kind};
 use crate::jit::helpers::Helper;
 use crate::jit::numeric::{IndexedRead, IndexedReadContract, Kind};
 use crate::value::Value;
-use crate::value::{TAG_FIRST, TAG_SHIFT, TAG_SPAN, TAG_STRING};
+use crate::value::{TAG_FIRST, TAG_OBJECT, TAG_SHIFT, TAG_SPAN, TAG_STRING};
 
 use super::repr::{Operand, Repr};
 use super::{FunctionCompiler, ir_helpers};
@@ -26,6 +24,8 @@ enum Element {
     F32,
     F64,
 }
+
+const ADDRESS_MASK: i64 = (1 << TAG_SHIFT) - 1;
 
 const TYPED_KINDS: [Element; 8] = [
     Element::U8,
@@ -45,6 +45,20 @@ impl Element {
 
     fn is_float(self) -> bool {
         matches!(self, Self::F32 | Self::F64)
+    }
+
+    fn kind(self) -> u32 {
+        kind::TYPED
+            | match self {
+                Self::U8 => 0,
+                Self::U16 => 1,
+                Self::U32 => 2,
+                Self::I8 => kind::ELEMENT_SIGNED,
+                Self::I16 => kind::ELEMENT_SIGNED | 1,
+                Self::I32 => kind::ELEMENT_SIGNED | 2,
+                Self::F32 => kind::ELEMENT_FLOAT | 2,
+                Self::F64 => kind::ELEMENT_FLOAT | 3,
+            }
     }
 }
 
@@ -534,13 +548,66 @@ impl FunctionCompiler<'_, '_> {
         result
     }
 
+    // Non-objects and the global object (address zero) see an all-zero slot, so every
+    // kind check fails and the length reads as zero.
     pub(super) fn view(&mut self, object: ClifValue) -> ClifValue {
-        let slot =
-            self.b
-                .create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 24, 3));
-        let address = self.b.ins().stack_addr(self.pointer, slot, 0);
-        self.call_helper(Helper::TypedView, &[object, address]);
-        address
+        let tag = self.b.ins().ushr_imm(object, TAG_SHIFT as i64);
+        let is_object = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, tag, (TAG_OBJECT >> TAG_SHIFT) as i64);
+        let address = self.b.ins().band_imm(object, ADDRESS_MASK);
+        let present = self.b.ins().icmp_imm(IntCC::NotEqual, address, 0);
+        let valid = self.b.ins().band(is_object, present);
+        let empty = self
+            .b
+            .ins()
+            .iconst(self.pointer, NO_ELEMENTS.as_ptr() as i64);
+        self.b.ins().select(valid, address, empty)
+    }
+
+    pub(super) fn view_kind(&mut self, view: ClifValue) -> ClifValue {
+        self.b
+            .ins()
+            .load(types::I32, MemFlags::trusted(), view, KIND_OFFSET)
+    }
+
+    pub(super) fn has_kind(&mut self, view: ClifValue, mask: u32) -> ClifValue {
+        let kind = self.view_kind(view);
+        let masked = self.b.ins().band_imm(kind, mask as i64);
+        self.b.ins().icmp_imm(IntCC::NotEqual, masked, 0)
+    }
+
+    pub(super) fn view_length(&mut self, view: ClifValue) -> ClifValue {
+        let length = self
+            .b
+            .ins()
+            .load(types::I64, MemFlags::trusted(), view, LENGTH_OFFSET);
+        self.b.ins().fcvt_from_uint(types::F64, length)
+    }
+
+    pub(super) fn length_access(&mut self, object: ClifValue) -> ClifValue {
+        let view = self.view(object);
+        let indexed = self.has_kind(view, kind::ARRAY | kind::TYPED);
+        let inline = self.b.create_block();
+        let slow = self.b.create_block();
+        let done = self.b.create_block();
+        self.b.append_block_param(done, types::I64);
+        self.brif(indexed, inline, &[], slow, &[]);
+        self.switch(inline);
+        let length = self.view_length(view);
+        let bits = self.b.ins().bitcast(types::I64, MemFlags::new(), length);
+        self.jump(done, &[BlockArg::Value(bits)]);
+        self.switch(slow);
+        let result = self.property_access(object, "length", None);
+        self.jump(done, &[BlockArg::Value(result)]);
+        self.switch(done);
+        self.b.block_params(done)[0]
+    }
+
+    pub(super) fn element_read(&mut self, object: ClifValue, key: Operand) -> ClifValue {
+        let view = self.view(object);
+        self.viewed_index_access(view, object, key, None, true)
     }
 
     pub(super) fn viewed_index_access(
@@ -552,7 +619,7 @@ impl FunctionCompiler<'_, '_> {
         fallback: bool,
     ) -> ClifValue {
         let flags = MemFlags::trusted();
-        let length = self.b.ins().load(types::I64, flags, view, 8);
+        let length = self.b.ins().load(types::I64, flags, view, LENGTH_OFFSET);
         let (position, fast) = if key.repr == Repr::Int32 {
             let position = self.b.ins().sextend(types::I64, key.value);
             let inside = self.b.ins().icmp(IntCC::UnsignedLessThan, position, length);
@@ -572,17 +639,52 @@ impl FunctionCompiler<'_, '_> {
         self.brif(fast, inline, &[], slow, &[]);
 
         self.switch(inline);
-        let data = self.b.ins().load(self.pointer, flags, view, 0);
-        let kind = self.b.ins().load(types::I64, flags, view, 16);
+        let data = self.b.ins().load(self.pointer, flags, view, DATA_OFFSET);
+        let kind = self.view_kind(view);
         let mut switch = Switch::new();
         let kinds: Vec<_> = TYPED_KINDS
             .iter()
             .map(|&element| (element, self.b.create_block()))
             .collect();
-        for (index, (_, block)) in kinds.iter().enumerate() {
-            switch.set_entry(index as u128, *block);
+        for (element, block) in &kinds {
+            switch.set_entry(element.kind() as u128, *block);
         }
+        let elements = value.is_none().then(|| {
+            let packed = self.b.create_block();
+            let holey = self.b.create_block();
+            switch.set_entry(kind::ARRAY as u128, packed);
+            switch.set_entry((kind::ARRAY | kind::HOLEY) as u128, holey);
+            let offset = self.b.ins().ishl_imm(position, 3);
+            let address = self.b.ins().iadd(data, offset);
+            (packed, holey, address)
+        });
         switch.emit(self.b, kind, slow);
+        if let Some((packed, holey, address)) = elements {
+            let element = self.b.create_block();
+            self.b.append_block_param(element, types::I64);
+            self.switch(packed);
+            let bits = self.b.ins().load(types::I64, flags, address, 0);
+            self.jump(element, &[BlockArg::Value(bits)]);
+            self.switch(holey);
+            let bits = self.b.ins().load(types::I64, flags, address, 0);
+            let hole = self
+                .b
+                .ins()
+                .icmp_imm(IntCC::Equal, bits, HOLE.bits() as i64);
+            let undefined = self.constant(Value::UNDEFINED);
+            let bits = self.b.ins().select(hole, undefined, bits);
+            self.jump(element, &[BlockArg::Value(bits)]);
+            self.switch(element);
+            let bits = self.b.block_params(element)[0];
+            let heap = self.is_heap(bits);
+            // Matches the IndexGet helper, which hands heap elements out as temporaries.
+            let retain = self.b.create_block();
+            self.brif(heap, retain, &[], done, &[BlockArg::Value(bits)]);
+            self.switch(retain);
+            let retained = self.call_helper(Helper::TempRetain, &[bits]);
+            self.check_error();
+            self.jump(done, &[BlockArg::Value(retained)]);
+        }
         for (element, block) in kinds {
             self.switch(block);
             let offset = self.b.ins().imul_imm(position, element.bytes() as i64);
