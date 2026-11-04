@@ -1,14 +1,63 @@
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
-use cranelift_codegen::ir::{BlockArg, InstBuilder, MemFlags, Value as ClifValue, types};
+use cranelift_codegen::ir::{
+    BlockArg, InstBuilder, MemFlags, StackSlotData, StackSlotKind, Type, Value as ClifValue, types,
+};
+use cranelift_frontend::Switch;
 use cranelift_module::Module;
 use oxc_syntax::operator::BinaryOperator;
 
+use crate::heap::MathFunction;
 use crate::jit::helpers::Helper;
 use crate::jit::numeric::{IndexedRead, IndexedReadContract, Kind};
 use crate::value::Value;
 use crate::value::{TAG_FIRST, TAG_SHIFT, TAG_SPAN, TAG_STRING};
 
 use super::{FunctionCompiler, ir_helpers};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Element {
+    U8,
+    U16,
+    U32,
+    I8,
+    I16,
+    I32,
+    F32,
+    F64,
+}
+
+const TYPED_KINDS: [Element; 8] = [
+    Element::U8,
+    Element::U16,
+    Element::U32,
+    Element::I8,
+    Element::I16,
+    Element::I32,
+    Element::F32,
+    Element::F64,
+];
+
+impl Element {
+    fn bytes(self) -> u32 {
+        Type::from(self).bytes()
+    }
+
+    fn is_float(self) -> bool {
+        matches!(self, Self::F32 | Self::F64)
+    }
+}
+
+impl From<Element> for Type {
+    fn from(element: Element) -> Self {
+        match element {
+            Element::U8 | Element::I8 => types::I8,
+            Element::U16 | Element::I16 => types::I16,
+            Element::U32 | Element::I32 => types::I32,
+            Element::F32 => types::F32,
+            Element::F64 => types::F64,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum BinaryOp {
@@ -231,9 +280,14 @@ impl FunctionCompiler<'_, '_> {
             BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
                 self.numeric_binary(op, left, right)
             }
-            BinaryOp::Less | BinaryOp::LessEqual | BinaryOp::Greater | BinaryOp::GreaterEqual => {
-                self.numeric_comparison(op, left, right)
-            }
+            BinaryOp::Less
+            | BinaryOp::LessEqual
+            | BinaryOp::Greater
+            | BinaryOp::GreaterEqual
+            | BinaryOp::LooseEqual
+            | BinaryOp::LooseNotEqual
+            | BinaryOp::StrictEqual
+            | BinaryOp::StrictNotEqual => self.numeric_comparison(op, left, right),
             _ => self.binary_helper(op, left, right),
         }
     }
@@ -288,6 +342,64 @@ impl FunctionCompiler<'_, '_> {
         self.switch(slow);
         let result = self.binary_helper(op, left, right);
         self.jump(done, &[BlockArg::Value(result)]);
+
+        self.switch(done);
+        self.b.block_params(done)[0]
+    }
+
+    pub(super) fn native_math(
+        &mut self,
+        function: MathFunction,
+        args: &[ClifValue],
+        slow: impl FnOnce(&mut Self) -> ClifValue,
+    ) -> ClifValue {
+        let inline = matches!(
+            (function, args.len()),
+            (
+                MathFunction::Floor | MathFunction::Ceil | MathFunction::Sqrt,
+                1
+            ) | (MathFunction::Min | MathFunction::Max, 1..)
+        );
+        if !inline {
+            return slow(self);
+        }
+        let mut numbers = self.b.ins().iconst(types::I8, 1);
+        for &arg in args {
+            let number = self.is_number(arg);
+            numbers = self.b.ins().band(numbers, number);
+        }
+        let fast_block = self.b.create_block();
+        let slow_block = self.b.create_block();
+        let done = self.b.create_block();
+        self.b.append_block_param(done, types::I64);
+        self.brif(numbers, fast_block, &[], slow_block, &[]);
+
+        self.switch(fast_block);
+        let floats: Vec<_> = args
+            .iter()
+            .map(|&arg| self.b.ins().bitcast(types::F64, MemFlags::new(), arg))
+            .collect();
+        let result = match function {
+            MathFunction::Floor => self.b.ins().floor(floats[0]),
+            MathFunction::Ceil => self.b.ins().ceil(floats[0]),
+            MathFunction::Sqrt => self.b.ins().sqrt(floats[0]),
+            MathFunction::Min => floats[1..]
+                .iter()
+                .fold(floats[0], |left, &right| self.b.ins().fmin(left, right)),
+            _ => floats[1..]
+                .iter()
+                .fold(floats[0], |left, &right| self.b.ins().fmax(left, right)),
+        };
+        let unordered = self.b.ins().fcmp(FloatCC::Unordered, result, result);
+        let bits = self.b.ins().bitcast(types::I64, MemFlags::new(), result);
+        let nan = self.constant(Value::number(f64::NAN));
+        let boxed = self.b.ins().select(unordered, nan, bits);
+        self.annotations.results.insert(boxed, Kind::Number);
+        self.jump(done, &[BlockArg::Value(boxed)]);
+
+        self.switch(slow_block);
+        let slow_result = slow(self);
+        self.jump(done, &[BlockArg::Value(slow_result)]);
 
         self.switch(done);
         self.b.block_params(done)[0]
@@ -361,6 +473,8 @@ impl FunctionCompiler<'_, '_> {
                     BinaryOp::LessEqual => FloatCC::LessThanOrEqual,
                     BinaryOp::Greater => FloatCC::GreaterThan,
                     BinaryOp::GreaterEqual => FloatCC::GreaterThanOrEqual,
+                    BinaryOp::LooseEqual | BinaryOp::StrictEqual => FloatCC::Equal,
+                    BinaryOp::LooseNotEqual | BinaryOp::StrictNotEqual => FloatCC::NotEqual,
                     _ => unreachable!(),
                 };
                 let condition = compiler.b.ins().fcmp(condition, left_float, right_float);
@@ -417,6 +531,124 @@ impl FunctionCompiler<'_, '_> {
             });
         }
         result
+    }
+
+    pub(super) fn view(&mut self, object: ClifValue) -> ClifValue {
+        let slot =
+            self.b
+                .create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 24, 3));
+        let address = self.b.ins().stack_addr(self.pointer, slot, 0);
+        self.call_helper(Helper::TypedView, &[object, address]);
+        address
+    }
+
+    pub(super) fn viewed_index_access(
+        &mut self,
+        view: ClifValue,
+        object: ClifValue,
+        index: ClifValue,
+        value: Option<ClifValue>,
+    ) -> ClifValue {
+        let flags = MemFlags::trusted();
+        let key = self.b.ins().bitcast(types::F64, MemFlags::new(), index);
+        let position = self.b.ins().fcvt_to_sint_sat(types::I64, key);
+        let exact = self.b.ins().fcvt_from_sint(types::F64, position);
+        let integral = self.b.ins().fcmp(FloatCC::Equal, exact, key);
+        let length = self.b.ins().load(types::I64, flags, view, 8);
+        let inside = self.b.ins().icmp(IntCC::UnsignedLessThan, position, length);
+        let fast = self.b.ins().band(integral, inside);
+        let inline = self.b.create_block();
+        let slow = self.b.create_block();
+        let done = self.b.create_block();
+        self.b.append_block_param(done, types::I64);
+        self.brif(fast, inline, &[], slow, &[]);
+
+        self.switch(inline);
+        let data = self.b.ins().load(self.pointer, flags, view, 0);
+        let kind = self.b.ins().load(types::I64, flags, view, 16);
+        let mut switch = Switch::new();
+        let kinds: Vec<_> = TYPED_KINDS
+            .iter()
+            .map(|&element| (element, self.b.create_block()))
+            .collect();
+        for (index, (_, block)) in kinds.iter().enumerate() {
+            switch.set_entry(index as u128, *block);
+        }
+        switch.emit(self.b, kind, slow);
+        for (element, block) in kinds {
+            self.switch(block);
+            let offset = self.b.ins().imul_imm(position, element.bytes() as i64);
+            let address = self.b.ins().iadd(data, offset);
+            match value {
+                None => {
+                    let raw = self.b.ins().load(element.into(), flags, address, 0);
+                    let number = match element {
+                        Element::F64 => raw,
+                        Element::F32 => self.b.ins().fpromote(types::F64, raw),
+                        Element::U32 => {
+                            let wide = self.b.ins().uextend(types::I64, raw);
+                            self.b.ins().fcvt_from_sint(types::F64, wide)
+                        }
+                        Element::U8 | Element::U16 => {
+                            let wide = self.b.ins().uextend(types::I32, raw);
+                            self.b.ins().fcvt_from_sint(types::F64, wide)
+                        }
+                        Element::I32 => self.b.ins().fcvt_from_sint(types::F64, raw),
+                        Element::I8 | Element::I16 => {
+                            let wide = self.b.ins().sextend(types::I32, raw);
+                            self.b.ins().fcvt_from_sint(types::F64, wide)
+                        }
+                    };
+                    let bits = self.b.ins().bitcast(types::I64, MemFlags::new(), number);
+                    let bits = if element.is_float() {
+                        let nan = self.b.ins().fcmp(FloatCC::Unordered, number, number);
+                        let canonical = self.constant(Value::number(f64::NAN));
+                        self.b.ins().select(nan, canonical, bits)
+                    } else {
+                        bits
+                    };
+                    self.jump(done, &[BlockArg::Value(bits)]);
+                }
+                Some(value) => {
+                    let number = self.b.ins().bitcast(types::F64, MemFlags::new(), value);
+                    let (stored, valid) = if element.is_float() {
+                        let valid = self.is_number(value);
+                        let stored = if element == Element::F32 {
+                            self.b.ins().fdemote(types::F32, number)
+                        } else {
+                            number
+                        };
+                        (stored, valid)
+                    } else {
+                        let integer = self.b.ins().fcvt_to_sint_sat(types::I64, number);
+                        let exact = self.b.ins().fcvt_from_sint(types::F64, integer);
+                        let integral = self.b.ins().fcmp(FloatCC::Equal, exact, number);
+                        let upper = self.b.ins().f64const(9223372036854775808.0);
+                        let lower = self.b.ins().f64const(-9223372036854775808.0);
+                        let below = self.b.ins().fcmp(FloatCC::LessThan, number, upper);
+                        let above = self
+                            .b
+                            .ins()
+                            .fcmp(FloatCC::GreaterThanOrEqual, number, lower);
+                        let in_range = self.b.ins().band(below, above);
+                        let valid = self.b.ins().band(integral, in_range);
+                        (self.b.ins().ireduce(element.into(), integer), valid)
+                    };
+                    let store = self.b.create_block();
+                    self.brif(valid, store, &[], slow, &[]);
+                    self.switch(store);
+                    self.b.ins().store(flags, stored, address, 0);
+                    let undefined = self.constant(Value::UNDEFINED);
+                    self.jump(done, &[BlockArg::Value(undefined)]);
+                }
+            }
+        }
+
+        self.switch(slow);
+        let result = self.index_access(object, index, value);
+        self.jump(done, &[BlockArg::Value(result)]);
+        self.switch(done);
+        self.b.block_params(done)[0]
     }
 
     pub(super) fn global_access(&mut self, name: &str, value: Option<ClifValue>) -> ClifValue {

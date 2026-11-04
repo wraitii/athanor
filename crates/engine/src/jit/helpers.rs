@@ -74,6 +74,7 @@ define_helpers! {
     Call => MethodCallable, js_call;
     SemanticGlobalProbe => GlobalGet, js_semantic_global_probe;
     SemanticPropertyProbe => PropertyGet, js_semantic_property_probe;
+    SemanticIndexProbe => Binary, js_semantic_index_probe;
     SemanticMathNative => Binary, js_semantic_math_native;
     MathDirect => MethodCallable, js_math_direct;
     FrameEnter => Unary, js_frame_enter;
@@ -99,6 +100,7 @@ define_helpers! {
     IndexRoot => Quaternary, js_index_root;
     IndexProbe => Binary, js_index_probe;
     IndexSet => IndexSet, js_index_set;
+    TypedView => Binary, js_typed_view;
     PropertyGet => PropertyGet, js_property_get;
     PropertySet => PropertySet, js_property_set;
     PropertyDefineHidden => PropertySet, js_property_define_hidden;
@@ -151,7 +153,8 @@ impl Helper {
             | Self::Pow
             | Self::ShiftRightUnsigned
             | Self::UnaryPlus
-            | Self::UnaryNegation => Some(Kind::Number),
+            | Self::UnaryNegation
+            | Self::MathDirect => Some(Kind::Number),
             _ => None,
         }
     }
@@ -263,7 +266,7 @@ pub(crate) fn signature(shape: HelperShape, call_conv: CallConv, pointer: Type) 
     signature
 }
 
-fn primitive_number(ctx: *mut JitCtx, value: Value) -> f64 {
+pub(in crate::jit) fn primitive_number(ctx: *mut JitCtx, value: Value) -> f64 {
     if value.is_string() {
         let heap = unsafe { &*ctx }.global.heap();
         return heap
@@ -1098,6 +1101,21 @@ extern "C" fn js_array_extend(ctx: *mut JitCtx, arguments: Value, iterable: Valu
     Value::UNDEFINED
 }
 
+extern "C" fn js_typed_view(ctx: *mut JitCtx, value: Value, out: *mut u64) -> Value {
+    let (pointer, length, kind) =
+        unsafe { &*ctx }
+            .global
+            .heap()
+            .typed_view(value)
+            .unwrap_or((std::ptr::null(), 0, 0));
+    unsafe {
+        *out = pointer as u64;
+        *out.add(1) = length as u64;
+        *out.add(2) = kind;
+    }
+    Value::UNDEFINED
+}
+
 extern "C" fn js_semantic_global_probe(ctx: *mut JitCtx, ptr: *const u8, len: u64) -> Value {
     let name =
         unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len as usize)) };
@@ -1116,12 +1134,28 @@ extern "C" fn js_semantic_property_probe(
     let name =
         unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len as usize)) };
     if object == Value::GLOBAL_OBJECT {
-        return Value::UNDEFINED;
+        return Value::UNINITIALIZED;
     }
     match unsafe { &*ctx }.global.heap().read_property(object, name) {
         Some(PropertyRead::Value(value)) => value,
-        _ => Value::UNDEFINED,
+        _ => Value::UNINITIALIZED,
     }
+}
+
+extern "C" fn js_semantic_index_probe(ctx: *mut JitCtx, object: Value, key: Value) -> Value {
+    let heap = unsafe { &*ctx }.global.heap();
+    if let Some(number) = key.as_number() {
+        match heap.read_numeric_index(object, number) {
+            Some(IndexRead::Primitive(value) | IndexRead::Borrowed(value)) => return value,
+            Some(IndexRead::Character(_)) => return Value::UNINITIALIZED,
+            None => {}
+        }
+    }
+    if key.is_object() || key == Value::UNINITIALIZED {
+        return Value::UNINITIALIZED;
+    }
+    let name = heap.text(key).unwrap_or_else(|| key.to_string());
+    js_semantic_property_probe(ctx, object, name.as_ptr(), name.len() as u64)
 }
 
 extern "C" fn js_semantic_math_native(ctx: *mut JitCtx, value: Value, operation: u64) -> Value {
@@ -1420,7 +1454,7 @@ extern "C" fn js_typeof(ctx: *mut JitCtx, value: Value) -> Value {
     } else {
         value.type_name()
     };
-    match ctx.global.heap().string(name) {
+    match ctx.global.heap().interned(name) {
         Some(value) => ctx.own(value),
         None => {
             ctx.error = Some(Box::new(crate::Error::Runtime("heap exhausted".into())));

@@ -108,13 +108,13 @@ fn math_edge_cases() {
             Math.sqrt(9, {}) === 3 && Math.pow(2, 3, {}) === 8 &&
             Math.pow(2) !== Math.pow(2) && Math.sqrt() !== Math.sqrt() &&
             Math.min(1, nan) !== Math.min(1, nan) && Math.pow(1, 1/0) !== Math.pow(1, 1/0) &&
-            Math.abs() !== Math.abs() && Math.abs(null) === 0 && Math.sign(true) === 1;
+            Math.abs() !== Math.abs() && Math.abs(null) === 0 && Math.sign(true) === 1 &&
+            Math.abs('-1') === 1 && Math.min(0/0, '1') !== Math.min(0/0, '1') &&
+            Math.floor(' 2.5 ') === 2 && Math.ceil('x') !== Math.ceil('x');
     }"#;
     assert_eq!(run(source).unwrap(), Value::TRUE);
     for source in [
-        "function main(){ return Math.abs('1'); }",
         "function main(){ return Math.max(1, {}); }",
-        "function main(){ return Math.min(0/0, '1'); }",
         "function main(){ return Math.max(0/0, {}); }",
         "function main(){ return Math.pow(0/0, {}); }",
     ] {

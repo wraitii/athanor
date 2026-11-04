@@ -1,5 +1,6 @@
 use cranelift_codegen::entity::EntityRef;
-use cranelift_codegen::ir::{BlockArg, InstBuilder, Value as ClifValue, types};
+use cranelift_codegen::ir::condcodes::IntCC;
+use cranelift_codegen::ir::{BlockArg, InstBuilder, MemFlags, Value as ClifValue, types};
 use cranelift_frontend::Variable;
 
 use crate::error::{Error, compile_at};
@@ -13,6 +14,18 @@ use super::ops::{self, BinaryOp, UnaryOp as EmitUnaryOp};
 const HEAP: Types = Types::STRING.union(Types::OBJECT).union(Types::OTHER);
 
 impl FunctionCompiler<'_, '_> {
+    fn epoch(&mut self) -> ClifValue {
+        let address = self.b.ins().load(
+            self.pointer,
+            MemFlags::trusted(),
+            self.ctx,
+            crate::jit::session::EPOCH_OFFSET,
+        );
+        self.b
+            .ins()
+            .load(types::I64, MemFlags::trusted(), address, 0)
+    }
+
     pub(super) fn emit_semantic_graph(
         &mut self,
         graph: &Graph,
@@ -32,6 +45,14 @@ impl FunctionCompiler<'_, '_> {
             .bindings
             .values()
             .map(|_| self.b.declare_var(types::I64))
+            .collect();
+        let cells: Vec<i64> = (0..graph.guards)
+            .map(|_| {
+                let mut cell = Box::new(u64::MAX);
+                let address = &raw mut *cell as i64;
+                self.cells.push(cell);
+                address
+            })
             .collect();
         let facts = Facts::compute(graph);
         let suspends = self.generator.is_some();
@@ -56,6 +77,8 @@ impl FunctionCompiler<'_, '_> {
                     .set_srcloc(cranelift_codegen::ir::SourceLoc::default());
             }
             self.switch(blocks[block.index()]);
+            let cold = graph.cold.contains(&block);
+            let created = self.b.func.dfg.num_blocks();
             let params = self.b.block_params(blocks[block.index()]).to_vec();
             let undefined = self.constant(Value::UNDEFINED);
             let mut retained_any = false;
@@ -69,8 +92,15 @@ impl FunctionCompiler<'_, '_> {
                     Value::UNINITIALIZED.bits() as i64,
                 );
                 let retained = self.b.ins().select(uninitialized, undefined, param);
+                let heap = self.is_heap(retained);
+                let retain = self.b.create_block();
+                let done = self.b.create_block();
+                self.brif(heap, retain, &[], done, &[]);
+                self.switch(retain);
                 self.call_helper(Helper::TempRetain, &[retained]);
                 self.check_error();
+                self.jump(done, &[]);
+                self.switch(done);
                 retained_any = true;
             }
             for (&value, param) in data.params.iter().zip(params) {
@@ -320,15 +350,41 @@ impl FunctionCompiler<'_, '_> {
                     Op::GetIndex(object, index) => {
                         let object = get(self, *object);
                         let index = get(self, *index);
-                        Some(self.index_access(object, index, None))
+                        Some(match graph.views.get(&inst) {
+                            Some(&view) => {
+                                let view = get(self, view);
+                                self.viewed_index_access(view, object, index, None)
+                            }
+                            None => self.index_access(object, index, None),
+                        })
                     }
                     Op::SetIndex(object, index, value) => {
                         let object = get(self, *object);
                         let index = get(self, *index);
                         let value = get(self, *value);
-                        self.index_access(object, index, Some(value));
+                        match graph.views.get(&inst) {
+                            Some(&view) => {
+                                let view = get(self, view);
+                                self.viewed_index_access(view, object, index, Some(value));
+                            }
+                            None => {
+                                self.index_access(object, index, Some(value));
+                            }
+                        }
                         None
                     }
+                    Op::View(object) => {
+                        let object = get(self, *object);
+                        Some(self.view(object))
+                    }
+                    Op::IsNumber(value) => {
+                        let value = get(self, *value);
+                        let condition = self.is_number(value);
+                        let yes = self.constant(Value::TRUE);
+                        let no = self.constant(Value::FALSE);
+                        Some(self.b.ins().select(condition, yes, no))
+                    }
+                    Op::AsNumber(value) => Some(get(self, *value)),
                     Op::ToNumeric(value) => {
                         let value = get(self, *value);
                         Some(ops::to_number(self, value))
@@ -435,21 +491,46 @@ impl FunctionCompiler<'_, '_> {
                         self.names.push(name);
                         Some(self.call_helper(Helper::SemanticPropertyProbe, &[object, ptr, len]))
                     }
+                    Op::ProbeIndex(object, key) => {
+                        let object = get(self, *object);
+                        let key = get(self, *key);
+                        Some(self.call_helper(Helper::SemanticIndexProbe, &[object, key]))
+                    }
                     Op::IsNative(value, native) => {
                         let value = get(self, *value);
                         let operation = self.b.ins().iconst(types::I64, native.index() as i64);
                         Some(self.call_helper(Helper::SemanticMathNative, &[value, operation]))
                     }
+                    Op::GuardValid(guard) => {
+                        let epoch = self.epoch();
+                        let cell = self.b.ins().iconst(self.pointer, cells[*guard]);
+                        let validated = self.b.ins().load(types::I64, MemFlags::trusted(), cell, 0);
+                        let condition = self.b.ins().icmp(IntCC::Equal, epoch, validated);
+                        let yes = self.constant(Value::TRUE);
+                        let no = self.constant(Value::FALSE);
+                        Some(self.b.ins().select(condition, yes, no))
+                    }
+                    Op::GuardCommit(guard) => {
+                        let epoch = self.epoch();
+                        let cell = self.b.ins().iconst(self.pointer, cells[*guard]);
+                        self.b.ins().store(MemFlags::trusted(), epoch, cell, 0);
+                        None
+                    }
                     Op::CallNative(native, args) => {
                         let args: Vec<_> = args.iter().map(|&v| get(self, v)).collect();
                         let argv = self.stack_values(&args, data.span)?;
-                        let argc = self.b.ins().iconst(types::I64, args.len() as i64);
-                        let operation = self.b.ins().iconst(types::I64, native.index() as i64);
-                        let receiver = self.constant(Value::UNDEFINED);
-                        let value = self
-                            .call_helper(Helper::MathDirect, &[operation, receiver, argv, argc]);
-                        self.check_error();
-                        Some(value)
+                        let function = crate::jit::math::METHODS[native.index()].1;
+                        Some(self.native_math(function, &args, |this| {
+                            let argc = this.b.ins().iconst(types::I64, args.len() as i64);
+                            let operation = this.b.ins().iconst(types::I64, native.index() as i64);
+                            let receiver = this.constant(Value::UNDEFINED);
+                            let value = this.call_helper(
+                                Helper::MathDirect,
+                                &[operation, receiver, argv, argc],
+                            );
+                            this.check_error();
+                            value
+                        }))
                     }
                     Op::IsUndefined(value) => {
                         let value = get(self, *value);
@@ -553,8 +634,22 @@ impl FunctionCompiler<'_, '_> {
                     self.jump(block, &args);
                 }
                 TerminatorKind::Branch(value, yes, no) => {
-                    let value = self.b.use_var(values[value.index()]);
-                    let condition = self.truthy(value);
+                    let condition = match graph.defining_op(*value) {
+                        Some(Op::IsNumber(checked)) => {
+                            let checked = self.b.use_var(values[checked.index()]);
+                            self.is_number(checked)
+                        }
+                        _ if facts.of(*value).within(Types::BOOLEAN) => {
+                            let value = self.b.use_var(values[value.index()]);
+                            self.b
+                                .ins()
+                                .icmp_imm(IntCC::Equal, value, Value::TRUE.bits() as i64)
+                        }
+                        _ => {
+                            let value = self.b.use_var(values[value.index()]);
+                            self.truthy(value)
+                        }
+                    };
                     let (yes, yes_args) = target(self, yes);
                     let (no, no_args) = target(self, no);
                     self.brif(condition, yes, &yes_args, no, &no_args);
@@ -581,6 +676,13 @@ impl FunctionCompiler<'_, '_> {
                 TerminatorKind::Return(value) => {
                     let value = self.b.use_var(values[value.index()]);
                     self.jump(self.return_block, &[BlockArg::Value(value)]);
+                }
+            }
+            if cold {
+                self.b.set_cold_block(blocks[block.index()]);
+                for index in created..self.b.func.dfg.num_blocks() {
+                    self.b
+                        .set_cold_block(cranelift_codegen::ir::Block::from_u32(index as u32));
                 }
             }
         }

@@ -34,6 +34,7 @@ pub(super) enum FunctionKind {
 
 pub(super) struct FunctionCompiler<'a, 'f> {
     names: &'a mut Vec<Box<str>>,
+    cells: &'a mut Vec<Box<u64>>,
     source_name: (usize, usize),
     source_span: Span,
     b: &'a mut FunctionBuilder<'f>,
@@ -53,7 +54,7 @@ pub(super) struct FunctionCompiler<'a, 'f> {
     suspensions: HashMap<u32, (usize, Block)>,
     terminated: bool,
     frame_size: Option<Inst>,
-    slots: u32,
+    slots: HashMap<u32, u32>,
 }
 
 pub(super) fn build_function(
@@ -62,6 +63,7 @@ pub(super) fn build_function(
     helpers: &[FuncId],
     annotations: &mut Annotations,
     names: &mut Vec<Box<str>>,
+    cells: &mut Vec<Box<u64>>,
     source_name: (usize, usize),
     params: &FormalParameters<'_>,
     closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
@@ -74,6 +76,7 @@ pub(super) fn build_function(
         helpers,
         annotations,
         names,
+        cells,
         source_name,
         params,
         closures,
@@ -88,6 +91,7 @@ pub(super) fn build_factory(
     helpers: &[FuncId],
     annotations: &mut Annotations,
     names: &mut Vec<Box<str>>,
+    cells: &mut Vec<Box<u64>>,
     source_name: (usize, usize),
     params: &FormalParameters<'_>,
     closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
@@ -99,6 +103,7 @@ pub(super) fn build_factory(
         helpers,
         annotations,
         names,
+        cells,
         source_name,
         params,
         closures,
@@ -118,6 +123,7 @@ fn build_callable(
     helpers: &[FuncId],
     annotations: &mut Annotations,
     names: &mut Vec<Box<str>>,
+    cells: &mut Vec<Box<u64>>,
     source_name: (usize, usize),
     params: &FormalParameters<'_>,
     closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
@@ -134,6 +140,7 @@ fn build_callable(
     let pointer = module.target_config().pointer_type();
     let mut compiler = FunctionCompiler {
         names,
+        cells,
         source_name,
         source_span: params.span,
         b,
@@ -153,7 +160,7 @@ fn build_callable(
         suspensions: HashMap::new(),
         terminated: false,
         frame_size: None,
-        slots: 0,
+        slots: HashMap::new(),
     };
 
     let dispatch = if let FunctionKind::Generator(plan) = &kind {
@@ -218,6 +225,7 @@ pub(super) fn build_global(
     helpers: &[FuncId],
     annotations: &mut Annotations,
     names: &mut Vec<Box<str>>,
+    cells: &mut Vec<Box<u64>>,
     source_name: (usize, usize),
     closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
     graph: &super::semantic::Graph,
@@ -231,6 +239,7 @@ pub(super) fn build_global(
     let pointer = module.target_config().pointer_type();
     let mut compiler = FunctionCompiler {
         names,
+        cells,
         source_name,
         source_span: Span::new(0, 0),
         b,
@@ -250,7 +259,7 @@ pub(super) fn build_global(
         suspensions: HashMap::new(),
         terminated: false,
         frame_size: None,
-        slots: 0,
+        slots: HashMap::new(),
     };
     compiler.enter_frame();
     compiler.emit_semantic_graph(graph, closure)?;
@@ -304,13 +313,25 @@ impl FunctionCompiler<'_, '_> {
                 .func
                 .dfg
                 .replace(inst)
-                .iconst(types::I64, self.slots as i64);
+                .iconst(types::I64, self.slots.len() as i64);
         }
     }
 
     pub(super) fn clear_temporaries(&mut self) {
+        let pending = self.b.ins().load(
+            types::I64,
+            MemFlags::trusted(),
+            self.ctx,
+            crate::jit::session::PENDING_OFFSET,
+        );
+        let clear = self.b.create_block();
+        let done = self.b.create_block();
+        self.brif(pending, clear, &[], done, &[]);
+        self.switch(clear);
         let dummy = self.constant(Value::UNDEFINED);
         self.call_helper(Helper::TempClear, &[dummy]);
+        self.jump(done, &[]);
+        self.switch(done);
     }
 
     pub(super) fn load_arg(&mut self, index: usize) -> ClifValue {

@@ -111,3 +111,34 @@ fn private_iteration_does_not_block_versioning() {
         assert_eq!(String::from_utf8(result.stdout).unwrap().trim(), "7,20");
     }
 }
+
+#[test]
+fn loops_version_independently_of_their_function() {
+    let source = "function f(g,xs){ const t=g(); let s=0; let last=-1; for(let i=0;i<xs.length;++i){ last=Math.floor(xs[i]); s+=last; } return s+':'+last+':'+t; } function main(){ const xs=[0.5,2.5]; const r=f(()=>1,xs); Math.floor=x=>x*10; return r+','+f(()=>2,xs); }";
+    let dump = Command::new(env!("CARGO_BIN_EXE_js-runner"))
+        .env("JS_JIT_SSA", "1")
+        .args(["--compile", "--no-ir", "--semantic-ir", "--eval", source])
+        .output()
+        .unwrap();
+    assert!(dump.status.success());
+    let dump = String::from_utf8(dump.stdout).unwrap();
+    let f = dump.split("semantic IR f").nth(1).unwrap();
+    assert!(
+        f.split("semantic IR")
+            .next()
+            .unwrap()
+            .contains(": versioned:")
+    );
+    for enabled in [false, true] {
+        let result = Command::new(env!("CARGO_BIN_EXE_js-runner"))
+            .env("JS_JIT_SSA", if enabled { "1" } else { "0" })
+            .args(["--eval", source])
+            .output()
+            .unwrap();
+        assert!(result.status.success());
+        assert_eq!(
+            String::from_utf8(result.stdout).unwrap().trim(),
+            "2:2:1,30:25:2"
+        );
+    }
+}

@@ -53,6 +53,9 @@ pub(super) struct Graph {
     pub(super) span: Span,
     pub(super) entry: Block,
     pub(super) has_handlers: bool,
+    pub(in crate::jit) guards: usize,
+    pub(in crate::jit) views: HashMap<Inst, Value>,
+    pub(in crate::jit) cold: HashSet<Block>,
     pub(super) generator: bool,
     pub(super) blocks: PrimaryMap<Block, BlockData>,
     pub(super) insts: PrimaryMap<Inst, InstData>,
@@ -216,7 +219,13 @@ pub(super) enum Op {
     IsNullish(Value),
     ProbeGlobal(String),
     ProbeProperty(Value, String),
+    ProbeIndex(Value, Value),
     IsNative(Value, Native),
+    GuardValid(usize),
+    GuardCommit(usize),
+    View(Value),
+    IsNumber(Value),
+    AsNumber(Value),
     EnterScope(Scope),
     LeaveScope(Scope),
     NextIteration(Scope),
@@ -301,6 +310,8 @@ impl Op {
             | Op::Read(_)
             | Op::NewObject
             | Op::ProbeGlobal(_)
+            | Op::GuardValid(_)
+            | Op::GuardCommit(_)
             | Op::EnterScope(_)
             | Op::LeaveScope(_)
             | Op::NextIteration(_)
@@ -325,11 +336,15 @@ impl Op {
             | Op::IsUndefined(value)
             | Op::IsNullish(value)
             | Op::ProbeProperty(value, _)
-            | Op::IsNative(value, _) => vec![value],
+            | Op::IsNative(value, _)
+            | Op::View(value)
+            | Op::IsNumber(value)
+            | Op::AsNumber(value) => vec![value],
             Op::Define(object, _, value)
             | Op::DefineHidden(object, _, value)
             | Op::Set(object, _, value) => vec![object, value],
             Op::GetIndex(object, key)
+            | Op::ProbeIndex(object, key)
             | Op::Binary(_, object, key)
             | Op::ArrayAppend(object, key, _)
             | Op::ConstructSpread(object, key) => vec![object, key],
@@ -779,7 +794,14 @@ impl Graph {
             Op::CallNative(..) => coercing(Unowned),
             Op::IsUndefined(_) | Op::IsNullish(_) | Op::IsNative(..) => closed(0, &[], Unowned),
             Op::ProbeGlobal(_) => closed(GLOBAL_READ, &[Assumption::NoAccessors], Borrowed),
-            Op::ProbeProperty(..) => closed(HEAP_READ, &[Assumption::NoAccessors], Borrowed),
+            Op::ProbeProperty(..) | Op::ProbeIndex(..) => {
+                closed(HEAP_READ, &[Assumption::NoAccessors], Borrowed)
+            }
+            Op::GuardValid(_) => closed(GLOBAL_READ, &[], Unowned),
+            Op::GuardCommit(_) => closed(INTERNAL, &[], None),
+            Op::View(_) => closed(HEAP_READ, &[Assumption::FixedTypedStorage], Unowned),
+            Op::IsNumber(_) => closed(0, &[], Unowned),
+            Op::AsNumber(_) => closed(INTERNAL, &[], Unowned),
             Op::EnterScope(scope) | Op::NextIteration(scope) | Op::FreshIteration(scope) => {
                 if self.materialized(*scope) {
                     closed(ALLOCATION | INTERNAL | ERROR, &[], None)
@@ -983,7 +1005,13 @@ impl Graph {
             Op::IsNullish(value) => format!("is_nullish {value}"),
             Op::ProbeGlobal(name) => format!("probe_global {name}"),
             Op::ProbeProperty(object, name) => format!("probe {object}.{name}"),
+            Op::ProbeIndex(object, key) => format!("probe {object}[{key}]"),
             Op::IsNative(value, native) => format!("is_native {value}, {native}"),
+            Op::GuardValid(guard) => format!("guard_valid {guard}"),
+            Op::GuardCommit(guard) => format!("guard_commit {guard}"),
+            Op::View(value) => format!("view {value}"),
+            Op::IsNumber(value) => format!("is_number {value}"),
+            Op::AsNumber(value) => format!("as_number {value}"),
             Op::EnterScope(scope) => format!("enter {scope}"),
             Op::LeaveScope(scope) => format!("leave {scope}"),
             Op::NextIteration(scope) => format!("next_iteration {scope}"),
@@ -1225,14 +1253,22 @@ fn optimize_graph(mut graph: Graph, ssa_opt: bool) -> Result<Analysis> {
     promote::promote(&mut graph, &mut notes);
     graph.verify()?;
     optimize::simplify(&mut graph);
-    let region = optimize::version(&mut graph, &mut notes)?;
+    let mut regions = optimize::version(&mut graph, &mut notes)?;
     graph.verify()?;
-    if let Some(region) = region {
-        optimize::reuse_loads(&mut graph, &region, &mut notes);
+    for region in &regions {
+        optimize::reuse_loads(&mut graph, region, &mut notes);
         graph.verify()?;
-        optimize::hoist(&mut graph, &region, &mut notes);
+        optimize::hoist(&mut graph, region, &mut notes);
         graph.verify()?;
     }
+    for copy in optimize::check_loops(&mut graph, &mut regions, &mut notes)? {
+        optimize::reuse_loads(&mut graph, &copy, &mut notes);
+        graph.verify()?;
+        optimize::hoist(&mut graph, &copy, &mut notes);
+        graph.verify()?;
+    }
+    optimize::views(&mut graph, &mut notes);
+    graph.verify()?;
     optimize::simplify(&mut graph);
     graph.verify()?;
     let facts = Facts::compute(&graph);
@@ -1423,7 +1459,7 @@ mod tests {
     #[test]
     fn global_writes_prevent_versioning_and_load_reuse() {
         let analysis = analyze_source(
-            "function f() { let before = shared; shared = Math.min(3, 4); return before + shared; }",
+            "function f() { let before = shared; Math = shared; shared = Math.min(3, 4); return before + shared; }",
         );
         let ops = ops(&analysis.graph);
         assert!(ops.iter().any(|op| matches!(op, Op::GlobalWrite(..))));
@@ -1431,7 +1467,7 @@ mod tests {
             ops.iter()
                 .filter(|op| matches!(op, Op::GlobalRead(name) if name == "shared"))
                 .count(),
-            2
+            3
         );
         assert!(!ops.iter().any(|op| matches!(op, Op::CallNative(..))));
     }

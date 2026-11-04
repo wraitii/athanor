@@ -532,3 +532,88 @@ fn function_and_var_share_storage() {
         assert_eq!(run(source, enabled).unwrap(), Value::TRUE);
     }
 }
+
+#[test]
+fn numeric_properties_and_global_aliases_observe_writes() {
+    for body in [
+        "const a=o.NaN; o[0/0]=2; return a+o.NaN;",
+        "const a=o[0/0]; o.NaN=2; return a+o[0/0];",
+        "const a=o.Infinity; o[1/0]=2; return a+o.Infinity;",
+        "const a=o[-1]; o['-1']=2; return a+o[-1];",
+    ] {
+        let source = format!(
+            "function f(o){{ {body} }} function main(){{ return f({{NaN:1,Infinity:1,'-1':1}}); }}"
+        );
+        for enabled in [false, true] {
+            assert_eq!(run(&source, enabled).unwrap(), Value::number(3.0), "{body}");
+        }
+    }
+    for body in [
+        "const a=x; o.x=2; return a+x;",
+        "const a=o.x; x=2; return a+o.x;",
+    ] {
+        let source = format!(
+            "var x=1; function f(o){{ {body} }} function main(){{ return f(globalThis); }}"
+        );
+        for enabled in [false, true] {
+            assert_eq!(run(&source, enabled).unwrap(), Value::number(3.0), "{body}");
+        }
+    }
+    let source = "function f(o){ const a=Math.floor(1.9); o.Math={floor:x=>9}; return a+Math.floor(1.9); } function main(){ return f(globalThis); }";
+    for enabled in [false, true] {
+        assert_eq!(run(source, enabled).unwrap(), Value::number(10.0));
+    }
+}
+
+#[test]
+fn loop_guards_check_captured_math_callees() {
+    for source in [
+        "function f(reset){ const floor=Math.floor; reset(); let sum=0; for(let i=0;i<2;++i) sum+=floor(1.9); return sum; } function main(){ const original=Math.floor; Math.floor=x=>99; return f(()=>{Math.floor=original;}); }",
+        "function f(reset){ const m=Math; reset(); let sum=0; for(let i=0;i<2;++i) sum+=m.floor(1.9); return sum; } function main(){ const original=Math.floor; Math.floor=x=>99; return f(()=>{Math={floor:original};}); }",
+    ] {
+        for enabled in [false, true] {
+            assert_eq!(run(source, enabled).unwrap(), Value::number(198.0));
+        }
+    }
+    let source = "function f(reset,key){ const m=Math; reset(); let sum=0; for(let i=0;i<2;++i){ sum+=m.floor(1.9); m[key]=x=>99; } return sum; } function main(){ return f(()=>0,'floor'); }";
+    for enabled in [false, true] {
+        assert_eq!(run(source, enabled).unwrap(), Value::number(100.0));
+    }
+}
+
+#[test]
+fn speculative_reads_preserve_skipped_paths_and_ownership() {
+    for source in [
+        "function f(n){ const a=[]; let sum=0; for(let i=0;i<n;++i) sum+=a.missing; return sum; } function main(){ return f(0); }",
+        "function f(a,n){ let sum=0; for(let i=0;i<n;++i) sum+=a.missing; return sum; } function main(){ return f([],0); }",
+        "function f(a,n){ const length=a.length; let sum=0; for(let i=0;i<n;++i) if(i>0) sum+=a.missing; return sum+length; } function main(){ return f([],1); }",
+        "function f(a,n){ let sum=0; for(let i=0;i<n;++i) sum+=a.missing; return sum; } function main(){ return f([],1); }",
+        "function f(a,n){ let sum=0; for(let i=0;i<n;++i) sum+=a[0]; return sum; } function main(){ return f(null,0); }",
+        "function f(a,n){ let value; for(let i=0;i<n;++i) value=a.x; return value; } function main(){ return f({},2)===undefined; }",
+        "function f(a,n){ let value; for(let i=0;i<n;++i) value=a.x; return value; } function main(){ const value=f({x:{v:7}},2); return value.v; }",
+        "function f(a,k,n){ let value; for(let i=0;i<n;++i) value=a[k]; return value; } function main(){ return f({x:'kept'},'x',2)==='kept'; }",
+        "function f(a,k,n){ let value; for(let i=0;i<n;++i) value=a[k]; return value; } function main(){ return f('abc',1,2)==='b'; }",
+    ] {
+        assert_eq!(run(source, true), run(source, false), "{source}");
+    }
+}
+
+#[test]
+fn typed_loop_stores_preserve_integer_conversion_boundaries() {
+    let source = "function fill(a,value){ for(let i=0;i<a.length;++i) a[i]=value; return a[0]; } function main(){ const a=new Uint8Array(2); const b=new Int32Array(2); return fill(a,9223372036854775808)===0 && fill(b,9223372036854775808)===0 && fill(a,-9223372036854775808)===0 && fill(a,9223372036854774784)===0 && fill(a,255)===255; }";
+    for enabled in [false, true] {
+        assert_eq!(run(source, enabled).unwrap(), Value::TRUE);
+    }
+}
+
+#[test]
+fn loop_versions_keep_callee_reads_used_after_the_loop() {
+    for source in [
+        "function f(h,xs){ h(); let s=0; for(var i=0;;++i){ var g=Math.floor; s+=g(xs[i]); if(i>0) break; } return g===Math.floor && s===3; } function main(){ return f(()=>0,[1.5,2.5]); }",
+        "function f(h,xs){ h(); let s=0; for(var i=0;;++i){ var m=Math; s+=m.floor(xs[i]); if(i>0) break; } return m===Math && s===3; } function main(){ return f(()=>0,[1.5,2.5]); }",
+    ] {
+        for enabled in [false, true] {
+            assert_eq!(run(source, enabled).unwrap(), Value::TRUE, "{source}");
+        }
+    }
+}

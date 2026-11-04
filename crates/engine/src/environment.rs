@@ -1,5 +1,5 @@
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::Value;
@@ -24,9 +24,9 @@ impl Default for Environment {
         let heap = Heap::default();
         Self {
             data: Rc::new(RefCell::new(EnvironmentData {
-                bindings: HashMap::new(),
-                lexical: HashMap::new(),
-                readonly: HashSet::new(),
+                bindings: HashMap::default(),
+                lexical: HashMap::default(),
+                readonly: HashSet::default(),
                 parent: None,
                 heap: heap.clone(),
             })),
@@ -54,9 +54,9 @@ impl Environment {
     pub fn child(&self) -> Self {
         Self {
             data: Rc::new(RefCell::new(EnvironmentData {
-                bindings: HashMap::new(),
-                lexical: HashMap::new(),
-                readonly: HashSet::new(),
+                bindings: HashMap::default(),
+                lexical: HashMap::default(),
+                readonly: HashSet::default(),
                 parent: Some(self.clone()),
                 heap: self.heap.clone(),
             })),
@@ -69,6 +69,7 @@ impl Environment {
         match self.data.borrow_mut().bindings.entry(name.into()) {
             Entry::Vacant(entry) if self.heap.retain(value) => {
                 entry.insert(value);
+                self.heap.invalidate();
                 true
             }
             _ => false,
@@ -128,6 +129,7 @@ impl Environment {
     }
 
     pub(crate) fn define_lexical(&self, name: String, mutable: bool) {
+        self.heap.invalidate();
         self.data
             .borrow_mut()
             .lexical
@@ -159,7 +161,7 @@ impl Environment {
                 return Err("has invalid value");
             }
             let old = std::mem::replace(&mut binding.0, value);
-            self.heap.release(old);
+            self.replaced(old);
             return Ok(());
         }
         drop(data);
@@ -182,12 +184,19 @@ impl Environment {
                 return false;
             }
             let old = std::mem::replace(binding, value);
-            self.heap.release(old);
+            self.replaced(old);
             return true;
         }
         data.parent
             .as_ref()
             .is_some_and(|parent| parent.set(name, value))
+    }
+
+    fn replaced(&self, old: Value) {
+        if old.is_object() {
+            self.heap.invalidate();
+        }
+        self.heap.release(old);
     }
 
     pub(crate) fn heap(&self) -> &Heap {

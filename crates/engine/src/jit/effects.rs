@@ -13,6 +13,7 @@ pub(super) enum Assumption {
     NoCoercionCallbacks,
     DirectIteration,
     StableIndexStorage,
+    FixedTypedStorage,
     GuardedMathIdentity,
 }
 
@@ -23,6 +24,7 @@ impl std::fmt::Display for Assumption {
             Self::NoCoercionCallbacks => "coercion does not invoke JS callbacks",
             Self::DirectIteration => "iteration and enumeration use direct engine state",
             Self::StableIndexStorage => "direct numeric array reads have stable storage",
+            Self::FixedTypedStorage => "typed array storage never moves or resizes",
             Self::GuardedMathIdentity => "native Math identity is checked by the entry guard",
         })
     }
@@ -67,6 +69,7 @@ pub(super) fn effects(helper: Helper) -> Effects {
             ],
         ),
         Truthy => (Reentry::Closed, HEAP_READ, &[]),
+        TypedView => (Reentry::Closed, HEAP_READ, &[Assumption::FixedTypedStorage]),
         ArrayNew | Rest | ObjectNew | StringNew => {
             (Reentry::Closed, ALLOCATION | INTERNAL | ERROR, &[])
         }
@@ -117,8 +120,8 @@ pub(super) fn temporary_effect(helper: Helper) -> TemporaryEffect {
         TempClear => Clear,
         TempRetain => RetainArgument,
         Add => NumericAdd,
-        LocalSet | LocalReplace | ErrorOrigin | Throw | MathDirect | IndexRoot | IndexProbe
-        | Truthy | BitwiseAnd | BitwiseOr | BitwiseXor | ShiftLeft | ShiftRight
+        LocalSet | LocalReplace | TypedView | ErrorOrigin | Throw | MathDirect | IndexRoot
+        | IndexProbe | Truthy | BitwiseAnd | BitwiseOr | BitwiseXor | ShiftLeft | ShiftRight
         | ShiftRightUnsigned | Sub | Mul | Div | Rem | Pow | LooseEqual | LooseNotEqual
         | StrictEqual | StrictNotEqual | Less | LessEqual | Greater | GreaterEqual | UnaryPlus
         | UnaryNegation | LogicalNot | BitwiseNot => None,

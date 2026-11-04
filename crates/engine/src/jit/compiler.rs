@@ -29,6 +29,7 @@ pub(crate) struct CompiledFunction {
 
 pub(crate) struct Compiler {
     names: Vec<Box<str>>,
+    cells: Vec<Box<u64>>,
     source_name: (usize, usize),
     module: JITModule,
     signature: Signature,
@@ -81,6 +82,7 @@ impl Compiler {
         let dump_ir = dump.is_some() && options.jitdump_ir;
         Ok(Self {
             names: Vec::new(),
+            cells: Vec::new(),
             source_name: (0, 0),
             module,
             signature,
@@ -470,6 +472,7 @@ impl Compiler {
                     &self.helpers,
                     &mut annotations,
                     &mut self.names,
+                    &mut self.cells,
                     self.source_name,
                     &closures,
                     &graph.graph,
@@ -820,6 +823,7 @@ impl Compiler {
                     &self.helpers,
                     &mut annotations,
                     &mut self.names,
+                    &mut self.cells,
                     self.source_name,
                     params,
                     closures,
@@ -833,6 +837,7 @@ impl Compiler {
                     &self.helpers,
                     &mut annotations,
                     &mut self.names,
+                    &mut self.cells,
                     self.source_name,
                     params,
                     closures,

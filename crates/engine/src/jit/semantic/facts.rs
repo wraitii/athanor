@@ -18,6 +18,7 @@ impl Types {
     pub(in crate::jit) const OBJECT: Self = Self(64);
     pub(in crate::jit) const OTHER: Self = Self(128);
     pub(in crate::jit) const UNINITIALIZED: Self = Self(256);
+    pub(in crate::jit) const VIEW: Self = Self(512);
     pub(in crate::jit) const NUMBER: Self = Self(1 | 2);
     pub(in crate::jit) const PRIMITIVE: Self = Self(1 | 2 | 4 | 8 | 16 | 32);
     pub(in crate::jit) const VALUE: Self = Self(511 & !256);
@@ -58,6 +59,7 @@ impl fmt::Display for Types {
             (Self::OBJECT, "object"),
             (Self::OTHER, "other"),
             (Self::UNINITIALIZED, "uninit"),
+            (Self::VIEW, "view"),
         ] {
             if self.intersects(types) {
                 names.push(name);
@@ -146,6 +148,10 @@ fn result_types(op: &Op, facts: &Facts) -> Types {
         Op::NewObject | Op::NewArray(_) | Op::IteratorNew(_) | Op::EnumerateNew(_) => Types::OBJECT,
         Op::IteratorNext(_) | Op::EnumerateNext(_) => Types::ALL,
         Op::IsUninitialized(_) => Types::BOOLEAN,
+        Op::ProbeProperty(..) | Op::ProbeIndex(..) => Types::ALL,
+        Op::View(_) => Types::VIEW,
+        Op::IsNumber(_) => Types::BOOLEAN,
+        Op::AsNumber(_) => Types::NUMBER,
         Op::ToNumeric(value) | Op::Unary(UnaryOp::Plus, value)
             if facts.of(*value).within(Types::NUMBER) =>
         {
@@ -188,7 +194,9 @@ fn result_types(op: &Op, facts: &Facts) -> Types {
             _ => Types::BOOLEAN,
         },
         Op::CallNative(..) => Types::NUMBER,
-        Op::IsUndefined(_) | Op::IsNullish(_) | Op::IsNative(..) => Types::BOOLEAN,
+        Op::IsUndefined(_) | Op::IsNullish(_) | Op::IsNative(..) | Op::GuardValid(_) => {
+            Types::BOOLEAN
+        }
         _ => Types::VALUE,
     }
 }

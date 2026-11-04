@@ -46,7 +46,7 @@ aliasing, and cycles; document deliberate semantic restrictions.
   with `JS_JIT_SSA=0`, though SSA-based guard elimination is disabled. Compound assignments share
   binary operations and evaluate the target and its old value before the right
   operand. Numeric operators use heap-aware primitive string conversion.
-- `typeof` returns heap strings for supported values, identifying closures and
+- `typeof` returns interned heap strings for supported values, identifying closures and
   built-in Error as functions. Undeclared identifier operands return undefined
   as a type name; uninitialized lexical bindings still report an error.
 - Helpers report runtime errors through `JitCtx`; generated error checks return
@@ -753,9 +753,9 @@ and the complete arguments prototype and iterator semantics are unsupported.
 
 The global Math object has stable native methods for abs, ceil, floor, round,
 trunc, sqrt, sin, cos, tan, asin, acos, atan, atan2, exp, log, pow, min, max,
-imul, sign, and random, plus PI and E. Methods ignore their receiver. Numeric, boolean,
-null, and undefined arguments use the engine's primitive number conversion;
-string and object coercions are explicitly unsupported. Min and max preserve
+imul, sign, and random, plus PI and E. Methods ignore their receiver. Primitive
+arguments, strings included, use the engine's primitive number conversion;
+object coercion is explicitly unsupported. Min and max preserve
 signed zero and propagate NaN; round uses ties toward positive infinity.
 
 Math and its properties use ordinary mutable global and object storage; the
@@ -924,7 +924,9 @@ nondecimal values and non-numeric formatting arguments are rejected. Errors are
 engine errors rather than catchable RangeErrors.
 
 Unary plus now converts formatted strings through the primitive numeric
-conversion path, including `toFixed` output.
+conversion path, including `toFixed` output. Implicit string conversion of
+numbers (concatenation, `join`, property keys) follows the same ECMAScript
+Number::toString rules, including `Infinity`, `-0` as `0` and exponent forms.
 
 
 ## Primitive numeric conversion
@@ -1002,7 +1004,8 @@ optimization is disabled by `JS_JIT_SSA=0`, for graphs with exception handlers a
 generator graphs; the shared CLIF optimization passes still apply.
 
 ```text
-Oxc AST -> build -> promote -> simplify -> version -> reuse loads -> hoist -> simplify
+Oxc AST -> build -> promote -> simplify -> version -> reuse loads -> hoist
+        -> loop number checks -> reuse loads -> hoist -> views -> simplify
 ```
 
 ### Representation
@@ -1053,8 +1056,8 @@ literal being built, so it does not count as a write to existing heap state. It 
 read and callback assumptions of the shared property setter.
 
 Facts are sets of possible value types: int32, other doubles, boolean,
-undefined, null, string, object, other values (symbols and BigInts) and the
-uninitialized-binding sentinel. They are computed flow-insensitively over SSA
+undefined, null, string, object, other values (symbols and BigInts), the
+uninitialized-binding sentinel and internal typed-array views. They are computed flow-insensitively over SSA
 values to a fixed point; block parameters join their incoming arguments. The
 engine has no BigInt, so numeric operators always produce numbers. Facts
 refine contracts: a coercing operation on numbers is pure, one on other
@@ -1071,48 +1074,100 @@ results are unused, including checks of initialized values and the scope
 operations of scopes without captured bindings, and replaces numeric coercions
 of numbers by their operand.
 
+Optimization works on regions: the whole function, or a loop whose body is
+closed. A region is closed when nothing in it reenters JavaScript and nothing
+writes state the region is guarded on. Typed versions of a region are selected
+by checks that run before it is entered; a region never exits mid-way. Each
+versioned region keeps exactly one generic sibling, which is not versioned
+further, so the result is a tree of loop versions that join again at loop exits.
+Values defined inside the version and used after it reach those exits through
+block parameters, placed by dominance-based SSA reconstruction.
+
 A call whose callee is a property read of a global, such as `Math.min`, reenters
 unless the callee is the expected native function. Versioning collects these
-requirements for the initial `Math` natives. It copies the function and
-rewrites the copy's calls to `CallNative`. The copy's global and method reads
-are replaced by non-throwing probes in a new entry block. The probes take the
-original body if any identity check fails. Versioning only commits if the copy
-is closed: no reentry, no global writes, and heap writes only to allocations
-that do not escape. An allocation escapes when it is used other than as the
-receiver of a property access, in an identity test, as an iteration source, or
-returned. Iterators and enumerators created by the function are allocations too;
-advancing one writes only its own state, and a source escapes if its iterator
-does. This relies on iteration using direct engine state rather than JS
-callbacks. Array-pattern declarations initialized by an array literal without
-spreads or holes bind the evaluated elements directly. Under these
-conditions the probed values remain valid throughout the copy. A function
-without requirements that is already closed is optimized in place.
+requirements for the recognized `Math` natives, first for the function and,
+failing that, for the largest closed loops. The copy calls `CallNative` and drops
+its now unused callee reads. Its entry compares a per-guard cell against the
+realm epoch. On a mismatch the global and method probes run without invoking
+JavaScript, and on success the cell records the epoch; any identity failure
+selects the original. The heap bumps the epoch when a property holding a native
+function is replaced, when a global binding holding an object is replaced, and
+on every global definition, so a script that redefines builtins once at startup
+revalidates each guard once. Callees captured before the region are checked
+by value on each entry. When only the receiver was captured, its property is
+probed on each entry instead of looking up the current global. A guarded copy
+must not write a guarded global or a property with a guarded name. Property
+writes through receivers that may be `globalThis` also affect globals with the
+same name; unknown keys affect all globals. Numeric keys cannot overwrite
+recognized Math names. Unescaped local allocations do not alias globals.
 
-Within a closed region, a property, index or global read reuses an equal
-dominating read if no write in the region may alias its receiver; `this` and
-argument reads are always reused. Writes to
-unescaped allocations alias only that allocation. Loop hoisting moves reads and
-pure operations with loop-invariant operands from a loop header to its single
-preheader. It stops at the first operation it cannot move, so the hoisted
-operations still run first, and exceptions occur in the same order.
+After loads are reused and hoisted, a loop inside an optimized region whose body
+uses values defined before it as numeric operands (arithmetic, comparison,
+bitwise, Math, index keys) gets a typed copy behind `is_number` checks on those
+values; inside, `as_number` marks them as numbers. Inner loops of a typed copy
+may be checked again on values their outer loop defines. A check only replaces
+the tag test the generic code would run per operation, so no cost model is
+needed yet. Invariant read probes share these entry guards, and their results
+can also receive number checks. Other values loaded inside the loop stay generic.
 
-The emitter probes globals and properties without invoking JavaScript or raising
-an error, checks native Math identities, and selects the original graph on guard
-failure. Graph values and block parameters whose facts admit strings, objects
+Write effects are classified by access: a named property, `length`, elements
+under a numeric key, iteration state, or unknown. Element writes conflict with
+element and `length` reads. Numeric-looking names, including `NaN` and
+`Infinity`, conservatively overlap numeric accesses. Other named writes
+conflict with reads of the same name, and iterator and enumerator steps with no read, since their state is not visible to
+JavaScript. Escape is judged within the region: an allocation escapes when it
+is used other than as the receiver of a property access, in an identity test or
+as an iteration source, or when it is passed to a block inside the region.
+Iterators and enumerators created in the region are allocations too, and a
+source escapes if its iterator does; this relies on iteration using direct
+engine state rather than JS callbacks. Array-pattern declarations initialized
+by an array literal without spreads or holes bind the evaluated elements
+directly.
+
+Within a region, a property, index or global read reuses an equal dominating
+read if no write in the region may alias it; `this`, argument reads and pure
+binary operations are reused too. Loop hoisting moves reads and pure operations
+with loop-invariant operands from a loop header to its single preheader,
+stopping at the first operation it cannot move. Other invariant reads use
+non-erroring probes before a versioned loop. Every probe must succeed to enter
+the specialized copy, which uses the probed values without per-read checks;
+failure selects the original loop and preserves when errors occur. The internal
+uninitialized sentinel distinguishes failure from a successful `undefined`.
+Probes support directly stored values, numeric indexed values and simple builtin
+properties such as `length`; accesses requiring materialization fall back.
+
+A loop indexing an object defined before it gets a view: one helper call at the
+preheader records the typed array's element pointer, length and element kind,
+or a zero length for other receivers. Each access then checks for an integral
+key within that length and loads or stores inline, falling back to the generic
+helper at the same point. Integer stores check integrality and the signed
+64-bit conversion range before truncating to the element width; other values
+use the generic modulo conversion. Typed-array storage never moves or resizes
+(`FixedTypedStorage`), and the frame keeps the array alive while the loop runs.
+
+The emitter lowers recognized Math natives (floor, ceil, sqrt, min, max) to
+inline f64 instructions behind tag checks, with the native helper as fallback;
+numeric equality takes the same inline path as relational comparison. Branches
+on known booleans compare directly. Fallback versions and the probe path are
+cold blocks, laid out after the hot code. Graph values and block parameters whose facts admit strings, objects
 or other heap values are rooted in frame slots; `this` and arguments are
 borrowed from the caller and are not rooted. Generator graphs root every value
 because resumption restores them from the frame. Incoming block parameters are
-retained before replacing their slots. Temporary values are cleared once per
-block, before its terminator, so they live at most until the end of their block;
+retained before replacing their slots when they hold heap values. Temporary
+values are cleared once per block, before its terminator, skipping the call when
+no temporary is pending, so they live at most until the end of their block;
 every heap result they could release early is also rooted. Frame exit releases
 the slots. This conservative scheme keeps each value rooted until it is
 overwritten or the frame exits.
 
 Frames share one contiguous slot stack and one temporary stack in `JitCtx`;
-ordinary functions reserve their slot count on entry, and `JitCtx` exposes the
-current frame's slot base. A slot store writes inline and calls the runtime only
+ordinary functions number their rooted values densely and reserve that many
+slots on entry, and `JitCtx` exposes the current frame's slot base and pending
+temporary count. Frame exit releases slots and temporaries under one heap
+borrow. A slot store writes inline and calls the runtime only
 when the new or old value is a heap reference. Storing the most recent temporary
 transfers its ownership instead of retaining it again. Error and exception
-checks load fixed `JitCtx` fields inline. Scalar
-replacement of unescaped objects, branch-sensitive facts and guards on values
-computed inside the function are not implemented.
+checks load fixed `JitCtx` fields inline. Scalar replacement of unescaped
+objects, branch-sensitive facts, structural facts about loaded values (such as
+an array of `{x: number}`), object kinds and inline property reads are not
+implemented.

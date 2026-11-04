@@ -14,14 +14,14 @@ const _: () = assert!(TAG_STRING - TAG_OBJECT == 1 << TAG_SHIFT);
 
 impl FunctionCompiler<'_, '_> {
     pub(super) fn initialize_local(&mut self, variable: Variable, value: ClifValue) {
-        let index = variable.as_u32();
-        self.slots = self.slots.max(index + 1);
         if self.frame_size.is_none() {
-            let slot = self.b.ins().iconst(types::I64, index as i64);
+            let slot = self.b.ins().iconst(types::I64, variable.as_u32() as i64);
             self.call_helper(Helper::LocalSet, &[slot, value]);
             self.b.def_var(variable, value);
             return;
         }
+        let next = self.slots.len() as u32;
+        let index = *self.slots.entry(variable.as_u32()).or_insert(next);
         let flags = MemFlags::trusted();
         let base = self.b.ins().load(
             types::I64,
@@ -46,7 +46,7 @@ impl FunctionCompiler<'_, '_> {
         self.b.def_var(variable, value);
     }
 
-    fn is_heap(&mut self, value: ClifValue) -> ClifValue {
+    pub(super) fn is_heap(&mut self, value: ClifValue) -> ClifValue {
         let tag = self.b.ins().ushr_imm(value, TAG_SHIFT as i64);
         let first = (TAG_OBJECT >> TAG_SHIFT) as i64;
         let offset = self.b.ins().iadd_imm(tag, -first);

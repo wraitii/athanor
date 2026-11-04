@@ -129,7 +129,7 @@ impl fmt::Debug for Value {
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(value) = self.as_number() {
-            return write!(f, "{value}");
+            return f.write_str(&number_text(value));
         }
         if self.is_undefined() {
             return f.write_str("undefined");
@@ -144,5 +144,42 @@ impl fmt::Display for Value {
             return f.write_str("false");
         }
         f.write_str(self.type_name())
+    }
+}
+
+fn number_text(value: f64) -> String {
+    if value.is_nan() {
+        return "NaN".into();
+    }
+    if value == 0.0 {
+        return "0".into();
+    }
+    if value.is_infinite() {
+        return if value > 0.0 { "Infinity" } else { "-Infinity" }.into();
+    }
+    if value.fract() == 0.0 && value.abs() < 1e21 {
+        return format!("{value}");
+    }
+    if value < 0.0 {
+        return format!("-{}", number_text(-value));
+    }
+    let scientific = format!("{value:e}");
+    let (mantissa, exponent) = scientific.split_once('e').unwrap();
+    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    let k = digits.len() as i32;
+    let n = exponent.parse::<i32>().unwrap() + 1;
+    if k <= n && n <= 21 {
+        format!("{digits}{}", "0".repeat((n - k) as usize))
+    } else if 0 < n && n <= 21 {
+        format!("{}.{}", &digits[..n as usize], &digits[n as usize..])
+    } else if -6 < n && n <= 0 {
+        format!("0.{}{digits}", "0".repeat(-n as usize))
+    } else {
+        let sign = if n - 1 < 0 { '-' } else { '+' };
+        let power = (n - 1).abs();
+        match digits.split_at(1) {
+            (first, "") => format!("{first}e{sign}{power}"),
+            (first, rest) => format!("{first}.{rest}e{sign}{power}"),
+        }
     }
 }

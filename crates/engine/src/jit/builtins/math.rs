@@ -1,14 +1,14 @@
 use super::{arg, fail};
 use crate::heap::MathFunction;
-use crate::jit::helpers::to_int32;
+use crate::jit::helpers::{primitive_number, to_int32};
 use crate::jit::session::JitCtx;
 use crate::value::Value;
 
-fn number(value: Value) -> Option<f64> {
-    if value.is_string() || value.is_object() {
+fn number(ctx: &mut JitCtx, value: Value) -> Option<f64> {
+    if value.is_object() {
         return None;
     }
-    Some(value.to_number())
+    Some(primitive_number(ctx, value))
 }
 
 fn min_max(ctx: &mut JitCtx, function: MathFunction, args: &[Value]) -> Value {
@@ -19,8 +19,8 @@ fn min_max(ctx: &mut JitCtx, function: MathFunction, args: &[Value]) -> Value {
         f64::NEG_INFINITY
     };
     for &value in args {
-        let Some(n) = number(value) else {
-            return fail(ctx, "Math string and object coercion is unsupported");
+        let Some(n) = number(ctx, value) else {
+            return fail(ctx, "Math object coercion is unsupported");
         };
         if result.is_nan() {
             continue;
@@ -43,12 +43,12 @@ pub(in crate::jit) fn call(ctx: &mut JitCtx, function: MathFunction, args: &[Val
     if matches!(function, Min | Max) {
         return min_max(ctx, function, args);
     }
-    let Some(x) = number(arg(args, 0)) else {
-        return fail(ctx, "Math string and object coercion is unsupported");
+    let Some(x) = number(ctx, arg(args, 0)) else {
+        return fail(ctx, "Math object coercion is unsupported");
     };
     let y = if matches!(function, Atan2 | Pow | Imul) {
-        let Some(y) = number(arg(args, 1)) else {
-            return fail(ctx, "Math string and object coercion is unsupported");
+        let Some(y) = number(ctx, arg(args, 1)) else {
+            return fail(ctx, "Math object coercion is unsupported");
         };
         y
     } else {

@@ -21,12 +21,16 @@ pub(crate) struct JitCtx<'a> {
     locals: Vec<Value>,
     locals_base: *mut Value,
     temps: Vec<Value>,
+    pending: u64,
+    epoch: *const u64,
     pub(crate) engine: &'a Engine,
 }
 
 pub(crate) const ERROR_OFFSET: i32 = std::mem::offset_of!(JitCtx<'static>, error) as i32;
 pub(crate) const EXCEPTION_OFFSET: i32 = std::mem::offset_of!(JitCtx<'static>, exception) as i32;
 pub(crate) const LOCALS_OFFSET: i32 = std::mem::offset_of!(JitCtx<'static>, locals_base) as i32;
+pub(crate) const PENDING_OFFSET: i32 = std::mem::offset_of!(JitCtx<'static>, pending) as i32;
+pub(crate) const EPOCH_OFFSET: i32 = std::mem::offset_of!(JitCtx<'static>, epoch) as i32;
 
 impl<'a> JitCtx<'a> {
     fn new(engine: &'a Engine) -> Self {
@@ -39,6 +43,8 @@ impl<'a> JitCtx<'a> {
             locals: Vec::new(),
             locals_base: std::ptr::null_mut(),
             temps: Vec::new(),
+            pending: 0,
+            epoch: engine.global().heap().epoch(),
             engine,
         }
     }
@@ -107,6 +113,12 @@ impl<'a> JitCtx<'a> {
             Some(frame) => self.locals.as_mut_ptr().wrapping_add(frame.locals),
             None => std::ptr::null_mut(),
         };
+        self.sync_temps();
+    }
+
+    fn sync_temps(&mut self) {
+        let base = self.frames.last().map_or(0, |frame| frame.temps);
+        self.pending = (self.temps.len() - base) as u64;
     }
 
     fn frame(&self) -> &Frame {
@@ -155,6 +167,7 @@ impl<'a> JitCtx<'a> {
     pub(crate) fn own(&mut self, value: Value) -> Value {
         if (value.is_object() && value != Value::GLOBAL_OBJECT) || value.is_string() {
             self.temps.push(value);
+            self.pending += 1;
         }
         value
     }
@@ -167,9 +180,9 @@ impl<'a> JitCtx<'a> {
     }
     pub(crate) fn clear(&mut self) {
         let base = self.frame().temps;
-        for value in self.temps.drain(base..) {
-            self.global.heap().release(value);
-        }
+        self.global.heap().release_all(&self.temps[base..]);
+        self.temps.truncate(base);
+        self.pending = 0;
     }
     pub(crate) fn root_index_read(
         &mut self,
@@ -210,6 +223,7 @@ impl<'a> JitCtx<'a> {
     fn take_ownership(&mut self, value: Value) -> bool {
         if self.temps.len() > self.frame().temps && self.temps.last() == Some(&value) {
             self.temps.pop();
+            self.pending -= 1;
             return true;
         }
         if self.global.heap().retain(value) {
@@ -252,13 +266,12 @@ impl<'a> JitCtx<'a> {
         };
         let frame = self.frames.pop().unwrap();
         let heap = self.global.heap();
-        for owned in self
-            .locals
-            .drain(frame.locals..)
-            .chain(self.temps.drain(frame.temps..))
-            .chain(frame.index_roots.into_iter().flatten().flatten())
-        {
-            heap.release(owned);
+        heap.release_all(&self.locals[frame.locals..]);
+        self.locals.truncate(frame.locals);
+        heap.release_all(&self.temps[frame.temps..]);
+        self.temps.truncate(frame.temps);
+        for roots in frame.index_roots.into_iter().flatten() {
+            heap.release_all(&roots);
         }
         self.sync_locals();
         value

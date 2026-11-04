@@ -14,8 +14,10 @@ struct HeapData {
     slots: Vec<Slot>,
     free: Vec<usize>,
     natives: Vec<(NativeFunction, u64)>,
+    interned: Vec<(&'static str, u64)>,
     regexp_cache: HashMap<(String, u8), Rc<regress::Regex>>,
     pending: VecDeque<u64>,
+    epoch: u64,
 }
 
 struct Slot {
@@ -530,6 +532,23 @@ impl Heap {
         Some(Value::from_bits(TAG_OBJECT | id))
     }
 
+    pub(crate) fn typed_view(&self, value: Value) -> Option<(*const u8, usize, u64)> {
+        let data = self.0.borrow();
+        let Payload::TypedArray(array) = &data.live(heap_id(value)?)?.payload else {
+            return None;
+        };
+        Some(match &array.storage {
+            TypedStorage::Uint8(values) => (values.as_ptr().cast(), values.len(), 0),
+            TypedStorage::Uint16(values) => (values.as_ptr().cast(), values.len(), 1),
+            TypedStorage::Uint32(values) => (values.as_ptr().cast(), values.len(), 2),
+            TypedStorage::Int8(values) => (values.as_ptr().cast(), values.len(), 3),
+            TypedStorage::Int16(values) => (values.as_ptr().cast(), values.len(), 4),
+            TypedStorage::Int32(values) => (values.as_ptr().cast(), values.len(), 5),
+            TypedStorage::Float32(values) => (values.as_ptr().cast(), values.len(), 6),
+            TypedStorage::Float64(values) => (values.as_ptr().cast(), values.len(), 7),
+        })
+    }
+
     pub(crate) fn typed_kind(&self, value: Value) -> Option<TypedKind> {
         let data = self.0.borrow();
         let array = data.typed_array(heap_id(value)?)?;
@@ -646,6 +665,20 @@ impl Heap {
         };
         data.slots[(id - 1) as usize].references += 1;
         Some(Value::from_bits(TAG_OBJECT | id))
+    }
+
+    pub(crate) fn interned(&self, text: &'static str) -> Option<Value> {
+        let mut data = self.0.borrow_mut();
+        let id = if let Some((_, id)) = data.interned.iter().find(|(name, _)| *name == text) {
+            *id
+        } else {
+            let id = data.reserve()?;
+            data.slots[(id - 1) as usize].payload = Payload::String(text.into());
+            data.interned.push((text, id));
+            id
+        };
+        data.slots[(id - 1) as usize].references += 1;
+        Some(Value::from_bits(TAG_STRING | id))
     }
 
     pub(crate) fn native(&self, value: Value) -> Option<NativeFunction> {
@@ -1023,9 +1056,23 @@ impl Heap {
             &mut data.closure_mut(id).unwrap().properties
         };
         if let Some(old) = properties.set(name, value, enumerable) {
+            if heap_id(old)
+                .and_then(|id| data.live(id))
+                .is_some_and(|slot| matches!(slot.payload, Payload::Native(_)))
+            {
+                data.epoch += 1;
+            }
             data.release(old);
         }
         true
+    }
+
+    pub(crate) fn invalidate(&self) {
+        self.0.borrow_mut().epoch += 1;
+    }
+
+    pub(crate) fn epoch(&self) -> *const u64 {
+        unsafe { &raw const (*self.0.as_ptr()).epoch }
     }
 
     pub(crate) fn enumerate(&self, value: Value) -> Option<Value> {
@@ -1450,6 +1497,20 @@ impl Heap {
             return;
         }
         self.0.borrow_mut().release(value);
+    }
+
+    pub(crate) fn release_all(&self, values: &[Value]) {
+        let mut owned = values
+            .iter()
+            .filter(|value| value.is_object() || value.is_string())
+            .peekable();
+        if owned.peek().is_none() {
+            return;
+        }
+        let mut data = self.0.borrow_mut();
+        for &value in owned {
+            data.release(value);
+        }
     }
 
     pub(crate) fn supports_indexed_storage(
