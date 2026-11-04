@@ -53,6 +53,17 @@ struct Builder<'a> {
     handlers: Vec<(Block, usize)>,
 }
 
+fn literal_elements<'s, 'a>(init: &'s Expression<'a>) -> Option<Vec<&'s Expression<'a>>> {
+    let Expression::ArrayExpression(array) = init.without_parentheses() else {
+        return None;
+    };
+    array
+        .elements
+        .iter()
+        .map(ArrayExpressionElement::as_expression)
+        .collect()
+}
+
 fn pattern_bindings<'s, 'a>(
     pattern: &'s BindingPattern<'a>,
 ) -> Result<Vec<&'s BindingIdentifier<'a>>> {
@@ -865,6 +876,25 @@ impl<'a> Builder<'a> {
     fn initialize(&mut self, declaration: &VariableDeclaration<'_>) -> Result<()> {
         for item in &declaration.declarations {
             pattern_bindings(&item.id)?;
+            if let BindingPattern::ArrayPattern(pattern) = &item.id
+                && let Some(elements) = item.init.as_ref().and_then(literal_elements)
+            {
+                let mut values = Vec::new();
+                for element in elements {
+                    values.push(self.expression(element)?);
+                }
+                for (index, element) in pattern.elements.iter().enumerate() {
+                    let Some(element) = element else {
+                        continue;
+                    };
+                    let value = match values.get(index) {
+                        Some(&value) => value,
+                        None => self.constant(element.span(), Constant::Undefined),
+                    };
+                    self.bind_pattern(element, value)?;
+                }
+                continue;
+            }
             let value = match &item.init {
                 Some(init) => self.expression(init)?,
                 None if declaration.kind == VariableDeclarationKind::Var => continue,

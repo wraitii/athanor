@@ -79,6 +79,7 @@ define_helpers! {
     FrameEnter => Unary, js_frame_enter;
     FrameExit => Unary, js_frame_exit;
     LocalSet => Binary, js_local_set;
+    LocalReplace => IndexSet, js_local_replace;
     TempClear => Unary, js_temp_clear;
     TempRetain => Unary, js_temp_retain;
     IterateNew => Unary, js_iterate_new;
@@ -107,8 +108,6 @@ define_helpers! {
     GlobalInitialize => GlobalSet, js_global_initialize;
     Throw => Unary, js_throw;
     Catch => Unary, js_catch;
-    ExceptionPending => Unary, js_exception_pending;
-    ErrorPending => Unary, js_error_pending;
     ErrorOrigin => SourceLocation, js_error_origin;
     BitwiseAnd => Binary, js_bitwise_and;
     BitwiseOr => Binary, js_bitwise_or;
@@ -277,9 +276,9 @@ fn primitive_number(ctx: *mut JitCtx, value: Value) -> f64 {
 
 fn numeric_operands(ctx: *mut JitCtx, values: &[Value]) -> bool {
     if values.iter().any(|value| value.is_object()) {
-        unsafe { &mut *ctx }.error = Some(crate::Error::Runtime(
+        unsafe { &mut *ctx }.error = Some(Box::new(crate::Error::Runtime(
             "object-to-primitive conversion is unsupported".into(),
-        ));
+        )));
         return false;
     }
     true
@@ -385,9 +384,9 @@ pub(crate) extern "C" fn js_add(ctx: *mut JitCtx, left: Value, right: Value) -> 
         if (left.is_object() && ctx.global.heap().error_text(left).is_none())
             || (right.is_object() && ctx.global.heap().error_text(right).is_none())
         {
-            ctx.error = Some(crate::Error::Runtime(
+            ctx.error = Some(Box::new(crate::Error::Runtime(
                 "object-to-primitive conversion is unsupported".into(),
-            ));
+            )));
             return Value::UNDEFINED;
         }
         let heap = ctx.global.heap();
@@ -402,7 +401,9 @@ pub(crate) extern "C" fn js_add(ctx: *mut JitCtx, left: Value, right: Value) -> 
         return match heap.string(&(left + &right)) {
             Some(value) => ctx.own(value),
             None => {
-                ctx.error = Some(crate::Error::Runtime("string heap exhausted".into()));
+                ctx.error = Some(Box::new(crate::Error::Runtime(
+                    "string heap exhausted".into(),
+                )));
                 Value::UNDEFINED
             }
         };
@@ -494,14 +495,16 @@ extern "C" fn js_global_get(ctx: *mut JitCtx, ptr: *const u8, len: u64) -> Value
         unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len as usize)) };
     match ctx.global.get_raw(name) {
         Some(Value::UNINITIALIZED) => {
-            ctx.error = Some(crate::Error::Runtime(format!(
+            ctx.error = Some(Box::new(crate::Error::Runtime(format!(
                 "binding `{name}` accessed before initialization"
-            )));
+            ))));
             Value::UNDEFINED
         }
         Some(value) => ctx.retain_temp(value),
         None => {
-            ctx.error = Some(crate::Error::Runtime(format!("unknown variable `{name}`")));
+            ctx.error = Some(Box::new(crate::Error::Runtime(format!(
+                "unknown variable `{name}`"
+            ))));
             Value::UNDEFINED
         }
     }
@@ -521,7 +524,9 @@ extern "C" fn js_global_set(ctx: *mut JitCtx, ptr: *const u8, len: u64, value: V
     let name =
         unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len as usize)) };
     if let Err(reason) = ctx.global.set_binding(name, value) {
-        ctx.error = Some(crate::Error::Runtime(format!("binding `{name}` {reason}")));
+        ctx.error = Some(Box::new(crate::Error::Runtime(format!(
+            "binding `{name}` {reason}"
+        ))));
     }
     value
 }
@@ -536,9 +541,9 @@ extern "C" fn js_global_initialize(
     let name =
         unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len as usize)) };
     if !ctx.global.initialize_lexical(name, value) {
-        ctx.error = Some(crate::Error::Runtime(format!(
+        ctx.error = Some(Box::new(crate::Error::Runtime(format!(
             "cannot initialize binding `{name}`"
-        )));
+        ))));
     }
     value
 }
@@ -551,16 +556,13 @@ extern "C" fn js_error_origin(
     end: u64,
 ) -> Value {
     let ctx = unsafe { &mut *ctx };
-    if ctx.error_origin.is_none() && matches!(ctx.error, Some(crate::Error::Runtime(_))) {
+    if ctx.error_origin.is_none() && matches!(ctx.error.as_deref(), Some(crate::Error::Runtime(_)))
+    {
         let filename =
             unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len as usize)) };
         ctx.error_origin = Some((filename.to_owned(), start as u32, end as u32));
     }
     Value::UNDEFINED
-}
-
-extern "C" fn js_error_pending(ctx: *mut JitCtx, _unused: Value) -> Value {
-    Value::boolean(unsafe { &*ctx }.error.is_some())
 }
 
 extern "C" fn js_property_get(ctx: *mut JitCtx, object: Value, ptr: *const u8, len: u64) -> Value {
@@ -577,7 +579,7 @@ extern "C" fn js_property_get(ctx: *mut JitCtx, object: Value, ptr: *const u8, l
             return match ctx.global.heap().native_function(function) {
                 Some(value) => ctx.own(value),
                 None => {
-                    ctx.error = Some(crate::Error::Runtime("heap exhausted".into()));
+                    ctx.error = Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
                     Value::UNDEFINED
                 }
             };
@@ -589,10 +591,10 @@ extern "C" fn js_property_get(ctx: *mut JitCtx, object: Value, ptr: *const u8, l
         }
         None => {}
     }
-    ctx.error = Some(crate::Error::Runtime(format!(
+    ctx.error = Some(Box::new(crate::Error::Runtime(format!(
         "cannot read property {name:?} of {}",
         ctx.global.heap().receiver_kind(object)
-    )));
+    ))));
     Value::UNDEFINED
 }
 
@@ -611,9 +613,9 @@ extern "C" fn js_property_set(
             if let Some(index) = value.as_number() {
                 ctx.global.heap().regexp_set_last_index(object, index);
             } else {
-                ctx.error = Some(crate::Error::Runtime(
+                ctx.error = Some(Box::new(crate::Error::Runtime(
                     "RegExp lastIndex requires a number".into(),
-                ));
+                )));
             }
             return value;
         }
@@ -625,10 +627,10 @@ extern "C" fn js_property_set(
         {
             return value;
         }
-        ctx.error = Some(crate::Error::Runtime(format!(
+        ctx.error = Some(Box::new(crate::Error::Runtime(format!(
             "cannot assign property {name:?} of {}",
             ctx.global.heap().receiver_kind(object)
-        )));
+        ))));
         return Value::UNDEFINED;
     }
     if !ctx.global.set(name, value) {
@@ -652,13 +654,15 @@ extern "C" fn js_property_define_hidden(
         .heap()
         .define_property(object, name, value, false)
     {
-        ctx.error = Some(crate::Error::Runtime("cannot define property".into()));
+        ctx.error = Some(Box::new(crate::Error::Runtime(
+            "cannot define property".into(),
+        )));
     }
     value
 }
 
-extern "C" fn js_frame_enter(ctx: *mut JitCtx, _: Value) -> Value {
-    unsafe { &mut *ctx }.enter();
+extern "C" fn js_frame_enter(ctx: *mut JitCtx, size: u64) -> Value {
+    unsafe { &mut *ctx }.enter(size as usize);
     Value::UNDEFINED
 }
 extern "C" fn js_frame_exit(ctx: *mut JitCtx, value: Value) -> Value {
@@ -667,6 +671,9 @@ extern "C" fn js_frame_exit(ctx: *mut JitCtx, value: Value) -> Value {
 extern "C" fn js_local_set(ctx: *mut JitCtx, slot: u64, value: Value) -> Value {
     unsafe { &mut *ctx }.local_set(slot as usize, value)
 }
+extern "C" fn js_local_replace(ctx: *mut JitCtx, slot: u64, value: Value, old: Value) -> Value {
+    unsafe { &mut *ctx }.local_replace(slot as usize, value, old)
+}
 extern "C" fn js_temp_clear(ctx: *mut JitCtx, _: Value) -> Value {
     unsafe { &mut *ctx }.clear();
     Value::UNDEFINED
@@ -674,9 +681,9 @@ extern "C" fn js_temp_clear(ctx: *mut JitCtx, _: Value) -> Value {
 extern "C" fn js_temp_retain(ctx: *mut JitCtx, value: Value) -> Value {
     let ctx = unsafe { &mut *ctx };
     if value == Value::UNINITIALIZED {
-        ctx.error = Some(crate::Error::Runtime(
+        ctx.error = Some(Box::new(crate::Error::Runtime(
             "binding accessed before initialization".into(),
-        ));
+        )));
         return Value::UNDEFINED;
     }
     ctx.retain_temp(value)
@@ -691,9 +698,9 @@ extern "C" fn js_array_new(ctx: *mut JitCtx, argv: *const Value, argc: u64) -> V
     match ctx.global.heap().array(values) {
         Some(value) => ctx.own(value),
         None => {
-            ctx.error = Some(crate::Error::Runtime(
+            ctx.error = Some(Box::new(crate::Error::Runtime(
                 "invalid array elements or heap exhausted".into(),
-            ));
+            )));
             Value::UNDEFINED
         }
     }
@@ -785,7 +792,9 @@ fn index_get_character(ctx: &mut JitCtx, character: char) -> Value {
     match ctx.global.heap().string(character.encode_utf8(&mut [0; 4])) {
         Some(value) => ctx.own(value),
         None => {
-            ctx.error = Some(crate::Error::Runtime("string heap exhausted".into()));
+            ctx.error = Some(Box::new(crate::Error::Runtime(
+                "string heap exhausted".into(),
+            )));
             Value::UNDEFINED
         }
     }
@@ -830,7 +839,9 @@ fn index_get_slow(ctx: &mut JitCtx, array: Value, index: Value) -> Value {
         if let Some(value) = super::builtins::property_get(ctx, array, &name) {
             return value;
         }
-        ctx.error = Some(crate::Error::Runtime("unsupported RegExp property".into()));
+        ctx.error = Some(Box::new(crate::Error::Runtime(
+            "unsupported RegExp property".into(),
+        )));
         return Value::UNDEFINED;
     }
     if ctx.global.heap().generator_state(array).is_some() {
@@ -866,7 +877,9 @@ fn index_get_slow(ctx: &mut JitCtx, array: Value, index: Value) -> Value {
         return match ctx.global.heap().string(character.encode_utf8(&mut [0; 4])) {
             Some(value) => ctx.own(value),
             None => {
-                ctx.error = Some(crate::Error::Runtime("string heap exhausted".into()));
+                ctx.error = Some(Box::new(crate::Error::Runtime(
+                    "string heap exhausted".into(),
+                )));
                 Value::UNDEFINED
             }
         };
@@ -875,10 +888,10 @@ fn index_get_slow(ctx: &mut JitCtx, array: Value, index: Value) -> Value {
     match result {
         Some(value) => ctx.retain_temp(value),
         None => {
-            ctx.error = Some(crate::Error::Runtime(format!(
+            ctx.error = Some(Box::new(crate::Error::Runtime(format!(
                 "unsupported index or receiver: {}",
                 ctx.global.heap().receiver_kind(array)
-            )));
+            ))));
             Value::UNDEFINED
         }
     }
@@ -908,12 +921,14 @@ extern "C" fn js_index_set(ctx: *mut JitCtx, array: Value, index: Value, value: 
             if let Some(index) = value.as_number() {
                 ctx.global.heap().regexp_set_last_index(array, index);
             } else {
-                ctx.error = Some(crate::Error::Runtime(
+                ctx.error = Some(Box::new(crate::Error::Runtime(
                     "RegExp lastIndex requires a number".into(),
-                ));
+                )));
             }
         } else {
-            ctx.error = Some(crate::Error::Runtime("unsupported RegExp property".into()));
+            ctx.error = Some(Box::new(crate::Error::Runtime(
+                "unsupported RegExp property".into(),
+            )));
         }
         return value;
     }
@@ -931,9 +946,9 @@ extern "C" fn js_index_set(ctx: *mut JitCtx, array: Value, index: Value, value: 
         return value;
     }
     if !array_index(index).is_some_and(|index| ctx.global.heap().set(array, index, value)) {
-        ctx.error = Some(crate::Error::Runtime(
+        ctx.error = Some(Box::new(crate::Error::Runtime(
             "unsupported array index or receiver".into(),
-        ));
+        )));
     }
     value
 }
@@ -943,9 +958,9 @@ extern "C" fn js_cell_new(ctx: *mut JitCtx, value: Value) -> Value {
     match ctx.global.heap().cell(value) {
         Some(cell) => ctx.own(cell),
         None => {
-            ctx.error = Some(crate::Error::Runtime(
+            ctx.error = Some(Box::new(crate::Error::Runtime(
                 "invalid cell value or heap exhausted".into(),
-            ));
+            )));
             Value::UNDEFINED
         }
     }
@@ -955,14 +970,16 @@ extern "C" fn js_cell_get(ctx: *mut JitCtx, cell: Value) -> Value {
     let ctx = unsafe { &mut *ctx };
     match ctx.global.heap().cell_get(cell) {
         Some(Value::UNINITIALIZED) => {
-            ctx.error = Some(crate::Error::Runtime(
+            ctx.error = Some(Box::new(crate::Error::Runtime(
                 "binding accessed before initialization".into(),
-            ));
+            )));
             Value::UNDEFINED
         }
         Some(value) => ctx.retain_temp(value),
         None => {
-            ctx.error = Some(crate::Error::Runtime("invalid capture cell".into()));
+            ctx.error = Some(Box::new(crate::Error::Runtime(
+                "invalid capture cell".into(),
+            )));
             Value::UNDEFINED
         }
     }
@@ -971,9 +988,9 @@ extern "C" fn js_cell_get(ctx: *mut JitCtx, cell: Value) -> Value {
 extern "C" fn js_cell_set(ctx: *mut JitCtx, cell: Value, value: Value) -> Value {
     let ctx = unsafe { &mut *ctx };
     if !ctx.global.heap().cell_set(cell, value) {
-        ctx.error = Some(crate::Error::Runtime(
+        ctx.error = Some(Box::new(crate::Error::Runtime(
             "invalid capture cell or value".into(),
-        ));
+        )));
     }
     value
 }
@@ -983,7 +1000,9 @@ extern "C" fn js_capture_get(ctx: *mut JitCtx, closure: Value, index: u64) -> Va
     match ctx.global.heap().capture(closure, index as usize) {
         Some(cell) => ctx.retain_temp(cell),
         None => {
-            ctx.error = Some(crate::Error::Runtime("invalid closure capture".into()));
+            ctx.error = Some(Box::new(crate::Error::Runtime(
+                "invalid closure capture".into(),
+            )));
             Value::UNDEFINED
         }
     }
@@ -997,7 +1016,9 @@ extern "C" fn js_closure_new(
 ) -> Value {
     let ctx = unsafe { &mut *ctx };
     if ctx.entry(code).is_none() {
-        ctx.error = Some(crate::Error::Runtime("unknown closure code".into()));
+        ctx.error = Some(Box::new(crate::Error::Runtime(
+            "unknown closure code".into(),
+        )));
         return Value::UNDEFINED;
     }
     let captures = if count == 0 {
@@ -1012,9 +1033,9 @@ extern "C" fn js_closure_new(
     {
         Some(value) => ctx.own(value),
         None => {
-            ctx.error = Some(crate::Error::Runtime(
+            ctx.error = Some(Box::new(crate::Error::Runtime(
                 "invalid captures or heap exhausted".into(),
-            ));
+            )));
             Value::UNDEFINED
         }
     }
@@ -1052,7 +1073,9 @@ extern "C" fn js_array_append(ctx: *mut JitCtx, arguments: Value, value: Value) 
     let context = unsafe { &mut *ctx };
     let heap = context.global.heap();
     if !heap.set(arguments, heap.len(arguments).unwrap(), value) {
-        context.error = Some(crate::Error::Runtime("cannot append array element".into()));
+        context.error = Some(Box::new(crate::Error::Runtime(
+            "cannot append array element".into(),
+        )));
     }
     Value::UNDEFINED
 }
@@ -1133,9 +1156,9 @@ pub(super) extern "C" fn js_call(
     argc: u64,
 ) -> Value {
     if unsafe { &*ctx }.global.heap().is_class(closure) {
-        unsafe { &mut *ctx }.error = Some(crate::Error::Runtime(
+        unsafe { &mut *ctx }.error = Some(Box::new(crate::Error::Runtime(
             "class constructor requires new".into(),
-        ));
+        )));
         return Value::UNDEFINED;
     }
     invoke(ctx, closure, receiver, argv, argc)
@@ -1159,9 +1182,9 @@ fn invoke(
             .closure_code(closure)
             .and_then(|code| context.entry(code.0));
         let Some(entry) = entry else {
-            context.error = Some(crate::Error::Runtime(
+            context.error = Some(Box::new(crate::Error::Runtime(
                 "value is not callable in this engine".into(),
-            ));
+            )));
             return Value::UNDEFINED;
         };
         entry
@@ -1184,9 +1207,9 @@ extern "C" fn js_regexp_new(ctx: *mut JitCtx, flags: u64, ptr: *const u8, len: u
     match ctx.global.heap().regexp(pattern, flags as u8) {
         Ok(value) => ctx.own(value),
         Err(message) => {
-            ctx.error = Some(crate::Error::Runtime(format!(
+            ctx.error = Some(Box::new(crate::Error::Runtime(format!(
                 "invalid regular expression: {message}"
-            )));
+            ))));
             Value::UNDEFINED
         }
     }
@@ -1199,7 +1222,9 @@ extern "C" fn js_string_new(ctx: *mut JitCtx, ptr: *const u8, len: u64) -> Value
     match ctx.global.heap().string(text) {
         Some(value) => ctx.own(value),
         None => {
-            ctx.error = Some(crate::Error::Runtime("string heap exhausted".into()));
+            ctx.error = Some(Box::new(crate::Error::Runtime(
+                "string heap exhausted".into(),
+            )));
             Value::UNDEFINED
         }
     }
@@ -1220,10 +1245,6 @@ extern "C" fn js_throw(ctx: *mut JitCtx, value: Value) -> Value {
 
 extern "C" fn js_catch(ctx: *mut JitCtx, _: Value) -> Value {
     unsafe { &mut *ctx }.catch()
-}
-
-extern "C" fn js_exception_pending(ctx: *mut JitCtx, _: Value) -> Value {
-    Value::boolean(unsafe { &*ctx }.exception_pending())
 }
 
 extern "C" fn js_construct(
@@ -1253,7 +1274,7 @@ extern "C" fn js_construct(
     }
     if ctx.global.heap().constructable(constructor) {
         let Some(instance) = ctx.global.heap().constructed_object(constructor) else {
-            ctx.error = Some(crate::Error::Runtime("heap exhausted".into()));
+            ctx.error = Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
             return Value::UNDEFINED;
         };
         ctx.own(instance);
@@ -1270,21 +1291,23 @@ extern "C" fn js_construct(
             unsafe { *argv }
         };
         if !argument.is_nullish() {
-            ctx.error = Some(crate::Error::Runtime(
+            ctx.error = Some(Box::new(crate::Error::Runtime(
                 "Set iterable construction is unsupported".into(),
-            ));
+            )));
             return Value::UNDEFINED;
         }
         return match ctx.global.heap().set_new() {
             Some(value) => ctx.own(value),
             None => {
-                ctx.error = Some(crate::Error::Runtime("heap exhausted".into()));
+                ctx.error = Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
                 Value::UNDEFINED
             }
         };
     }
     if ctx.global.heap().native(constructor) != Some(crate::heap::NativeFunction::Error) {
-        ctx.error = Some(crate::Error::Runtime("unsupported constructor".into()));
+        ctx.error = Some(Box::new(crate::Error::Runtime(
+            "unsupported constructor".into(),
+        )));
         return Value::UNDEFINED;
     }
     let argument = if argc == 0 {
@@ -1297,9 +1320,9 @@ extern "C" fn js_construct(
         String::new()
     } else if argument.is_object() {
         let Some(text) = heap.error_text(argument) else {
-            ctx.error = Some(crate::Error::Runtime(
+            ctx.error = Some(Box::new(crate::Error::Runtime(
                 "object-to-primitive conversion is unsupported".into(),
-            ));
+            )));
             return Value::UNDEFINED;
         };
         text
@@ -1307,12 +1330,12 @@ extern "C" fn js_construct(
         heap.text(argument).unwrap_or_else(|| argument.to_string())
     };
     let Some(message) = heap.string(&text) else {
-        ctx.error = Some(crate::Error::Runtime("heap exhausted".into()));
+        ctx.error = Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
         return Value::UNDEFINED;
     };
     let Some(name) = heap.string("Error") else {
         heap.release(message);
-        ctx.error = Some(crate::Error::Runtime("heap exhausted".into()));
+        ctx.error = Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
         return Value::UNDEFINED;
     };
     let result = heap.error(message, name);
@@ -1321,7 +1344,7 @@ extern "C" fn js_construct(
     match result {
         Some(value) => ctx.own(value),
         None => {
-            ctx.error = Some(crate::Error::Runtime("heap exhausted".into()));
+            ctx.error = Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
             Value::UNDEFINED
         }
     }
@@ -1330,9 +1353,9 @@ extern "C" fn js_construct(
 extern "C" fn js_in(ctx: *mut JitCtx, key: Value, object: Value) -> Value {
     let ctx = unsafe { &mut *ctx };
     if !object.is_object() {
-        ctx.error = Some(crate::Error::Runtime(format!(
+        ctx.error = Some(Box::new(crate::Error::Runtime(format!(
             "right operand of in must be an object, got {object}"
-        )));
+        ))));
         return Value::UNDEFINED;
     }
     let Some(name) = property_key(ctx, key) else {
@@ -1344,9 +1367,9 @@ extern "C" fn js_in(ctx: *mut JitCtx, key: Value, object: Value) -> Value {
     match ctx.global.heap().has_property(object, &name) {
         Some(present) => Value::boolean(present),
         None => {
-            ctx.error = Some(crate::Error::Runtime(
+            ctx.error = Some(Box::new(crate::Error::Runtime(
                 "unsupported right operand of in".into(),
-            ));
+            )));
             Value::UNDEFINED
         }
     }
@@ -1362,9 +1385,9 @@ extern "C" fn js_instanceof(ctx: *mut JitCtx, value: Value, constructor: Value) 
         return Value::boolean(heap.is_array(value));
     }
     if heap.closure_code(constructor).is_none() {
-        ctx.error = Some(crate::Error::Runtime(
+        ctx.error = Some(Box::new(crate::Error::Runtime(
             "instanceof requires a supported callable right operand".into(),
-        ));
+        )));
         return Value::UNDEFINED;
     }
     if !value.is_object() {
@@ -1374,9 +1397,9 @@ extern "C" fn js_instanceof(ctx: *mut JitCtx, value: Value, constructor: Value) 
         .property(constructor, "prototype")
         .unwrap_or(Value::UNDEFINED);
     if !prototype.is_object() {
-        ctx.error = Some(crate::Error::Runtime(
+        ctx.error = Some(Box::new(crate::Error::Runtime(
             "instanceof constructor prototype is not an object".into(),
-        ));
+        )));
         return Value::UNDEFINED;
     }
     Value::boolean(heap.inherits(value, prototype))
@@ -1385,9 +1408,9 @@ extern "C" fn js_instanceof(ctx: *mut JitCtx, value: Value, constructor: Value) 
 extern "C" fn js_typeof(ctx: *mut JitCtx, value: Value) -> Value {
     let ctx = unsafe { &mut *ctx };
     if value == Value::UNINITIALIZED {
-        ctx.error = Some(crate::Error::Runtime(
+        ctx.error = Some(Box::new(crate::Error::Runtime(
             "binding accessed before initialization".into(),
-        ));
+        )));
         return Value::UNDEFINED;
     }
     let name = if ctx.global.heap().closure_code(value).is_some()
@@ -1400,7 +1423,7 @@ extern "C" fn js_typeof(ctx: *mut JitCtx, value: Value) -> Value {
     match ctx.global.heap().string(name) {
         Some(value) => ctx.own(value),
         None => {
-            ctx.error = Some(crate::Error::Runtime("heap exhausted".into()));
+            ctx.error = Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
             Value::UNDEFINED
         }
     }
@@ -1411,9 +1434,9 @@ extern "C" fn js_enumerate_new(ctx: *mut JitCtx, receiver: Value) -> Value {
     match ctx.global.heap().enumerate(receiver) {
         Some(state) => ctx.own(state),
         None => {
-            ctx.error = Some(crate::Error::Runtime(
+            ctx.error = Some(Box::new(crate::Error::Runtime(
                 "for-in receiver is unsupported".into(),
-            ));
+            )));
             Value::UNDEFINED
         }
     }
@@ -1425,7 +1448,9 @@ extern "C" fn js_enumerate_next(ctx: *mut JitCtx, state: Value) -> Value {
         Some(Some(value)) => ctx.own(value),
         Some(None) => Value::UNINITIALIZED,
         None => {
-            ctx.error = Some(crate::Error::Runtime("for-in enumeration failed".into()));
+            ctx.error = Some(Box::new(crate::Error::Runtime(
+                "for-in enumeration failed".into(),
+            )));
             Value::UNDEFINED
         }
     }
@@ -1434,15 +1459,15 @@ extern "C" fn js_enumerate_next(ctx: *mut JitCtx, state: Value) -> Value {
 pub(super) extern "C" fn js_iterate_new(ctx: *mut JitCtx, iterable: Value) -> Value {
     let ctx = unsafe { &mut *ctx };
     if ctx.global.heap().len(iterable).is_none() {
-        ctx.error = Some(crate::Error::Runtime(
+        ctx.error = Some(Box::new(crate::Error::Runtime(
             "iteration requires an array, typed array, or string".into(),
-        ));
+        )));
         return Value::UNDEFINED;
     }
     match ctx.global.heap().array(&[iterable, Value::number(0.0)]) {
         Some(value) => ctx.own(value),
         None => {
-            ctx.error = Some(crate::Error::Runtime("heap exhausted".into()));
+            ctx.error = Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
             Value::UNDEFINED
         }
     }
@@ -1461,7 +1486,7 @@ pub(super) extern "C" fn js_iterate_next(ctx: *mut JitCtx, state: Value) -> Valu
         return match heap.string(character.encode_utf8(&mut [0; 4])) {
             Some(value) => ctx.own(value),
             None => {
-                ctx.error = Some(crate::Error::Runtime("heap exhausted".into()));
+                ctx.error = Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
                 Value::UNDEFINED
             }
         };
@@ -1524,7 +1549,7 @@ extern "C" fn js_object_new(ctx: *mut JitCtx, _: Value) -> Value {
     match ctx.global.heap().object() {
         Some(value) => ctx.own(value),
         None => {
-            ctx.error = Some(crate::Error::Runtime("heap exhausted".into()));
+            ctx.error = Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
             Value::UNDEFINED
         }
     }
@@ -1532,9 +1557,9 @@ extern "C" fn js_object_new(ctx: *mut JitCtx, _: Value) -> Value {
 
 fn property_key(ctx: &mut JitCtx, value: Value) -> Option<String> {
     if value.is_object() {
-        ctx.error = Some(crate::Error::Runtime(
+        ctx.error = Some(Box::new(crate::Error::Runtime(
             "object-to-property-key conversion is unsupported".into(),
-        ));
+        )));
         return None;
     }
     Some(ctx.global.heap().text(value).unwrap_or_else(|| {
@@ -1554,7 +1579,7 @@ extern "C" fn js_property_key(ctx: *mut JitCtx, value: Value) -> Value {
     match ctx.global.heap().string(&name) {
         Some(value) => ctx.own(value),
         None => {
-            ctx.error = Some(crate::Error::Runtime("heap exhausted".into()));
+            ctx.error = Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
             Value::UNDEFINED
         }
     }
@@ -1576,7 +1601,7 @@ fn set_property_get(ctx: &mut JitCtx, object: Value, name: &str) -> Option<Value
     Some(match ctx.global.heap().native_function(function) {
         Some(value) => ctx.own(value),
         None => {
-            ctx.error = Some(crate::Error::Runtime("heap exhausted".into()));
+            ctx.error = Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
             Value::UNDEFINED
         }
     })
@@ -1625,9 +1650,9 @@ fn native_call(
         return super::builtins::math::call(unsafe { &mut *ctx }, operation, args);
     }
     if matches!(function, NativeFunction::TypedConstructor(_)) {
-        unsafe { &mut *ctx }.error = Some(crate::Error::Runtime(
+        unsafe { &mut *ctx }.error = Some(Box::new(crate::Error::Runtime(
             "typed array constructor requires new".into(),
-        ));
+        )));
         return Value::UNDEFINED;
     }
     if function == NativeFunction::Array {
@@ -1663,9 +1688,9 @@ fn native_call(
     }
     if function == NativeFunction::GeneratorNext {
         if argc != 0 && unsafe { *argv } != Value::UNDEFINED {
-            unsafe { &mut *ctx }.error = Some(crate::Error::Runtime(
+            unsafe { &mut *ctx }.error = Some(Box::new(crate::Error::Runtime(
                 "generator resume arguments are unsupported".into(),
-            ));
+            )));
             return Value::UNDEFINED;
         }
         return generator_next(ctx, receiver);
@@ -1721,13 +1746,13 @@ fn native_call(
     }
     let ctx = unsafe { &mut *ctx };
     if function == NativeFunction::Set {
-        ctx.error = Some(crate::Error::Runtime("Set requires new".into()));
+        ctx.error = Some(Box::new(crate::Error::Runtime("Set requires new".into())));
         return Value::UNDEFINED;
     }
     if ctx.global.heap().set_size(receiver).is_none() {
-        ctx.error = Some(crate::Error::Runtime(
+        ctx.error = Some(Box::new(crate::Error::Runtime(
             "Set method requires a Set receiver".into(),
-        ));
+        )));
         return Value::UNDEFINED;
     }
     let argument = if argc == 0 {
@@ -1744,14 +1769,14 @@ fn native_call(
         }
         NativeFunction::SetAdd => {
             if !ctx.global.heap().set_add(receiver, argument) {
-                ctx.error = Some(crate::Error::Runtime("invalid Set entry".into()));
+                ctx.error = Some(Box::new(crate::Error::Runtime("invalid Set entry".into())));
                 return Value::UNDEFINED;
             }
             ctx.retain_temp(receiver)
         }
         NativeFunction::SetClear => {
             if !ctx.global.heap().set_clear(receiver) {
-                ctx.error = Some(crate::Error::Runtime("heap exhausted".into()));
+                ctx.error = Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
             }
             Value::UNDEFINED
         }
@@ -1770,7 +1795,7 @@ fn generator_property(ctx: &mut JitCtx, name: &str) -> Value {
     {
         Some(value) => ctx.own(value),
         None => {
-            ctx.error = Some(crate::Error::Runtime("heap exhausted".into()));
+            ctx.error = Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
             Value::UNDEFINED
         }
     }
@@ -1791,7 +1816,7 @@ extern "C" fn js_generator_new(
     {
         Some(value) => ctx.own(value),
         None => {
-            ctx.error = Some(crate::Error::Runtime("heap exhausted".into()));
+            ctx.error = Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
             Value::UNDEFINED
         }
     }
@@ -1830,7 +1855,7 @@ extern "C" fn js_generator_complete(ctx: *mut JitCtx, generator: Value, value: V
 fn generator_result(ctx: &mut JitCtx, value: Value, done: bool) -> Value {
     let Some(result) = ctx.global.heap().object() else {
         ctx.global.heap().release(value);
-        ctx.error = Some(crate::Error::Runtime("heap exhausted".into()));
+        ctx.error = Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
         return Value::UNDEFINED;
     };
     ctx.global.heap().set_property(result, "value", value);
@@ -1845,23 +1870,25 @@ fn generator_next(ctx: *mut JitCtx, generator: Value) -> Value {
     use crate::heap::{GENERATOR_DONE, GENERATOR_RUNNING};
     let context = unsafe { &mut *ctx };
     let Some(state) = context.global.heap().generator_state(generator) else {
-        context.error = Some(crate::Error::Runtime(
+        context.error = Some(Box::new(crate::Error::Runtime(
             "next requires a generator receiver".into(),
-        ));
+        )));
         return Value::UNDEFINED;
     };
     if state == GENERATOR_DONE {
         return generator_result(context, Value::UNDEFINED, true);
     }
     if state == GENERATOR_RUNNING {
-        context.error = Some(crate::Error::Runtime("generator is already running".into()));
+        context.error = Some(Box::new(crate::Error::Runtime(
+            "generator is already running".into(),
+        )));
         return Value::UNDEFINED;
     }
     let (code, _, arguments) = context.global.heap().generator_parts(generator).unwrap();
     let Some(entry) = context.entry(code.0) else {
-        context.error = Some(crate::Error::Runtime(
+        context.error = Some(Box::new(crate::Error::Runtime(
             "generator code is unavailable".into(),
-        ));
+        )));
         return Value::UNDEFINED;
     };
     let args: Vec<_> = (0..context.global.heap().len(arguments).unwrap())
@@ -1885,7 +1912,9 @@ fn generator_next(ctx: *mut JitCtx, generator: Value) -> Value {
 extern "C" fn js_bind_this(ctx: *mut JitCtx, closure: Value, receiver: Value) -> Value {
     let ctx = unsafe { &mut *ctx };
     if !ctx.global.heap().bind_this(closure, receiver) {
-        ctx.error = Some(crate::Error::Runtime("invalid arrow receiver".into()));
+        ctx.error = Some(Box::new(crate::Error::Runtime(
+            "invalid arrow receiver".into(),
+        )));
     }
     closure
 }

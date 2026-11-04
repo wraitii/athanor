@@ -270,9 +270,9 @@ fn sort(ctx: *mut JitCtx, receiver: Value, args: &[Value]) -> Value {
                 return Ordering::Equal;
             }
             let Some(number) = sort_number(&heap, result) else {
-                context.error = Some(crate::Error::Runtime(
+                context.error = Some(Box::new(crate::Error::Runtime(
                     "object conversion in sort is unsupported".into(),
-                ));
+                )));
                 failed = true;
                 return Ordering::Equal;
             };

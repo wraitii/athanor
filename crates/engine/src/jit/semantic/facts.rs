@@ -23,7 +23,7 @@ impl Types {
     pub(in crate::jit) const VALUE: Self = Self(511 & !256);
     pub(in crate::jit) const ALL: Self = Self(511);
 
-    pub(in crate::jit) fn union(self, other: Self) -> Self {
+    pub(in crate::jit) const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
     }
 
@@ -133,21 +133,7 @@ fn number(value: f64) -> Types {
     }
 }
 
-fn numeric(operands: Types, result: Types) -> Types {
-    if operands.within(Types::PRIMITIVE) {
-        result
-    } else {
-        result.union(Types::OTHER)
-    }
-}
-
 fn result_types(op: &Op, facts: &Facts) -> Types {
-    let operands = op
-        .operands()
-        .into_iter()
-        .fold(Types::default(), |types, value| {
-            types.union(facts.of(value))
-        });
     match op {
         Op::Constant(constant) => match constant {
             Constant::Undefined => Types::UNDEFINED,
@@ -165,15 +151,13 @@ fn result_types(op: &Op, facts: &Facts) -> Types {
         {
             facts.of(*value)
         }
-        Op::ToNumeric(_) => numeric(operands, Types::NUMBER),
+        Op::ToNumeric(_) => Types::NUMBER,
         Op::Unary(operator, _) => match operator {
             UnaryOp::Not => Types::BOOLEAN,
             UnaryOp::Typeof => Types::STRING,
             UnaryOp::Plus => Types::NUMBER,
-            UnaryOp::BitwiseNot => numeric(operands, Types::INT32),
-            UnaryOp::Negate | UnaryOp::Increment | UnaryOp::Decrement => {
-                numeric(operands, Types::NUMBER)
-            }
+            UnaryOp::BitwiseNot => Types::INT32,
+            UnaryOp::Negate | UnaryOp::Increment | UnaryOp::Decrement => Types::NUMBER,
         },
         Op::Binary(operator, left, right) => match operator {
             BinaryOperator::Addition => {
@@ -187,19 +171,19 @@ fn result_types(op: &Op, facts: &Facts) -> Types {
                 } else if left.within(Types::STRING) || right.within(Types::STRING) {
                     Types::STRING
                 } else {
-                    Types::NUMBER.union(Types::STRING).union(Types::OTHER)
+                    Types::NUMBER.union(Types::STRING)
                 }
             }
             BinaryOperator::Subtraction
             | BinaryOperator::Multiplication
             | BinaryOperator::Division
             | BinaryOperator::Remainder
-            | BinaryOperator::Exponential => numeric(operands, Types::NUMBER),
+            | BinaryOperator::Exponential => Types::NUMBER,
             BinaryOperator::ShiftLeft
             | BinaryOperator::ShiftRight
             | BinaryOperator::BitwiseOR
             | BinaryOperator::BitwiseXOR
-            | BinaryOperator::BitwiseAnd => numeric(operands, Types::INT32),
+            | BinaryOperator::BitwiseAnd => Types::INT32,
             BinaryOperator::ShiftRightZeroFill => Types::NUMBER,
             _ => Types::BOOLEAN,
         },

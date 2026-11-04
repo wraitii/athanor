@@ -1,71 +1,6 @@
 use std::process::Command;
 
 #[test]
-fn compile_reports_closed_and_unresolved_calls() {
-    let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
-        .args([
-            "--compile",
-            "--no-ir",
-            "--eval",
-            "function closed(x) { return x + 1; } function open(f) { return f(); } function unknown(o) { o.x = 1; }",
-        ])
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    let output = String::from_utf8(output.stdout).unwrap();
-    let closed = output
-        .split("[closed@")
-        .nth(1)
-        .unwrap()
-        .split("[open@")
-        .next()
-        .unwrap();
-    assert!(closed.contains("admission: closed against reentry"));
-    assert!(closed.contains("js_local_set"));
-    let open = output
-        .split("[open@")
-        .nth(1)
-        .unwrap()
-        .split("[unknown@")
-        .next()
-        .unwrap();
-    assert!(open.contains("admission: unresolved"));
-    assert!(open.contains("js_call: 1 site(s), unresolved: arbitrary call"));
-    assert!(open.contains("@line 1"));
-    let unknown = output.split("[unknown@").nth(1).unwrap();
-    assert!(unknown.contains("admission: unresolved"));
-    assert!(unknown.contains("unresolved: unclassified helper"));
-}
-
-#[test]
-fn compile_recognizes_math_candidates_without_proving_identity() {
-    let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
-        .env("JS_JIT_SSA", "0")
-        .args([
-            "--compile",
-            "--no-ir",
-            "--eval",
-            "function f(x) { return Math.floor(x); } function g(Math) { return Math.floor(1); }",
-        ])
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    let output = String::from_utf8(output.stdout).unwrap();
-    let global = output
-        .split("[f@")
-        .nth(1)
-        .unwrap()
-        .split("[g@")
-        .next()
-        .unwrap();
-    assert!(global.contains("candidate call targets (identity unproven)"));
-    assert!(global.contains("Math.floor"));
-    assert!(global.contains("admission: unresolved"));
-    let local = output.split("[g@").nth(1).unwrap();
-    assert!(!local.contains("candidate call targets"));
-}
-
-#[test]
 fn constant_branch_cleanup_is_gated_by_ssa_optimization() {
     for enabled in [false, true] {
         let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
@@ -147,5 +82,32 @@ fn semantic_index_reads_observe_writes_and_calls() {
             .unwrap();
         assert!(result.status.success());
         assert_eq!(String::from_utf8(result.stdout).unwrap().trim(), "19");
+    }
+}
+
+#[test]
+fn private_iteration_does_not_block_versioning() {
+    let source = "function f(p,xs){ const [a,b]=[p.x,p.y]; let s=0; for(const v of xs) s+=Math.floor(v+a+b); return s; } function main(){ const xs=[0.5,1.5]; const r=f({x:1,y:2},xs); Math.floor=x=>x*10; return r+','+f({x:0,y:0},xs); }";
+    let dump = Command::new(env!("CARGO_BIN_EXE_js-runner"))
+        .args(["--compile", "--no-ir", "--semantic-ir", "--eval", source])
+        .output()
+        .unwrap();
+    assert!(dump.status.success());
+    let dump = String::from_utf8(dump.stdout).unwrap();
+    let f = dump.split("semantic IR f").nth(1).unwrap();
+    assert!(
+        f.split("semantic IR")
+            .next()
+            .unwrap()
+            .contains("note: versioned:")
+    );
+    for enabled in [false, true] {
+        let result = Command::new(env!("CARGO_BIN_EXE_js-runner"))
+            .env("JS_JIT_SSA", if enabled { "1" } else { "0" })
+            .args(["--eval", source])
+            .output()
+            .unwrap();
+        assert!(result.status.success());
+        assert_eq!(String::from_utf8(result.stdout).unwrap().trim(), "7,20");
     }
 }

@@ -23,17 +23,17 @@ temporary directory. `samply` and `perf` can consume the dump, and debug
 information points at the original JavaScript source so they show JavaScript
 lines alongside the assembly. Set `JS_JIT_JITDUMP=2` to instead write one `.jsir` listing per compiled
 function; debug information then points at these listings, which contain the
-complete Cranelift IR in block order with the originating JavaScript source line
-interspersed whenever it changes.
+semantic IR in block order with the originating JavaScript source line
+interspersed whenever it changes. Profile samples are attributed to semantic
+instructions and terminators where machine-code source locations are available;
+generated code without a semantic location points to the listing header.
 
 Use `--compile --eval SOURCE` or `--compile SCRIPT` to print Cranelift IR
-and a per-function helper effect and reentry admission report without executing
-the source. Add `--semantic-ir` to print the semantic graph, inferred types,
-and optimization notes. The report identifies unresolved calls and current runtime assumptions;
-its admission status does not establish purity or analyze raw memory effects.
-Add `--ast` for the analyzed Oxc AST and generator resume plans, or `--asm` for
-Cranelift machine-instruction output. Use `--no-ir` to omit IR while retaining
-the effect report. The compiler lowers the AST to a semantic graph before
+without executing the source. Add `--semantic-ir` to print the semantic graph,
+inferred types, and optimization notes, including why a function was not
+versioned or optimized. Add `--ast` for the analyzed Oxc AST and generator
+resume plans, or `--asm` for Cranelift machine-instruction output. Use
+`--no-ir` to omit IR. The compiler lowers the AST to a semantic graph before
 emitting Cranelift IR. Eligible functions get a guarded Math fast path that
 checks native identities once per invocation and falls back on mismatch.
 `JS_JIT_SSA=0` disables semantic graph optimization and CLIF SSA optimization.

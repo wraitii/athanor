@@ -4,10 +4,9 @@ use crate::environment::Environment;
 use crate::error::Error;
 use crate::value::Value;
 
-#[derive(Default)]
 struct Frame {
-    locals: Vec<Value>,
-    temps: Vec<Value>,
+    locals: usize,
+    temps: usize,
     index_roots: Vec<Option<[Value; 3]>>,
     resume_state: usize,
 }
@@ -15,12 +14,19 @@ struct Frame {
 #[repr(C)]
 pub(crate) struct JitCtx<'a> {
     pub(crate) global: Environment,
-    pub(crate) error: Option<Error>,
+    pub(crate) error: Option<Box<Error>>,
     pub(crate) error_origin: Option<(String, u32, u32)>,
-    exception: Option<Value>,
+    exception: Value,
     frames: Vec<Frame>,
+    locals: Vec<Value>,
+    locals_base: *mut Value,
+    temps: Vec<Value>,
     pub(crate) engine: &'a Engine,
 }
+
+pub(crate) const ERROR_OFFSET: i32 = std::mem::offset_of!(JitCtx<'static>, error) as i32;
+pub(crate) const EXCEPTION_OFFSET: i32 = std::mem::offset_of!(JitCtx<'static>, exception) as i32;
+pub(crate) const LOCALS_OFFSET: i32 = std::mem::offset_of!(JitCtx<'static>, locals_base) as i32;
 
 impl<'a> JitCtx<'a> {
     fn new(engine: &'a Engine) -> Self {
@@ -28,8 +34,11 @@ impl<'a> JitCtx<'a> {
             global: engine.global().clone(),
             error: None,
             error_origin: None,
-            exception: None,
+            exception: Value::UNINITIALIZED,
             frames: Vec::new(),
+            locals: Vec::new(),
+            locals_base: std::ptr::null_mut(),
+            temps: Vec::new(),
             engine,
         }
     }
@@ -39,7 +48,7 @@ impl<'a> JitCtx<'a> {
             Ok(Some(entry)) => entry,
             Ok(None) => return Value::UNDEFINED,
             Err(error) => {
-                self.error = Some(error);
+                self.error = Some(Box::new(error));
                 return Value::UNDEFINED;
             }
         };
@@ -57,20 +66,19 @@ impl<'a> JitCtx<'a> {
 
     pub(crate) fn throw(&mut self, value: Value) {
         if !self.global.heap().retain(value) {
-            self.error = Some(Error::Runtime("invalid thrown value".into()));
+            self.error = Some(Box::new(Error::Runtime("invalid thrown value".into())));
             return;
         }
-        if let Some(old) = self.exception.replace(value) {
-            self.global.heap().release(old);
-        }
+        let old = std::mem::replace(&mut self.exception, value);
+        self.global.heap().release(old);
     }
 
     pub(crate) fn exception_pending(&self) -> bool {
-        self.exception.is_some()
+        self.exception != Value::UNINITIALIZED
     }
 
     pub(crate) fn catch(&mut self) -> Value {
-        let value = self.exception.take().unwrap();
+        let value = std::mem::replace(&mut self.exception, Value::UNINITIALIZED);
         self.clear();
         self.own(value)
     }
@@ -80,12 +88,29 @@ impl<'a> JitCtx<'a> {
     }
 
     pub(crate) fn resume(&mut self, locals: Vec<Value>, state: usize) {
+        self.push_frame(state);
+        self.locals.extend(locals);
+        self.sync_locals();
+    }
+
+    fn push_frame(&mut self, resume_state: usize) {
         self.frames.push(Frame {
-            locals,
-            temps: Vec::new(),
+            locals: self.locals.len(),
+            temps: self.temps.len(),
             index_roots: Vec::new(),
-            resume_state: state,
+            resume_state,
         });
+    }
+
+    fn sync_locals(&mut self) {
+        self.locals_base = match self.frames.last() {
+            Some(frame) => self.locals.as_mut_ptr().wrapping_add(frame.locals),
+            None => std::ptr::null_mut(),
+        };
+    }
+
+    fn frame(&self) -> &Frame {
+        self.frames.last().unwrap()
     }
 
     pub(crate) fn resume_state(&self) -> usize {
@@ -94,11 +119,8 @@ impl<'a> JitCtx<'a> {
 
     pub(crate) fn local_get(&mut self, slot: usize) -> Value {
         let value = self
-            .frames
-            .last()
-            .unwrap()
             .locals
-            .get(slot)
+            .get(self.frame().locals + slot)
             .copied()
             .unwrap_or(Value::UNDEFINED);
         self.retain_temp(value)
@@ -106,7 +128,7 @@ impl<'a> JitCtx<'a> {
 
     pub(crate) fn suspend(&mut self, generator: Value, value: Value, state: usize) -> Value {
         if !self.global.heap().retain(value) {
-            self.error = Some(Error::Runtime("invalid yielded value".into()));
+            self.error = Some(Box::new(Error::Runtime("invalid yielded value".into())));
             return self.exit(Value::UNDEFINED);
         }
         self.clear();
@@ -116,30 +138,36 @@ impl<'a> JitCtx<'a> {
                 self.global.heap().release(value);
             }
         }
+        let locals = self.locals.split_off(frame.locals);
+        self.sync_locals();
         self.global
             .heap()
-            .generator_suspend(generator, state, frame.locals);
+            .generator_suspend(generator, state, locals);
         value
     }
 
-    pub(crate) fn enter(&mut self) {
-        self.frames.push(Frame::default());
+    pub(crate) fn enter(&mut self, size: usize) {
+        self.push_frame(0);
+        self.locals
+            .resize(self.locals.len() + size, Value::UNDEFINED);
+        self.sync_locals();
     }
     pub(crate) fn own(&mut self, value: Value) -> Value {
         if (value.is_object() && value != Value::GLOBAL_OBJECT) || value.is_string() {
-            self.frames.last_mut().unwrap().temps.push(value);
+            self.temps.push(value);
         }
         value
     }
     pub(crate) fn retain_temp(&mut self, value: Value) -> Value {
         if !self.global.heap().retain(value) {
-            self.error = Some(Error::Runtime("invalid heap value".into()));
+            self.error = Some(Box::new(Error::Runtime("invalid heap value".into())));
             return Value::UNDEFINED;
         }
         self.own(value)
     }
     pub(crate) fn clear(&mut self) {
-        for value in self.frames.last_mut().unwrap().temps.drain(..) {
+        let base = self.frame().temps;
+        for value in self.temps.drain(base..) {
             self.global.heap().release(value);
         }
     }
@@ -179,16 +207,39 @@ impl<'a> JitCtx<'a> {
         true
     }
 
-    pub(crate) fn local_set(&mut self, slot: usize, value: Value) -> Value {
-        if !self.global.heap().retain(value) {
-            self.error = Some(Error::Runtime("invalid heap value".into()));
+    fn take_ownership(&mut self, value: Value) -> bool {
+        if self.temps.len() > self.frame().temps && self.temps.last() == Some(&value) {
+            self.temps.pop();
+            return true;
+        }
+        if self.global.heap().retain(value) {
+            return true;
+        }
+        self.error = Some(Box::new(Error::Runtime("invalid heap value".into())));
+        false
+    }
+
+    pub(crate) fn local_replace(&mut self, slot: usize, value: Value, old: Value) -> Value {
+        if !self.take_ownership(value) {
+            let index = self.frame().locals + slot;
+            self.locals[index] = old;
             return Value::UNDEFINED;
         }
-        let frame = self.frames.last_mut().unwrap();
-        frame
-            .locals
-            .resize(frame.locals.len().max(slot + 1), Value::UNDEFINED);
-        let old = std::mem::replace(&mut frame.locals[slot], value);
+        self.global.heap().release(old);
+        value
+    }
+
+    pub(crate) fn local_set(&mut self, slot: usize, value: Value) -> Value {
+        if !self.take_ownership(value) {
+            return Value::UNDEFINED;
+        }
+        let frame = self.frames.last().unwrap();
+        let index = frame.locals + slot;
+        if index >= self.locals.len() {
+            self.locals.resize(index + 1, Value::UNDEFINED);
+            self.sync_locals();
+        }
+        let old = std::mem::replace(&mut self.locals[index], value);
         self.global.heap().release(old);
         value
     }
@@ -196,18 +247,20 @@ impl<'a> JitCtx<'a> {
         let value = if self.global.heap().retain(value) {
             value
         } else {
-            self.error = Some(Error::Runtime("invalid heap value".into()));
+            self.error = Some(Box::new(Error::Runtime("invalid heap value".into())));
             Value::UNDEFINED
         };
         let frame = self.frames.pop().unwrap();
-        for owned in frame
+        let heap = self.global.heap();
+        for owned in self
             .locals
-            .into_iter()
-            .chain(frame.temps)
+            .drain(frame.locals..)
+            .chain(self.temps.drain(frame.temps..))
             .chain(frame.index_roots.into_iter().flatten().flatten())
         {
-            self.global.heap().release(owned);
+            heap.release(owned);
         }
+        self.sync_locals();
         value
     }
 }
@@ -235,7 +288,8 @@ pub(crate) unsafe fn call(
         argv,
         args.len() as u64,
     ));
-    if let Some(exception) = ctx.exception.take() {
+    let exception = std::mem::replace(&mut ctx.exception, Value::UNINITIALIZED);
+    if exception != Value::UNINITIALIZED {
         let message = global
             .heap()
             .text(exception)
@@ -243,13 +297,15 @@ pub(crate) unsafe fn call(
             .unwrap_or_else(|| exception.to_string());
         global.heap().release(exception);
         if ctx.error.is_none() {
-            ctx.error = Some(Error::Runtime(format!("uncaught exception: {message}")));
+            ctx.error = Some(Box::new(Error::Runtime(format!(
+                "uncaught exception: {message}"
+            ))));
         }
     }
     match ctx.error {
         Some(error) => {
             global.heap().release(value);
-            match (error, ctx.error_origin) {
+            match (*error, ctx.error_origin) {
                 (Error::Runtime(message), Some((filename, start, end))) => Err(Error::Runtime(
                     format!("{filename}:{start}..{end}: {message}"),
                 )),
@@ -274,7 +330,7 @@ mod tests {
         let second = heap.object().unwrap();
         let second_array = heap.array(&[second]).unwrap();
         let key = Value::number(0.0);
-        ctx.enter();
+        ctx.enter(0);
         assert!(ctx.root_index_read(0, first_array, key, first));
         heap.release(first_array);
         heap.release(first);
@@ -286,7 +342,7 @@ mod tests {
         assert!(!heap.valid(first_array) && !heap.valid(first));
         heap.release(second_array);
         heap.release(second);
-        ctx.error = Some(Error::Runtime("test error".into()));
+        ctx.error = Some(Box::new(Error::Runtime("test error".into())));
         ctx.exit(Value::UNDEFINED);
         heap.drain(100);
         assert!(!heap.valid(second_array) && !heap.valid(second));
@@ -341,7 +397,7 @@ mod tests {
         let method = heap
             .native_function(crate::heap::NativeFunction::ArrayMap)
             .unwrap();
-        ctx.enter();
+        ctx.enter(0);
         assert!(!ctx.root_index_read(0, array, key, method));
         assert!(ctx.frames.last().unwrap().index_roots.is_empty());
         heap.release(array);

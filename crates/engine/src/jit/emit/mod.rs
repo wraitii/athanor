@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
-    Block, BlockArg, InstBuilder, MemFlags, Type, Value as ClifValue, types,
+    Block, BlockArg, Inst, InstBuilder, MemFlags, Type, Value as ClifValue, types,
 };
 use cranelift_frontend::{FunctionBuilder, Switch};
 use cranelift_jit::JITModule;
@@ -52,6 +52,8 @@ pub(super) struct FunctionCompiler<'a, 'f> {
     resume_blocks: Vec<Block>,
     suspensions: HashMap<u32, (usize, Block)>,
     terminated: bool,
+    frame_size: Option<Inst>,
+    slots: u32,
 }
 
 pub(super) fn build_function(
@@ -150,6 +152,8 @@ fn build_callable(
         resume_blocks: Vec::new(),
         suspensions: HashMap::new(),
         terminated: false,
+        frame_size: None,
+        slots: 0,
     };
 
     let dispatch = if let FunctionKind::Generator(plan) = &kind {
@@ -188,6 +192,7 @@ fn build_callable(
             closure
         };
         compiler.emit_semantic_graph(graph, graph_closure)?;
+        compiler.patch_frame_size();
         if let Some(dispatch) = dispatch {
             compiler.switch(dispatch);
             let dummy = compiler.constant(Value::UNDEFINED);
@@ -244,9 +249,13 @@ pub(super) fn build_global(
         resume_blocks: Vec::new(),
         suspensions: HashMap::new(),
         terminated: false,
+        frame_size: None,
+        slots: 0,
     };
     compiler.enter_frame();
-    compiler.emit_semantic_graph(graph, closure)
+    compiler.emit_semantic_graph(graph, closure)?;
+    compiler.patch_frame_size();
+    Ok(())
 }
 
 impl FunctionCompiler<'_, '_> {
@@ -284,8 +293,19 @@ impl FunctionCompiler<'_, '_> {
     }
 
     fn enter_frame(&mut self) {
-        let dummy = self.constant(Value::UNDEFINED);
-        self.call_helper(Helper::FrameEnter, &[dummy]);
+        let size = self.b.ins().iconst(types::I64, 0);
+        self.frame_size = Some(self.b.func.dfg.value_def(size).unwrap_inst());
+        self.call_helper(Helper::FrameEnter, &[size]);
+    }
+
+    fn patch_frame_size(&mut self) {
+        if let Some(inst) = self.frame_size {
+            self.b
+                .func
+                .dfg
+                .replace(inst)
+                .iconst(types::I64, self.slots as i64);
+        }
     }
 
     pub(super) fn clear_temporaries(&mut self) {

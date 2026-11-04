@@ -32,7 +32,7 @@ aliasing, and cycles; document deliberate semantic restrictions.
   use runtime helpers and an `Rc<RefCell<...>>` environment containing a string
   map. `globalThis` property access shares those bindings. Each frame retains
   local slots until replacement or return and owns temporary values until the
-  end of a full expression or frame; error exits release both.
+  end of their block or frame; error exits release both.
 - The supported subset includes numeric/boolean/null expressions, assignments,
   selected operators, conditionals, basic loops, returns, and dynamic calls.
   Common arithmetic and comparisons have inline numeric paths with helper
@@ -91,18 +91,11 @@ preserve or rebuild the affected metadata. The annotations are consumed before
 Cranelift optimization and are not expected to describe the backend's rewritten
 IR. Source locations remain available separately for debugging and profiling.
 
-The `--compile` effect report consumes helper annotations before numeric SSA
-simplification. Its structured helper summaries distinguish heap and global
-reads and writes, internal bookkeeping and ownership, allocation, errors, and
-reentry. Heap writes describe changes to existing JS-visible heap state;
-internal effects include ownership, freeing, and iterator bookkeeping, while
-allocation is separate. Unclassified helpers and unannotated calls remain
-unresolved. Property and numeric summaries depend on the current runtime lacking
-getter and coercion callbacks; iteration and enumeration currently use direct
-engine state rather than JS iterator callbacks. These are runtime assumptions,
-not guards. Admission only describes closure against reentry under those
-assumptions: it does not imply purity, establish call identity, or analyze raw
-memory effects.
+Helpers also have effect summaries distinguishing heap and global reads and
+writes, internal bookkeeping and ownership, allocation, errors, and reentry.
+The CLIF-level indexed-read scope and temporary-clear analysis consume them.
+Semantic optimization uses the separate operation contracts described under
+[Contracts and facts](#contracts-and-facts).
 
 Math specialization now runs on the semantic graph, as described below.
 
@@ -1062,7 +1055,8 @@ read and callback assumptions of the shared property setter.
 Facts are sets of possible value types: int32, other doubles, boolean,
 undefined, null, string, object, other values (symbols and BigInts) and the
 uninitialized-binding sentinel. They are computed flow-insensitively over SSA
-values to a fixed point; block parameters join their incoming arguments. Facts
+values to a fixed point; block parameters join their incoming arguments. The
+engine has no BigInt, so numeric operators always produce numbers. Facts
 refine contracts: a coercing operation on numbers is pure, one on other
 primitives needs no callback assumption, and an initialization check of a value
 that cannot be uninitialized is pure.
@@ -1085,12 +1079,18 @@ are replaced by non-throwing probes in a new entry block. The probes take the
 original body if any identity check fails. Versioning only commits if the copy
 is closed: no reentry, no global writes, and heap writes only to allocations
 that do not escape. An allocation escapes when it is used other than as the
-receiver of a property access, in an identity test, or returned. Under these
+receiver of a property access, in an identity test, as an iteration source, or
+returned. Iterators and enumerators created by the function are allocations too;
+advancing one writes only its own state, and a source escapes if its iterator
+does. This relies on iteration using direct engine state rather than JS
+callbacks. Array-pattern declarations initialized by an array literal without
+spreads or holes bind the evaluated elements directly. Under these
 conditions the probed values remain valid throughout the copy. A function
 without requirements that is already closed is optimized in place.
 
 Within a closed region, a property, index or global read reuses an equal
-dominating read if no write in the region may alias its receiver. Writes to
+dominating read if no write in the region may alias its receiver; `this` and
+argument reads are always reused. Writes to
 unescaped allocations alias only that allocation. Loop hoisting moves reads and
 pure operations with loop-invariant operands from a loop header to its single
 preheader. It stops at the first operation it cannot move, so the hoisted
@@ -1098,9 +1098,21 @@ operations still run first, and exceptions occur in the same order.
 
 The emitter probes globals and properties without invoking JavaScript or raising
 an error, checks native Math identities, and selects the original graph on guard
-failure. Graph values and block parameters are rooted in frame slots; incoming
-block parameters are retained before replacing those slots. Temporary values are
-cleared after each operation and frame exit releases the slots. This conservative
-scheme keeps each value rooted until it is overwritten or the frame exits. Scalar
+failure. Graph values and block parameters whose facts admit strings, objects
+or other heap values are rooted in frame slots; `this` and arguments are
+borrowed from the caller and are not rooted. Generator graphs root every value
+because resumption restores them from the frame. Incoming block parameters are
+retained before replacing their slots. Temporary values are cleared once per
+block, before its terminator, so they live at most until the end of their block;
+every heap result they could release early is also rooted. Frame exit releases
+the slots. This conservative scheme keeps each value rooted until it is
+overwritten or the frame exits.
+
+Frames share one contiguous slot stack and one temporary stack in `JitCtx`;
+ordinary functions reserve their slot count on entry, and `JitCtx` exposes the
+current frame's slot base. A slot store writes inline and calls the runtime only
+when the new or old value is a heap reference. Storing the most recent temporary
+transfers its ownership instead of retaining it again. Error and exception
+checks load fixed `JitCtx` fields inline. Scalar
 replacement of unescaped objects, branch-sensitive facts and guards on values
 computed inside the function are not implemented.

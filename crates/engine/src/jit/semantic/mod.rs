@@ -352,9 +352,11 @@ impl Op {
 
     pub(super) fn write_target(&self) -> Option<Value> {
         match self {
-            Op::Define(object, ..) | Op::Set(object, ..) | Op::SetIndex(object, ..) => {
-                Some(*object)
-            }
+            Op::Define(object, ..)
+            | Op::Set(object, ..)
+            | Op::SetIndex(object, ..)
+            | Op::IteratorNext(object)
+            | Op::EnumerateNext(object) => Some(*object),
             _ => None,
         }
     }
@@ -712,7 +714,7 @@ impl Graph {
             | Op::EnumerateNew(_) => closed(ALLOCATION | INTERNAL | ERROR, &[], Owned),
             Op::IteratorNext(_) | Op::EnumerateNext(_) => closed(
                 HEAP_READ | HEAP_WRITE | ALLOCATION | INTERNAL | ERROR,
-                &[],
+                &[Assumption::DirectIteration],
                 MaybeOwned,
             ),
             Op::IsUninitialized(_) => closed(0, &[], Unowned),
@@ -1021,10 +1023,10 @@ impl fmt::Display for Target {
     }
 }
 
-impl fmt::Display for Listing<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Listing<'_> {
+    fn lines(&self) -> Vec<(u32, Option<Span>, String)> {
         let graph = self.graph;
-        writeln!(f, "function {}", graph.name)?;
+        let mut lines = vec![(0, None, format!("function {}", graph.name))];
         for (scope, data) in &graph.scopes {
             debug_assert!(
                 data.bindings
@@ -1034,33 +1036,30 @@ impl fmt::Display for Listing<'_> {
             let parent = data
                 .parent
                 .map_or(String::new(), |parent| format!(" in {parent}"));
-            write!(f, "  {scope} {:?}{parent}:", data.kind)?;
+            let mut text = format!("  {scope} {:?}{parent}:", data.kind);
             for &binding in &data.bindings {
                 let binding_data = &graph.bindings[binding];
-                write!(
-                    f,
+                text.push_str(&format!(
                     " {} {:?}",
                     graph.binding_name(binding),
                     binding_data.kind
-                )?;
+                ));
                 if binding_data.captured {
-                    write!(f, " captured")?;
+                    text.push_str(" captured");
                 }
-                write!(f, ";")?;
+                text.push(';');
             }
-            writeln!(f)?;
+            lines.push((0, None, text));
         }
-        let line = |f: &mut fmt::Formatter<'_>, text: String, span: Span, note: &str| {
-            writeln!(f, "  {text:<48} ; {}..{}{note}", span.start, span.end)
-        };
         for block in Cfg::new(graph).rpo {
             let data = &graph.blocks[block];
-            if data.params.is_empty() {
-                writeln!(f, "{block}:")?;
+            let header = if data.params.is_empty() {
+                format!("{block}:")
             } else {
                 let params: Vec<_> = data.params.iter().map(|&p| self.value(p)).collect();
-                writeln!(f, "{block}({}):", params.join(", "))?;
-            }
+                format!("{block}({}):", params.join(", "))
+            };
+            lines.push((0, None, header));
             for &inst in &data.insts {
                 let inst_data = &graph.insts[inst];
                 let mut text = graph.op_text(&inst_data.op);
@@ -1073,7 +1072,12 @@ impl fmt::Display for Listing<'_> {
                     (Reentry::Closed, false) => "",
                     (_, _) => " reenters, throws",
                 };
-                line(f, text, inst_data.span, note)?;
+                let span = inst_data.span;
+                lines.push((
+                    graph.inst_location(inst),
+                    Some(span),
+                    format!("  {text:<48} ; {}..{}{note}", span.start, span.end),
+                ));
             }
             if let Some(terminator) = &data.terminator {
                 let text = match &terminator.kind {
@@ -1087,10 +1091,34 @@ impl fmt::Display for Listing<'_> {
                     TerminatorKind::Yield(_, value, target) => format!("yield {value}, {target}"),
                     TerminatorKind::Return(value) => format!("return {value}"),
                 };
-                line(f, text, terminator.span, "")?;
+                let span = terminator.span;
+                lines.push((
+                    graph.terminator_location(block),
+                    Some(span),
+                    format!("  {text:<48} ; {}..{}", span.start, span.end),
+                ));
             }
         }
+        lines
+    }
+}
+
+impl fmt::Display for Listing<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (_, _, line) in self.lines() {
+            writeln!(f, "{line}")?;
+        }
         Ok(())
+    }
+}
+
+impl Graph {
+    pub(super) fn inst_location(&self, inst: Inst) -> u32 {
+        u32::try_from(inst.index() + 1).unwrap()
+    }
+
+    pub(super) fn terminator_location(&self, block: Block) -> u32 {
+        u32::try_from(self.insts.len() + block.index() + 1).unwrap()
     }
 }
 
@@ -1107,6 +1135,12 @@ pub(super) struct Analysis {
     pub(super) graph: Graph,
     facts: Facts,
     notes: Vec<String>,
+}
+
+impl Analysis {
+    pub(super) fn listing_lines(&self) -> Vec<(u32, Option<Span>, String)> {
+        self.graph.listing(&self.facts).lines()
+    }
 }
 
 impl fmt::Display for Analysis {

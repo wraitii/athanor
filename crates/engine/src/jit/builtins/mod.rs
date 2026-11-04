@@ -18,7 +18,7 @@ fn arg(args: &[Value], index: usize) -> Value {
     args.get(index).copied().unwrap_or(Value::UNDEFINED)
 }
 fn fail(context: &mut JitCtx, message: &str) -> Value {
-    context.error = Some(crate::Error::Runtime(message.into()));
+    context.error = Some(Box::new(crate::Error::Runtime(message.into())));
     Value::UNDEFINED
 }
 
@@ -30,7 +30,7 @@ pub(super) fn property_get(ctx: &mut JitCtx, object: Value, name: &str) -> Optio
     Some(match heap.native_function(function) {
         Some(value) => ctx.own(value),
         None => {
-            ctx.error = Some(crate::Error::Runtime("heap exhausted".into()));
+            ctx.error = Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
             Value::UNDEFINED
         }
     })

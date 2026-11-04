@@ -4,11 +4,13 @@ use cranelift_frontend::Variable;
 
 use crate::error::{Error, compile_at};
 use crate::jit::helpers::Helper;
-use crate::jit::semantic::{Constant, Graph, Op, ScopeKind, TerminatorKind, UnaryOp};
+use crate::jit::semantic::{Constant, Facts, Graph, Op, ScopeKind, TerminatorKind, Types, UnaryOp};
 use crate::value::Value;
 
 use super::FunctionCompiler;
 use super::ops::{self, BinaryOp, UnaryOp as EmitUnaryOp};
+
+const HEAP: Types = Types::STRING.union(Types::OBJECT).union(Types::OTHER);
 
 impl FunctionCompiler<'_, '_> {
     pub(super) fn emit_semantic_graph(
@@ -31,6 +33,10 @@ impl FunctionCompiler<'_, '_> {
             .values()
             .map(|_| self.b.declare_var(types::I64))
             .collect();
+        let facts = Facts::compute(graph);
+        let suspends = self.generator.is_some();
+        let rooted =
+            |value: crate::jit::semantic::Value| suspends || facts.of(value).intersects(HEAP);
         let reachable = crate::jit::semantic::Cfg::new(graph).rpo;
         for &block in &reachable {
             let data = &graph.blocks[block];
@@ -45,10 +51,18 @@ impl FunctionCompiler<'_, '_> {
         self.jump(blocks[graph.entry.index()], &[]);
         for &block in &reachable {
             let data = &graph.blocks[block];
+            if self.annotations.semantic_locations {
+                self.b
+                    .set_srcloc(cranelift_codegen::ir::SourceLoc::default());
+            }
             self.switch(blocks[block.index()]);
             let params = self.b.block_params(blocks[block.index()]).to_vec();
             let undefined = self.constant(Value::UNDEFINED);
-            for &param in &params {
+            let mut retained_any = false;
+            for (&value, &param) in data.params.iter().zip(&params) {
+                if !rooted(value) {
+                    continue;
+                }
                 let uninitialized = self.b.ins().icmp_imm(
                     cranelift_codegen::ir::condcodes::IntCC::Equal,
                     param,
@@ -57,11 +71,18 @@ impl FunctionCompiler<'_, '_> {
                 let retained = self.b.ins().select(uninitialized, undefined, param);
                 self.call_helper(Helper::TempRetain, &[retained]);
                 self.check_error();
+                retained_any = true;
             }
             for (&value, param) in data.params.iter().zip(params) {
-                self.initialize_local(values[value.index()], param);
+                if rooted(value) {
+                    self.initialize_local(values[value.index()], param);
+                } else {
+                    self.b.def_var(values[value.index()], param);
+                }
             }
-            self.clear_temporaries();
+            if retained_any {
+                self.clear_temporaries();
+            }
             for &inst in &data.insts {
                 let handler = match &data.terminator.as_ref().unwrap().kind {
                     TerminatorKind::CheckException(_, error) => Some(blocks[error.block.index()]),
@@ -72,8 +93,13 @@ impl FunctionCompiler<'_, '_> {
                 }
                 let data = &graph.insts[inst];
                 self.source_span = data.span;
-                self.b
-                    .set_srcloc(cranelift_codegen::ir::SourceLoc::new(data.span.start));
+                self.b.set_srcloc(cranelift_codegen::ir::SourceLoc::new(
+                    if self.annotations.semantic_locations {
+                        graph.inst_location(inst)
+                    } else {
+                        data.span.start
+                    },
+                ));
                 let get = |this: &mut Self, value: crate::jit::semantic::Value| {
                     this.b.use_var(values[value.index()])
                 };
@@ -490,17 +516,29 @@ impl FunctionCompiler<'_, '_> {
                     }
                 };
                 if let (Some(value), Some(result)) = (data.result, result) {
-                    self.initialize_local(values[value.index()], result);
+                    let borrowed = matches!(data.op, Op::This | Op::Argument(_)) && !suspends;
+                    if rooted(value) && !borrowed {
+                        self.initialize_local(values[value.index()], result);
+                    } else {
+                        self.b.def_var(values[value.index()], result);
+                    }
                 }
-                self.clear_temporaries();
                 if handler.is_some() {
                     self.handlers.pop();
                 }
             }
+            if !data.insts.is_empty() {
+                self.clear_temporaries();
+            }
             let terminator = data.terminator.as_ref().unwrap();
             self.source_span = terminator.span;
-            self.b
-                .set_srcloc(cranelift_codegen::ir::SourceLoc::new(terminator.span.start));
+            self.b.set_srcloc(cranelift_codegen::ir::SourceLoc::new(
+                if self.annotations.semantic_locations {
+                    graph.terminator_location(block)
+                } else {
+                    terminator.span.start
+                },
+            ));
             let target = |this: &mut Self, target: &crate::jit::semantic::Target| {
                 let args: Vec<_> = target
                     .args
@@ -545,6 +583,10 @@ impl FunctionCompiler<'_, '_> {
                     self.jump(self.return_block, &[BlockArg::Value(value)]);
                 }
             }
+        }
+        if self.annotations.semantic_locations {
+            self.b
+                .set_srcloc(cranelift_codegen::ir::SourceLoc::default());
         }
         self.switch(self.return_block);
         let result = self.b.block_params(self.return_block)[0];

@@ -74,6 +74,7 @@ pub(super) struct IndexedStorageGuard {
 #[derive(Clone, Default)]
 pub(super) struct Annotations {
     pub semantic_regions: Vec<String>,
+    pub semantic_locations: bool,
     pub invocation_roots: HashSet<Value>,
     pub indexed_storage_guards: HashMap<Inst, IndexedStorageGuard>,
     pub indexed_reads: Vec<IndexedRead>,
@@ -108,6 +109,7 @@ impl Annotations {
 pub(super) struct FunctionBody {
     pub function: Function,
     pub annotations: Annotations,
+    pub listing: Option<Vec<(u32, Option<oxc_span::Span>, String)>>,
 }
 
 type Facts = HashMap<Value, Kind>;
@@ -250,9 +252,7 @@ fn helper_kind(function: &Function, facts: &Facts, inst: Inst, helper: Helper) -
         | Helper::Less
         | Helper::LessEqual
         | Helper::Greater
-        | Helper::GreaterEqual
-        | Helper::ErrorPending
-        | Helper::ExceptionPending => Some(Kind::Other),
+        | Helper::GreaterEqual => Some(Kind::Other),
         _ => None,
     }
 }
@@ -754,6 +754,7 @@ mod tests {
         FunctionBody {
             function,
             annotations,
+            listing: None,
         }
     }
 

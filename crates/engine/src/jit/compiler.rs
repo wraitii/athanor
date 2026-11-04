@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use cranelift_codegen::Context;
-use cranelift_codegen::ir::{AbiParam, Signature, SourceLoc, types};
+use cranelift_codegen::ir::{AbiParam, Signature, types};
 use cranelift_frontend::FunctionBuilderContext;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module, default_libcall_names};
@@ -18,7 +18,7 @@ use crate::EngineOptions;
 use crate::error::{Error, compile_at, unsupported_at};
 
 use super::numeric::{Annotations, FunctionBody};
-use super::{analysis::CaptureAnalysis, effects, emit, helpers, jitdump, numeric};
+use super::{analysis::CaptureAnalysis, emit, helpers, jitdump, numeric};
 
 pub(crate) struct CompiledFunction {
     pub(crate) name: String,
@@ -445,7 +445,10 @@ impl Compiler {
             let id = self.declare_js(&label, line)?;
             self.context.clear();
             self.context.func.signature = self.signature.clone();
-            let mut annotations = Annotations::default();
+            let mut annotations = Annotations {
+                semantic_locations: self.dump_ir,
+                ..Annotations::default()
+            };
             let graph = super::semantic::lower_global(
                 &program.body,
                 program.span,
@@ -482,6 +485,7 @@ impl Compiler {
                         cranelift_codegen::ir::Function::new(),
                     ),
                     annotations,
+                    listing: self.dump_ir.then(|| graph.listing_lines()),
                 },
             ));
             Some(id)
@@ -504,7 +508,6 @@ impl Compiler {
                 .cloned()
                 .unwrap_or_else(|| format!("jsfn_{}", id.as_u32()));
             if self.compile_dump {
-                effects::dump(&self.context.func, &code.annotations, &name, &lines);
                 for region in &code.annotations.semantic_regions {
                     println!("[{name}] semantic loop (before CLIF optimization)\n{region}");
                 }
@@ -576,8 +579,8 @@ impl Compiler {
                         .map_err(|error| Error::Compile(error.to_string()))?;
                 }
             }
-            if self.dump_ir {
-                let ir = ir_lines(&mut self.context.func, source, &lines);
+            if let Some(semantic) = &code.listing {
+                let ir = ir_lines(semantic, source, &lines);
                 if let Some(dump) = self.dump.as_mut() {
                     match dump.listing(&name, &ir) {
                         Ok(written) => listing = Some(written),
@@ -610,20 +613,36 @@ impl Compiler {
                 };
                 let size = compiled.code_buffer().len();
                 let mut locations = BTreeMap::new();
-                let mut default_line = None;
-                for location in compiled.buffer.get_srclocs_sorted() {
-                    if location.loc.is_default() {
-                        continue;
+                let ranges = compiled.buffer.get_srclocs_sorted();
+                if self.dump_ir {
+                    locations.insert(0, 0);
+                    for location in ranges {
+                        if (location.end as usize) < size {
+                            locations.entry(location.end).or_insert(0);
+                        }
                     }
-                    let line = if self.dump_ir {
-                        location.loc.bits()
-                    } else {
-                        line_at(&lines, location.loc.bits())
-                    };
-                    default_line.get_or_insert(line);
-                    locations.insert(location.start, line);
+                    for location in ranges {
+                        locations.insert(
+                            location.start,
+                            if location.loc.is_default() {
+                                0
+                            } else {
+                                location.loc.bits()
+                            },
+                        );
+                    }
+                } else {
+                    let mut default_line = None;
+                    for location in ranges {
+                        if location.loc.is_default() {
+                            continue;
+                        }
+                        let line = line_at(&lines, location.loc.bits());
+                        default_line.get_or_insert(line);
+                        locations.insert(location.start, line);
+                    }
+                    locations.insert(0, default_line.unwrap_or(1));
                 }
-                locations.insert(0, default_line.unwrap_or(1));
                 dumped.push((
                     id,
                     name,
@@ -644,7 +663,7 @@ impl Compiler {
                     let filename = path.to_str().unwrap_or(source_path);
                     let locations = locations
                         .iter()
-                        .filter_map(|&(offset, id)| ir_mapping.get(&id).map(|&line| (offset, line)))
+                        .map(|&(offset, id)| (offset, ir_mapping.get(&id).copied().unwrap_or(1)))
                         .collect::<Vec<_>>();
                     dump.record(&name, filename, &locations, bytes);
                 } else if self.dump_ir {
@@ -783,7 +802,10 @@ impl Compiler {
                 .map_err(Error::Unsupported)
             })
             .transpose()?;
-        let mut annotations = Annotations::default();
+        let mut annotations = Annotations {
+            semantic_locations: self.dump_ir,
+            ..Annotations::default()
+        };
         self.context.clear();
         self.context.func.signature = self.signature.clone();
         {
@@ -826,6 +848,11 @@ impl Compiler {
                 cranelift_codegen::ir::Function::new(),
             ),
             annotations,
+            listing: if self.dump_ir {
+                graph.as_ref().map(|graph| graph.listing_lines())
+            } else {
+                None
+            },
         })
     }
 }
@@ -923,75 +950,30 @@ fn line_at(starts: &[u32], offset: u32) -> u32 {
 }
 
 fn ir_lines(
-    function: &mut cranelift_codegen::ir::Function,
+    semantic: &[(u32, Option<oxc_span::Span>, String)],
     source: &str,
     starts: &[u32],
 ) -> Vec<(u32, String)> {
     let mut result = Vec::new();
-    let mut next_ir = 1;
     let mut last_line = 0;
-    let blocks: Vec<_> = function.layout.blocks().collect();
-    let display = function.display().to_string();
-    if let Some(first) = blocks.first() {
-        let header = format!("{first}(");
-        for line in display
-            .lines()
-            .take_while(|line| !line.trim_start().starts_with(&header))
-        {
-            result.push((0, line.to_owned()));
+    for (id, span, text) in semantic {
+        if let Some(span) = span {
+            let line = line_at(starts, span.start);
+            if line != last_line {
+                last_line = line;
+                let start = starts[line as usize - 1] as usize;
+                let end = starts
+                    .get(line as usize)
+                    .map_or(source.len(), |&end| end as usize);
+                result.push((0, String::new()));
+                result.push((
+                    0,
+                    format!("  ;;; JS {line:>5} | {}", source[start..end].trim()),
+                ));
+            }
         }
+        result.push((*id, text.clone()));
     }
-    for block in blocks {
-        let params = function
-            .dfg
-            .block_params(block)
-            .iter()
-            .map(|value| format!("{value}: {}", function.dfg.value_type(*value)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        result.push((0, format!("{block}({params}):")));
-        let header = format!("{block}(");
-        let plain_header = format!("{block}:");
-        let mut in_block = false;
-        for line in display.lines() {
-            let trimmed = line.trim();
-            if trimmed.starts_with(&header) || trimmed == plain_header {
-                in_block = true;
-                continue;
-            }
-            if in_block && trimmed.starts_with("block") && trimmed.ends_with(':') {
-                break;
-            }
-            if in_block && trimmed.contains(" -> ") {
-                result.push((0, format!("    {trimmed}")));
-            }
-        }
-        let insts: Vec<_> = function.layout.block_insts(block).collect();
-        for inst in insts {
-            let location = function.srcloc(inst);
-            if !location.is_default() {
-                let line = line_at(starts, location.bits());
-                if line != last_line {
-                    last_line = line;
-                    let start = starts[line as usize - 1] as usize;
-                    let end = starts
-                        .get(line as usize)
-                        .map_or(source.len(), |&e| e as usize);
-                    result.push((0, String::new()));
-                    result.push((
-                        0,
-                        format!("  ;;; JS {line:>5} | {}", source[start..end].trim()),
-                    ));
-                }
-            }
-            let text = format!("    {}", function.dfg.display_inst(inst));
-            let index = next_ir;
-            next_ir += 1;
-            function.set_srcloc(inst, SourceLoc::new(index));
-            result.push((index, text));
-        }
-    }
-    result.push((0, "}".into()));
     result
 }
 
@@ -1053,4 +1035,42 @@ fn validate_params(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod listing_tests {
+    use super::{ir_lines, line_starts};
+    use oxc_span::Span;
+
+    #[test]
+    fn semantic_listing_interleaves_source_and_keeps_ids() {
+        let source = "let x = 1;\nreturn x;\n";
+        let semantic = vec![
+            (0, None, "block0:".into()),
+            (1, Some(Span::new(8, 9)), "constant".into()),
+            (2, Some(Span::new(8, 9)), "store".into()),
+            (3, Some(Span::new(11, 20)), "return".into()),
+        ];
+        let lines = ir_lines(&semantic, source, &line_starts(source));
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|(_, line)| line.contains(";;; JS"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|(id, _)| *id != 0)
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|(_, line)| line.contains("JS     2 | return x;"))
+        );
+    }
 }

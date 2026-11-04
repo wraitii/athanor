@@ -54,6 +54,9 @@ fn contained_use(op: &Op, index: usize) -> bool {
         }
         Op::IsUndefined(_) | Op::IsNullish(_) | Op::CheckInitialized(_) => true,
         Op::Binary(BinaryOperator::StrictEquality | BinaryOperator::StrictInequality, ..) => true,
+        Op::IteratorNew(_) | Op::IteratorNext(_) | Op::EnumerateNew(_) | Op::EnumerateNext(_) => {
+            true
+        }
         _ => false,
     }
 }
@@ -61,11 +64,17 @@ fn contained_use(op: &Op, index: usize) -> bool {
 fn unescaped(graph: &Graph) -> HashSet<Value> {
     let cfg = Cfg::new(graph);
     let mut allocations = HashSet::new();
+    let mut sources = Vec::new();
     for &block in &cfg.rpo {
         for &inst in &graph.blocks[block].insts {
             let data = &graph.insts[inst];
-            if matches!(data.op, Op::NewObject | Op::NewArray(_)) {
-                allocations.extend(data.result);
+            match data.op {
+                Op::NewObject | Op::NewArray(_) => allocations.extend(data.result),
+                Op::IteratorNew(source) | Op::EnumerateNew(source) => {
+                    allocations.extend(data.result);
+                    sources.extend(data.result.map(|iterator| (iterator, source)));
+                }
+                _ => {}
             }
         }
     }
@@ -84,6 +93,11 @@ fn unescaped(graph: &Graph) -> HashSet<Value> {
                     allocations.remove(value);
                 }
             }
+        }
+    }
+    for (iterator, source) in sources {
+        if !allocations.contains(&iterator) {
+            allocations.remove(&source);
         }
     }
     allocations
@@ -349,6 +363,8 @@ enum LoadKey {
     Property(Value, String),
     Index(Value, Value),
     Global(String),
+    This,
+    Argument(usize),
 }
 
 pub(super) fn reuse_loads(graph: &mut Graph, region: &HashSet<Block>, notes: &mut Vec<String>) {
@@ -371,6 +387,8 @@ pub(super) fn reuse_loads(graph: &mut Graph, region: &HashSet<Block>, notes: &mu
                     LoadKey::Index(resolve(&aliases, *object), resolve(&aliases, *key))
                 }
                 Op::GlobalRead(name) => LoadKey::Global(name.clone()),
+                Op::This => LoadKey::This,
+                Op::Argument(index) => LoadKey::Argument(*index),
                 _ => continue,
             };
             let preserved = match &key {
@@ -378,6 +396,7 @@ pub(super) fn reuse_loads(graph: &mut Graph, region: &HashSet<Block>, notes: &mu
                     !writes.clobbers(*object)
                 }
                 LoadKey::Global(_) => !writes.globals,
+                LoadKey::This | LoadKey::Argument(_) => true,
             };
             if !preserved {
                 continue;

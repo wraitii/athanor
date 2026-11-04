@@ -493,6 +493,14 @@ impl FunctionCompiler<'_, '_> {
         self.check_error();
     }
 
+    fn pending(&mut self, offset: i32, none: i64) -> ClifValue {
+        let word = self
+            .b
+            .ins()
+            .load(types::I64, MemFlags::trusted(), self.ctx, offset);
+        self.b.ins().icmp_imm(IntCC::NotEqual, word, none)
+    }
+
     pub(super) fn check_error(&mut self) {
         // Execution reaches a helper with no pending exception; catch entry clears it.
         let helper_call = self
@@ -512,11 +520,7 @@ impl FunctionCompiler<'_, '_> {
                 .map(|kind| (self.b.func.dfg.first_result(inst), kind))
         });
         let dummy = self.constant(Value::UNDEFINED);
-        let pending = self.call_helper(Helper::ErrorPending, &[dummy]);
-        let condition = self
-            .b
-            .ins()
-            .icmp_imm(IntCC::Equal, pending, Value::TRUE.bits() as i64);
+        let condition = self.pending(crate::jit::session::ERROR_OFFSET, 0);
         let failed = self.b.create_block();
         let done = self.b.create_block();
         self.brif(condition, failed, &[], done, &[]);
@@ -541,11 +545,10 @@ impl FunctionCompiler<'_, '_> {
             }
             return;
         }
-        let pending = self.call_helper(Helper::ExceptionPending, &[dummy]);
-        let condition = self
-            .b
-            .ins()
-            .icmp_imm(IntCC::Equal, pending, Value::TRUE.bits() as i64);
+        let condition = self.pending(
+            crate::jit::session::EXCEPTION_OFFSET,
+            Value::UNINITIALIZED.bits() as i64,
+        );
         let done = self.b.create_block();
         if let Some(handler) = self.handlers.last().copied() {
             self.brif(condition, handler, &[], done, &[]);

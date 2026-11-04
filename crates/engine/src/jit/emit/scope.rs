@@ -1,6 +1,8 @@
 use super::{ClifValue, FunctionCompiler};
 use crate::jit::helpers::Helper;
-use cranelift_codegen::ir::{InstBuilder, types};
+use crate::value::{TAG_OBJECT, TAG_SHIFT, TAG_STRING};
+use cranelift_codegen::ir::condcodes::IntCC;
+use cranelift_codegen::ir::{InstBuilder, MemFlags, types};
 use cranelift_frontend::Variable;
 use oxc_ast::ast::{
     BindingPattern, ForStatementInit, ForStatementLeft, Statement, VariableDeclaration,
@@ -8,11 +10,47 @@ use oxc_ast::ast::{
 };
 use oxc_syntax::symbol::SymbolId;
 
+const _: () = assert!(TAG_STRING - TAG_OBJECT == 1 << TAG_SHIFT);
+
 impl FunctionCompiler<'_, '_> {
     pub(super) fn initialize_local(&mut self, variable: Variable, value: ClifValue) {
-        let slot = self.b.ins().iconst(types::I64, variable.as_u32() as i64);
-        self.call_helper(Helper::LocalSet, &[slot, value]);
+        let index = variable.as_u32();
+        self.slots = self.slots.max(index + 1);
+        if self.frame_size.is_none() {
+            let slot = self.b.ins().iconst(types::I64, index as i64);
+            self.call_helper(Helper::LocalSet, &[slot, value]);
+            self.b.def_var(variable, value);
+            return;
+        }
+        let flags = MemFlags::trusted();
+        let base = self.b.ins().load(
+            types::I64,
+            flags,
+            self.ctx,
+            crate::jit::session::LOCALS_OFFSET,
+        );
+        let offset = (index as i32) * 8;
+        let old = self.b.ins().load(types::I64, flags, base, offset);
+        self.b.ins().store(flags, value, base, offset);
+        let new_heap = self.is_heap(value);
+        let old_heap = self.is_heap(old);
+        let heap = self.b.ins().bor(new_heap, old_heap);
+        let slow = self.b.create_block();
+        let done = self.b.create_block();
+        self.brif(heap, slow, &[], done, &[]);
+        self.switch(slow);
+        let slot = self.b.ins().iconst(types::I64, index as i64);
+        self.call_helper(Helper::LocalReplace, &[slot, value, old]);
+        self.jump(done, &[]);
+        self.switch(done);
         self.b.def_var(variable, value);
+    }
+
+    fn is_heap(&mut self, value: ClifValue) -> ClifValue {
+        let tag = self.b.ins().ushr_imm(value, TAG_SHIFT as i64);
+        let first = (TAG_OBJECT >> TAG_SHIFT) as i64;
+        let offset = self.b.ins().iadd_imm(tag, -first);
+        self.b.ins().icmp_imm(IntCC::UnsignedLessThan, offset, 2)
     }
 }
 
