@@ -1,3 +1,4 @@
+mod borrow;
 mod build;
 pub(in crate::jit) mod facts;
 mod optimize;
@@ -55,6 +56,7 @@ pub(super) struct Graph {
     pub(super) has_handlers: bool,
     pub(in crate::jit) guards: usize,
     pub(in crate::jit) views: HashMap<Inst, Value>,
+    pub(in crate::jit) borrowed: HashSet<Value>,
     pub(in crate::jit) cold: HashSet<Block>,
     pub(super) generator: bool,
     pub(super) blocks: PrimaryMap<Block, BlockData>,
@@ -1291,6 +1293,7 @@ fn optimize_graph(mut graph: Graph, ssa_opt: bool) -> Result<Analysis> {
     optimize::simplify(&mut graph);
     graph.verify()?;
     let facts = Facts::compute(&graph);
+    borrow::borrows(&mut graph, &facts, &mut notes);
     Ok(Analysis {
         graph,
         facts,

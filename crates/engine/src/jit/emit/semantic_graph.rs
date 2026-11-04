@@ -425,7 +425,8 @@ impl FunctionCompiler<'_, '_> {
                     | Op::IndexedGet(object, index) => {
                         let object = get(self, *object);
                         let index = get(self, *index);
-                        Some(self.element_read(object, Operand::new(index, Repr::Boxed)))
+                        let retain = data.result.is_none_or(|value| !graph.borrowed.contains(&value));
+                        Some(self.element_read(object, Operand::new(index, Repr::Boxed), retain))
                     }
                     Op::SetIndex(object, index, value) => {
                         let object = get(self, *object);
@@ -676,7 +677,9 @@ impl FunctionCompiler<'_, '_> {
                 };
                 if let (Some(value), Some(result)) = (data.result, result) {
                     let result = self.convert(result, reprs[value]);
-                    let borrowed = matches!(data.op, Op::This | Op::Argument(_)) && !suspends;
+                    let borrowed = (matches!(data.op, Op::This | Op::Argument(_))
+                        || graph.borrowed.contains(&value))
+                        && !suspends;
                     if rooted(value) && !borrowed {
                         self.initialize_local(values[value.index()], result);
                     } else if suspends {
@@ -950,7 +953,10 @@ impl FunctionCompiler<'_, '_> {
                     }
                     key => key,
                 };
-                let result = self.viewed_index_access(view, object, key, None, fallback);
+                let retain = data
+                    .result
+                    .is_none_or(|value| !graph.borrowed.contains(&value));
+                let result = self.viewed_index_access(view, object, key, None, fallback, retain);
                 Some(Some(Operand::new(result, Repr::Boxed)))
             }
             Op::SetIndex(object, key, value) => {
@@ -962,7 +968,7 @@ impl FunctionCompiler<'_, '_> {
                 let object = self.convert(object, Repr::Boxed);
                 let key = self.operand(cx, *key);
                 let value = self.operand(cx, *value);
-                self.viewed_index_access(view, object, key, Some(value), true);
+                self.viewed_index_access(view, object, key, Some(value), true, true);
                 Some(None)
             }
             _ => None,

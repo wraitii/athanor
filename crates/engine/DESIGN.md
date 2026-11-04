@@ -1184,6 +1184,16 @@ every heap result they could release early is also rooted. Frame exit releases
 the slots. This conservative scheme keeps each value rooted until it is
 overwritten or the frame exits.
 
+Property and element reads can instead be borrowed: they are neither rooted nor
+retained by the inline element path. The last semantic pass accepts a read when,
+throughout its live range, nothing writes the heap, reenters, or redefines a
+receiver along its chain of reads (`height` for `height[x][y]`). A store may be
+the last use, since stores retain before releasing. Either every receiver in the
+chain is known to be an object, so it owns the result, or the read dies within
+its block before the temporary clear, which covers fresh slow-path results such
+as string characters. Block parameters and returns still retain what they
+receive. `--semantic-ir` lists the borrowed reads.
+
 Frames share one contiguous slot stack and one temporary stack in `JitCtx`;
 ordinary functions number their rooted values densely and reserve that many
 slots on entry, and `JitCtx` exposes the current frame's slot base and pending

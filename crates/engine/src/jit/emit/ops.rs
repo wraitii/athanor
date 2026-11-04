@@ -605,9 +605,14 @@ impl FunctionCompiler<'_, '_> {
         self.b.block_params(done)[0]
     }
 
-    pub(super) fn element_read(&mut self, object: ClifValue, key: Operand) -> ClifValue {
+    pub(super) fn element_read(
+        &mut self,
+        object: ClifValue,
+        key: Operand,
+        retain: bool,
+    ) -> ClifValue {
         let view = self.view(object);
-        self.viewed_index_access(view, object, key, None, true)
+        self.viewed_index_access(view, object, key, None, true, retain)
     }
 
     pub(super) fn viewed_index_access(
@@ -617,6 +622,7 @@ impl FunctionCompiler<'_, '_> {
         key: Operand,
         value: Option<Operand>,
         fallback: bool,
+        retain: bool,
     ) -> ClifValue {
         let flags = MemFlags::trusted();
         let length = self.b.ins().load(types::I64, flags, view, LENGTH_OFFSET);
@@ -676,14 +682,18 @@ impl FunctionCompiler<'_, '_> {
             self.jump(element, &[BlockArg::Value(bits)]);
             self.switch(element);
             let bits = self.b.block_params(element)[0];
-            let heap = self.is_heap(bits);
-            // Matches the IndexGet helper, which hands heap elements out as temporaries.
-            let retain = self.b.create_block();
-            self.brif(heap, retain, &[], done, &[BlockArg::Value(bits)]);
-            self.switch(retain);
-            let retained = self.call_helper(Helper::TempRetain, &[bits]);
-            self.check_error();
-            self.jump(done, &[BlockArg::Value(retained)]);
+            if retain {
+                let heap = self.is_heap(bits);
+                // Matches the IndexGet helper, which hands heap elements out as temporaries.
+                let retain = self.b.create_block();
+                self.brif(heap, retain, &[], done, &[BlockArg::Value(bits)]);
+                self.switch(retain);
+                let retained = self.call_helper(Helper::TempRetain, &[bits]);
+                self.check_error();
+                self.jump(done, &[BlockArg::Value(retained)]);
+            } else {
+                self.jump(done, &[BlockArg::Value(bits)]);
+            }
         }
         for (element, block) in kinds {
             self.switch(block);
