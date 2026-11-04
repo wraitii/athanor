@@ -33,6 +33,10 @@ impl Types {
         self.0 & !other.0 == 0
     }
 
+    pub(in crate::jit) const fn without(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+
     pub(in crate::jit) fn intersects(self, other: Self) -> bool {
         self.0 & other.0 != 0
     }
@@ -111,10 +115,15 @@ impl Facts {
                 let Some(terminator) = &graph.blocks[block].terminator else {
                     continue;
                 };
+                let initialized = initialized_edge(graph, &terminator.kind);
                 for target in terminator.kind.targets() {
                     for (&param, &arg) in graph.blocks[target.block].params.iter().zip(&target.args)
                     {
-                        changed |= facts.widen(param, facts.of(arg));
+                        let mut types = facts.of(arg);
+                        if initialized == Some((target.block, arg)) {
+                            types = types.without(Types::UNINITIALIZED);
+                        }
+                        changed |= facts.widen(param, types);
                     }
                 }
             }
@@ -136,6 +145,20 @@ impl Facts {
         }
         self.types[value] = widened;
         true
+    }
+}
+
+// The false edge of a branch on `is_uninitialized v` passes an initialized `v`.
+fn initialized_edge(graph: &Graph, kind: &TerminatorKind) -> Option<(Block, Value)> {
+    let TerminatorKind::Branch(condition, yes, no) = kind else {
+        return None;
+    };
+    if yes.block == no.block {
+        return None;
+    }
+    match graph.defining_op(*condition) {
+        Some(&Op::IsUninitialized(value)) => Some((no.block, value)),
+        _ => None,
     }
 }
 
@@ -325,7 +348,7 @@ fn result_types(op: &Op, facts: &Facts) -> Types {
         Op::TypedIndex(..) => Types::NUMBER.union(Types::UNDEFINED),
         Op::IsTyped(_) | Op::IsIndexed(_) => Types::BOOLEAN,
         Op::IndexedLength(_) => Types::NUMBER,
-        Op::IsNumber(_) => Types::BOOLEAN,
+        Op::IsNumber(_) | Op::IsString(_) => Types::BOOLEAN,
         Op::AsNumber(_) => Types::NUMBER,
         Op::ToNumeric(value) | Op::Unary(UnaryOp::Plus, value)
             if facts.of(*value).within(Types::NUMBER) =>
@@ -369,9 +392,11 @@ fn result_types(op: &Op, facts: &Facts) -> Types {
             _ => Types::BOOLEAN,
         },
         Op::CallNative(..) => Types::NUMBER,
-        Op::IsUndefined(_) | Op::IsNullish(_) | Op::IsNative(..) | Op::GuardValid(_) => {
-            Types::BOOLEAN
-        }
+        Op::IsUndefined(_)
+        | Op::IsNullish(_)
+        | Op::IsNative(..)
+        | Op::IsCode(..)
+        | Op::GuardValid(_) => Types::BOOLEAN,
         _ => Types::VALUE,
     }
 }

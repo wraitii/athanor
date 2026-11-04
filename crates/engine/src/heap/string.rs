@@ -50,4 +50,11 @@ impl Heap {
         let text = data.string(heap_id(value)?)?;
         Some(text.clone())
     }
+
+    pub(crate) fn strings_equal(&self, left: Value, right: Value) -> bool {
+        let data = self.0.borrow();
+        let left = heap_id(left).and_then(|id| data.string(id));
+        let right = heap_id(right).and_then(|id| data.string(id));
+        left == right
+    }
 }

@@ -76,11 +76,14 @@ define_helpers! {
     SemanticPropertyProbe => PropertyGet, js_semantic_property_probe;
     SemanticIndexProbe => Binary, js_semantic_index_probe;
     SemanticMathNative => Binary, js_semantic_math_native;
+    SemanticCode => Binary, js_semantic_code;
     MathDirect => MethodCallable, js_math_direct;
     FrameEnter => Unary, js_frame_enter;
     FrameExit => Unary, js_frame_exit;
     LocalSet => Binary, js_local_set;
     LocalReplace => IndexSet, js_local_replace;
+    Retain => Unary, js_retain;
+    Release => Unary, js_release;
     TempClear => Unary, js_temp_clear;
     TempRetain => Unary, js_temp_retain;
     IterateNew => Unary, js_iterate_new;
@@ -101,6 +104,7 @@ define_helpers! {
     IndexProbe => Binary, js_index_probe;
     IndexSet => IndexSet, js_index_set;
     PropertyGet => PropertyGet, js_property_get;
+    PropertyGetCached => Binary, js_property_get_cached;
     PropertySet => PropertySet, js_property_set;
     PropertyDefineHidden => PropertySet, js_property_define_hidden;
     GlobalGet => GlobalGet, js_global_get;
@@ -163,9 +167,12 @@ impl Helper {
         !matches!(
             self,
             Self::TempRetain
+                | Self::Retain
+                | Self::Release
                 | Self::IndexGet
                 | Self::IndexGetNumeric
                 | Self::PropertyGet
+                | Self::PropertyGetCached
                 | Self::GlobalGet
                 | Self::GlobalGetOptional
                 | Self::BitwiseAnd
@@ -369,7 +376,7 @@ fn loose_equals(ctx: *mut JitCtx, left: Value, right: Value) -> bool {
 
 pub(super) fn strict_equals(heap: &crate::heap::Heap, left: Value, right: Value) -> bool {
     if left.is_string() && right.is_string() {
-        return heap.text(left) == heap.text(right);
+        return heap.strings_equal(left, right);
     }
     if left.is_number() && right.is_number() {
         return left.as_number() == right.as_number();
@@ -600,6 +607,42 @@ extern "C" fn js_property_get(ctx: *mut JitCtx, object: Value, ptr: *const u8, l
     Value::UNDEFINED
 }
 
+/// A named property read site. Generated code compares a receiver's shape with `shape` and,
+/// on a match, loads its shaped value at `index`; a miss refills both from the receiver.
+#[repr(C)]
+pub(crate) struct PropertyCache {
+    pub(crate) shape: u32,
+    pub(crate) index: u32,
+    pub(crate) name: Box<str>,
+}
+
+pub(crate) const CACHE_SHAPE_OFFSET: i32 = std::mem::offset_of!(PropertyCache, shape) as i32;
+pub(crate) const CACHE_INDEX_OFFSET: i32 = std::mem::offset_of!(PropertyCache, index) as i32;
+
+impl PropertyCache {
+    pub(crate) fn new(name: &str) -> Self {
+        Self {
+            shape: crate::heap::DICTIONARY,
+            index: 0,
+            name: name.into(),
+        }
+    }
+}
+
+extern "C" fn js_property_get_cached(
+    ctx: *mut JitCtx,
+    object: Value,
+    cache: *mut PropertyCache,
+) -> Value {
+    let cache = unsafe { &mut *cache };
+    let heap = unsafe { &*ctx }.global.heap();
+    if let Some((shape, index)) = heap.cached_property(object, &cache.name) {
+        cache.shape = shape;
+        cache.index = index;
+    }
+    js_property_get(ctx, object, cache.name.as_ptr(), cache.name.len() as u64)
+}
+
 extern "C" fn js_property_set(
     ctx: *mut JitCtx,
     object: Value,
@@ -672,6 +715,17 @@ extern "C" fn js_frame_exit(ctx: *mut JitCtx, value: Value) -> Value {
 }
 extern "C" fn js_local_set(ctx: *mut JitCtx, slot: u64, value: Value) -> Value {
     unsafe { &mut *ctx }.local_set(slot as usize, value)
+}
+extern "C" fn js_retain(ctx: *mut JitCtx, value: Value) -> Value {
+    let ctx = unsafe { &mut *ctx };
+    if !ctx.global.heap().retain(value) {
+        ctx.error = Some(Box::new(crate::Error::Runtime("invalid heap value".into())));
+    }
+    Value::UNDEFINED
+}
+extern "C" fn js_release(ctx: *mut JitCtx, value: Value) -> Value {
+    unsafe { &*ctx }.global.heap().release(value);
+    Value::UNDEFINED
 }
 extern "C" fn js_local_replace(ctx: *mut JitCtx, slot: u64, value: Value, old: Value) -> Value {
     unsafe { &mut *ctx }.local_replace(slot as usize, value, old)
@@ -1147,6 +1201,15 @@ extern "C" fn js_semantic_math_native(ctx: *mut JitCtx, value: Value, operation:
     Value::boolean(
         unsafe { &*ctx }.global.heap().native(value)
             == Some(crate::heap::NativeFunction::Math(expected)),
+    )
+}
+
+extern "C" fn js_semantic_code(ctx: *mut JitCtx, value: Value, code: u64) -> Value {
+    let heap = unsafe { &*ctx }.global.heap();
+    Value::boolean(
+        heap.closure_code(value) == Some(crate::heap::CodeId(code))
+            && !heap.is_class(value)
+            && heap.lexical_this(value).is_none(),
     )
 }
 

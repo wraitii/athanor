@@ -14,6 +14,13 @@ impl Default for Properties {
 }
 
 impl Properties {
+    pub(super) fn raw(&self) -> (*const u8, usize) {
+        match self {
+            Self::Shaped(values) => (values.as_ptr().cast(), values.len()),
+            Self::Dictionary(_) => (std::ptr::null(), 0),
+        }
+    }
+
     pub(super) fn pop(&mut self) -> Option<Value> {
         match self {
             Self::Shaped(values) => values.pop(),
@@ -97,6 +104,18 @@ impl HeapData {
         value: Value,
         enumerable: Option<bool>,
     ) -> Option<Value> {
+        let old = self.write_property(id, name, value, enumerable);
+        self.sync(id);
+        old
+    }
+
+    fn write_property(
+        &mut self,
+        id: u64,
+        name: &str,
+        value: Value,
+        enumerable: Option<bool>,
+    ) -> Option<Value> {
         // Slots live in arena chunks rather than in HeapData, so this borrow is disjoint
         // from the shape and atom tables.
         let slot = unsafe { &mut *self.arena.get(id).as_ptr() };
@@ -126,7 +145,13 @@ impl HeapData {
                 return None;
             }
             let mut table = PropertyTable::default();
-            for (key, value) in self.shapes.get(slot.shape).keys().iter().zip(values.drain(..)) {
+            for (key, value) in self
+                .shapes
+                .get(slot.shape)
+                .keys()
+                .iter()
+                .zip(values.drain(..))
+            {
                 table.set(self.atoms.name(key.atom), value, Some(key.enumerable));
             }
             *properties = Properties::Dictionary(table);

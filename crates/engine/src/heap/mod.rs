@@ -35,11 +35,14 @@ use set::*;
 use shape::*;
 use typed::*;
 
-pub(crate) use arena::{DATA_OFFSET, KIND_OFFSET, LENGTH_OFFSET, NO_ELEMENTS};
+pub(crate) use arena::{
+    DATA_OFFSET, KIND_OFFSET, LENGTH_OFFSET, NO_ELEMENTS, REFERENCES_OFFSET, SHAPE_OFFSET,
+};
 pub(crate) use array::HOLE;
 pub(crate) use natives::{MathFunction, NativeFunction};
 pub use owned::OwnedValue;
 pub(crate) use regexp::regexp_flags;
+pub(crate) use shape::DICTIONARY;
 pub(crate) use typed::TypedKind;
 
 #[derive(Clone, Default)]
@@ -395,6 +398,8 @@ impl HeapData {
         (slot.data, slot.length) = match &slot.payload {
             Payload::Array(array) => (array.elements.as_ptr().cast(), array.elements.len()),
             Payload::TypedArray(array) => array.storage.raw(),
+            Payload::Object(object) => object.properties.raw(),
+            Payload::Closure(closure) => closure.properties.raw(),
             _ => (std::ptr::null(), 0),
         };
     }
@@ -476,6 +481,8 @@ impl HeapData {
         assert!(slot.references > 0);
         slot.references -= 1;
         if slot.references == 0 {
+            // Disposal pops property values, so no site cache may match while it runs.
+            slot.shape = NO_SHAPE;
             self.pending.push_back(id);
         }
     }

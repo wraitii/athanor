@@ -203,7 +203,11 @@ impl FunctionCompiler<'_, '_> {
         })
     }
 
-    pub(super) fn typed_math(&mut self, function: MathFunction, args: &[Operand]) -> Option<Operand> {
+    pub(super) fn typed_math(
+        &mut self,
+        function: MathFunction,
+        args: &[Operand],
+    ) -> Option<Operand> {
         let inline = matches!(
             (function, args.len()),
             (

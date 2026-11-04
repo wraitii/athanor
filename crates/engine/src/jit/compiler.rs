@@ -30,7 +30,9 @@ pub(crate) struct CompiledFunction {
 pub(crate) struct Compiler {
     names: Vec<Box<str>>,
     cells: Vec<Box<u64>>,
+    property_caches: Vec<Box<helpers::PropertyCache>>,
     source_name: (usize, usize),
+    canonical: super::semantic::specialize::Repository,
     module: JITModule,
     signature: Signature,
     helpers: Vec<FuncId>,
@@ -83,7 +85,9 @@ impl Compiler {
         Ok(Self {
             names: Vec::new(),
             cells: Vec::new(),
+            property_caches: Vec::new(),
             source_name: (0, 0),
+            canonical: super::semantic::specialize::Repository::default(),
             module,
             signature,
             helpers: helper_ids,
@@ -335,9 +339,35 @@ impl Compiler {
             }
         }
 
+        for (name, function) in &ordered {
+            if function.generator {
+                continue;
+            }
+            let canonical = super::semantic::canonical_for_emission(
+                &function.params,
+                &function.body.as_ref().unwrap().statements,
+                None,
+                function.span,
+                scoping,
+                &analysis.captured,
+                &[],
+                &closures,
+                analysis
+                    .arguments_bindings
+                    .get(&function.span.start)
+                    .copied(),
+                &analysis.arguments_references,
+                false,
+                self.ssa_opt,
+            )
+            .map_err(Error::Unsupported)?;
+            self.canonical
+                .insert(self.source_name.0, name, ids[name], canonical);
+        }
+
         if self.compile_dump && self.compile_semantic_ir {
             for (name, function) in &ordered {
-                let graph = super::semantic::lower_for_emission(
+                let graph = super::semantic::canonical_for_emission(
                     &function.params,
                     &function.body.as_ref().unwrap().statements,
                     None,
@@ -354,13 +384,20 @@ impl Compiler {
                     function.generator,
                     self.ssa_opt,
                 );
+                let graph = graph.and_then(|canonical| {
+                    super::semantic::optimize_canonical(
+                        canonical,
+                        self.ssa_opt,
+                        Some((&self.canonical, self.source_name.0)),
+                    )
+                });
                 match graph {
                     Ok(graph) => println!("[{source_path}] semantic IR {name}\n{}", graph),
                     Err(error) => println!("[{source_path}] semantic IR {name}: {error}"),
                 }
             }
             for (_, span, params, statements, expression, generator, label, _) in &nested {
-                let graph = super::semantic::lower_for_emission(
+                let graph = super::semantic::canonical_for_emission(
                     params,
                     statements,
                     *expression,
@@ -374,6 +411,13 @@ impl Compiler {
                     *generator,
                     self.ssa_opt,
                 );
+                let graph = graph.and_then(|canonical| {
+                    super::semantic::optimize_canonical(
+                        canonical,
+                        self.ssa_opt,
+                        Some((&self.canonical, self.source_name.0)),
+                    )
+                });
                 match graph {
                     Ok(graph) => println!("[{source_path}] semantic IR {label}\n{}", graph),
                     Err(error) => println!("[{source_path}] semantic IR {label}: {error}"),
@@ -473,6 +517,7 @@ impl Compiler {
                     &mut annotations,
                     &mut self.names,
                     &mut self.cells,
+                    &mut self.property_caches,
                     self.source_name,
                     &closures,
                     &graph.graph,
@@ -788,23 +833,31 @@ impl Compiler {
     ) -> Result<FunctionBody, Error> {
         let graph = semantic_function
             .map(|span| {
-                super::semantic::lower_for_emission(
-                    params,
-                    statements,
-                    expression,
-                    span,
-                    scoping,
-                    captured,
-                    captures,
-                    closures,
-                    arguments_binding,
-                    arguments_references,
-                    matches!(kind, emit::FunctionKind::Generator(_)),
+                let canonical = match self.canonical.canonical(self.source_name.0, span.start) {
+                    Some(canonical) => Ok(canonical.clone()),
+                    None => super::semantic::canonical_for_emission(
+                        params,
+                        statements,
+                        expression,
+                        span,
+                        scoping,
+                        captured,
+                        captures,
+                        closures,
+                        arguments_binding,
+                        arguments_references,
+                        matches!(kind, emit::FunctionKind::Generator(_)),
+                        self.ssa_opt,
+                    ),
+                }?;
+                super::semantic::optimize_canonical(
+                    canonical,
                     self.ssa_opt,
+                    Some((&self.canonical, self.source_name.0)),
                 )
-                .map_err(Error::Unsupported)
             })
-            .transpose()?;
+            .transpose()
+            .map_err(Error::Unsupported)?;
         let mut annotations = Annotations {
             semantic_locations: self.dump_ir,
             ..Annotations::default()
@@ -824,6 +877,7 @@ impl Compiler {
                     &mut annotations,
                     &mut self.names,
                     &mut self.cells,
+                    &mut self.property_caches,
                     self.source_name,
                     params,
                     closures,
@@ -838,6 +892,7 @@ impl Compiler {
                     &mut annotations,
                     &mut self.names,
                     &mut self.cells,
+                    &mut self.property_caches,
                     self.source_name,
                     params,
                     closures,

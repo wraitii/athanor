@@ -18,6 +18,12 @@ pub(crate) const fn tag_word(bits: u64) -> u64 {
     bits >> TAG_SHIFT
 }
 
+/// A copyable value whose heap tokens borrow their allocation and originating runtime.
+///
+/// Keep an owning handle alive while using a heap token, and pass it only to its
+/// originating runtime. Public entry points check arena membership and liveness,
+/// but cannot detect a stale token if its address has been reused for another
+/// allocation, including by another runtime after the original runtime is dropped.
 #[repr(transparent)]
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct Value(u64);
@@ -30,7 +36,7 @@ impl Value {
     pub const TRUE: Self = Self(TAG_TRUE);
     pub const UNINITIALIZED: Self = Self(TAG_UNINITIALIZED);
 
-    pub const fn from_bits(bits: u64) -> Self {
+    pub(crate) const fn from_bits(bits: u64) -> Self {
         Self(bits)
     }
 

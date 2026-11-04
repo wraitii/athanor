@@ -51,10 +51,14 @@ pub(super) fn effects(helper: Helper) -> Effects {
     use Helper::*;
     let (reentry, flags, assumptions): (_, _, &'static [Assumption]) = match helper {
         Call | CallSpread | Construct | ConstructSpread => (Reentry::Arbitrary, UNKNOWN, &[]),
-        FrameEnter | FrameExit | LocalSet | LocalReplace | LocalGet | TempClear | TempRetain
-        | ErrorOrigin | Catch | Throw => (Reentry::Closed, INTERNAL | ERROR, &[]),
+        FrameEnter | FrameExit | LocalSet | LocalReplace | Retain | Release | LocalGet
+        | TempClear | TempRetain | ErrorOrigin | Catch | Throw => {
+            (Reentry::Closed, INTERNAL | ERROR, &[])
+        }
         SemanticGlobalProbe => (Reentry::Closed, GLOBAL_READ, &[]),
-        SemanticPropertyProbe | SemanticMathNative => (Reentry::Closed, HEAP_READ, &[]),
+        SemanticPropertyProbe | SemanticMathNative | SemanticCode => {
+            (Reentry::Closed, HEAP_READ, &[])
+        }
         IndexRoot | IndexProbe => (
             Reentry::Closed,
             HEAP_READ | INTERNAL,
@@ -74,7 +78,7 @@ pub(super) fn effects(helper: Helper) -> Effects {
         }
         GlobalGet | GlobalGetOptional => (Reentry::Closed, GLOBAL_READ | INTERNAL | ERROR, &[]),
         GlobalSet | GlobalInitialize => (Reentry::Closed, GLOBAL_WRITE | INTERNAL | ERROR, &[]),
-        PropertyGet | IndexGet | IndexGetNumeric => (
+        PropertyGet | PropertyGetCached | IndexGet | IndexGetNumeric => (
             Reentry::Closed,
             HEAP_READ | GLOBAL_READ | ALLOCATION | INTERNAL | ERROR,
             &[Assumption::NoAccessors, Assumption::NoCoercionCallbacks],
@@ -119,11 +123,11 @@ pub(super) fn temporary_effect(helper: Helper) -> TemporaryEffect {
         TempClear => Clear,
         TempRetain => RetainArgument,
         Add => NumericAdd,
-        LocalSet | LocalReplace | ErrorOrigin | Throw | MathDirect | IndexRoot | IndexProbe
-        | Truthy | BitwiseAnd | BitwiseOr | BitwiseXor | ShiftLeft | ShiftRight
-        | ShiftRightUnsigned | Sub | Mul | Div | Rem | Pow | LooseEqual | LooseNotEqual
-        | StrictEqual | StrictNotEqual | Less | LessEqual | Greater | GreaterEqual | UnaryPlus
-        | UnaryNegation | LogicalNot | BitwiseNot => None,
+        LocalSet | LocalReplace | Retain | Release | ErrorOrigin | Throw | MathDirect
+        | SemanticCode | IndexRoot | IndexProbe | Truthy | BitwiseAnd | BitwiseOr | BitwiseXor
+        | ShiftLeft | ShiftRight | ShiftRightUnsigned | Sub | Mul | Div | Rem | Pow
+        | LooseEqual | LooseNotEqual | StrictEqual | StrictNotEqual | Less | LessEqual
+        | Greater | GreaterEqual | UnaryPlus | UnaryNegation | LogicalNot | BitwiseNot => None,
         _ => MayRegister,
     }
 }

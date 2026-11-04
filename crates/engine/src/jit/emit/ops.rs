@@ -4,8 +4,10 @@ use cranelift_frontend::Switch;
 use cranelift_module::Module;
 use oxc_syntax::operator::BinaryOperator;
 
-use crate::heap::{DATA_OFFSET, HOLE, KIND_OFFSET, LENGTH_OFFSET, MathFunction, NO_ELEMENTS, kind};
-use crate::jit::helpers::Helper;
+use crate::heap::{
+    DATA_OFFSET, HOLE, KIND_OFFSET, LENGTH_OFFSET, MathFunction, NO_ELEMENTS, SHAPE_OFFSET, kind,
+};
+use crate::jit::helpers::{CACHE_INDEX_OFFSET, CACHE_SHAPE_OFFSET, Helper, PropertyCache};
 use crate::jit::numeric::{IndexedRead, IndexedReadContract, Kind};
 use crate::value::Value;
 use crate::value::{TAG_FIRST, TAG_OBJECT, TAG_SHIFT, TAG_SPAN, TAG_STRING};
@@ -823,6 +825,65 @@ impl FunctionCompiler<'_, '_> {
         self.names.push(name);
         self.call_helper(Helper::GlobalInitialize, &[ptr, len, value]);
         self.check_error();
+    }
+
+    pub(super) fn cached_property_get(
+        &mut self,
+        object: ClifValue,
+        name: &str,
+        retain: bool,
+    ) -> ClifValue {
+        let cache = Box::new(PropertyCache::new(name));
+        let address = self.b.ins().iconst(self.pointer, &raw const *cache as i64);
+        self.property_caches.push(cache);
+        let flags = MemFlags::trusted();
+        let view = self.view(object);
+        let shape = self.b.ins().load(types::I32, flags, view, SHAPE_OFFSET);
+        let expected = self
+            .b
+            .ins()
+            .load(types::I32, flags, address, CACHE_SHAPE_OFFSET);
+        let hit = self.b.ins().icmp(IntCC::Equal, shape, expected);
+        let valid =
+            self.b
+                .ins()
+                .icmp_imm(IntCC::NotEqual, expected, crate::heap::DICTIONARY as i64);
+        let hit = self.b.ins().band(hit, valid);
+        let inline = self.b.create_block();
+        let slow = self.b.create_block();
+        let done = self.b.create_block();
+        self.b.append_block_param(done, types::I64);
+        self.b.set_cold_block(slow);
+        self.brif(hit, inline, &[], slow, &[]);
+
+        self.switch(inline);
+        let index = self
+            .b
+            .ins()
+            .load(types::I32, flags, address, CACHE_INDEX_OFFSET);
+        let index = self.b.ins().uextend(types::I64, index);
+        let offset = self.b.ins().ishl_imm(index, 3);
+        let data = self.b.ins().load(self.pointer, flags, view, DATA_OFFSET);
+        let slot = self.b.ins().iadd(data, offset);
+        let bits = self.b.ins().load(types::I64, flags, slot, 0);
+        if retain {
+            let heap = self.is_heap(bits);
+            let retain = self.b.create_block();
+            self.brif(heap, retain, &[], done, &[BlockArg::Value(bits)]);
+            self.switch(retain);
+            let retained = self.call_helper(Helper::TempRetain, &[bits]);
+            self.check_error();
+            self.jump(done, &[BlockArg::Value(retained)]);
+        } else {
+            self.jump(done, &[BlockArg::Value(bits)]);
+        }
+
+        self.switch(slow);
+        let result = self.call_helper(Helper::PropertyGetCached, &[object, address]);
+        self.check_error();
+        self.jump(done, &[BlockArg::Value(result)]);
+        self.switch(done);
+        self.b.block_params(done)[0]
     }
 
     pub(super) fn property_access(

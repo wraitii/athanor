@@ -182,11 +182,13 @@ kinds, and individual guard conclusions to stderr. Enabling dumps with rewriting
 analysis without changing CLIF. The existing IR listings show CLIF after this
 pass when rewriting is enabled.
 
-Future compilation tiers can build on this boundary, but canonical bodies are
-not currently retained for recompilation. Runtime feedback would need stable
-operation-site IDs independent of CLIF entity IDs, and observed types would
-require runtime guards before becoming proven facts. Recompilation, entry-point
-replacement, on-stack replacement, and deoptimization remain future work.
+Future compilation tiers can build on this boundary. Canonical semantic graphs
+of ordinary top-level functions are retained separately from emitted bodies, as
+described below; canonical CLIF bodies are not retained. Runtime feedback would
+need stable operation-site IDs independent of CLIF entity IDs, and observed types
+would require runtime guards before becoming proven facts. Recompilation,
+entry-point replacement, on-stack replacement, and deoptimization remain future
+work.
 
 ## Values, objects, and arrays
 
@@ -207,6 +209,15 @@ contain contiguous `Value` elements; binding cells and closures have separate
 heap kinds. Environments and host handles share the runtime; raw `Value` tokens
 do not keep it alive; their owner must remain alive while they are used, and
 tokens must only be passed to their originating engine.
+
+Public environment writes and engine calls reject heap tokens outside their
+runtime's live arena. Live runtimes have disjoint arena allocations, so this
+rejects tokens from another live engine. Tokens have no allocation generation
+or runtime identity: a stale token can be accepted if its address is reused for
+another compatible allocation, including by a different engine after the
+original runtime is destroyed. These checks do not replace the requirement to
+keep an owning handle alive and use tokens only with their originating runtime.
+Raw bit construction is internal to the crate.
 
 Dense array literals and rest parameters allocate arrays; rest copies trailing
 arguments and retains referenced values. Numeric index reads return undefined
@@ -268,9 +279,23 @@ transitions keyed by name and enumerability, rooted per prototype. The shape id
 lives in the slot header. Adding a property, changing its enumerability, or
 setting the prototype changes the shape; replacing a value does not. Objects
 with more than 64 properties or an array-index-like name switch to an ordered
-dictionary and a reserved shape id that no cache may match. Property access
-still goes through helpers; guarded shape/slot fast paths come next. Indexed
-elements stay separate from named properties. Typed arrays provide contiguous
+dictionary and a reserved shape id that no cache may match. Indexed
+elements stay separate from named properties.
+
+The slot header's data and length words take their meaning from the payload:
+array elements, typed-array storage, or the shaped property values of objects
+and closures (null for dictionaries and other kinds). Only shaped objects and
+closures carry a shape id other than `NO_SHAPE` or `DICTIONARY`, so a shape id
+alone fixes the value index of each own property. A count reaching zero resets
+the shape to `NO_SHAPE`, since disposal pops values without changing it.
+
+Each compiled named read has a monomorphic site cache holding a shape id and a
+value index. Generated code compares the receiver's shape (non-objects and the
+global object read the all-zero view) and loads the value inline on a match;
+heap results are retained unless the read is borrowed. A miss calls the generic
+read and refills the cache when the receiver has an own shaped property of that
+name. Inherited and absent properties are not cached. Writes, `in` and probes
+still go through helpers. Typed arrays provide contiguous
 numeric storage without per-element reference counting.
 
 Ordinary prototype methods are needed by existing map code.
@@ -298,7 +323,11 @@ contents, and ordering uses lexicographic scalar-value order.
 
 Use immutable, reference-counted heap strings with checked handles and the same
 ownership rules as other heap allocations. String equality compares contents,
-not allocation identity. Begin with contiguous storage and helper operations;
+not allocation identity, borrowing both strings without copying their contents.
+The semantic optimizer replaces strict comparisons of a single-use `typeof`
+result with the literal `"string"` by a string tag test, in either operand order.
+It preserves initialization checks at the original `typeof` evaluation point.
+Begin with contiguous storage and helper operations;
 scalar indexing may scan the UTF-8 sequence. Add indexing metadata or other
 representations only when workloads justify their cost. String literals, concatenation, content equality, scalar length and indexing,
 and truthiness are implemented. Slicing and full coercion support
@@ -1024,8 +1053,10 @@ optimization is disabled by `JS_JIT_SSA=0`, for graphs with exception handlers a
 generator graphs; the shared CLIF optimization passes still apply.
 
 ```text
-Oxc AST -> build -> promote -> simplify -> version -> reuse loads -> hoist
-        -> loop number checks -> reuse loads -> hoist -> views -> simplify
+Oxc AST -> build -> promote -> simplify -> canonical graph
+        -> plan specialization -> inline -> simplify -> version
+        -> reuse loads -> hoist -> loop number checks -> reuse loads -> hoist
+        -> views -> simplify -> borrow
 ```
 
 ### Representation
@@ -1078,11 +1109,49 @@ read and callback assumptions of the shared property setter.
 Facts are sets of possible value types: int32, other doubles, boolean,
 undefined, null, string, object, other values (symbols and BigInts), the
 uninitialized-binding sentinel and internal typed-array views. They are computed flow-insensitively over SSA
-values to a fixed point; block parameters join their incoming arguments. The
+values to a fixed point; block parameters join their incoming arguments. An
+argument passed on the false edge of a branch on `is_uninitialized` of itself
+excludes the sentinel, so for-of elements reached through the iterator path need
+no initialization checks. The
 engine has no BigInt, so numeric operators always produce numbers. Facts
 refine contracts: a coercing operation on numbers is pure, one on other
 primitives needs no callback assumption, and an initialization check of a value
 that cannot be uninitialized is pure.
+
+### Initial call specialization
+
+The compiler retains canonical graphs of ordinary top-level functions, keyed by
+their code IDs, before specialization or region copying. Emission optimizes a
+clone. The repository also records the originating compilation; inlining is
+currently restricted to the same source compilation so byte spans and closure
+lookup remain unambiguous.
+
+`semantic/specialize.rs` separates specialization requests, guard planning, and
+application. The initial static request producer recognizes calls through global
+bindings to small helpers in that repository and requests numeric arguments.
+The planner accepts explicit call-site and target-code requests, removes number
+checks already proven by caller facts, deduplicates checks of equal argument
+values, and bounds expansion to 128 callee instructions per caller. Eligible
+callees contain at most 32 instructions and use only arguments, primitive
+constants, coercions, unary and binary operations, and ordinary control flow.
+Captures, receiver access, nested calls, heap accesses, rest and arguments
+snapshots, generators, and exception handlers remain unsupported by this inliner.
+
+`semantic/inlining.rs` materializes each selected request. It checks the already
+evaluated callee's code identity, then all remaining numeric assumptions. All
+failures select the original call; success executes one inlined body. Returns
+join the original continuation through a block parameter. Callee and argument
+evaluation stay before dispatch, including side effects in extra arguments.
+Narrowed argument values use `AsNumber`, so facts and representation selection
+see numeric operands inside the copy. Ownership analysis runs after inlining.
+
+For example, `square(x)` with `square(x) { return x * x; }` gets a code check,
+one number check, an inline multiply, and the original call as fallback.
+`square(x * 2)` needs only the code check because its argument is already known
+numeric. This is a call-site prototype; it does not yet merge requirements across
+calls or compact enclosing regions. Runtime feedback, including observations
+from inline caches, can supply future requests without changing graph splicing.
+Feedback collection and asynchronous compilation are not implemented.
 
 ### Passes
 
@@ -1189,7 +1258,8 @@ retained by the inline element path. The last semantic pass accepts a read when,
 throughout its live range, nothing writes the heap, reenters, or redefines a
 receiver along its chain of reads (`height` for `height[x][y]`). A store may be
 the last use, since stores retain before releasing. Either every receiver in the
-chain is known to be an object, so it owns the result, or the read dies within
+chain is known to be an object or reads it as an indexed iteration element (only
+arrays and typed arrays reach those reads), so it owns the result, or the read dies within
 its block before the temporary clear, which covers fresh slow-path results such
 as string characters. Block parameters and returns still retain what they
 receive. `--semantic-ir` lists the borrowed reads.
@@ -1199,9 +1269,15 @@ ordinary functions number their rooted values densely and reserve that many
 slots on entry, and `JitCtx` exposes the current frame's slot base and pending
 temporary count. Frame exit releases slots and temporaries under one heap
 borrow. A slot store writes inline and calls the runtime only
-when the new or old value is a heap reference. Storing the most recent temporary
-transfers its ownership instead of retaining it again. Error and exception
-checks load fixed `JitCtx` fields inline. Scalar replacement of unescaped
-objects, branch-sensitive facts, structural facts about loaded values (such as
-an array of `{x: number}`), object kinds and inline property reads are not
+when the new value is a heap reference. Storing the most recent temporary
+transfers its ownership instead of retaining it again. Block parameters in
+ordinary frames are retained without temporaries: every incoming heap value is
+retained inline first, so swapped parameters stay alive, then each slot is
+replaced. Retains increment the slot header's count inline; releases decrement
+it inline while other references remain, and otherwise call the runtime, which
+queues the slot for disposal. A zero count on a retained value is an engine
+error reported by the runtime. Generator frames keep the helper path. Error and
+exception checks load fixed `JitCtx` fields inline. Scalar replacement of
+unescaped objects, general branch-sensitive facts, structural facts about loaded
+values (such as an array of `{x: number}`) and object kinds are not
 implemented.

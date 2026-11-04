@@ -13,8 +13,8 @@ pub(super) struct Slot {
     pub(super) kind: u32,
     pub(super) shape: u32,
     pub(super) flags: u32,
-    // Generated code reads elements through these; HeapData::sync refreshes them after
-    // any change that can move or resize array storage.
+    // Generated code reads elements or shaped property values through these; HeapData::sync
+    // refreshes them after any change that can move or resize that storage.
     pub(super) data: *const u8,
     pub(super) length: usize,
     pub(super) payload: Payload,
@@ -22,7 +22,9 @@ pub(super) struct Slot {
 
 const _: () = assert!(std::mem::size_of::<Slot>() == SLOT_SIZE);
 
+pub(crate) const REFERENCES_OFFSET: i32 = std::mem::offset_of!(Slot, references) as i32;
 pub(crate) const KIND_OFFSET: i32 = std::mem::offset_of!(Slot, kind) as i32;
+pub(crate) const SHAPE_OFFSET: i32 = std::mem::offset_of!(Slot, shape) as i32;
 pub(crate) const DATA_OFFSET: i32 = std::mem::offset_of!(Slot, data) as i32;
 pub(crate) const LENGTH_OFFSET: i32 = std::mem::offset_of!(Slot, length) as i32;
 

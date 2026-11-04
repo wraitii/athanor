@@ -4,9 +4,64 @@ use oxc_syntax::operator::BinaryOperator;
 
 use super::super::effects::{GLOBAL_WRITE, HEAP_WRITE, Reentry};
 use super::{
-    Block, BlockData, Cfg, Facts, Graph, Inst, Native, Op, Result, Target, Terminator,
+    Block, BlockData, Cfg, Constant, Facts, Graph, Inst, Native, Op, Result, Target, Terminator,
     TerminatorKind, Types, UnaryOp, Value, ValueDef, resolve,
 };
+
+pub(super) fn typeof_comparisons(graph: &mut Graph) {
+    let uses = graph.use_counts();
+    for block in Cfg::new(graph).rpo {
+        for inst in graph.blocks[block].insts.clone() {
+            let Op::Binary(operator, left, right) = graph.insts[inst].op else {
+                continue;
+            };
+            if !matches!(
+                operator,
+                BinaryOperator::StrictEquality | BinaryOperator::StrictInequality
+            ) {
+                continue;
+            }
+            let pair = [(left, right), (right, left)]
+                .into_iter()
+                .find_map(|(value, literal)| {
+                    let Op::Unary(UnaryOp::Typeof, operand) = graph.defining_op(value)? else {
+                        return None;
+                    };
+                    let Op::Constant(Constant::String(text)) = graph.defining_op(literal)? else {
+                        return None;
+                    };
+                    (uses[value] == 1 && text == "string").then_some((value, literal, *operand))
+                });
+            let Some((value, literal, operand)) = pair else {
+                continue;
+            };
+            let ValueDef::Result(typeof_inst) = graph.values[value] else {
+                unreachable!();
+            };
+            // Keep TDZ errors at the original typeof evaluation point.
+            graph.insts[typeof_inst].op = Op::CheckInitialized(operand);
+            graph.insts[typeof_inst].result = None;
+            if uses[literal] == 1 {
+                let ValueDef::Result(literal_inst) = graph.values[literal] else {
+                    unreachable!();
+                };
+                graph.remove_inst(literal_inst);
+            }
+            graph.insts[inst].op = if operator == BinaryOperator::StrictEquality {
+                Op::IsString(operand)
+            } else {
+                let position = graph.blocks[block]
+                    .insts
+                    .iter()
+                    .position(|&i| i == inst)
+                    .unwrap();
+                let span = graph.insts[inst].span;
+                let (_, result) = graph.insert(block, position, span, Op::IsString(operand), true);
+                Op::Unary(UnaryOp::Not, result.unwrap())
+            };
+        }
+    }
+}
 
 pub(super) fn simplify(graph: &mut Graph) {
     let facts = Facts::compute(graph);

@@ -39,14 +39,17 @@ impl Heap {
         for value in captures {
             data.retain(*value);
         }
-        data.store_shaped(id, Payload::Closure(Box::new(Closure {
-            code,
-            captures: captures.to_vec(),
-            lexical_this: None,
-            constructable: true,
-            class: false,
-            properties: Properties::default(),
-        })));
+        data.store_shaped(
+            id,
+            Payload::Closure(Box::new(Closure {
+                code,
+                captures: captures.to_vec(),
+                lexical_this: None,
+                constructable: true,
+                class: false,
+                properties: Properties::default(),
+            })),
+        );
         Some(Value::from_bits(TAG_OBJECT | id))
     }
 

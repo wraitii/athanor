@@ -4,7 +4,7 @@ pub(super) type Atom = u32;
 pub(super) type ShapeId = u32;
 
 pub(super) const NO_SHAPE: ShapeId = 0;
-pub(super) const DICTIONARY: ShapeId = u32::MAX;
+pub(crate) const DICTIONARY: ShapeId = u32::MAX;
 const INDEXED_KEYS: usize = 8;
 
 #[derive(Default)]
@@ -124,8 +124,9 @@ impl Shapes {
 
     pub(super) fn rebase(&mut self, shape: ShapeId, prototype: Option<Value>) -> ShapeId {
         let keys = self.get(shape).keys.clone();
-        keys.into_iter()
-            .fold(self.root(prototype), |shape, key| self.transition(shape, key))
+        keys.into_iter().fold(self.root(prototype), |shape, key| {
+            self.transition(shape, key)
+        })
     }
 
     fn push(&mut self, shape: Shape) -> ShapeId {

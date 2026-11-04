@@ -21,7 +21,7 @@ use oxc_span::Span;
 use oxc_syntax::symbol::SymbolId;
 
 use crate::error::Error;
-use crate::jit::helpers::Helper;
+use crate::jit::helpers::{Helper, PropertyCache};
 use crate::jit::numeric::Annotations;
 use crate::value::Value;
 
@@ -36,6 +36,7 @@ pub(super) enum FunctionKind {
 pub(super) struct FunctionCompiler<'a, 'f> {
     names: &'a mut Vec<Box<str>>,
     cells: &'a mut Vec<Box<u64>>,
+    property_caches: &'a mut Vec<Box<PropertyCache>>,
     source_name: (usize, usize),
     source_span: Span,
     b: &'a mut FunctionBuilder<'f>,
@@ -65,6 +66,7 @@ pub(super) fn build_function(
     annotations: &mut Annotations,
     names: &mut Vec<Box<str>>,
     cells: &mut Vec<Box<u64>>,
+    property_caches: &mut Vec<Box<PropertyCache>>,
     source_name: (usize, usize),
     params: &FormalParameters<'_>,
     closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
@@ -78,6 +80,7 @@ pub(super) fn build_function(
         annotations,
         names,
         cells,
+        property_caches,
         source_name,
         params,
         closures,
@@ -93,6 +96,7 @@ pub(super) fn build_factory(
     annotations: &mut Annotations,
     names: &mut Vec<Box<str>>,
     cells: &mut Vec<Box<u64>>,
+    property_caches: &mut Vec<Box<PropertyCache>>,
     source_name: (usize, usize),
     params: &FormalParameters<'_>,
     closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
@@ -105,6 +109,7 @@ pub(super) fn build_factory(
         annotations,
         names,
         cells,
+        property_caches,
         source_name,
         params,
         closures,
@@ -125,6 +130,7 @@ fn build_callable(
     annotations: &mut Annotations,
     names: &mut Vec<Box<str>>,
     cells: &mut Vec<Box<u64>>,
+    property_caches: &mut Vec<Box<PropertyCache>>,
     source_name: (usize, usize),
     params: &FormalParameters<'_>,
     closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
@@ -142,6 +148,7 @@ fn build_callable(
     let mut compiler = FunctionCompiler {
         names,
         cells,
+        property_caches,
         source_name,
         source_span: params.span,
         b,
@@ -227,6 +234,7 @@ pub(super) fn build_global(
     annotations: &mut Annotations,
     names: &mut Vec<Box<str>>,
     cells: &mut Vec<Box<u64>>,
+    property_caches: &mut Vec<Box<PropertyCache>>,
     source_name: (usize, usize),
     closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
     graph: &super::semantic::Graph,
@@ -241,6 +249,7 @@ pub(super) fn build_global(
     let mut compiler = FunctionCompiler {
         names,
         cells,
+        property_caches,
         source_name,
         source_span: Span::new(0, 0),
         b,

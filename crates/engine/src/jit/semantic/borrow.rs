@@ -65,13 +65,18 @@ impl Borrows<'_> {
 // the value keeps holding it. When a receiver might not hold it (string indexing allocates),
 // the value must die within its block: slow-path results stay owned by a temporary until the
 // block's clear, and the inline path only runs on arrays, which own their elements.
+// Indexed iteration reads only run on arrays and typed arrays, so their receiver always holds them.
 pub(super) fn borrows(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>) {
     let mut reads = HashMap::new();
+    let mut held = HashSet::new();
     for (_, data) in graph.insts.iter() {
         if let (Some(object), Some(result)) = (receiver(&data.op), data.result)
             && facts.of(result).intersects(HEAP)
         {
             reads.insert(result, object);
+            if matches!(data.op, Op::IndexedGet(..)) {
+                held.insert(result);
+            }
         }
     }
     let mut chains = HashMap::new();
@@ -81,10 +86,10 @@ pub(super) fn borrows(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>)
         while let Some(&next) = reads.get(chain.last().unwrap()) {
             chain.push(next);
         }
-        if chain
-            .iter()
-            .all(|object| facts.of(*object).within(Types::OBJECT))
-        {
+        let results = std::iter::once(value).chain(chain.iter().copied());
+        if results.zip(&chain).all(|(result, object)| {
+            held.contains(&result) || facts.of(*object).within(Types::OBJECT)
+        }) {
             objects.insert(value);
         }
         chains.insert(value, chain);

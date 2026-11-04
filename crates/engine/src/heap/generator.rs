@@ -26,14 +26,17 @@ impl Heap {
         data.retain(closure);
         data.retain(arguments);
         data.retain(receiver);
-        data.store(id, Payload::Generator(Box::new(Generator {
-            code,
-            closure,
-            arguments,
-            receiver,
-            state: 0,
-            locals: Vec::new(),
-        })));
+        data.store(
+            id,
+            Payload::Generator(Box::new(Generator {
+                code,
+                closure,
+                arguments,
+                receiver,
+                state: 0,
+                locals: Vec::new(),
+            })),
+        );
         Some(Value::from_bits(TAG_OBJECT | id))
     }
 

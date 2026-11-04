@@ -32,11 +32,14 @@ impl Heap {
             regex
         };
         let id = data.reserve().ok_or("heap exhausted")?;
-        data.store(id, Payload::RegExp(Box::new(RegExp {
-            regex,
-            global: flags & 16 != 0,
-            last_index: 0.0,
-        })));
+        data.store(
+            id,
+            Payload::RegExp(Box::new(RegExp {
+                regex,
+                global: flags & 16 != 0,
+                last_index: 0.0,
+            })),
+        );
         Ok(Value::from_bits(TAG_OBJECT | id))
     }
 

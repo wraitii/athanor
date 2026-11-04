@@ -16,6 +16,67 @@ fn run(source: &str, ssa_opt: bool) -> Result<Value, String> {
 }
 
 #[test]
+fn typeof_string_comparisons_preserve_values_and_evaluation() {
+    let source = r#"
+        function isString(value) { return typeof value === "string"; }
+        function reversed(value) { return "string" === typeof value; }
+        function isOther(value) { return typeof value !== "string"; }
+        function reversedOther(value) { return "string" !== typeof value; }
+        function shared(value) {
+            let type = typeof value;
+            return type === "string" && type === value;
+        }
+        function main() {
+            let values = ["", "é😀", undefined, null, false, 0, NaN, [], {}, isString, Math.abs];
+            for (let i = 0; i < values.length; ++i) {
+                let expected = i < 2;
+                if (isString(values[i]) !== expected || reversed(values[i]) !== expected ||
+                    isOther(values[i]) === expected || reversedOther(values[i]) === expected)
+                    return false;
+            }
+            let calls = 0;
+            function next() { calls++; return "string"; }
+            return typeof next() === "string" && "string" !== typeof (calls++, 7) &&
+                calls === 2 && typeof missingGlobal !== "string" && shared("string");
+        }
+    "#;
+    for ssa_opt in [false, true] {
+        assert_eq!(run(source, ssa_opt), Ok(Value::TRUE));
+    }
+}
+
+#[test]
+fn typeof_string_comparisons_preserve_errors() {
+    for source in [
+        "function main(){ return typeof x === 'string'; let x; }",
+        "function main(){ return 'string' !== typeof x; let x; }",
+        "function main(){ return typeof null.x === 'string'; }",
+        "function main(){ return typeof x === 'string'; } let result = main(); let x;",
+        "function main(){ let type = typeof x; let x; return type === 'string'; }",
+    ] {
+        let expected = run(source, false);
+        assert!(expected.is_err(), "{source}");
+        assert_eq!(run(source, true), expected, "{source}");
+    }
+}
+
+#[test]
+fn string_equality_compares_contents_across_allocations() {
+    let source = r#"
+        function equal(a, b) { return a === b && a == b && !(a !== b) && !(a != b); }
+        function main() {
+            let text = "é😀";
+            return equal(text, text) && equal(text, "é" + "😀") && equal("", "x".slice(1)) &&
+                !equal(text, "e😀") && !equal("é", "é") && !equal("7", 7) &&
+                !equal("", undefined) && !equal("", null);
+        }
+    "#;
+    for ssa_opt in [false, true] {
+        assert_eq!(run(source, ssa_opt), Ok(Value::TRUE));
+    }
+}
+
+#[test]
 fn heightmap_runs_through_semantic_graph() {
     let source = r#"
         function getMinAndMaxHeight(heightmap = g_Map.height) {

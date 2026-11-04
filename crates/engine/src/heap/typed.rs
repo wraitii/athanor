@@ -180,7 +180,10 @@ impl Heap {
         self.drain(64);
         let mut data = self.0.borrow_mut();
         let id = data.reserve()?;
-        data.store(id, Payload::TypedArray(Box::new(TypedArray { kind, storage })));
+        data.store(
+            id,
+            Payload::TypedArray(Box::new(TypedArray { kind, storage })),
+        );
         Some(Value::from_bits(TAG_OBJECT | id))
     }
 

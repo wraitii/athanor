@@ -10,6 +10,52 @@ fn check(source: &str, expected: f64) {
 }
 
 #[test]
+fn environment_writes_reject_foreign_heap_values() {
+    let mut source = Engine::new().unwrap();
+    source
+        .compile("function make(){ return [5]; }", "foreign.js")
+        .unwrap();
+    let destination = Engine::new().unwrap();
+    let environment = destination.global().child();
+    assert!(destination.global().define("existing", Value::number(7.0)));
+    let string = source.string("foreign").unwrap();
+    let array = source.call("make", &[]).unwrap();
+    for value in [string.value(), array.value()] {
+        assert!(!environment.define("foreign", value));
+        assert!(environment.get("foreign").is_none());
+        assert!(!environment.set("existing", value));
+        assert_eq!(
+            destination.global().get("existing").unwrap().value(),
+            Value::number(7.0)
+        );
+    }
+}
+
+#[test]
+fn environment_writes_retain_local_heap_values_and_reject_disposed_values() {
+    let engine = Engine::new().unwrap();
+    let first = engine.string("first").unwrap();
+    assert!(engine.global().define("value", first.value()));
+    drop(first);
+    assert_eq!(
+        engine.global().get("value").unwrap().text().as_deref(),
+        Some("first")
+    );
+    let second = engine.string("second").unwrap();
+    assert!(engine.global().set("value", second.value()));
+    let stale = second.value();
+    drop(second);
+    assert_eq!(
+        engine.global().get("value").unwrap().text().as_deref(),
+        Some("second")
+    );
+    assert!(engine.global().set("value", Value::UNDEFINED));
+    engine.drain_disposals(1000);
+    assert!(!engine.global().define("stale", stale));
+    assert!(!engine.global().set("value", stale));
+}
+
+#[test]
 fn arguments_survive_later_argument_side_effects() {
     check(
         "var saved; function first(a, b){ return a; }

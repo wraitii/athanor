@@ -11,7 +11,7 @@ use crate::jit::helpers::Helper;
 use crate::jit::semantic::{
     Constant, Facts, Graph, Op, ScopeKind, TerminatorKind, Types, UnaryOp, Value as GraphValue,
 };
-use crate::value::Value;
+use crate::value::{TAG_SHIFT, TAG_STRING, Value};
 
 use super::FunctionCompiler;
 use super::ops::{self, BinaryOp, UnaryOp as EmitUnaryOp};
@@ -138,10 +138,14 @@ impl FunctionCompiler<'_, '_> {
             let created = self.b.func.dfg.num_blocks();
             let params = self.b.block_params(blocks[block.index()]).to_vec();
             let undefined = self.constant(Value::UNDEFINED);
-            let calls = self.annotations.helpers.len();
+            let slotted = self.frame_size.is_some();
             let mut retained_any = false;
             for (&value, &param) in data.params.iter().zip(&params) {
                 if !rooted(value) {
+                    continue;
+                }
+                if slotted {
+                    self.retain_inline(param);
                     continue;
                 }
                 let uninitialized = self.b.ins().icmp_imm(
@@ -162,7 +166,9 @@ impl FunctionCompiler<'_, '_> {
                 retained_any = true;
             }
             for (&value, param) in data.params.iter().zip(params) {
-                if rooted(value) {
+                if rooted(value) && slotted {
+                    self.replace_local(values[value.index()], param);
+                } else if rooted(value) {
                     self.initialize_local(values[value.index()], param);
                 } else if suspends {
                     self.b.def_var(values[value.index()], param);
@@ -172,11 +178,7 @@ impl FunctionCompiler<'_, '_> {
             if retained_any {
                 self.clear_temporaries();
             }
-            let calls = if retained_any {
-                self.annotations.helpers.len()
-            } else {
-                calls
-            };
+            let calls = self.annotations.helpers.len();
             for &inst in &data.insts {
                 let handler = match &data.terminator.as_ref().unwrap().kind {
                     TerminatorKind::CheckException(_, error) => Some(blocks[error.block.index()]),
@@ -203,475 +205,514 @@ impl FunctionCompiler<'_, '_> {
                     typed
                 } else {
                     let result = match &data.op {
-                    Op::Argument(index) => Some(self.load_arg(*index)),
-                    Op::Arguments => {
-                        let value = self.call_helper(Helper::ArrayNew, &[self.argv, self.argc]);
-                        self.check_error();
-                        Some(value)
-                    }
-                    Op::Rest(index) => {
-                        let index = self.b.ins().iconst(types::I64, *index as i64);
-                        let value = self.call_helper(Helper::Rest, &[self.argv, self.argc, index]);
-                        self.check_error();
-                        Some(value)
-                    }
-                    Op::This => Some(self.receiver),
-                    Op::Throw(value) => {
-                        let value = get(self, *value);
-                        self.call_helper(Helper::Throw, &[value]);
-                        self.check_error();
-                        None
-                    }
-                    Op::Catch => {
-                        let dummy = self.constant(Value::UNDEFINED);
-                        Some(self.call_helper(Helper::Catch, &[dummy]))
-                    }
-                    Op::Closure(span, arrow, generator, captures) => {
-                        let (id, _, lexical_this) = self
-                            .closures
-                            .get(&span.start)
-                            .cloned()
-                            .ok_or_else(|| compile_at(*span, "missing closure code"))?;
-                        let cells: Vec<_> = captures
-                            .iter()
-                            .map(|binding| self.b.use_var(bindings[binding.index()]))
-                            .collect();
-                        let argv = self.stack_values(&cells, *span)?;
-                        let count = self.b.ins().iconst(types::I64, cells.len() as i64);
-                        let code = self.b.ins().iconst(types::I64, id.as_u32() as i64);
-                        let result = self.call_helper(Helper::ClosureNew, &[code, argv, count]);
-                        self.check_error();
-                        if *arrow {
-                            let receiver = if lexical_this {
-                                self.receiver
+                        Op::Argument(index) => Some(self.load_arg(*index)),
+                        Op::Arguments => {
+                            let value = self.call_helper(Helper::ArrayNew, &[self.argv, self.argc]);
+                            self.check_error();
+                            Some(value)
+                        }
+                        Op::Rest(index) => {
+                            let index = self.b.ins().iconst(types::I64, *index as i64);
+                            let value =
+                                self.call_helper(Helper::Rest, &[self.argv, self.argc, index]);
+                            self.check_error();
+                            Some(value)
+                        }
+                        Op::This => Some(self.receiver),
+                        Op::Throw(value) => {
+                            let value = get(self, *value);
+                            self.call_helper(Helper::Throw, &[value]);
+                            self.check_error();
+                            None
+                        }
+                        Op::Catch => {
+                            let dummy = self.constant(Value::UNDEFINED);
+                            Some(self.call_helper(Helper::Catch, &[dummy]))
+                        }
+                        Op::Closure(span, arrow, generator, captures) => {
+                            let (id, _, lexical_this) = self
+                                .closures
+                                .get(&span.start)
+                                .cloned()
+                                .ok_or_else(|| compile_at(*span, "missing closure code"))?;
+                            let cells: Vec<_> = captures
+                                .iter()
+                                .map(|binding| self.b.use_var(bindings[binding.index()]))
+                                .collect();
+                            let argv = self.stack_values(&cells, *span)?;
+                            let count = self.b.ins().iconst(types::I64, cells.len() as i64);
+                            let code = self.b.ins().iconst(types::I64, id.as_u32() as i64);
+                            let result = self.call_helper(Helper::ClosureNew, &[code, argv, count]);
+                            self.check_error();
+                            if *arrow {
+                                let receiver = if lexical_this {
+                                    self.receiver
+                                } else {
+                                    self.constant(Value::UNDEFINED)
+                                };
+                                self.call_helper(Helper::BindThis, &[result, receiver]);
+                                self.check_error();
+                            } else if *generator {
+                                self.call_helper(Helper::DisableConstructor, &[result]);
+                                self.check_error();
+                                self.check_error();
+                            }
+                            Some(result)
+                        }
+                        Op::Constant(c) => Some(match c {
+                            Constant::Undefined => self.constant(Value::UNDEFINED),
+                            Constant::Null => self.constant(Value::NULL),
+                            Constant::Boolean(value) => self.constant(Value::boolean(*value)),
+                            Constant::Number(value) => self.constant(Value::number(*value)),
+                            Constant::Uninitialized => self.constant(Value::UNINITIALIZED),
+                            Constant::String(value) => {
+                                let text: Box<str> = value.as_str().into();
+                                let ptr = self.b.ins().iconst(self.pointer, text.as_ptr() as i64);
+                                let len = self.b.ins().iconst(types::I64, text.len() as i64);
+                                self.names.push(text);
+                                let result = self.call_helper(Helper::StringNew, &[ptr, len]);
+                                self.check_error();
+                                result
+                            }
+                        }),
+                        Op::GlobalRead(name) => Some(self.global_access(name, None)),
+                        Op::GlobalReadOptional(name) => Some(self.global_get_optional(name)),
+                        Op::PropertyKey(value) => {
+                            let value = get(self, *value);
+                            let result = self.call_helper(Helper::PropertyKey, &[value]);
+                            self.check_error();
+                            Some(result)
+                        }
+                        Op::RegExp(pattern, flags) => {
+                            let pattern: Box<str> = pattern.as_str().into();
+                            let ptr = self.b.ins().iconst(self.pointer, pattern.as_ptr() as i64);
+                            let len = self.b.ins().iconst(types::I64, pattern.len() as i64);
+                            let flags = self.b.ins().iconst(types::I64, *flags as i64);
+                            self.names.push(pattern);
+                            let result = self.call_helper(Helper::RegExpNew, &[flags, ptr, len]);
+                            self.check_error();
+                            Some(result)
+                        }
+                        Op::GlobalInitialize(name, value) => {
+                            let value = get(self, *value);
+                            self.global_initialize(name, value);
+                            None
+                        }
+                        Op::GlobalWrite(name, value) => {
+                            let value = get(self, *value);
+                            self.global_access(name, Some(value));
+                            None
+                        }
+                        Op::Read(binding) => {
+                            let value = self.b.use_var(bindings[binding.index()]);
+                            let helper = if graph.bindings[*binding].captured {
+                                Helper::CellGet
                             } else {
-                                self.constant(Value::UNDEFINED)
+                                Helper::TempRetain
                             };
-                            self.call_helper(Helper::BindThis, &[result, receiver]);
-                            self.check_error();
-                        } else if *generator {
-                            self.call_helper(Helper::DisableConstructor, &[result]);
+                            let value = self.call_helper(helper, &[value]);
                             self.check_error();
                             self.check_error();
+                            Some(value)
                         }
-                        Some(result)
-                    }
-                    Op::Constant(c) => Some(match c {
-                        Constant::Undefined => self.constant(Value::UNDEFINED),
-                        Constant::Null => self.constant(Value::NULL),
-                        Constant::Boolean(value) => self.constant(Value::boolean(*value)),
-                        Constant::Number(value) => self.constant(Value::number(*value)),
-                        Constant::Uninitialized => self.constant(Value::UNINITIALIZED),
-                        Constant::String(value) => {
-                            let text: Box<str> = value.as_str().into();
-                            let ptr = self.b.ins().iconst(self.pointer, text.as_ptr() as i64);
-                            let len = self.b.ins().iconst(types::I64, text.len() as i64);
-                            self.names.push(text);
-                            let result = self.call_helper(Helper::StringNew, &[ptr, len]);
+                        Op::Write(binding, value) => {
+                            let old = self.b.use_var(bindings[binding.index()]);
+                            let helper = if graph.bindings[*binding].captured {
+                                Helper::CellGet
+                            } else {
+                                Helper::TempRetain
+                            };
+                            self.call_helper(helper, &[old]);
                             self.check_error();
-                            result
+                            let value = get(self, *value);
+                            if graph.bindings[*binding].captured {
+                                self.call_helper(Helper::CellSet, &[old, value]);
+                                self.check_error();
+                            } else {
+                                self.initialize_local(bindings[binding.index()], value);
+                            }
+                            None
                         }
-                    }),
-                    Op::GlobalRead(name) => Some(self.global_access(name, None)),
-                    Op::GlobalReadOptional(name) => Some(self.global_get_optional(name)),
-                    Op::PropertyKey(value) => {
-                        let value = get(self, *value);
-                        let result = self.call_helper(Helper::PropertyKey, &[value]);
-                        self.check_error();
-                        Some(result)
-                    }
-                    Op::RegExp(pattern, flags) => {
-                        let pattern: Box<str> = pattern.as_str().into();
-                        let ptr = self.b.ins().iconst(self.pointer, pattern.as_ptr() as i64);
-                        let len = self.b.ins().iconst(types::I64, pattern.len() as i64);
-                        let flags = self.b.ins().iconst(types::I64, *flags as i64);
-                        self.names.push(pattern);
-                        let result = self.call_helper(Helper::RegExpNew, &[flags, ptr, len]);
-                        self.check_error();
-                        Some(result)
-                    }
-                    Op::GlobalInitialize(name, value) => {
-                        let value = get(self, *value);
-                        self.global_initialize(name, value);
-                        None
-                    }
-                    Op::GlobalWrite(name, value) => {
-                        let value = get(self, *value);
-                        self.global_access(name, Some(value));
-                        None
-                    }
-                    Op::Read(binding) => {
-                        let value = self.b.use_var(bindings[binding.index()]);
-                        let helper = if graph.bindings[*binding].captured {
-                            Helper::CellGet
-                        } else {
-                            Helper::TempRetain
-                        };
-                        let value = self.call_helper(helper, &[value]);
-                        self.check_error();
-                        self.check_error();
-                        Some(value)
-                    }
-                    Op::Write(binding, value) => {
-                        let old = self.b.use_var(bindings[binding.index()]);
-                        let helper = if graph.bindings[*binding].captured {
-                            Helper::CellGet
-                        } else {
-                            Helper::TempRetain
-                        };
-                        self.call_helper(helper, &[old]);
-                        self.check_error();
-                        let value = get(self, *value);
-                        if graph.bindings[*binding].captured {
-                            self.call_helper(Helper::CellSet, &[old, value]);
+                        Op::Initialize(binding, value) => {
+                            let value = get(self, *value);
+                            if graph.bindings[*binding].captured {
+                                let cell = self.b.use_var(bindings[binding.index()]);
+                                self.call_helper(Helper::CellSet, &[cell, value]);
+                                self.check_error();
+                            } else {
+                                self.initialize_local(bindings[binding.index()], value);
+                            }
+                            None
+                        }
+                        Op::CheckInitialized(value) => {
+                            let value = get(self, *value);
+                            let value = self.call_helper(Helper::TempRetain, &[value]);
                             self.check_error();
-                        } else {
-                            self.initialize_local(bindings[binding.index()], value);
+                            Some(value)
                         }
-                        None
-                    }
-                    Op::Initialize(binding, value) => {
-                        let value = get(self, *value);
-                        if graph.bindings[*binding].captured {
-                            let cell = self.b.use_var(bindings[binding.index()]);
-                            self.call_helper(Helper::CellSet, &[cell, value]);
+                        Op::IteratorNew(value)
+                        | Op::IteratorNext(value)
+                        | Op::EnumerateNew(value)
+                        | Op::EnumerateNext(value) => {
+                            let value = get(self, *value);
+                            let helper = match data.op {
+                                Op::IteratorNew(_) => Helper::IterateNew,
+                                Op::IteratorNext(_) => Helper::IterateNext,
+                                Op::EnumerateNew(_) => Helper::EnumerateNew,
+                                Op::EnumerateNext(_) => Helper::EnumerateNext,
+                                _ => unreachable!(),
+                            };
+                            let result = self.call_helper(helper, &[value]);
                             self.check_error();
-                        } else {
-                            self.initialize_local(bindings[binding.index()], value);
+                            self.check_error();
+                            Some(result)
                         }
-                        None
-                    }
-                    Op::CheckInitialized(value) => {
-                        let value = get(self, *value);
-                        let value = self.call_helper(Helper::TempRetain, &[value]);
-                        self.check_error();
-                        Some(value)
-                    }
-                    Op::IteratorNew(value)
-                    | Op::IteratorNext(value)
-                    | Op::EnumerateNew(value)
-                    | Op::EnumerateNext(value) => {
-                        let value = get(self, *value);
-                        let helper = match data.op {
-                            Op::IteratorNew(_) => Helper::IterateNew,
-                            Op::IteratorNext(_) => Helper::IterateNext,
-                            Op::EnumerateNew(_) => Helper::EnumerateNew,
-                            Op::EnumerateNext(_) => Helper::EnumerateNext,
-                            _ => unreachable!(),
-                        };
-                        let result = self.call_helper(helper, &[value]);
-                        self.check_error();
-                        self.check_error();
-                        Some(result)
-                    }
-                    Op::IsUninitialized(value) => {
-                        let value = get(self, *value);
-                        let condition = self.b.ins().icmp_imm(
-                            cranelift_codegen::ir::condcodes::IntCC::Equal,
-                            value,
-                            Value::UNINITIALIZED.bits() as i64,
-                        );
-                        let yes = self.constant(Value::TRUE);
-                        let no = self.constant(Value::FALSE);
-                        Some(self.b.ins().select(condition, yes, no))
-                    }
-                    Op::NewObject => {
-                        let dummy = self.constant(Value::UNDEFINED);
-                        let value = self.call_helper(Helper::ObjectNew, &[dummy]);
-                        self.check_error();
-                        Some(value)
-                    }
-                    Op::NewArray(args) => {
-                        let args: Vec<_> = args.iter().map(|&v| get(self, v)).collect();
-                        let ptr = self.stack_values(&args, data.span)?;
-                        let len = self.b.ins().iconst(types::I64, args.len() as i64);
-                        let value = self.call_helper(Helper::ArrayNew, &[ptr, len]);
-                        self.check_error();
-                        Some(value)
-                    }
-                    Op::DefineHidden(object, name, value) => {
-                        let object = get(self, *object);
-                        let value = get(self, *value);
-                        self.define_hidden_property(object, name, value);
-                        None
-                    }
-                    Op::MarkClass(value) | Op::DisableConstructor(value) => {
-                        let value = get(self, *value);
-                        let helper = if matches!(data.op, Op::MarkClass(_)) {
-                            Helper::MarkClass
-                        } else {
-                            Helper::DisableConstructor
-                        };
-                        self.call_helper(helper, &[value]);
-                        self.check_error();
-                        None
-                    }
-                    Op::Define(object, name, value) | Op::Set(object, name, value) => {
-                        let object = get(self, *object);
-                        let value = get(self, *value);
-                        self.property_access(object, name, Some(value));
-                        None
-                    }
-                    Op::Get(object, name) if name == "length" => {
-                        let object = get(self, *object);
-                        Some(self.length_access(object))
-                    }
-                    Op::Get(object, name) => {
-                        let object = get(self, *object);
-                        Some(self.property_access(object, name, None))
-                    }
-                    Op::GetIndex(object, index)
-                    | Op::TypedIndex(object, index)
-                    | Op::IndexedGet(object, index) => {
-                        let object = get(self, *object);
-                        let index = get(self, *index);
-                        let retain = data.result.is_none_or(|value| !graph.borrowed.contains(&value));
-                        Some(self.element_read(object, Operand::new(index, Repr::Boxed), retain))
-                    }
-                    Op::SetIndex(object, index, value) => {
-                        let object = get(self, *object);
-                        let index = get(self, *index);
-                        let value = get(self, *value);
-                        self.index_access(object, index, Some(value));
-                        None
-                    }
-                    Op::View(object) => {
-                        let object = get(self, *object);
-                        Some(self.view(object))
-                    }
-                    Op::IsNumber(value) => {
-                        let value = get(self, *value);
-                        let condition = self.is_number(value);
-                        let yes = self.constant(Value::TRUE);
-                        let no = self.constant(Value::FALSE);
-                        Some(self.b.ins().select(condition, yes, no))
-                    }
-                    Op::IsTyped(_) => unreachable!(),
-                    Op::IsIndexed(value) => {
-                        let value = get(self, *value);
-                        let view = self.view(value);
-                        let condition = self.has_kind(view, kind::ARRAY | kind::TYPED);
-                        let yes = self.constant(Value::TRUE);
-                        let no = self.constant(Value::FALSE);
-                        Some(self.b.ins().select(condition, yes, no))
-                    }
-                    Op::IndexedLength(value) => {
-                        let value = get(self, *value);
-                        let view = self.view(value);
-                        let length = self.view_length(view);
-                        Some(self.b.ins().bitcast(types::I64, MemFlags::new(), length))
-                    }
-                    Op::AsNumber(value) => Some(get(self, *value)),
-                    Op::ToNumeric(value) => {
-                        let value = get(self, *value);
-                        Some(ops::to_number(self, value))
-                    }
-                    Op::Unary(op, value) => {
-                        let value = get(self, *value);
-                        Some(match op {
-                            UnaryOp::Increment | UnaryOp::Decrement => {
-                                let one = self.constant(Value::number(1.0));
-                                self.binary(
-                                    if matches!(op, UnaryOp::Increment) {
-                                        BinaryOp::Add
-                                    } else {
-                                        BinaryOp::Sub
+                        Op::IsUninitialized(value) => {
+                            let value = get(self, *value);
+                            let condition = self.b.ins().icmp_imm(
+                                cranelift_codegen::ir::condcodes::IntCC::Equal,
+                                value,
+                                Value::UNINITIALIZED.bits() as i64,
+                            );
+                            let yes = self.constant(Value::TRUE);
+                            let no = self.constant(Value::FALSE);
+                            Some(self.b.ins().select(condition, yes, no))
+                        }
+                        Op::NewObject => {
+                            let dummy = self.constant(Value::UNDEFINED);
+                            let value = self.call_helper(Helper::ObjectNew, &[dummy]);
+                            self.check_error();
+                            Some(value)
+                        }
+                        Op::NewArray(args) => {
+                            let args: Vec<_> = args.iter().map(|&v| get(self, v)).collect();
+                            let ptr = self.stack_values(&args, data.span)?;
+                            let len = self.b.ins().iconst(types::I64, args.len() as i64);
+                            let value = self.call_helper(Helper::ArrayNew, &[ptr, len]);
+                            self.check_error();
+                            Some(value)
+                        }
+                        Op::DefineHidden(object, name, value) => {
+                            let object = get(self, *object);
+                            let value = get(self, *value);
+                            self.define_hidden_property(object, name, value);
+                            None
+                        }
+                        Op::MarkClass(value) | Op::DisableConstructor(value) => {
+                            let value = get(self, *value);
+                            let helper = if matches!(data.op, Op::MarkClass(_)) {
+                                Helper::MarkClass
+                            } else {
+                                Helper::DisableConstructor
+                            };
+                            self.call_helper(helper, &[value]);
+                            self.check_error();
+                            None
+                        }
+                        Op::Define(object, name, value) | Op::Set(object, name, value) => {
+                            let object = get(self, *object);
+                            let value = get(self, *value);
+                            self.property_access(object, name, Some(value));
+                            None
+                        }
+                        Op::Get(object, name) if name == "length" => {
+                            let object = get(self, *object);
+                            Some(self.length_access(object))
+                        }
+                        Op::Get(object, name) => {
+                            let object = get(self, *object);
+                            let retain = data
+                                .result
+                                .is_none_or(|value| !graph.borrowed.contains(&value));
+                            Some(self.cached_property_get(object, name, retain))
+                        }
+                        Op::GetIndex(object, index)
+                        | Op::TypedIndex(object, index)
+                        | Op::IndexedGet(object, index) => {
+                            let object = get(self, *object);
+                            let index = get(self, *index);
+                            let retain = data
+                                .result
+                                .is_none_or(|value| !graph.borrowed.contains(&value));
+                            Some(self.element_read(
+                                object,
+                                Operand::new(index, Repr::Boxed),
+                                retain,
+                            ))
+                        }
+                        Op::SetIndex(object, index, value) => {
+                            let object = get(self, *object);
+                            let index = get(self, *index);
+                            let value = get(self, *value);
+                            self.index_access(object, index, Some(value));
+                            None
+                        }
+                        Op::View(object) => {
+                            let object = get(self, *object);
+                            Some(self.view(object))
+                        }
+                        Op::IsNumber(value) => {
+                            let value = get(self, *value);
+                            let condition = self.is_number(value);
+                            let yes = self.constant(Value::TRUE);
+                            let no = self.constant(Value::FALSE);
+                            Some(self.b.ins().select(condition, yes, no))
+                        }
+                        Op::IsString(value) => {
+                            let value = get(self, *value);
+                            let tag = self.b.ins().ushr_imm(value, TAG_SHIFT as i64);
+                            let condition = self.b.ins().icmp_imm(
+                                IntCC::Equal,
+                                tag,
+                                (TAG_STRING >> TAG_SHIFT) as i64,
+                            );
+                            let yes = self.constant(Value::TRUE);
+                            let no = self.constant(Value::FALSE);
+                            Some(self.b.ins().select(condition, yes, no))
+                        }
+                        Op::IsTyped(_) => unreachable!(),
+                        Op::IsIndexed(value) => {
+                            let value = get(self, *value);
+                            let view = self.view(value);
+                            let condition = self.has_kind(view, kind::ARRAY | kind::TYPED);
+                            let yes = self.constant(Value::TRUE);
+                            let no = self.constant(Value::FALSE);
+                            Some(self.b.ins().select(condition, yes, no))
+                        }
+                        Op::IndexedLength(value) => {
+                            let value = get(self, *value);
+                            let view = self.view(value);
+                            let length = self.view_length(view);
+                            Some(self.b.ins().bitcast(types::I64, MemFlags::new(), length))
+                        }
+                        Op::AsNumber(value) => Some(get(self, *value)),
+                        Op::ToNumeric(value) => {
+                            let value = get(self, *value);
+                            Some(ops::to_number(self, value))
+                        }
+                        Op::Unary(op, value) => {
+                            let value = get(self, *value);
+                            Some(match op {
+                                UnaryOp::Increment | UnaryOp::Decrement => {
+                                    let one = self.constant(Value::number(1.0));
+                                    self.binary(
+                                        if matches!(op, UnaryOp::Increment) {
+                                            BinaryOp::Add
+                                        } else {
+                                            BinaryOp::Sub
+                                        },
+                                        value,
+                                        one,
+                                    )
+                                }
+                                _ => self.unary_helper(
+                                    match op {
+                                        UnaryOp::Negate => EmitUnaryOp::Negation,
+                                        UnaryOp::Plus => EmitUnaryOp::Plus,
+                                        UnaryOp::Not => EmitUnaryOp::Not,
+                                        UnaryOp::BitwiseNot => EmitUnaryOp::BitwiseNot,
+                                        UnaryOp::Typeof => EmitUnaryOp::Typeof,
+                                        _ => unreachable!(),
                                     },
                                     value,
-                                    one,
-                                )
-                            }
-                            _ => self.unary_helper(
-                                match op {
-                                    UnaryOp::Negate => EmitUnaryOp::Negation,
-                                    UnaryOp::Plus => EmitUnaryOp::Plus,
-                                    UnaryOp::Not => EmitUnaryOp::Not,
-                                    UnaryOp::BitwiseNot => EmitUnaryOp::BitwiseNot,
-                                    UnaryOp::Typeof => EmitUnaryOp::Typeof,
-                                    _ => unreachable!(),
+                                ),
+                            })
+                        }
+                        Op::Binary(op, left, right) => {
+                            let left = get(self, *left);
+                            let right = get(self, *right);
+                            Some(self.binary(ops::binary_operator(*op), left, right))
+                        }
+                        Op::ArrayAppend(array, value, spread) => {
+                            let array = get(self, *array);
+                            let value = get(self, *value);
+                            self.call_helper(
+                                if *spread {
+                                    Helper::ArrayExtend
+                                } else {
+                                    Helper::ArrayAppend
                                 },
-                                value,
-                            ),
-                        })
-                    }
-                    Op::Binary(op, left, right) => {
-                        let left = get(self, *left);
-                        let right = get(self, *right);
-                        Some(self.binary(ops::binary_operator(*op), left, right))
-                    }
-                    Op::ArrayAppend(array, value, spread) => {
-                        let array = get(self, *array);
-                        let value = get(self, *value);
-                        self.call_helper(
-                            if *spread {
-                                Helper::ArrayExtend
-                            } else {
-                                Helper::ArrayAppend
-                            },
-                            &[array, value],
-                        );
-                        self.check_error();
-                        None
-                    }
-                    Op::CallSpread(callee, receiver, args) => {
-                        let callee = get(self, *callee);
-                        let receiver = get(self, *receiver);
-                        let args = get(self, *args);
-                        let value = self.call_helper(Helper::CallSpread, &[callee, receiver, args]);
-                        self.check_error();
-                        Some(value)
-                    }
-                    Op::ConstructSpread(callee, args) => {
-                        let callee = get(self, *callee);
-                        let args = get(self, *args);
-                        let value = self.call_helper(Helper::ConstructSpread, &[callee, args]);
-                        self.check_error();
-                        Some(value)
-                    }
-                    Op::Call {
-                        callee,
-                        receiver,
-                        args,
-                    } => {
-                        let callee = get(self, *callee);
-                        let receiver = receiver
-                            .map(|v| get(self, v))
-                            .unwrap_or_else(|| self.constant(Value::UNDEFINED));
-                        let args: Vec<_> = args.iter().map(|&v| get(self, v)).collect();
-                        let argv = self.stack_values(&args, data.span)?;
-                        let argc = self.b.ins().iconst(types::I64, args.len() as i64);
-                        let value = self.call_helper(Helper::Call, &[callee, receiver, argv, argc]);
-                        self.check_error();
-                        Some(value)
-                    }
-                    Op::Construct { callee, args } => {
-                        let callee = get(self, *callee);
-                        let args: Vec<_> = args.iter().map(|&v| get(self, v)).collect();
-                        let argv = self.stack_values(&args, data.span)?;
-                        let argc = self.b.ins().iconst(types::I64, args.len() as i64);
-                        let value = self.call_helper(Helper::Construct, &[callee, argv, argc]);
-                        self.check_error();
-                        Some(value)
-                    }
-                    Op::ProbeGlobal(name) => {
-                        let name: Box<str> = name.as_str().into();
-                        let ptr = self.b.ins().iconst(self.pointer, name.as_ptr() as i64);
-                        let len = self.b.ins().iconst(types::I64, name.len() as i64);
-                        self.names.push(name);
-                        Some(self.call_helper(Helper::SemanticGlobalProbe, &[ptr, len]))
-                    }
-                    Op::ProbeProperty(object, name) => {
-                        let object = get(self, *object);
-                        let name: Box<str> = name.as_str().into();
-                        let ptr = self.b.ins().iconst(self.pointer, name.as_ptr() as i64);
-                        let len = self.b.ins().iconst(types::I64, name.len() as i64);
-                        self.names.push(name);
-                        Some(self.call_helper(Helper::SemanticPropertyProbe, &[object, ptr, len]))
-                    }
-                    Op::ProbeIndex(object, key) => {
-                        let object = get(self, *object);
-                        let key = get(self, *key);
-                        Some(self.call_helper(Helper::SemanticIndexProbe, &[object, key]))
-                    }
-                    Op::IsNative(value, native) => {
-                        let value = get(self, *value);
-                        let operation = self.b.ins().iconst(types::I64, native.index() as i64);
-                        Some(self.call_helper(Helper::SemanticMathNative, &[value, operation]))
-                    }
-                    Op::GuardValid(guard) => {
-                        let epoch = self.epoch();
-                        let cell = self.b.ins().iconst(self.pointer, cells[*guard]);
-                        let validated = self.b.ins().load(types::I64, MemFlags::trusted(), cell, 0);
-                        let condition = self.b.ins().icmp(IntCC::Equal, epoch, validated);
-                        let yes = self.constant(Value::TRUE);
-                        let no = self.constant(Value::FALSE);
-                        Some(self.b.ins().select(condition, yes, no))
-                    }
-                    Op::GuardCommit(guard) => {
-                        let epoch = self.epoch();
-                        let cell = self.b.ins().iconst(self.pointer, cells[*guard]);
-                        self.b.ins().store(MemFlags::trusted(), epoch, cell, 0);
-                        None
-                    }
-                    Op::CallNative(native, args) => {
-                        let args: Vec<_> = args.iter().map(|&v| get(self, v)).collect();
-                        let argv = self.stack_values(&args, data.span)?;
-                        let function = crate::jit::math::METHODS[native.index()].1;
-                        Some(self.native_math(function, &args, |this| {
-                            let argc = this.b.ins().iconst(types::I64, args.len() as i64);
-                            let operation = this.b.ins().iconst(types::I64, native.index() as i64);
-                            let receiver = this.constant(Value::UNDEFINED);
-                            let value = this.call_helper(
-                                Helper::MathDirect,
-                                &[operation, receiver, argv, argc],
+                                &[array, value],
                             );
-                            this.check_error();
-                            value
-                        }))
-                    }
-                    Op::IsUndefined(value) => {
-                        let value = get(self, *value);
-                        let condition = self.b.ins().icmp_imm(
-                            cranelift_codegen::ir::condcodes::IntCC::Equal,
-                            value,
-                            Value::UNDEFINED.bits() as i64,
-                        );
-                        let yes = self.constant(Value::TRUE);
-                        let no = self.constant(Value::FALSE);
-                        Some(self.b.ins().select(condition, yes, no))
-                    }
-                    Op::IsNullish(value) => {
-                        let value = get(self, *value);
-                        let condition = self.is_nullish(value);
-                        let yes = self.constant(Value::TRUE);
-                        let no = self.constant(Value::FALSE);
-                        Some(self.b.ins().select(condition, yes, no))
-                    }
-                    Op::EnterScope(scope) => {
-                        for (index, &binding) in graph.scopes[*scope].bindings.iter().enumerate() {
-                            let value = if graph.scopes[*scope].kind == ScopeKind::Captures {
-                                let index = self.b.ins().iconst(types::I64, index as i64);
-                                let cell = self.call_helper(Helper::CaptureGet, &[closure, index]);
-                                self.check_error();
-                                cell
-                            } else if graph.bindings[binding].captured {
-                                let initial = self.constant(Value::UNINITIALIZED);
+                            self.check_error();
+                            None
+                        }
+                        Op::CallSpread(callee, receiver, args) => {
+                            let callee = get(self, *callee);
+                            let receiver = get(self, *receiver);
+                            let args = get(self, *args);
+                            let value =
+                                self.call_helper(Helper::CallSpread, &[callee, receiver, args]);
+                            self.check_error();
+                            Some(value)
+                        }
+                        Op::ConstructSpread(callee, args) => {
+                            let callee = get(self, *callee);
+                            let args = get(self, *args);
+                            let value = self.call_helper(Helper::ConstructSpread, &[callee, args]);
+                            self.check_error();
+                            Some(value)
+                        }
+                        Op::Call {
+                            callee,
+                            receiver,
+                            args,
+                        } => {
+                            let callee = get(self, *callee);
+                            let receiver = receiver
+                                .map(|v| get(self, v))
+                                .unwrap_or_else(|| self.constant(Value::UNDEFINED));
+                            let args: Vec<_> = args.iter().map(|&v| get(self, v)).collect();
+                            let argv = self.stack_values(&args, data.span)?;
+                            let argc = self.b.ins().iconst(types::I64, args.len() as i64);
+                            let value =
+                                self.call_helper(Helper::Call, &[callee, receiver, argv, argc]);
+                            self.check_error();
+                            Some(value)
+                        }
+                        Op::Construct { callee, args } => {
+                            let callee = get(self, *callee);
+                            let args: Vec<_> = args.iter().map(|&v| get(self, v)).collect();
+                            let argv = self.stack_values(&args, data.span)?;
+                            let argc = self.b.ins().iconst(types::I64, args.len() as i64);
+                            let value = self.call_helper(Helper::Construct, &[callee, argv, argc]);
+                            self.check_error();
+                            Some(value)
+                        }
+                        Op::ProbeGlobal(name) => {
+                            let name: Box<str> = name.as_str().into();
+                            let ptr = self.b.ins().iconst(self.pointer, name.as_ptr() as i64);
+                            let len = self.b.ins().iconst(types::I64, name.len() as i64);
+                            self.names.push(name);
+                            Some(self.call_helper(Helper::SemanticGlobalProbe, &[ptr, len]))
+                        }
+                        Op::ProbeProperty(object, name) => {
+                            let object = get(self, *object);
+                            let name: Box<str> = name.as_str().into();
+                            let ptr = self.b.ins().iconst(self.pointer, name.as_ptr() as i64);
+                            let len = self.b.ins().iconst(types::I64, name.len() as i64);
+                            self.names.push(name);
+                            Some(
+                                self.call_helper(
+                                    Helper::SemanticPropertyProbe,
+                                    &[object, ptr, len],
+                                ),
+                            )
+                        }
+                        Op::ProbeIndex(object, key) => {
+                            let object = get(self, *object);
+                            let key = get(self, *key);
+                            Some(self.call_helper(Helper::SemanticIndexProbe, &[object, key]))
+                        }
+                        Op::IsNative(value, native) => {
+                            let value = get(self, *value);
+                            let operation = self.b.ins().iconst(types::I64, native.index() as i64);
+                            Some(self.call_helper(Helper::SemanticMathNative, &[value, operation]))
+                        }
+                        Op::IsCode(value, code) => {
+                            let value = get(self, *value);
+                            let code = self.b.ins().iconst(types::I64, code.as_u32() as i64);
+                            Some(self.call_helper(Helper::SemanticCode, &[value, code]))
+                        }
+                        Op::GuardValid(guard) => {
+                            let epoch = self.epoch();
+                            let cell = self.b.ins().iconst(self.pointer, cells[*guard]);
+                            let validated =
+                                self.b.ins().load(types::I64, MemFlags::trusted(), cell, 0);
+                            let condition = self.b.ins().icmp(IntCC::Equal, epoch, validated);
+                            let yes = self.constant(Value::TRUE);
+                            let no = self.constant(Value::FALSE);
+                            Some(self.b.ins().select(condition, yes, no))
+                        }
+                        Op::GuardCommit(guard) => {
+                            let epoch = self.epoch();
+                            let cell = self.b.ins().iconst(self.pointer, cells[*guard]);
+                            self.b.ins().store(MemFlags::trusted(), epoch, cell, 0);
+                            None
+                        }
+                        Op::CallNative(native, args) => {
+                            let args: Vec<_> = args.iter().map(|&v| get(self, v)).collect();
+                            let argv = self.stack_values(&args, data.span)?;
+                            let function = crate::jit::math::METHODS[native.index()].1;
+                            Some(self.native_math(function, &args, |this| {
+                                let argc = this.b.ins().iconst(types::I64, args.len() as i64);
+                                let operation =
+                                    this.b.ins().iconst(types::I64, native.index() as i64);
+                                let receiver = this.constant(Value::UNDEFINED);
+                                let value = this.call_helper(
+                                    Helper::MathDirect,
+                                    &[operation, receiver, argv, argc],
+                                );
+                                this.check_error();
+                                value
+                            }))
+                        }
+                        Op::IsUndefined(value) => {
+                            let value = get(self, *value);
+                            let condition = self.b.ins().icmp_imm(
+                                cranelift_codegen::ir::condcodes::IntCC::Equal,
+                                value,
+                                Value::UNDEFINED.bits() as i64,
+                            );
+                            let yes = self.constant(Value::TRUE);
+                            let no = self.constant(Value::FALSE);
+                            Some(self.b.ins().select(condition, yes, no))
+                        }
+                        Op::IsNullish(value) => {
+                            let value = get(self, *value);
+                            let condition = self.is_nullish(value);
+                            let yes = self.constant(Value::TRUE);
+                            let no = self.constant(Value::FALSE);
+                            Some(self.b.ins().select(condition, yes, no))
+                        }
+                        Op::EnterScope(scope) => {
+                            for (index, &binding) in
+                                graph.scopes[*scope].bindings.iter().enumerate()
+                            {
+                                let value = if graph.scopes[*scope].kind == ScopeKind::Captures {
+                                    let index = self.b.ins().iconst(types::I64, index as i64);
+                                    let cell =
+                                        self.call_helper(Helper::CaptureGet, &[closure, index]);
+                                    self.check_error();
+                                    cell
+                                } else if graph.bindings[binding].captured {
+                                    let initial = self.constant(Value::UNINITIALIZED);
+                                    let cell = self.call_helper(Helper::CellNew, &[initial]);
+                                    self.check_error();
+                                    cell
+                                } else {
+                                    self.constant(Value::UNINITIALIZED)
+                                };
+                                self.initialize_local(bindings[binding.index()], value);
+                            }
+                            None
+                        }
+                        Op::LeaveScope(scope) => {
+                            for &binding in &graph.scopes[*scope].bindings {
+                                let value = self.constant(Value::UNDEFINED);
+                                self.initialize_local(bindings[binding.index()], value);
+                            }
+                            None
+                        }
+                        Op::NextIteration(scope) | Op::FreshIteration(scope) => {
+                            for &binding in &graph.scopes[*scope].bindings {
+                                if !graph.bindings[binding].captured {
+                                    continue;
+                                }
+                                let initial = if matches!(data.op, Op::FreshIteration(_)) {
+                                    self.constant(Value::UNINITIALIZED)
+                                } else {
+                                    let cell = self.b.use_var(bindings[binding.index()]);
+                                    let value = self.call_helper(Helper::CellGet, &[cell]);
+                                    self.check_error();
+                                    value
+                                };
                                 let cell = self.call_helper(Helper::CellNew, &[initial]);
                                 self.check_error();
-                                cell
-                            } else {
-                                self.constant(Value::UNINITIALIZED)
-                            };
-                            self.initialize_local(bindings[binding.index()], value);
-                        }
-                        None
-                    }
-                    Op::LeaveScope(scope) => {
-                        for &binding in &graph.scopes[*scope].bindings {
-                            let value = self.constant(Value::UNDEFINED);
-                            self.initialize_local(bindings[binding.index()], value);
-                        }
-                        None
-                    }
-                    Op::NextIteration(scope) | Op::FreshIteration(scope) => {
-                        for &binding in &graph.scopes[*scope].bindings {
-                            if !graph.bindings[binding].captured {
-                                continue;
+                                self.initialize_local(bindings[binding.index()], cell);
                             }
-                            let initial = if matches!(data.op, Op::FreshIteration(_)) {
-                                self.constant(Value::UNINITIALIZED)
-                            } else {
-                                let cell = self.b.use_var(bindings[binding.index()]);
-                                let value = self.call_helper(Helper::CellGet, &[cell]);
-                                self.check_error();
-                                value
-                            };
-                            let cell = self.call_helper(Helper::CellNew, &[initial]);
-                            self.check_error();
-                            self.initialize_local(bindings[binding.index()], cell);
+                            None
                         }
-                        None
-                    }
                     };
                     result.map(|value| Operand::new(value, Repr::Boxed))
                 };

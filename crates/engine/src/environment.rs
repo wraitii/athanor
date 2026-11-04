@@ -64,8 +64,13 @@ impl Environment {
         }
     }
 
+    /// Defines a binding, retaining its value. Rejects values outside this runtime's live heap.
+    /// Heap tokens must satisfy the lifetime and runtime requirements of [`Value`].
     pub fn define(&self, name: impl Into<String>, value: Value) -> bool {
         use std::collections::hash_map::Entry;
+        if !self.heap.owns(value) {
+            return false;
+        }
         match self.data.borrow_mut().bindings.entry(name.into()) {
             Entry::Vacant(entry) if self.heap.retain(value) => {
                 entry.insert(value);
@@ -174,7 +179,12 @@ impl Environment {
         }
     }
 
+    /// Replaces a binding, retaining its value. Rejects values outside this runtime's live heap.
+    /// Heap tokens must satisfy the lifetime and runtime requirements of [`Value`].
     pub fn set(&self, name: &str, value: Value) -> bool {
+        if !self.heap.owns(value) {
+            return false;
+        }
         let mut data = self.data.borrow_mut();
         if data.readonly.contains(name) {
             return false;

@@ -18,11 +18,14 @@ impl Heap {
         self.drain(64);
         let mut data = self.0.borrow_mut();
         let id = data.reserve()?;
-        data.store_shaped(id, Payload::Object(Box::new(Object {
-            properties: Properties::default(),
-            error: false,
-            prototype: None,
-        })));
+        data.store_shaped(
+            id,
+            Payload::Object(Box::new(Object {
+                properties: Properties::default(),
+                error: false,
+                prototype: None,
+            })),
+        );
         Some(Value::from_bits(TAG_OBJECT | id))
     }
 
@@ -39,14 +42,37 @@ impl Heap {
         let id = data.reserve()?;
         data.retain(message);
         data.retain(name);
-        data.store_shaped(id, Payload::Object(Box::new(Object {
-            properties: Properties::default(),
-            error: true,
-            prototype: None,
-        })));
+        data.store_shaped(
+            id,
+            Payload::Object(Box::new(Object {
+                properties: Properties::default(),
+                error: true,
+                prototype: None,
+            })),
+        );
         data.put_property(id, "message", message, Some(false));
         data.put_property(id, "name", name, Some(false));
         Some(Value::from_bits(TAG_OBJECT | id))
+    }
+
+    /// The receiver's shape and value index of an own property, if a site cache may hold them.
+    pub(crate) fn cached_property(&self, receiver: Value, name: &str) -> Option<(u32, u32)> {
+        let data = self.0.borrow();
+        let id = heap_id(receiver)?;
+        let shape = data.live(id)?.shape;
+        if shape == NO_SHAPE || shape == DICTIONARY {
+            return None;
+        }
+        let PropertyView::Shaped {
+            atoms,
+            shape: layout,
+            ..
+        } = data.properties(id)?
+        else {
+            return None;
+        };
+        let index = layout.slot(atoms.find(name)?)?;
+        Some((shape, index as u32))
     }
 
     /// Returned values are borrowed; native functions and lazy prototypes are resolved by the caller.
@@ -275,7 +301,9 @@ impl Heap {
         }
         let enumerable = if enumerable.is_none()
             && name == "prototype"
-            && data.closure(id).is_some_and(|closure| closure.constructable)
+            && data
+                .closure(id)
+                .is_some_and(|closure| closure.constructable)
             && !data.properties(id).unwrap().contains_key(name)
         {
             Some(false)
@@ -316,12 +344,15 @@ impl Heap {
             }
             return None;
         };
-        data.store(id, Payload::Enumerator(Box::new(Enumerator {
-            current,
-            keys,
-            cursor: 0,
-            visited: HashSet::default(),
-        })));
+        data.store(
+            id,
+            Payload::Enumerator(Box::new(Enumerator {
+                current,
+                keys,
+                cursor: 0,
+                visited: HashSet::default(),
+            })),
+        );
         Some(Value::from_bits(TAG_OBJECT | id))
     }
 
@@ -417,9 +448,7 @@ impl Heap {
                 .parse::<u32>()
                 .ok()
                 .filter(|index| *index != u32::MAX && index.to_string() == name);
-            return Some(index.is_some_and(|index| {
-                array.present(index as usize)
-            }));
+            return Some(index.is_some_and(|index| array.present(index as usize)));
         }
         let mut current = value;
         loop {
@@ -577,9 +606,8 @@ impl HeapData {
             ) {
                 return Some(false);
             }
-            return array_index_name(name).and_then(|index| {
-                array.present(index as usize).then_some(true)
-            });
+            return array_index_name(name)
+                .and_then(|index| array.present(index as usize).then_some(true));
         }
         None
     }

@@ -387,7 +387,9 @@ fn closure_disposal_is_budgeted_by_capture_edges() {
     heap.release(closure);
     heap.drain(1);
     assert_eq!(
-        heap.0.borrow().slot(heap_id(closure).unwrap())
+        heap.0
+            .borrow()
+            .slot(heap_id(closure).unwrap())
             .payload
             .capture_count(),
         99

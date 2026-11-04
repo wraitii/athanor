@@ -1,8 +1,10 @@
 mod borrow;
 mod build;
 pub(in crate::jit) mod facts;
+mod inlining;
 mod optimize;
 mod promote;
+pub(super) mod specialize;
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -226,12 +228,14 @@ pub(super) enum Op {
     ProbeProperty(Value, String),
     ProbeIndex(Value, Value),
     IsNative(Value, Native),
+    IsCode(Value, cranelift_module::FuncId),
     GuardValid(usize),
     GuardCommit(usize),
     View(Value),
     IsTyped(Value),
     TypedIndex(Value, Value),
     IsNumber(Value),
+    IsString(Value),
     AsNumber(Value),
     EnterScope(Scope),
     LeaveScope(Scope),
@@ -346,9 +350,11 @@ impl Op {
             | Op::IsNullish(value)
             | Op::ProbeProperty(value, _)
             | Op::IsNative(value, _)
+            | Op::IsCode(value, _)
             | Op::View(value)
             | Op::IsTyped(value)
             | Op::IsNumber(value)
+            | Op::IsString(value)
             | Op::AsNumber(value) => vec![value],
             Op::Define(object, _, value)
             | Op::DefineHidden(object, _, value)
@@ -805,6 +811,7 @@ impl Graph {
             },
             Op::CallNative(..) => coercing(Unowned),
             Op::IsUndefined(_) | Op::IsNullish(_) | Op::IsNative(..) => closed(0, &[], Unowned),
+            Op::IsCode(..) => closed(HEAP_READ, &[], Unowned),
             Op::ProbeGlobal(_) => closed(GLOBAL_READ, &[Assumption::NoAccessors], Borrowed),
             Op::ProbeProperty(..) | Op::ProbeIndex(..) => {
                 closed(HEAP_READ, &[Assumption::NoAccessors], Borrowed)
@@ -816,7 +823,7 @@ impl Graph {
             Op::IndexedLength(_) => closed(HEAP_READ, &[], Unowned),
             Op::IndexedGet(..) => closed(HEAP_READ | INTERNAL, &[], Borrowed),
             Op::TypedIndex(..) => closed(HEAP_READ, &[Assumption::FixedTypedStorage], Unowned),
-            Op::IsNumber(_) => closed(0, &[], Unowned),
+            Op::IsNumber(_) | Op::IsString(_) => closed(0, &[], Unowned),
             Op::AsNumber(_) => closed(INTERNAL, &[], Unowned),
             Op::EnterScope(scope) | Op::NextIteration(scope) | Op::FreshIteration(scope) => {
                 if self.materialized(*scope) {
@@ -1026,12 +1033,14 @@ impl Graph {
             Op::ProbeProperty(object, name) => format!("probe {object}.{name}"),
             Op::ProbeIndex(object, key) => format!("probe {object}[{key}]"),
             Op::IsNative(value, native) => format!("is_native {value}, {native}"),
+            Op::IsCode(value, code) => format!("is_code {value}, {code}"),
             Op::GuardValid(guard) => format!("guard_valid {guard}"),
             Op::GuardCommit(guard) => format!("guard_commit {guard}"),
             Op::View(value) => format!("view {value}"),
             Op::IsTyped(value) => format!("is_typed {value}"),
             Op::TypedIndex(object, key) => format!("get_typed {object}[{key}]"),
             Op::IsNumber(value) => format!("is_number {value}"),
+            Op::IsString(value) => format!("is_string {value}"),
             Op::AsNumber(value) => format!("as_number {value}"),
             Op::EnterScope(scope) => format!("enter {scope}"),
             Op::LeaveScope(scope) => format!("leave {scope}"),
@@ -1222,7 +1231,7 @@ pub(super) fn lower_global(
     optimize_graph(graph, ssa_opt)
 }
 
-pub(super) fn lower_for_emission(
+pub(super) fn canonical_for_emission(
     params: &FormalParameters<'_>,
     statements: &[Statement<'_>],
     expression: Option<&Expression<'_>>,
@@ -1235,7 +1244,7 @@ pub(super) fn lower_for_emission(
     arguments_references: &std::collections::HashMap<u32, SymbolId>,
     generator: bool,
     ssa_opt: bool,
-) -> Result<Analysis> {
+) -> Result<Canonical> {
     let graph = build::lower_parts(
         params,
         statements,
@@ -1249,7 +1258,7 @@ pub(super) fn lower_for_emission(
         arguments_references,
         generator,
     )?;
-    optimize_graph(graph, ssa_opt)
+    canonicalize(graph, ssa_opt)
 }
 
 #[cfg(test)]
@@ -1261,8 +1270,37 @@ pub(super) fn analyze(
     optimize_graph(build::lower(function, scoping, captured)?, true)
 }
 
-fn optimize_graph(mut graph: Graph, ssa_opt: bool) -> Result<Analysis> {
+#[derive(Clone)]
+pub(super) struct Canonical {
+    pub(super) graph: Graph,
+    notes: Vec<String>,
+}
+
+fn canonicalize(mut graph: Graph, ssa_opt: bool) -> Result<Canonical> {
     let mut notes = Vec::new();
+    if ssa_opt && !graph.has_handlers && !graph.generator {
+        promote::promote(&mut graph, &mut notes);
+        graph.verify()?;
+        optimize::typeof_comparisons(&mut graph);
+        optimize::simplify(&mut graph);
+        graph.verify()?;
+    }
+    Ok(Canonical { graph, notes })
+}
+
+fn optimize_graph(graph: Graph, ssa_opt: bool) -> Result<Analysis> {
+    optimize_canonical(canonicalize(graph, ssa_opt)?, ssa_opt, None)
+}
+
+pub(super) fn optimize_canonical(
+    canonical: Canonical,
+    ssa_opt: bool,
+    specialization: Option<(&specialize::Repository, usize)>,
+) -> Result<Analysis> {
+    let Canonical {
+        mut graph,
+        mut notes,
+    } = canonical;
     if !ssa_opt || graph.has_handlers || graph.generator {
         let facts = Facts::compute(&graph);
         return Ok(Analysis {
@@ -1271,9 +1309,13 @@ fn optimize_graph(mut graph: Graph, ssa_opt: bool) -> Result<Analysis> {
             notes,
         });
     }
-    promote::promote(&mut graph, &mut notes);
-    graph.verify()?;
-    optimize::simplify(&mut graph);
+    if let Some((bodies, source)) = specialization {
+        let requests = specialize::requests(&graph, bodies, source);
+        let plan = specialize::plan(&graph, bodies, source, &requests);
+        specialize::apply(&mut graph, bodies, source, plan, &mut notes)?;
+        optimize::simplify(&mut graph);
+        graph.verify()?;
+    }
     let mut regions = optimize::version(&mut graph, &mut notes)?;
     graph.verify()?;
     for region in &regions {
@@ -1345,6 +1387,24 @@ mod tests {
             .flat_map(|block| &graph.blocks[block].insts)
             .map(|&inst| &graph.insts[inst].op)
             .collect()
+    }
+
+    #[test]
+    fn typeof_string_comparisons_avoid_string_materialization() {
+        for expression in [
+            "typeof value === 'string'",
+            "'string' === typeof value",
+            "typeof value !== 'string'",
+            "'string' !== typeof value",
+        ] {
+            let analysis = analyze_source(&format!("function f(value) {{ return {expression}; }}"));
+            let operations = ops(&analysis.graph);
+            assert!(operations.iter().any(|op| matches!(op, Op::IsString(_))));
+            assert!(!operations.iter().any(|op| matches!(
+                op,
+                Op::Constant(Constant::String(_)) | Op::Unary(UnaryOp::Typeof, _)
+            )));
+        }
     }
 
     const CONTROL_FLOW: &str = "function f(a, b = g.h) {

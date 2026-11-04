@@ -15,9 +15,12 @@ impl Heap {
         self.drain(64);
         let mut data = self.0.borrow_mut();
         let id = data.reserve()?;
-        data.store(id, Payload::Set(Box::new(Set {
-            entries: HashMap::default(),
-        })));
+        data.store(
+            id,
+            Payload::Set(Box::new(Set {
+                entries: HashMap::default(),
+            })),
+        );
         Some(Value::from_bits(TAG_OBJECT | id))
     }
 
