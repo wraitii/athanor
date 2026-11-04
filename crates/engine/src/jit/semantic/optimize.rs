@@ -49,9 +49,12 @@ pub(super) fn simplify(graph: &mut Graph) {
 
 fn contained_use(op: &Op, index: usize) -> bool {
     match op {
-        Op::Get(..) | Op::GetIndex(..) | Op::Set(..) | Op::SetIndex(..) | Op::Define(..) => {
-            index == 0
-        }
+        Op::Get(..)
+        | Op::GetIndex(..)
+        | Op::TypedIndex(..)
+        | Op::Set(..)
+        | Op::SetIndex(..)
+        | Op::Define(..) => index == 0,
         Op::IsUndefined(_) | Op::IsNullish(_) | Op::CheckInitialized(_) => true,
         Op::Binary(BinaryOperator::StrictEquality | BinaryOperator::StrictInequality, ..) => true,
         Op::IteratorNew(_) | Op::IteratorNext(_) | Op::EnumerateNew(_) | Op::EnumerateNext(_) => {
@@ -136,7 +139,7 @@ impl Access {
     fn of(op: &Op, facts: &Facts) -> Self {
         match op {
             Op::Get(_, name) | Op::Set(_, name, _) | Op::Define(_, name, _) => Self::named(name),
-            Op::GetIndex(_, key) | Op::SetIndex(_, key, _)
+            Op::GetIndex(_, key) | Op::TypedIndex(_, key) | Op::SetIndex(_, key, _)
                 if facts.of(*key).within(Types::NUMBER) =>
             {
                 Self::Elements
@@ -228,7 +231,7 @@ impl Writes {
 
     fn preserves(&self, op: &Op) -> bool {
         match op {
-            Op::Get(object, _) | Op::GetIndex(object, _) => {
+            Op::Get(object, _) | Op::GetIndex(object, _) | Op::TypedIndex(object, _) => {
                 !self.clobbers(*object, &Access::of(op, &self.facts))
             }
             Op::GlobalRead(name) => !self.clobbers_global(name),
@@ -397,7 +400,7 @@ fn region(
         return Ok(Some(all));
     }
     let mut candidate = graph.clone();
-    let fast = apply_version(&mut candidate, blocks, entry, &requirements, &[], &[]);
+    let (fast, _) = apply_version(&mut candidate, blocks, entry, &requirements, &[], &[], &[]);
     candidate.verify()?;
     if let Some(reason) = closure_failure(&candidate, &fast, &Guarded::new(&requirements)) {
         notes.push(format!("{label}not versioned: guarded copy {reason}"));
@@ -452,37 +455,164 @@ pub(super) fn check_loops(
             .collect();
         let probes = probe_reads(graph, &blocks);
         let checks = entry_checks(graph, &blocks, &probes);
-        if checks.is_empty() && probes.is_empty() {
-            continue;
-        }
         let mut candidate = graph.clone();
-        let copy = apply_version(
-            &mut candidate,
-            &blocks,
-            Some((preheader, header)),
-            &[],
-            &checks,
-            &probes,
-        );
-        candidate.verify()?;
-        if closure_failure(&candidate, &copy, &Guarded::default()).is_some() {
-            continue;
-        }
-        let list: Vec<String> = checks.iter().map(ToString::to_string).collect();
-        notes.push(format!(
-            "loop at {header}: number checks on [{}] and {} read probes select the typed copy",
-            list.join(", "),
-            probes.len()
-        ));
-        *graph = candidate;
-        for region in regions.iter_mut() {
-            if body.is_subset(region) {
-                region.extend(copy.iter().copied());
+        let mut numbered = None;
+        if !checks.is_empty() || !probes.is_empty() {
+            let (copy, copy_header) = apply_version(
+                &mut candidate,
+                &blocks,
+                Some((preheader, header)),
+                &[],
+                &checks,
+                &probes,
+                &[],
+            );
+            candidate.verify()?;
+            if closure_failure(&candidate, &copy, &Guarded::default()).is_none() {
+                let list: Vec<String> = checks.iter().map(ToString::to_string).collect();
+                notes.push(format!(
+                    "loop at {header}: number checks on [{}] and {} read probes select the typed copy",
+                    list.join(", "),
+                    probes.len()
+                ));
+                numbered = Some((copy, copy_header));
+            } else {
+                candidate = graph.clone();
             }
         }
-        fallbacks.extend(body);
-        copies.push(copy);
+        let (layer_body, layer_header) = match &numbered {
+            Some((copy, copy_header)) => (copy.clone(), *copy_header),
+            None => (body.clone(), header),
+        };
+        let typed = typed_version(&mut candidate, layer_header, &layer_body, notes)?;
+        if numbered.is_none() && typed.is_none() {
+            continue;
+        }
+        *graph = candidate;
+        fallbacks.extend(body.iter().copied());
+        let mut added: Vec<HashSet<Block>> = Vec::new();
+        if let Some((copy, _)) = numbered {
+            if typed.is_some() {
+                fallbacks.extend(copy.iter().copied());
+            }
+            added.push(copy);
+        }
+        added.extend(typed);
+        for copy in added {
+            for region in regions.iter_mut() {
+                if body.is_subset(region) {
+                    region.extend(copy.iter().copied());
+                }
+            }
+            copies.push(copy);
+        }
     }
+}
+
+const NUMERIC: Types = Types::NUMBER.union(Types::UNDEFINED);
+
+fn receiver_use(op: &Op, index: usize) -> bool {
+    match op {
+        Op::Get(..)
+        | Op::GetIndex(..)
+        | Op::TypedIndex(..)
+        | Op::Set(..)
+        | Op::SetIndex(..)
+        | Op::Define(..)
+        | Op::Construct { .. }
+        | Op::IteratorNew(_)
+        | Op::EnumerateNew(_) => index == 0,
+        Op::Call { receiver, .. } => index == 0 || (index == 1 && receiver.is_some()),
+        _ => false,
+    }
+}
+
+fn typed_objects(graph: &Graph, body: &HashSet<Block>) -> Vec<Value> {
+    let facts = Facts::compute(graph);
+    let mut reads = HashMap::new();
+    for &block in body {
+        for &inst in &graph.blocks[block].insts {
+            let data = &graph.insts[inst];
+            if let (Op::GetIndex(object, key), Some(result)) = (&data.op, data.result)
+                && !body.contains(&graph.def_block(*object))
+                && facts.of(*object).intersects(Types::OBJECT)
+                && facts.of(*key).within(NUMERIC)
+            {
+                reads.insert(result, *object);
+            }
+        }
+    }
+    let mut excluded = HashSet::new();
+    for &block in body {
+        for &inst in &graph.blocks[block].insts {
+            let op = &graph.insts[inst].op;
+            for (index, value) in op.operands().into_iter().enumerate() {
+                if let Some(&object) = reads.get(&value)
+                    && receiver_use(op, index)
+                {
+                    excluded.insert(object);
+                }
+            }
+        }
+    }
+    let objects: HashSet<Value> = reads.into_values().collect();
+    let mut objects: Vec<Value> = objects.difference(&excluded).copied().collect();
+    objects.sort();
+    objects
+}
+
+fn typed_version(
+    graph: &mut Graph,
+    header: Block,
+    body: &HashSet<Block>,
+    notes: &mut Vec<String>,
+) -> Result<Option<HashSet<Block>>> {
+    let cfg = Cfg::new(graph);
+    let Some(preheader) = preheader(graph, &cfg, header, body) else {
+        return Ok(None);
+    };
+    let objects = typed_objects(graph, body);
+    if objects.is_empty() {
+        return Ok(None);
+    }
+    let blocks: Vec<Block> = cfg
+        .rpo
+        .iter()
+        .copied()
+        .filter(|block| body.contains(block))
+        .collect();
+    let mut candidate = graph.clone();
+    let (copy, _) = apply_version(
+        &mut candidate,
+        &blocks,
+        Some((preheader, header)),
+        &[],
+        &[],
+        &[],
+        &objects,
+    );
+    let facts = Facts::compute(&candidate);
+    for &block in &copy {
+        for inst in candidate.blocks[block].insts.clone() {
+            if let Op::GetIndex(object, key) = candidate.insts[inst].op
+                && objects.contains(&object)
+                && facts.of(key).within(NUMERIC)
+            {
+                candidate.insts[inst].op = Op::TypedIndex(object, key);
+            }
+        }
+    }
+    candidate.verify()?;
+    if closure_failure(&candidate, &copy, &Guarded::default()).is_some() {
+        return Ok(None);
+    }
+    let list: Vec<String> = objects.iter().map(ToString::to_string).collect();
+    notes.push(format!(
+        "loop at {header}: typed array checks on [{}] select the typed copy",
+        list.join(", ")
+    ));
+    *graph = candidate;
+    Ok(Some(copy))
 }
 
 fn preheader(graph: &Graph, cfg: &Cfg, header: Block, body: &HashSet<Block>) -> Option<Block> {
@@ -517,7 +647,7 @@ fn numeric_use(op: &Op, index: usize) -> bool {
         ),
         Op::Unary(operator, _) => !matches!(operator, UnaryOp::Not | UnaryOp::Typeof),
         Op::ToNumeric(_) | Op::CallNative(..) => true,
-        Op::GetIndex(..) | Op::SetIndex(..) => index == 1,
+        Op::GetIndex(..) | Op::TypedIndex(..) | Op::SetIndex(..) => index == 1,
         _ => false,
     }
 }
@@ -535,7 +665,7 @@ fn entry_checks(graph: &Graph, region: &[Block], probes: &[Inst]) -> Vec<Value> 
             let op = &graph.insts[inst].op;
             for (index, value) in op.operands().into_iter().enumerate() {
                 if numeric_use(op, index)
-                    && !facts.of(value).within(Types::NUMBER)
+                    && !facts.of(value).within(NUMERIC)
                     && (!inside.contains(&graph.def_block(value)) || probed.contains(&value))
                     && !matches!(graph.defining_op(value), Some(Op::Constant(_)))
                 {
@@ -574,7 +704,8 @@ fn apply_version(
     requirements: &[Requirement],
     checks: &[Value],
     reads: &[Inst],
-) -> HashSet<Block> {
+    typed: &[Value],
+) -> (HashSet<Block>, Block) {
     let head = entry.map_or(graph.entry, |(_, header)| header);
     let mut blocks = HashMap::new();
     let mut values = HashMap::new();
@@ -749,6 +880,18 @@ fn apply_version(
         graph.remove_inst(insts[&inst]);
         values.insert(result, value);
     }
+    for &object in typed {
+        let check = graph
+            .append(current, span, Op::IsTyped(object), true)
+            .1
+            .unwrap();
+        let next = graph.blocks.push(BlockData::default());
+        graph.blocks[current].terminator = Some(Terminator {
+            span,
+            kind: TerminatorKind::Branch(check, Target::new(next), original.clone()),
+        });
+        current = next;
+    }
     for &value in checks {
         let checked = values.get(&value).copied().unwrap_or(value);
         let check = graph
@@ -848,7 +991,7 @@ fn apply_version(
         })
         .collect();
     repair(graph, &definitions);
-    copies
+    (copies, blocks[&head])
 }
 
 fn repair(graph: &mut Graph, values: &HashMap<Value, Vec<Value>>) {
@@ -959,7 +1102,7 @@ pub(super) fn reuse_loads(graph: &mut Graph, region: &HashSet<Block>, notes: &mu
                 Op::Get(object, name) => {
                     LoadKey::Property(resolve(&aliases, *object), name.clone())
                 }
-                Op::GetIndex(object, key) => {
+                Op::GetIndex(object, key) | Op::TypedIndex(object, key) => {
                     LoadKey::Index(resolve(&aliases, *object), resolve(&aliases, *key))
                 }
                 Op::GlobalRead(name) => LoadKey::Global(name.clone()),
@@ -1121,7 +1264,9 @@ pub(super) fn views(graph: &mut Graph, notes: &mut Vec<String>) {
     let mut placed: HashMap<(Block, Value), Value> = HashMap::new();
     for &block in &cfg.rpo {
         for inst in graph.blocks[block].insts.clone() {
-            let (Op::GetIndex(object, key) | Op::SetIndex(object, key, _)) = graph.insts[inst].op
+            let (Op::GetIndex(object, key)
+            | Op::TypedIndex(object, key)
+            | Op::SetIndex(object, key, _)) = graph.insts[inst].op
             else {
                 continue;
             };

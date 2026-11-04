@@ -2,6 +2,7 @@ pub(super) mod class;
 pub(in crate::jit) mod expression;
 mod ir_helpers;
 mod ops;
+mod repr;
 pub(in crate::jit) mod scope;
 mod semantic_graph;
 mod statement;

@@ -1,17 +1,46 @@
-use cranelift_codegen::entity::EntityRef;
+use std::cell::RefCell;
+
+use cranelift_codegen::entity::{EntityRef, SecondaryMap};
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{BlockArg, InstBuilder, MemFlags, Value as ClifValue, types};
 use cranelift_frontend::Variable;
 
 use crate::error::{Error, compile_at};
 use crate::jit::helpers::Helper;
-use crate::jit::semantic::{Constant, Facts, Graph, Op, ScopeKind, TerminatorKind, Types, UnaryOp};
+use crate::jit::semantic::{
+    Constant, Facts, Graph, Op, ScopeKind, TerminatorKind, Types, UnaryOp, Value as GraphValue,
+};
 use crate::value::Value;
 
 use super::FunctionCompiler;
 use super::ops::{self, BinaryOp, UnaryOp as EmitUnaryOp};
+use super::repr::{Operand, Repr};
 
 const HEAP: Types = Types::STRING.union(Types::OBJECT).union(Types::OTHER);
+const NUMERIC: Types = Types::NUMBER.union(Types::UNDEFINED);
+
+struct Context<'a> {
+    values: &'a [Variable],
+    direct: Option<RefCell<SecondaryMap<GraphValue, Option<ClifValue>>>>,
+    reprs: &'a SecondaryMap<GraphValue, Repr>,
+    facts: &'a Facts,
+}
+
+impl Context<'_> {
+    fn define(&self, value: GraphValue, clif: ClifValue) {
+        if let Some(direct) = &self.direct {
+            direct.borrow_mut()[value] = Some(clif);
+        }
+    }
+
+    fn numeric(&self, value: GraphValue) -> bool {
+        self.facts.of(value).within(NUMERIC)
+    }
+
+    fn number(&self, value: GraphValue) -> bool {
+        self.facts.of(value).within(Types::NUMBER)
+    }
+}
 
 impl FunctionCompiler<'_, '_> {
     fn epoch(&mut self) -> ClifValue {
@@ -36,10 +65,18 @@ impl FunctionCompiler<'_, '_> {
             .values()
             .map(|_| self.b.create_block())
             .collect();
+        let facts = Facts::compute(graph);
+        let suspends = self.generator.is_some();
+        let mut reprs: SecondaryMap<GraphValue, Repr> = SecondaryMap::with_default(Repr::Boxed);
+        if !suspends {
+            for value in graph.values.keys() {
+                reprs[value] = Repr::of(facts.of(value));
+            }
+        }
         let values: Vec<Variable> = graph
             .values
-            .values()
-            .map(|_| self.b.declare_var(types::I64))
+            .keys()
+            .map(|value| self.b.declare_var(reprs[value].clif()))
             .collect();
         let bindings: Vec<Variable> = graph
             .bindings
@@ -54,22 +91,41 @@ impl FunctionCompiler<'_, '_> {
                 address
             })
             .collect();
-        let facts = Facts::compute(graph);
-        let suspends = self.generator.is_some();
         let rooted =
             |value: crate::jit::semantic::Value| suspends || facts.of(value).intersects(HEAP);
-        let reachable = crate::jit::semantic::Cfg::new(graph).rpo;
+        let cfg = crate::jit::semantic::Cfg::new(graph);
+        let reachable = cfg.rpo.clone();
+        let mut pending: SecondaryMap<crate::jit::semantic::Block, usize> = SecondaryMap::new();
+        for &block in &reachable {
+            pending[block] = cfg.preds[block].len();
+        }
         for &block in &reachable {
             let data = &graph.blocks[block];
-            for _ in &data.params {
-                self.b.append_block_param(blocks[block.index()], types::I64);
+            for &param in &data.params {
+                self.b
+                    .append_block_param(blocks[block.index()], reprs[param].clif());
             }
         }
         let undefined = self.constant(Value::UNDEFINED);
-        for &variable in values.iter().chain(&bindings) {
+        for &variable in &bindings {
             self.b.def_var(variable, undefined);
         }
+        if suspends {
+            for value in graph.values.keys() {
+                let zero = self.zero(reprs[value]);
+                self.b.def_var(values[value.index()], zero);
+            }
+        }
+        let cx = Context {
+            values: &values,
+            direct: (!suspends).then(|| RefCell::new(SecondaryMap::new())),
+            reprs: &reprs,
+            facts: &facts,
+        };
         self.jump(blocks[graph.entry.index()], &[]);
+        if pending[graph.entry] == 0 {
+            self.b.seal_block(blocks[graph.entry.index()]);
+        }
         for &block in &reachable {
             let data = &graph.blocks[block];
             if self.annotations.semantic_locations {
@@ -81,6 +137,7 @@ impl FunctionCompiler<'_, '_> {
             let created = self.b.func.dfg.num_blocks();
             let params = self.b.block_params(blocks[block.index()]).to_vec();
             let undefined = self.constant(Value::UNDEFINED);
+            let calls = self.annotations.helpers.len();
             let mut retained_any = false;
             for (&value, &param) in data.params.iter().zip(&params) {
                 if !rooted(value) {
@@ -106,13 +163,19 @@ impl FunctionCompiler<'_, '_> {
             for (&value, param) in data.params.iter().zip(params) {
                 if rooted(value) {
                     self.initialize_local(values[value.index()], param);
-                } else {
+                } else if suspends {
                     self.b.def_var(values[value.index()], param);
                 }
+                cx.define(value, param);
             }
             if retained_any {
                 self.clear_temporaries();
             }
+            let calls = if retained_any {
+                self.annotations.helpers.len()
+            } else {
+                calls
+            };
             for &inst in &data.insts {
                 let handler = match &data.terminator.as_ref().unwrap().kind {
                     TerminatorKind::CheckException(_, error) => Some(blocks[error.block.index()]),
@@ -130,10 +193,15 @@ impl FunctionCompiler<'_, '_> {
                         data.span.start
                     },
                 ));
-                let get = |this: &mut Self, value: crate::jit::semantic::Value| {
-                    this.b.use_var(values[value.index()])
+                let get = |this: &mut Self, value: GraphValue| {
+                    let operand = this.operand(&cx, value);
+                    this.convert(operand, Repr::Boxed)
                 };
-                let result = match &data.op {
+                let typed = self.typed_op(&cx, graph, inst)?;
+                let result = if let Some(typed) = typed {
+                    typed
+                } else {
+                    let result = match &data.op {
                     Op::Argument(index) => Some(self.load_arg(*index)),
                     Op::Arguments => {
                         let value = self.call_helper(Helper::ArrayNew, &[self.argv, self.argc]);
@@ -347,30 +415,16 @@ impl FunctionCompiler<'_, '_> {
                         let object = get(self, *object);
                         Some(self.property_access(object, name, None))
                     }
-                    Op::GetIndex(object, index) => {
+                    Op::GetIndex(object, index) | Op::TypedIndex(object, index) => {
                         let object = get(self, *object);
                         let index = get(self, *index);
-                        Some(match graph.views.get(&inst) {
-                            Some(&view) => {
-                                let view = get(self, view);
-                                self.viewed_index_access(view, object, index, None)
-                            }
-                            None => self.index_access(object, index, None),
-                        })
+                        Some(self.index_access(object, index, None))
                     }
                     Op::SetIndex(object, index, value) => {
                         let object = get(self, *object);
                         let index = get(self, *index);
                         let value = get(self, *value);
-                        match graph.views.get(&inst) {
-                            Some(&view) => {
-                                let view = get(self, view);
-                                self.viewed_index_access(view, object, index, Some(value));
-                            }
-                            None => {
-                                self.index_access(object, index, Some(value));
-                            }
-                        }
+                        self.index_access(object, index, Some(value));
                         None
                     }
                     Op::View(object) => {
@@ -384,6 +438,7 @@ impl FunctionCompiler<'_, '_> {
                         let no = self.constant(Value::FALSE);
                         Some(self.b.ins().select(condition, yes, no))
                     }
+                    Op::IsTyped(_) => unreachable!(),
                     Op::AsNumber(value) => Some(get(self, *value)),
                     Op::ToNumeric(value) => {
                         let value = get(self, *value);
@@ -595,20 +650,24 @@ impl FunctionCompiler<'_, '_> {
                         }
                         None
                     }
+                    };
+                    result.map(|value| Operand::new(value, Repr::Boxed))
                 };
                 if let (Some(value), Some(result)) = (data.result, result) {
+                    let result = self.convert(result, reprs[value]);
                     let borrowed = matches!(data.op, Op::This | Op::Argument(_)) && !suspends;
                     if rooted(value) && !borrowed {
                         self.initialize_local(values[value.index()], result);
-                    } else {
+                    } else if suspends {
                         self.b.def_var(values[value.index()], result);
                     }
+                    cx.define(value, result);
                 }
                 if handler.is_some() {
                     self.handlers.pop();
                 }
             }
-            if !data.insts.is_empty() {
+            if self.annotations.helpers.len() != calls {
                 self.clear_temporaries();
             }
             let terminator = data.terminator.as_ref().unwrap();
@@ -624,7 +683,11 @@ impl FunctionCompiler<'_, '_> {
                 let args: Vec<_> = target
                     .args
                     .iter()
-                    .map(|value| BlockArg::Value(this.b.use_var(values[value.index()])))
+                    .zip(&graph.blocks[target.block].params)
+                    .map(|(&value, &param)| {
+                        let operand = this.operand(&cx, value);
+                        BlockArg::Value(this.convert(operand, reprs[param]))
+                    })
                     .collect();
                 (blocks[target.block.index()], args)
             };
@@ -634,29 +697,16 @@ impl FunctionCompiler<'_, '_> {
                     self.jump(block, &args);
                 }
                 TerminatorKind::Branch(value, yes, no) => {
-                    let condition = match graph.defining_op(*value) {
-                        Some(Op::IsNumber(checked)) => {
-                            let checked = self.b.use_var(values[checked.index()]);
-                            self.is_number(checked)
-                        }
-                        _ if facts.of(*value).within(Types::BOOLEAN) => {
-                            let value = self.b.use_var(values[value.index()]);
-                            self.b
-                                .ins()
-                                .icmp_imm(IntCC::Equal, value, Value::TRUE.bits() as i64)
-                        }
-                        _ => {
-                            let value = self.b.use_var(values[value.index()]);
-                            self.truthy(value)
-                        }
-                    };
+                    let operand = self.operand(&cx, *value);
+                    let condition = self.condition(operand, cx.numeric(*value));
                     let (yes, yes_args) = target(self, yes);
                     let (no, no_args) = target(self, no);
                     self.brif(condition, yes, &yes_args, no, &no_args);
                 }
                 TerminatorKind::Yield(span, value, target_) => {
                     let generator = self.generator.unwrap();
-                    let value = self.b.use_var(values[value.index()]);
+                    let operand = self.operand(&cx, *value);
+                    let value = self.convert(operand, Repr::Boxed);
                     let (state, resume) = self.suspensions[&span.start];
                     let state = self.b.ins().iconst(types::I64, state as i64);
                     let result =
@@ -674,8 +724,15 @@ impl FunctionCompiler<'_, '_> {
                     self.jump(block, &args);
                 }
                 TerminatorKind::Return(value) => {
-                    let value = self.b.use_var(values[value.index()]);
+                    let operand = self.operand(&cx, *value);
+                    let value = self.convert(operand, Repr::Boxed);
                     self.jump(self.return_block, &[BlockArg::Value(value)]);
+                }
+            }
+            for successor in graph.successors(block) {
+                pending[successor] -= 1;
+                if pending[successor] == 0 {
+                    self.b.seal_block(blocks[successor.index()]);
                 }
             }
             if cold {
@@ -694,5 +751,185 @@ impl FunctionCompiler<'_, '_> {
         let result = self.b.block_params(self.return_block)[0];
         self.return_value(result);
         Ok(())
+    }
+}
+
+impl FunctionCompiler<'_, '_> {
+    fn operand(&mut self, cx: &Context<'_>, value: GraphValue) -> Operand {
+        let clif = match &cx.direct {
+            Some(direct) => direct.borrow()[value].expect("semantic value used before definition"),
+            None => self.b.use_var(cx.values[value.index()]),
+        };
+        Operand::new(clif, cx.reprs[value])
+    }
+
+    fn typed_op(
+        &mut self,
+        cx: &Context<'_>,
+        graph: &Graph,
+        inst: crate::jit::semantic::Inst,
+    ) -> Result<Option<Option<Operand>>, Error> {
+        let data = &graph.insts[inst];
+        let target = data.result.map(|value| cx.reprs[value]);
+        let boolean = |condition: ClifValue| Some(Some(Operand::new(condition, Repr::Bool)));
+        Ok(match &data.op {
+            Op::Constant(Constant::Number(number)) => match target {
+                Some(Repr::Float) => Some(Some(Operand::new(
+                    self.b.ins().f64const(*number),
+                    Repr::Float,
+                ))),
+                Some(Repr::Int32) => Some(Some(Operand::new(
+                    self.b.ins().iconst(types::I32, *number as i32 as i64),
+                    Repr::Int32,
+                ))),
+                _ => None,
+            },
+            Op::Constant(Constant::Boolean(value)) if target == Some(Repr::Bool) => {
+                let value = self.b.ins().iconst(types::I8, i64::from(*value));
+                boolean(value)
+            }
+            Op::Binary(operator, left, right) => {
+                let op = ops::binary_operator(*operator);
+                let applicable = match op {
+                    BinaryOp::LooseEqual
+                    | BinaryOp::StrictEqual
+                    | BinaryOp::LooseNotEqual
+                    | BinaryOp::StrictNotEqual => cx.number(*left) && cx.number(*right),
+                    BinaryOp::Instanceof | BinaryOp::In | BinaryOp::Rem | BinaryOp::Pow => false,
+                    _ => cx.numeric(*left) && cx.numeric(*right),
+                };
+                let (left, right) = (self.operand(cx, *left), self.operand(cx, *right));
+                if left.repr == Repr::Bool
+                    && right.repr == Repr::Bool
+                    && matches!(op, BinaryOp::StrictEqual | BinaryOp::StrictNotEqual)
+                {
+                    let condition = if op == BinaryOp::StrictEqual {
+                        IntCC::Equal
+                    } else {
+                        IntCC::NotEqual
+                    };
+                    let value = self.b.ins().icmp(condition, left.value, right.value);
+                    return Ok(boolean(value));
+                }
+                if !applicable {
+                    return Ok(None);
+                }
+                self.typed_binary(op, left, right).map(Some)
+            }
+            Op::Unary(UnaryOp::Increment | UnaryOp::Decrement, value) if cx.numeric(*value) => {
+                let operand = self.operand(cx, *value);
+                let delta = if matches!(data.op, Op::Unary(UnaryOp::Increment, _)) {
+                    1
+                } else {
+                    -1
+                };
+                Some(Some(if target == Some(Repr::Int32) {
+                    let integer = self.convert(operand, Repr::Int32);
+                    Operand::new(self.b.ins().iadd_imm(integer, delta), Repr::Int32)
+                } else {
+                    let float = self.convert(operand, Repr::Float);
+                    let one = self.b.ins().f64const(delta as f64);
+                    Operand::new(self.b.ins().fadd(float, one), Repr::Float)
+                }))
+            }
+            Op::Unary(UnaryOp::Negate, value) if cx.numeric(*value) => {
+                let operand = self.operand(cx, *value);
+                let float = self.convert(operand, Repr::Float);
+                Some(Some(Operand::new(self.b.ins().fneg(float), Repr::Float)))
+            }
+            Op::Unary(UnaryOp::BitwiseNot, value) if cx.numeric(*value) => {
+                let operand = self.operand(cx, *value);
+                let integer = self.convert(operand, Repr::Int32);
+                Some(Some(Operand::new(self.b.ins().bnot(integer), Repr::Int32)))
+            }
+            Op::Unary(UnaryOp::Plus, value) | Op::ToNumeric(value) | Op::AsNumber(value)
+                if cx.numeric(*value) || matches!(data.op, Op::AsNumber(_)) =>
+            {
+                let operand = self.operand(cx, *value);
+                Some(Some(match operand.repr {
+                    Repr::Int32 | Repr::Float => operand,
+                    _ => Operand::new(self.convert(operand, Repr::Float), Repr::Float),
+                }))
+            }
+            Op::Unary(UnaryOp::Not, value)
+                if cx.numeric(*value) || cx.reprs[*value] != Repr::Boxed =>
+            {
+                let operand = self.operand(cx, *value);
+                let truth = self.condition(operand, true);
+                let value = self.b.ins().icmp_imm(IntCC::Equal, truth, 0);
+                boolean(value)
+            }
+            Op::IsNumber(value) => {
+                let operand = self.operand(cx, *value);
+                let value = match operand.repr {
+                    Repr::Boxed => self.is_number(operand.value),
+                    Repr::Bool => self.b.ins().iconst(types::I8, 0),
+                    _ => self.b.ins().iconst(types::I8, 1),
+                };
+                boolean(value)
+            }
+            Op::IsUninitialized(value) | Op::IsUndefined(value) | Op::IsNullish(value) => {
+                let operand = self.operand(cx, *value);
+                let value = if operand.repr != Repr::Boxed {
+                    self.b.ins().iconst(types::I8, 0)
+                } else {
+                    match data.op {
+                        Op::IsNullish(_) => self.is_nullish(operand.value),
+                        Op::IsUndefined(_) => self.b.ins().icmp_imm(
+                            IntCC::Equal,
+                            operand.value,
+                            Value::UNDEFINED.bits() as i64,
+                        ),
+                        _ => self.b.ins().icmp_imm(
+                            IntCC::Equal,
+                            operand.value,
+                            Value::UNINITIALIZED.bits() as i64,
+                        ),
+                    }
+                };
+                boolean(value)
+            }
+            Op::CallNative(native, args) if args.iter().all(|&arg| cx.numeric(arg)) => {
+                let function = crate::jit::math::METHODS[native.index()].1;
+                let operands: Vec<_> = args.iter().map(|&arg| self.operand(cx, arg)).collect();
+                self.typed_math(function, &operands).map(Some)
+            }
+            Op::IsTyped(object) => {
+                let operand = self.operand(cx, *object);
+                let object = self.convert(operand, Repr::Boxed);
+                let view = self.view(object);
+                let kind = self
+                    .b
+                    .ins()
+                    .load(types::I64, MemFlags::trusted(), view, 16);
+                let value = self.b.ins().icmp_imm(IntCC::UnsignedLessThan, kind, 8);
+                boolean(value)
+            }
+            Op::GetIndex(object, key) | Op::TypedIndex(object, key) => {
+                let Some(&view) = graph.views.get(&inst) else {
+                    return Ok(None);
+                };
+                let fallback = matches!(data.op, Op::GetIndex(..));
+                let view = self.operand(cx, view).value;
+                let object = self.operand(cx, *object);
+                let object = self.convert(object, Repr::Boxed);
+                let key = self.operand(cx, *key);
+                let result = self.viewed_index_access(view, object, key, None, fallback);
+                Some(Some(Operand::new(result, Repr::Boxed)))
+            }
+            Op::SetIndex(object, key, value) => {
+                let Some(&view) = graph.views.get(&inst) else {
+                    return Ok(None);
+                };
+                let view = self.operand(cx, view).value;
+                let object = self.operand(cx, *object);
+                let object = self.convert(object, Repr::Boxed);
+                let key = self.operand(cx, *key);
+                let value = self.operand(cx, *value);
+                self.viewed_index_access(view, object, key, Some(value), true);
+                Some(None)
+            }
+            _ => None,
+        })
     }
 }

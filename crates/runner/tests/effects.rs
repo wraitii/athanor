@@ -10,7 +10,7 @@ fn constant_branch_cleanup_is_gated_by_ssa_optimization() {
                 "--compile",
                 "--no-ir",
                 "--eval",
-                "function f() { let x = 0; return x + 1; }",
+                "function f(a) { let x = 0; try { x = x + 1; } catch (e) {} return x; }",
             ])
             .output()
             .unwrap();

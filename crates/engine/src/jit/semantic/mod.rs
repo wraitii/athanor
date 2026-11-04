@@ -224,6 +224,8 @@ pub(super) enum Op {
     GuardValid(usize),
     GuardCommit(usize),
     View(Value),
+    IsTyped(Value),
+    TypedIndex(Value, Value),
     IsNumber(Value),
     AsNumber(Value),
     EnterScope(Scope),
@@ -338,12 +340,14 @@ impl Op {
             | Op::ProbeProperty(value, _)
             | Op::IsNative(value, _)
             | Op::View(value)
+            | Op::IsTyped(value)
             | Op::IsNumber(value)
             | Op::AsNumber(value) => vec![value],
             Op::Define(object, _, value)
             | Op::DefineHidden(object, _, value)
             | Op::Set(object, _, value) => vec![object, value],
             Op::GetIndex(object, key)
+            | Op::TypedIndex(object, key)
             | Op::ProbeIndex(object, key)
             | Op::Binary(_, object, key)
             | Op::ArrayAppend(object, key, _)
@@ -800,6 +804,8 @@ impl Graph {
             Op::GuardValid(_) => closed(GLOBAL_READ, &[], Unowned),
             Op::GuardCommit(_) => closed(INTERNAL, &[], None),
             Op::View(_) => closed(HEAP_READ, &[Assumption::FixedTypedStorage], Unowned),
+            Op::IsTyped(_) => closed(0, &[], Unowned),
+            Op::TypedIndex(..) => closed(HEAP_READ, &[Assumption::FixedTypedStorage], Unowned),
             Op::IsNumber(_) => closed(0, &[], Unowned),
             Op::AsNumber(_) => closed(INTERNAL, &[], Unowned),
             Op::EnterScope(scope) | Op::NextIteration(scope) | Op::FreshIteration(scope) => {
@@ -1010,6 +1016,8 @@ impl Graph {
             Op::GuardValid(guard) => format!("guard_valid {guard}"),
             Op::GuardCommit(guard) => format!("guard_commit {guard}"),
             Op::View(value) => format!("view {value}"),
+            Op::IsTyped(value) => format!("is_typed {value}"),
+            Op::TypedIndex(object, key) => format!("get_typed {object}[{key}]"),
             Op::IsNumber(value) => format!("is_number {value}"),
             Op::AsNumber(value) => format!("as_number {value}"),
             Op::EnterScope(scope) => format!("enter {scope}"),

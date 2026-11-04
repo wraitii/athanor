@@ -1,9 +1,10 @@
+use std::collections::HashMap;
 use std::fmt;
 
 use cranelift_codegen::entity::SecondaryMap;
 use oxc_syntax::operator::BinaryOperator;
 
-use super::{Cfg, Constant, Graph, Op, UnaryOp, Value};
+use super::{Block, Cfg, Constant, Graph, Inst, Op, TerminatorKind, UnaryOp, Value};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(in crate::jit) struct Types(u16);
@@ -88,6 +89,7 @@ impl Facts {
 
     pub(in crate::jit) fn compute(graph: &Graph) -> Self {
         let cfg = Cfg::new(graph);
+        let steps = steps(graph, &cfg);
         let mut facts = Self {
             types: SecondaryMap::new(),
             known: true,
@@ -99,7 +101,11 @@ impl Facts {
                 for &inst in &graph.blocks[block].insts {
                     let data = &graph.insts[inst];
                     if let Some(result) = data.result {
-                        changed |= facts.widen(result, result_types(&data.op, &facts));
+                        let types = match steps.get(&inst) {
+                            Some(bounds) if facts.bounded(&data.op, bounds) => Types::INT32,
+                            _ => result_types(&data.op, &facts),
+                        };
+                        changed |= facts.widen(result, types);
                     }
                 }
                 let Some(terminator) = &graph.blocks[block].terminator else {
@@ -116,6 +122,13 @@ impl Facts {
         facts
     }
 
+    fn bounded(&self, op: &Op, bounds: &[Value]) -> bool {
+        step(op).is_some_and(|(operand, _)| self.of(operand).within(Types::INT32))
+            && bounds
+                .iter()
+                .any(|&bound| self.of(bound).within(Types::INT32))
+    }
+
     fn widen(&mut self, value: Value, types: Types) -> bool {
         let widened = self.types[value].union(types);
         if widened == self.types[value] {
@@ -123,6 +136,165 @@ impl Facts {
         }
         self.types[value] = widened;
         true
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Relation {
+    Less,
+    LessEqual,
+    Greater,
+    GreaterEqual,
+}
+
+impl Relation {
+    fn of(operator: BinaryOperator) -> Option<Self> {
+        Some(match operator {
+            BinaryOperator::LessThan => Self::Less,
+            BinaryOperator::LessEqualThan => Self::LessEqual,
+            BinaryOperator::GreaterThan => Self::Greater,
+            BinaryOperator::GreaterEqualThan => Self::GreaterEqual,
+            _ => return None,
+        })
+    }
+
+    fn negate(self) -> Self {
+        match self {
+            Self::Less => Self::GreaterEqual,
+            Self::LessEqual => Self::Greater,
+            Self::Greater => Self::LessEqual,
+            Self::GreaterEqual => Self::Less,
+        }
+    }
+
+    fn swap(self) -> Self {
+        match self {
+            Self::Less => Self::Greater,
+            Self::LessEqual => Self::GreaterEqual,
+            Self::Greater => Self::Less,
+            Self::GreaterEqual => Self::LessEqual,
+        }
+    }
+}
+
+fn one(graph: &Graph, value: Value) -> bool {
+    matches!(graph.defining_op(value), Some(Op::Constant(Constant::Number(n))) if *n == 1.0)
+}
+
+fn step(op: &Op) -> Option<(Value, bool)> {
+    match *op {
+        Op::Unary(UnaryOp::Increment, operand) => Some((operand, true)),
+        Op::Unary(UnaryOp::Decrement, operand) => Some((operand, false)),
+        Op::Binary(BinaryOperator::Addition, left, _) => Some((left, true)),
+        Op::Binary(BinaryOperator::Subtraction, left, _) => Some((left, false)),
+        _ => None,
+    }
+}
+
+fn steps(graph: &Graph, cfg: &Cfg) -> HashMap<Inst, Vec<Value>> {
+    let mut incoming: HashMap<Value, Vec<Value>> = HashMap::new();
+    let mut relations: Vec<(Block, Value, Relation, Value)> = Vec::new();
+    for &block in &cfg.rpo {
+        let Some(terminator) = &graph.blocks[block].terminator else {
+            continue;
+        };
+        for target in terminator.kind.targets() {
+            for (&param, &arg) in graph.blocks[target.block].params.iter().zip(&target.args) {
+                incoming.entry(param).or_default().push(arg);
+            }
+        }
+        let TerminatorKind::Branch(condition, yes, no) = &terminator.kind else {
+            continue;
+        };
+        let Some(&Op::Binary(operator, left, right)) = graph.defining_op(*condition) else {
+            continue;
+        };
+        let Some(relation) = Relation::of(operator) else {
+            continue;
+        };
+        if yes.block == no.block {
+            continue;
+        }
+        for (target, relation) in [(yes.block, relation), (no.block, relation.negate())] {
+            if cfg.preds[target].len() == 1 {
+                relations.push((target, left, relation, right));
+                relations.push((target, right, relation.swap(), left));
+            }
+        }
+    }
+    let mut steps = HashMap::new();
+    for &block in &cfg.rpo {
+        for &inst in &graph.blocks[block].insts {
+            let op = &graph.insts[inst].op;
+            let Some((operand, up)) = step(op) else {
+                continue;
+            };
+            if let Op::Binary(_, left, right) = *op
+                && (left != operand || !one(graph, right))
+            {
+                continue;
+            }
+            let bounds: Vec<Value> = relations
+                .iter()
+                .filter(|(target, value, ..)| *value == operand && cfg.dominates(*target, block))
+                .filter(|(.., relation, bound)| {
+                    let (low, high) = range(graph, &incoming, *bound, 0);
+                    match (up, relation) {
+                        (true, Relation::Less) | (false, Relation::Greater) => true,
+                        (true, Relation::LessEqual) => high < i32::MAX as i64,
+                        (false, Relation::GreaterEqual) => low > i32::MIN as i64,
+                        _ => false,
+                    }
+                })
+                .map(|(.., bound)| *bound)
+                .collect();
+            if !bounds.is_empty() {
+                steps.insert(inst, bounds);
+            }
+        }
+    }
+    steps
+}
+
+fn range(
+    graph: &Graph,
+    incoming: &HashMap<Value, Vec<Value>>,
+    value: Value,
+    depth: usize,
+) -> (i64, i64) {
+    const FULL: (i64, i64) = (i32::MIN as i64, i32::MAX as i64);
+    let constant = |value: Value| match graph.defining_op(value) {
+        Some(Op::Constant(Constant::Number(n)))
+            if n.fract() == 0.0 && *n >= i32::MIN as f64 && *n <= i32::MAX as f64 =>
+        {
+            Some(*n as i64)
+        }
+        _ => None,
+    };
+    if depth > 8 {
+        return FULL;
+    }
+    if let Some(n) = constant(value) {
+        return (n, n);
+    }
+    match graph.defining_op(value) {
+        Some(&Op::Binary(BinaryOperator::BitwiseAnd, left, right)) => {
+            match constant(left).or(constant(right)) {
+                Some(mask) if mask >= 0 => (0, mask),
+                _ => FULL,
+            }
+        }
+        Some(&Op::Binary(BinaryOperator::ShiftRight, _, count)) => match constant(count) {
+            Some(count) => (FULL.0 >> (count & 31), FULL.1 >> (count & 31)),
+            None => FULL,
+        },
+        Some(_) => FULL,
+        None => incoming.get(&value).map_or(FULL, |args| {
+            args.iter()
+                .map(|&arg| range(graph, incoming, arg, depth + 1))
+                .reduce(|(low, high), (l, h)| (low.min(l), high.max(h)))
+                .unwrap_or(FULL)
+        }),
     }
 }
 
@@ -150,6 +322,8 @@ fn result_types(op: &Op, facts: &Facts) -> Types {
         Op::IsUninitialized(_) => Types::BOOLEAN,
         Op::ProbeProperty(..) | Op::ProbeIndex(..) => Types::ALL,
         Op::View(_) => Types::VIEW,
+        Op::TypedIndex(..) => Types::NUMBER.union(Types::UNDEFINED),
+        Op::IsTyped(_) => Types::BOOLEAN,
         Op::IsNumber(_) => Types::BOOLEAN,
         Op::AsNumber(_) => Types::NUMBER,
         Op::ToNumeric(value) | Op::Unary(UnaryOp::Plus, value)

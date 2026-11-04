@@ -12,6 +12,7 @@ use crate::jit::numeric::{IndexedRead, IndexedReadContract, Kind};
 use crate::value::Value;
 use crate::value::{TAG_FIRST, TAG_SHIFT, TAG_SPAN, TAG_STRING};
 
+use super::repr::{Operand, Repr};
 use super::{FunctionCompiler, ir_helpers};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -546,17 +547,24 @@ impl FunctionCompiler<'_, '_> {
         &mut self,
         view: ClifValue,
         object: ClifValue,
-        index: ClifValue,
-        value: Option<ClifValue>,
+        key: Operand,
+        value: Option<Operand>,
+        fallback: bool,
     ) -> ClifValue {
         let flags = MemFlags::trusted();
-        let key = self.b.ins().bitcast(types::F64, MemFlags::new(), index);
-        let position = self.b.ins().fcvt_to_sint_sat(types::I64, key);
-        let exact = self.b.ins().fcvt_from_sint(types::F64, position);
-        let integral = self.b.ins().fcmp(FloatCC::Equal, exact, key);
         let length = self.b.ins().load(types::I64, flags, view, 8);
-        let inside = self.b.ins().icmp(IntCC::UnsignedLessThan, position, length);
-        let fast = self.b.ins().band(integral, inside);
+        let (position, fast) = if key.repr == Repr::Int32 {
+            let position = self.b.ins().sextend(types::I64, key.value);
+            let inside = self.b.ins().icmp(IntCC::UnsignedLessThan, position, length);
+            (position, inside)
+        } else {
+            let key = self.convert(key, Repr::Float);
+            let position = self.b.ins().fcvt_to_sint_sat(types::I64, key);
+            let exact = self.b.ins().fcvt_from_sint(types::F64, position);
+            let integral = self.b.ins().fcmp(FloatCC::Equal, exact, key);
+            let inside = self.b.ins().icmp(IntCC::UnsignedLessThan, position, length);
+            (position, self.b.ins().band(integral, inside))
+        };
         let inline = self.b.create_block();
         let slow = self.b.create_block();
         let done = self.b.create_block();
@@ -610,16 +618,27 @@ impl FunctionCompiler<'_, '_> {
                     self.jump(done, &[BlockArg::Value(bits)]);
                 }
                 Some(value) => {
-                    let number = self.b.ins().bitcast(types::F64, MemFlags::new(), value);
                     let (stored, valid) = if element.is_float() {
-                        let valid = self.is_number(value);
+                        let valid = match value.repr {
+                            Repr::Boxed => self.is_number(value.value),
+                            _ => self.b.ins().iconst(types::I8, 1),
+                        };
+                        let number = self.convert(value, Repr::Float);
                         let stored = if element == Element::F32 {
                             self.b.ins().fdemote(types::F32, number)
                         } else {
                             number
                         };
                         (stored, valid)
+                    } else if value.repr == Repr::Int32 {
+                        let stored = if Type::from(element) == types::I32 {
+                            value.value
+                        } else {
+                            self.b.ins().ireduce(element.into(), value.value)
+                        };
+                        (stored, self.b.ins().iconst(types::I8, 1))
                     } else {
+                        let number = self.convert(value, Repr::Float);
                         let integer = self.b.ins().fcvt_to_sint_sat(types::I64, number);
                         let exact = self.b.ins().fcvt_from_sint(types::F64, integer);
                         let integral = self.b.ins().fcmp(FloatCC::Equal, exact, number);
@@ -645,7 +664,13 @@ impl FunctionCompiler<'_, '_> {
         }
 
         self.switch(slow);
-        let result = self.index_access(object, index, value);
+        let result = if fallback {
+            let index = self.convert(key, Repr::Boxed);
+            let value = value.map(|value| self.convert(value, Repr::Boxed));
+            self.index_access(object, index, value)
+        } else {
+            self.constant(Value::UNDEFINED)
+        };
         self.jump(done, &[BlockArg::Value(result)]);
         self.switch(done);
         self.b.block_params(done)[0]

@@ -1107,7 +1107,7 @@ extern "C" fn js_typed_view(ctx: *mut JitCtx, value: Value, out: *mut u64) -> Va
             .global
             .heap()
             .typed_view(value)
-            .unwrap_or((std::ptr::null(), 0, 0));
+            .unwrap_or((std::ptr::null(), 0, u64::MAX));
     unsafe {
         *out = pointer as u64;
         *out.add(1) = length as u64;
