@@ -107,7 +107,7 @@ pub(super) struct Budget {
 impl Default for Budget {
     fn default() -> Self {
         Self {
-            remaining: 128,
+            remaining: 512,
             sites: HashSet::new(),
             inlines: Vec::new(),
         }
@@ -145,7 +145,7 @@ fn numeric_body(graph: &Graph) -> bool {
         }
         for &inst in &graph.blocks[block].insts {
             count += 1;
-            if count > 32 {
+            if count > 128 {
                 return false;
             }
             match graph.insts[inst].op {
@@ -183,7 +183,7 @@ pub(super) fn eligible(graph: &Graph) -> bool {
         }
         for &inst in &graph.blocks[block].insts {
             count += 1;
-            if count > 32
+            if count > 128
                 || matches!(
                     graph.insts[inst].op,
                     Op::Closure(..) | Op::Arguments | Op::Rest(_) | Op::Catch
@@ -473,6 +473,49 @@ mod tests {
     }
 
     #[test]
+    fn varying_method_guards_exit_to_the_original_continuation() {
+        let (canonical, mut bodies) = fixture(
+            "function method(x){return Math.floor(x);} function main(objects,n){let sum=0;for(let i=0;i<n;++i)sum+=objects[i].method(i);return sum;}",
+        );
+        for data in canonical.graph.insts.values() {
+            if let Op::Call { callee, .. } = data.op
+                && matches!(canonical.graph.defining_op(callee), Some(Op::Get(_, name)) if name == "method")
+            {
+                bodies.feedback.insert(
+                    crate::jit::planner::Site {
+                        source: 0,
+                        start: data.span.start,
+                        end: data.span.end,
+                    },
+                    FuncId::from_u32(0),
+                );
+            }
+        }
+        let analysis =
+            super::super::optimize_canonical(canonical, true, Some((&bodies, 0))).unwrap();
+        let graph = &analysis.graph;
+        graph.verify().unwrap();
+        let mut fallbacks = Vec::new();
+        for block in Cfg::new(graph).rpo {
+            if let Some(super::super::Terminator {
+                kind: TerminatorKind::Branch(condition, _, otherwise),
+                ..
+            }) = &graph.blocks[block].terminator
+                && matches!(graph.defining_op(*condition), Some(Op::IsCode(_, code)) if *code == FuncId::from_u32(0))
+            {
+                fallbacks.push(otherwise.block);
+            }
+        }
+        assert!(fallbacks.len() >= 2);
+        assert!(fallbacks.iter().all(|block| *block == fallbacks[0]));
+        assert!(
+            operations(graph)
+                .iter()
+                .any(|op| matches!(op, Op::CallNative(..)))
+        );
+    }
+
+    #[test]
     fn explicit_request_has_one_inline_body_and_one_fallback() {
         let (canonical, bodies) =
             fixture("function square(x) { return x * x; } function main(x) { return square(x); }");
@@ -571,7 +614,7 @@ mod tests {
                 .len(),
             1
         );
-        let calls = "square(x);".repeat(100);
+        let calls = "square(x);".repeat(Budget::default().remaining + 1);
         let (canonical, bodies) = fixture(&format!(
             "function square(x) {{ return x * x; }} function main(x) {{ {calls} return x; }}",
         ));

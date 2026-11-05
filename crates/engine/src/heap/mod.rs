@@ -69,10 +69,11 @@ enum Payload {
     RegExp(Box<RegExp>),
     Enumerator(Box<Enumerator>),
     Set(Box<Set>),
-    Object(Box<Object>),
-    Array(Box<Array>),
-    TypedArray(Box<TypedArray>),
-    Cell(Box<Cell>),
+    SmallObject(SmallObject),
+    Object(Object),
+    Array(Array),
+    TypedArray(TypedArray),
+    Cell(Cell),
     Closure(Box<Closure>),
 }
 
@@ -87,6 +88,7 @@ impl Payload {
             Self::Enumerator(_) => kind::ENUMERATOR,
             Self::Set(_) => kind::SET,
             Self::Object(_) => kind::OBJECT,
+            Self::SmallObject(_) => kind::OBJECT | kind::INLINE,
             Self::Array(array) if array.holes == 0 => kind::ARRAY,
             Self::Array(_) => kind::ARRAY | kind::HOLEY,
             Self::TypedArray(array) => kind::TYPED | array.kind.element(),
@@ -217,6 +219,7 @@ impl Heap {
                         .next()
                         .map(|(_, value)| value),
                     Payload::Object(object) => object.properties.pop(),
+                    Payload::SmallObject(object) => object.pop(),
                     Payload::Array(array) => array.elements.pop(),
                     Payload::Closure(closure) => {
                         closure.properties.pop().or_else(|| closure.captures.pop())
@@ -244,6 +247,11 @@ impl Heap {
                         data.release(generator.receiver);
                     }
                     Payload::Object(object) => {
+                        if let Some(value) = object.prototype {
+                            data.release(value);
+                        }
+                    }
+                    Payload::SmallObject(object) => {
                         if let Some(value) = object.prototype {
                             data.release(value);
                         }
@@ -320,9 +328,16 @@ impl HeapData {
             _ => None,
         }
     }
-    fn object(&self, id: u64) -> Option<&Object> {
+    fn object(&self, id: u64) -> Option<ObjectInfo> {
         match &self.live(id)?.payload {
-            Payload::Object(value) => Some(value),
+            Payload::Object(value) => Some(ObjectInfo {
+                prototype: value.prototype,
+                error: value.error,
+            }),
+            Payload::SmallObject(value) => Some(ObjectInfo {
+                prototype: value.prototype,
+                error: value.error,
+            }),
             _ => None,
         }
     }
@@ -403,6 +418,7 @@ impl HeapData {
             Payload::Array(array) => (array.elements.as_ptr().cast(), array.elements.len()),
             Payload::TypedArray(array) => array.storage.raw(),
             Payload::Object(object) => object.properties.raw(),
+            Payload::SmallObject(object) => (object.values.as_ptr().cast(), object.len as usize),
             Payload::Closure(closure) => closure.properties.raw(),
             _ => (std::ptr::null(), 0),
         };

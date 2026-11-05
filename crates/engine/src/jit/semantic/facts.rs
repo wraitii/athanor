@@ -357,7 +357,7 @@ fn result_types(op: &Op, facts: &Facts) -> Types {
         | Op::IteratorNew(_)
         | Op::EnumerateNew(_) => Types::OBJECT,
         Op::MapElement(..) => Types::ALL,
-        Op::IsArrayMap(..) => Types::BOOLEAN,
+        Op::IsArrayIteration(..) => Types::BOOLEAN,
         Op::IteratorNext(_) | Op::EnumerateNext(_) => Types::ALL,
         Op::IsUninitialized(_) => Types::BOOLEAN,
         Op::ProbeProperty(..) | Op::ProbeIndex(..) | Op::ConstructorPrototype(_) => Types::ALL,
@@ -371,7 +371,7 @@ fn result_types(op: &Op, facts: &Facts) -> Types {
         Op::TypedIndex(..) => Types::NUMBER.union(Types::UNDEFINED),
         Op::IsTyped(..) | Op::IsIndexed(_) => Types::BOOLEAN,
         Op::IndexedLength(_) => Types::NUMBER,
-        Op::IsNumber(_) | Op::IsString(_) => Types::BOOLEAN,
+        Op::IsNumber(_) | Op::IsString(_) | Op::IsTypeof(..) => Types::BOOLEAN,
         Op::AsNumber(_) => Types::NUMBER,
         Op::ToInt32(_) => Types::INT32,
         Op::ToNumeric(value) | Op::Unary(UnaryOp::Plus, value)

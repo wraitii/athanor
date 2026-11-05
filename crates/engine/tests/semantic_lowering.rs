@@ -74,6 +74,95 @@ fn explicit_integer_coercions_preserve_numeric_edges() {
 }
 
 #[test]
+fn bit_test_branches_preserve_signed_bits_and_shift_counts() {
+    let source = r#"
+        function test(word, index) {
+            if ((word | 0) & (1 << (index | 0)))
+                return true;
+            return false;
+        }
+        function reversed(word, index) {
+            if ((1 << (index | 0)) & (word | 0))
+                return true;
+            return false;
+        }
+        function mask(word, index) {
+            return (word | 0) & (1 << (index | 0));
+        }
+        function reused(word, index) {
+            const value = (word | 0) & (1 << (index | 0));
+            if (value)
+                return value;
+            return 0;
+        }
+        function main() {
+            const words = [0, -1, 1, 65535, -2147483648, 2147483647, 4294967295];
+            const shifts = [-65, -33, -32, -1, 0, 1, 15, 31, 32, 33, 63, NaN, Infinity, 3.75];
+            for (const word of words)
+                for (const shift of shifts) {
+                    const expected = !!((word >> shift) & 1);
+                    if (test(word, shift) !== expected || reversed(word, shift) !== expected)
+                        return false;
+                }
+            return mask(-2147483648, 31) === -2147483648 && mask(-1, 32) === 1 &&
+                reused(-2147483648, 31) === -2147483648 && reused(0, 31) === 0;
+        }
+    "#;
+    for ssa_opt in [false, true] {
+        assert_eq!(run(source, ssa_opt), Ok(Value::TRUE));
+    }
+}
+
+#[test]
+fn repeated_typed_reads_preserve_fallbacks_and_mutations() {
+    let source = r#"
+        function count(grid, width) {
+            let members = 0;
+            for (let y = 0; y < 2; ++y) {
+                const indexY = y * width;
+                for (let x = 0; x < 2; ++x)
+                    if (grid[indexY + x])
+                        for (let i = 0; i < 16; ++i)
+                            if (grid[indexY + x] & (1 << i))
+                                ++members;
+            }
+            return members;
+        }
+        function mutate(grid) {
+            let members = 0;
+            if (grid[0])
+                for (let i = 0; i < 16; ++i) {
+                    grid[0] = 1 << i;
+                    if (grid[0] & (1 << i))
+                        ++members;
+                }
+            return members;
+        }
+        function main() {
+            const grid = new Uint16Array(2);
+            grid[0] = 65535;
+            grid[1] = 5;
+            const floats = new Float64Array(4);
+            floats[0] = NaN;
+            floats[1] = Infinity;
+            floats[2] = 3.75;
+            for (let warmup = 0; warmup < 3; ++warmup) {
+                const changing = new Uint16Array(1);
+                changing[0] = 1;
+                if (count(grid, 2) !== 18 || mutate(changing) !== 16)
+                    return false;
+            }
+            return count(["5", 3.75], 2) === 4 && count(floats, 2) === 2 &&
+                count(grid, 0.5) === 18 && count(grid, NaN) === 0 &&
+                count(grid, Infinity) === 0 && count([], 2) === 0;
+        }
+    "#;
+    for ssa_opt in [false, true] {
+        assert_eq!(run(source, ssa_opt), Ok(Value::TRUE));
+    }
+}
+
+#[test]
 fn typeof_string_comparisons_preserve_values_and_evaluation() {
     let source = r#"
         function isString(value) { return typeof value === "string"; }
@@ -874,6 +963,76 @@ fn expanded_construction_preserves_return_values_and_classes() {
     "#;
     for ssa_opt in [false, true] {
         assert_eq!(run(source, ssa_opt).unwrap(), Value::TRUE);
+    }
+}
+
+#[test]
+fn builtin_property_caches_preserve_kinds_identity_and_mutable_methods() {
+    for ssa_opt in [false, true] {
+        let mut engine = Engine::with_options(EngineOptions {
+            ssa_opt,
+            ..Default::default()
+        })
+        .unwrap();
+        engine
+            .compile(
+                r#"
+            var receiver = [1, 2, 3];
+            function read() { return receiver.slice; }
+            function array() { receiver = [4, 5, 6]; }
+            function string() { receiver = "abc"; }
+            function object() { receiver = {slice: 7}; }
+            function replace() { receiver.slice = 9; }
+            function missing() { receiver = null; }
+            function from(constructor) { return constructor.from; }
+            function arrayConstructor() { return Array; }
+            function typedConstructor() { return Uint8Array; }
+            "#,
+                "builtin_property_cache.js",
+            )
+            .unwrap();
+        let array_method = engine.call("read", &[]).unwrap();
+        for _ in 0..3 {
+            assert_eq!(
+                engine.call("read", &[]).unwrap().value(),
+                array_method.value()
+            );
+        }
+        engine.call("string", &[]).unwrap();
+        let string_method = engine.call("read", &[]).unwrap();
+        assert_ne!(string_method.value(), array_method.value());
+        engine.call("array", &[]).unwrap();
+        engine.drain_disposals(1000);
+        assert_eq!(
+            engine.call("read", &[]).unwrap().value(),
+            array_method.value()
+        );
+        engine.call("string", &[]).unwrap();
+        assert_eq!(
+            engine.call("read", &[]).unwrap().value(),
+            string_method.value()
+        );
+        engine.call("object", &[]).unwrap();
+        assert_eq!(
+            engine.call("read", &[]).unwrap().value(),
+            Value::number(7.0)
+        );
+        engine.call("replace", &[]).unwrap();
+        assert_eq!(
+            engine.call("read", &[]).unwrap().value(),
+            Value::number(9.0)
+        );
+        engine.call("missing", &[]).unwrap();
+        assert!(engine.call("read", &[]).is_err());
+        let array = engine.call("arrayConstructor", &[]).unwrap();
+        let typed = engine.call("typedConstructor", &[]).unwrap();
+        let array_from = engine.call("from", &[array.value()]).unwrap();
+        let typed_from = engine.call("from", &[typed.value()]).unwrap();
+        assert_ne!(array_from.value(), typed_from.value());
+        assert_eq!(
+            engine.call("from", &[array.value()]).unwrap().value(),
+            array_from.value()
+        );
     }
 }
 

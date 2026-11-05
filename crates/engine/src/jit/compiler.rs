@@ -581,7 +581,7 @@ impl Compiler {
                     &graph.graph,
                 )?;
                 builder.seal_all_blocks();
-                builder.finalize();
+                builder.finalize(self.module.target_config());
             }
             pending.push((
                 id,
@@ -711,20 +711,20 @@ impl Compiler {
                     for location in ranges {
                         locations.insert(
                             location.start,
-                            if location.loc.is_default() {
+                            if location.loc.as_abs().is_default() {
                                 0
                             } else {
-                                location.loc.bits()
+                                location.loc.as_abs().bits()
                             },
                         );
                     }
                 } else {
                     let mut default_line = None;
                     for location in ranges {
-                        if location.loc.is_default() {
+                        if location.loc.as_abs().is_default() {
                             continue;
                         }
-                        let line = line_at(&lines, location.loc.bits());
+                        let line = line_at(&lines, location.loc.as_abs().bits());
                         default_line.get_or_insert(line);
                         locations.insert(location.start, line);
                     }
@@ -851,7 +851,7 @@ impl Compiler {
                 }),
             )?;
             builder.seal_all_blocks();
-            builder.finalize();
+            builder.finalize(self.module.target_config());
         }
         let body = FunctionBody {
             function: std::mem::replace(
@@ -1046,7 +1046,7 @@ impl Compiler {
                 )?;
             }
             builder.seal_all_blocks();
-            builder.finalize();
+            builder.finalize(self.module.target_config());
         }
         Ok(FunctionBody {
             function: std::mem::replace(

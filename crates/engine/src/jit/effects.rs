@@ -58,16 +58,18 @@ pub(super) fn effects(helper: Helper) -> Effects {
         | ConstructorCall
         | ConstructorCallSpread
         | ConstructSpreadResolved => (Reentry::Arbitrary, UNKNOWN, &[]),
-        FrameEnter | FrameExit | LocalSet | LocalReplace | Release | LocalGet | TempClear
-        | TempRetain | ErrorOrigin | Catch | Throw => (Reentry::Closed, INTERNAL | ERROR, &[]),
+        FrameEnter | FrameExit | FrameExitUnrooted | LocalSet | LocalReplace | Release
+        | LocalGet | TempClear | TempRetain | ErrorOrigin | Catch | Throw => {
+            (Reentry::Closed, INTERNAL | ERROR, &[])
+        }
         ObserveCall | ObserveGet | ObserveIndex => (Reentry::Closed, HEAP_READ | INTERNAL, &[]),
         SemanticGlobalProbe => (Reentry::Closed, GLOBAL_READ, &[]),
         ConstructorPrototype
-        | SemanticPropertyProbe
+        | SemanticPropertyProbeCached
         | SemanticMathNative
         | SemanticCode
         | ClosureThis
-        | ArrayMapGuard => (Reentry::Closed, HEAP_READ, &[]),
+        | ArrayIterationGuard => (Reentry::Closed, HEAP_READ, &[]),
         IndexRoot | IndexProbe => (
             Reentry::Closed,
             HEAP_READ | INTERNAL,
@@ -130,12 +132,13 @@ pub(super) fn temporary_effect(helper: Helper) -> TemporaryEffect {
         FrameEnter => Enter,
         TempClear => Clear,
         TempRetain | Add => MayRegister,
+        SemanticPropertyProbeCached => None,
         LocalSet | LocalReplace | Release | ErrorOrigin | Throw | MathDirect | SemanticCode
-        | ObserveCall | ObserveGet | ObserveIndex | ClosureThis | ArrayMapGuard | IndexRoot
-        | IndexProbe | Truthy | BitwiseAnd | BitwiseOr | BitwiseXor | ShiftLeft | ShiftRight
-        | ShiftRightUnsigned | Sub | Mul | Div | Rem | Pow | LooseEqual | LooseNotEqual
-        | StrictEqual | StrictNotEqual | Less | LessEqual | Greater | GreaterEqual | UnaryPlus
-        | UnaryNegation | LogicalNot | BitwiseNot => None,
+        | ObserveCall | ObserveGet | ObserveIndex | ClosureThis | ArrayIterationGuard
+        | IndexRoot | IndexProbe | Truthy | BitwiseAnd | BitwiseOr | BitwiseXor | ShiftLeft
+        | ShiftRight | ShiftRightUnsigned | Sub | Mul | Div | Rem | Pow | LooseEqual
+        | LooseNotEqual | StrictEqual | StrictNotEqual | Less | LessEqual | Greater
+        | GreaterEqual | UnaryPlus | UnaryNegation | LogicalNot | BitwiseNot => None,
         _ => MayRegister,
     }
 }

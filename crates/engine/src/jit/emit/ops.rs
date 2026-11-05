@@ -1,5 +1,5 @@
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
-use cranelift_codegen::ir::{BlockArg, InstBuilder, MemFlags, Type, Value as ClifValue, types};
+use cranelift_codegen::ir::{BlockArg, InstBuilder, MemFlagsData, Type, Value as ClifValue, types};
 use cranelift_frontend::Switch;
 use cranelift_module::Module;
 use oxc_syntax::operator::BinaryOperator;
@@ -10,8 +10,8 @@ use crate::heap::{
 };
 use crate::jit::clif::{IndexedRead, IndexedReadContract};
 use crate::jit::helpers::{
-    CACHE_HOLDER_OFFSET, CACHE_HOLDER_SHAPE_OFFSET, CACHE_INDEX_OFFSET, CACHE_SHAPE_OFFSET, Helper,
-    PropertyCache,
+    CACHE_BUILTIN_KIND_OFFSET, CACHE_BUILTIN_VALUE_OFFSET, CACHE_HOLDER_OFFSET,
+    CACHE_HOLDER_SHAPE_OFFSET, CACHE_INDEX_OFFSET, CACHE_SHAPE_OFFSET, Helper, PropertyCache,
 };
 use crate::value::Value;
 use crate::value::{TAG_FIRST, TAG_OBJECT, TAG_SHIFT, TAG_SPAN, TAG_STRING};
@@ -205,12 +205,12 @@ impl FunctionCompiler<'_, '_> {
     }
 
     pub(super) fn is_number(&mut self, value: ClifValue) -> ClifValue {
-        let top = self.b.ins().ushr_imm(value, TAG_SHIFT as i64);
-        let offset = self.b.ins().iadd_imm(top, -(TAG_FIRST as i64));
-        let condition = self
-            .b
-            .ins()
-            .icmp_imm(IntCC::UnsignedGreaterThan, offset, TAG_SPAN as i64);
+        let top = self.b.ins().ushr_imm_s(value, TAG_SHIFT as i64);
+        let offset = self.b.ins().iadd_imm_s(top, -(TAG_FIRST as i64));
+        let condition =
+            self.b
+                .ins()
+                .icmp_imm_s(IntCC::UnsignedGreaterThan, offset, TAG_SPAN as i64);
         condition
     }
 
@@ -225,7 +225,7 @@ impl FunctionCompiler<'_, '_> {
         self.brif(number, number_block, &[], other_block, &[]);
 
         self.switch(number_block);
-        let float = self.b.ins().bitcast(types::F64, MemFlags::new(), value);
+        let float = self.b.ins().bitcast(types::F64, MemFlagsData::new(), value);
         let zero = self.b.ins().f64const(0.0);
         let negative = self.b.ins().fcmp(FloatCC::LessThan, float, zero);
         let positive = self.b.ins().fcmp(FloatCC::GreaterThan, float, zero);
@@ -233,11 +233,11 @@ impl FunctionCompiler<'_, '_> {
         self.jump(done, &[BlockArg::Value(truth)]);
 
         self.switch(other_block);
-        let tag = self.b.ins().ushr_imm(value, TAG_SHIFT as i64);
-        let is_string = self
-            .b
-            .ins()
-            .icmp_imm(IntCC::Equal, tag, (TAG_STRING >> TAG_SHIFT) as i64);
+        let tag = self.b.ins().ushr_imm_s(value, TAG_SHIFT as i64);
+        let is_string =
+            self.b
+                .ins()
+                .icmp_imm_s(IntCC::Equal, tag, (TAG_STRING >> TAG_SHIFT) as i64);
         self.brif(is_string, string_block, &[], primitive_block, &[]);
 
         self.switch(string_block);
@@ -245,25 +245,25 @@ impl FunctionCompiler<'_, '_> {
         let truth = self
             .b
             .ins()
-            .icmp_imm(IntCC::Equal, truth, Value::TRUE.bits() as i64);
+            .icmp_imm_s(IntCC::Equal, truth, Value::TRUE.bits() as i64);
         self.jump(done, &[BlockArg::Value(truth)]);
 
         self.switch(primitive_block);
-        let undefined = self
-            .b
-            .ins()
-            .icmp_imm(IntCC::Equal, value, Value::UNDEFINED.bits() as i64);
+        let undefined =
+            self.b
+                .ins()
+                .icmp_imm_s(IntCC::Equal, value, Value::UNDEFINED.bits() as i64);
         let null = self
             .b
             .ins()
-            .icmp_imm(IntCC::Equal, value, Value::NULL.bits() as i64);
+            .icmp_imm_s(IntCC::Equal, value, Value::NULL.bits() as i64);
         let false_value = self
             .b
             .ins()
-            .icmp_imm(IntCC::Equal, value, Value::FALSE.bits() as i64);
+            .icmp_imm_s(IntCC::Equal, value, Value::FALSE.bits() as i64);
         let falsy = self.b.ins().bor(undefined, null);
         let falsy = self.b.ins().bor(falsy, false_value);
-        let truth = self.b.ins().icmp_imm(IntCC::Equal, falsy, 0);
+        let truth = self.b.ins().icmp_imm_s(IntCC::Equal, falsy, 0);
         self.jump(done, &[BlockArg::Value(truth)]);
 
         self.switch(done);
@@ -271,14 +271,14 @@ impl FunctionCompiler<'_, '_> {
     }
 
     pub(super) fn is_nullish(&mut self, value: ClifValue) -> ClifValue {
-        let undefined = self
-            .b
-            .ins()
-            .icmp_imm(IntCC::Equal, value, Value::UNDEFINED.bits() as i64);
+        let undefined =
+            self.b
+                .ins()
+                .icmp_imm_s(IntCC::Equal, value, Value::UNDEFINED.bits() as i64);
         let null = self
             .b
             .ins()
-            .icmp_imm(IntCC::Equal, value, Value::NULL.bits() as i64);
+            .icmp_imm_s(IntCC::Equal, value, Value::NULL.bits() as i64);
         self.b.ins().bor(undefined, null)
     }
 
@@ -355,7 +355,7 @@ impl FunctionCompiler<'_, '_> {
         };
         let result = if matches!(op, BinaryOp::ShiftRightUnsigned) {
             let float = self.b.ins().fcvt_from_uint(types::F64, integer);
-            self.b.ins().bitcast(types::I64, MemFlags::new(), float)
+            self.b.ins().bitcast(types::I64, MemFlagsData::new(), float)
         } else {
             ir_helpers::box_int32(self.b, integer)
         };
@@ -399,7 +399,7 @@ impl FunctionCompiler<'_, '_> {
         self.switch(fast_block);
         let floats: Vec<_> = args
             .iter()
-            .map(|&arg| self.b.ins().bitcast(types::F64, MemFlags::new(), arg))
+            .map(|&arg| self.b.ins().bitcast(types::F64, MemFlagsData::new(), arg))
             .collect();
         let result = match function {
             MathFunction::Floor => self.b.ins().floor(floats[0]),
@@ -413,7 +413,10 @@ impl FunctionCompiler<'_, '_> {
                 .fold(floats[0], |left, &right| self.b.ins().fmax(left, right)),
         };
         let unordered = self.b.ins().fcmp(FloatCC::Unordered, result, result);
-        let bits = self.b.ins().bitcast(types::I64, MemFlags::new(), result);
+        let bits = self
+            .b
+            .ins()
+            .bitcast(types::I64, MemFlagsData::new(), result);
         let nan = self.constant(Value::number(f64::NAN));
         let boxed = self.b.ins().select(unordered, nan, bits);
         self.jump(done, &[BlockArg::Value(boxed)]);
@@ -461,8 +464,14 @@ impl FunctionCompiler<'_, '_> {
             right,
             None,
             |compiler, left, right| {
-                let left_float = compiler.b.ins().bitcast(types::F64, MemFlags::new(), left);
-                let right_float = compiler.b.ins().bitcast(types::F64, MemFlags::new(), right);
+                let left_float = compiler
+                    .b
+                    .ins()
+                    .bitcast(types::F64, MemFlagsData::new(), left);
+                let right_float = compiler
+                    .b
+                    .ins()
+                    .bitcast(types::F64, MemFlagsData::new(), right);
                 let result = match op {
                     BinaryOp::Add => compiler.b.ins().fadd(left_float, right_float),
                     BinaryOp::Sub => compiler.b.ins().fsub(left_float, right_float),
@@ -474,7 +483,7 @@ impl FunctionCompiler<'_, '_> {
                 let bits = compiler
                     .b
                     .ins()
-                    .bitcast(types::I64, MemFlags::new(), result);
+                    .bitcast(types::I64, MemFlagsData::new(), result);
                 let nan = compiler.constant(Value::number(f64::NAN));
                 let boxed = compiler.b.ins().select(unordered, nan, bits);
                 boxed
@@ -495,8 +504,14 @@ impl FunctionCompiler<'_, '_> {
             right,
             guards,
             |compiler, left, right| {
-                let left_float = compiler.b.ins().bitcast(types::F64, MemFlags::new(), left);
-                let right_float = compiler.b.ins().bitcast(types::F64, MemFlags::new(), right);
+                let left_float = compiler
+                    .b
+                    .ins()
+                    .bitcast(types::F64, MemFlagsData::new(), left);
+                let right_float = compiler
+                    .b
+                    .ins()
+                    .bitcast(types::F64, MemFlagsData::new(), right);
                 let condition = match op {
                     BinaryOp::Less => FloatCC::LessThan,
                     BinaryOp::LessEqual => FloatCC::LessThanOrEqual,
@@ -573,13 +588,13 @@ impl FunctionCompiler<'_, '_> {
     // Non-objects and the global object (address zero) see an all-zero slot, so every
     // kind check fails and the length reads as zero.
     pub(super) fn view(&mut self, object: ClifValue) -> ClifValue {
-        let tag = self.b.ins().ushr_imm(object, TAG_SHIFT as i64);
-        let is_object = self
-            .b
-            .ins()
-            .icmp_imm(IntCC::Equal, tag, (TAG_OBJECT >> TAG_SHIFT) as i64);
-        let address = self.b.ins().band_imm(object, ADDRESS_MASK);
-        let present = self.b.ins().icmp_imm(IntCC::NotEqual, address, 0);
+        let tag = self.b.ins().ushr_imm_s(object, TAG_SHIFT as i64);
+        let is_object =
+            self.b
+                .ins()
+                .icmp_imm_s(IntCC::Equal, tag, (TAG_OBJECT >> TAG_SHIFT) as i64);
+        let address = self.b.ins().band_imm_s(object, ADDRESS_MASK);
+        let present = self.b.ins().icmp_imm_s(IntCC::NotEqual, address, 0);
         let valid = self.b.ins().band(is_object, present);
         let empty = self
             .b
@@ -591,20 +606,20 @@ impl FunctionCompiler<'_, '_> {
     pub(super) fn view_kind(&mut self, view: ClifValue) -> ClifValue {
         self.b
             .ins()
-            .load(types::I32, MemFlags::trusted(), view, KIND_OFFSET)
+            .load(types::I32, MemFlagsData::trusted(), view, KIND_OFFSET)
     }
 
     pub(super) fn has_kind(&mut self, view: ClifValue, mask: u32) -> ClifValue {
         let kind = self.view_kind(view);
-        let masked = self.b.ins().band_imm(kind, mask as i64);
-        self.b.ins().icmp_imm(IntCC::NotEqual, masked, 0)
+        let masked = self.b.ins().band_imm_s(kind, mask as i64);
+        self.b.ins().icmp_imm_s(IntCC::NotEqual, masked, 0)
     }
 
     pub(super) fn view_length(&mut self, view: ClifValue) -> ClifValue {
         let length = self
             .b
             .ins()
-            .load(types::I64, MemFlags::trusted(), view, LENGTH_OFFSET);
+            .load(types::I64, MemFlagsData::trusted(), view, LENGTH_OFFSET);
         self.b.ins().fcvt_from_uint(types::F64, length)
     }
 
@@ -618,7 +633,10 @@ impl FunctionCompiler<'_, '_> {
         self.brif(indexed, inline, &[], slow, &[]);
         self.switch(inline);
         let length = self.view_length(view);
-        let bits = self.b.ins().bitcast(types::I64, MemFlags::new(), length);
+        let bits = self
+            .b
+            .ins()
+            .bitcast(types::I64, MemFlagsData::new(), length);
         self.jump(done, &[BlockArg::Value(bits)]);
         self.switch(slow);
         let result = self.property_access(object, "length", None);
@@ -640,7 +658,9 @@ impl FunctionCompiler<'_, '_> {
     pub(super) fn typed_kind_is(&mut self, view: ClifValue, kind: TypedKind) -> ClifValue {
         let actual = self.view_kind(view);
         let expected = Element::from(kind).kind();
-        self.b.ins().icmp_imm(IntCC::Equal, actual, expected as i64)
+        self.b
+            .ins()
+            .icmp_imm_s(IntCC::Equal, actual, expected as i64)
     }
 
     /// Reads an element of a typed array of known kind at an index known to be in bounds.
@@ -651,7 +671,7 @@ impl FunctionCompiler<'_, '_> {
         kind: TypedKind,
     ) -> Operand {
         let element = Element::from(kind);
-        let flags = MemFlags::trusted();
+        let flags = MemFlagsData::trusted();
         let position = if key.repr == Repr::Int32 {
             self.b.ins().sextend(types::I64, key.value)
         } else {
@@ -659,7 +679,7 @@ impl FunctionCompiler<'_, '_> {
             self.b.ins().fcvt_to_sint_sat(types::I64, key)
         };
         let data = self.b.ins().load(self.pointer, flags, view, DATA_OFFSET);
-        let offset = self.b.ins().imul_imm(position, element.bytes() as i64);
+        let offset = self.b.ins().imul_imm_s(position, element.bytes() as i64);
         let address = self.b.ins().iadd(data, offset);
         let raw = self.b.ins().load(element.into(), flags, address, 0);
         match element {
@@ -688,7 +708,7 @@ impl FunctionCompiler<'_, '_> {
         fallback: bool,
         retain: bool,
     ) -> ClifValue {
-        let flags = MemFlags::trusted();
+        let flags = MemFlagsData::trusted();
         let length = self.b.ins().load(types::I64, flags, view, LENGTH_OFFSET);
         let (position, fast) = if key.repr == Repr::Int32 {
             let position = self.b.ins().sextend(types::I64, key.value);
@@ -724,7 +744,7 @@ impl FunctionCompiler<'_, '_> {
             let holey = self.b.create_block();
             switch.set_entry(kind::ARRAY as u128, packed);
             switch.set_entry((kind::ARRAY | kind::HOLEY) as u128, holey);
-            let offset = self.b.ins().ishl_imm(position, 3);
+            let offset = self.b.ins().ishl_imm_s(position, 3);
             let address = self.b.ins().iadd(data, offset);
             (packed, holey, address)
         });
@@ -740,7 +760,7 @@ impl FunctionCompiler<'_, '_> {
             let hole = self
                 .b
                 .ins()
-                .icmp_imm(IntCC::Equal, bits, HOLE.bits() as i64);
+                .icmp_imm_s(IntCC::Equal, bits, HOLE.bits() as i64);
             let undefined = self.constant(Value::UNDEFINED);
             let bits = self.b.ins().select(hole, undefined, bits);
             self.jump(element, &[BlockArg::Value(bits)]);
@@ -760,7 +780,7 @@ impl FunctionCompiler<'_, '_> {
         }
         for (element, block) in kinds {
             self.switch(block);
-            let offset = self.b.ins().imul_imm(position, element.bytes() as i64);
+            let offset = self.b.ins().imul_imm_s(position, element.bytes() as i64);
             let address = self.b.ins().iadd(data, offset);
             match value {
                 None => {
@@ -782,7 +802,10 @@ impl FunctionCompiler<'_, '_> {
                             self.b.ins().fcvt_from_sint(types::F64, wide)
                         }
                     };
-                    let bits = self.b.ins().bitcast(types::I64, MemFlags::new(), number);
+                    let bits = self
+                        .b
+                        .ins()
+                        .bitcast(types::I64, MemFlagsData::new(), number);
                     let bits = if element.is_float() {
                         let nan = self.b.ins().fcmp(FloatCC::Unordered, number, number);
                         let canonical = self.constant(Value::number(f64::NAN));
@@ -888,11 +911,58 @@ impl FunctionCompiler<'_, '_> {
         name: &str,
         retain: bool,
     ) -> ClifValue {
+        self.cached_property_read(object, name, retain, false)
+    }
+
+    pub(super) fn cached_property_probe(&mut self, object: ClifValue, name: &str) -> ClifValue {
+        self.cached_property_read(object, name, false, true)
+    }
+
+    fn cached_property_read(
+        &mut self,
+        object: ClifValue,
+        name: &str,
+        retain: bool,
+        probe: bool,
+    ) -> ClifValue {
         let cache = Box::new(PropertyCache::new(name));
         let address = self.b.ins().iconst(self.pointer, &raw const *cache as i64);
         self.property_caches.push(cache);
-        let flags = MemFlags::trusted();
-        let view = self.view(object);
+        let flags = MemFlagsData::trusted();
+        let heap = self.is_heap(object);
+        let address_bits = self.b.ins().band_imm_s(object, ADDRESS_MASK);
+        let present = self.b.ins().icmp_imm_s(IntCC::NotEqual, address_bits, 0);
+        let valid = self.b.ins().band(heap, present);
+        let empty = self
+            .b
+            .ins()
+            .iconst(self.pointer, NO_ELEMENTS.as_ptr() as i64);
+        let view = self.b.ins().select(valid, address_bits, empty);
+        let builtin = self.b.create_block();
+        let shaped = self.b.create_block();
+        let inline = self.b.create_block();
+        let slow = self.b.create_block();
+        let ready = self.b.create_block();
+        let done = self.b.create_block();
+        self.b.append_block_param(ready, types::I64);
+        self.b.append_block_param(done, types::I64);
+        self.b.set_cold_block(slow);
+        let kind = self.view_kind(view);
+        let expected_kind =
+            self.b
+                .ins()
+                .load(types::I32, flags, address, CACHE_BUILTIN_KIND_OFFSET);
+        let cached = self.b.ins().icmp_imm_s(IntCC::NotEqual, expected_kind, 0);
+        let matches = self.b.ins().icmp(IntCC::Equal, kind, expected_kind);
+        let hit = self.b.ins().band(cached, matches);
+        self.brif(hit, builtin, &[], shaped, &[]);
+        self.switch(builtin);
+        let bits = self
+            .b
+            .ins()
+            .load(types::I64, flags, address, CACHE_BUILTIN_VALUE_OFFSET);
+        self.jump(ready, &[BlockArg::Value(bits)]);
+        self.switch(shaped);
         let shape = self.b.ins().load(types::I32, flags, view, SHAPE_OFFSET);
         let expected = self
             .b
@@ -902,7 +972,7 @@ impl FunctionCompiler<'_, '_> {
             .b
             .ins()
             .load(self.pointer, flags, address, CACHE_HOLDER_OFFSET);
-        let own = self.b.ins().icmp_imm(IntCC::Equal, holder, 0);
+        let own = self.b.ins().icmp_imm_s(IntCC::Equal, holder, 0);
         let holder = self.b.ins().select(own, view, holder);
         let holder_shape = self.b.ins().load(types::I32, flags, holder, SHAPE_OFFSET);
         let expected_holder =
@@ -915,11 +985,6 @@ impl FunctionCompiler<'_, '_> {
             .ins()
             .icmp(IntCC::Equal, holder_shape, expected_holder);
         let hit = self.b.ins().band(receiver_hit, holder_hit);
-        let inline = self.b.create_block();
-        let slow = self.b.create_block();
-        let done = self.b.create_block();
-        self.b.append_block_param(done, types::I64);
-        self.b.set_cold_block(slow);
         self.brif(hit, inline, &[], slow, &[]);
 
         self.switch(inline);
@@ -928,10 +993,13 @@ impl FunctionCompiler<'_, '_> {
             .ins()
             .load(types::I32, flags, address, CACHE_INDEX_OFFSET);
         let index = self.b.ins().uextend(types::I64, index);
-        let offset = self.b.ins().ishl_imm(index, 3);
+        let offset = self.b.ins().ishl_imm_s(index, 3);
         let data = self.b.ins().load(self.pointer, flags, holder, DATA_OFFSET);
         let slot = self.b.ins().iadd(data, offset);
         let bits = self.b.ins().load(types::I64, flags, slot, 0);
+        self.jump(ready, &[BlockArg::Value(bits)]);
+        self.switch(ready);
+        let bits = self.b.block_params(ready)[0];
         if retain {
             let heap = self.is_heap(bits);
             let retain = self.b.create_block();
@@ -944,8 +1012,17 @@ impl FunctionCompiler<'_, '_> {
         }
 
         self.switch(slow);
-        let result = self.call_helper(Helper::PropertyGetCached, &[object, address]);
-        self.check_error();
+        let result = self.call_helper(
+            if probe {
+                Helper::SemanticPropertyProbeCached
+            } else {
+                Helper::PropertyGetCached
+            },
+            &[object, address],
+        );
+        if !probe {
+            self.check_error();
+        }
         self.jump(done, &[BlockArg::Value(result)]);
         self.switch(done);
         self.b.block_params(done)[0]
@@ -987,8 +1064,8 @@ impl FunctionCompiler<'_, '_> {
         let word = self
             .b
             .ins()
-            .load(types::I64, MemFlags::trusted(), self.ctx, offset);
-        self.b.ins().icmp_imm(IntCC::NotEqual, word, none)
+            .load(types::I64, MemFlagsData::trusted(), self.ctx, offset);
+        self.b.ins().icmp_imm_s(IntCC::NotEqual, word, none)
     }
 
     pub(super) fn check_error(&mut self) {

@@ -23,11 +23,25 @@ pub(super) fn read_lifetime(
             return ReadLifetime::Frame;
         };
         match function.dfg.insts[inst] {
-            InstructionData::BinaryImm64 {
-                opcode: Opcode::IaddImm,
-                arg,
-                imm,
-            } if imm.bits() == 0 => value = arg,
+            InstructionData::Binary {
+                opcode: Opcode::Iadd,
+                args,
+            } => {
+                let zero = |value| {
+                    let value = function.dfg.resolve_aliases(value);
+                    let ValueDef::Result(inst, _) = function.dfg.value_def(value) else {
+                        return false;
+                    };
+                    matches!(function.dfg.insts[inst], InstructionData::UnaryImm { opcode: Opcode::Iconst, imm } if imm.bits() == 0)
+                };
+                value = if zero(args[1]) {
+                    args[0]
+                } else if zero(args[0]) {
+                    args[1]
+                } else {
+                    return ReadLifetime::Frame;
+                };
+            }
             _ => return ReadLifetime::Frame,
         }
     }
@@ -54,11 +68,14 @@ mod tests {
         builder.switch_to_block(entry);
         let rooted = builder.block_params(entry)[0];
         let unknown = builder.block_params(entry)[1];
-        let copy = builder.ins().iadd_imm(rooted, 0);
-        let changed = builder.ins().iadd_imm(rooted, 1);
+        let copy = builder.ins().iadd_imm_s(rooted, 0);
+        let changed = builder.ins().iadd_imm_s(rooted, 1);
         builder.ins().return_(&[]);
         builder.seal_all_blocks();
-        builder.finalize();
+        let module = cranelift_jit::JITModule::new(
+            cranelift_jit::JITBuilder::new(cranelift_module::default_libcall_names()).unwrap(),
+        );
+        builder.finalize(cranelift_module::Module::target_config(&module));
         let mut annotations = Annotations::default();
         annotations.invocation_roots.insert(rooted);
         assert_eq!(

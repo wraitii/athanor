@@ -22,7 +22,7 @@ impl Heap {
         }
         let id = data.reserve()?;
         data.retain(value);
-        data.store(id, Payload::Cell(Box::new(Cell { value })));
+        data.store(id, Payload::Cell(Cell { value }));
         Some(Value::from_bits(TAG_OBJECT | id))
     }
 

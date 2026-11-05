@@ -172,9 +172,11 @@ pub(super) fn promote(graph: &mut Graph, notes: &mut Vec<String>) {
 }
 
 fn remove_trivial_params(graph: &mut Graph) {
+    let blocks = Cfg::new(graph).rpo;
     loop {
         let mut incoming: HashMap<Value, Vec<Value>> = HashMap::new();
-        for data in graph.blocks.values() {
+        for &block in &blocks {
+            let data = &graph.blocks[block];
             if let Some(terminator) = &data.terminator {
                 for target in terminator.kind.targets() {
                     for (&param, &arg) in graph.blocks[target.block].params.iter().zip(&target.args)
@@ -221,7 +223,8 @@ fn remove_trivial_params(graph: &mut Graph) {
                 )
             })
             .collect();
-        for data in graph.blocks.values_mut() {
+        for &block in &blocks {
+            let data = &mut graph.blocks[block];
             if let Some(terminator) = &mut data.terminator {
                 for target in terminator.kind.targets_mut() {
                     for &index in removed[&target.block].iter().rev() {

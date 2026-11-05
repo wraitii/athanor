@@ -1,5 +1,5 @@
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
-use cranelift_codegen::ir::{InstBuilder, MemFlags, Type, Value as ClifValue, types};
+use cranelift_codegen::ir::{InstBuilder, MemFlagsData, Type, Value as ClifValue, types};
 
 use crate::heap::MathFunction;
 use crate::jit::semantic::Types;
@@ -67,26 +67,28 @@ impl FunctionCompiler<'_, '_> {
         let value = operand.value;
         match (operand.repr, to) {
             (from, to) if from == to => value,
-            (Repr::Boxed, Repr::Float) => self.b.ins().bitcast(types::F64, MemFlags::new(), value),
+            (Repr::Boxed, Repr::Float) => {
+                self.b.ins().bitcast(types::F64, MemFlagsData::new(), value)
+            }
             (Repr::Boxed, Repr::Int32) => {
-                let float = self.b.ins().bitcast(types::F64, MemFlags::new(), value);
+                let float = self.b.ins().bitcast(types::F64, MemFlagsData::new(), value);
                 self.to_int32(float)
             }
             (Repr::Boxed, Repr::Bool) => {
                 self.b
                     .ins()
-                    .icmp_imm(IntCC::Equal, value, Value::TRUE.bits() as i64)
+                    .icmp_imm_s(IntCC::Equal, value, Value::TRUE.bits() as i64)
             }
             (Repr::Float, Repr::Boxed) => {
                 let unordered = self.b.ins().fcmp(FloatCC::Unordered, value, value);
-                let bits = self.b.ins().bitcast(types::I64, MemFlags::new(), value);
+                let bits = self.b.ins().bitcast(types::I64, MemFlagsData::new(), value);
                 let nan = self.constant(Value::number(f64::NAN));
                 let boxed = self.b.ins().select(unordered, nan, bits);
                 boxed
             }
             (Repr::Int32, Repr::Boxed) => {
                 let float = self.b.ins().fcvt_from_sint(types::F64, value);
-                let boxed = self.b.ins().bitcast(types::I64, MemFlags::new(), float);
+                let boxed = self.b.ins().bitcast(types::I64, MemFlagsData::new(), float);
                 boxed
             }
             (Repr::Bool, Repr::Boxed) => {
@@ -101,7 +103,7 @@ impl FunctionCompiler<'_, '_> {
                 let wide = self.b.ins().uextend(types::I32, value);
                 self.b.ins().fcvt_from_uint(types::F64, wide)
             }
-            (Repr::Int32, Repr::Bool) => self.b.ins().icmp_imm(IntCC::NotEqual, value, 0),
+            (Repr::Int32, Repr::Bool) => self.b.ins().icmp_imm_s(IntCC::NotEqual, value, 0),
             (Repr::Float, Repr::Bool) => {
                 let zero = self.b.ins().f64const(0.0);
                 let negative = self.b.ins().fcmp(FloatCC::LessThan, value, zero);

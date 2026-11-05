@@ -1,6 +1,6 @@
 use super::{ClifValue, FunctionCompiler};
 use crate::error::{Error, compile_at};
-use cranelift_codegen::ir::{InstBuilder, MemFlags, StackSlotData, StackSlotKind};
+use cranelift_codegen::ir::{InstBuilder, MemFlagsData, StackSlotData, StackSlotKind};
 use oxc_ast::ast::Expression;
 use oxc_span::Span;
 
@@ -28,7 +28,9 @@ impl FunctionCompiler<'_, '_> {
                 .b
                 .ins()
                 .stack_addr(self.pointer, slot, (index * 8) as i32);
-            self.b.ins().store(MemFlags::trusted(), *value, address, 0);
+            self.b
+                .ins()
+                .store(MemFlagsData::trusted(), *value, address, 0);
         }
         Ok(self.b.ins().stack_addr(self.pointer, slot, 0))
     }

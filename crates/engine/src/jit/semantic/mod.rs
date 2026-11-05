@@ -65,6 +65,7 @@ pub(super) struct Graph {
     pub(in crate::jit) views: HashMap<Inst, Value>,
     pub(in crate::jit) borrowed: HashSet<Value>,
     pub(in crate::jit) cold: HashSet<Block>,
+    pub(super) lazy_captures: HashSet<Binding>,
     pub(super) generator: bool,
     pub(super) blocks: PrimaryMap<Block, BlockData>,
     pub(super) insts: PrimaryMap<Inst, InstData>,
@@ -174,6 +175,14 @@ impl fmt::Display for Native {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ArrayMethod {
+    Map,
+    Some,
+    Every,
+    Filter,
+}
+
 #[derive(Clone, Debug)]
 pub(super) enum Op {
     Argument(usize),
@@ -199,7 +208,7 @@ pub(super) enum Op {
     NewArray(Vec<Value>),
     NewHoleyArray(Value),
     MapElement(Value, Value),
-    IsArrayMap(Value, Value),
+    IsArrayIteration(Value, Value, ArrayMethod),
     ArrayAppend(Value, Value, bool),
     CallSpread(Value, Value, Value),
     ConstructSpread(Value, Value),
@@ -271,6 +280,7 @@ pub(super) enum Op {
     TypedIndex(Value, Value, TypedRead),
     IsNumber(Value),
     IsString(Value),
+    IsTypeof(Value, u8),
     AsNumber(Value),
     EnterScope(Scope),
     EnterCaptures(Scope, Value),
@@ -397,12 +407,13 @@ impl Op {
             | Op::IsTyped(value, _)
             | Op::IsNumber(value)
             | Op::IsString(value)
+            | Op::IsTypeof(value, _)
             | Op::AsNumber(value) => vec![value],
             Op::Define(object, _, value)
             | Op::DefineHidden(object, _, value)
             | Op::Set(object, _, value) => vec![object, value],
             Op::MapElement(object, key)
-            | Op::IsArrayMap(object, key)
+            | Op::IsArrayIteration(object, key, _)
             | Op::GetIndex(object, key)
             | Op::TypedIndex(object, key, _)
             | Op::IndexedGet(object, key)
@@ -798,7 +809,7 @@ impl Graph {
             Op::ClosureThis(_) => closed(HEAP_READ, &[], Borrowed),
             Op::NewHoleyArray(_) => closed(ALLOCATION | INTERNAL | ERROR, &[], Owned),
             Op::MapElement(..) => closed(HEAP_READ | INTERNAL, &[], Borrowed),
-            Op::IsArrayMap(..) => closed(HEAP_READ, &[], Unowned),
+            Op::IsArrayIteration(..) => closed(HEAP_READ, &[], Unowned),
             Op::Constant(_) => closed(0, &[], Unowned),
             Op::GlobalRead(_) | Op::GlobalReadOptional(_) => {
                 closed(GLOBAL_READ | INTERNAL | ERROR, &[], Borrowed)
@@ -911,6 +922,11 @@ impl Graph {
                 assumptions: &[],
                 result: Owned,
             },
+            Op::CallNative(native, _)
+                if METHODS[native.index()].1 == crate::heap::MathFunction::Random =>
+            {
+                closed(INTERNAL, &[], Unowned)
+            }
             Op::CallNative(..) => coercing(Unowned),
             Op::IsUndefined(_) | Op::IsNullish(_) | Op::IsNative(..) => closed(0, &[], Unowned),
             Op::ConstructorPrototype(_) => closed(HEAP_READ, &[Assumption::NoAccessors], Borrowed),
@@ -927,6 +943,7 @@ impl Graph {
             Op::IndexedGet(..) => closed(HEAP_READ | INTERNAL | ERROR, &[], Borrowed),
             Op::TypedIndex(..) => closed(HEAP_READ, &[Assumption::FixedTypedStorage], Unowned),
             Op::IsNumber(_) | Op::IsString(_) => closed(0, &[], Unowned),
+            Op::IsTypeof(..) => closed(HEAP_READ, &[], Unowned),
             Op::AsNumber(_) => closed(INTERNAL, &[], Unowned),
             Op::EnterCaptures(..) => closed(HEAP_READ | INTERNAL | ERROR, &[], None),
             Op::EnterScope(scope) | Op::NextIteration(scope) | Op::FreshIteration(scope) => {
@@ -1094,7 +1111,9 @@ impl Graph {
             Op::NewArray(values) => format!("new_array [{}]", list(values)),
             Op::NewHoleyArray(length) => format!("new_holey_array {length}"),
             Op::MapElement(object, key) => format!("map_element {object}[{key}]"),
-            Op::IsArrayMap(callee, receiver) => format!("is_array_map {callee}, {receiver}"),
+            Op::IsArrayIteration(callee, receiver, method) => {
+                format!("is_array_{} {callee}, {receiver}", method.name())
+            }
             Op::ArrayAppend(array, value, spread) => {
                 format!("array_append {array}, {value}, {spread}")
             }
@@ -1189,6 +1208,7 @@ impl Graph {
             }
             Op::IsNumber(value) => format!("is_number {value}"),
             Op::IsString(value) => format!("is_string {value}"),
+            Op::IsTypeof(value, kind) => format!("is_typeof {value} {kind}"),
             Op::AsNumber(value) => format!("as_number {value}"),
             Op::EnterScope(scope) => format!("enter {scope}"),
             Op::EnterCaptures(scope, closure) => format!("enter_captures {scope}, {closure}"),
@@ -1536,6 +1556,11 @@ pub(super) fn optimize_planned(planned: Planned) -> Result<Analysis> {
     }
     reads::apply(&mut graph, &reads, &mut notes)?;
     comparisons::expose(&mut graph);
+    optimize::sink_closures(&mut graph, &mut notes);
+    if optimize::lazy_captures(&mut graph, &mut notes) {
+        promote::promote(&mut graph, &mut notes);
+        optimize::simplify(&mut graph);
+    }
     graph.verify()?;
     let mut regions = optimize::version(&mut graph, &mut notes)?;
     graph.verify()?;
@@ -1547,6 +1572,7 @@ pub(super) fn optimize_planned(planned: Planned) -> Result<Analysis> {
     }
     let copies = optimize::check_loops(&mut graph, &mut regions, &mut notes)?;
     optimize::coercions(&mut graph);
+    optimize::bit_tests(&mut graph);
     graph.verify()?;
     for region in regions.iter().chain(&copies) {
         optimize::reuse_loads(&mut graph, region, &mut notes);
@@ -1560,6 +1586,7 @@ pub(super) fn optimize_planned(planned: Planned) -> Result<Analysis> {
     optimize::simplify(&mut graph);
     graph.verify()?;
     optimize::sink_closures(&mut graph, &mut notes);
+    optimize::lazy_captures(&mut graph, &mut notes);
     graph.verify()?;
     let facts = Facts::compute(&graph);
     borrow::borrows(&mut graph, &facts, &mut notes);
@@ -1845,6 +1872,36 @@ mod tests {
     }
 
     #[test]
+    fn typed_loop_reads_are_reused_before_inner_loop_versioning() {
+        let graph = lower_source("function f(grid,width){let members=0;for(let y=0;y<2;++y){const indexY=y*width;for(let x=0;x<2;++x){if(grid[indexY+x])for(let i=0;i<16;++i)if(grid[indexY+x]&(1<<i))++members;}}return members;}").unwrap();
+        let canonical = canonicalize(graph, true).unwrap();
+        let read = canonical
+            .graph
+            .insts
+            .values()
+            .filter(|data| matches!(data.op, Op::GetIndex(..)))
+            .min_by_key(|data| data.span.start)
+            .unwrap();
+        let mut bodies = specialize::Repository::default();
+        bodies.read_feedback.insert(
+            (
+                crate::jit::planner::Site {
+                    source: 0,
+                    start: read.span.start,
+                    end: read.span.end,
+                },
+                crate::jit::planner::ReadKind::Receiver,
+            ),
+            crate::jit::planner::ReadType::Typed(crate::heap::TypedKind::Uint16),
+        );
+        let analysis = optimize_canonical(canonical, true, Some((&bodies, 0))).unwrap();
+        let operations = ops(&analysis.graph);
+        assert!(operations.iter().any(|op| matches!(op, Op::TypedIndex(..))));
+        assert!(!operations.iter().any(|op| matches!(op, Op::ProbeIndex(..))));
+        analysis.graph.verify().unwrap();
+    }
+
+    #[test]
     fn typeof_string_comparisons_avoid_string_materialization() {
         for expression in [
             "typeof value === 'string'",
@@ -1859,6 +1916,26 @@ mod tests {
                 op,
                 Op::Constant(Constant::String(_)) | Op::Unary(UnaryOp::Typeof, _)
             )));
+        }
+    }
+
+    #[test]
+    fn typeof_comparisons_avoid_string_materialization() {
+        for name in ["number", "boolean", "undefined", "object", "function"] {
+            for operator in ["===", "!=="] {
+                for expression in [
+                    format!("typeof value {operator} '{name}'"),
+                    format!("'{name}' {operator} typeof value"),
+                ] {
+                    let analysis =
+                        analyze_source(&format!("function f(value) {{ return {expression}; }}"));
+                    let operations = ops(&analysis.graph);
+                    assert!(!operations.iter().any(|op| matches!(
+                        op,
+                        Op::Constant(Constant::String(_)) | Op::Unary(UnaryOp::Typeof, _)
+                    )));
+                }
+            }
         }
     }
 
@@ -2061,6 +2138,39 @@ mod tests {
                     && cfg.dominates(header, graph.insts[user].block)
             }));
         }
+    }
+
+    #[test]
+    fn capture_cell_writes_preserve_guarded_globals_and_properties() {
+        let mut graph = lower_source(
+            "function f(n){let count=0;for(let i=0;i<n;++i){++count;Math.floor(2);}return count;}",
+        )
+        .unwrap();
+        let binding = graph
+            .bindings
+            .iter()
+            .find_map(|(binding, data)| (data.name == "count").then_some(binding))
+            .unwrap();
+        graph.bindings[binding].captured = true;
+        let canonical = canonicalize(graph, true).unwrap();
+        let mut graph = canonical.graph.clone();
+        let regions = optimize::version(&mut graph, &mut Vec::new()).unwrap();
+        graph.verify().unwrap();
+        assert!(!regions.is_empty());
+        assert!(
+            ops(&graph)
+                .iter()
+                .any(|op| matches!(op, Op::CallNative(..)))
+        );
+        assert!(
+            ops(&graph)
+                .iter()
+                .any(|op| matches!(op, Op::Write(id, _) if *id == binding))
+        );
+        let analysis = optimize_canonical(canonical, true, None).unwrap();
+        assert!(!analysis.graph.bindings[binding].captured);
+        assert!(!ops(&analysis.graph).iter().any(|op| matches!(op,
+            Op::Read(id) | Op::Write(id, _) | Op::Initialize(id, _) if *id == binding)));
     }
 
     #[test]

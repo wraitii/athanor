@@ -78,7 +78,7 @@ pub(super) fn remove_empty_clears(function: &mut Function, annotations: &Annotat
         }
     }
     for &(inst, done) in &remove {
-        function.dfg.replace(inst).jump(done, &[]);
+        function.replace(inst).jump(done, &[]);
     }
     remove.len()
 }
@@ -86,7 +86,7 @@ pub(super) fn remove_empty_clears(function: &mut Function, annotations: &Annotat
 #[cfg(test)]
 mod tests {
     use cranelift_codegen::ir::{
-        AbiParam, Block, ExtFuncData, ExternalName, FuncRef, MemFlags, Signature, types,
+        AbiParam, Block, ExtFuncData, ExternalName, FuncRef, MemFlagsData, Signature, types,
     };
     use cranelift_codegen::isa::CallConv;
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
@@ -136,7 +136,10 @@ mod tests {
         emit(&mut b, &mut annotations, entry);
         b.ins().return_(&[]);
         b.seal_all_blocks();
-        b.finalize();
+        let module = cranelift_jit::JITModule::new(
+            cranelift_jit::JITBuilder::new(cranelift_module::default_libcall_names()).unwrap(),
+        );
+        b.finalize(cranelift_module::Module::target_config(&module));
         assert_eq!(remove_empty_clears(&mut function, &annotations), expected);
         cranelift_codegen::verify_function(
             &function,
@@ -151,7 +154,7 @@ mod tests {
             check(usize::from(!push), |b, annotations, entry| {
                 let address = b.block_params(entry)[0];
                 let value = b.ins().iconst(types::I64, 0);
-                let store = b.ins().store(MemFlags::trusted(), value, address, 0);
+                let store = b.ins().store(MemFlagsData::trusted(), value, address, 0);
                 if push {
                     annotations.temporary_pushes.insert(store);
                 }

@@ -1,4 +1,4 @@
-use js_engine::{Engine, Value};
+use js_engine::{Engine, EngineOptions, Value};
 
 #[test]
 fn escaped_capture_survives_host_and_argument_replacement() {
@@ -204,5 +204,74 @@ fn unsupported_closure_semantics_fail_explicitly() {
             matches!(error, js_engine::Error::Unsupported(_)),
             "{source}: {error}"
         );
+    }
+}
+
+#[test]
+fn lazily_materialized_captures_retain_replaced_heap_values() {
+    let mut engine = Engine::new().unwrap();
+    engine
+        .compile(
+            "var saved;
+         function make(xs){ let value=[17]; xs.some(x=>value); value=[23]; return value; }
+         function main(){ return make({some:f=>{saved=f; return f(1);}}); }
+         function invoke(){ return saved()[0]; }
+         function clear(){ saved=undefined; }",
+            "lazy-capture-ownership.js",
+        )
+        .unwrap();
+    let returned = engine.call("main", &[]).unwrap();
+    drop(returned);
+    engine.drain_disposals(1000);
+    assert_eq!(
+        engine.call("invoke", &[]).unwrap().value(),
+        Value::number(23.0)
+    );
+    engine.call("clear", &[]).unwrap();
+    engine.drain_disposals(1000);
+    assert!(engine.call("invoke", &[]).is_err());
+}
+
+#[test]
+fn borrowed_probe_returns_and_mutating_fallbacks_preserve_heap_values() {
+    for enabled in [false, true] {
+        let mut engine = Engine::with_options(EngineOptions {
+            ssa_opt: enabled,
+            ..Default::default()
+        })
+        .unwrap();
+        engine
+            .compile(
+                "var target;
+             function square(x){return x*x;}
+             function setup(){target={item:[7],n:2};return target;}
+             function read(a){let kept=a.item; square(a.n);return kept;}
+             function replacement(x){target.item=[99];return x;}
+             function switcher(){square=replacement;}
+             function clear(){target=undefined;}
+             function peek(a){return a[0];}",
+                "borrowed-probe-ownership.js",
+            )
+            .unwrap();
+        let holder = engine.call("setup", &[]).unwrap();
+        let fast = engine.call("read", &[holder.value()]).unwrap();
+        engine.call("switcher", &[]).unwrap();
+        let slow = engine.call("read", &[holder.value()]).unwrap();
+        engine.call("clear", &[]).unwrap();
+        drop(holder);
+        engine.drain_disposals(1000);
+        assert_eq!(
+            engine.call("peek", &[fast.value()]).unwrap().value(),
+            Value::number(7.0)
+        );
+        assert_eq!(
+            engine.call("peek", &[slow.value()]).unwrap().value(),
+            Value::number(7.0)
+        );
+        let stale = fast.value();
+        drop(fast);
+        drop(slow);
+        engine.drain_disposals(1000);
+        assert!(engine.call("peek", &[stale]).is_err());
     }
 }

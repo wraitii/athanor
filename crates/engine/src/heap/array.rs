@@ -32,7 +32,7 @@ impl Heap {
             return None;
         };
         let holes = elements.iter().filter(|value| **value == HOLE).count();
-        data.store(id, Payload::Array(Box::new(Array { elements, holes })));
+        data.store(id, Payload::Array(Array { elements, holes }));
         Some(Value::from_bits(TAG_OBJECT | id))
     }
 
@@ -93,10 +93,10 @@ impl Heap {
         }
         data.store(
             id,
-            Payload::Array(Box::new(Array {
+            Payload::Array(Array {
                 elements: elements.to_vec(),
                 holes: elements.iter().filter(|value| **value == HOLE).count(),
-            })),
+            }),
         );
         Some(Value::from_bits(TAG_OBJECT | id))
     }
@@ -110,10 +110,10 @@ impl Heap {
         let id = data.reserve()?;
         data.store(
             id,
-            Payload::Array(Box::new(Array {
+            Payload::Array(Array {
                 elements,
                 holes: length,
-            })),
+            }),
         );
         Some(Value::from_bits(TAG_OBJECT | id))
     }

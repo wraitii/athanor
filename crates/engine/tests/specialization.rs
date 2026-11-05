@@ -96,6 +96,112 @@ fn missing_arguments_and_fallback_errors_agree() {
 }
 
 #[test]
+fn loop_guard_exits_preserve_progress_captures_and_mutated_globals() {
+    for enabled in [false, true] {
+        let mut engine = Engine::with_options(EngineOptions {
+            ssa_opt: enabled,
+            ..Default::default()
+        })
+        .unwrap();
+        engine
+            .compile(
+                r#"
+            var change;
+            function method(x) { return Math.floor(x); }
+            var points = [{method:method}, {method:method}, {method:method}];
+            function sum() {
+                let count = 0;
+                change = x => { count = x; };
+                let total = 0;
+                for (let i = 0; i < 3; ++i) {
+                    ++count;
+                    total += points[i].method(i + 0.9);
+                    total += Math.floor(i + 0.9);
+                }
+                return count * 1000 + total;
+            }
+            function replace() {
+                points[1].method = x => {
+                    change(20);
+                    Math.floor = x => 90;
+                    return 7;
+                };
+            }
+            "#,
+                "loop_guard_exit.js",
+            )
+            .unwrap();
+        for _ in 0..3 {
+            assert_eq!(
+                engine.call("sum", &[]).unwrap().value(),
+                Value::number(3006.0)
+            );
+        }
+        engine.call("replace", &[]).unwrap();
+        assert_eq!(
+            engine.call("sum", &[]).unwrap().value(),
+            Value::number(21277.0)
+        );
+    }
+}
+
+#[test]
+fn loop_guard_exits_keep_heap_values_alive() {
+    for enabled in [false, true] {
+        let mut engine = Engine::with_options(EngineOptions {
+            ssa_opt: enabled,
+            ..Default::default()
+        })
+        .unwrap();
+        engine
+            .compile(
+                r#"
+                function identity(x) { return x; }
+                var points = [{method:identity}, {method:identity}, {method:identity}];
+                var saved;
+                function collect() {
+                    let value = {v:-1};
+                    const read = () => value;
+                    let total = 0;
+                    for (let i = 0; i < 3; ++i) {
+                        const previous = value;
+                        value = points[i].method({v:i});
+                        total += previous.v + Math.floor(i + 0.9);
+                    }
+                    saved = read;
+                    return total + value.v + read().v;
+                }
+                function replace() {
+                    points[1].method = x => {
+                        Math.floor = x => 10;
+                        return {v:x.v + 10};
+                    };
+                }
+                function retained() { return saved().v; }
+                "#,
+                "loop_guard_heap_exit.js",
+            )
+            .unwrap();
+        for _ in 0..3 {
+            assert_eq!(
+                engine.call("collect", &[]).unwrap().value(),
+                Value::number(7.0)
+            );
+        }
+        engine.call("replace", &[]).unwrap();
+        assert_eq!(
+            engine.call("collect", &[]).unwrap().value(),
+            Value::number(34.0)
+        );
+        engine.drain_disposals(1000);
+        assert_eq!(
+            engine.call("retained", &[]).unwrap().value(),
+            Value::number(2.0)
+        );
+    }
+}
+
+#[test]
 fn local_closures_share_mutable_captures_and_preserve_heap_returns() {
     for (source, expected) in [
         (

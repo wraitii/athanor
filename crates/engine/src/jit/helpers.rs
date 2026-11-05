@@ -81,17 +81,18 @@ define_helpers! {
     ObserveGet => Binary, js_observe_get;
     ObserveIndex => Binary, js_observe_index;
     SemanticGlobalProbe => GlobalGet, js_semantic_global_probe;
-    SemanticPropertyProbe => PropertyGet, js_semantic_property_probe;
+    SemanticPropertyProbeCached => Binary, js_semantic_property_probe_cached;
     SemanticIndexProbe => Binary, js_semantic_index_probe;
     SemanticMathNative => Binary, js_semantic_math_native;
     SemanticCode => Binary, js_semantic_code;
     ClosureThis => Unary, js_closure_this;
-    ArrayMapGuard => Binary, js_array_map_guard;
+    ArrayIterationGuard => IndexSet, js_array_iteration_guard;
     ArrayMapNew => Unary, js_array_map_new;
     ArrayMapElement => Binary, js_array_map_element;
     MathDirect => MethodCallable, js_math_direct;
     FrameEnter => Unary, js_frame_enter;
     FrameExit => Unary, js_frame_exit;
+    FrameExitUnrooted => Unary, js_frame_exit_unrooted;
     LocalSet => Binary, js_local_set;
     LocalReplace => IndexSet, js_local_replace;
     Release => Unary, js_release;
@@ -102,6 +103,7 @@ define_helpers! {
     EnumerateNew => Unary, js_enumerate_new;
     EnumerateNext => Unary, js_enumerate_next;
     Typeof => Unary, js_typeof;
+    IsTypeof => Binary, js_is_typeof;
     Truthy => Unary, js_truthy;
     ObjectNew => Unary, js_object_new;
     PropertyKey => Unary, js_property_key;
@@ -606,6 +608,8 @@ pub(crate) struct PropertyCache {
     pub(crate) index: u32,
     pub(crate) holder: u64,
     pub(crate) holder_shape: u32,
+    pub(crate) builtin_kind: u32,
+    pub(crate) builtin_value: u64,
     pub(crate) name: Box<str>,
 }
 
@@ -614,6 +618,10 @@ pub(crate) const CACHE_INDEX_OFFSET: i32 = std::mem::offset_of!(PropertyCache, i
 pub(crate) const CACHE_HOLDER_OFFSET: i32 = std::mem::offset_of!(PropertyCache, holder) as i32;
 pub(crate) const CACHE_HOLDER_SHAPE_OFFSET: i32 =
     std::mem::offset_of!(PropertyCache, holder_shape) as i32;
+pub(crate) const CACHE_BUILTIN_KIND_OFFSET: i32 =
+    std::mem::offset_of!(PropertyCache, builtin_kind) as i32;
+pub(crate) const CACHE_BUILTIN_VALUE_OFFSET: i32 =
+    std::mem::offset_of!(PropertyCache, builtin_value) as i32;
 
 impl PropertyCache {
     pub(crate) fn new(name: &str) -> Self {
@@ -622,8 +630,20 @@ impl PropertyCache {
             index: 0,
             holder: 0,
             holder_shape: crate::heap::NO_SHAPE,
+            builtin_kind: 0,
+            builtin_value: Value::UNDEFINED.bits(),
             name: name.into(),
         }
+    }
+
+    fn builtin(&mut self, heap: &crate::heap::Heap, receiver: Value) -> Option<Value> {
+        let (kind, function) = heap.builtin_property(receiver, &self.name)?;
+        let value = heap.native_function(function)?;
+        // The engine's native-function cache owns the reference backing this borrowed value.
+        heap.release(value);
+        self.builtin_kind = kind;
+        self.builtin_value = value.bits();
+        Some(value)
     }
 }
 
@@ -634,6 +654,9 @@ extern "C" fn js_property_get_cached(
 ) -> Value {
     let cache = unsafe { &mut *cache };
     let heap = unsafe { &*ctx }.global.heap();
+    if let Some(value) = cache.builtin(heap, object) {
+        return unsafe { &mut *ctx }.retain_temp(value);
+    }
     if let Some(found) = heap.cached_property(object, &cache.name) {
         cache.shape = found.shape;
         cache.index = found.index;
@@ -712,6 +735,9 @@ extern "C" fn js_frame_enter(ctx: *mut JitCtx, size: u64) -> Value {
 }
 extern "C" fn js_frame_exit(ctx: *mut JitCtx, value: Value) -> Value {
     unsafe { &mut *ctx }.exit(value)
+}
+extern "C" fn js_frame_exit_unrooted(ctx: *mut JitCtx, value: Value) -> Value {
+    unsafe { &mut *ctx }.exit_unrooted(value)
 }
 extern "C" fn js_local_set(ctx: *mut JitCtx, slot: u64, value: Value) -> Value {
     unsafe { &mut *ctx }.local_set(slot as usize, value)
@@ -1214,6 +1240,25 @@ extern "C" fn js_semantic_property_probe(
     }
 }
 
+extern "C" fn js_semantic_property_probe_cached(
+    ctx: *mut JitCtx,
+    object: Value,
+    cache: *mut PropertyCache,
+) -> Value {
+    let cache = unsafe { &mut *cache };
+    let heap = unsafe { &*ctx }.global.heap();
+    if let Some(value) = cache.builtin(heap, object) {
+        return value;
+    }
+    if let Some(found) = heap.cached_property(object, &cache.name) {
+        cache.shape = found.shape;
+        cache.index = found.index;
+        cache.holder = found.holder;
+        cache.holder_shape = found.holder_shape;
+    }
+    js_semantic_property_probe(ctx, object, cache.name.as_ptr(), cache.name.len() as u64)
+}
+
 extern "C" fn js_semantic_index_probe(ctx: *mut JitCtx, object: Value, key: Value) -> Value {
     let heap = unsafe { &*ctx }.global.heap();
     if let Some(number) = key.as_number() {
@@ -1253,12 +1298,23 @@ extern "C" fn js_closure_this(ctx: *mut JitCtx, closure: Value) -> Value {
         .unwrap_or(Value::UNDEFINED)
 }
 
-extern "C" fn js_array_map_guard(ctx: *mut JitCtx, callee: Value, receiver: Value) -> Value {
+extern "C" fn js_array_iteration_guard(
+    ctx: *mut JitCtx,
+    callee: Value,
+    receiver: Value,
+    method: u64,
+) -> Value {
+    use super::semantic::ArrayMethod;
+    use crate::heap::NativeFunction;
+    let native = match method {
+        x if x == ArrayMethod::Map as u64 => NativeFunction::ArrayMap,
+        x if x == ArrayMethod::Some as u64 => NativeFunction::ArraySome,
+        x if x == ArrayMethod::Every as u64 => NativeFunction::ArrayEvery,
+        x if x == ArrayMethod::Filter as u64 => NativeFunction::ArrayFilter,
+        _ => unreachable!(),
+    };
     let heap = unsafe { &*ctx }.global.heap();
-    Value::boolean(
-        heap.native(callee) == Some(crate::heap::NativeFunction::ArrayMap)
-            && heap.is_array(receiver),
-    )
+    Value::boolean(heap.native(callee) == Some(native) && heap.is_array(receiver))
 }
 
 extern "C" fn js_array_map_new(ctx: *mut JitCtx, length: Value) -> Value {
@@ -1700,6 +1756,25 @@ extern "C" fn js_instanceof(ctx: *mut JitCtx, value: Value, constructor: Value) 
         return Value::UNDEFINED;
     }
     Value::boolean(heap.inherits(value, prototype))
+}
+
+extern "C" fn js_is_typeof(ctx: *mut JitCtx, value: Value, kind: Value) -> Value {
+    let ctx = unsafe { &mut *ctx };
+    let callable = ctx.global.heap().closure_code(value).is_some()
+        || ctx.global.heap().native(value).is_some();
+    let name = if callable {
+        "function"
+    } else {
+        value.type_name()
+    };
+    let expected = match kind.as_number().unwrap() as u8 {
+        2 => "boolean",
+        3 => "undefined",
+        4 => "object",
+        5 => "function",
+        _ => unreachable!(),
+    };
+    Value::boolean(name == expected)
 }
 
 extern "C" fn js_typeof(ctx: *mut JitCtx, value: Value) -> Value {

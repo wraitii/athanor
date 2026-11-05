@@ -13,19 +13,48 @@ pub(super) struct Object {
     pub(super) prototype: Option<Value>,
 }
 
+pub(super) struct ObjectInfo {
+    pub(super) error: bool,
+    pub(super) prototype: Option<Value>,
+}
+
+pub(super) const INLINE_PROPERTIES: usize = 8;
+
+pub(super) struct SmallObject {
+    pub(super) values: [Value; INLINE_PROPERTIES],
+    pub(super) prototype: Option<Value>,
+    pub(super) error: bool,
+    pub(super) len: u8,
+}
+
+impl SmallObject {
+    fn new(error: bool) -> Self {
+        Self {
+            values: [Value::UNDEFINED; INLINE_PROPERTIES],
+            prototype: None,
+            error,
+            len: 0,
+        }
+    }
+
+    pub(super) fn pop(&mut self) -> Option<Value> {
+        if self.len == 0 {
+            return None;
+        }
+        self.len -= 1;
+        Some(self.values[self.len as usize])
+    }
+}
+
 impl Heap {
     pub(crate) fn object(&self) -> Option<Value> {
+        if let Some(id) = self.0.borrow_mut().reuse_object() {
+            return Some(Value::from_bits(TAG_OBJECT | id));
+        }
         self.drain(64);
         let mut data = self.0.borrow_mut();
         let id = data.reserve()?;
-        data.store_shaped(
-            id,
-            Payload::Object(Box::new(Object {
-                properties: Properties::default(),
-                error: false,
-                prototype: None,
-            })),
-        );
+        data.store_shaped(id, Payload::SmallObject(SmallObject::new(false)));
         Some(Value::from_bits(TAG_OBJECT | id))
     }
 
@@ -42,14 +71,7 @@ impl Heap {
         let id = data.reserve()?;
         data.retain(message);
         data.retain(name);
-        data.store_shaped(
-            id,
-            Payload::Object(Box::new(Object {
-                properties: Properties::default(),
-                error: true,
-                prototype: None,
-            })),
-        );
+        data.store_shaped(id, Payload::SmallObject(SmallObject::new(true)));
         data.put_property(id, "message", message, Some(false));
         data.put_property(id, "name", name, Some(false));
         Some(Value::from_bits(TAG_OBJECT | id))
@@ -80,6 +102,31 @@ impl Heap {
         })
     }
 
+    pub(crate) fn builtin_property(
+        &self,
+        receiver: Value,
+        name: &str,
+    ) -> Option<(u32, NativeFunction)> {
+        // These payloads resolve methods by kind; native constructors need their identity too.
+        let kind = {
+            let data = self.0.borrow();
+            let slot = data.live(heap_id(receiver)?)?;
+            match &slot.payload {
+                Payload::Array(_)
+                | Payload::TypedArray(_)
+                | Payload::String(_)
+                | Payload::Set(_)
+                | Payload::RegExp(_)
+                | Payload::Generator(_) => slot.kind,
+                _ => return None,
+            }
+        };
+        let Some(PropertyRead::Native(function)) = self.read_property(receiver, name) else {
+            return None;
+        };
+        Some((kind, function))
+    }
+
     /// Returned values are borrowed; native functions and lazy prototypes are resolved by the caller.
     pub(crate) fn read_property(&self, receiver: Value, name: &str) -> Option<PropertyRead> {
         use NativeFunction::*;
@@ -94,7 +141,7 @@ impl Heap {
         let data = self.0.borrow();
         let payload = &data.live(heap_id(receiver)?)?.payload;
         let function = match payload {
-            Payload::Object(_) => {
+            Payload::Object(_) | Payload::SmallObject(_) => {
                 return data
                     .object_property(heap_id(receiver)?, name)
                     .map(PropertyRead::Value);
@@ -556,6 +603,39 @@ pub(crate) struct CachedProperty {
 }
 
 impl HeapData {
+    fn reuse_object(&mut self) -> Option<u64> {
+        let id = *self.pending.front()?;
+        if !matches!(self.slot(id).payload, Payload::SmallObject(_)) {
+            return None;
+        }
+        debug_assert_eq!(self.slot(id).references, 0);
+        self.pending.pop_front();
+        loop {
+            let Payload::SmallObject(object) = &mut self.slot_mut(id).payload else {
+                unreachable!();
+            };
+            let Some(value) = object.pop() else {
+                break;
+            };
+            self.release(value);
+        }
+        let root = self.shapes.root(None);
+        let slot = self.slot_mut(id);
+        let Payload::SmallObject(object) = &mut slot.payload else {
+            unreachable!();
+        };
+        let prototype = object.prototype.take();
+        object.error = false;
+        slot.references = 1;
+        slot.shape = root;
+        slot.flags = 0;
+        slot.length = 0;
+        if let Some(prototype) = prototype {
+            self.release(prototype);
+        }
+        Some(id)
+    }
+
     fn cacheable_shape(&self, id: u64) -> Option<ShapeId> {
         Some(self.live(id)?.shape).filter(|&shape| shape != NO_SHAPE && shape != DICTIONARY)
     }

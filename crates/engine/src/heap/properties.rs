@@ -83,6 +83,13 @@ impl HeapData {
     pub(super) fn properties(&self, id: u64) -> Option<PropertyView<'_>> {
         let slot = self.live(id)?;
         let properties = match &slot.payload {
+            Payload::SmallObject(object) => {
+                return Some(PropertyView::Shaped {
+                    atoms: &self.atoms,
+                    shape: self.shapes.get(slot.shape),
+                    values: &object.values[..object.len as usize],
+                });
+            }
             Payload::Object(object) => &object.properties,
             Payload::Closure(closure) => &closure.properties,
             _ => return None,
@@ -119,6 +126,38 @@ impl HeapData {
         // Slots live in arena chunks rather than in HeapData, so this borrow is disjoint
         // from the shape and atom tables.
         let slot = unsafe { &mut *self.arena.get(id).as_ptr() };
+        if let Payload::SmallObject(object) = &mut slot.payload {
+            let atom = self.atoms.intern(name);
+            let shape = self.shapes.get(slot.shape);
+            if let Some(index) = shape.slot(atom) {
+                if let Some(enumerable) = enumerable
+                    && shape.keys()[index].enumerable != enumerable
+                {
+                    slot.shape = self.shapes.transition(slot.shape, Key { atom, enumerable });
+                }
+                return Some(std::mem::replace(&mut object.values[index], value));
+            }
+            if (object.len as usize) < INLINE_PROPERTIES && array_index_name(name).is_none() {
+                slot.shape = self.shapes.transition(
+                    slot.shape,
+                    Key {
+                        atom,
+                        enumerable: enumerable.unwrap_or(true),
+                    },
+                );
+                object.values[object.len as usize] = value;
+                object.len += 1;
+                return None;
+            }
+            let mut values = Vec::with_capacity(INLINE_PROPERTIES * 2);
+            values.extend_from_slice(&object.values[..object.len as usize]);
+            // The replacement takes ownership of the values and prototype without retaining them.
+            slot.payload = Payload::Object(Object {
+                properties: Properties::Shaped(values),
+                error: object.error,
+                prototype: object.prototype,
+            });
+        }
         let properties = match &mut slot.payload {
             Payload::Object(object) => &mut object.properties,
             Payload::Closure(closure) => &mut closure.properties,
@@ -165,10 +204,11 @@ impl HeapData {
 
     pub(super) fn set_prototype(&mut self, id: u64, prototype: Value) {
         let slot = unsafe { &mut *self.arena.get(id).as_ptr() };
-        let Payload::Object(object) = &mut slot.payload else {
-            unreachable!()
-        };
-        object.prototype = Some(prototype);
+        match &mut slot.payload {
+            Payload::Object(object) => object.prototype = Some(prototype),
+            Payload::SmallObject(object) => object.prototype = Some(prototype),
+            _ => unreachable!(),
+        }
         if slot.shape != DICTIONARY {
             slot.shape = self.shapes.rebase(slot.shape, Some(prototype));
         }

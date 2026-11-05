@@ -2,9 +2,9 @@ use super::{ClifValue, FunctionCompiler};
 use crate::heap::REFERENCES_OFFSET;
 use crate::jit::helpers::Helper;
 use crate::jit::session::{TEMPS_CAPACITY_OFFSET, TEMPS_LEN_OFFSET, TEMPS_VALUES_OFFSET};
-use crate::value::{TAG_OBJECT, TAG_SHIFT, TAG_STRING};
+use crate::value::{TAG_OBJECT, TAG_SHIFT, TAG_STRING, Value};
 use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::{Block, BlockArg, InstBuilder, MemFlags, types};
+use cranelift_codegen::ir::{Block, BlockArg, InstBuilder, MemFlagsData, types};
 use cranelift_frontend::Variable;
 use oxc_ast::ast::{
     BindingPattern, ForStatementInit, ForStatementLeft, Statement, VariableDeclaration,
@@ -55,19 +55,19 @@ impl FunctionCompiler<'_, '_> {
 
     pub(super) fn increment(&mut self, value: ClifValue) {
         let heap = self.is_heap(value);
-        let address = self.b.ins().band_imm(value, ADDRESS_MASK);
+        let address = self.b.ins().band_imm_s(value, ADDRESS_MASK);
         let zero = self.b.ins().iconst(types::I64, 0);
         let address = self.b.ins().select(heap, address, zero);
         let increment = self.b.create_block();
         let done = self.b.create_block();
         self.brif(address, increment, &[], done, &[]);
         self.switch(increment);
-        let flags = MemFlags::trusted();
+        let flags = MemFlagsData::trusted();
         let references = self
             .b
             .ins()
             .load(types::I32, flags, address, REFERENCES_OFFSET);
-        let references = self.b.ins().iadd_imm(references, 1);
+        let references = self.b.ins().iadd_imm_s(references, 1);
         self.b
             .ins()
             .store(flags, references, address, REFERENCES_OFFSET);
@@ -75,11 +75,36 @@ impl FunctionCompiler<'_, '_> {
         self.switch(done);
     }
 
+    pub(super) fn checked_temporary(&mut self, value: ClifValue) -> ClifValue {
+        let missing =
+            self.b
+                .ins()
+                .icmp_imm_s(IntCC::Equal, value, Value::UNINITIALIZED.bits() as i64);
+        let error = self.b.create_block();
+        let valid = self.b.create_block();
+        let retain = self.b.create_block();
+        let done = self.b.create_block();
+        self.b.set_cold_block(error);
+        self.brif(missing, error, &[], valid, &[]);
+        self.switch(error);
+        self.call_helper(Helper::TempRetain, &[value]);
+        self.check_error();
+        self.jump(valid, &[]);
+        self.switch(valid);
+        let heap = self.is_heap(value);
+        self.brif(heap, retain, &[], done, &[]);
+        self.switch(retain);
+        self.retain_temporary(value);
+        self.jump(done, &[]);
+        self.switch(done);
+        value
+    }
+
     /// Hands a heap-tagged value out as a temporary, calling the runtime only to grow the
     /// temporary stack.
     pub(super) fn retain_temporary(&mut self, value: ClifValue) -> ClifValue {
-        let flags = MemFlags::trusted();
-        let address = self.b.ins().band_imm(value, ADDRESS_MASK);
+        let flags = MemFlagsData::trusted();
+        let address = self.b.ins().band_imm_s(value, ADDRESS_MASK);
         let load = self.b.create_block();
         let push = self.b.create_block();
         let slow = self.b.create_block();
@@ -97,15 +122,15 @@ impl FunctionCompiler<'_, '_> {
             .b
             .ins()
             .load(types::I32, flags, address, REFERENCES_OFFSET);
-        let references = self.b.ins().iadd_imm(references, 1);
+        let references = self.b.ins().iadd_imm_s(references, 1);
         self.b
             .ins()
             .store(flags, references, address, REFERENCES_OFFSET);
         let values = self.load_ctx(TEMPS_VALUES_OFFSET);
-        let offset = self.b.ins().ishl_imm(len, 3);
+        let offset = self.b.ins().ishl_imm_s(len, 3);
         let entry = self.b.ins().iadd(values, offset);
         self.b.ins().store(flags, value, entry, 0);
-        let len = self.b.ins().iadd_imm(len, 1);
+        let len = self.b.ins().iadd_imm_s(len, 1);
         let push = self.b.ins().store(flags, len, self.ctx, TEMPS_LEN_OFFSET);
         self.annotations.temporary_pushes.insert(push);
         self.jump(done, &[BlockArg::Value(value)]);
@@ -120,7 +145,7 @@ impl FunctionCompiler<'_, '_> {
     fn load_ctx(&mut self, offset: i32) -> ClifValue {
         self.b
             .ins()
-            .load(types::I64, MemFlags::trusted(), self.ctx, offset)
+            .load(types::I64, MemFlagsData::trusted(), self.ctx, offset)
     }
 
     /// Stores a value whose reference the slot already owns, releasing the value it replaces
@@ -142,9 +167,14 @@ impl FunctionCompiler<'_, '_> {
     }
 
     fn store_local(&mut self, variable: Variable, value: ClifValue) -> (u32, ClifValue) {
+        // Even scalar stores conservatively require the normal frame cleanup.
+        if let Some(roots) = self.frame_roots {
+            let dirty = self.b.ins().iconst(types::I8, 1);
+            self.b.def_var(roots, dirty);
+        }
         let next = self.slots.len() as u32;
         let index = *self.slots.entry(variable.as_u32()).or_insert(next);
-        let flags = MemFlags::trusted();
+        let flags = MemFlagsData::trusted();
         let base = self.b.ins().load(
             types::I64,
             flags,
@@ -159,13 +189,13 @@ impl FunctionCompiler<'_, '_> {
 
     /// Releases a heap-tagged value, calling the runtime only when its count would reach zero.
     fn release_inline(&mut self, value: ClifValue, done: Block) {
-        let address = self.b.ins().band_imm(value, ADDRESS_MASK);
+        let address = self.b.ins().band_imm_s(value, ADDRESS_MASK);
         let load = self.b.create_block();
         let decrement = self.b.create_block();
         let last = self.b.create_block();
         self.brif(address, load, &[], done, &[]);
         self.switch(load);
-        let flags = MemFlags::trusted();
+        let flags = MemFlagsData::trusted();
         let references = self
             .b
             .ins()
@@ -173,10 +203,10 @@ impl FunctionCompiler<'_, '_> {
         let shared = self
             .b
             .ins()
-            .icmp_imm(IntCC::UnsignedGreaterThan, references, 1);
+            .icmp_imm_s(IntCC::UnsignedGreaterThan, references, 1);
         self.brif(shared, decrement, &[], last, &[]);
         self.switch(decrement);
-        let references = self.b.ins().iadd_imm(references, -1);
+        let references = self.b.ins().iadd_imm_s(references, -1);
         self.b
             .ins()
             .store(flags, references, address, REFERENCES_OFFSET);
@@ -187,10 +217,10 @@ impl FunctionCompiler<'_, '_> {
     }
 
     pub(super) fn is_heap(&mut self, value: ClifValue) -> ClifValue {
-        let tag = self.b.ins().ushr_imm(value, TAG_SHIFT as i64);
+        let tag = self.b.ins().ushr_imm_s(value, TAG_SHIFT as i64);
         let first = (TAG_OBJECT >> TAG_SHIFT) as i64;
-        let offset = self.b.ins().iadd_imm(tag, -first);
-        self.b.ins().icmp_imm(IntCC::UnsignedLessThan, offset, 2)
+        let offset = self.b.ins().iadd_imm_s(tag, -first);
+        self.b.ins().icmp_imm_s(IntCC::UnsignedLessThan, offset, 2)
     }
 }
 

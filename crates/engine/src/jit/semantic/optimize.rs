@@ -31,9 +31,19 @@ pub(super) fn typeof_comparisons(graph: &mut Graph) {
                     let Op::Constant(Constant::String(text)) = graph.defining_op(literal)? else {
                         return None;
                     };
-                    (uses[value] == 1 && text == "string").then_some((value, literal, *operand))
+                    let kind = [
+                        "string",
+                        "number",
+                        "boolean",
+                        "undefined",
+                        "object",
+                        "function",
+                    ]
+                    .iter()
+                    .position(|name| text == name)?;
+                    (uses[value] == 1).then_some((value, literal, *operand, kind as u8))
                 });
-            let Some((value, literal, operand)) = pair else {
+            let Some((value, literal, operand, kind)) = pair else {
                 continue;
             };
             let ValueDef::Result(typeof_inst) = graph.values[value] else {
@@ -48,8 +58,15 @@ pub(super) fn typeof_comparisons(graph: &mut Graph) {
                 };
                 graph.remove_inst(literal_inst);
             }
-            graph.insts[inst].op = if operator == BinaryOperator::StrictEquality {
+            let test = if kind == 0 {
                 Op::IsString(operand)
+            } else if kind == 1 {
+                Op::IsNumber(operand)
+            } else {
+                Op::IsTypeof(operand, kind)
+            };
+            graph.insts[inst].op = if operator == BinaryOperator::StrictEquality {
+                test
             } else {
                 let position = graph.blocks[block]
                     .insts
@@ -57,7 +74,7 @@ pub(super) fn typeof_comparisons(graph: &mut Graph) {
                     .position(|&i| i == inst)
                     .unwrap();
                 let span = graph.insts[inst].span;
-                let (_, result) = graph.insert(block, position, span, Op::IsString(operand), true);
+                let (_, result) = graph.insert(block, position, span, test, true);
                 Op::Unary(UnaryOp::Not, result.unwrap())
             };
         }
@@ -114,6 +131,64 @@ pub(super) fn coercions(graph: &mut Graph) {
             }
             graph.insts[inst].op = op;
         }
+    }
+}
+
+pub(super) fn bit_tests(graph: &mut Graph) {
+    let facts = Facts::compute(graph);
+    let uses = graph.use_counts();
+    for block in Cfg::new(graph).rpo {
+        let terminator = graph.blocks[block].terminator.as_ref().unwrap();
+        let TerminatorKind::Branch(condition, _, _) = terminator.kind else {
+            continue;
+        };
+        // The sign-bit mask may be negative; this rewrite preserves only truthiness.
+        if uses[condition] != 1 {
+            continue;
+        }
+        let Some(&Op::Binary(BinaryOperator::BitwiseAnd, left, right)) =
+            graph.defining_op(condition)
+        else {
+            continue;
+        };
+        let test = [(left, right), (right, left)]
+            .into_iter()
+            .find_map(|(word, mask)| {
+                let &Op::Binary(BinaryOperator::ShiftLeft, one, index) = graph.defining_op(mask)?
+                else {
+                    return None;
+                };
+                (matches!(
+                    graph.defining_op(one),
+                    Some(Op::Constant(Constant::Number(1.0)))
+                ) && facts.of(word).within(Types::INT32)
+                    && facts.of(index).within(Types::INT32))
+                .then_some((word, index, one))
+            });
+        let Some((word, index, one)) = test else {
+            continue;
+        };
+        let ValueDef::Result(inst) = graph.values[condition] else {
+            unreachable!();
+        };
+        let data = &graph.insts[inst];
+        let span = data.span;
+        let source_name = data.source_name;
+        let block = data.block;
+        let position = graph.blocks[block]
+            .insts
+            .iter()
+            .position(|&candidate| candidate == inst)
+            .unwrap();
+        let (shift, shifted) = graph.insert(
+            block,
+            position,
+            span,
+            Op::Binary(BinaryOperator::ShiftRight, word, index),
+            true,
+        );
+        graph.insts[shift].source_name = source_name;
+        graph.insts[inst].op = Op::Binary(BinaryOperator::BitwiseAnd, shifted.unwrap(), one);
     }
 }
 
@@ -270,6 +345,8 @@ fn unescaped(graph: &Graph, scope: &HashSet<Block>) -> HashSet<Value> {
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum Access {
     Named(String),
+    // Cells can alias other captures, but cannot alias JavaScript properties.
+    Cells,
     Length,
     Elements,
     Iteration,
@@ -291,6 +368,7 @@ impl Access {
 
     fn of(op: &Op, facts: &Facts) -> Self {
         match op {
+            Op::Read(_) | Op::Initialize(..) | Op::Write(..) => Self::Cells,
             Op::Get(_, name) | Op::Set(_, name, _) | Op::Define(_, name, _) => Self::named(name),
             Op::GetIndex(_, key)
             | Op::TypedIndex(_, key, _)
@@ -316,6 +394,7 @@ impl Access {
         match (self, read) {
             (Self::Iteration, _) | (_, Self::Iteration) => false,
             (Self::Any, _) | (_, Self::Any) => true,
+            (Self::Cells, Self::Cells) => true,
             (Self::Named(write), Self::Named(read)) => write == read,
             (Self::Elements, Self::Elements | Self::Length) => true,
             _ => false,
@@ -434,7 +513,7 @@ impl Guarded {
             (_, Access::Named(name)) => {
                 self.properties.contains(&name) || self.globals.contains(&name)
             }
-            (_, Access::Elements | Access::Iteration) => false,
+            (_, Access::Cells | Access::Elements | Access::Iteration) => false,
             _ => !self.is_empty(),
         }
     }
@@ -506,9 +585,20 @@ fn requirements(graph: &Graph, blocks: &[Block]) -> Vec<Requirement> {
 
 pub(super) fn version(graph: &mut Graph, notes: &mut Vec<String>) -> Result<Vec<HashSet<Block>>> {
     let blocks = Cfg::new(graph).rpo;
-    if let Some(region) = region(graph, &blocks, None, "", notes)? {
+    let mut reasons = Vec::new();
+    if let Some(region) = region(graph, &blocks, None, "", &mut reasons)? {
+        notes.extend(reasons);
         return Ok(vec![region]);
     }
+    let mut checked = Vec::new();
+    if let Some((copy, _)) =
+        checked_region(graph, &blocks, None, &blocks, "function: ", &mut checked)?
+    {
+        notes.extend(checked);
+        return Ok(vec![copy]);
+    }
+    notes.extend(reasons);
+    notes.extend(checked);
     let mut regions = Vec::new();
     let mut covered = HashSet::new();
     let mut tried = HashSet::new();
@@ -622,6 +712,68 @@ fn enters(graph: &Graph, (header, body): &(Block, HashSet<Block>), inner: Block)
     true
 }
 
+fn checked_region(
+    graph: &mut Graph,
+    blocks: &[Block],
+    entry: Option<(Block, Block)>,
+    scan: &[Block],
+    label: &str,
+    notes: &mut Vec<String>,
+) -> Result<Option<(HashSet<Block>, Block)>> {
+    let body: HashSet<_> = blocks.iter().copied().collect();
+    let branches: Vec<_> = blocks
+        .iter()
+        .copied()
+        .filter(|&block| guard_fallback(graph, block).is_some())
+        .collect();
+    let fallbacks: HashSet<_> = branches
+        .iter()
+        .filter_map(|&block| guard_fallback(graph, block))
+        .collect();
+    let written: HashSet<_> = body.difference(&fallbacks).copied().collect();
+    let requirements = requirements(graph, blocks);
+    let guarded = Guarded::new(&requirements);
+    let mut planning = graph.clone();
+    // These effects apply only after the native identity checks at region entry.
+    for requirement in &requirements {
+        let Op::Call { args, .. } = &graph.insts[requirement.call].op else {
+            unreachable!();
+        };
+        planning.insts[requirement.call].op = Op::CallNative(requirement.native, args.clone());
+    }
+    if closure_failure(&planning, &written, &guarded).is_some() {
+        return Ok(None);
+    }
+    let probes = probe_reads(&planning, &body, &written, scan, entry.is_none());
+    let checks = entry_checks(&planning, &body, scan, &probes);
+    let guards = invariant_guards(&planning, &body, scan, &probes);
+    if requirements.is_empty() && checks.is_empty() && probes.is_empty() && guards.is_empty() {
+        return Ok(None);
+    }
+    let speculation = Speculation {
+        requirements: &requirements,
+        checks: &checks,
+        reads: &probes,
+        guards: &guards,
+        exits: &branches,
+        ..Default::default()
+    };
+    let mut candidate = graph.clone();
+    let (copy, header) = apply_version(&mut candidate, blocks, entry, &speculation);
+    candidate.verify()?;
+    if let Some(reason) = closure_failure(&candidate, &copy, &guarded) {
+        notes.push(format!("{label}not versioned: guarded copy {reason}"));
+        return Ok(None);
+    }
+    let list: Vec<_> = checks.iter().map(ToString::to_string).collect();
+    notes.push(format!(
+        "{label}versioned: number checks on [{}], {} read probes and {} hoisted guards select the closed copy",
+        list.join(", "), probes.len(), guards.len()
+    ));
+    *graph = candidate;
+    Ok(Some((copy, header)))
+}
+
 pub(super) fn check_loops(
     graph: &mut Graph,
     regions: &mut Vec<HashSet<Block>>,
@@ -656,49 +808,16 @@ pub(super) fn check_loops(
             .filter(|block| placed.contains(block))
             .collect();
         let closed = regions.iter().any(|region| body.is_subset(region));
-        let fallbacks: HashSet<Block> = scan
-            .iter()
-            .filter_map(|&block| guard_fallback(graph, block))
-            .collect();
-        if !closed && fallbacks.is_empty() {
-            continue;
-        }
-        let written: HashSet<Block> = body.difference(&fallbacks).copied().collect();
-        if !closed && closure_failure(graph, &written, &Guarded::default()).is_some() {
-            continue;
-        }
-        let probes = probe_reads(graph, &body, &written, &scan);
-        let checks = entry_checks(graph, &body, &scan, &probes);
-        let guards = invariant_guards(graph, &body, &scan, &probes);
         let mut candidate = graph.clone();
-        let mut numbered = None;
-        if !checks.is_empty() || !probes.is_empty() || !guards.is_empty() {
-            let speculation = Speculation {
-                checks: &checks,
-                reads: &probes,
-                guards: &guards,
-                ..Default::default()
-            };
-            let (copy, copy_header) = apply_version(
-                &mut candidate,
-                &blocks,
-                Some((preheader, header)),
-                &speculation,
-            );
-            candidate.verify()?;
-            if closure_failure(&candidate, &copy, &Guarded::default()).is_none() {
-                let list: Vec<String> = checks.iter().map(ToString::to_string).collect();
-                notes.push(format!(
-                    "loop at {header}: number checks on [{}], {} read probes and {} hoisted guards select the typed copy",
-                    list.join(", "),
-                    probes.len(),
-                    guards.len()
-                ));
-                numbered = Some((copy, copy_header));
-            } else {
-                candidate = graph.clone();
-            }
-        }
+        let label = format!("loop at {header}: ");
+        let numbered = checked_region(
+            &mut candidate,
+            &blocks,
+            Some((preheader, header)),
+            &scan,
+            &label,
+            notes,
+        )?;
         let (layer_body, layer_header) = match &numbered {
             Some((copy, copy_header)) => (copy.clone(), *copy_header),
             None => (body.clone(), header),
@@ -724,6 +843,7 @@ pub(super) fn check_loops(
             regions.push(HashSet::new());
         }
         for copy in added {
+            reuse_loads(graph, &copy, notes);
             for region in regions.iter_mut() {
                 if body.is_subset(region) || !closed && region.is_empty() {
                     region.extend(copy.iter().copied());
@@ -749,7 +869,7 @@ fn guard_fallback(graph: &Graph, block: Block) -> Option<Block> {
                 | Op::IsNumber(_)
                 | Op::IsTyped(..)
                 | Op::IsIndexed(_)
-                | Op::IsArrayMap(..)
+                | Op::IsArrayIteration(..)
         )
     );
     (guard && graph.cold.contains(&otherwise.block)).then_some(otherwise.block)
@@ -1155,9 +1275,17 @@ struct Speculation<'a> {
     requirements: &'a [Requirement],
     reads: &'a [Inst],
     guards: &'a [Block],
+    exits: &'a [Block],
     typed: &'a [(Value, Option<TypedKind>)],
     bounds: &'a [(Value, Value)],
     checks: &'a [Value],
+}
+
+#[derive(PartialEq, Eq, Hash)]
+enum EntryGuard {
+    Code(Value, cranelift_module::FuncId),
+    Number(Value),
+    Value(Value),
 }
 
 fn apply_version(
@@ -1170,6 +1298,7 @@ fn apply_version(
         requirements,
         reads,
         guards,
+        exits,
         typed,
         bounds,
         checks,
@@ -1211,6 +1340,18 @@ fn apply_version(
         graph.blocks[blocks[&block]].terminator = Some(terminator);
     }
     let copies: HashSet<Block> = blocks.values().copied().collect();
+    // A varying guard leaves the copy before reentry; SSA repair carries its current values.
+    for &block in exits {
+        if guards.contains(&block) {
+            continue;
+        }
+        let fallback = guard_fallback(graph, block).unwrap();
+        let terminator = graph.blocks[blocks[&block]].terminator.as_mut().unwrap();
+        let TerminatorKind::Branch(_, _, otherwise) = &mut terminator.kind else {
+            unreachable!();
+        };
+        otherwise.block = fallback;
+    }
     for &block in region {
         if graph.cold.contains(&block) {
             graph.cold.insert(blocks[&block]);
@@ -1332,12 +1473,15 @@ fn apply_version(
         current = next;
     }
     let mut probes = HashMap::new();
+    let mut available = HashMap::new();
     for &inst in reads {
         let data = graph.insts[inst].clone();
         let mut op = match data.op {
             Op::Get(object, name) => Op::ProbeProperty(object, name),
             Op::GetIndex(object, key) | Op::IndexedGet(object, key) => Op::ProbeIndex(object, key),
             Op::GlobalRead(name) => Op::ProbeGlobal(name),
+            Op::Argument(index) => Op::Argument(index),
+            Op::This => Op::This,
             _ => unreachable!(),
         };
         for value in op.operands_mut() {
@@ -1345,17 +1489,35 @@ fn apply_version(
                 *value = probe;
             }
         }
-        let value = graph.append(current, data.span, op, true).1.unwrap();
-        let failed = graph
-            .append(current, data.span, Op::IsUninitialized(value), true)
-            .1
-            .unwrap();
-        let next = graph.blocks.push(BlockData::default());
-        graph.blocks[current].terminator = Some(Terminator {
-            span: data.span,
-            kind: TerminatorKind::Branch(failed, original.clone(), Target::new(next)),
-        });
-        current = next;
+        let key = match &op {
+            Op::ProbeGlobal(name) => LoadKey::Global(name.clone()),
+            Op::ProbeProperty(object, name) => LoadKey::Property(*object, name.clone()),
+            Op::ProbeIndex(object, key) => LoadKey::Index(*object, *key),
+            Op::Argument(index) => LoadKey::Argument(*index),
+            Op::This => LoadKey::This,
+            _ => unreachable!(),
+        };
+        let value = match available.get(&key) {
+            Some(&value) => value,
+            None => {
+                let input = matches!(op, Op::Argument(_) | Op::This);
+                let value = graph.append(current, data.span, op, true).1.unwrap();
+                if !input {
+                    let failed = graph
+                        .append(current, data.span, Op::IsUninitialized(value), true)
+                        .1
+                        .unwrap();
+                    let next = graph.blocks.push(BlockData::default());
+                    graph.blocks[current].terminator = Some(Terminator {
+                        span: data.span,
+                        kind: TerminatorKind::Branch(failed, original.clone(), Target::new(next)),
+                    });
+                    current = next;
+                }
+                available.insert(key, value);
+                value
+            }
+        };
         let result = data.result.unwrap();
         graph.replace_uses(&HashMap::from([(values[&result], value)]));
         graph.remove_inst(insts[&inst]);
@@ -1363,6 +1525,7 @@ fn apply_version(
         probes.insert(result, value);
     }
     let copied: HashSet<Block> = region.iter().copied().collect();
+    let mut tested = HashSet::new();
     for &block in guards {
         let Some(Terminator {
             span,
@@ -1371,29 +1534,44 @@ fn apply_version(
         else {
             unreachable!();
         };
-        let condition = if copied.contains(&graph.def_block(condition)) {
-            let mut op = graph.defining_op(condition).unwrap().clone();
-            for value in op.operands_mut() {
-                if copied.contains(&graph.def_block(*value)) {
-                    *value = values[value];
-                }
-            }
-            graph.append(current, span, op, true).1.unwrap()
-        } else {
-            condition
-        };
-        let next = graph.blocks.push(BlockData::default());
-        graph.blocks[current].terminator = Some(Terminator {
-            span,
-            kind: TerminatorKind::Branch(condition, Target::new(next), original.clone()),
-        });
-        current = next;
         let copy = blocks[&block];
         let terminator = graph.blocks[copy].terminator.as_mut().unwrap();
         let TerminatorKind::Branch(_, taken, _) = &terminator.kind else {
             unreachable!();
         };
         terminator.kind = TerminatorKind::Jump(taken.clone());
+        let (test, key) = if copied.contains(&graph.def_block(condition)) {
+            let mut op = graph.defining_op(condition).unwrap().clone();
+            for value in op.operands_mut() {
+                if copied.contains(&graph.def_block(*value)) {
+                    *value = values[value];
+                }
+            }
+            let key = match op {
+                Op::IsCode(value, code) => Some(EntryGuard::Code(value, code)),
+                Op::IsNumber(value) => Some(EntryGuard::Number(value)),
+                _ => None,
+            };
+            let ValueDef::Result(inst) = graph.values[condition] else {
+                unreachable!();
+            };
+            graph.insts[insts[&inst]].op = Op::Constant(Constant::Boolean(true));
+            (Some(op), key)
+        } else {
+            (None, Some(EntryGuard::Value(condition)))
+        };
+        if key.is_some_and(|key| !tested.insert(key)) {
+            continue;
+        }
+        let condition = test.map_or(condition, |op| {
+            graph.append(current, span, op, true).1.unwrap()
+        });
+        let next = graph.blocks.push(BlockData::default());
+        graph.blocks[current].terminator = Some(Terminator {
+            span,
+            kind: TerminatorKind::Branch(condition, Target::new(next), original.clone()),
+        });
+        current = next;
     }
     for &(object, element) in typed {
         let check = graph
@@ -1423,6 +1601,9 @@ fn apply_version(
     }
     for &value in checks {
         let checked = values.get(&value).copied().unwrap_or(value);
+        if !tested.insert(EntryGuard::Number(checked)) {
+            continue;
+        }
         let check = graph
             .append(current, span, Op::IsNumber(checked), true)
             .1
@@ -1520,7 +1701,13 @@ fn apply_version(
         })
         .collect();
     repair(graph, &definitions);
-    (copies, blocks[&head])
+    // Disconnected fallbacks must not contribute writes to the closed copy.
+    let reachable = Cfg::new(graph)
+        .rpo
+        .into_iter()
+        .filter(|block| copies.contains(block))
+        .collect();
+    (reachable, blocks[&head])
 }
 
 fn repair(graph: &mut Graph, values: &HashMap<Value, Vec<Value>>) {
@@ -1786,6 +1973,7 @@ fn probe_reads(
     inside: &HashSet<Block>,
     written: &HashSet<Block>,
     scan: &[Block],
+    inputs: bool,
 ) -> Vec<Inst> {
     let writes = Writes::collect(graph, written);
     let mut reads = Vec::new();
@@ -1793,15 +1981,16 @@ fn probe_reads(
     for &block in scan {
         for &inst in &graph.blocks[block].insts {
             let data = &graph.insts[inst];
-            if matches!(
-                data.op,
-                Op::Get(..) | Op::GetIndex(..) | Op::IndexedGet(..) | Op::GlobalRead(_)
-            ) && data
-                .op
-                .operands()
-                .iter()
-                .all(|value| !inside.contains(&graph.def_block(*value)) || probed.contains(value))
-                && writes.preserves(&data.op)
+            let input = inputs && matches!(data.op, Op::Argument(_) | Op::This);
+            if (input
+                || matches!(
+                    data.op,
+                    Op::Get(..) | Op::GetIndex(..) | Op::IndexedGet(..) | Op::GlobalRead(_)
+                ))
+                && data.op.operands().iter().all(|value| {
+                    !inside.contains(&graph.def_block(*value)) || probed.contains(value)
+                })
+                && (input || writes.preserves(&data.op))
             {
                 reads.push(inst);
                 probed.extend(data.result);
@@ -1864,7 +2053,7 @@ pub(super) fn sink_closures(graph: &mut Graph, notes: &mut Vec<String>) {
     for &block in &cfg.rpo {
         for &inst in &graph.blocks[block].insts {
             let data = &graph.insts[inst];
-            if matches!(&data.op, Op::Closure(_, _, false, captures) if captures.is_empty()) {
+            if matches!(&data.op, Op::Closure(_, _, false, _)) {
                 closures.push(inst);
             }
             for value in data.op.operands() {
@@ -1901,6 +2090,18 @@ pub(super) fn sink_closures(graph: &mut Graph, notes: &mut Vec<String>) {
         {
             continue;
         }
+        if matches!(&graph.insts[inst].op, Op::Closure(_, _, _, captures) if !captures.is_empty()) {
+            let user = graph.blocks[target]
+                .insts
+                .iter()
+                .copied()
+                .find(|&user| graph.insts[user].op.operands().contains(&value));
+            if !user
+                .is_some_and(|user| super::inlining::direct_captures(graph, user, value).is_some())
+            {
+                continue;
+            }
+        }
         graph.remove_inst(inst);
         let position = graph.blocks[target]
             .insts
@@ -1913,4 +2114,41 @@ pub(super) fn sink_closures(graph: &mut Graph, notes: &mut Vec<String>) {
             "closure {value} materialized only in fallback {target}"
         ));
     }
+}
+
+pub(super) fn lazy_captures(graph: &mut Graph, notes: &mut Vec<String>) -> bool {
+    let mut demoted = false;
+    let mut candidates = HashSet::new();
+    let mut eager = HashSet::new();
+    for block in Cfg::new(graph).rpo {
+        for &inst in &graph.blocks[block].insts {
+            match &graph.insts[inst].op {
+                Op::Closure(_, _, false, captures) if graph.cold.contains(&block) => {
+                    candidates.extend(captures.iter().copied());
+                }
+                Op::Closure(_, _, _, captures) => eager.extend(captures.iter().copied()),
+                _ => {}
+            }
+        }
+    }
+    for (binding, data) in &mut graph.bindings {
+        if data.captured
+            && graph.scopes[data.scope].kind != super::ScopeKind::Captures
+            && !eager.contains(&binding)
+        {
+            if candidates.contains(&binding) {
+                if graph.lazy_captures.insert(binding) {
+                    notes.push(format!(
+                        "binding {binding} materialized as a cell only on closure creation"
+                    ));
+                }
+            } else {
+                data.captured = false;
+                graph.lazy_captures.remove(&binding);
+                demoted = true;
+                notes.push(format!("binding {binding} no longer needs a capture cell"));
+            }
+        }
+    }
+    demoted
 }

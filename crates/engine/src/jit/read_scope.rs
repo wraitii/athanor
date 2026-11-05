@@ -38,7 +38,6 @@ fn admitted(context: &Context, annotations: &Annotations) -> bool {
                 return false;
             } else if function.dfg.insts[inst].opcode().can_store() {
                 match function.dfg.insts[inst] {
-                    InstructionData::StackStore { .. } => {}
                     InstructionData::Store { args, .. } => {
                         let address = function.dfg.resolve_aliases(args[1]);
                         let cranelift_codegen::ir::ValueDef::Result(inst, _) =
@@ -163,7 +162,7 @@ pub(super) fn specialize(
     cursor.set_srcloc(loc);
     let ready = cursor
         .ins()
-        .icmp_imm(IntCC::Equal, stable, Value::TRUE.bits() as i64);
+        .icmp_imm_s(IntCC::Equal, stable, Value::TRUE.bits() as i64);
     let receiver = cursor
         .ins()
         .icmp(IntCC::Equal, source.receiver, target.receiver);

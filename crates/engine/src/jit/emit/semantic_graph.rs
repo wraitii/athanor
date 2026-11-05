@@ -2,7 +2,7 @@ use std::cell::RefCell;
 
 use cranelift_codegen::entity::{EntityRef, SecondaryMap};
 use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::{BlockArg, InstBuilder, MemFlags, Value as ClifValue, types};
+use cranelift_codegen::ir::{BlockArg, InstBuilder, MemFlagsData, Value as ClifValue, types};
 use cranelift_frontend::Variable;
 
 use crate::error::{Error, compile_at};
@@ -67,7 +67,7 @@ impl FunctionCompiler<'_, '_> {
         let recorded = self
             .b
             .ins()
-            .load(types::I64, MemFlags::trusted(), address, 0);
+            .load(types::I64, MemFlagsData::trusted(), address, 0);
         let observe = self.b.create_block();
         let next = self.b.create_block();
         self.b.ins().brif(recorded, next, &[], observe, &[]);
@@ -80,13 +80,78 @@ impl FunctionCompiler<'_, '_> {
     fn epoch(&mut self) -> ClifValue {
         let address = self.b.ins().load(
             self.pointer,
-            MemFlags::trusted(),
+            MemFlagsData::trusted(),
             self.ctx,
             crate::jit::session::EPOCH_OFFSET,
         );
         self.b
             .ins()
-            .load(types::I64, MemFlags::trusted(), address, 0)
+            .load(types::I64, MemFlagsData::trusted(), address, 0)
+    }
+
+    fn lazy_capture_read(&mut self, local: Variable, cell: Variable) -> ClifValue {
+        let raw = self.b.use_var(local);
+        let cell = self.b.use_var(cell);
+        let boxed = self
+            .b
+            .ins()
+            .icmp_imm_s(IntCC::NotEqual, cell, Value::UNDEFINED.bits() as i64);
+        let shared = self.b.create_block();
+        let direct = self.b.create_block();
+        let done = self.b.create_block();
+        self.b.append_block_param(done, types::I64);
+        self.brif(boxed, shared, &[], direct, &[]);
+        self.switch(shared);
+        let value = self.call_helper(Helper::CellGet, &[cell]);
+        self.check_error();
+        self.jump(done, &[value.into()]);
+        self.switch(direct);
+        let value = self.checked_temporary(raw);
+        self.jump(done, &[value.into()]);
+        self.switch(done);
+        self.b.block_params(done)[0]
+    }
+
+    fn lazy_capture_write(&mut self, local: Variable, cell: Variable, value: ClifValue) {
+        let cell = self.b.use_var(cell);
+        let boxed = self
+            .b
+            .ins()
+            .icmp_imm_s(IntCC::NotEqual, cell, Value::UNDEFINED.bits() as i64);
+        let shared = self.b.create_block();
+        let direct = self.b.create_block();
+        let done = self.b.create_block();
+        self.brif(boxed, shared, &[], direct, &[]);
+        self.switch(shared);
+        self.call_helper(Helper::CellSet, &[cell, value]);
+        self.check_error();
+        self.jump(done, &[]);
+        self.switch(direct);
+        self.initialize_local(local, value);
+        self.jump(done, &[]);
+        self.switch(done);
+    }
+
+    fn materialize_capture(&mut self, local: Variable, cell: Variable) -> ClifValue {
+        let current = self.b.use_var(cell);
+        let boxed =
+            self.b
+                .ins()
+                .icmp_imm_s(IntCC::NotEqual, current, Value::UNDEFINED.bits() as i64);
+        let create = self.b.create_block();
+        let done = self.b.create_block();
+        self.brif(boxed, done, &[], create, &[]);
+        self.switch(create);
+        let value = self.b.use_var(local);
+        let created = self.call_helper(Helper::CellNew, &[value]);
+        self.check_error();
+        self.initialize_local(cell, created);
+        // The cell now owns the binding value, including updates made by escaped callbacks.
+        let undefined = self.constant(Value::UNDEFINED);
+        self.initialize_local(local, undefined);
+        self.jump(done, &[]);
+        self.switch(done);
+        self.b.use_var(cell)
     }
 
     pub(super) fn emit_semantic_graph(
@@ -118,6 +183,16 @@ impl FunctionCompiler<'_, '_> {
             .values()
             .map(|_| self.b.declare_var(types::I64))
             .collect();
+        let lazy_cells: Vec<_> = graph
+            .bindings
+            .keys()
+            .map(|binding| {
+                graph
+                    .lazy_captures
+                    .contains(&binding)
+                    .then(|| self.b.declare_var(types::I64))
+            })
+            .collect();
         let cells: Vec<i64> = (0..graph.guards)
             .map(|_| {
                 let mut cell = Box::new(u64::MAX);
@@ -146,7 +221,7 @@ impl FunctionCompiler<'_, '_> {
             }
         }
         let undefined = self.constant(Value::UNDEFINED);
-        for &variable in &bindings {
+        for &variable in bindings.iter().chain(lazy_cells.iter().flatten()) {
             self.b.def_var(variable, undefined);
         }
         if suspends {
@@ -186,7 +261,7 @@ impl FunctionCompiler<'_, '_> {
                     self.increment(param);
                     continue;
                 }
-                let uninitialized = self.b.ins().icmp_imm(
+                let uninitialized = self.b.ins().icmp_imm_s(
                     cranelift_codegen::ir::condcodes::IntCC::Equal,
                     param,
                     Value::UNINITIALIZED.bits() as i64,
@@ -268,10 +343,14 @@ impl FunctionCompiler<'_, '_> {
                             let value = get(self, *value);
                             Some(self.call_helper(Helper::ClosureThis, &[value]))
                         }
-                        Op::IsArrayMap(callee, receiver) => {
+                        Op::IsArrayIteration(callee, receiver, method) => {
                             let callee = get(self, *callee);
                             let receiver = get(self, *receiver);
-                            Some(self.call_helper(Helper::ArrayMapGuard, &[callee, receiver]))
+                            let method = self.b.ins().iconst(types::I64, *method as i64);
+                            Some(self.call_helper(
+                                Helper::ArrayIterationGuard,
+                                &[callee, receiver, method],
+                            ))
                         }
                         Op::NewHoleyArray(length) => {
                             let length = get(self, *length);
@@ -302,7 +381,13 @@ impl FunctionCompiler<'_, '_> {
                                 .ok_or_else(|| compile_at(*span, "missing closure code"))?;
                             let cells: Vec<_> = captures
                                 .iter()
-                                .map(|binding| self.b.use_var(bindings[binding.index()]))
+                                .map(|binding| {
+                                    let local = bindings[binding.index()];
+                                    match lazy_cells[binding.index()] {
+                                        Some(cell) => self.materialize_capture(local, cell),
+                                        None => self.b.use_var(local),
+                                    }
+                                })
                                 .collect();
                             let argv = self.stack_values(&cells, *span)?;
                             let count = self.b.ins().iconst(types::I64, cells.len() as i64);
@@ -368,16 +453,33 @@ impl FunctionCompiler<'_, '_> {
                             self.global_access(name, Some(value));
                             None
                         }
+                        Op::Read(binding) if lazy_cells[binding.index()].is_some() => {
+                            Some(self.lazy_capture_read(
+                                bindings[binding.index()],
+                                lazy_cells[binding.index()].unwrap(),
+                            ))
+                        }
+                        Op::Write(binding, value) | Op::Initialize(binding, value)
+                            if lazy_cells[binding.index()].is_some() =>
+                        {
+                            let local = bindings[binding.index()];
+                            let cell = lazy_cells[binding.index()].unwrap();
+                            if matches!(data.op, Op::Write(..)) {
+                                self.lazy_capture_read(local, cell);
+                            }
+                            let value = get(self, *value);
+                            self.lazy_capture_write(local, cell, value);
+                            None
+                        }
                         Op::Read(binding) => {
                             let value = self.b.use_var(bindings[binding.index()]);
-                            let helper = if graph.bindings[*binding].captured {
-                                Helper::CellGet
+                            let value = if graph.bindings[*binding].captured {
+                                let value = self.call_helper(Helper::CellGet, &[value]);
+                                self.check_error();
+                                value
                             } else {
-                                Helper::TempRetain
+                                self.checked_temporary(value)
                             };
-                            let value = self.call_helper(helper, &[value]);
-                            self.check_error();
-                            self.check_error();
                             Some(value)
                         }
                         Op::Write(binding, value) => {
@@ -411,8 +513,7 @@ impl FunctionCompiler<'_, '_> {
                         }
                         Op::CheckInitialized(value) => {
                             let value = get(self, *value);
-                            let value = self.call_helper(Helper::TempRetain, &[value]);
-                            self.check_error();
+                            let value = self.checked_temporary(value);
                             Some(value)
                         }
                         Op::IteratorNew(value)
@@ -434,7 +535,7 @@ impl FunctionCompiler<'_, '_> {
                         }
                         Op::IsUninitialized(value) => {
                             let value = get(self, *value);
-                            let condition = self.b.ins().icmp_imm(
+                            let condition = self.b.ins().icmp_imm_s(
                                 cranelift_codegen::ir::condcodes::IntCC::Equal,
                                 value,
                                 Value::UNINITIALIZED.bits() as i64,
@@ -549,10 +650,15 @@ impl FunctionCompiler<'_, '_> {
                             let no = self.constant(Value::FALSE);
                             Some(self.b.ins().select(condition, yes, no))
                         }
+                        Op::IsTypeof(value, kind) => {
+                            let value = get(self, *value);
+                            let kind = self.constant(Value::number(*kind as f64));
+                            Some(self.call_helper(Helper::IsTypeof, &[value, kind]))
+                        }
                         Op::IsString(value) => {
                             let value = get(self, *value);
-                            let tag = self.b.ins().ushr_imm(value, TAG_SHIFT as i64);
-                            let condition = self.b.ins().icmp_imm(
+                            let tag = self.b.ins().ushr_imm_s(value, TAG_SHIFT as i64);
+                            let condition = self.b.ins().icmp_imm_s(
                                 IntCC::Equal,
                                 tag,
                                 (TAG_STRING >> TAG_SHIFT) as i64,
@@ -574,7 +680,11 @@ impl FunctionCompiler<'_, '_> {
                             let value = get(self, *value);
                             let view = self.view(value);
                             let length = self.view_length(view);
-                            Some(self.b.ins().bitcast(types::I64, MemFlags::new(), length))
+                            Some(
+                                self.b
+                                    .ins()
+                                    .bitcast(types::I64, MemFlagsData::new(), length),
+                            )
                         }
                         Op::AsNumber(value) => Some(get(self, *value)),
                         Op::ToInt32(_) => unreachable!(),
@@ -675,8 +785,8 @@ impl FunctionCompiler<'_, '_> {
                             let tag = self
                                 .b
                                 .ins()
-                                .band_imm(result, 0xffff_0000_0000_0000u64 as i64);
-                            let object = self.b.ins().icmp_imm(
+                                .band_imm_s(result, 0xffff_0000_0000_0000u64 as i64);
+                            let object = self.b.ins().icmp_imm_s(
                                 IntCC::Equal,
                                 tag,
                                 crate::value::TAG_OBJECT as i64,
@@ -762,16 +872,7 @@ impl FunctionCompiler<'_, '_> {
                         }
                         Op::ProbeProperty(object, name) => {
                             let object = get(self, *object);
-                            let name: Box<str> = name.as_str().into();
-                            let ptr = self.b.ins().iconst(self.pointer, name.as_ptr() as i64);
-                            let len = self.b.ins().iconst(types::I64, name.len() as i64);
-                            self.names.push(name);
-                            Some(
-                                self.call_helper(
-                                    Helper::SemanticPropertyProbe,
-                                    &[object, ptr, len],
-                                ),
-                            )
+                            Some(self.cached_property_probe(object, name))
                         }
                         Op::ProbeIndex(object, key) => {
                             let object = get(self, *object);
@@ -792,7 +893,9 @@ impl FunctionCompiler<'_, '_> {
                             let epoch = self.epoch();
                             let cell = self.b.ins().iconst(self.pointer, cells[*guard]);
                             let validated =
-                                self.b.ins().load(types::I64, MemFlags::trusted(), cell, 0);
+                                self.b
+                                    .ins()
+                                    .load(types::I64, MemFlagsData::trusted(), cell, 0);
                             let condition = self.b.ins().icmp(IntCC::Equal, epoch, validated);
                             let yes = self.constant(Value::TRUE);
                             let no = self.constant(Value::FALSE);
@@ -801,7 +904,7 @@ impl FunctionCompiler<'_, '_> {
                         Op::GuardCommit(guard) => {
                             let epoch = self.epoch();
                             let cell = self.b.ins().iconst(self.pointer, cells[*guard]);
-                            self.b.ins().store(MemFlags::trusted(), epoch, cell, 0);
+                            self.b.ins().store(MemFlagsData::trusted(), epoch, cell, 0);
                             None
                         }
                         Op::CallNative(native, args) => {
@@ -823,7 +926,7 @@ impl FunctionCompiler<'_, '_> {
                         }
                         Op::IsUndefined(value) => {
                             let value = get(self, *value);
-                            let condition = self.b.ins().icmp_imm(
+                            let condition = self.b.ins().icmp_imm_s(
                                 cranelift_codegen::ir::condcodes::IntCC::Equal,
                                 value,
                                 Value::UNDEFINED.bits() as i64,
@@ -853,7 +956,9 @@ impl FunctionCompiler<'_, '_> {
                                         self.call_helper(Helper::CaptureGet, &[closure, index]);
                                     self.check_error();
                                     cell
-                                } else if graph.bindings[binding].captured {
+                                } else if graph.bindings[binding].captured
+                                    && lazy_cells[binding.index()].is_none()
+                                {
                                     let initial = self.constant(Value::UNINITIALIZED);
                                     let cell = self.call_helper(Helper::CellNew, &[initial]);
                                     self.check_error();
@@ -861,6 +966,10 @@ impl FunctionCompiler<'_, '_> {
                                 } else {
                                     self.constant(Value::UNINITIALIZED)
                                 };
+                                if let Some(cell) = lazy_cells[binding.index()] {
+                                    let undefined = self.constant(Value::UNDEFINED);
+                                    self.initialize_local(cell, undefined);
+                                }
                                 self.initialize_local(bindings[binding.index()], value);
                             }
                             None
@@ -869,6 +978,9 @@ impl FunctionCompiler<'_, '_> {
                             for &binding in &graph.scopes[*scope].bindings {
                                 let value = self.constant(Value::UNDEFINED);
                                 self.initialize_local(bindings[binding.index()], value);
+                                if let Some(cell) = lazy_cells[binding.index()] {
+                                    self.initialize_local(cell, value);
+                                }
                             }
                             None
                         }
@@ -880,11 +992,21 @@ impl FunctionCompiler<'_, '_> {
                                 let initial = if matches!(data.op, Op::FreshIteration(_)) {
                                     self.constant(Value::UNINITIALIZED)
                                 } else {
-                                    let cell = self.b.use_var(bindings[binding.index()]);
-                                    let value = self.call_helper(Helper::CellGet, &[cell]);
-                                    self.check_error();
-                                    value
+                                    if let Some(cell) = lazy_cells[binding.index()] {
+                                        self.lazy_capture_read(bindings[binding.index()], cell)
+                                    } else {
+                                        let cell = self.b.use_var(bindings[binding.index()]);
+                                        let value = self.call_helper(Helper::CellGet, &[cell]);
+                                        self.check_error();
+                                        value
+                                    }
                                 };
+                                if let Some(cell) = lazy_cells[binding.index()] {
+                                    let undefined = self.constant(Value::UNDEFINED);
+                                    self.initialize_local(cell, undefined);
+                                    self.initialize_local(bindings[binding.index()], initial);
+                                    continue;
+                                }
                                 let cell = self.call_helper(Helper::CellNew, &[initial]);
                                 self.check_error();
                                 self.initialize_local(bindings[binding.index()], cell);
@@ -1096,7 +1218,7 @@ impl FunctionCompiler<'_, '_> {
                 };
                 Some(Some(if target == Some(Repr::Int32) {
                     let integer = self.convert(operand, Repr::Int32);
-                    Operand::new(self.b.ins().iadd_imm(integer, delta), Repr::Int32)
+                    Operand::new(self.b.ins().iadd_imm_s(integer, delta), Repr::Int32)
                 } else {
                     let float = self.convert(operand, Repr::Float);
                     let one = self.b.ins().f64const(delta as f64);
@@ -1133,7 +1255,7 @@ impl FunctionCompiler<'_, '_> {
             {
                 let operand = self.operand(cx, *value);
                 let truth = self.condition(operand, true);
-                let value = self.b.ins().icmp_imm(IntCC::Equal, truth, 0);
+                let value = self.b.ins().icmp_imm_s(IntCC::Equal, truth, 0);
                 boolean(value)
             }
             Op::IsNumber(value) => {
@@ -1152,12 +1274,12 @@ impl FunctionCompiler<'_, '_> {
                 } else {
                     match data.op {
                         Op::IsNullish(_) => self.is_nullish(operand.value),
-                        Op::IsUndefined(_) => self.b.ins().icmp_imm(
+                        Op::IsUndefined(_) => self.b.ins().icmp_imm_s(
                             IntCC::Equal,
                             operand.value,
                             Value::UNDEFINED.bits() as i64,
                         ),
-                        _ => self.b.ins().icmp_imm(
+                        _ => self.b.ins().icmp_imm_s(
                             IntCC::Equal,
                             operand.value,
                             Value::UNINITIALIZED.bits() as i64,

@@ -136,7 +136,7 @@ work.
 
 ## Values, objects, and arrays
 
-Heap values store the address of a 64-byte arena slot in the NaN-box payload.
+Heap values store the address of a 128-byte arena slot in the NaN-box payload.
 Arena chunks never move or shrink while the runtime lives. Each slot starts with
 a fixed `repr(C)` header: reference count, kind, shape, and flags, as 32-bit
 words. Kinds are bit families (typed array, array, holey, object, closure, ...);
@@ -145,8 +145,9 @@ The header is followed by an element pointer and length at fixed offsets,
 mirrored from array and typed-array storage whenever it changes, so generated
 code reads elements without a helper. Arrays store holes in-band as the
 uninitialized sentinel and count them; the holey kind bit is set exactly while
-any hole remains. Larger payloads are boxed behind the header. Vacant slots are reused after
-incremental destruction completes. Internal lookups trust slot addresses:
+any hole remains. Objects, arrays, typed-array descriptors, and binding cells
+are embedded in the slot; other larger payloads remain boxed. Vacant slots are
+reused after incremental destruction completes. Internal lookups trust slot addresses:
 a stale value from the same runtime reaches a zero-reference slot, while host
 entry points check that an address belongs to the arena. Arrays
 contain contiguous `Value` elements; binding cells and closures have separate
@@ -216,9 +217,16 @@ properties. Object-to-property-key conversion remains unsupported. Ordinary obje
 including undefined values, stop lookup. Property enumerability is tracked;
 other property descriptor attributes remain unsupported.
 
-Ordinary objects and closures store property values in a vector indexed by
-their shape. Shapes are shared and immutable: they record the prototype, the
-ordered interned property names with enumerability, and are reached through
+Ordinary objects start with eight inline property values. Adding a ninth property
+upgrades them to an embedded object with vector storage, preserving identity and
+ownership. The `INLINE` kind bit distinguishes small objects while retaining the
+`OBJECT` family bit. Object allocation first checks the pending destruction head:
+if it is a small object, its remaining values and prototype are released and the
+slot is reset in place, leaving unused value bits intact. Other heads use the
+normal bounded drain and allocation path. Closures also use vector storage. Both inline and vector
+property values are indexed by their shape. Shapes are shared and immutable:
+they record the prototype, the ordered interned property names with enumerability,
+and are reached through
 transitions keyed by name and enumerability, rooted per prototype. The shape id
 lives in the slot header. Adding a property, changing its enumerability, or
 setting the prototype changes the shape; replacing a value does not. Objects
@@ -1081,7 +1089,7 @@ application. The static producer recognizes global bindings and known local
 closures through their SSA definitions. Numeric helper bodies can request
 number guards; general bodies and observed call targets do not require them. The planner removes number checks
 already proven by caller facts, deduplicates equal argument checks, and bounds
-expansion to 128 callee instructions per caller, with at most 32 instructions
+expansion to 512 callee instructions per caller, with at most 128 instructions
 per eligible callee. These counts use canonical semantic operations, including
 arguments, constants and scopes, but not block parameters or terminators.
 
@@ -1091,29 +1099,36 @@ code-identity guard and the original call as fallback. Direct local closure
 creation proves the code identity without a repeated guard, except when class
 marking requires the ordinary call checks. Arguments and ordinary receivers are
 substituted at the call site; a known local arrow uses its enclosing receiver.
-Captured scopes use an explicit closure operand to load the original cells,
-preserving shared writes, initialization checks and per-iteration environments.
+Known local closures access the original caller bindings directly when their
+captured environments have not changed since closure creation. Other captured
+scopes use an explicit closure operand to load the original cells, preserving
+shared writes, initialization checks and per-iteration environments.
 Nested calls, heap operations and ordinary control flow can be copied. Creating
 further closures, rest and arguments snapshots, generators, and exception
 handlers remain unsupported by the inliner.
 
-`semantic/arrays.rs` exposes `array.map(knownClosure)` as a semantic loop behind
-a guard on the evaluated native identity and array receiver. Unsupported
+`semantic/arrays.rs` exposes `map`, `some`, `every`, and `filter` calls with known
+closures as semantic loops behind a guard on the evaluated native identity and
+array receiver. Unsupported
 receivers, replacement methods, and unsupported thisArg values retain the generic
 call. The loop snapshots the initial length, skips absent indices at visitation,
-passes `(value, index, array)`, and writes into a result initially containing
-holes. Reads observe callback mutations. Exposing the callback lets ordinary
-inlining remove its dispatch and frame while retaining calls made by its body,
+and passes `(value, index, array)`. `map` writes into a result initially
+containing holes; `filter` appends matching values to a dense result. `some` and
+`every` short-circuit on callback truthiness. Reads observe callback mutations.
+Exposing the callback lets ordinary inlining remove its dispatch and frame while retaining calls made by its body,
 such as the recursive `createTerrain(t)` in the rmgen library. Exception and
 engine-error exits retain the caller's normal frame cleanup.
 
-After specialization, capture-free closure allocations with no reachable uses
-are removed. An allocation used only in one cold fallback block can move to
+After specialization, closure allocations with no reachable uses are removed. An allocation used only in one cold fallback block can move to
 that block when its loop nesting is unchanged; this avoids duplicating observable
 closure identities across iterations. Inlined paths then avoid materializing an
-otherwise unused callback. Captured closures remain materialized when their
-cells are accessed through the closure object. Ownership analysis runs after
-these transformations.
+otherwise unused callback. Captured closures can also sink when their original
+binding environments remain available. Local bindings needed only by fallback
+closures start as ordinary values and acquire a shared cell on first closure
+creation. Subsequent accesses use that cell, and iteration changes reset the
+current cell while escaped closures retain the previous environment. Bindings
+with no remaining closure uses need no cell. Ownership analysis runs after these
+transformations.
 
 For example, `square(x)` with `square(x) { return x * x; }` gets a code check,
 one number check, an inline multiply, and the original call as fallback.
@@ -1153,7 +1168,7 @@ observations through SSA merges or specialize writes.
 At the owner's next dispatch, the compiler synchronously plans from its canonical
 graph with the accumulated feedback. Observations supply speculative candidates,
 with the evaluated callee checked by the existing code-identity guard. The planner
-runs at most four inlining rounds with one shared 128-instruction budget, allowing
+runs at most four inlining rounds with one shared 512-instruction budget, allowing
 calls exposed by earlier rounds to inline without expanding fallback calls again.
 The ordered inlining and read decisions form the decision record for the emitted
 version.
@@ -1216,6 +1231,37 @@ must not write a guarded global or a property with a guarded name. Property
 writes through receivers that may be `globalThis` also affect globals with the
 same name; unknown keys affect all globals. Numeric keys cannot overwrite
 recognized Math names. Unescaped local allocations do not alias globals.
+`Math.random` is also a recognized guarded native. Its RNG mutation has the
+internal-state effect, so it stays in execution order and cannot be removed or
+hoisted. It does not clobber globals or heap properties, allowing their reads
+to move outside closed loops.
+
+When inline fallbacks prevent whole-function closure, the same entry-check
+planner used for loops attempts a function copy. Arguments and `this` seed its
+probe dependencies; preserved global and property reads can then feed code and
+number guards at entry. Repeated probes and identical code or number checks are
+shared. The copy takes hoisted guard branches unconditionally. Guards that
+depend on values produced inside the region remain in place; failure transfers
+to the original slow continuation before reentry, with SSA repair carrying the
+current values. The closed copy retains no reachable reentrant fallback. If the closure proof fails, the candidate is
+discarded. Failed entry checks select the original function before any of its
+effects run. Only reachable copied blocks participate in subsequent write
+summaries and load optimization.
+Property probes use the same shape and holder cache as ordinary named reads,
+with a non-throwing, non-retaining miss path. Borrow analysis includes property
+and global probes; reentry and heap or global writes end those borrows. A path
+that never writes a frame slot skips the local-slot release scan on return,
+even when its generic sibling reserves slots. Temporary and indexed roots still
+receive their normal cleanup.
+
+Property caches also retain a builtin-method entry guarded by the receiver's
+exact heap kind. Arrays, typed arrays, strings, sets, regexps and generators
+resolve these methods by kind; native constructors remain on the ordinary miss
+path because their methods also depend on constructor identity. The native
+function cache keeps cached method values alive. Hits load the function value
+directly and use the existing ownership rules for the result.
+Lazy binding reads check initialization inline and retain heap temporaries with
+the inline retain-and-push path; immediate values need no runtime helper.
 
 After loads are reused and hoisted, a loop inside an optimized region whose body
 uses values defined before it as numeric operands (arithmetic, comparison,
@@ -1226,7 +1272,9 @@ the tag test the generic code would run per operation, so no cost model is
 needed yet. Invariant read probes share these entry guards, and their results
 can also receive number checks. Other values loaded inside the loop stay generic.
 
-Loops are versioned outermost first. A loop's entry checks come from its own
+Loops are versioned outermost first. Each new copy reuses dominating reads before
+nested loops are considered, so reads exposed by outer guards do not become
+redundant inner-loop probes. A loop's entry checks come from its own
 blocks and from loops at most one level deeper whose header every iteration of
 the outer loop reaches; exits are ignored, as are zero-trip loops. Checks that
 cannot be placed that high stay for the inner loop, so a guard is never hoisted
@@ -1235,7 +1283,12 @@ past a condition or out of more than two loops. Inline guards whose condition
 defined before the loop or on probed reads, global reads included, are
 checked on entry too; the copy jumps straight to the fast path. A loop that only
 reenters through such guards' cold fallbacks is versioned the same way and its
-copy becomes a closed region. Typed-array checks remain a separate layer on top
+copy becomes a closed region. Capture-cell accesses have their own alias
+category, so writing a binding does not invalidate global or property guards.
+Unused closures and unnecessary capture cells are removed before region
+planning, and bindings that no longer need cells are promoted to SSA again.
+Unknown reentrant calls still prevent closed-region optimization.
+Typed-array checks remain a separate layer on top
 of the number copy, since a wrong typed guess should still keep the number
 copy.
 

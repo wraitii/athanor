@@ -10,6 +10,154 @@ impl Payload {
 }
 
 #[test]
+fn small_objects_reuse_pending_heads_and_release_owned_edges() {
+    let heap = Heap::default();
+    let prototype = heap.object().unwrap();
+    let child = heap.array(&[]).unwrap();
+    let message = heap.string("message").unwrap();
+    let name = heap.string("Error").unwrap();
+    let object = heap.error(message, name).unwrap();
+    assert!(heap.set_property(object, "child", child));
+    {
+        let mut data = heap.0.borrow_mut();
+        assert!(data.retain(prototype));
+        data.set_prototype(heap_id(object).unwrap(), prototype);
+    }
+    for value in [prototype, child, message, name, object] {
+        heap.release(value);
+    }
+    let pointer = heap.0.borrow().slot(heap_id(object).unwrap()).data;
+    let reused = heap.object().unwrap();
+    assert_eq!(reused, object);
+    assert_eq!(heap.property(reused, "child"), Some(Value::UNDEFINED));
+    assert_eq!(
+        heap.own_property_names(reused, false).unwrap(),
+        Vec::<String>::new()
+    );
+    assert_eq!(heap.error_text(reused), None);
+    {
+        let data = heap.0.borrow();
+        let slot = data.slot(heap_id(reused).unwrap());
+        assert_eq!(slot.data, pointer);
+        assert_eq!(slot.length, 0);
+        assert_eq!(slot.references, 1);
+        assert_eq!(
+            data.object(heap_id(reused).unwrap()).unwrap().prototype,
+            None
+        );
+        for value in [prototype, child, message, name] {
+            let id = heap_id(value).unwrap();
+            assert_eq!(data.slot(id).references, 0);
+            assert!(data.pending.contains(&id));
+        }
+        assert!(!data.pending.contains(&heap_id(reused).unwrap()));
+    }
+    assert!(heap.set_property(reused, "fresh", Value::TRUE));
+    heap.drain(100);
+    assert_eq!(heap.property(reused, "fresh"), Some(Value::TRUE));
+    heap.release(reused);
+    heap.drain(100);
+    assert!(!heap.valid(reused));
+}
+
+#[test]
+fn small_object_reuse_handles_partial_disposal() {
+    let heap = Heap::default();
+    let child = heap.string("child").unwrap();
+    let object = heap.object().unwrap();
+    assert!(heap.set_property(object, "child", child));
+    assert!(heap.set_property(object, "last", Value::TRUE));
+    heap.release(child);
+    heap.release(object);
+    heap.drain(1);
+    let reused = heap.object().unwrap();
+    assert_eq!(reused, object);
+    assert!(!heap.valid(child));
+    assert_eq!(heap.property(reused, "child"), Some(Value::UNDEFINED));
+    heap.drain(100);
+    assert!(heap.valid(reused));
+    heap.release(reused);
+    heap.drain(100);
+}
+
+#[test]
+fn small_objects_upgrade_without_changing_identity_or_ownership() {
+    let heap = Heap::default();
+    let prototype = heap.object().unwrap();
+    let child = heap.string("child").unwrap();
+    assert!(heap.set_property(prototype, "inherited", child));
+    let object = heap.object_with_prototype(prototype).unwrap();
+    assert!(heap.define_property(object, "child", child, false));
+    heap.release(child);
+    heap.release(prototype);
+    for index in 1..INLINE_PROPERTIES {
+        assert!(heap.set_property(object, &format!("p{index}"), Value::number(index as f64)));
+    }
+    let id = heap_id(object).unwrap();
+    let inline_data = {
+        let data = heap.0.borrow();
+        let slot = data.slot(id);
+        assert_eq!(slot.kind, kind::OBJECT | kind::INLINE);
+        assert_eq!(slot.length, INLINE_PROPERTIES);
+        let address = slot.data as usize;
+        assert!((id as usize..id as usize + arena::SLOT_SIZE).contains(&address));
+        assert_eq!(unsafe { *slot.data.cast::<Value>() }, child);
+        slot.data
+    };
+    assert!(heap.set_property(object, "overflow", Value::TRUE));
+    {
+        let data = heap.0.borrow();
+        let slot = data.slot(id);
+        assert_eq!(slot.kind, kind::OBJECT);
+        assert_eq!(slot.length, INLINE_PROPERTIES + 1);
+        assert_ne!(slot.data, inline_data);
+        assert_eq!(unsafe { *slot.data.cast::<Value>() }, child);
+        assert_eq!(data.slot(heap_id(child).unwrap()).references, 2);
+        assert_eq!(data.slot(heap_id(prototype).unwrap()).references, 1);
+    }
+    assert_eq!(heap.property(object, "inherited"), Some(child));
+    assert_eq!(heap.property(object, "child"), Some(child));
+    assert_eq!(heap.has_property(object, "overflow"), Some(true));
+    assert!(
+        !heap
+            .own_property_names(object, true)
+            .unwrap()
+            .contains(&"child".into())
+    );
+    heap.release(object);
+    heap.drain(100);
+    assert!(!heap.valid(object));
+    assert!(!heap.valid(prototype));
+    assert!(!heap.valid(child));
+}
+
+#[test]
+fn small_objects_convert_to_dictionaries_and_release_values() {
+    let heap = Heap::default();
+    let object = heap.object().unwrap();
+    let child = heap.string("child").unwrap();
+    assert!(heap.set_property(object, "named", child));
+    assert!(heap.set_property(object, "2", child));
+    heap.release(child);
+    {
+        let data = heap.0.borrow();
+        let slot = data.slot(heap_id(object).unwrap());
+        assert_eq!(slot.kind, kind::OBJECT);
+        assert_eq!(slot.shape, DICTIONARY);
+        assert!(slot.data.is_null());
+    }
+    assert_eq!(heap.property(object, "named"), Some(child));
+    assert_eq!(heap.property(object, "2"), Some(child));
+    assert_eq!(
+        heap.own_property_names(object, true).unwrap(),
+        ["2", "named"]
+    );
+    heap.release(object);
+    heap.drain(100);
+    assert!(!heap.valid(child));
+}
+
+#[test]
 fn numeric_element_indices_respect_limits_and_exactness() {
     let cases = [
         f64::NAN,
@@ -71,7 +219,7 @@ fn enumeration_respects_hidden_shadowing_and_releases_receivers() {
         heap.0
             .borrow()
             .slots()
-            .all(|slot| !matches!(slot.payload, Payload::Object(_)))
+            .all(|slot| !matches!(slot.payload, Payload::Object(_) | Payload::SmallObject(_)))
     );
     assert!(
         heap.0
@@ -331,7 +479,7 @@ fn error_properties_own_values_and_dispose_incrementally() {
     assert!(!heap.valid(error));
     assert!(matches!(
         heap.0.borrow().slot(heap_id(error).unwrap()).payload,
-        Payload::Object(_)
+        Payload::Object(_) | Payload::SmallObject(_)
     ));
     heap.drain(100);
     assert!(!heap.valid(message));
@@ -341,7 +489,7 @@ fn error_properties_own_values_and_dispose_incrementally() {
         heap.0
             .borrow()
             .slots()
-            .all(|slot| !matches!(slot.payload, Payload::Object(_)))
+            .all(|slot| !matches!(slot.payload, Payload::Object(_) | Payload::SmallObject(_)))
     );
 }
 

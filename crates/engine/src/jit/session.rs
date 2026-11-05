@@ -302,6 +302,14 @@ impl<'a> JitCtx<'a> {
         value
     }
     pub(crate) fn exit(&mut self, value: Value) -> Value {
+        self.exit_frame(value, true)
+    }
+
+    pub(crate) fn exit_unrooted(&mut self, value: Value) -> Value {
+        self.exit_frame(value, false)
+    }
+
+    fn exit_frame(&mut self, value: Value, roots: bool) -> Value {
         let value = if self.global.heap().retain(value) {
             value
         } else {
@@ -310,7 +318,9 @@ impl<'a> JitCtx<'a> {
         };
         let frame = self.frames.pop().unwrap();
         let heap = self.global.heap();
-        heap.release_all(&self.locals[frame.locals..]);
+        if roots {
+            heap.release_all(&self.locals[frame.locals..]);
+        }
         self.locals.truncate(frame.locals);
         heap.release_all(self.temps.above(frame.temps));
         self.temps.len = frame.temps;

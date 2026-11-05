@@ -11,9 +11,9 @@ use std::collections::HashMap;
 
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
-    Block, BlockArg, Inst, InstBuilder, MemFlags, Type, Value as ClifValue, types,
+    Block, BlockArg, Inst, InstBuilder, MemFlagsData, Type, Value as ClifValue, types,
 };
-use cranelift_frontend::{FunctionBuilder, Switch};
+use cranelift_frontend::{FunctionBuilder, Switch, Variable};
 use cranelift_jit::JITModule;
 use cranelift_module::{FuncId, Module};
 use oxc_span::Span;
@@ -62,6 +62,7 @@ pub(super) struct FunctionCompiler<'a, 'f> {
     suspensions: HashMap<u32, (usize, Block)>,
     terminated: bool,
     frame_size: Option<Inst>,
+    frame_roots: Option<Variable>,
     slots: HashMap<u32, u32>,
 }
 
@@ -179,6 +180,7 @@ fn build_callable(
         suspensions: HashMap::new(),
         terminated: false,
         frame_size: None,
+        frame_roots: None,
         slots: HashMap::new(),
     };
 
@@ -281,6 +283,7 @@ pub(super) fn build_global(
         suspensions: HashMap::new(),
         terminated: false,
         frame_size: None,
+        frame_roots: None,
         slots: HashMap::new(),
     };
     compiler.enter_frame();
@@ -317,13 +320,35 @@ impl FunctionCompiler<'_, '_> {
     pub(super) fn return_value(&mut self, value: ClifValue) {
         let value = match self.generator {
             Some(generator) => self.call_helper(Helper::GeneratorComplete, &[generator, value]),
-            None => self.call_helper(Helper::FrameExit, &[value]),
+            None => match self.frame_roots {
+                Some(roots) => {
+                    let rooted = self.b.create_block();
+                    let unrooted = self.b.create_block();
+                    let done = self.b.create_block();
+                    self.b.append_block_param(done, types::I64);
+                    let roots = self.b.use_var(roots);
+                    self.brif(roots, rooted, &[], unrooted, &[]);
+                    self.switch(rooted);
+                    let result = self.call_helper(Helper::FrameExit, &[value]);
+                    self.jump(done, &[BlockArg::Value(result)]);
+                    self.switch(unrooted);
+                    let result = self.call_helper(Helper::FrameExitUnrooted, &[value]);
+                    self.jump(done, &[BlockArg::Value(result)]);
+                    self.switch(done);
+                    self.b.block_params(done)[0]
+                }
+                None => self.call_helper(Helper::FrameExit, &[value]),
+            },
         };
         self.b.ins().return_(&[value]);
         self.terminated = true;
     }
 
     fn enter_frame(&mut self) {
+        let roots = self.b.declare_var(types::I8);
+        let clean = self.b.ins().iconst(types::I8, 0);
+        self.b.def_var(roots, clean);
+        self.frame_roots = Some(roots);
         let size = self.b.ins().iconst(types::I64, 0);
         self.frame_size = Some(self.b.func.dfg.value_def(size).unwrap_inst());
         self.call_helper(Helper::FrameEnter, &[size]);
@@ -333,14 +358,13 @@ impl FunctionCompiler<'_, '_> {
         if let Some(inst) = self.frame_size {
             self.b
                 .func
-                .dfg
                 .replace(inst)
                 .iconst(types::I64, self.slots.len() as i64);
         }
     }
 
     pub(super) fn clear_temporaries(&mut self) {
-        let flags = MemFlags::trusted();
+        let flags = MemFlagsData::trusted();
         let len = self.b.ins().load(
             types::I64,
             flags,
@@ -375,7 +399,7 @@ impl FunctionCompiler<'_, '_> {
         let present = self
             .b
             .ins()
-            .icmp_imm(IntCC::UnsignedGreaterThan, self.argc, index as i64);
+            .icmp_imm_s(IntCC::UnsignedGreaterThan, self.argc, index as i64);
         let load_block = self.b.create_block();
         let missing_block = self.b.create_block();
         let done = self.b.create_block();
@@ -385,7 +409,7 @@ impl FunctionCompiler<'_, '_> {
         self.switch(load_block);
         let value = self.b.ins().load(
             types::I64,
-            MemFlags::trusted(),
+            MemFlagsData::trusted(),
             self.argv,
             (index * 8) as i32,
         );

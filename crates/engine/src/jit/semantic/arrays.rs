@@ -2,9 +2,30 @@ use oxc_syntax::operator::BinaryOperator;
 
 use super::specialize::{self, Repository};
 use super::{
-    BlockData, Cfg, Constant, Facts, Graph, Inst, Op, Result, Target, Terminator, TerminatorKind,
-    Types,
+    ArrayMethod, BlockData, Cfg, Constant, Facts, Graph, Inst, Op, Result, Target, Terminator,
+    TerminatorKind, Types,
 };
+
+impl ArrayMethod {
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Self::Map => "map",
+            Self::Some => "some",
+            Self::Every => "every",
+            Self::Filter => "filter",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "map" => Some(Self::Map),
+            "some" => Some(Self::Some),
+            "every" => Some(Self::Every),
+            "filter" => Some(Self::Filter),
+            _ => None,
+        }
+    }
+}
 
 pub(super) fn expand(
     graph: &mut Graph,
@@ -24,9 +45,12 @@ pub(super) fn expand(
             else {
                 continue;
             };
-            if !matches!(graph.defining_op(*callee), Some(Op::Get(_, name)) if name == "map") {
+            let Some(Op::Get(_, name)) = graph.defining_op(*callee) else {
                 continue;
-            }
+            };
+            let Some(method) = ArrayMethod::from_name(name) else {
+                continue;
+            };
             let Some(&callback) = args.first() else {
                 continue;
             };
@@ -45,22 +69,24 @@ pub(super) fn expand(
             if !bodies.body(code).is_some_and(specialize::eligible) {
                 continue;
             }
-            sites.push(inst);
+            sites.push((inst, method));
         }
     }
-    for inst in sites {
-        map(graph, inst);
+    for (inst, method) in sites {
+        iteration(graph, inst, method);
         graph.verify()?;
         let span = graph.insts[inst].span;
         notes.push(format!(
-            "array map at {}..{}: expose callback loop behind native and array checks",
-            span.start, span.end
+            "array {} at {}..{}: expose callback loop behind native and array checks",
+            method.name(),
+            span.start,
+            span.end
         ));
     }
     Ok(())
 }
 
-fn map(graph: &mut Graph, inst: Inst) {
+fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
     let call = graph.insts[inst].clone();
     let Op::Call {
         callee,
@@ -80,7 +106,12 @@ fn map(graph: &mut Graph, inst: Inst) {
     let exit = graph.blocks.push(BlockData::default());
     let span = call.span;
     let check = graph
-        .append(block, span, Op::IsArrayMap(callee, receiver), true)
+        .append(
+            block,
+            span,
+            Op::IsArrayIteration(callee, receiver, method),
+            true,
+        )
         .1
         .unwrap();
     graph.blocks[block].terminator = Some(Terminator {
@@ -91,10 +122,14 @@ fn map(graph: &mut Graph, inst: Inst) {
         .append(start, span, Op::IndexedLength(receiver), true)
         .1
         .unwrap();
-    let result = graph
-        .append(start, span, Op::NewHoleyArray(length), true)
-        .1
-        .unwrap();
+    let result_op = match method {
+        ArrayMethod::Map => Op::NewHoleyArray(length),
+        ArrayMethod::Filter => Op::NewArray(Vec::new()),
+        ArrayMethod::Some | ArrayMethod::Every => {
+            Op::Constant(Constant::Boolean(method == ArrayMethod::Every))
+        }
+    };
+    let result = graph.append(start, span, result_op, true).1.unwrap();
     let zero = graph
         .append(start, span, Op::Constant(Constant::Number(0.0)), true)
         .1
@@ -149,11 +184,55 @@ fn map(graph: &mut Graph, inst: Inst) {
         )
         .1
         .unwrap();
-    graph.append(invoke, span, Op::SetIndex(result, index, mapped), false);
-    graph.blocks[invoke].terminator = Some(Terminator {
-        span,
-        kind: TerminatorKind::Jump(Target::new(advance)),
-    });
+    match method {
+        ArrayMethod::Map => {
+            graph.append(invoke, span, Op::SetIndex(result, index, mapped), false);
+            graph.blocks[invoke].terminator = Some(Terminator {
+                span,
+                kind: TerminatorKind::Jump(Target::new(advance)),
+            });
+        }
+        ArrayMethod::Filter => {
+            let keep = graph.blocks.push(BlockData::default());
+            graph.blocks[invoke].terminator = Some(Terminator {
+                span,
+                kind: TerminatorKind::Branch(mapped, Target::new(keep), Target::new(advance)),
+            });
+            graph.append(keep, span, Op::ArrayAppend(result, element, false), false);
+            graph.blocks[keep].terminator = Some(Terminator {
+                span,
+                kind: TerminatorKind::Jump(Target::new(advance)),
+            });
+        }
+        ArrayMethod::Some | ArrayMethod::Every => {
+            let stop = graph.blocks.push(BlockData::default());
+            let targets = if method == ArrayMethod::Some {
+                (Target::new(stop), Target::new(advance))
+            } else {
+                (Target::new(advance), Target::new(stop))
+            };
+            graph.blocks[invoke].terminator = Some(Terminator {
+                span,
+                kind: TerminatorKind::Branch(mapped, targets.0, targets.1),
+            });
+            let found = graph
+                .append(
+                    stop,
+                    span,
+                    Op::Constant(Constant::Boolean(method == ArrayMethod::Some)),
+                    true,
+                )
+                .1
+                .unwrap();
+            graph.blocks[stop].terminator = Some(Terminator {
+                span,
+                kind: TerminatorKind::Jump(Target {
+                    block: continuation,
+                    args: vec![found],
+                }),
+            });
+        }
+    }
     let one = graph
         .append(advance, span, Op::Constant(Constant::Number(1.0)), true)
         .1

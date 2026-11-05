@@ -2,14 +2,17 @@ use std::collections::{HashMap, HashSet};
 
 use cranelift_codegen::entity::SecondaryMap;
 
-use super::super::effects::{HEAP_WRITE, Reentry};
+use super::super::effects::{GLOBAL_WRITE, HEAP_WRITE, Reentry};
 use super::{Block, Cfg, Facts, Graph, Inst, Op, Types, Value};
 
 const HEAP: Types = Types::STRING.union(Types::OBJECT).union(Types::OTHER);
 
 fn receiver(op: &Op) -> Option<Value> {
     match op {
-        Op::Get(object, _) | Op::GetIndex(object, _) | Op::IndexedGet(object, _) => Some(*object),
+        Op::Get(object, _)
+        | Op::ProbeProperty(object, _)
+        | Op::GetIndex(object, _)
+        | Op::IndexedGet(object, _) => Some(*object),
         _ => None,
     }
 }
@@ -38,7 +41,7 @@ impl Borrows<'_> {
         let contract = self.graph.contract(&self.graph.insts[inst].op, self.facts);
         (
             contract.reentry != Reentry::Closed,
-            contract.flags & HEAP_WRITE != 0,
+            contract.flags & (GLOBAL_WRITE | HEAP_WRITE) != 0,
         )
     }
 
@@ -74,7 +77,7 @@ pub(super) fn borrows(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>)
             && facts.of(result).intersects(HEAP)
         {
             reads.insert(result, object);
-            if matches!(data.op, Op::IndexedGet(..)) {
+            if matches!(data.op, Op::IndexedGet(..) | Op::ProbeProperty(..)) {
                 held.insert(result);
             }
         }
@@ -93,6 +96,13 @@ pub(super) fn borrows(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>)
             objects.insert(value);
         }
         chains.insert(value, chain);
+    }
+    // The environment owns these values until a write or reentry invalidates the borrow.
+    for (_, data) in &graph.insts {
+        if let (Op::ProbeGlobal(_), Some(value)) = (&data.op, data.result) {
+            chains.insert(value, Vec::new());
+            objects.insert(value);
+        }
     }
     if chains.is_empty() {
         return;

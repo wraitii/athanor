@@ -63,6 +63,49 @@ fn scope_at(graph: &Graph, inst: Inst) -> Option<Scope> {
     unreachable!()
 }
 
+pub(super) fn direct_captures(
+    graph: &Graph,
+    call: Inst,
+    callee: super::Value,
+) -> Option<Vec<super::Binding>> {
+    let Op::Closure(_, _, false, captures) = graph.defining_op(callee)? else {
+        return None;
+    };
+    let origin = graph.def_block(callee);
+    let target = graph.insts[call].block;
+    let cfg = Cfg::new(graph);
+    let mut pending = vec![target];
+    let mut blocks = HashSet::new();
+    while let Some(block) = pending.pop() {
+        if !blocks.insert(block) || block == origin {
+            continue;
+        }
+        pending.extend(cfg.preds[block].iter().copied());
+    }
+    // A closure can retain an earlier iteration even while the binding name stays in scope.
+    let scopes: HashSet<_> = captures.iter().map(|&b| graph.bindings[b].scope).collect();
+    for block in blocks {
+        let mut after = block != origin;
+        for &inst in &graph.blocks[block].insts {
+            if inst == call {
+                break;
+            }
+            if graph.insts[inst].result == Some(callee) {
+                after = true;
+                continue;
+            }
+            if after
+                && matches!(graph.insts[inst].op,
+                Op::EnterScope(scope) | Op::LeaveScope(scope) | Op::NextIteration(scope)
+                | Op::FreshIteration(scope) if scopes.contains(&scope))
+            {
+                return None;
+            }
+        }
+    }
+    Some(captures.clone())
+}
+
 pub(super) fn apply(graph: &mut Graph, body: &Graph, plan: &Inline) {
     let call = graph.insts[plan.call].clone();
     let (callee, receiver, args) = match &call.op {
@@ -78,6 +121,9 @@ pub(super) fn apply(graph: &mut Graph, body: &Graph, plan: &Inline) {
         } => (callee, Some(*receiver), args),
         _ => unreachable!(),
     };
+    let captures = (!plan.guard_code)
+        .then(|| direct_captures(graph, plan.call, *callee))
+        .flatten();
     let parent = scope_at(graph, plan.call);
     let (block, continuation, fallback) = split_call(graph, plan.call);
     let mut current = graph.blocks.push(BlockData::default());
@@ -140,7 +186,22 @@ pub(super) fn apply(graph: &mut Graph, body: &Graph, plan: &Inline) {
     for (scope, data) in &body.scopes {
         scopes.insert(scope, graph.scopes.push(data.clone()));
     }
+    let aliases: HashMap<_, _> = captures
+        .as_ref()
+        .map(|captures| {
+            body.scopes
+                .values()
+                .filter(|scope| scope.kind == ScopeKind::Captures)
+                .flat_map(|scope| scope.bindings.iter().copied())
+                .zip(captures.iter().copied())
+                .collect()
+        })
+        .unwrap_or_default();
     for (binding, data) in &body.bindings {
+        if let Some(&alias) = aliases.get(&binding) {
+            bindings.insert(binding, alias);
+            continue;
+        }
         let mut data = data.clone();
         data.scope = scopes[&data.scope];
         bindings.insert(binding, graph.bindings.push(data));
@@ -151,6 +212,7 @@ pub(super) fn apply(graph: &mut Graph, body: &Graph, plan: &Inline) {
         copy.bindings = data
             .bindings
             .iter()
+            .filter(|binding| !aliases.contains_key(binding))
             .map(|binding| bindings[binding])
             .collect();
     }
@@ -186,7 +248,11 @@ pub(super) fn apply(graph: &mut Graph, body: &Graph, plan: &Inline) {
                     *binding = bindings[binding];
                 }
                 Op::EnterScope(scope) if body.scopes[*scope].kind == ScopeKind::Captures => {
-                    op = Op::EnterCaptures(scopes[scope], *callee);
+                    op = if captures.is_some() {
+                        Op::EnterScope(scopes[scope])
+                    } else {
+                        Op::EnterCaptures(scopes[scope], *callee)
+                    };
                 }
                 Op::EnterScope(scope)
                 | Op::LeaveScope(scope)

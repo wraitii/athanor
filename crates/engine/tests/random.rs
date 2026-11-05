@@ -1,4 +1,4 @@
-use js_engine::{Engine, Host, Value};
+use js_engine::{Engine, EngineOptions, Host, Value};
 
 struct TestHost;
 
@@ -68,4 +68,51 @@ fn random_state_persists_and_is_isolated_per_engine() {
         second.call("next", &[]).unwrap().value(),
         Value::number(1610402240.0)
     );
+}
+
+#[test]
+fn guarded_random_preserves_unused_draws_loop_counts_and_replacements() {
+    for enabled in [false, true] {
+        let mut engine = Engine::with_options(EngineOptions {
+            ssa_opt: enabled,
+            ..Default::default()
+        })
+        .unwrap();
+        engine
+            .compile(
+                "function seed(){hostSeedRandom(0);}
+             function next(){return Math.random()*2147483648;}
+             function skip(n){for(let i=0;i<n;++i) Math.random();}
+             function discarded(){Math.random();return Math.random()*2147483648;}
+             function sum(n){let total=0;for(let i=0;i<n;++i) total+=Math.random();return total;}
+             function replace(){Math.random=function(){Math.random=()=>0.75;return 0.25;};}",
+                "guarded-random.js",
+            )
+            .unwrap();
+        engine.call("seed", &[]).unwrap();
+        engine.call("skip", &[Value::number(0.0)]).unwrap();
+        assert_eq!(
+            engine.call("next", &[]).unwrap().value(),
+            Value::number(366850414.0)
+        );
+        engine.call("seed", &[]).unwrap();
+        engine.call("skip", &[Value::number(1.0)]).unwrap();
+        assert_eq!(
+            engine.call("next", &[]).unwrap().value(),
+            Value::number(1610402240.0)
+        );
+        engine.call("seed", &[]).unwrap();
+        assert_eq!(
+            engine.call("discarded", &[]).unwrap().value(),
+            Value::number(1610402240.0)
+        );
+        engine.call("seed", &[]).unwrap();
+        let total = engine.call("sum", &[Value::number(2.0)]).unwrap().value();
+        assert_eq!(total, Value::number(1977252654.0 / 2147483648.0));
+        engine.call("replace", &[]).unwrap();
+        assert_eq!(
+            engine.call("sum", &[Value::number(3.0)]).unwrap().value(),
+            Value::number(1.75)
+        );
+    }
 }

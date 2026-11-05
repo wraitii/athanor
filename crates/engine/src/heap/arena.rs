@@ -2,12 +2,12 @@ use std::ptr::NonNull;
 
 use super::Payload;
 
-pub(crate) const SLOT_SIZE: usize = 64;
+pub(crate) const SLOT_SIZE: usize = 128;
 const FIRST_CHUNK: usize = 256;
 const LARGEST_CHUNK: usize = 1 << 18;
 const ADDRESS_LIMIT: usize = 1 << 48;
 
-#[repr(C, align(64))]
+#[repr(C, align(128))]
 pub(super) struct Slot {
     pub(super) references: u32,
     pub(super) kind: u32,

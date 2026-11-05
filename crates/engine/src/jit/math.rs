@@ -6,4 +6,5 @@ pub(super) const METHODS: &[(&str, MathFunction)] = &[
     ("min", MathFunction::Min),
     ("max", MathFunction::Max),
     ("sqrt", MathFunction::Sqrt),
+    ("random", MathFunction::Random),
 ];

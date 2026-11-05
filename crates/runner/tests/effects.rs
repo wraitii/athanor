@@ -107,34 +107,41 @@ fn loops_version_independently_of_their_function() {
 }
 
 #[test]
-fn array_map_exposes_and_inlines_known_closures() {
-    let source = "function createTerrain(terrain){ return typeof terrain === 'string' ? terrain : terrain.map(t=>createTerrain(t)); }";
-    for enabled in [false, true] {
-        let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
-            .env("JS_JIT_SSA", if enabled { "1" } else { "0" })
-            .args(["--compile", "--no-ir", "--semantic-ir", "--eval", source])
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
+fn array_iteration_exposes_and_inlines_known_closures() {
+    for method in ["map", "some", "every", "filter"] {
+        let source = format!(
+            "function createTerrain(terrain){{ return typeof terrain === 'string' ? terrain : terrain.{method}(t=>createTerrain(t)); }}"
         );
-        let dump = String::from_utf8(output.stdout).unwrap();
-        let caller = dump
-            .split("semantic IR createTerrain\n")
-            .nth(1)
-            .unwrap()
-            .split("semantic IR")
-            .next()
-            .unwrap();
-        assert_eq!(caller.contains("is_array_map"), enabled);
-        assert_eq!(caller.contains("map_element"), enabled);
-        if enabled {
-            assert!(caller.contains("inline") && caller.contains("0 code check(s)"));
-            assert!(!caller.contains("is_code"));
-            assert!(caller.contains("materialized only in fallback"));
-            assert!(caller.find("is_array_map").unwrap() < caller.find(" = closure ").unwrap());
+        for enabled in [false, true] {
+            let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
+                .env("JS_JIT_SSA", if enabled { "1" } else { "0" })
+                .args(["--compile", "--no-ir", "--semantic-ir", "--eval", &source])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let dump = String::from_utf8(output.stdout).unwrap();
+            let caller = dump
+                .split("semantic IR createTerrain\n")
+                .nth(1)
+                .unwrap()
+                .split("semantic IR")
+                .next()
+                .unwrap();
+            assert_eq!(caller.contains(&format!("is_array_{method}")), enabled);
+            assert_eq!(caller.contains("map_element"), enabled);
+            if enabled {
+                assert!(caller.contains("inline") && caller.contains("0 code check(s)"));
+                assert!(!caller.contains("is_code"));
+                assert!(caller.contains("materialized only in fallback"));
+                assert!(
+                    caller.find(&format!("is_array_{method}")).unwrap()
+                        < caller.find(" = closure ").unwrap()
+                );
+            }
         }
     }
 }
@@ -204,4 +211,220 @@ fn known_constructor_bodies_can_be_inlined() {
     let main = dump.split("semantic IR main\n").nth(1).unwrap();
     assert!(main.contains("inline"));
     assert!(main.contains("constructor_result"));
+}
+
+#[test]
+fn array_iteration_preserves_mutation_short_circuiting_and_fallbacks() {
+    let source = r#"
+function main() {
+    let a = [1, 2, 3], seen = '';
+    let some = a.some((v, i, xs) => { seen += v; xs.push(9); return i == 1 ? 'yes' : ''; });
+    let b = [1, 2, 3];
+    let every = b.every((v, i, xs) => { seen += v; xs[2] = 8; return i == 1 ? 0 : 1; });
+    let c = [1, 2, 3, 4];
+    let filtered = c.filter((v, i, xs) => { if (i == 0) { xs.length = 3; xs.push(7); xs.push(9); } return v % 2; });
+    let sparse = new Array(4); sparse[2] = 5;
+    let holes = sparse.filter(v => { seen += v; return v; });
+    let emptySome = [].some(v => { seen += 'bad'; return true; });
+    let emptyEvery = [].every(v => { seen += 'bad'; return false; });
+    let custom = { some: f => f(9) };
+    let fallback = custom.some(v => v + 1);
+    let threshold = 2;
+    let captured = [1, 3].some(v => v > threshold);
+    return some + ':' + every + ':' + seen + ':' + filtered.join(',') + ':' + holes.join(',') + ':' + emptySome + ':' + emptyEvery + ':' + fallback + ':' + captured;
+}
+"#;
+    for enabled in [false, true] {
+        let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
+            .env("JS_JIT_SSA", if enabled { "1" } else { "0" })
+            .args(["--eval", source])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            "true:false:12125:1,3,7:5:false:true:10:true"
+        );
+    }
+}
+
+#[test]
+fn inlined_captures_use_bindings_and_materialize_only_for_fallbacks() {
+    let source = "function main(xs){ let limit=2; return xs.some(x=>x>limit); }";
+    let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
+        .env("JS_JIT_SSA", "1")
+        .args(["--compile", "--no-ir", "--semantic-ir", "--eval", source])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let dump = String::from_utf8(output.stdout).unwrap();
+    let caller = dump
+        .split("semantic IR main\n")
+        .nth(1)
+        .unwrap()
+        .split("semantic IR")
+        .next()
+        .unwrap();
+    assert!(!caller.contains("enter_captures"));
+    assert!(caller.contains("read limit#"));
+    assert!(caller.contains("materialized only in fallback"));
+    assert!(caller.contains("materialized as a cell only on closure creation"));
+}
+
+#[test]
+fn lazy_captures_share_writes_and_preserve_escaped_iteration_environments() {
+    let source = r#"
+let saved;
+function run(xs) {
+    let n = 1;
+    let result = xs.some(v => { n += v; return n > 3; });
+    n += 10;
+    return result + ':' + n;
+}
+function main() {
+    let fast = run([1, 2, 3]);
+    let slow = run({ some: f => { saved = f; return f(1); } });
+    let escaped = saved(1);
+    let callbacks = [];
+    let custom = { some: f => { callbacks.push(f); return false; } };
+    for (let i = 0; i < 3; ++i) custom.some(v => i + v);
+    let iterations = callbacks[0](10) + ',' + callbacks[1](10) + ',' + callbacks[2](10);
+    let snapshots = [];
+    for (let i = 0, f = () => i; i < 3; ++i) snapshots.push(f());
+    let value = 1;
+    let other = () => value;
+    [2].every(v => { value += v; return true; });
+    return fast + ':' + slow + ':' + escaped + ':' + iterations + ':' + snapshots.join(',') + ':' + other();
+}
+"#;
+    for enabled in [false, true] {
+        let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
+            .env("JS_JIT_SSA", if enabled { "1" } else { "0" })
+            .args(["--eval", source])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            "true:14:false:12:true:10,11,12:0,0,0:3"
+        );
+        let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
+            .env("JS_JIT_SSA", if enabled { "1" } else { "0" })
+            .args(["--eval", "function main(){ [1].some(v=>v+n); let n=2; }"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("before initialization"));
+    }
+}
+
+#[test]
+fn whole_function_guards_expose_closed_inlined_arithmetic() {
+    let source = "function square(x){return x*x;} function distance(x1,y1,x2,y2){return square(x2-x1)+square(y2-y1);}";
+    let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
+        .env("JS_JIT_SSA", "1")
+        .args(["--compile", "--no-ir", "--semantic-ir", "--eval", source])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let dump = String::from_utf8(output.stdout).unwrap();
+    let function = dump
+        .split("semantic IR distance\n")
+        .nth(1)
+        .unwrap()
+        .split("semantic IR")
+        .next()
+        .unwrap();
+    assert!(function.contains("function: versioned:"));
+    let fast = function.split("\nblock0:").next().unwrap();
+    assert_eq!(fast.matches("probe_global square").count(), 1);
+    assert_eq!(fast.matches(" = is_code ").count(), 1);
+    assert_eq!(fast.matches(" = is_number ").count(), 4);
+    assert!(!fast.contains(" = global "));
+    assert!(!fast.contains(" = call "));
+    assert_eq!(fast.matches(" * ").count(), 2);
+    assert!(!function.contains("not optimized:"));
+}
+
+#[test]
+fn whole_function_guard_fallbacks_preserve_conversion_and_method_replacement() {
+    let source = r#"
+function square(x) { return x * x; }
+function distance(x1,y1,x2,y2) { return square(x2-x1) + square(y2-y1); }
+function replacement(x) { square = y => 100 + y; return 10 + x; }
+function mixed(a,b) { return square(a) + Math.floor(b); }
+function replaceFloor(x) { Math.floor = y => 100 + y; return 10 + x; }
+function main() {
+    let first = distance(1,2,4,6);
+    let converted = distance('1',null,4,5);
+    square = replacement;
+    let replaced = distance(1,2,4,6);
+    square = replaceFloor;
+    return first + ':' + converted + ':' + replaced + ':' + mixed(2,3);
+}
+"#;
+    for enabled in [false, true] {
+        let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
+            .env("JS_JIT_SSA", if enabled { "1" } else { "0" })
+            .args(["--eval", source])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            "25:34:117:115"
+        );
+    }
+}
+
+#[test]
+fn feedback_inlining_closes_nested_math_property_calls() {
+    let source = r#"
+Math.square = function(x) { return x*x; };
+Math.euclidDistance2DSquared = function(x1,y1,x2,y2) {
+    return Math.square(x2-x1) + Math.square(y2-y1);
+};
+function distance(a,b) {
+    return Math.euclidDistance2DSquared(a.x,a.y,b.x,b.y);
+}
+function main() {
+    let a={x:1,y:2}, b={x:4,y:6}, sum=0;
+    try { for(let i=0;i<200;++i) sum+=distance(a,b); } catch(e) { throw e; }
+    Math.square = x => x+1;
+    return sum + ':' + distance(a,b);
+}
+"#;
+    for enabled in [false, true] {
+        let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
+            .env("JS_JIT_SSA", if enabled { "1" } else { "0" })
+            .args(["--eval", source])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "5000:9");
+    }
 }
