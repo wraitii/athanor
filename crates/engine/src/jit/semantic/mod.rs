@@ -1,9 +1,13 @@
+mod arrays;
 mod borrow;
 mod build;
+mod comparisons;
+mod construction;
 pub(in crate::jit) mod facts;
 mod inlining;
 mod optimize;
 mod promote;
+pub(super) mod reads;
 pub(super) mod specialize;
 
 use std::collections::{HashMap, HashSet};
@@ -21,6 +25,7 @@ use super::effects::{
     Reentry, UNKNOWN,
 };
 use super::math::METHODS;
+use crate::heap::TypedKind;
 
 pub(super) use facts::{Facts, Types};
 pub(super) use ids::{Binding, Block, Inst, Scope, Value};
@@ -77,6 +82,7 @@ pub(super) struct BlockData {
 
 #[derive(Clone)]
 pub(super) struct InstData {
+    pub(super) source_name: Option<(usize, usize)>,
     pub(super) span: Span,
     pub(super) block: Block,
     pub(super) result: Option<Value>,
@@ -174,6 +180,7 @@ pub(super) enum Op {
     Arguments,
     Rest(usize),
     This,
+    ClosureThis(Value),
     Throw(Value),
     Catch,
     Closure(Span, bool, bool, Vec<Binding>),
@@ -190,9 +197,29 @@ pub(super) enum Op {
     CheckInitialized(Value),
     NewObject,
     NewArray(Vec<Value>),
+    NewHoleyArray(Value),
+    MapElement(Value, Value),
+    IsArrayMap(Value, Value),
     ArrayAppend(Value, Value, bool),
     CallSpread(Value, Value, Value),
     ConstructSpread(Value, Value),
+    // UNINITIALIZED leaves native constructors and lazy prototypes to generic construction.
+    ConstructorPrototype(Value),
+    ConstructSpreadResolved(Value, Value, Value),
+    ConstructResolved {
+        callee: Value,
+        prototype: Value,
+        args: Vec<Value>,
+    },
+    NewInstance(Value),
+    ConstructorResult(Value, Value),
+    // Calls a validated constructor with its allocated receiver; class constructors are allowed.
+    ConstructorCall {
+        callee: Value,
+        receiver: Value,
+        args: Vec<Value>,
+    },
+    ConstructorCallSpread(Value, Value, Value),
     IteratorNew(Value),
     IteratorNext(Value),
     IsIndexed(Value),
@@ -210,8 +237,16 @@ pub(super) enum Op {
     Set(Value, String, Value),
     SetIndex(Value, Value, Value),
     ToNumeric(Value),
+    // Pure integer coercion of a value proven to be a number or undefined.
+    ToInt32(Value),
     Unary(UnaryOp, Value),
     Binary(BinaryOperator, Value, Value),
+    GuardedCompare {
+        operator: BinaryOperator,
+        left: Value,
+        right: Value,
+        numbers: [Value; 2],
+    },
     Call {
         callee: Value,
         receiver: Option<Value>,
@@ -232,12 +267,13 @@ pub(super) enum Op {
     GuardValid(usize),
     GuardCommit(usize),
     View(Value),
-    IsTyped(Value),
-    TypedIndex(Value, Value),
+    IsTyped(Value, Option<TypedKind>),
+    TypedIndex(Value, Value, TypedRead),
     IsNumber(Value),
     IsString(Value),
     AsNumber(Value),
     EnterScope(Scope),
+    EnterCaptures(Scope, Value),
     LeaveScope(Scope),
     NextIteration(Scope),
     FreshIteration(Scope),
@@ -327,7 +363,10 @@ impl Op {
             | Op::LeaveScope(_)
             | Op::NextIteration(_)
             | Op::FreshIteration(_) => Vec::new(),
-            Op::Throw(value)
+            Op::ClosureThis(value)
+            | Op::NewHoleyArray(value)
+            | Op::EnterCaptures(_, value)
+            | Op::Throw(value)
             | Op::GlobalInitialize(_, value)
             | Op::GlobalWrite(_, value)
             | Op::Initialize(_, value)
@@ -345,28 +384,61 @@ impl Op {
             | Op::DisableConstructor(value)
             | Op::PropertyKey(value)
             | Op::ToNumeric(value)
+            | Op::ToInt32(value)
             | Op::Unary(_, value)
             | Op::IsUndefined(value)
             | Op::IsNullish(value)
             | Op::ProbeProperty(value, _)
             | Op::IsNative(value, _)
+            | Op::NewInstance(value)
+            | Op::ConstructorPrototype(value)
             | Op::IsCode(value, _)
             | Op::View(value)
-            | Op::IsTyped(value)
+            | Op::IsTyped(value, _)
             | Op::IsNumber(value)
             | Op::IsString(value)
             | Op::AsNumber(value) => vec![value],
             Op::Define(object, _, value)
             | Op::DefineHidden(object, _, value)
             | Op::Set(object, _, value) => vec![object, value],
-            Op::GetIndex(object, key)
-            | Op::TypedIndex(object, key)
+            Op::MapElement(object, key)
+            | Op::IsArrayMap(object, key)
+            | Op::GetIndex(object, key)
+            | Op::TypedIndex(object, key, _)
             | Op::IndexedGet(object, key)
             | Op::ProbeIndex(object, key)
             | Op::Binary(_, object, key)
             | Op::ArrayAppend(object, key, _)
+            | Op::ConstructorResult(object, key)
             | Op::ConstructSpread(object, key) => vec![object, key],
-            Op::CallSpread(callee, receiver, args) => vec![callee, receiver, args],
+            Op::CallSpread(callee, receiver, args)
+            | Op::ConstructorCallSpread(callee, receiver, args)
+            | Op::ConstructSpreadResolved(callee, receiver, args) => vec![callee, receiver, args],
+            Op::ConstructorCall {
+                callee,
+                receiver,
+                args,
+            } => std::iter::once(callee)
+                .chain(std::iter::once(receiver))
+                .chain(args.iter_mut())
+                .collect(),
+            Op::ConstructResolved {
+                callee,
+                prototype,
+                args,
+            } => std::iter::once(callee)
+                .chain(std::iter::once(prototype))
+                .chain(args.iter_mut())
+                .collect(),
+            Op::GuardedCompare {
+                left,
+                right,
+                numbers,
+                ..
+            } => std::iter::once(left)
+                .chain(std::iter::once(right))
+                .chain(numbers.iter_mut())
+                .collect(),
             Op::SetIndex(object, key, value) => vec![object, key, value],
             Op::NewArray(values) | Op::CallNative(_, values) => values.iter_mut().collect(),
             Op::Construct { callee, args } => {
@@ -452,6 +524,14 @@ pub(super) fn resolve(aliases: &HashMap<Value, Value>, mut value: Value) -> Valu
         value = next;
     }
     value
+}
+
+/// What a typed-array read may assume: a fixed element kind, and a key proven to be an
+/// integral index below the length.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::jit) struct TypedRead {
+    pub(in crate::jit) element: Option<TypedKind>,
+    pub(in crate::jit) bounded: bool,
 }
 
 pub(super) struct Cfg {
@@ -590,7 +670,12 @@ impl Graph {
     ) -> (Inst, Option<Value>) {
         let inst = self.insts.next_key();
         let result = has_result.then(|| self.values.push(ValueDef::Result(inst)));
+        let source_name = self.blocks[block]
+            .insts
+            .get(position)
+            .and_then(|&next| self.insts[next].source_name);
         self.insts.push(InstData {
+            source_name,
             span,
             block,
             result,
@@ -704,10 +789,16 @@ impl Graph {
             }
         };
         match op {
+            Op::NewInstance(_) => closed(ALLOCATION | INTERNAL | ERROR, &[], Owned),
+            Op::ConstructorResult(..) => closed(0, &[], Borrowed),
             Op::Rest(_) | Op::Arguments => closed(ALLOCATION | INTERNAL | ERROR, &[], Owned),
             Op::Throw(_) => closed(INTERNAL | ERROR, &[], None),
             Op::Catch => closed(INTERNAL, &[], Owned),
             Op::Argument(_) | Op::This => closed(0, &[], Borrowed),
+            Op::ClosureThis(_) => closed(HEAP_READ, &[], Borrowed),
+            Op::NewHoleyArray(_) => closed(ALLOCATION | INTERNAL | ERROR, &[], Owned),
+            Op::MapElement(..) => closed(HEAP_READ | INTERNAL, &[], Borrowed),
+            Op::IsArrayMap(..) => closed(HEAP_READ, &[], Unowned),
             Op::Constant(_) => closed(0, &[], Unowned),
             Op::GlobalRead(_) | Op::GlobalReadOptional(_) => {
                 closed(GLOBAL_READ | INTERNAL | ERROR, &[], Borrowed)
@@ -781,7 +872,14 @@ impl Graph {
                     closed(ALLOCATION | INTERNAL | ERROR, &[], MaybeOwned)
                 }
             }
+            Op::ToInt32(_) => closed(0, &[], Unowned),
             Op::ToNumeric(_) | Op::Unary(..) => coercing(MaybeOwned),
+            Op::GuardedCompare {
+                operator,
+                left,
+                right,
+                ..
+            } => self.contract(&Op::Binary(*operator, *left, *right), facts),
             Op::Binary(operator, ..) => match operator {
                 BinaryOperator::StrictEquality | BinaryOperator::StrictInequality => {
                     closed(HEAP_READ, &[], Unowned)
@@ -803,7 +901,11 @@ impl Graph {
             Op::Call { .. }
             | Op::Construct { .. }
             | Op::CallSpread(..)
-            | Op::ConstructSpread(..) => Contract {
+            | Op::ConstructSpread(..)
+            | Op::ConstructorCall { .. }
+            | Op::ConstructorCallSpread(..)
+            | Op::ConstructResolved { .. }
+            | Op::ConstructSpreadResolved(..) => Contract {
                 reentry: Reentry::Arbitrary,
                 flags: UNKNOWN,
                 assumptions: &[],
@@ -811,6 +913,7 @@ impl Graph {
             },
             Op::CallNative(..) => coercing(Unowned),
             Op::IsUndefined(_) | Op::IsNullish(_) | Op::IsNative(..) => closed(0, &[], Unowned),
+            Op::ConstructorPrototype(_) => closed(HEAP_READ, &[Assumption::NoAccessors], Borrowed),
             Op::IsCode(..) => closed(HEAP_READ, &[], Unowned),
             Op::ProbeGlobal(_) => closed(GLOBAL_READ, &[Assumption::NoAccessors], Borrowed),
             Op::ProbeProperty(..) | Op::ProbeIndex(..) => {
@@ -819,12 +922,13 @@ impl Graph {
             Op::GuardValid(_) => closed(GLOBAL_READ, &[], Unowned),
             Op::GuardCommit(_) => closed(INTERNAL, &[], None),
             Op::View(_) => closed(HEAP_READ, &[Assumption::FixedTypedStorage], Unowned),
-            Op::IsTyped(_) | Op::IsIndexed(_) => closed(0, &[], Unowned),
+            Op::IsTyped(..) | Op::IsIndexed(_) => closed(0, &[], Unowned),
             Op::IndexedLength(_) => closed(HEAP_READ, &[], Unowned),
-            Op::IndexedGet(..) => closed(HEAP_READ | INTERNAL, &[], Borrowed),
+            Op::IndexedGet(..) => closed(HEAP_READ | INTERNAL | ERROR, &[], Borrowed),
             Op::TypedIndex(..) => closed(HEAP_READ, &[Assumption::FixedTypedStorage], Unowned),
             Op::IsNumber(_) | Op::IsString(_) => closed(0, &[], Unowned),
             Op::AsNumber(_) => closed(INTERNAL, &[], Unowned),
+            Op::EnterCaptures(..) => closed(HEAP_READ | INTERNAL | ERROR, &[], None),
             Op::EnterScope(scope) | Op::NextIteration(scope) | Op::FreshIteration(scope) => {
                 if self.materialized(*scope) {
                     closed(ALLOCATION | INTERNAL | ERROR, &[], None)
@@ -853,7 +957,7 @@ impl Graph {
                     return Err(format!("{inst} is listed in the wrong block"));
                 }
                 match self.insts[inst].op {
-                    Op::EnterScope(scope) => {
+                    Op::EnterScope(scope) | Op::EnterCaptures(scope, _) => {
                         if self.scopes[scope].parent != stack.last().copied() {
                             return Err(format!("{inst} enters {scope} outside its parent"));
                         }
@@ -963,6 +1067,7 @@ impl Graph {
             Op::Constant(Constant::Null) => "null".into(),
             Op::Rest(index) => format!("rest {index}"),
             Op::This => "this".into(),
+            Op::ClosureThis(value) => format!("closure_this {value}"),
             Op::Throw(value) => format!("throw {value}"),
             Op::Catch => "catch".into(),
             Op::Closure(span, arrow, generator, captures) => format!(
@@ -987,11 +1092,35 @@ impl Graph {
             Op::CheckInitialized(value) => format!("check_initialized {value}"),
             Op::NewObject => "new_object".into(),
             Op::NewArray(values) => format!("new_array [{}]", list(values)),
+            Op::NewHoleyArray(length) => format!("new_holey_array {length}"),
+            Op::MapElement(object, key) => format!("map_element {object}[{key}]"),
+            Op::IsArrayMap(callee, receiver) => format!("is_array_map {callee}, {receiver}"),
             Op::ArrayAppend(array, value, spread) => {
                 format!("array_append {array}, {value}, {spread}")
             }
             Op::CallSpread(callee, receiver, args) => {
                 format!("call_spread {callee}, {receiver}, {args}")
+            }
+            Op::NewInstance(prototype) => format!("new_instance {prototype}"),
+            Op::ConstructorResult(result, instance) => {
+                format!("constructor_result {result}, {instance}")
+            }
+            Op::ConstructorCall {
+                callee,
+                receiver,
+                args,
+            } => format!("constructor_call {callee}, {receiver}({})", list(args)),
+            Op::ConstructorCallSpread(callee, receiver, args) => {
+                format!("constructor_call_spread {callee}, {receiver}, {args}")
+            }
+            Op::ConstructorPrototype(callee) => format!("constructor_prototype {callee}"),
+            Op::ConstructResolved {
+                callee,
+                prototype,
+                args,
+            } => format!("construct_resolved {callee}, {prototype}({})", list(args)),
+            Op::ConstructSpreadResolved(callee, prototype, args) => {
+                format!("construct_spread_resolved {callee}, {prototype}, {args}")
             }
             Op::ConstructSpread(callee, args) => format!("construct_spread {callee}, {args}"),
             Op::IteratorNew(value) => format!("iterator_new {value}"),
@@ -1013,7 +1142,19 @@ impl Graph {
             Op::Set(object, name, value) => format!("set {object}.{name}, {value}"),
             Op::SetIndex(object, key, value) => format!("set {object}[{key}], {value}"),
             Op::ToNumeric(value) => format!("to_numeric {value}"),
+            Op::ToInt32(value) => format!("to_int32 {value}"),
             Op::Unary(operator, value) => format!("{operator:?} {value}").to_lowercase(),
+            Op::GuardedCompare {
+                operator,
+                left,
+                right,
+                numbers,
+            } => format!(
+                "compare {left} {} {right} numbers=[{}, {}]",
+                operator.as_str(),
+                numbers[0],
+                numbers[1]
+            ),
             Op::Binary(operator, left, right) => {
                 format!("{left} {} {right}", operator.as_str())
             }
@@ -1037,12 +1178,20 @@ impl Graph {
             Op::GuardValid(guard) => format!("guard_valid {guard}"),
             Op::GuardCommit(guard) => format!("guard_commit {guard}"),
             Op::View(value) => format!("view {value}"),
-            Op::IsTyped(value) => format!("is_typed {value}"),
-            Op::TypedIndex(object, key) => format!("get_typed {object}[{key}]"),
+            Op::IsTyped(value, None) => format!("is_typed {value}"),
+            Op::IsTyped(value, Some(element)) => format!("is_typed {value}, {element:?}"),
+            Op::TypedIndex(object, key, read) => {
+                let element = read
+                    .element
+                    .map_or(String::new(), |element| format!(" {element:?}"));
+                let bounded = if read.bounded { " bounded" } else { "" };
+                format!("get_typed {object}[{key}]{element}{bounded}")
+            }
             Op::IsNumber(value) => format!("is_number {value}"),
             Op::IsString(value) => format!("is_string {value}"),
             Op::AsNumber(value) => format!("as_number {value}"),
             Op::EnterScope(scope) => format!("enter {scope}"),
+            Op::EnterCaptures(scope, closure) => format!("enter_captures {scope}, {closure}"),
             Op::LeaveScope(scope) => format!("leave {scope}"),
             Op::NextIteration(scope) => format!("next_iteration {scope}"),
             Op::FreshIteration(scope) => format!("fresh_iteration {scope}"),
@@ -1133,7 +1282,7 @@ impl Listing<'_> {
                 let span = inst_data.span;
                 lines.push((
                     graph.inst_location(inst),
-                    Some(span),
+                    inst_data.source_name.is_none().then_some(span),
                     format!("  {text:<48} ; {}..{}{note}", span.start, span.end),
                 ));
             }
@@ -1152,7 +1301,10 @@ impl Listing<'_> {
                 let span = terminator.span;
                 lines.push((
                     graph.terminator_location(block),
-                    Some(span),
+                    data.insts
+                        .last()
+                        .is_none_or(|&inst| graph.insts[inst].source_name.is_none())
+                        .then_some(span),
                     format!("  {text:<48} ; {}..{}", span.start, span.end),
                 ));
             }
@@ -1189,7 +1341,17 @@ fn unsupported<T>(what: &str, span: Span) -> Result<T> {
     ))
 }
 
+pub(super) struct Planned {
+    pub(super) inlines: Vec<specialize::Inline>,
+    pub(super) reads: Vec<reads::Read>,
+    graph: Graph,
+    notes: Vec<String>,
+    optimize: bool,
+}
+
 pub(super) struct Analysis {
+    pub(super) inlines: Vec<specialize::Inline>,
+    pub(super) reads: Vec<reads::Read>,
     pub(super) graph: Graph,
     facts: Facts,
     notes: Vec<String>,
@@ -1297,25 +1459,84 @@ pub(super) fn optimize_canonical(
     ssa_opt: bool,
     specialization: Option<(&specialize::Repository, usize)>,
 ) -> Result<Analysis> {
+    optimize_planned(plan_canonical(canonical, ssa_opt, specialization)?)
+}
+
+pub(super) fn plan_canonical(
+    canonical: Canonical,
+    ssa_opt: bool,
+    specialization: Option<(&specialize::Repository, usize)>,
+) -> Result<Planned> {
     let Canonical {
         mut graph,
         mut notes,
     } = canonical;
-    if !ssa_opt || graph.has_handlers || graph.generator {
+    let optimize = ssa_opt && !graph.has_handlers && !graph.generator;
+    if !optimize {
+        return Ok(Planned {
+            inlines: Vec::new(),
+            reads: Vec::new(),
+            graph,
+            notes,
+            optimize,
+        });
+    }
+    let mut inline_budget = specialize::Budget::default();
+    if let Some((bodies, source)) = specialization {
+        arrays::expand(&mut graph, bodies, source, &mut notes)?;
+        let requests = specialize::requests(&graph, bodies, source);
+        let plan = specialize::plan_round(&graph, bodies, source, &requests, &mut inline_budget);
+        specialize::apply(&mut graph, bodies, source, plan, &mut notes)?;
+        optimize::simplify(&mut graph);
+        graph.verify()?;
+    }
+    construction::resolve(&mut graph);
+    construction::expand(&mut graph);
+    if let Some((bodies, source)) = specialization {
+        for _ in 0..3 {
+            let requests = specialize::requests(&graph, bodies, source);
+            let plan =
+                specialize::plan_round(&graph, bodies, source, &requests, &mut inline_budget);
+            if plan.is_empty() {
+                break;
+            }
+            specialize::apply(&mut graph, bodies, source, plan, &mut notes)?;
+            optimize::simplify(&mut graph);
+        }
+    }
+    let reads = specialization.map_or_else(Vec::new, |(bodies, source)| {
+        reads::plan(&graph, bodies, source)
+    });
+    Ok(Planned {
+        inlines: inline_budget.inlines,
+        reads,
+        graph,
+        notes,
+        optimize,
+    })
+}
+
+pub(super) fn optimize_planned(planned: Planned) -> Result<Analysis> {
+    let Planned {
+        inlines,
+        reads,
+        mut graph,
+        mut notes,
+        optimize,
+    } = planned;
+    if !optimize {
         let facts = Facts::compute(&graph);
         return Ok(Analysis {
+            inlines,
+            reads,
             graph,
             facts,
             notes,
         });
     }
-    if let Some((bodies, source)) = specialization {
-        let requests = specialize::requests(&graph, bodies, source);
-        let plan = specialize::plan(&graph, bodies, source, &requests);
-        specialize::apply(&mut graph, bodies, source, plan, &mut notes)?;
-        optimize::simplify(&mut graph);
-        graph.verify()?;
-    }
+    reads::apply(&mut graph, &reads, &mut notes)?;
+    comparisons::expose(&mut graph);
+    graph.verify()?;
     let mut regions = optimize::version(&mut graph, &mut notes)?;
     graph.verify()?;
     for region in &regions {
@@ -1324,19 +1545,27 @@ pub(super) fn optimize_canonical(
         optimize::hoist(&mut graph, region, &mut notes);
         graph.verify()?;
     }
-    for copy in optimize::check_loops(&mut graph, &mut regions, &mut notes)? {
-        optimize::reuse_loads(&mut graph, &copy, &mut notes);
+    let copies = optimize::check_loops(&mut graph, &mut regions, &mut notes)?;
+    optimize::coercions(&mut graph);
+    graph.verify()?;
+    for region in regions.iter().chain(&copies) {
+        optimize::reuse_loads(&mut graph, region, &mut notes);
         graph.verify()?;
-        optimize::hoist(&mut graph, &copy, &mut notes);
+        optimize::hoist(&mut graph, region, &mut notes);
         graph.verify()?;
     }
     optimize::views(&mut graph, &mut notes);
+    comparisons::expose(&mut graph);
     graph.verify()?;
     optimize::simplify(&mut graph);
+    graph.verify()?;
+    optimize::sink_closures(&mut graph, &mut notes);
     graph.verify()?;
     let facts = Facts::compute(&graph);
     borrow::borrows(&mut graph, &facts, &mut notes);
     Ok(Analysis {
+        inlines,
+        reads,
         graph,
         facts,
         notes,
@@ -1387,6 +1616,232 @@ mod tests {
             .flat_map(|block| &graph.blocks[block].insts)
             .map(|&inst| &graph.insts[inst].op)
             .collect()
+    }
+
+    #[test]
+    fn comparisons_share_number_checks_with_refined_reads_without_splitting() {
+        let graph = lower_source(
+            "function f(height,x,limit){if(x<0||x>=limit)return 0;return height[x][0];}",
+        )
+        .unwrap();
+        let mut graph = canonicalize(graph, true).unwrap().graph;
+        let x = graph
+            .insts
+            .values()
+            .find_map(|data| {
+                matches!(data.op, Op::Argument(1))
+                    .then_some(data.result)
+                    .flatten()
+            })
+            .unwrap();
+        let mut bodies = specialize::Repository::default();
+        for data in graph.insts.values() {
+            if matches!(data.op, Op::GetIndex(..)) {
+                bodies.read_feedback.insert(
+                    (
+                        crate::jit::planner::Site {
+                            source: 0,
+                            start: data.span.start,
+                            end: data.span.end,
+                        },
+                        crate::jit::planner::ReadKind::Receiver,
+                    ),
+                    crate::jit::planner::ReadType::Array,
+                );
+            }
+        }
+        let reads = reads::plan(&graph, &bodies, 0);
+        reads::apply(&mut graph, &reads, &mut Vec::new()).unwrap();
+        let blocks = graph.blocks.len();
+        comparisons::expose(&mut graph);
+        graph.verify().unwrap();
+        assert_eq!(graph.blocks.len(), blocks);
+        let checks: Vec<_> = ops(&graph)
+            .into_iter()
+            .filter(|op| matches!(op, Op::IsNumber(value) if *value == x))
+            .collect();
+        assert_eq!(checks.len(), 1);
+        let guards: Vec<_> = ops(&graph)
+            .into_iter()
+            .filter_map(|op| match op {
+                Op::GuardedCompare { left, numbers, .. } if *left == x => Some(numbers[0]),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(guards.len(), 2);
+        assert_eq!(guards[0], guards[1]);
+        assert!(Cfg::new(&graph).rpo.iter().any(|&block| matches!(graph.blocks[block].terminator.as_ref().map(|term| &term.kind), Some(TerminatorKind::Branch(condition, ..)) if *condition == guards[0])));
+    }
+
+    #[test]
+    fn late_number_facts_remove_refinement_guards_and_assertions() {
+        let graph = lower_source("function f(height,x,limit){const xx=x+1;if(xx<0||xx>=limit)return 0;return height[xx][0];}").unwrap();
+        let mut graph = canonicalize(graph, true).unwrap().graph;
+        let sum = graph
+            .insts
+            .values()
+            .find_map(|data| {
+                matches!(data.op, Op::Binary(BinaryOperator::Addition, ..))
+                    .then_some(data.result)
+                    .flatten()
+            })
+            .unwrap();
+        let mut bodies = specialize::Repository::default();
+        for data in graph.insts.values() {
+            if matches!(data.op, Op::GetIndex(..)) {
+                bodies.read_feedback.insert(
+                    (
+                        crate::jit::planner::Site {
+                            source: 0,
+                            start: data.span.start,
+                            end: data.span.end,
+                        },
+                        crate::jit::planner::ReadKind::Receiver,
+                    ),
+                    crate::jit::planner::ReadType::Array,
+                );
+            }
+        }
+        let reads = reads::plan(&graph, &bodies, 0);
+        reads::apply(&mut graph, &reads, &mut Vec::new()).unwrap();
+        comparisons::expose(&mut graph);
+        assert!(
+            ops(&graph)
+                .iter()
+                .any(|op| matches!(op, Op::IsNumber(value) if *value == sum))
+        );
+        assert!(
+            ops(&graph)
+                .iter()
+                .any(|op| matches!(op, Op::AsNumber(value) if *value == sum))
+        );
+        let branches = Cfg::new(&graph)
+            .rpo
+            .iter()
+            .filter(|&&block| {
+                matches!(
+                    graph.blocks[block].terminator.as_ref().unwrap().kind,
+                    TerminatorKind::Branch(..)
+                )
+            })
+            .count();
+        for data in graph.insts.values_mut() {
+            if matches!(data.op, Op::Argument(1)) {
+                data.op = Op::Constant(Constant::Number(2.0));
+            }
+        }
+        optimize::simplify(&mut graph);
+        graph.verify().unwrap();
+        assert!(
+            !ops(&graph)
+                .iter()
+                .any(|op| matches!(op, Op::IsNumber(value) | Op::AsNumber(value) if *value == sum))
+        );
+        assert!(
+            Cfg::new(&graph)
+                .rpo
+                .iter()
+                .filter(|&&block| matches!(
+                    graph.blocks[block].terminator.as_ref().unwrap().kind,
+                    TerminatorKind::Branch(..)
+                ))
+                .count()
+                < branches
+        );
+    }
+
+    #[test]
+    fn folding_guard_edges_recomputes_number_facts_at_joins() {
+        let graph = lower_source(
+            "function f(flag){let x;if(flag)x=1;else x='text';if(x<0)return 0;return +x;}",
+        )
+        .unwrap();
+        let mut graph = canonicalize(graph, true).unwrap().graph;
+        comparisons::expose(&mut graph);
+        assert!(ops(&graph).iter().any(|op| matches!(op, Op::IsNumber(_))));
+        for data in graph.insts.values_mut() {
+            if matches!(data.op, Op::Argument(0)) {
+                data.op = Op::Constant(Constant::Boolean(true));
+            }
+        }
+        optimize::simplify(&mut graph);
+        graph.verify().unwrap();
+        assert!(!ops(&graph).iter().any(|op| matches!(
+            op,
+            Op::IsNumber(_) | Op::AsNumber(_) | Op::ToNumeric(_) | Op::Unary(UnaryOp::Plus, _)
+        )));
+    }
+
+    #[test]
+    fn loop_versioning_reuses_exposed_comparison_checks() {
+        let analysis = analyze_source(
+            "function f(limit){let sum=0;for(let i=0;i<2;++i){if(i<limit)sum+=i;}return sum;}",
+        );
+        let graph = &analysis.graph;
+        let limit = graph
+            .insts
+            .values()
+            .find_map(|data| {
+                matches!(data.op, Op::Argument(0))
+                    .then_some(data.result)
+                    .flatten()
+            })
+            .unwrap();
+        assert_eq!(
+            ops(graph)
+                .into_iter()
+                .filter(|op| matches!(op, Op::IsNumber(value) if *value == limit))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn comparison_checks_do_not_cross_non_dominating_branches() {
+        let graph = lower_source("function f(x,y,flag){if(flag)return x<y;return x>y;}").unwrap();
+        let mut graph = canonicalize(graph, true).unwrap().graph;
+        comparisons::expose(&mut graph);
+        graph.verify().unwrap();
+        assert_eq!(
+            ops(&graph)
+                .into_iter()
+                .filter(|op| matches!(op, Op::IsNumber(_)))
+                .count(),
+            4
+        );
+    }
+
+    #[test]
+    fn indexed_reads_are_reused_probed_and_get_hoisted_views() {
+        let graph = lower_source("function f(array){const zero=0;let sum=0;for(let i=0;i<2;++i){sum+=array[zero]+array[zero];}return sum;}").unwrap();
+        let mut canonical = canonicalize(graph, true).unwrap();
+        for data in canonical.graph.insts.values_mut() {
+            if let Op::GetIndex(object, key) = data.op {
+                data.op = Op::IndexedGet(object, key);
+            }
+        }
+        let mut viewed = canonical.graph.clone();
+        optimize::views(&mut viewed, &mut Vec::new());
+        assert!(
+            viewed
+                .views
+                .keys()
+                .any(|&inst| matches!(viewed.insts[inst].op, Op::IndexedGet(..)))
+        );
+        let analysis = optimize_canonical(canonical, true, None).unwrap();
+        assert!(
+            analysis
+                .notes
+                .iter()
+                .any(|note| note.contains("get_indexed") && note.contains("reuses"))
+        );
+        assert!(
+            analysis
+                .notes
+                .iter()
+                .any(|note| note.contains("1 read probes"))
+        );
+        analysis.graph.verify().unwrap();
     }
 
     #[test]
@@ -1552,6 +2007,60 @@ mod tests {
             3
         );
         assert!(!ops.iter().any(|op| matches!(op, Op::CallNative(..))));
+    }
+
+    #[test]
+    fn integer_coercions_are_reused_and_hoisted_out_of_bit_loops() {
+        let analysis = analyze_source(
+            "function f(grid) { let sum=0; for(let x=0;x<grid.length;++x) { const word=grid[x]; for(let i=0;i<16;++i) { sum+=word&(1<<i); sum+=word^i; } } return sum; }",
+        );
+        let graph = &analysis.graph;
+        let cfg = Cfg::new(graph);
+        let conversions: Vec<_> = cfg
+            .rpo
+            .iter()
+            .flat_map(|&block| &graph.blocks[block].insts)
+            .filter_map(|&inst| match graph.insts[inst].op {
+                Op::ToInt32(value)
+                    if matches!(graph.defining_op(value), Some(Op::TypedIndex(..))) =>
+                {
+                    Some(inst)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(conversions.len(), 1);
+        let conversion = &graph.insts[conversions[0]];
+        let converted = conversion.result.unwrap();
+        let users: Vec<_> = cfg
+            .rpo
+            .iter()
+            .flat_map(|&block| &graph.blocks[block].insts)
+            .filter(|&&inst| graph.insts[inst].op.operands().contains(&converted))
+            .collect();
+        assert_eq!(users.len(), 2);
+        for &user in users {
+            assert!(cfg.rpo.iter().any(|&header| {
+                let Some(Terminator {
+                    kind: TerminatorKind::Branch(condition, _, _),
+                    ..
+                }) = &graph.blocks[header].terminator
+                else {
+                    return false;
+                };
+                let Some(&Op::Binary(BinaryOperator::LessThan, _, bound)) =
+                    graph.defining_op(*condition)
+                else {
+                    return false;
+                };
+                matches!(
+                    graph.defining_op(bound),
+                    Some(Op::Constant(Constant::Number(16.0)))
+                ) && conversion.block != header
+                    && cfg.dominates(conversion.block, header)
+                    && cfg.dominates(header, graph.insts[user].block)
+            }));
+        }
     }
 
     #[test]

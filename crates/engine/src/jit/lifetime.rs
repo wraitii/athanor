@@ -1,6 +1,6 @@
 use cranelift_codegen::ir::{Function, InstructionData, Opcode, Value, ValueDef};
 
-use super::numeric::Annotations;
+use super::clif::Annotations;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ReadLifetime {

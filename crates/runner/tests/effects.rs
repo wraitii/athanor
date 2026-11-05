@@ -1,43 +1,6 @@
 use std::process::Command;
 
 #[test]
-fn constant_branch_cleanup_is_gated_by_ssa_optimization() {
-    for enabled in [false, true] {
-        let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
-            .env("JS_JIT_SSA", if enabled { "1" } else { "0" })
-            .env("JS_JIT_SSA_DUMP", "1")
-            .args([
-                "--compile",
-                "--no-ir",
-                "--eval",
-                "function f(a) { let x = 0; try { x = x + 1; } catch (e) {} return x; }",
-            ])
-            .output()
-            .unwrap();
-        assert!(output.status.success());
-        let output = String::from_utf8(output.stderr).unwrap();
-        let simplified = output
-            .lines()
-            .find(|line| line.contains("[f@") && line.contains("constant branches"));
-        if enabled {
-            let line = simplified.unwrap();
-            let count: usize = line
-                .split("simplified ")
-                .nth(1)
-                .unwrap()
-                .split_whitespace()
-                .next()
-                .unwrap()
-                .parse()
-                .unwrap();
-            assert!(count > 0);
-        } else {
-            assert!(simplified.is_none());
-        }
-    }
-}
-
-#[test]
 fn semantic_graph_versions_math_calls_and_preserves_fallbacks() {
     let source = "function f(a,n){ let x=0; for(let i=0;i<n;i++) x+=Math.floor(a[i]); return x; } function main(){ let a=f([1.2,2.8],2); Math.floor=x=>x+1; return a*10+f([1,2],2); }";
     let dump = Command::new(env!("CARGO_BIN_EXE_js-runner"))
@@ -141,4 +104,104 @@ fn loops_version_independently_of_their_function() {
             "2:2:1,30:25:2"
         );
     }
+}
+
+#[test]
+fn array_map_exposes_and_inlines_known_closures() {
+    let source = "function createTerrain(terrain){ return typeof terrain === 'string' ? terrain : terrain.map(t=>createTerrain(t)); }";
+    for enabled in [false, true] {
+        let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
+            .env("JS_JIT_SSA", if enabled { "1" } else { "0" })
+            .args(["--compile", "--no-ir", "--semantic-ir", "--eval", source])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let dump = String::from_utf8(output.stdout).unwrap();
+        let caller = dump
+            .split("semantic IR createTerrain\n")
+            .nth(1)
+            .unwrap()
+            .split("semantic IR")
+            .next()
+            .unwrap();
+        assert_eq!(caller.contains("is_array_map"), enabled);
+        assert_eq!(caller.contains("map_element"), enabled);
+        if enabled {
+            assert!(caller.contains("inline") && caller.contains("0 code check(s)"));
+            assert!(!caller.contains("is_code"));
+            assert!(caller.contains("materialized only in fallback"));
+            assert!(caller.find("is_array_map").unwrap() < caller.find(" = closure ").unwrap());
+        }
+    }
+}
+
+#[test]
+fn inlined_local_calls_remove_unused_closure_allocations() {
+    let source = "function main(){ const f=x=>x*x; return f(3); }";
+    let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
+        .env("JS_JIT_SSA", "1")
+        .args(["--compile", "--no-ir", "--semantic-ir", "--eval", source])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let dump = String::from_utf8(output.stdout).unwrap();
+    let caller = dump
+        .split("semantic IR main\n")
+        .nth(1)
+        .unwrap()
+        .split("semantic IR")
+        .next()
+        .unwrap();
+    assert!(!caller.contains(" = closure "));
+    assert!(caller.contains("unused closure"));
+}
+
+#[test]
+fn construction_exposes_prototype_resolution() {
+    let source = "function make(C,p){return new C((C.prototype=p,1));} function spread(C,args){return new C(...args);}";
+    for enabled in [false, true] {
+        let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
+            .env("JS_JIT_SSA", if enabled { "1" } else { "0" })
+            .args(["--compile", "--no-ir", "--semantic-ir", "--eval", source])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let dump = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(dump.contains("constructor_prototype"), enabled);
+        assert_eq!(dump.contains("construct_resolved"), enabled);
+        assert_eq!(dump.contains("construct_spread_resolved"), enabled);
+        assert_eq!(dump.contains("new_instance"), enabled);
+        assert_eq!(dump.contains("constructor_call "), enabled);
+        assert_eq!(dump.contains("constructor_call_spread"), enabled);
+        assert_eq!(dump.contains("constructor_result"), enabled);
+        if enabled {
+            assert!(dump.find("set ").unwrap() < dump.find("constructor_prototype").unwrap());
+        }
+    }
+}
+
+#[test]
+fn known_constructor_bodies_can_be_inlined() {
+    let source = "function C(x){this.x=x;} function main(){C.prototype={};return new C(7).x;}";
+    let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
+        .args(["--compile", "--no-ir", "--semantic-ir", "--eval", source])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let dump = String::from_utf8(output.stdout).unwrap();
+    let main = dump.split("semantic IR main\n").nth(1).unwrap();
+    assert!(main.contains("inline"));
+    assert!(main.contains("constructor_result"));
 }

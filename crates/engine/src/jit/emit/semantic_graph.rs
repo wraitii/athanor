@@ -9,7 +9,8 @@ use crate::error::{Error, compile_at};
 use crate::heap::kind;
 use crate::jit::helpers::Helper;
 use crate::jit::semantic::{
-    Constant, Facts, Graph, Op, ScopeKind, TerminatorKind, Types, UnaryOp, Value as GraphValue,
+    Constant, Facts, Graph, Op, ScopeKind, TerminatorKind, TypedRead, Types, UnaryOp,
+    Value as GraphValue,
 };
 use crate::value::{TAG_SHIFT, TAG_STRING, Value};
 
@@ -44,6 +45,38 @@ impl Context<'_> {
 }
 
 impl FunctionCompiler<'_, '_> {
+    fn observe(&mut self, value: ClifValue, span: oxc_span::Span, helper: Helper) {
+        let Some(feedback) = &mut self.feedback else {
+            return;
+        };
+        if !feedback.get_refinement && matches!(helper, Helper::ObserveGet | Helper::ObserveIndex) {
+            return;
+        }
+        let mut cache = Box::new(crate::jit::planner::ObservationCache {
+            recorded: 0,
+            owner: feedback.owner,
+            site: crate::jit::planner::Site {
+                source: self.source_name.0,
+                start: span.start,
+                end: span.end,
+            },
+        });
+        let address = &raw mut *cache as i64;
+        feedback.caches.push(cache);
+        let address = self.b.ins().iconst(self.pointer, address);
+        let recorded = self
+            .b
+            .ins()
+            .load(types::I64, MemFlags::trusted(), address, 0);
+        let observe = self.b.create_block();
+        let next = self.b.create_block();
+        self.b.ins().brif(recorded, next, &[], observe, &[]);
+        self.b.switch_to_block(observe);
+        self.call_helper(helper, &[value, address]);
+        self.b.ins().jump(next, &[]);
+        self.b.switch_to_block(next);
+    }
+
     fn epoch(&mut self) -> ClifValue {
         let address = self.b.ins().load(
             self.pointer,
@@ -61,6 +94,7 @@ impl FunctionCompiler<'_, '_> {
         graph: &Graph,
         closure: ClifValue,
     ) -> Result<(), Error> {
+        let source_name = self.source_name;
         let blocks: Vec<_> = graph
             .blocks
             .values()
@@ -96,6 +130,10 @@ impl FunctionCompiler<'_, '_> {
             |value: crate::jit::semantic::Value| suspends || facts.of(value).intersects(HEAP);
         let cfg = crate::jit::semantic::Cfg::new(graph);
         let reachable = cfg.rpo.clone();
+        let cyclic = cyclic_blocks(graph, &cfg);
+        let repeated = |block: crate::jit::semantic::Block| {
+            suspends || graph.has_handlers || cyclic.contains(&block)
+        };
         let mut pending: SecondaryMap<crate::jit::semantic::Block, usize> = SecondaryMap::new();
         for &block in &reachable {
             pending[block] = cfg.preds[block].len();
@@ -145,7 +183,7 @@ impl FunctionCompiler<'_, '_> {
                     continue;
                 }
                 if slotted {
-                    self.retain_inline(param);
+                    self.increment(param);
                     continue;
                 }
                 let uninitialized = self.b.ins().icmp_imm(
@@ -159,15 +197,14 @@ impl FunctionCompiler<'_, '_> {
                 let done = self.b.create_block();
                 self.brif(heap, retain, &[], done, &[]);
                 self.switch(retain);
-                self.call_helper(Helper::TempRetain, &[retained]);
-                self.check_error();
+                self.retain_temporary(retained);
                 self.jump(done, &[]);
                 self.switch(done);
                 retained_any = true;
             }
             for (&value, param) in data.params.iter().zip(params) {
                 if rooted(value) && slotted {
-                    self.replace_local(values[value.index()], param);
+                    self.replace_local(values[value.index()], param, repeated(block));
                 } else if rooted(value) {
                     self.initialize_local(values[value.index()], param);
                 } else if suspends {
@@ -189,17 +226,25 @@ impl FunctionCompiler<'_, '_> {
                 }
                 let data = &graph.insts[inst];
                 self.source_span = data.span;
-                self.b.set_srcloc(cranelift_codegen::ir::SourceLoc::new(
-                    if self.annotations.semantic_locations {
-                        graph.inst_location(inst)
-                    } else {
-                        data.span.start
-                    },
-                ));
+                self.source_name = data.source_name.unwrap_or(source_name);
+                let location = if self.annotations.semantic_locations {
+                    cranelift_codegen::ir::SourceLoc::new(graph.inst_location(inst))
+                } else if self.source_name == source_name {
+                    cranelift_codegen::ir::SourceLoc::new(data.span.start)
+                } else {
+                    cranelift_codegen::ir::SourceLoc::default()
+                };
+                self.b.set_srcloc(location);
                 let get = |this: &mut Self, value: GraphValue| {
                     let operand = this.operand(&cx, value);
                     this.convert(operand, Repr::Boxed)
                 };
+                if let Op::GetIndex(object, _)
+                | Op::TypedIndex(object, _, TypedRead { element: None, .. }) = data.op
+                {
+                    let object = get(self, object);
+                    self.observe(object, data.span, Helper::ObserveIndex);
+                }
                 let typed = self.typed_op(&cx, graph, inst)?;
                 let result = if let Some(typed) = typed {
                     typed
@@ -219,6 +264,26 @@ impl FunctionCompiler<'_, '_> {
                             Some(value)
                         }
                         Op::This => Some(self.receiver),
+                        Op::ClosureThis(value) => {
+                            let value = get(self, *value);
+                            Some(self.call_helper(Helper::ClosureThis, &[value]))
+                        }
+                        Op::IsArrayMap(callee, receiver) => {
+                            let callee = get(self, *callee);
+                            let receiver = get(self, *receiver);
+                            Some(self.call_helper(Helper::ArrayMapGuard, &[callee, receiver]))
+                        }
+                        Op::NewHoleyArray(length) => {
+                            let length = get(self, *length);
+                            let value = self.call_helper(Helper::ArrayMapNew, &[length]);
+                            self.check_error();
+                            Some(value)
+                        }
+                        Op::MapElement(receiver, index) => {
+                            let receiver = get(self, *receiver);
+                            let index = get(self, *index);
+                            Some(self.call_helper(Helper::ArrayMapElement, &[receiver, index]))
+                        }
                         Op::Throw(value) => {
                             let value = get(self, *value);
                             self.call_helper(Helper::Throw, &[value]);
@@ -378,6 +443,27 @@ impl FunctionCompiler<'_, '_> {
                             let no = self.constant(Value::FALSE);
                             Some(self.b.ins().select(condition, yes, no))
                         }
+                        Op::GuardedCompare {
+                            operator,
+                            left,
+                            right,
+                            numbers,
+                        } => {
+                            let left = get(self, *left);
+                            let right = get(self, *right);
+                            let first = self.operand(&cx, numbers[0]);
+                            let first = self.convert(first, Repr::Bool);
+                            let second = self.operand(&cx, numbers[1]);
+                            let second = self.convert(second, Repr::Bool);
+                            let value = self.numeric_comparison(
+                                ops::binary_operator(*operator),
+                                left,
+                                right,
+                                Some((first, second)),
+                            );
+                            self.check_error();
+                            Some(value)
+                        }
                         Op::NewObject => {
                             let dummy = self.constant(Value::UNDEFINED);
                             let value = self.call_helper(Helper::ObjectNew, &[dummy]);
@@ -421,13 +507,14 @@ impl FunctionCompiler<'_, '_> {
                         }
                         Op::Get(object, name) => {
                             let object = get(self, *object);
-                            let retain = data
-                                .result
-                                .is_none_or(|value| !graph.borrowed.contains(&value));
+                            let retain = data.result.is_none_or(|value| {
+                                !graph.borrowed.contains(&value)
+                                    && !self.slot_owned(graph, &facts, value)
+                            });
                             Some(self.cached_property_get(object, name, retain))
                         }
                         Op::GetIndex(object, index)
-                        | Op::TypedIndex(object, index)
+                        | Op::TypedIndex(object, index, _)
                         | Op::IndexedGet(object, index) => {
                             let object = get(self, *object);
                             let index = get(self, *index);
@@ -444,7 +531,11 @@ impl FunctionCompiler<'_, '_> {
                             let object = get(self, *object);
                             let index = get(self, *index);
                             let value = get(self, *value);
-                            self.index_access(object, index, Some(value));
+                            self.index_access(
+                                object,
+                                Operand::new(index, Repr::Boxed),
+                                Some(value),
+                            );
                             None
                         }
                         Op::View(object) => {
@@ -470,7 +561,7 @@ impl FunctionCompiler<'_, '_> {
                             let no = self.constant(Value::FALSE);
                             Some(self.b.ins().select(condition, yes, no))
                         }
-                        Op::IsTyped(_) => unreachable!(),
+                        Op::IsTyped(..) => unreachable!(),
                         Op::IsIndexed(value) => {
                             let value = get(self, *value);
                             let view = self.view(value);
@@ -486,6 +577,7 @@ impl FunctionCompiler<'_, '_> {
                             Some(self.b.ins().bitcast(types::I64, MemFlags::new(), length))
                         }
                         Op::AsNumber(value) => Some(get(self, *value)),
+                        Op::ToInt32(_) => unreachable!(),
                         Op::ToNumeric(value) => {
                             let value = get(self, *value);
                             Some(ops::to_number(self, value))
@@ -563,10 +655,92 @@ impl FunctionCompiler<'_, '_> {
                                 .map(|v| get(self, v))
                                 .unwrap_or_else(|| self.constant(Value::UNDEFINED));
                             let args: Vec<_> = args.iter().map(|&v| get(self, v)).collect();
+                            self.observe(callee, data.span, Helper::ObserveCall);
                             let argv = self.stack_values(&args, data.span)?;
                             let argc = self.b.ins().iconst(types::I64, args.len() as i64);
                             let value =
                                 self.call_helper(Helper::Call, &[callee, receiver, argv, argc]);
+                            self.check_error();
+                            Some(value)
+                        }
+                        Op::NewInstance(prototype) => {
+                            let prototype = get(self, *prototype);
+                            let result = self.call_helper(Helper::NewInstance, &[prototype]);
+                            self.check_error();
+                            Some(result)
+                        }
+                        Op::ConstructorResult(result, instance) => {
+                            let result = get(self, *result);
+                            let instance = get(self, *instance);
+                            let tag = self
+                                .b
+                                .ins()
+                                .band_imm(result, 0xffff_0000_0000_0000u64 as i64);
+                            let object = self.b.ins().icmp_imm(
+                                IntCC::Equal,
+                                tag,
+                                crate::value::TAG_OBJECT as i64,
+                            );
+                            Some(self.b.ins().select(object, result, instance))
+                        }
+                        Op::ConstructorCall {
+                            callee,
+                            receiver,
+                            args,
+                        } => {
+                            let callee = get(self, *callee);
+                            let receiver = get(self, *receiver);
+                            let args: Vec<_> = args.iter().map(|&v| get(self, v)).collect();
+                            self.observe(callee, data.span, Helper::ObserveCall);
+                            let argv = self.stack_values(&args, data.span)?;
+                            let argc = self.b.ins().iconst(types::I64, args.len() as i64);
+                            let result = self.call_helper(
+                                Helper::ConstructorCall,
+                                &[callee, receiver, argv, argc],
+                            );
+                            self.check_error();
+                            Some(result)
+                        }
+                        Op::ConstructorCallSpread(callee, receiver, args) => {
+                            let callee = get(self, *callee);
+                            let receiver = get(self, *receiver);
+                            let args = get(self, *args);
+                            let result = self.call_helper(
+                                Helper::ConstructorCallSpread,
+                                &[callee, receiver, args],
+                            );
+                            self.check_error();
+                            Some(result)
+                        }
+                        Op::ConstructorPrototype(callee) => {
+                            let callee = get(self, *callee);
+                            Some(self.call_helper(Helper::ConstructorPrototype, &[callee]))
+                        }
+                        Op::ConstructResolved {
+                            callee,
+                            prototype,
+                            args,
+                        } => {
+                            let callee = get(self, *callee);
+                            let prototype = get(self, *prototype);
+                            let args: Vec<_> = args.iter().map(|&v| get(self, v)).collect();
+                            let argv = self.stack_values(&args, data.span)?;
+                            let argc = self.b.ins().iconst(types::I64, args.len() as i64);
+                            let value = self.call_helper(
+                                Helper::ConstructResolved,
+                                &[callee, prototype, argv, argc],
+                            );
+                            self.check_error();
+                            Some(value)
+                        }
+                        Op::ConstructSpreadResolved(callee, prototype, args) => {
+                            let callee = get(self, *callee);
+                            let prototype = get(self, *prototype);
+                            let args = get(self, *args);
+                            let value = self.call_helper(
+                                Helper::ConstructSpreadResolved,
+                                &[callee, prototype, args],
+                            );
                             self.check_error();
                             Some(value)
                         }
@@ -665,7 +839,11 @@ impl FunctionCompiler<'_, '_> {
                             let no = self.constant(Value::FALSE);
                             Some(self.b.ins().select(condition, yes, no))
                         }
-                        Op::EnterScope(scope) => {
+                        Op::EnterScope(scope) | Op::EnterCaptures(scope, _) => {
+                            let closure = match data.op {
+                                Op::EnterCaptures(_, value) => get(self, value),
+                                _ => closure,
+                            };
                             for (index, &binding) in
                                 graph.scopes[*scope].bindings.iter().enumerate()
                             {
@@ -717,11 +895,19 @@ impl FunctionCompiler<'_, '_> {
                     result.map(|value| Operand::new(value, Repr::Boxed))
                 };
                 if let (Some(value), Some(result)) = (data.result, result) {
+                    if matches!(data.op, Op::Get(..) | Op::GetIndex(..) | Op::IndexedGet(..))
+                        && facts.of(value).intersects(Types::OBJECT)
+                    {
+                        let boxed = self.convert(result, Repr::Boxed);
+                        self.observe(boxed, data.span, Helper::ObserveGet);
+                    }
                     let result = self.convert(result, reprs[value]);
                     let borrowed = (matches!(data.op, Op::This | Op::Argument(_))
                         || graph.borrowed.contains(&value))
                         && !suspends;
-                    if rooted(value) && !borrowed {
+                    if !borrowed && self.slot_owned(graph, &facts, value) {
+                        self.own_local(values[value.index()], result, repeated(block));
+                    } else if rooted(value) && !borrowed {
                         self.initialize_local(values[value.index()], result);
                     } else if suspends {
                         self.b.def_var(values[value.index()], result);
@@ -737,13 +923,19 @@ impl FunctionCompiler<'_, '_> {
             }
             let terminator = data.terminator.as_ref().unwrap();
             self.source_span = terminator.span;
-            self.b.set_srcloc(cranelift_codegen::ir::SourceLoc::new(
-                if self.annotations.semantic_locations {
-                    graph.terminator_location(block)
-                } else {
-                    terminator.span.start
-                },
-            ));
+            self.source_name = data
+                .insts
+                .last()
+                .and_then(|&inst| graph.insts[inst].source_name)
+                .unwrap_or(source_name);
+            let location = if self.annotations.semantic_locations {
+                cranelift_codegen::ir::SourceLoc::new(graph.terminator_location(block))
+            } else if self.source_name == source_name {
+                cranelift_codegen::ir::SourceLoc::new(terminator.span.start)
+            } else {
+                cranelift_codegen::ir::SourceLoc::default()
+            };
+            self.b.set_srcloc(location);
             let target = |this: &mut Self, target: &crate::jit::semantic::Target| {
                 let args: Vec<_> = target
                     .args
@@ -820,6 +1012,14 @@ impl FunctionCompiler<'_, '_> {
 }
 
 impl FunctionCompiler<'_, '_> {
+    /// Whether a result is stored straight into its frame slot, which takes its own reference.
+    fn slot_owned(&self, graph: &Graph, facts: &Facts, value: GraphValue) -> bool {
+        self.frame_size.is_some()
+            && self.generator.is_none()
+            && facts.of(value).intersects(HEAP)
+            && !graph.borrowed.contains(&value)
+    }
+
     fn operand(&mut self, cx: &Context<'_>, value: GraphValue) -> Operand {
         let clif = match &cx.direct {
             Some(direct) => direct.borrow()[value].expect("semantic value used before definition"),
@@ -853,7 +1053,13 @@ impl FunctionCompiler<'_, '_> {
                 let value = self.b.ins().iconst(types::I8, i64::from(*value));
                 boolean(value)
             }
-            Op::Binary(operator, left, right) => {
+            Op::Binary(operator, left, right)
+            | Op::GuardedCompare {
+                operator,
+                left,
+                right,
+                ..
+            } => {
                 let op = ops::binary_operator(*operator);
                 let applicable = match op {
                     BinaryOp::LooseEqual
@@ -901,6 +1107,12 @@ impl FunctionCompiler<'_, '_> {
                 let operand = self.operand(cx, *value);
                 let float = self.convert(operand, Repr::Float);
                 Some(Some(Operand::new(self.b.ins().fneg(float), Repr::Float)))
+            }
+            Op::ToInt32(value) => {
+                debug_assert!(cx.numeric(*value));
+                let operand = self.operand(cx, *value);
+                let integer = self.convert(operand, Repr::Int32);
+                Some(Some(Operand::new(integer, Repr::Int32)))
             }
             Op::Unary(UnaryOp::BitwiseNot, value) if cx.numeric(*value) => {
                 let operand = self.operand(cx, *value);
@@ -959,11 +1171,14 @@ impl FunctionCompiler<'_, '_> {
                 let operands: Vec<_> = args.iter().map(|&arg| self.operand(cx, arg)).collect();
                 self.typed_math(function, &operands).map(Some)
             }
-            Op::IsTyped(object) => {
+            Op::IsTyped(object, element) => {
                 let operand = self.operand(cx, *object);
                 let object = self.convert(operand, Repr::Boxed);
                 let view = self.view(object);
-                boolean(self.has_kind(view, kind::TYPED))
+                boolean(match element {
+                    Some(element) => self.typed_kind_is(view, *element),
+                    None => self.has_kind(view, kind::TYPED),
+                })
             }
             Op::IsIndexed(object) => {
                 let operand = self.operand(cx, *object);
@@ -978,8 +1193,27 @@ impl FunctionCompiler<'_, '_> {
                 let length = self.view_length(view);
                 Some(Some(Operand::new(length, Repr::Float)))
             }
+            Op::TypedIndex(
+                object,
+                key,
+                TypedRead {
+                    element: Some(element),
+                    bounded: true,
+                },
+            ) => {
+                let view = match graph.views.get(&inst) {
+                    Some(&view) => self.operand(cx, view).value,
+                    None => {
+                        let object = self.operand(cx, *object);
+                        let object = self.convert(object, Repr::Boxed);
+                        self.view(object)
+                    }
+                };
+                let key = self.operand(cx, *key);
+                Some(Some(self.bounded_element_read(view, key, *element)))
+            }
             Op::GetIndex(object, key)
-            | Op::TypedIndex(object, key)
+            | Op::TypedIndex(object, key, _)
             | Op::IndexedGet(object, key) => {
                 let fallback = !matches!(data.op, Op::TypedIndex(..));
                 let object = self.operand(cx, *object);
@@ -994,9 +1228,9 @@ impl FunctionCompiler<'_, '_> {
                     }
                     key => key,
                 };
-                let retain = data
-                    .result
-                    .is_none_or(|value| !graph.borrowed.contains(&value));
+                let retain = data.result.is_none_or(|value| {
+                    !graph.borrowed.contains(&value) && !self.slot_owned(graph, cx.facts, value)
+                });
                 let result = self.viewed_index_access(view, object, key, None, fallback, retain);
                 Some(Some(Operand::new(result, Repr::Boxed)))
             }
@@ -1015,4 +1249,51 @@ impl FunctionCompiler<'_, '_> {
             _ => None,
         })
     }
+}
+
+/// Blocks on a cycle of the control flow graph, which may run more than once per call.
+fn cyclic_blocks(
+    graph: &Graph,
+    cfg: &crate::jit::semantic::Cfg,
+) -> std::collections::HashSet<crate::jit::semantic::Block> {
+    let mut finished = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for &root in &cfg.rpo {
+        if !seen.insert(root) {
+            continue;
+        }
+        let mut stack = vec![(root, graph.successors(root), 0)];
+        while let Some((block, successors, next)) = stack.last_mut() {
+            if let Some(&successor) = successors.get(*next) {
+                *next += 1;
+                if seen.insert(successor) {
+                    stack.push((successor, graph.successors(successor), 0));
+                }
+            } else {
+                finished.push(*block);
+                stack.pop();
+            }
+        }
+    }
+    let mut cyclic = std::collections::HashSet::new();
+    let mut assigned = std::collections::HashSet::new();
+    for &root in finished.iter().rev() {
+        if !assigned.insert(root) {
+            continue;
+        }
+        let mut component = vec![root];
+        let mut stack = vec![root];
+        while let Some(block) = stack.pop() {
+            for &pred in &cfg.preds[block] {
+                if assigned.insert(pred) {
+                    component.push(pred);
+                    stack.push(pred);
+                }
+            }
+        }
+        if component.len() > 1 || graph.successors(root).contains(&root) {
+            cyclic.extend(component);
+        }
+    }
+    cyclic
 }

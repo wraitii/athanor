@@ -6,9 +6,9 @@ use cranelift_codegen::ir::{
 use cranelift_jit::JITModule;
 use cranelift_module::{FuncId, Module};
 
+use super::clif::{Annotations, IndexedRead, IndexedReadContract};
 use super::effects::{self, GLOBAL_WRITE, HEAP_WRITE, Reentry};
 use super::helpers::Helper;
-use super::numeric::{Annotations, IndexedRead, IndexedReadContract};
 use crate::value::Value;
 
 fn admitted(context: &Context, annotations: &Annotations) -> bool {
@@ -64,7 +64,7 @@ pub(super) fn specialize(
     module: &mut JITModule,
     root_id: FuncId,
     probe_id: FuncId,
-) -> Option<(super::lifetime::ReadLifetime, bool)> {
+) -> Option<super::lifetime::ReadLifetime> {
     if !admitted(context, annotations) || annotations.indexed_reads.len() < 2 {
         return None;
     }
@@ -105,24 +105,11 @@ pub(super) fn specialize(
     };
     let lifetime = super::lifetime::read_lifetime(&context.func, annotations, source.receiver);
     let rooted = lifetime == super::lifetime::ReadLifetime::Invocation;
-    let prior_guard = annotations
-        .indexed_storage_guards
-        .get(&source.call)
-        .filter(|guard| {
-            rooted
-                && guard.contract == crate::heap::IndexedStorageContract::DirectNumericIndexStorage
-                && context
-                    .domtree
-                    .dominates(guard.call, target.call, &context.func.layout)
-        })
-        .copied();
     let function = &mut context.func;
     let Some(first) = function.layout.first_inst(source.success) else {
         return None;
     };
-    let stable = if let Some(guard) = prior_guard {
-        guard.result
-    } else {
+    let stable = {
         let helper = if rooted {
             Helper::IndexProbe
         } else {
@@ -163,7 +150,6 @@ pub(super) fn specialize(
     function.dfg.change_to_alias(result, merged);
     function.layout.remove_inst(target.call);
     annotations.helpers.remove(&target.call);
-    annotations.indexed_storage_guards.remove(&target.call);
     annotations
         .indexed_reads
         .retain(|read| read.call != target.call);
@@ -188,5 +174,5 @@ pub(super) fn specialize(
         .ins()
         .brif(reuse, done, &[BlockArg::Value(source.result)], slow, &[]);
     context.flowgraph();
-    Some((lifetime, prior_guard.is_some()))
+    Some(lifetime)
 }

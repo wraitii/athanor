@@ -69,3 +69,22 @@ fn replaced_loop_values_are_released() {
         124750.0,
     );
 }
+
+#[test]
+fn temporaries_grow_past_their_initial_capacity() {
+    let reads = vec!["o.p"; 200].join(", ");
+    check(
+        &format!(
+            "function main() {{
+                const o = {{p: {{n: 1}}}};
+                let sum = 0;
+                for (let i = 0; i < 3; ++i) {{
+                    const list = [{reads}];
+                    sum += list.length + list[199].n;
+                }}
+                return sum;
+            }}"
+        ),
+        603.0,
+    );
+}

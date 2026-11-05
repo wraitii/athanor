@@ -60,32 +60,32 @@ pub(super) fn call(
             if args.len() > 1 && arg(1) != Value::UNDEFINED {
                 return fail(context, "split limit is unsupported");
             }
-            let pieces: Vec<String> = if arg(0) == Value::UNDEFINED {
-                vec![text]
+            let separator = if arg(0) == Value::UNDEFINED {
+                None
             } else {
                 let Some(separator) = string_arg(arg(0)) else {
                     return fail(context, "split separator must be a string");
                 };
-                if separator.is_empty() {
-                    text.chars().map(|c| c.to_string()).collect()
-                } else {
-                    text.split(&separator).map(str::to_owned).collect()
-                }
+                Some(separator)
             };
-            let mut values = Vec::with_capacity(pieces.len());
-            for piece in pieces {
-                let Some(value) = heap.string(&piece) else {
-                    for value in values {
-                        heap.release(value);
-                    }
-                    return fail(context, "heap exhausted");
-                };
+            let mut values = Vec::new();
+            let mut push = |piece: &str| {
+                let value = heap.string(piece)?;
                 values.push(value);
+                Some(())
+            };
+            let result = match separator.as_deref() {
+                None => push(&text),
+                Some("") => text
+                    .chars()
+                    .try_for_each(|character| push(character.encode_utf8(&mut [0; 4]))),
+                Some(separator) => text.split(separator).try_for_each(push),
+            };
+            if result.is_none() {
+                heap.release_all(&values);
+                return fail(context, "heap exhausted");
             }
-            let result = heap.array(&values);
-            for value in values {
-                heap.release(value);
-            }
+            let result = heap.array_from_owned(values);
             return match result {
                 Some(value) => context.own(value),
                 None => fail(context, "heap exhausted"),

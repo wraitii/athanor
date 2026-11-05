@@ -531,3 +531,76 @@ fn freed_slots_are_reused_across_kinds_and_allocation_churn_is_bounded() {
     heap.drain(100);
     assert_eq!(heap.0.borrow().arena.len(), 1);
 }
+
+#[test]
+fn bulk_array_extension_retains_values_and_refreshes_storage() {
+    let heap = Heap::default();
+    let child = heap.string("texture").unwrap();
+    let source = heap.array(&[child, HOLE]).unwrap();
+    heap.release(child);
+    let destination = heap.array(&[]).unwrap();
+    assert_eq!(heap.extend_array(destination, source), Some(true));
+    assert_eq!(heap.extend_array(destination, destination), Some(true));
+    heap.release(source);
+    heap.drain(1000);
+    assert_eq!(heap.len(destination), Some(4));
+    assert_eq!(heap.get(destination, 0), Some(child));
+    assert_eq!(heap.get(destination, 1), Some(Value::UNDEFINED));
+    assert_eq!(heap.get(destination, 2), Some(child));
+    assert_eq!(heap.get(destination, 3), Some(Value::UNDEFINED));
+    let data = heap.0.borrow();
+    let slot = data.slot(heap_id(destination).unwrap());
+    assert_eq!(slot.length, 4);
+    assert_eq!(slot.kind, kind::ARRAY);
+    assert_eq!(
+        slot.data,
+        data.array(heap_id(destination).unwrap())
+            .unwrap()
+            .elements
+            .as_ptr()
+            .cast()
+    );
+    drop(data);
+    heap.release(destination);
+    heap.drain(1000);
+    assert!(!heap.valid(child));
+}
+
+#[test]
+fn owned_array_and_snapshot_balance_references() {
+    let heap = Heap::default();
+    let child = heap.string("texture").unwrap();
+    let array = heap.array_from_owned(vec![child]).unwrap();
+    let values = heap.owned_indexed_values(array).unwrap();
+    heap.release(array);
+    heap.drain(1000);
+    assert_eq!(heap.text(values[0]).as_deref(), Some("texture"));
+    heap.release_all(&values);
+    heap.drain(1000);
+    assert!(!heap.valid(child));
+}
+
+#[test]
+fn disposal_respects_budget_across_shared_array_edges() {
+    let heap = Heap::default();
+    let child = heap.string("shared").unwrap();
+    let first = heap.array(&vec![child; 100]).unwrap();
+    let second = heap.array(&vec![child; 100]).unwrap();
+    heap.release(child);
+    heap.release(first);
+    heap.release(second);
+    heap.drain(17);
+    let data = heap.0.borrow();
+    let remaining: usize = [first, second]
+        .into_iter()
+        .map(|value| match &data.slot(heap_id(value).unwrap()).payload {
+            Payload::Array(array) => array.elements.len(),
+            _ => panic!("array was disposed before its edges"),
+        })
+        .sum();
+    assert_eq!(remaining, 183);
+    assert_eq!(data.slot(heap_id(child).unwrap()).references, 183);
+    drop(data);
+    heap.drain(1000);
+    assert!(!heap.valid(child));
+}

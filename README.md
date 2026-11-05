@@ -32,11 +32,11 @@ Use `--compile --eval SOURCE` or `--compile SCRIPT` to print Cranelift IR
 without executing the source. Add `--semantic-ir` to print the semantic graph,
 inferred types, and optimization notes, including why a function was not
 versioned or optimized. Add `--ast` for the analyzed Oxc AST and generator
-resume plans, or `--asm` for Cranelift machine-instruction output. Use
+resume plans, or `--asm` for disassembled machine code with relocations. Use
 `--no-ir` to omit IR. The compiler lowers the AST to a semantic graph before
 emitting Cranelift IR. Eligible functions get a guarded Math fast path that
 checks native identities once per invocation and falls back on mismatch.
-`JS_JIT_SSA=0` disables semantic graph optimization and CLIF SSA optimization.
+`JS_JIT_SSA=0` disables semantic graph optimization and CLIF cleanup.
 Both runners provide deterministic `Math.random()` without a Boost dependency.
 The shared bootstrap calls `hostSeedRandom(settings.Seed)` before loading scripts;
 a missing seed defaults to zero. The generator matches the game's rand48 sequence.
@@ -53,19 +53,15 @@ defaults. This workload now completes and prints the map summary. The dev
 profile uses `opt-level = 1`; use `--release` for performance measurements.
 Release builds include line tables for profiling.
 
-The JS numeric SSA pass runs after frontend SSA construction and before
-Cranelift optimization. It records boxed constants, helper identities, and
-numeric guards, propagates facts through branches and block arguments, and
-replaces proven guards with constants. Constant branches are rewritten and
-unreachable blocks removed before analysis repeats. It also removes frame stores for locals
-that only hold non-owning values, excluding generator resume functions. A
-separate control-flow analysis removes temporary clears proven empty; unknown
-calls and potentially owning reads remain barriers. Error checks remain unchanged. Set `JS_JIT_SSA=0` to disable it, and `JS_JIT_SSA_DUMP=1` to print
-the inferred guard and block-parameter kinds to stderr. Combining these settings
-runs the analysis without applying its transformations. The corresponding
-embedding options are `EngineOptions::ssa_opt` and `EngineOptions::ssa_dump`.
-See [Post-SSA numeric analysis](crates/engine/DESIGN.md#post-ssa-numeric-analysis)
-for the annotation model, dataflow rules, pass boundary, and future tiering work.
+Numeric facts and representation selection run on the semantic graph before
+CLIF emission. Numeric index operands select their specialized fallback helper
+directly. A small effect analysis removes guarded temporary clears when every
+incoming path is known clean, tracking inline pushes explicitly. Unknown calls
+and potentially owning reads remain barriers. `JS_JIT_SSA=0` disables semantic
+optimization and CLIF cleanup; `JS_JIT_SSA_DUMP=1` reports removed temporary
+clears. The embedding options are `EngineOptions::ssa_opt` and
+`EngineOptions::ssa_dump`. See [CLIF cleanup](crates/engine/DESIGN.md#clif-cleanup)
+for annotations and temporary-stack effects.
 
 
 ## cpp
@@ -98,3 +94,6 @@ template values, so the generated map is a workload rather than a faithful map.
 
 Output is a JSON summary with a deterministic hash of the generated heightmap
 and tile data, plus generator timing.
+
+Set `JS_JIT_GET_REFINEMENT=0` to disable get feedback and refinement while keeping
+other optimizations enabled (`EngineOptions::get_refinement`).

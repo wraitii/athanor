@@ -1,9 +1,10 @@
 use super::{ClifValue, FunctionCompiler};
 use crate::heap::REFERENCES_OFFSET;
 use crate::jit::helpers::Helper;
+use crate::jit::session::{TEMPS_CAPACITY_OFFSET, TEMPS_LEN_OFFSET, TEMPS_VALUES_OFFSET};
 use crate::value::{TAG_OBJECT, TAG_SHIFT, TAG_STRING};
 use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::{Block, InstBuilder, MemFlags, types};
+use cranelift_codegen::ir::{Block, BlockArg, InstBuilder, MemFlags, types};
 use cranelift_frontend::Variable;
 use oxc_ast::ast::{
     BindingPattern, ForStatementInit, ForStatementLeft, Statement, VariableDeclaration,
@@ -44,42 +45,92 @@ impl FunctionCompiler<'_, '_> {
         self.b.def_var(variable, value);
     }
 
-    /// Retains a value inline, calling the runtime only to report an invalid one.
-    pub(super) fn retain_inline(&mut self, value: ClifValue) {
+    /// Stores a value in its slot under a reference of the slot's own; a temporary keeps any
+    /// reference it holds until its block's clear. Only a slot written more than once per call
+    /// can hold an old value to release.
+    pub(super) fn own_local(&mut self, variable: Variable, value: ClifValue, repeated: bool) {
+        self.increment(value);
+        self.replace_local(variable, value, repeated);
+    }
+
+    pub(super) fn increment(&mut self, value: ClifValue) {
         let heap = self.is_heap(value);
         let address = self.b.ins().band_imm(value, ADDRESS_MASK);
-        let check = self.b.create_block();
-        let load = self.b.create_block();
+        let zero = self.b.ins().iconst(types::I64, 0);
+        let address = self.b.ins().select(heap, address, zero);
         let increment = self.b.create_block();
-        let invalid = self.b.create_block();
         let done = self.b.create_block();
-        self.b.set_cold_block(invalid);
-        self.brif(heap, check, &[], done, &[]);
-        self.switch(check);
-        self.brif(address, load, &[], done, &[]);
-        self.switch(load);
+        self.brif(address, increment, &[], done, &[]);
+        self.switch(increment);
         let flags = MemFlags::trusted();
         let references = self
             .b
             .ins()
             .load(types::I32, flags, address, REFERENCES_OFFSET);
-        self.brif(references, increment, &[], invalid, &[]);
-        self.switch(increment);
         let references = self.b.ins().iadd_imm(references, 1);
         self.b
             .ins()
             .store(flags, references, address, REFERENCES_OFFSET);
         self.jump(done, &[]);
-        self.switch(invalid);
-        self.call_helper(Helper::Retain, &[value]);
-        self.check_error();
-        self.jump(done, &[]);
         self.switch(done);
     }
 
-    /// Stores a value whose reference the slot already owns, releasing the replaced value.
-    pub(super) fn replace_local(&mut self, variable: Variable, value: ClifValue) {
+    /// Hands a heap-tagged value out as a temporary, calling the runtime only to grow the
+    /// temporary stack.
+    pub(super) fn retain_temporary(&mut self, value: ClifValue) -> ClifValue {
+        let flags = MemFlags::trusted();
+        let address = self.b.ins().band_imm(value, ADDRESS_MASK);
+        let load = self.b.create_block();
+        let push = self.b.create_block();
+        let slow = self.b.create_block();
+        let done = self.b.create_block();
+        self.b.append_block_param(done, types::I64);
+        self.b.set_cold_block(slow);
+        self.brif(address, load, &[], done, &[BlockArg::Value(value)]);
+        self.switch(load);
+        let len = self.load_ctx(TEMPS_LEN_OFFSET);
+        let capacity = self.load_ctx(TEMPS_CAPACITY_OFFSET);
+        let room = self.b.ins().icmp(IntCC::UnsignedLessThan, len, capacity);
+        self.brif(room, push, &[], slow, &[]);
+        self.switch(push);
+        let references = self
+            .b
+            .ins()
+            .load(types::I32, flags, address, REFERENCES_OFFSET);
+        let references = self.b.ins().iadd_imm(references, 1);
+        self.b
+            .ins()
+            .store(flags, references, address, REFERENCES_OFFSET);
+        let values = self.load_ctx(TEMPS_VALUES_OFFSET);
+        let offset = self.b.ins().ishl_imm(len, 3);
+        let entry = self.b.ins().iadd(values, offset);
+        self.b.ins().store(flags, value, entry, 0);
+        let len = self.b.ins().iadd_imm(len, 1);
+        let push = self.b.ins().store(flags, len, self.ctx, TEMPS_LEN_OFFSET);
+        self.annotations.temporary_pushes.insert(push);
+        self.jump(done, &[BlockArg::Value(value)]);
+        self.switch(slow);
+        let retained = self.call_helper(Helper::TempRetain, &[value]);
+        self.check_error();
+        self.jump(done, &[BlockArg::Value(retained)]);
+        self.switch(done);
+        self.b.block_params(done)[0]
+    }
+
+    fn load_ctx(&mut self, offset: i32) -> ClifValue {
+        self.b
+            .ins()
+            .load(types::I64, MemFlags::trusted(), self.ctx, offset)
+    }
+
+    /// Stores a value whose reference the slot already owns, releasing the value it replaces
+    /// when the slot may already hold one.
+    pub(super) fn replace_local(&mut self, variable: Variable, value: ClifValue, repeated: bool) {
         let (_, old) = self.store_local(variable, value);
+        if !repeated {
+            self.b.def_var(variable, value);
+            return;
+        }
         let heap = self.is_heap(old);
         let release = self.b.create_block();
         let done = self.b.create_block();

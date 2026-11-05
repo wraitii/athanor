@@ -43,7 +43,7 @@ aliasing, and cycles; document deliberate semantic restrictions.
   native operations for exact Int32 operands and runtime helpers for other
   conversions. Shift counts are masked to five bits; unsigned right shift
   returns a nonnegative number. These emission-time fast paths remain enabled
-  with `JS_JIT_SSA=0`, though SSA-based guard elimination is disabled. Compound assignments share
+  with `JS_JIT_SSA=0`. Compound assignments share
   binary operations and evaluate the target and its old value before the right
   operand. Numeric operators use heap-aware primitive string conversion.
 - `typeof` returns interned heap strings for supported values, identifying closures and
@@ -58,95 +58,40 @@ missing; arrays and rest alone will not make the bootstrap runnable. The C++
 runner independently embeds SpiderMonkey and provides a workload reference,
 not Rust-engine bindings.
 
-## Post-SSA numeric analysis
+## CLIF cleanup
 
-The frontend builds SSA through Cranelift's `FunctionBuilder`. After sealing
-all blocks and finalizing the builder, `jit/compiler.rs` runs the JS numeric
-analysis in `jit/numeric.rs`, applies guard simplification, and verifies the
-result before handing it to Cranelift's optimizer and machine-code generator.
-This applies to ordinary functions, module initializers, generator factories,
-and generator resume functions.
+Numeric facts and representation selection belong to the semantic graph and
+its emitter. There is no separate numeric dataflow analysis over CLIF. Unknown
+boxed operands keep their runtime guards and helper fallbacks; proven operands
+use typed emission directly. Mixed relational comparisons still perform their
+coercions inside the fallback helper, preserving string comparison when both
+operands are strings.
 
 ```text
-Oxc AST -> semantic graph -> finalized SSA CLIF + annotations
-                                -> numeric analysis
-                                -> guard simplification and verification
+Oxc AST -> semantic optimization -> typed CLIF + annotations
+                                -> indexed-read scope and temporary cleanup
                                 -> Cranelift optimization and code generation
 ```
 
-`FunctionBody` pairs a CLIF `Function` with its `Annotations`. Emission records
-boxed JS constants and guaranteed result kinds by SSA value, helper identities
-by instruction, and numeric and retain tests by instruction and tested value.
-Successful helper continuations carry result facts that become valid only after
-the error check. These blocks must remain exclusive to their successful edge. Emission does not
-propagate kinds through locals or control flow. Raw internal `i64` values, such as frame-slot indices
-and generator states, are not classified by interpreting their bits as JS
-values. The side tables require no executable marker instructions or fake
-locals.
+`jit/clif.rs` pairs a CLIF `Function` with emission annotations for helper calls,
+indexed reads, invocation roots, inline temporary pushes, and guarded temporary
+clears. Annotations refer to that exact body and are consumed before Cranelift
+rewrites it. Source locations remain available separately for profiling.
 
-Annotations belong to that exact CLIF body. The analysis resolves frontend SSA
-aliases when looking up values. Cloning a `FunctionBody` preserves the entity
-IDs and matching annotations; transformations that replace definitions must
-preserve or rebuild the affected metadata. The annotations are consumed before
-Cranelift optimization and are not expected to describe the backend's rewritten
-IR. Source locations remain available separately for debugging and profiling.
+`jit/temporaries.rs` summarizes each block's effect on the temporary stack and
+propagates a single may-register bit through the CFG. A guarded clear can be
+bypassed only when every incoming path is clean. Both the clear path and its
+empty-stack bypass leave the frame clean. Joins and loop backedges preserve any
+possible push. Unknown calls, retain helpers and generic addition are
+conservative barriers; inline pushes are recorded explicitly, so unrelated
+reference-count and frame-slot stores do not dirty the temporary stack. The
+cleanup bypasses the whole clear check, leaving unreachable blocks for Cranelift
+to remove. It is disabled with `JS_JIT_SSA=0`.
 
 Helpers also have effect summaries distinguishing heap and global reads and
 writes, internal bookkeeping and ownership, allocation, errors, and reentry.
-The CLIF-level indexed-read scope and temporary-clear analysis consume them.
 Semantic optimization uses the separate operation contracts described under
 [Contracts and facts](#contracts-and-facts).
-
-Math specialization now runs on the semantic graph, as described below.
-
-The abstract kinds are Number, its subtypes Int32, OtherNumber, and NaN,
-plus Other and unknown. Int32 describes an exactly representable signed 32-bit
-integer, excluding negative zero. OtherNumber includes fractions, larger
-integers, infinities, and negative zero. Other means a boxed JS value that is
-not numeric, including an uninitialized-binding sentinel. These are value facts;
-Int32 values still use the boxed-double representation. Constants get their
-narrowest kind. Signed bitwise results are Int32 after their error check;
-unsigned right shift remains Number because its result may exceed INT32_MAX. Each reachable
-block has an incoming fact map. An absent value fact means unknown, while an
-absent block state means unreachable in the traversed control-flow graph.
-A worklist propagates facts through branch arguments and block parameters until
-they stabilize, including loop backedges. Joins retain equal kinds, widen differing numeric kinds to Number, and discard
-incompatible facts. Facts about instruction results are cleared before processing
-their defining block again, so a loop cannot reuse a previous iteration's facts.
-
-A numeric test refines its operand to Number on the true edge, preserving any
-known numeric subtype, and Other on the false edge. A successful conjunction can refine both operands' numeric tests;
-a failed conjunction does not identify which operand failed. This gives runtime
-guards and statically known constants the same fact-propagation path. Selects
-use the same join rule as control-flow merges. A small helper-contract table
-also propagates kinds where the result is guaranteed, including numeric
-arithmetic with proven numeric operands. Subtraction, multiplication, division,
-remainder, exponentiation, numeric unary operations, and bitwise operations
-produce numeric results on their successful continuation without constraining
-the original operands. Inline arithmetic canonicalizes NaNs before boxing and
-records its result as numeric. Unrecognized results remain unknown;
-the pass does not infer types from mutable heap contents or arbitrary calls.
-
-After reaching a fixed point, the pass replaces proven numeric-test instructions
-with boolean constants. Proven numeric local reads also have their retain
-guards replaced with false. Constant conditional branches become jumps carrying
-the selected edge's arguments, and Cranelift removes unreachable blocks. Numeric
-analysis and branch cleanup repeat while branches are simplified, before index
-specialization and temporary-clear analysis. Frame-local stores are removed for slots whose stores are all
-proven numeric values or non-owning boxed constants. Slots with any unknown or
-owning store keep all stores, including primitive overwrites that release the
-previous value. Generator resume functions keep their frame slots for suspension
-and restoration. Slot numbering and engine-error checks remain unchanged.
-After these rewrites, a forward may-register analysis removes a temporary clear
-only if every reachable path since frame entry or the preceding clear is known
-not to have registered a temporary. Joins and loop backedges combine states
-conservatively, and constant branch conditions exclude unreachable helper paths.
-Helper contracts distinguish operations that cannot register from those that
-may; numeric and nonowning operand facts refine retain and addition. Arbitrary
-calls, unclassified calls, generic property and index reads, catch, generator
-transitions, and non-stack stores remain conservative barriers. This does not
-infer receiver types or remove error checks. The analysis is disabled with
-`JS_JIT_SSA=0`.
 
 Indexed-read emission records the receiver, key, result, source location,
 successful continuation and runtime-read contract as invocation-scoped read
@@ -177,13 +122,12 @@ compilation remain unimplemented.
 
 `EngineOptions::ssa_opt` enables rewriting and defaults to true unless
 `JS_JIT_SSA=0`. `EngineOptions::ssa_dump` defaults to false unless
-`JS_JIT_SSA_DUMP=1`; it prints per-function guard counts, inferred block-parameter
-kinds, and individual guard conclusions to stderr. Enabling dumps with rewriting disabled runs the
-analysis without changing CLIF. The existing IR listings show CLIF after this
-pass when rewriting is enabled.
+`JS_JIT_SSA_DUMP=1`; it prints per-function counts of removed temporary clears
+to stderr. The existing IR listings show CLIF after cleanup when rewriting is
+enabled.
 
 Future compilation tiers can build on this boundary. Canonical semantic graphs
-of ordinary top-level functions are retained separately from emitted bodies, as
+of ordinary functions are retained separately from emitted bodies, as
 described below; canonical CLIF bodies are not retained. Runtime feedback would
 need stable operation-site IDs independent of CLIF entity IDs, and observed types
 would require runtime guards before becoming proven facts. Recompilation,
@@ -289,12 +233,19 @@ closures carry a shape id other than `NO_SHAPE` or `DICTIONARY`, so a shape id
 alone fixes the value index of each own property. A count reaching zero resets
 the shape to `NO_SHAPE`, since disposal pops values without changing it.
 
-Each compiled named read has a monomorphic site cache holding a shape id and a
-value index. Generated code compares the receiver's shape (non-objects and the
-global object read the all-zero view) and loads the value inline on a match;
-heap results are retained unless the read is borrowed. A miss calls the generic
-read and refills the cache when the receiver has an own shaped property of that
-name. Inherited and absent properties are not cached. Writes, `in` and probes
+Each compiled named read has a monomorphic site cache holding the receiver's
+shape id, a holder address (zero for an own property), the holder's shape id and
+a value index. A shape's root fixes the prototype's address, and receivers keep
+their prototype alive, so matching both shapes fixes where the value lives.
+Generated code selects the holder (the receiver when the address is zero),
+compares both shapes (non-objects and the global object read the all-zero view)
+and loads the holder's value inline on a match; heap results are retained unless
+the read is borrowed or goes straight into a slot. An empty cache expects a
+dictionary receiver whose holder has no shape, which no receiver matches. A
+miss calls the generic read and refills the cache when the receiver or its
+direct prototype holds a shaped property of that name. Deeper chains and absent
+properties are not cached. Arena chunks stay mapped for the heap's lifetime, so
+a cached holder address is always safe to read. Writes, `in` and probes
 still go through helpers. Typed arrays provide contiguous
 numeric storage without per-element reference counting.
 
@@ -1026,13 +977,12 @@ This initial implementation stores each typed array independently.
 Bitwise and shift operators have guarded int32 IR paths emitted through shared boxing and
 unboxing routines in `jit/emit/ir_helpers.rs`. Unboxing uses saturating conversion
 and compares the boxed round trip, rejecting nonnumeric values, fractions,
-out-of-range numbers, and negative zero. Proven Int32 facts eliminate the guard;
-other known kinds except Number prove it false. The fallback retains the existing
-helper and its error check. Successful guard edges establish Int32 facts.
+out-of-range numbers, and negative zero. Semantic Int32 operands use typed
+emission without a boxed guard. Unknown operands keep the guard, fallback
+helper and error check.
 
-After numeric analysis, index-get calls whose index is proven numeric are
-redirected to `IndexGetNumeric`, passing the unboxed index as f64. The generic
-and numeric entrypoints share the numeric read implementation and the slow
+During emission, numeric index operands select `IndexGetNumeric` for the
+fallback helper, passing the index as f64. The generic and numeric entrypoints share the numeric read implementation and the slow
 receiver/property fallback. Specialization removes the boxed-index type test
 without assuming an array receiver, integer index, or valid bounds. Ownership
 and engine-error checks remain in place. Unknown index kinds keep IndexGet.
@@ -1120,38 +1070,104 @@ that cannot be uninitialized is pure.
 
 ### Initial call specialization
 
-The compiler retains canonical graphs of ordinary top-level functions, keyed by
+The compiler retains canonical graphs of ordinary top-level and nested functions, keyed by
 their code IDs, before specialization or region copying. Emission optimizes a
-clone. The repository also records the originating compilation; inlining is
-currently restricted to the same source compilation so byte spans and closure
-lookup remain unambiguous.
+clone. The repository also records the originating compilation. Cross-source
+inlining preserves the callee's error locations; closure creation remains
+ineligible until its source-local references can be remapped.
 
 `semantic/specialize.rs` separates specialization requests, guard planning, and
-application. The initial static request producer recognizes calls through global
-bindings to small helpers in that repository and requests numeric arguments.
-The planner accepts explicit call-site and target-code requests, removes number
-checks already proven by caller facts, deduplicates checks of equal argument
-values, and bounds expansion to 128 callee instructions per caller. Eligible
-callees contain at most 32 instructions and use only arguments, primitive
-constants, coercions, unary and binary operations, and ordinary control flow.
-Captures, receiver access, nested calls, heap accesses, rest and arguments
-snapshots, generators, and exception handlers remain unsupported by this inliner.
+application. The static producer recognizes global bindings and known local
+closures through their SSA definitions. Numeric helper bodies can request
+number guards; general bodies and observed call targets do not require them. The planner removes number checks
+already proven by caller facts, deduplicates equal argument checks, and bounds
+expansion to 128 callee instructions per caller, with at most 32 instructions
+per eligible callee. These counts use canonical semantic operations, including
+arguments, constants and scopes, but not block parameters or terminators.
 
-`semantic/inlining.rs` materializes each selected request. It checks the already
-evaluated callee's code identity, then all remaining numeric assumptions. All
-failures select the original call; success executes one inlined body. Returns
-join the original continuation through a block parameter. Callee and argument
-evaluation stay before dispatch, including side effects in extra arguments.
-Narrowed argument values use `AsNumber`, so facts and representation selection
-see numeric operands inside the copy. Ownership analysis runs after inlining.
+`semantic/inlining.rs` copies callee blocks, values, bindings and scopes, and
+joins returns through a continuation parameter. Mutable global targets keep a
+code-identity guard and the original call as fallback. Direct local closure
+creation proves the code identity without a repeated guard, except when class
+marking requires the ordinary call checks. Arguments and ordinary receivers are
+substituted at the call site; a known local arrow uses its enclosing receiver.
+Captured scopes use an explicit closure operand to load the original cells,
+preserving shared writes, initialization checks and per-iteration environments.
+Nested calls, heap operations and ordinary control flow can be copied. Creating
+further closures, rest and arguments snapshots, generators, and exception
+handlers remain unsupported by the inliner.
+
+`semantic/arrays.rs` exposes `array.map(knownClosure)` as a semantic loop behind
+a guard on the evaluated native identity and array receiver. Unsupported
+receivers, replacement methods, and unsupported thisArg values retain the generic
+call. The loop snapshots the initial length, skips absent indices at visitation,
+passes `(value, index, array)`, and writes into a result initially containing
+holes. Reads observe callback mutations. Exposing the callback lets ordinary
+inlining remove its dispatch and frame while retaining calls made by its body,
+such as the recursive `createTerrain(t)` in the rmgen library. Exception and
+engine-error exits retain the caller's normal frame cleanup.
+
+After specialization, capture-free closure allocations with no reachable uses
+are removed. An allocation used only in one cold fallback block can move to
+that block when its loop nesting is unchanged; this avoids duplicating observable
+closure identities across iterations. Inlined paths then avoid materializing an
+otherwise unused callback. Captured closures remain materialized when their
+cells are accessed through the closure object. Ownership analysis runs after
+these transformations.
 
 For example, `square(x)` with `square(x) { return x * x; }` gets a code check,
 one number check, an inline multiply, and the original call as fallback.
 `square(x * 2)` needs only the code check because its argument is already known
-numeric. This is a call-site prototype; it does not yet merge requirements across
-calls or compact enclosing regions. Runtime feedback, including observations
-from inline caches, can supply future requests without changing graph splicing.
-Feedback collection and asynchronous compilation are not implemented.
+numeric. This prototype does not yet merge requirements across calls or compact
+enclosing regions.
+
+`planner.rs` collects feedback independently of code emission. Fixed argument
+calls and named or indexed reads in ordinary functions have a stable site
+identified by source and byte span, including calls copied from an inlinee.
+A boxed cache records its owning code ID. For calls, its first execution records
+a JS code ID and queues the owner;
+native and invalid callees close the cache without requesting inlining. This
+initial policy keeps one candidate per source site and does not adapt to later
+target changes. Code IDs are metadata and do not retain closure objects.
+
+Read observations run after successful lookup, including named-property IC hits.
+The first result closes the observation cache; array results record their storage
+category (ordinary array or typed array with element kind) and queue the owner.
+Indexed reads also observe receiver categories, including generic typed reads
+whose element kind is still unknown. This retains feedback when load reuse
+eliminates the producing read or an existing loop version already establishes
+that the receiver is typed. Planning prefers a read's own receiver observation,
+then uses its producer's result observation. In `height[x][y]`, the first read
+can select `IndexedGet` and the second can select `TypedIndex` independently.
+
+An indexed-storage or typed-array guard and, where needed, a number guard select
+the existing generic indexed or typed read. Other receivers and keys use the
+original read. Key categories are not profiled yet: numeric speculation uses IR
+facts and explicit guards. Indexed reads retain bounds checks, hole handling and
+heap-result ownership. Typed element kinds are retained in feedback but are not
+yet used to specialize these reads further. Feedback does not prove a property
+immutable or retain the observed array. Read decisions join the inlining record
+when comparing plans. This initial policy does not propagate producer
+observations through SSA merges or specialize writes.
+
+At the owner's next dispatch, the compiler synchronously plans from its canonical
+graph with the accumulated feedback. Observations supply speculative candidates,
+with the evaluated callee checked by the existing code-identity guard. The planner
+runs at most four inlining rounds with one shared 128-instruction budget, allowing
+calls exposed by earlier rounds to inline without expanding fallback calls again.
+The ordered inlining and read decisions form the decision record for the emitted
+version.
+Planning includes expansion and simplification between inlining rounds, so later
+decisions use facts exposed by earlier inlines. If the decision record is
+unchanged, recompilation stops before region versioning, ownership analysis and
+machine-code emission. Otherwise those passes continue on the planned graph.
+
+Re-emission declares a new machine function and replaces the entry for the
+original logical code ID only after finalization succeeds. Closures retain their
+identity, captures, and prototype. Active frames finish in the old code, which the
+JIT module retains. Failed recompilation reports a diagnostic and keeps the
+previous entry. There is no on-stack replacement, background compilation, or
+feedback for property writes yet.
 
 ### Passes
 
@@ -1162,6 +1178,17 @@ explicit uninitialized sentinel. Simplification removes pure operations whose
 results are unused, including checks of initialized values and the scope
 operations of scopes without captured bindings, and replaces numeric coercions
 of numbers by their operand.
+
+Relational comparisons with unknown numeric operands expose their `is_number`
+checks in the semantic graph. `GuardedCompare` consumes those checks and keeps
+the original operands for generic comparison fallback. Dominating checks are
+shared with later comparisons and refined indexed reads without adding semantic
+blocks. Known numeric comparisons still lower directly. Simplification folds
+number checks once their operands' types are proven, removes redundant
+`as_number` assertions, and prunes constant branches. It recomputes facts after
+pruning so newly narrowed joins can simplify further. Choosing a shared fast
+region around several guarded operations remains a planning decision; a
+successful coercing comparison does not change the original index key's type.
 
 Optimization works on regions: the whole function, or a loop whose body is
 closed. A region is closed when nothing in it reenters JavaScript and nothing
@@ -1198,6 +1225,30 @@ may be checked again on values their outer loop defines. A check only replaces
 the tag test the generic code would run per operation, so no cost model is
 needed yet. Invariant read probes share these entry guards, and their results
 can also receive number checks. Other values loaded inside the loop stay generic.
+
+Loops are versioned outermost first. A loop's entry checks come from its own
+blocks and from loops at most one level deeper whose header every iteration of
+the outer loop reaches; exits are ignored, as are zero-trip loops. Checks that
+cannot be placed that high stay for the inner loop, so a guard is never hoisted
+past a condition or out of more than two loops. Inline guards whose condition
+(`is_code`, `is_number`, `is_typed`, `is_array_map`) only depends on values
+defined before the loop or on probed reads, global reads included, are
+checked on entry too; the copy jumps straight to the fast path. A loop that only
+reenters through such guards' cold fallbacks is versioned the same way and its
+copy becomes a closed region. Typed-array checks remain a separate layer on top
+of the number copy, since a wrong typed guess should still keep the number
+copy.
+
+A typed-array receiver created by a typed-array constructor or its `from` or
+`of`, looked up by global name, is guessed to have that element kind; the entry
+check then compares the exact kind, so a wrong guess or a replaced constructor
+only selects the number copy. A read whose key is a loop counter starting at a
+non-negative integer constant, stepping by one, and tested with `<` against a
+number defined before the copy, on a header whose false edge leaves the loop, is
+also checked once on entry: the bound must not exceed the receiver's length.
+Typed arrays never change length, so such a read is an in-bounds integral index.
+With a known kind it compiles to a single load with an unboxed result, an Int32
+for element kinds that fit.
 
 Write effects are classified by access: a named property, `length`, elements
 under a numeric key, iteration state, or unknown. Element writes conflict with
@@ -1266,17 +1317,22 @@ receive. `--semantic-ir` lists the borrowed reads.
 
 Frames share one contiguous slot stack and one temporary stack in `JitCtx`;
 ordinary functions number their rooted values densely and reserve that many
-slots on entry, and `JitCtx` exposes the current frame's slot base and pending
-temporary count. Frame exit releases slots and temporaries under one heap
-borrow. A slot store writes inline and calls the runtime only
-when the new value is a heap reference. Storing the most recent temporary
-transfers its ownership instead of retaining it again. Block parameters in
-ordinary frames are retained without temporaries: every incoming heap value is
-retained inline first, so swapped parameters stay alive, then each slot is
-replaced. Retains increment the slot header's count inline; releases decrement
-it inline while other references remain, and otherwise call the runtime, which
-queues the slot for disposal. A zero count on a retained value is an engine
-error reported by the runtime. Generator frames keep the helper path. Error and
+slots on entry, and `JitCtx` exposes the current frame's slot base and the
+temporary stack's storage, length, capacity and frame floor. Frame exit releases
+slots and temporaries under one heap borrow. A rooted graph value's slot takes
+a reference of its own and never takes over a temporary's: the store increments
+inline, and a temporary holding the same value keeps its reference until the
+block's clear. Reads stored this way skip the temporary entirely. A slot only
+holds an old value to release when its defining block lies on a control-flow
+cycle (a strongly connected component, so hoisting out of a loop removes the
+release); functions with handlers or generators treat every block as cyclic.
+Block parameters follow the same rule, with every incoming heap value
+incremented first so swapped parameters stay alive. Releases decrement inline
+while other references remain, and otherwise call the runtime, which queues the
+slot for disposal. Inline temporary pushes call the runtime only to grow the
+stack. Bindings without SSA values (written by assignment or scope entry) keep
+the runtime store, which takes over the most recent temporary. Generator frames
+keep the helper path. Error and
 exception checks load fixed `JitCtx` fields inline. Scalar replacement of
 unescaped objects, general branch-sensitive facts, structural facts about loaded
 values (such as an array of `{x: number}`) and object kinds are not

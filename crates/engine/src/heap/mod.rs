@@ -42,7 +42,7 @@ pub(crate) use array::HOLE;
 pub(crate) use natives::{MathFunction, NativeFunction};
 pub use owned::OwnedValue;
 pub(crate) use regexp::regexp_flags;
-pub(crate) use shape::DICTIONARY;
+pub(crate) use shape::{DICTIONARY, NO_SHAPE};
 pub(crate) use typed::TypedKind;
 
 #[derive(Clone, Default)]
@@ -205,28 +205,32 @@ impl Heap {
             let Some(id) = data.pending.pop_front() else {
                 break;
             };
-            let slot = data.slot_mut(id);
-            if slot.references != 0 {
+            if data.slot(id).references != 0 {
                 continue;
             }
-            let edge = match &mut slot.payload {
-                Payload::Generator(generator) => generator.locals.pop(),
-                Payload::Set(set) => set
-                    .entries
-                    .extract_if(|_, _| true)
-                    .next()
-                    .map(|(_, value)| value),
-                Payload::Object(object) => object.properties.pop(),
-                Payload::Array(array) => array.elements.pop(),
-                Payload::Closure(closure) => {
-                    closure.properties.pop().or_else(|| closure.captures.pop())
+            while budget > 0 {
+                let edge = match &mut data.slot_mut(id).payload {
+                    Payload::Generator(generator) => generator.locals.pop(),
+                    Payload::Set(set) => set
+                        .entries
+                        .extract_if(|_, _| true)
+                        .next()
+                        .map(|(_, value)| value),
+                    Payload::Object(object) => object.properties.pop(),
+                    Payload::Array(array) => array.elements.pop(),
+                    Payload::Closure(closure) => {
+                        closure.properties.pop().or_else(|| closure.captures.pop())
+                    }
+                    _ => None,
+                };
+                budget -= 1;
+                if let Some(value) = edge {
+                    data.release(value);
+                    if budget == 0 {
+                        data.pending.push_back(id);
+                    }
+                    continue;
                 }
-                _ => None,
-            };
-            if let Some(value) = edge {
-                data.pending.push_back(id);
-                data.release(value);
-            } else {
                 let payload = data.vacate(id);
                 match payload {
                     Payload::Enumerator(state) => {
@@ -252,8 +256,8 @@ impl Heap {
                     }
                     _ => {}
                 }
+                break;
             }
-            budget -= 1;
         }
     }
 }

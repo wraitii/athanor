@@ -55,24 +55,29 @@ impl Heap {
         Some(Value::from_bits(TAG_OBJECT | id))
     }
 
-    /// The receiver's shape and value index of an own property, if a site cache may hold them.
-    pub(crate) fn cached_property(&self, receiver: Value, name: &str) -> Option<(u32, u32)> {
+    /// Where a site cache may find a property: on the receiver itself, or on its prototype.
+    pub(crate) fn cached_property(&self, receiver: Value, name: &str) -> Option<CachedProperty> {
         let data = self.0.borrow();
         let id = heap_id(receiver)?;
-        let shape = data.live(id)?.shape;
-        if shape == NO_SHAPE || shape == DICTIONARY {
-            return None;
+        let shape = data.cacheable_shape(id)?;
+        let atom = data.atoms.find(name)?;
+        if let Some(index) = data.shapes.get(shape).slot(atom) {
+            return Some(CachedProperty {
+                shape,
+                holder: 0,
+                holder_shape: shape,
+                index: index as u32,
+            });
         }
-        let PropertyView::Shaped {
-            atoms,
-            shape: layout,
-            ..
-        } = data.properties(id)?
-        else {
-            return None;
-        };
-        let index = layout.slot(atoms.find(name)?)?;
-        Some((shape, index as u32))
+        let holder = heap_id(data.object(id)?.prototype?)?;
+        let holder_shape = data.cacheable_shape(holder)?;
+        let index = data.shapes.get(holder_shape).slot(atom)?;
+        Some(CachedProperty {
+            shape,
+            holder,
+            holder_shape,
+            index: index as u32,
+        })
     }
 
     /// Returned values are borrowed; native functions and lazy prototypes are resolved by the caller.
@@ -479,11 +484,21 @@ impl Heap {
         false
     }
 
-    pub(crate) fn constructed_object(&self, constructor: Value) -> Option<Value> {
-        let prototype = self.property(constructor, "prototype")?;
-        if prototype.is_object() && !self.has_properties(prototype) {
+    pub(crate) fn constructor_prototype(&self, constructor: Value) -> Option<Value> {
+        let data = self.0.borrow();
+        let id = heap_id(constructor)?;
+        if !data.closure(id)?.constructable {
             return None;
         }
+        // Reading an absent prototype must not trigger its lazy allocation.
+        let prototype = data.properties(id)?.get("prototype")?;
+        if prototype.is_object() && heap_id(prototype).and_then(|id| data.object(id)).is_none() {
+            return None;
+        }
+        Some(prototype)
+    }
+
+    pub(crate) fn object_with_prototype(&self, prototype: Value) -> Option<Value> {
         let instance = self.object()?;
         if prototype.is_object() {
             let mut data = self.0.borrow_mut();
@@ -491,6 +506,14 @@ impl Heap {
             data.set_prototype(heap_id(instance)?, prototype);
         }
         Some(instance)
+    }
+
+    pub(crate) fn constructed_object(&self, constructor: Value) -> Option<Value> {
+        let prototype = self.property(constructor, "prototype")?;
+        if prototype.is_object() && !self.has_properties(prototype) {
+            return None;
+        }
+        self.object_with_prototype(prototype)
     }
 
     pub(crate) fn error_text(&self, value: Value) -> Option<String> {
@@ -523,7 +546,20 @@ impl Heap {
     }
 }
 
+/// A receiver's shape fixes its prototype's address, so a matching receiver and holder shape
+/// fix where the value lives. `holder` is 0 for an own property.
+pub(crate) struct CachedProperty {
+    pub(crate) shape: u32,
+    pub(crate) holder: u64,
+    pub(crate) holder_shape: u32,
+    pub(crate) index: u32,
+}
+
 impl HeapData {
+    fn cacheable_shape(&self, id: u64) -> Option<ShapeId> {
+        Some(self.live(id)?.shape).filter(|&shape| shape != NO_SHAPE && shape != DICTIONARY)
+    }
+
     pub(super) fn object_property(&self, mut id: u64, name: &str) -> Option<Value> {
         loop {
             if let Some(value) = self.properties(id)?.get(name) {

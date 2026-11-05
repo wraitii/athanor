@@ -2,7 +2,6 @@ use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{InstBuilder, MemFlags, Type, Value as ClifValue, types};
 
 use crate::heap::MathFunction;
-use crate::jit::numeric::Kind;
 use crate::jit::semantic::Types;
 use crate::value::Value;
 
@@ -83,13 +82,11 @@ impl FunctionCompiler<'_, '_> {
                 let bits = self.b.ins().bitcast(types::I64, MemFlags::new(), value);
                 let nan = self.constant(Value::number(f64::NAN));
                 let boxed = self.b.ins().select(unordered, nan, bits);
-                self.annotations.results.insert(boxed, Kind::Number);
                 boxed
             }
             (Repr::Int32, Repr::Boxed) => {
                 let float = self.b.ins().fcvt_from_sint(types::F64, value);
                 let boxed = self.b.ins().bitcast(types::I64, MemFlags::new(), float);
-                self.annotations.results.insert(boxed, Kind::Int32);
                 boxed
             }
             (Repr::Bool, Repr::Boxed) => {

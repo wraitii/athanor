@@ -16,6 +16,64 @@ fn run(source: &str, ssa_opt: bool) -> Result<Value, String> {
 }
 
 #[test]
+fn explicit_integer_coercions_preserve_numeric_edges() {
+    let source = r#"
+        function check(input, expected) {
+            const value = +input;
+            const shift = 33.75;
+            return (value | 0) === expected && (value & -1) === expected &&
+                (value ^ 0) === expected && ~value === ~expected &&
+                (value << shift) === (expected << 1) &&
+                (value >> shift) === (expected >> 1) &&
+                (value >>> shift) === (expected >>> 1);
+        }
+        function count(grid, index, limit) {
+            const word = grid[index];
+            let members = 0;
+            if (word)
+                for (let i = 0; i < limit; ++i)
+                    if (word & (1 << i))
+                        ++members;
+            return members;
+        }
+        function sum(grid) {
+            let result = 0;
+            for (let i = 0; i < 3; ++i)
+                result += grid[i] | 0;
+            return result;
+        }
+        function countAll(grid) {
+            let members = 0;
+            for (let x = 0; x < grid.length; ++x) {
+                const word = grid[x];
+                if (word)
+                    for (let i = 0; i < 16; ++i)
+                        if (word & (1 << i))
+                            ++members;
+            }
+            return members;
+        }
+        function main() {
+            const grid = new Uint16Array(2);
+            grid[0] = 65535;
+            grid[1] = 5;
+            return check(undefined, 0) && check(NaN, 0) &&
+                check(Infinity, 0) && check(-Infinity, 0) && check(-0, 0) &&
+                check(3.75, 3) && check(-3.75, -3) &&
+                check(4294967297.75, 1) && check(-4294967297.75, -1) &&
+                check(2147483648, -2147483648) && check(-2147483649, 2147483647) &&
+                count(grid, 0, 16) === 16 && count(grid, 1, 16) === 2 &&
+                count(grid, 2, 16) === 0 && count(grid, 0, 0) === 0 &&
+                sum(grid) === 65540 && countAll(grid) === 18 &&
+                count([3.75], 0, 16) === 2 && count(["5"], 0, 16) === 2;
+        }
+    "#;
+    for ssa_opt in [false, true] {
+        assert_eq!(run(source, ssa_opt), Ok(Value::TRUE));
+    }
+}
+
+#[test]
 fn typeof_string_comparisons_preserve_values_and_evaluation() {
     let source = r#"
         function isString(value) { return typeof value === "string"; }
@@ -676,5 +734,177 @@ fn loop_versions_keep_callee_reads_used_after_the_loop() {
         for enabled in [false, true] {
             assert_eq!(run(source, enabled).unwrap(), Value::TRUE, "{source}");
         }
+    }
+}
+
+#[test]
+fn bounded_typed_reads_match_generic_execution() {
+    let kinds = [
+        "Uint8Array",
+        "Uint16Array",
+        "Uint32Array",
+        "Int8Array",
+        "Int16Array",
+        "Int32Array",
+        "Float32Array",
+        "Float64Array",
+    ];
+    let mut bodies: Vec<String> = kinds
+        .iter()
+        .map(|kind| {
+            format!(
+                "const a = {kind}.from([-1, 300, 2.5, 4294967295, -129, 70000, NaN]);
+                 const b = new {kind}(7);
+                 b[3] = 0.1;
+                 for (let k = 0; k < a.length; ++k) {{ const v = a[k] + b[k]; out = out * 3 + (v === v ? v : 7); }}"
+            )
+        })
+        .collect();
+    bodies.extend(
+        [
+            "const a = Int32Array.from([1, 2, 3]); const b = Int32Array.from([4, 5]); for (let k = 0; k < a.length; ++k) { const v = b[k]; out = out * 3 + (v === v ? v : 7); }",
+            "const a = Int32Array.from([1, 2, 3]); for (let k = -1; k < a.length; ++k) { const v = a[k]; out = out * 3 + (v === v ? v : 7); }",
+            "const a = Int32Array.from([1, 2, 3]); for (let k = 0; k <= a.length; ++k) { const v = a[k]; out = out * 3 + (v === v ? v : 7); }",
+            "const a = Int32Array.from([1, 2, 3]); for (let k = 0; k < a.length; k += 2) { const v = a[k]; out = out * 3 + (v === v ? v : 7); }",
+            "const a = Int32Array.from([1, 2, 3]); for (let k = 0; k < 5; k += 1) { const v = a[k]; out = out * 3 + (v === v ? v : 7); }",
+            "const a = Int32Array.from([1, 2, 3]); for (let k = 0; k < a.length; ++k) { { const v = a[k]; out = out * 3 + (v === v ? v : 7); } if (k == 0) k = 5; }",
+            "const a = Int16Array.from([1.5, -2, 3]); for (let k = 0; k < a.length; ++k) { const v = a[k]; out = out * 3 + (v === v ? v : 7); }",
+        ]
+        .map(String::from),
+    );
+    for body in bodies {
+        let source = format!(
+            "Int16Array = Float64Array;
+             function main() {{ let out = 0; {body} return out; }}"
+        );
+        let expected = run(&source, false);
+        assert!(expected.is_ok(), "{body}: {expected:?}");
+        assert_eq!(run(&source, true), expected, "{body}");
+    }
+}
+
+#[test]
+fn constructor_resolution_preserves_identity_prototypes_and_argument_order() {
+    let source = r#"
+        function make(C, value) { return new C(value); }
+        function spread(C, values) { return new C(...values); }
+        function change(C, prototype) { return new C((C.prototype = prototype, 7)); }
+        function First(value) { this.value = value; }
+        function Second(value) { this.value = value * 2; }
+        function Override() { return {value: 99}; }
+        function main() {
+            let C = First;
+            let sum = 0;
+            for (let i = 0; i < 4; ++i) {
+                C = i % 2 ? First : Second;
+                C.prototype = {tag: i};
+                let instance = make(C, 3);
+                let expanded = spread(C, [3]);
+                sum += instance.value + expanded.value + instance.tag + expanded.tag;
+            }
+            let original = {tag: 10};
+            First.prototype = original;
+            let before = make(First, 1);
+            let after = change(First, {tag: 20});
+            First.prototype = 0;
+            let primitive = make(First, 2);
+            return sum === 48 && before.tag === 10 && after.tag === 20 && after.value === 7 &&
+                primitive.value === 2 && make(Override, 0).value === 99 &&
+                make(Array, 3).length === 3 && spread(Uint8Array, [2]).length === 2;
+        }
+    "#;
+    for ssa_opt in [false, true] {
+        assert_eq!(run(source, ssa_opt).unwrap(), Value::TRUE);
+    }
+}
+
+#[test]
+fn constructor_resolution_keeps_failures_at_the_construction_site() {
+    for source in [
+        "function make(C){return new C();} function main(){return make(()=>7);}",
+        "function make(C, args){return new C(...args);} function main(){return make(null, []);}",
+        "function make(C, args){return new C(...args);} function main(){return make(Array, null);}",
+    ] {
+        for ssa_opt in [false, true] {
+            let mut engine = Engine::with_options(EngineOptions {
+                ssa_opt,
+                ..Default::default()
+            })
+            .unwrap();
+            engine.compile(source, "constructor-errors.js").unwrap();
+            assert!(engine.call("main", &[]).is_err());
+            engine
+                .compile(
+                    "function good(){return new Array(2).length;}",
+                    "constructor-recovery.js",
+                )
+                .unwrap();
+            assert_eq!(
+                engine.call("good", &[]).unwrap().value(),
+                Value::number(2.0)
+            );
+        }
+    }
+    let source = "function C(){throw 7;} function make(C){return new C();} function main(){try{make(C);}catch(e){return e === 7;} return false;}";
+    for ssa_opt in [false, true] {
+        assert_eq!(run(source, ssa_opt).unwrap(), Value::TRUE);
+    }
+}
+
+#[test]
+fn expanded_construction_preserves_return_values_and_classes() {
+    let source = r#"
+        function C(x) { this.value = x; return 42; }
+        function Replacement() { return {value: 99}; }
+        function NullReturn() { this.value = 8; return null; }
+        class Klass { constructor(x) { this.value = x; } }
+        function main() {
+            C.prototype = {tag: 3};
+            Replacement.prototype = {};
+            NullReturn.prototype = {};
+            let sum = 0;
+            for(let i = 0; i < 20; ++i) {
+                let instance = new C(i);
+                sum += instance.value + instance.tag;
+            }
+            return sum === 250 && new Replacement().value === 99 &&
+                new NullReturn().value === 8 && new Klass(7).value === 7 &&
+                new Klass(...[9]).value === 9;
+        }
+    "#;
+    for ssa_opt in [false, true] {
+        assert_eq!(run(source, ssa_opt).unwrap(), Value::TRUE);
+    }
+}
+
+#[test]
+fn cross_source_inlining_preserves_writes_and_global_rebinding() {
+    for ssa_opt in [false, true] {
+        let mut engine = Engine::with_options(EngineOptions {
+            ssa_opt,
+            ..Default::default()
+        })
+        .unwrap();
+        engine.compile("var count=0; function C(x){count+=1;this.value=x;} function touch(o){o.value+=2;return o;}", "definitions.js").unwrap();
+        engine.compile("function main(){C.prototype={};let a=new C(3);return touch(a).value+count;} function replace(){C=function(x){this.value=x*10;};touch=function(o){o.value+=20;return o;};}", "caller.js").unwrap();
+        assert_eq!(
+            engine.call("main", &[]).unwrap().value(),
+            Value::number(6.0)
+        );
+        engine.call("replace", &[]).unwrap();
+        assert_eq!(
+            engine.call("main", &[]).unwrap().value(),
+            Value::number(51.0)
+        );
+        engine
+            .compile(
+                "C=function(x){this.value=x*100;}; touch=function(o){return o;};",
+                "replacement.js",
+            )
+            .unwrap();
+        assert_eq!(
+            engine.call("main", &[]).unwrap().value(),
+            Value::number(301.0)
+        );
     }
 }

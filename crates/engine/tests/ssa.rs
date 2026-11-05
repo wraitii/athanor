@@ -17,7 +17,7 @@ fn engines() -> impl Iterator<Item = Engine> {
 }
 
 #[test]
-fn numeric_analysis_preserves_mixed_paths_loops_and_calls() {
+fn numeric_lowering_preserves_mixed_paths_loops_and_calls() {
     let source = r#"
         function add(x) { return x + 1; }
         function* values(x) { yield x * 2; x = 's'; yield x + 1; }
@@ -44,7 +44,7 @@ fn numeric_analysis_preserves_mixed_paths_loops_and_calls() {
 }
 
 #[test]
-fn numeric_analysis_preserves_nan_signed_zero_and_runtime_errors() {
+fn numeric_lowering_preserves_nan_signed_zero_and_runtime_errors() {
     for mut engine in engines() {
         engine.compile(
             "function main() { let zero = -0; let nan = 0/0; let infinity = 1/0; return 1/zero === -infinity && nan !== nan && infinity * 0 !== infinity * 0; }",
@@ -651,5 +651,28 @@ fn semantic_bit_loop_preserves_tdz_and_const_errors() {
             expected = Some(errors);
         }
         assert!(engine.compile(invalid, "semantic-bit-const.js").is_err());
+    }
+}
+
+#[test]
+fn mixed_relational_comparisons_preserve_coercions_and_string_ordering() {
+    let source = r#"
+        function less(value, number) { return value < number; }
+        function main() {
+            for (let i = 0; i < 4; ++i) {
+                const mixed = i & 1 ? '12' : 12;
+                if (!(mixed < 20) || mixed < 10 || mixed >= 20 || !(mixed > 10))
+                    return false;
+            }
+            return less('2', 10) && !less('12', 10) && less('12', '2') &&
+                !less('invalid', 10) && !less(0 / 0, 10) && less(null, 1) &&
+                less(false, 1) && !less(undefined, 1);
+        }
+        function fail() { return {} < 1; }
+    "#;
+    for mut engine in engines() {
+        engine.compile(source, "mixed-comparisons.js").unwrap();
+        assert_eq!(engine.call("main", &[]).unwrap().value(), Value::TRUE);
+        assert!(matches!(engine.call("fail", &[]), Err(Error::Runtime(_))));
     }
 }

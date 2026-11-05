@@ -17,8 +17,8 @@ use oxc_syntax::symbol::SymbolId;
 use crate::EngineOptions;
 use crate::error::{Error, compile_at, unsupported_at};
 
-use super::numeric::{Annotations, FunctionBody};
-use super::{analysis::CaptureAnalysis, emit, helpers, jitdump, numeric};
+use super::clif::{Annotations, FunctionBody};
+use super::{analysis::CaptureAnalysis, emit, helpers, jitdump, temporaries};
 
 pub(crate) struct CompiledFunction {
     pub(crate) name: String,
@@ -27,7 +27,19 @@ pub(crate) struct CompiledFunction {
     pub(crate) generator: bool,
 }
 
+#[derive(Clone)]
+struct Emission {
+    inlines: Vec<super::semantic::specialize::Inline>,
+    reads: Vec<super::semantic::reads::Read>,
+    source_name: (usize, usize),
+    params: oxc_span::Span,
+    closures: HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
+}
+
 pub(crate) struct Compiler {
+    emissions: HashMap<FuncId, Emission>,
+    sources: HashMap<usize, (String, String)>,
+    observation_caches: Vec<Box<super::planner::ObservationCache>>,
     names: Vec<Box<str>>,
     cells: Vec<Box<u64>>,
     property_caches: Vec<Box<helpers::PropertyCache>>,
@@ -41,6 +53,7 @@ pub(crate) struct Compiler {
     dump: Option<jitdump::Writer>,
     dump_ir: bool,
     ssa_opt: bool,
+    get_refinement: bool,
     ssa_dump: bool,
     compile_dump: bool,
     compile_ir: bool,
@@ -83,6 +96,9 @@ impl Compiler {
         let dump = options.jitdump.then(jitdump::Writer::new).flatten();
         let dump_ir = dump.is_some() && options.jitdump_ir;
         Ok(Self {
+            emissions: HashMap::new(),
+            sources: HashMap::new(),
+            observation_caches: Vec::new(),
             names: Vec::new(),
             cells: Vec::new(),
             property_caches: Vec::new(),
@@ -96,6 +112,7 @@ impl Compiler {
             dump,
             dump_ir,
             ssa_opt: options.ssa_opt,
+            get_refinement: options.get_refinement,
             ssa_dump: options.ssa_dump,
             compile_dump: options.compile_dump,
             compile_ir: options.compile_ir,
@@ -146,6 +163,13 @@ impl Compiler {
         let filename: Box<str> = filename.into();
         self.source_name = (filename.as_ptr() as usize, filename.len());
         self.names.push(filename);
+        self.sources.insert(
+            self.source_name.0,
+            (source.to_owned(), source_path.to_owned()),
+        );
+        self.canonical
+            .sources
+            .insert(self.source_name.0, self.source_name.1);
         let result = self.compile_program_inner(program, scoping, nodes, source, source_path);
         if result.is_err() {
             self.context.clear();
@@ -365,6 +389,40 @@ impl Compiler {
                 .insert(self.source_name.0, name, ids[name], canonical);
         }
 
+        let arrows: HashSet<u32> = nodes
+            .iter()
+            .filter_map(|node| match node.kind() {
+                AstKind::ArrowFunctionExpression(function) => Some(function.span.start),
+                _ => None,
+            })
+            .collect();
+        for (id, span, params, statements, expression, generator, _, _) in &nested {
+            if *generator {
+                continue;
+            }
+            let canonical = super::semantic::canonical_for_emission(
+                params,
+                statements,
+                *expression,
+                *span,
+                scoping,
+                &analysis.captured,
+                &closures[&span.start].1,
+                &closures,
+                analysis.arguments_bindings.get(&span.start).copied(),
+                &analysis.arguments_references,
+                false,
+                self.ssa_opt,
+            )
+            .map_err(Error::Unsupported)?;
+            self.canonical.insert_closure(
+                self.source_name.0,
+                *id,
+                canonical,
+                arrows.contains(&span.start),
+            );
+        }
+
         if self.compile_dump && self.compile_semantic_ir {
             for (name, function) in &ordered {
                 let graph = super::semantic::canonical_for_emission(
@@ -545,6 +603,41 @@ impl Compiler {
             .filter(|id| Some(*id) != initializer)
             .collect();
 
+        self.finish_functions(pending, source, source_path, &lines)?;
+
+        let mut functions = Vec::with_capacity(ordered.len());
+        for (name, function) in ordered {
+            functions.push(CompiledFunction {
+                name: name.clone(),
+                arity: function.params.items.len(),
+                code: ids[&name].as_u32() as u64,
+                generator: function.generator,
+            });
+        }
+        self.functions = ids;
+        Ok((
+            functions,
+            globals,
+            initializer.map(|id| self.module.get_finalized_function(id) as usize),
+            compiled_ids
+                .into_iter()
+                .map(|id| {
+                    (
+                        id.as_u32() as u64,
+                        self.module.get_finalized_function(id) as usize,
+                    )
+                })
+                .collect(),
+        ))
+    }
+
+    fn finish_functions(
+        &mut self,
+        pending: Vec<(FuncId, FunctionBody)>,
+        source: &str,
+        source_path: &str,
+        lines: &[u32],
+    ) -> Result<(), Error> {
         let mut dumped = Vec::new();
         for (id, mut code) in pending {
             let mut listing = None;
@@ -555,76 +648,18 @@ impl Compiler {
                 .get(&id)
                 .cloned()
                 .unwrap_or_else(|| format!("jsfn_{}", id.as_u32()));
-            if self.compile_dump {
-                for region in &code.annotations.semantic_regions {
-                    println!("[{name}] semantic loop (before CLIF optimization)\n{region}");
-                }
-            }
-            if self.ssa_opt || self.ssa_dump {
-                let analysis = numeric::Analysis::compute(&self.context.func, &code.annotations);
+            if self.ssa_opt {
+                super::read_scope::specialize(
+                    &mut self.context,
+                    &mut code.annotations,
+                    &mut self.module,
+                    self.helpers[helpers::Helper::IndexRoot as usize],
+                    self.helpers[helpers::Helper::IndexProbe as usize],
+                );
+                let removed =
+                    temporaries::remove_empty_clears(&mut self.context.func, &code.annotations);
                 if self.ssa_dump {
-                    analysis.dump(&self.context.func, &name, &code.annotations);
-                }
-                if self.ssa_opt {
-                    let mut analysis = analysis;
-                    let mut rewritten = 0;
-                    loop {
-                        analysis.simplify(&mut self.context.func);
-                        code.annotations.prune(&self.context.func);
-                        let count = numeric::simplify_constant_branches(&mut self.context.func);
-                        rewritten += count;
-                        if count == 0 {
-                            break;
-                        }
-                        self.context.flowgraph();
-                        self.context
-                            .eliminate_unreachable_code(self.module.isa())
-                            .map_err(|error| Error::Compile(error.to_string()))?;
-                        code.annotations.prune(&self.context.func);
-                        analysis =
-                            numeric::Analysis::compute(&self.context.func, &code.annotations);
-                    }
-                    if self.ssa_dump {
-                        eprintln!("js ssa [{name}]: simplified {rewritten} constant branches");
-                    }
-                    let reused = super::read_scope::specialize(
-                        &mut self.context,
-                        &mut code.annotations,
-                        &mut self.module,
-                        self.helpers[helpers::Helper::IndexRoot as usize],
-                        self.helpers[helpers::Helper::IndexProbe as usize],
-                    );
-                    if self.ssa_dump {
-                        let count = usize::from(reused.is_some());
-                        let lifetime = reused.map(|(lifetime, _)| lifetime);
-                        eprintln!(
-                            "js ssa [{name}]: {count} scoped indexed reads reused; lifetime: {lifetime:?}"
-                        );
-                        if reused.is_some_and(|(_, shared)| shared) {
-                            eprintln!("js ssa [{name}]: shared existing indexed storage guard");
-                        }
-                    }
-                    let analysis =
-                        numeric::Analysis::compute(&self.context.func, &code.annotations);
-                    let numeric_get = self.module.declare_func_in_func(
-                        self.helpers[helpers::Helper::IndexGetNumeric as usize],
-                        &mut self.context.func,
-                    );
-                    analysis.specialize_index_gets(
-                        &mut self.context.func,
-                        &mut code.annotations,
-                        numeric_get,
-                    );
-                    let analysis =
-                        numeric::Analysis::compute(&self.context.func, &code.annotations);
-                    let removed = analysis
-                        .remove_empty_temp_clears(&mut self.context.func, &mut code.annotations);
-                    if self.ssa_dump {
-                        eprintln!("js ssa [{name}]: removed {removed} empty temporary clears");
-                    }
-                    self.context
-                        .verify(self.module.isa())
-                        .map_err(|error| Error::Compile(error.to_string()))?;
+                    eprintln!("js ssa [{name}]: removed {removed} empty temporary clears");
                 }
             }
             if let Some(semantic) = &code.listing {
@@ -640,7 +675,6 @@ impl Compiler {
                 if self.compile_ir {
                     println!("[{name}] IR\n{}", self.context.func.display());
                 }
-                self.context.set_disasm(self.compile_asm);
             }
             self.module
                 .define_function(id, &mut self.context)
@@ -650,10 +684,15 @@ impl Compiler {
                     .context
                     .compiled_code()
                     .ok_or_else(|| Error::Compile("missing compiled code".into()))?;
-                println!(
-                    "[{name}] machine code\n{}",
-                    compiled.vcode.as_deref().unwrap_or("unavailable")
-                );
+                let disassembler = self
+                    .module
+                    .isa()
+                    .to_capstone()
+                    .map_err(|error| Error::Compile(error.to_string()))?;
+                let asm = compiled
+                    .disassemble(Some(&self.context.func.params), &disassembler)
+                    .map_err(|error| Error::Compile(error.to_string()))?;
+                println!("[{name}] machine code\n{asm}");
             }
             if self.dump.is_some() {
                 let Some(compiled) = self.context.compiled_code() else {
@@ -722,30 +761,115 @@ impl Compiler {
             }
         }
 
-        let mut functions = Vec::with_capacity(ordered.len());
-        for (name, function) in ordered {
-            functions.push(CompiledFunction {
-                name: name.clone(),
-                arity: function.params.items.len(),
-                code: ids[&name].as_u32() as u64,
-                generator: function.generator,
-            });
+        Ok(())
+    }
+
+    pub(crate) fn recompile(
+        &mut self,
+        code: u64,
+        planner: &super::planner::Planner,
+    ) -> Result<Option<usize>, Error> {
+        let result = self.recompile_inner(code, planner);
+        if result.is_err() {
+            self.context.clear();
+            self.builder_context = FunctionBuilderContext::new();
         }
-        self.functions = ids;
-        Ok((
-            functions,
-            globals,
-            initializer.map(|id| self.module.get_finalized_function(id) as usize),
-            compiled_ids
-                .into_iter()
-                .map(|id| {
-                    (
-                        id.as_u32() as u64,
-                        self.module.get_finalized_function(id) as usize,
-                    )
-                })
-                .collect(),
-        ))
+        result
+    }
+
+    fn recompile_inner(
+        &mut self,
+        code: u64,
+        planner: &super::planner::Planner,
+    ) -> Result<Option<usize>, Error> {
+        let Ok(code) = u32::try_from(code) else {
+            return Ok(None);
+        };
+        let code = FuncId::from_u32(code);
+        let Some(emission) = self.emissions.get(&code).cloned() else {
+            return Ok(None);
+        };
+        for (site, target) in planner.targets() {
+            if let Ok(target) = u32::try_from(target) {
+                self.canonical
+                    .feedback
+                    .insert(site, FuncId::from_u32(target));
+            }
+        }
+        if self.get_refinement {
+            for (site, element) in planner.reads() {
+                self.canonical.read_feedback.insert(site, element);
+            }
+        }
+        let Some((source, canonical)) = self.canonical.emission(code) else {
+            return Ok(None);
+        };
+        let planned = super::semantic::plan_canonical(
+            canonical,
+            self.ssa_opt,
+            Some((&self.canonical, source)),
+        )
+        .map_err(Error::Unsupported)?;
+        if planned.inlines == emission.inlines && planned.reads == emission.reads {
+            return Ok(None);
+        }
+        let graph = super::semantic::optimize_planned(planned).map_err(Error::Unsupported)?;
+        if self.compile_dump && self.compile_semantic_ir {
+            println!(
+                "[recompile {}] semantic IR\n{}",
+                self.function_names[&code], graph
+            );
+        }
+        let mut annotations = Annotations {
+            semantic_locations: self.dump_ir,
+            ..Annotations::default()
+        };
+        self.context.clear();
+        self.context.func.signature = self.signature.clone();
+        {
+            let mut builder = cranelift_frontend::FunctionBuilder::new(
+                &mut self.context.func,
+                &mut self.builder_context,
+            );
+            emit::build_function(
+                &mut builder,
+                &mut self.module,
+                &self.helpers,
+                &mut annotations,
+                &mut self.names,
+                &mut self.cells,
+                &mut self.property_caches,
+                emission.source_name,
+                emission.params,
+                &emission.closures,
+                emit::FunctionKind::Ordinary,
+                &graph.graph,
+                Some(emit::Feedback {
+                    get_refinement: self.get_refinement,
+                    owner: code.as_u32() as u64,
+                    caches: &mut self.observation_caches,
+                }),
+            )?;
+            builder.seal_all_blocks();
+            builder.finalize();
+        }
+        let body = FunctionBody {
+            function: std::mem::replace(
+                &mut self.context.func,
+                cranelift_codegen::ir::Function::new(),
+            ),
+            annotations,
+            listing: self.dump_ir.then(|| graph.listing_lines()),
+        };
+        let label = self.function_names[&code].clone();
+        let id = self.declare_js(&format!("{label}.feedback"), 1)?;
+        let (source, filename) = self.sources[&source].clone();
+        let lines = line_starts(&source);
+        self.finish_functions(vec![(id, body)], &source, &filename, &lines)?;
+        let emission = self.emissions.get_mut(&code).unwrap();
+        emission.inlines = graph.inlines;
+        emission.reads = graph.reads;
+        Ok(Some(self.module.get_finalized_function(id) as usize))
     }
 
     fn compile_callable(
@@ -858,6 +982,23 @@ impl Compiler {
             })
             .transpose()
             .map_err(Error::Unsupported)?;
+        let feedback = if self.ssa_opt && matches!(kind, emit::FunctionKind::Ordinary) {
+            semantic_function.and_then(|span| self.canonical.code(self.source_name.0, span.start))
+        } else {
+            None
+        };
+        if let Some(code) = feedback {
+            self.emissions.insert(
+                code,
+                Emission {
+                    inlines: graph.as_ref().unwrap().inlines.clone(),
+                    reads: graph.as_ref().unwrap().reads.clone(),
+                    source_name: self.source_name,
+                    params: params.span,
+                    closures: closures.clone(),
+                },
+            );
+        }
         let mut annotations = Annotations {
             semantic_locations: self.dump_ir,
             ..Annotations::default()
@@ -879,10 +1020,15 @@ impl Compiler {
                     &mut self.cells,
                     &mut self.property_caches,
                     self.source_name,
-                    params,
+                    params.span,
                     closures,
                     kind,
                     &graph.graph,
+                    feedback.map(|owner| emit::Feedback {
+                        get_refinement: self.get_refinement,
+                        owner: owner.as_u32() as u64,
+                        caches: &mut self.observation_caches,
+                    }),
                 )?;
             } else if let emit::FunctionKind::Factory(resume) = kind {
                 emit::build_factory(
@@ -894,7 +1040,7 @@ impl Compiler {
                     &mut self.cells,
                     &mut self.property_caches,
                     self.source_name,
-                    params,
+                    params.span,
                     closures,
                     resume,
                 )?;
@@ -960,6 +1106,9 @@ fn function_label(
             }
             AstKind::Function(function) => {
                 if let Some(identifier) = &function.id {
+                    if parts.is_empty() {
+                        parts.push("closure".into());
+                    }
                     parts.push(identifier.name.to_string());
                 }
             }

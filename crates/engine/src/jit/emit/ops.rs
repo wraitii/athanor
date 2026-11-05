@@ -5,10 +5,14 @@ use cranelift_module::Module;
 use oxc_syntax::operator::BinaryOperator;
 
 use crate::heap::{
-    DATA_OFFSET, HOLE, KIND_OFFSET, LENGTH_OFFSET, MathFunction, NO_ELEMENTS, SHAPE_OFFSET, kind,
+    DATA_OFFSET, HOLE, KIND_OFFSET, LENGTH_OFFSET, MathFunction, NO_ELEMENTS, SHAPE_OFFSET,
+    TypedKind, kind,
 };
-use crate::jit::helpers::{CACHE_INDEX_OFFSET, CACHE_SHAPE_OFFSET, Helper, PropertyCache};
-use crate::jit::numeric::{IndexedRead, IndexedReadContract, Kind};
+use crate::jit::clif::{IndexedRead, IndexedReadContract};
+use crate::jit::helpers::{
+    CACHE_HOLDER_OFFSET, CACHE_HOLDER_SHAPE_OFFSET, CACHE_INDEX_OFFSET, CACHE_SHAPE_OFFSET, Helper,
+    PropertyCache,
+};
 use crate::value::Value;
 use crate::value::{TAG_FIRST, TAG_OBJECT, TAG_SHIFT, TAG_SPAN, TAG_STRING};
 
@@ -61,6 +65,21 @@ impl Element {
                 Self::F32 => kind::ELEMENT_FLOAT | 2,
                 Self::F64 => kind::ELEMENT_FLOAT | 3,
             }
+    }
+}
+
+impl From<TypedKind> for Element {
+    fn from(kind: TypedKind) -> Self {
+        match kind {
+            TypedKind::Uint8 => Self::U8,
+            TypedKind::Uint16 => Self::U16,
+            TypedKind::Uint32 => Self::U32,
+            TypedKind::Int8 => Self::I8,
+            TypedKind::Int16 => Self::I16,
+            TypedKind::Int32 => Self::I32,
+            TypedKind::Float32 => Self::F32,
+            TypedKind::Float64 => Self::F64,
+        }
     }
 }
 
@@ -182,11 +201,7 @@ pub(super) fn binary_operator(operator: BinaryOperator) -> BinaryOp {
 
 impl FunctionCompiler<'_, '_> {
     pub(super) fn constant(&mut self, value: Value) -> ClifValue {
-        let result = self.b.ins().iconst(types::I64, value.bits() as i64);
-        self.annotations
-            .constants
-            .insert(result, Kind::of_constant(value));
-        result
+        self.b.ins().iconst(types::I64, value.bits() as i64)
     }
 
     pub(super) fn is_number(&mut self, value: ClifValue) -> ClifValue {
@@ -196,8 +211,6 @@ impl FunctionCompiler<'_, '_> {
             .b
             .ins()
             .icmp_imm(IntCC::UnsignedGreaterThan, offset, TAG_SPAN as i64);
-        let inst = self.b.func.dfg.value_def(condition).unwrap_inst();
-        self.annotations.guards.insert(inst, value);
         condition
     }
 
@@ -304,7 +317,7 @@ impl FunctionCompiler<'_, '_> {
             | BinaryOp::LooseEqual
             | BinaryOp::LooseNotEqual
             | BinaryOp::StrictEqual
-            | BinaryOp::StrictNotEqual => self.numeric_comparison(op, left, right),
+            | BinaryOp::StrictNotEqual => self.numeric_comparison(op, left, right, None),
             _ => self.binary_helper(op, left, right),
         }
     }
@@ -323,10 +336,6 @@ impl FunctionCompiler<'_, '_> {
     fn integer_binary(&mut self, op: BinaryOp, left: ClifValue, right: ClifValue) -> ClifValue {
         let (left_int, left_guard) = ir_helpers::unbox_int32(self.b, left);
         let (right_int, right_guard) = ir_helpers::unbox_int32(self.b, right);
-        for (guard, value) in [(left_guard, left), (right_guard, right)] {
-            let inst = self.b.func.dfg.value_def(guard).unwrap_inst();
-            self.annotations.int32_guards.insert(inst, value);
-        }
         let both = self.b.ins().band(left_guard, right_guard);
         let fast = self.b.create_block();
         let slow = self.b.create_block();
@@ -344,16 +353,12 @@ impl FunctionCompiler<'_, '_> {
             BinaryOp::ShiftRightUnsigned => self.b.ins().ushr(left_int, right_int),
             _ => unreachable!(),
         };
-        let (result, kind) = if matches!(op, BinaryOp::ShiftRightUnsigned) {
+        let result = if matches!(op, BinaryOp::ShiftRightUnsigned) {
             let float = self.b.ins().fcvt_from_uint(types::F64, integer);
-            (
-                self.b.ins().bitcast(types::I64, MemFlags::new(), float),
-                Kind::Number,
-            )
+            self.b.ins().bitcast(types::I64, MemFlags::new(), float)
         } else {
-            (ir_helpers::box_int32(self.b, integer), Kind::Int32)
+            ir_helpers::box_int32(self.b, integer)
         };
-        self.annotations.results.insert(result, kind);
         self.jump(done, &[BlockArg::Value(result)]);
 
         self.switch(slow);
@@ -411,7 +416,6 @@ impl FunctionCompiler<'_, '_> {
         let bits = self.b.ins().bitcast(types::I64, MemFlags::new(), result);
         let nan = self.constant(Value::number(f64::NAN));
         let boxed = self.b.ins().select(unordered, nan, bits);
-        self.annotations.results.insert(boxed, Kind::Number);
         self.jump(done, &[BlockArg::Value(boxed)]);
 
         self.switch(slow_block);
@@ -426,11 +430,12 @@ impl FunctionCompiler<'_, '_> {
         &mut self,
         left: ClifValue,
         right: ClifValue,
+        guards: Option<(ClifValue, ClifValue)>,
         fast: impl FnOnce(&mut Self, ClifValue, ClifValue) -> ClifValue,
         slow: impl FnOnce(&mut Self) -> ClifValue,
     ) -> ClifValue {
-        let left_number = self.is_number(left);
-        let right_number = self.is_number(right);
+        let (left_number, right_number) =
+            guards.unwrap_or_else(|| (self.is_number(left), self.is_number(right)));
         let both = self.b.ins().band(left_number, right_number);
         let fast_block = self.b.create_block();
         let slow_block = self.b.create_block();
@@ -454,6 +459,7 @@ impl FunctionCompiler<'_, '_> {
         self.numeric_fast_path(
             left,
             right,
+            None,
             |compiler, left, right| {
                 let left_float = compiler.b.ins().bitcast(types::F64, MemFlags::new(), left);
                 let right_float = compiler.b.ins().bitcast(types::F64, MemFlags::new(), right);
@@ -471,17 +477,23 @@ impl FunctionCompiler<'_, '_> {
                     .bitcast(types::I64, MemFlags::new(), result);
                 let nan = compiler.constant(Value::number(f64::NAN));
                 let boxed = compiler.b.ins().select(unordered, nan, bits);
-                compiler.annotations.results.insert(boxed, Kind::Number);
                 boxed
             },
             |compiler| compiler.binary_helper(op, left, right),
         )
     }
 
-    fn numeric_comparison(&mut self, op: BinaryOp, left: ClifValue, right: ClifValue) -> ClifValue {
+    pub(super) fn numeric_comparison(
+        &mut self,
+        op: BinaryOp,
+        left: ClifValue,
+        right: ClifValue,
+        guards: Option<(ClifValue, ClifValue)>,
+    ) -> ClifValue {
         self.numeric_fast_path(
             left,
             right,
+            guards,
             |compiler, left, right| {
                 let left_float = compiler.b.ins().bitcast(types::F64, MemFlags::new(), left);
                 let right_float = compiler.b.ins().bitcast(types::F64, MemFlags::new(), right);
@@ -528,15 +540,23 @@ impl FunctionCompiler<'_, '_> {
     pub(super) fn index_access(
         &mut self,
         object: ClifValue,
-        index: ClifValue,
+        index: Operand,
         value: Option<ClifValue>,
     ) -> ClifValue {
-        let result = match value {
-            Some(value) => self.call_helper(Helper::IndexSet, &[object, index, value]),
-            None => self.call_helper(Helper::IndexGet, &[object, index]),
+        if let Some(value) = value {
+            let index = self.convert(index, Repr::Boxed);
+            let result = self.call_helper(Helper::IndexSet, &[object, index, value]);
+            self.check_error();
+            return result;
+        }
+        let (helper, index) = if matches!(index.repr, Repr::Float | Repr::Int32) {
+            (Helper::IndexGetNumeric, self.convert(index, Repr::Float))
+        } else {
+            (Helper::IndexGet, index.value)
         };
+        let result = self.call_helper(helper, &[object, index]);
         self.check_error();
-        if value.is_none() {
+        if helper == Helper::IndexGet {
             self.annotations.indexed_reads.push(IndexedRead {
                 call: self.b.func.dfg.value_def(result).unwrap_inst(),
                 receiver: object,
@@ -617,6 +637,48 @@ impl FunctionCompiler<'_, '_> {
         self.viewed_index_access(view, object, key, None, true, retain)
     }
 
+    pub(super) fn typed_kind_is(&mut self, view: ClifValue, kind: TypedKind) -> ClifValue {
+        let actual = self.view_kind(view);
+        let expected = Element::from(kind).kind();
+        self.b.ins().icmp_imm(IntCC::Equal, actual, expected as i64)
+    }
+
+    /// Reads an element of a typed array of known kind at an index known to be in bounds.
+    pub(super) fn bounded_element_read(
+        &mut self,
+        view: ClifValue,
+        key: Operand,
+        kind: TypedKind,
+    ) -> Operand {
+        let element = Element::from(kind);
+        let flags = MemFlags::trusted();
+        let position = if key.repr == Repr::Int32 {
+            self.b.ins().sextend(types::I64, key.value)
+        } else {
+            let key = self.convert(key, Repr::Float);
+            self.b.ins().fcvt_to_sint_sat(types::I64, key)
+        };
+        let data = self.b.ins().load(self.pointer, flags, view, DATA_OFFSET);
+        let offset = self.b.ins().imul_imm(position, element.bytes() as i64);
+        let address = self.b.ins().iadd(data, offset);
+        let raw = self.b.ins().load(element.into(), flags, address, 0);
+        match element {
+            Element::F64 => Operand::new(raw, Repr::Float),
+            Element::F32 => Operand::new(self.b.ins().fpromote(types::F64, raw), Repr::Float),
+            Element::U32 => {
+                let wide = self.b.ins().uextend(types::I64, raw);
+                Operand::new(self.b.ins().fcvt_from_sint(types::F64, wide), Repr::Float)
+            }
+            Element::U8 | Element::U16 => {
+                Operand::new(self.b.ins().uextend(types::I32, raw), Repr::Int32)
+            }
+            Element::I8 | Element::I16 => {
+                Operand::new(self.b.ins().sextend(types::I32, raw), Repr::Int32)
+            }
+            Element::I32 => Operand::new(raw, Repr::Int32),
+        }
+    }
+
     pub(super) fn viewed_index_access(
         &mut self,
         view: ClifValue,
@@ -690,8 +752,7 @@ impl FunctionCompiler<'_, '_> {
                 let retain = self.b.create_block();
                 self.brif(heap, retain, &[], done, &[BlockArg::Value(bits)]);
                 self.switch(retain);
-                let retained = self.call_helper(Helper::TempRetain, &[bits]);
-                self.check_error();
+                let retained = self.retain_temporary(bits);
                 self.jump(done, &[BlockArg::Value(retained)]);
             } else {
                 self.jump(done, &[BlockArg::Value(bits)]);
@@ -779,9 +840,8 @@ impl FunctionCompiler<'_, '_> {
 
         self.switch(slow);
         let result = if fallback {
-            let index = self.convert(key, Repr::Boxed);
             let value = value.map(|value| self.convert(value, Repr::Boxed));
-            self.index_access(object, index, value)
+            self.index_access(object, key, value)
         } else {
             self.constant(Value::UNDEFINED)
         };
@@ -791,7 +851,6 @@ impl FunctionCompiler<'_, '_> {
     }
 
     pub(super) fn global_access(&mut self, name: &str, value: Option<ClifValue>) -> ClifValue {
-        let annotation_name = name.to_owned();
         let name: Box<str> = name.into();
         let ptr = self.b.ins().iconst(self.pointer, name.as_ptr() as i64);
         let len = self.b.ins().iconst(types::I64, name.len() as i64);
@@ -800,10 +859,6 @@ impl FunctionCompiler<'_, '_> {
             Some(value) => self.call_helper(Helper::GlobalSet, &[ptr, len, value]),
             None => self.call_helper(Helper::GlobalGet, &[ptr, len]),
         };
-        if value.is_none() {
-            let call = self.b.func.dfg.value_def(result).unwrap_inst();
-            self.annotations.names.insert(call, annotation_name);
-        }
         self.check_error();
         result
     }
@@ -843,12 +898,23 @@ impl FunctionCompiler<'_, '_> {
             .b
             .ins()
             .load(types::I32, flags, address, CACHE_SHAPE_OFFSET);
-        let hit = self.b.ins().icmp(IntCC::Equal, shape, expected);
-        let valid =
+        let holder = self
+            .b
+            .ins()
+            .load(self.pointer, flags, address, CACHE_HOLDER_OFFSET);
+        let own = self.b.ins().icmp_imm(IntCC::Equal, holder, 0);
+        let holder = self.b.ins().select(own, view, holder);
+        let holder_shape = self.b.ins().load(types::I32, flags, holder, SHAPE_OFFSET);
+        let expected_holder =
             self.b
                 .ins()
-                .icmp_imm(IntCC::NotEqual, expected, crate::heap::DICTIONARY as i64);
-        let hit = self.b.ins().band(hit, valid);
+                .load(types::I32, flags, address, CACHE_HOLDER_SHAPE_OFFSET);
+        let receiver_hit = self.b.ins().icmp(IntCC::Equal, shape, expected);
+        let holder_hit = self
+            .b
+            .ins()
+            .icmp(IntCC::Equal, holder_shape, expected_holder);
+        let hit = self.b.ins().band(receiver_hit, holder_hit);
         let inline = self.b.create_block();
         let slow = self.b.create_block();
         let done = self.b.create_block();
@@ -863,7 +929,7 @@ impl FunctionCompiler<'_, '_> {
             .load(types::I32, flags, address, CACHE_INDEX_OFFSET);
         let index = self.b.ins().uextend(types::I64, index);
         let offset = self.b.ins().ishl_imm(index, 3);
-        let data = self.b.ins().load(self.pointer, flags, view, DATA_OFFSET);
+        let data = self.b.ins().load(self.pointer, flags, holder, DATA_OFFSET);
         let slot = self.b.ins().iadd(data, offset);
         let bits = self.b.ins().load(types::I64, flags, slot, 0);
         if retain {
@@ -871,8 +937,7 @@ impl FunctionCompiler<'_, '_> {
             let retain = self.b.create_block();
             self.brif(heap, retain, &[], done, &[BlockArg::Value(bits)]);
             self.switch(retain);
-            let retained = self.call_helper(Helper::TempRetain, &[bits]);
-            self.check_error();
+            let retained = self.retain_temporary(bits);
             self.jump(done, &[BlockArg::Value(retained)]);
         } else {
             self.jump(done, &[BlockArg::Value(bits)]);
@@ -892,7 +957,6 @@ impl FunctionCompiler<'_, '_> {
         name: &str,
         value: Option<ClifValue>,
     ) -> ClifValue {
-        let annotation_name = name.to_owned();
         let name: Box<str> = name.into();
         let ptr = self.b.ins().iconst(self.pointer, name.as_ptr() as i64);
         let len = self.b.ins().iconst(types::I64, name.len() as i64);
@@ -901,10 +965,6 @@ impl FunctionCompiler<'_, '_> {
             Some(value) => self.call_helper(Helper::PropertySet, &[object, ptr, len, value]),
             None => self.call_helper(Helper::PropertyGet, &[object, ptr, len]),
         };
-        if value.is_none() {
-            let call = self.b.func.dfg.value_def(result).unwrap_inst();
-            self.annotations.names.insert(call, annotation_name);
-        }
         self.check_error();
         result
     }
@@ -933,22 +993,12 @@ impl FunctionCompiler<'_, '_> {
 
     pub(super) fn check_error(&mut self) {
         // Execution reaches a helper with no pending exception; catch entry clears it.
-        let helper_call = self
+        let can_throw = self
             .b
             .current_block()
             .and_then(|block| self.b.func.layout.last_inst(block))
-            .and_then(|inst| {
-                self.annotations
-                    .helpers
-                    .get(&inst)
-                    .map(|&helper| (inst, helper))
-            });
-        let can_throw = helper_call.is_none_or(|(_, helper)| helper.can_throw());
-        let numeric_result = helper_call.and_then(|(inst, helper)| {
-            helper
-                .result_kind_on_success()
-                .map(|kind| (self.b.func.dfg.first_result(inst), kind))
-        });
+            .and_then(|inst| self.annotations.helpers.get(&inst))
+            .is_none_or(|helper| helper.can_throw());
         let dummy = self.constant(Value::UNDEFINED);
         let condition = self.pending(crate::jit::session::ERROR_OFFSET, 0);
         let failed = self.b.create_block();
@@ -966,13 +1016,6 @@ impl FunctionCompiler<'_, '_> {
         self.jump(self.return_block, &[BlockArg::Value(dummy)]);
         self.switch(done);
         if !can_throw {
-            if let Some((result, kind)) = numeric_result {
-                self.annotations
-                    .continuations
-                    .entry(done)
-                    .or_default()
-                    .push((result, kind));
-            }
             return;
         }
         let condition = self.pending(

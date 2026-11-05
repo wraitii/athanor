@@ -38,6 +38,7 @@ pub struct EngineOptions {
     pub jitdump: bool,
     pub jitdump_ir: bool,
     pub ssa_opt: bool,
+    pub get_refinement: bool,
     pub ssa_dump: bool,
     pub compile_dump: bool,
     pub compile_ir: bool,
@@ -55,6 +56,7 @@ impl Default for EngineOptions {
             jitdump: matches!(jitdump, Some("1" | "2")),
             jitdump_ir: jitdump == Some("2"),
             ssa_opt: std::env::var("JS_JIT_SSA").as_deref() != Ok("0"),
+            get_refinement: std::env::var("JS_JIT_GET_REFINEMENT").as_deref() != Ok("0"),
             ssa_dump: std::env::var("JS_JIT_SSA_DUMP").as_deref() == Ok("1"),
             compile_dump: false,
             compile_ir: false,
@@ -67,10 +69,12 @@ impl Default for EngineOptions {
 
 pub struct Engine {
     compiler: RefCell<Compiler>,
+    planner: RefCell<jit::Planner>,
     random_state: Cell<u64>,
     global: Environment,
     functions: RefCell<HashMap<String, Function>>,
-    code: RefCell<HashMap<u64, usize>>,
+    // Code IDs are function indices in this engine's persistent Cranelift module.
+    code: RefCell<Vec<Option<usize>>>,
     pub(crate) host: Option<Box<dyn Host>>,
 }
 
@@ -240,10 +244,11 @@ impl Engine {
         global.heap().release(seed_random);
         Ok(Self {
             compiler: RefCell::new(Compiler::new(options)?),
+            planner: RefCell::new(jit::Planner::default()),
             random_state: Cell::new(0x330e),
             global,
             functions: RefCell::new(HashMap::new()),
-            code: RefCell::new(HashMap::new()),
+            code: RefCell::new(Vec::new()),
             host: None,
         })
     }
@@ -284,8 +289,43 @@ impl Engine {
         Ok(())
     }
 
+    pub(crate) fn observe_call(&self, cache: &mut jit::planner::ObservationCache, target: u64) {
+        self.planner
+            .borrow_mut()
+            .observe(cache.owner, cache.site, target);
+        cache.recorded = 1;
+    }
+
+    pub(crate) fn observe_get(
+        &self,
+        cache: &mut jit::planner::ObservationCache,
+        observed: jit::planner::ReadType,
+        kind: jit::planner::ReadKind,
+    ) {
+        self.planner
+            .borrow_mut()
+            .observe_get(cache.owner, cache.site, kind, observed);
+        cache.recorded = 1;
+    }
+
     pub(crate) fn entry(&self, code: u64) -> Option<usize> {
-        self.code.borrow().get(&code).copied()
+        let recompile = self.planner.borrow_mut().take(code);
+        if recompile {
+            let result = self
+                .compiler
+                .borrow_mut()
+                .recompile(code, &self.planner.borrow());
+            match result {
+                Ok(Some(entry)) => self.code.borrow_mut()[code as usize] = Some(entry),
+                Ok(None) => {}
+                Err(error) => eprintln!("js jit: recompilation failed: {error}"),
+            }
+        }
+        self.code
+            .borrow()
+            .get(usize::try_from(code).ok()?)
+            .copied()
+            .flatten()
     }
 
     pub fn global(&self) -> &Environment {
@@ -410,7 +450,16 @@ impl Engine {
         for (name, mutable) in lexical {
             self.global.define_lexical(name, mutable);
         }
-        self.code.borrow_mut().extend(code);
+        {
+            let mut entries = self.code.borrow_mut();
+            for (code, entry) in code {
+                let index = usize::try_from(code).unwrap();
+                if entries.len() <= index {
+                    entries.resize(index + 1, None);
+                }
+                entries[index] = Some(entry);
+            }
+        }
         for function in functions {
             let value = self
                 .global
@@ -491,5 +540,423 @@ impl Engine {
             .cloned()
             .collect::<Vec<_>>()
             .into_iter()
+    }
+}
+
+#[cfg(test)]
+mod feedback_tests {
+    use super::*;
+
+    fn code(engine: &Engine, name: &str) -> u64 {
+        engine
+            .global
+            .heap()
+            .closure_code(engine.global.get_raw(name).unwrap())
+            .unwrap()
+            .0
+    }
+
+    fn entry(engine: &Engine, code: u64) -> usize {
+        engine.code.borrow()[code as usize].unwrap()
+    }
+
+    #[test]
+    fn method_feedback_reemits_once_and_guards_replacements() {
+        let mut engine = Engine::new().unwrap();
+        engine
+            .compile("Math.square=function(x){return x*x;};", "math.js")
+            .unwrap();
+        engine
+            .compile(
+                r#"
+            function distance(x, y) { return Math.square(x) + Math.square(y); }
+            function replace() { Math.square=function(x){return x+10;}; }
+        "#,
+                "distance.js",
+            )
+            .unwrap();
+        let code = code(&engine, "distance");
+        let original = entry(&engine, code);
+        assert_eq!(
+            engine
+                .call("distance", &[Value::number(3.0), Value::number(4.0)])
+                .unwrap()
+                .value(),
+            Value::number(25.0)
+        );
+        assert_eq!(entry(&engine, code), original);
+        assert_eq!(
+            engine
+                .call("distance", &[Value::number(3.0), Value::number(4.0)])
+                .unwrap()
+                .value(),
+            Value::number(25.0)
+        );
+        let optimized = entry(&engine, code);
+        assert_ne!(original, optimized);
+        engine.call("replace", &[]).unwrap();
+        for _ in 0..3 {
+            assert_eq!(
+                engine
+                    .call("distance", &[Value::number(3.0), Value::number(4.0)])
+                    .unwrap()
+                    .value(),
+                Value::number(27.0)
+            );
+            assert_eq!(entry(&engine, code), optimized);
+        }
+    }
+
+    #[test]
+    fn feedback_keeps_captures_receivers_and_heap_returns() {
+        let mut engine = Engine::new().unwrap();
+        engine
+            .compile(
+                r#"
+            function make(n) { return function(x) { return {value:this.base+n+x}; }; }
+            var first={base:10, run:make(2)};
+            var second={base:20, run:make(3)};
+            function invoke(o) { return o.run(4).value; }
+        "#,
+                "captures.js",
+            )
+            .unwrap();
+        let code = code(&engine, "invoke");
+        let original = entry(&engine, code);
+        for _ in 0..4 {
+            for (name, expected) in [("first", 16.0), ("second", 27.0)] {
+                let receiver = engine.global.get_raw(name).unwrap();
+                assert_eq!(
+                    engine.call("invoke", &[receiver]).unwrap().value(),
+                    Value::number(expected)
+                );
+                engine.drain_disposals(1000);
+            }
+        }
+        assert_ne!(entry(&engine, code), original);
+    }
+
+    #[test]
+    fn feedback_preserves_foreign_source_errors_and_recovery() {
+        let mut engine = Engine::new().unwrap();
+        engine
+            .compile(
+                "var object={run:function(x){return x.value;}};",
+                "callee.js",
+            )
+            .unwrap();
+        engine
+            .compile("function invoke(x){return object.run(x);}", "caller.js")
+            .unwrap();
+        let object = engine.global.heap().object().unwrap();
+        engine
+            .global
+            .heap()
+            .set_property(object, "value", Value::number(7.0));
+        assert_eq!(
+            engine.call("invoke", &[object]).unwrap().value(),
+            Value::number(7.0)
+        );
+        let error = engine
+            .call("invoke", &[Value::NULL])
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("callee.js:"), "{error}");
+        assert_eq!(
+            engine.call("invoke", &[object]).unwrap().value(),
+            Value::number(7.0)
+        );
+        engine.global.heap().release(object);
+    }
+
+    #[test]
+    fn constructor_body_feedback_survives_prototype_replacement() {
+        let mut engine = Engine::new().unwrap();
+        engine
+            .compile(
+                r#"
+            function C(x){this.set(x);}
+            C.prototype.set=function(x){this.value=x;};
+            function make(x){return new C(x).value;}
+            function replace(){C.prototype.set=function(x){this.value=x+10;};}
+        "#,
+                "constructors.js",
+            )
+            .unwrap();
+        let code = code(&engine, "make");
+        let original = entry(&engine, code);
+        for _ in 0..2 {
+            assert_eq!(
+                engine.call("make", &[Value::number(3.0)]).unwrap().value(),
+                Value::number(3.0)
+            );
+        }
+        assert_ne!(entry(&engine, code), original);
+        engine.call("replace", &[]).unwrap();
+        assert_eq!(
+            engine.call("make", &[Value::number(3.0)]).unwrap().value(),
+            Value::number(13.0)
+        );
+    }
+
+    #[test]
+    fn recursive_dispatch_can_replace_code_with_old_frames_active() {
+        let mut engine = Engine::new().unwrap();
+        engine
+            .compile(
+                r#"
+            var object={run:function(x){return x+1;}};
+            function recurse(n){let x=object.run(n);if(n>0)return x+recurse(n-1);return x;}
+        "#,
+                "recursive.js",
+            )
+            .unwrap();
+        let code = code(&engine, "recurse");
+        let original = entry(&engine, code);
+        assert_eq!(
+            engine
+                .call("recurse", &[Value::number(5.0)])
+                .unwrap()
+                .value(),
+            Value::number(21.0)
+        );
+        assert_ne!(entry(&engine, code), original);
+        assert_eq!(
+            engine
+                .call("recurse", &[Value::number(5.0)])
+                .unwrap()
+                .value(),
+            Value::number(21.0)
+        );
+    }
+
+    #[test]
+    fn ineligible_feedback_keeps_the_existing_entry() {
+        let mut engine = Engine::new().unwrap();
+        engine.compile(
+            "var object={run:function(x){return (()=>x)();}};function invoke(x){return object.run(x);}",
+            "ineligible.js",
+        ).unwrap();
+        let code = code(&engine, "invoke");
+        let original = entry(&engine, code);
+        for _ in 0..3 {
+            assert_eq!(
+                engine
+                    .call("invoke", &[Value::number(7.0)])
+                    .unwrap()
+                    .value(),
+                Value::number(7.0)
+            );
+            assert_eq!(entry(&engine, code), original);
+        }
+    }
+
+    #[test]
+    fn get_feedback_specializes_nested_reads_and_guards_replacements() {
+        let mut engine = Engine::new().unwrap();
+        engine.compile(
+            "var matrix=[Float64Array.from([1.5,2.5])]; function read(i,j){return matrix[i][j];} function replace(){matrix[0]=[7,8];}",
+            "get_feedback.js",
+        ).unwrap();
+        let code = code(&engine, "read");
+        let original = entry(&engine, code);
+        let args = [Value::number(0.0), Value::number(1.0)];
+        assert_eq!(
+            engine.call("read", &args).unwrap().value(),
+            Value::number(2.5)
+        );
+        assert_eq!(entry(&engine, code), original);
+        assert_eq!(
+            engine.call("read", &args).unwrap().value(),
+            Value::number(2.5)
+        );
+        let optimized = entry(&engine, code);
+        assert_ne!(optimized, original);
+        assert_eq!(
+            engine
+                .call("read", &[Value::number(0.0), Value::number(-1.0)])
+                .unwrap()
+                .value(),
+            Value::UNDEFINED
+        );
+        for index in [0.5, f64::NAN, f64::INFINITY, 2.0] {
+            assert_eq!(
+                engine
+                    .call("read", &[Value::number(0.0), Value::number(index)])
+                    .unwrap()
+                    .value(),
+                Value::UNDEFINED
+            );
+        }
+        let key = engine.string("0").unwrap();
+        assert_eq!(
+            engine
+                .call("read", &[Value::number(0.0), key.value()])
+                .unwrap()
+                .value(),
+            Value::number(1.5)
+        );
+        engine.call("replace", &[]).unwrap();
+        assert_eq!(
+            engine.call("read", &args).unwrap().value(),
+            Value::number(8.0)
+        );
+        assert_eq!(entry(&engine, code), optimized);
+    }
+
+    #[test]
+    fn get_feedback_specializes_arrays_and_preserves_heap_results() {
+        let mut engine = Engine::new().unwrap();
+        engine.compile(
+            "var holder={values:new Array(3)};holder.values[0]={value:3};holder.values[2]=9; function read(i){return holder.values[i];} function replace(){holder.values={0:7};}",
+            "array_feedback.js",
+        ).unwrap();
+        let code = code(&engine, "read");
+        let original = entry(&engine, code);
+        for _ in 0..2 {
+            assert_eq!(
+                engine.call("read", &[Value::number(2.0)]).unwrap().value(),
+                Value::number(9.0)
+            );
+        }
+        assert_ne!(entry(&engine, code), original);
+        for index in [1.0, 3.0] {
+            assert_eq!(
+                engine
+                    .call("read", &[Value::number(index)])
+                    .unwrap()
+                    .value(),
+                Value::UNDEFINED
+            );
+        }
+        for index in [-1.0, 0.5, f64::NAN, f64::INFINITY] {
+            assert!(engine.call("read", &[Value::number(index)]).is_err());
+        }
+        let key = engine.string("2").unwrap();
+        assert_eq!(
+            engine.call("read", &[key.value()]).unwrap().value(),
+            Value::number(9.0)
+        );
+        let retained = engine.call("read", &[Value::number(0.0)]).unwrap();
+        engine.call("replace", &[]).unwrap();
+        engine.drain_disposals(1000);
+        assert_eq!(
+            engine.global.heap().property(retained.value(), "value"),
+            Some(Value::number(3.0))
+        );
+        assert_eq!(
+            engine.call("read", &[Value::number(0.0)]).unwrap().value(),
+            Value::number(7.0)
+        );
+    }
+
+    #[test]
+    fn get_feedback_specializes_typed_rows_inside_loops() {
+        for ssa_opt in [false, true] {
+            let mut engine = Engine::with_options(EngineOptions {
+                ssa_opt,
+                ..Default::default()
+            })
+            .unwrap();
+            engine.compile(
+                "var height=[Float64Array.from([1.5,2.5]),Float64Array.from([3.5,4.5])]; function sum(){let result=0;for(let x=0;x<height.length;++x)for(let y=0;y<height[x].length;++y)result+=height[x][y];return result;} function replace(){height[1]=[5,6];}",
+                "row_feedback.js",
+            ).unwrap();
+            let code = code(&engine, "sum");
+            let original = entry(&engine, code);
+            for _ in 0..3 {
+                assert_eq!(
+                    engine.call("sum", &[]).unwrap().value(),
+                    Value::number(12.0)
+                );
+            }
+            assert_eq!(entry(&engine, code) != original, ssa_opt);
+            engine.call("replace", &[]).unwrap();
+            assert_eq!(
+                engine.call("sum", &[]).unwrap().value(),
+                Value::number(15.0)
+            );
+        }
+    }
+
+    #[test]
+    fn get_feedback_specializes_named_typed_array_properties() {
+        let mut engine = Engine::new().unwrap();
+        engine.compile(
+            "var holder={values:Int32Array.from([3,4])}; function read(i){return holder.values[i];} function replace(){holder.values=Float64Array.from([5.5,6.5]);}",
+            "property_feedback.js",
+        ).unwrap();
+        let code = code(&engine, "read");
+        let original = entry(&engine, code);
+        let args = [Value::number(1.0)];
+        for _ in 0..3 {
+            assert_eq!(
+                engine.call("read", &args).unwrap().value(),
+                Value::number(4.0)
+            );
+        }
+        let optimized = entry(&engine, code);
+        assert_ne!(optimized, original);
+        engine.call("replace", &[]).unwrap();
+        assert_eq!(
+            engine.call("read", &args).unwrap().value(),
+            Value::number(6.5)
+        );
+        assert_eq!(entry(&engine, code), optimized);
+    }
+
+    #[test]
+    fn disabling_get_refinement_keeps_call_feedback() {
+        let mut engine = Engine::with_options(EngineOptions {
+            get_refinement: false,
+            ..Default::default()
+        })
+        .unwrap();
+        engine.compile(
+            "var holder={values:[1,2],run:function(){return 7;}}; function read(i){return holder.values[i];} function invoke(){return holder.run();}",
+            "disabled_get_feedback.js",
+        ).unwrap();
+        let read_code = code(&engine, "read");
+        let original = entry(&engine, read_code);
+        for _ in 0..3 {
+            assert_eq!(
+                engine.call("read", &[Value::number(1.0)]).unwrap().value(),
+                Value::number(2.0)
+            );
+            assert_eq!(entry(&engine, read_code), original);
+            assert!(!engine.planner.borrow_mut().take(read_code));
+        }
+        let invoke_code = code(&engine, "invoke");
+        let original = entry(&engine, invoke_code);
+        for _ in 0..2 {
+            assert_eq!(
+                engine.call("invoke", &[]).unwrap().value(),
+                Value::number(7.0)
+            );
+        }
+        assert_ne!(entry(&engine, invoke_code), original);
+    }
+
+    #[test]
+    fn feedback_is_disabled_with_semantic_optimization() {
+        let mut engine = Engine::with_options(EngineOptions {
+            ssa_opt: false,
+            ..Default::default()
+        })
+        .unwrap();
+        engine
+            .compile(
+                "var o={f:function(x){return x*x;}};function run(){return o.f(3);}",
+                "disabled.js",
+            )
+            .unwrap();
+        let code = code(&engine, "run");
+        let original = entry(&engine, code);
+        for _ in 0..3 {
+            assert_eq!(engine.call("run", &[]).unwrap().value(), Value::number(9.0));
+        }
+        assert_eq!(entry(&engine, code), original);
+        assert!(!engine.planner.borrow_mut().take(code));
     }
 }

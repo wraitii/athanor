@@ -1,5 +1,6 @@
 mod analysis;
 mod builtins;
+mod clif;
 mod compiler;
 mod conversion;
 mod effects;
@@ -9,10 +10,12 @@ mod helpers;
 mod jitdump;
 mod lifetime;
 mod math;
-mod numeric;
+pub(crate) mod planner;
 mod read_scope;
 mod semantic;
 mod session;
+mod temporaries;
 
 pub(crate) use compiler::Compiler;
+pub(crate) use planner::Planner;
 pub(crate) use session::call;

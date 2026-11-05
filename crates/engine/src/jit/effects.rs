@@ -50,15 +50,24 @@ pub(super) const UNKNOWN: u16 =
 pub(super) fn effects(helper: Helper) -> Effects {
     use Helper::*;
     let (reentry, flags, assumptions): (_, _, &'static [Assumption]) = match helper {
-        Call | CallSpread | Construct | ConstructSpread => (Reentry::Arbitrary, UNKNOWN, &[]),
-        FrameEnter | FrameExit | LocalSet | LocalReplace | Retain | Release | LocalGet
-        | TempClear | TempRetain | ErrorOrigin | Catch | Throw => {
-            (Reentry::Closed, INTERNAL | ERROR, &[])
-        }
+        Call
+        | CallSpread
+        | Construct
+        | ConstructSpread
+        | ConstructResolved
+        | ConstructorCall
+        | ConstructorCallSpread
+        | ConstructSpreadResolved => (Reentry::Arbitrary, UNKNOWN, &[]),
+        FrameEnter | FrameExit | LocalSet | LocalReplace | Release | LocalGet | TempClear
+        | TempRetain | ErrorOrigin | Catch | Throw => (Reentry::Closed, INTERNAL | ERROR, &[]),
+        ObserveCall | ObserveGet | ObserveIndex => (Reentry::Closed, HEAP_READ | INTERNAL, &[]),
         SemanticGlobalProbe => (Reentry::Closed, GLOBAL_READ, &[]),
-        SemanticPropertyProbe | SemanticMathNative | SemanticCode => {
-            (Reentry::Closed, HEAP_READ, &[])
-        }
+        ConstructorPrototype
+        | SemanticPropertyProbe
+        | SemanticMathNative
+        | SemanticCode
+        | ClosureThis
+        | ArrayMapGuard => (Reentry::Closed, HEAP_READ, &[]),
         IndexRoot | IndexProbe => (
             Reentry::Closed,
             HEAP_READ | INTERNAL,
@@ -73,7 +82,8 @@ pub(super) fn effects(helper: Helper) -> Effects {
             ],
         ),
         Truthy => (Reentry::Closed, HEAP_READ, &[]),
-        ArrayNew | Rest | ObjectNew | StringNew => {
+        ArrayMapElement => (Reentry::Closed, HEAP_READ | INTERNAL, &[]),
+        ArrayNew | Rest | ObjectNew | NewInstance | StringNew | ArrayMapNew => {
             (Reentry::Closed, ALLOCATION | INTERNAL | ERROR, &[])
         }
         GlobalGet | GlobalGetOptional => (Reentry::Closed, GLOBAL_READ | INTERNAL | ERROR, &[]),
@@ -108,8 +118,6 @@ pub(super) fn effects(helper: Helper) -> Effects {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum TemporaryEffect {
     None,
-    RetainArgument,
-    NumericAdd,
     Enter,
     Clear,
     MayRegister,
@@ -121,13 +129,13 @@ pub(super) fn temporary_effect(helper: Helper) -> TemporaryEffect {
     match helper {
         FrameEnter => Enter,
         TempClear => Clear,
-        TempRetain => RetainArgument,
-        Add => NumericAdd,
-        LocalSet | LocalReplace | Retain | Release | ErrorOrigin | Throw | MathDirect
-        | SemanticCode | IndexRoot | IndexProbe | Truthy | BitwiseAnd | BitwiseOr | BitwiseXor
-        | ShiftLeft | ShiftRight | ShiftRightUnsigned | Sub | Mul | Div | Rem | Pow
-        | LooseEqual | LooseNotEqual | StrictEqual | StrictNotEqual | Less | LessEqual
-        | Greater | GreaterEqual | UnaryPlus | UnaryNegation | LogicalNot | BitwiseNot => None,
+        TempRetain | Add => MayRegister,
+        LocalSet | LocalReplace | Release | ErrorOrigin | Throw | MathDirect | SemanticCode
+        | ObserveCall | ObserveGet | ObserveIndex | ClosureThis | ArrayMapGuard | IndexRoot
+        | IndexProbe | Truthy | BitwiseAnd | BitwiseOr | BitwiseXor | ShiftLeft | ShiftRight
+        | ShiftRightUnsigned | Sub | Mul | Div | Rem | Pow | LooseEqual | LooseNotEqual
+        | StrictEqual | StrictNotEqual | Less | LessEqual | Greater | GreaterEqual | UnaryPlus
+        | UnaryNegation | LogicalNot | BitwiseNot => None,
         _ => MayRegister,
     }
 }

@@ -3,7 +3,7 @@ use super::*;
 pub(super) type Atom = u32;
 pub(super) type ShapeId = u32;
 
-pub(super) const NO_SHAPE: ShapeId = 0;
+pub(crate) const NO_SHAPE: ShapeId = 0;
 pub(crate) const DICTIONARY: ShapeId = u32::MAX;
 const INDEXED_KEYS: usize = 8;
 

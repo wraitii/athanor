@@ -168,6 +168,7 @@ impl<'a> Builder<'a> {
         let inst = self.graph.insts.next_key();
         let result = has_result.then(|| self.graph.values.push(ValueDef::Result(inst)));
         self.graph.insts.push(InstData {
+            source_name: None,
             span,
             block,
             result,
@@ -191,6 +192,7 @@ impl<'a> Builder<'a> {
                 let scope = self.open[index];
                 let block = self.current.unwrap();
                 let inst = self.graph.insts.push(InstData {
+                    source_name: None,
                     span,
                     block,
                     result: None,
@@ -736,6 +738,9 @@ impl<'a> Builder<'a> {
         span: Span,
         arguments: &[Argument<'_>],
     ) -> Result<Option<Value>> {
+        if let [Argument::SpreadElement(spread)] = arguments {
+            return self.expression(&spread.argument).map(Some);
+        }
         if !arguments
             .iter()
             .any(|arg| matches!(arg, Argument::SpreadElement(_)))

@@ -16,13 +16,12 @@ use cranelift_codegen::ir::{
 use cranelift_frontend::{FunctionBuilder, Switch};
 use cranelift_jit::JITModule;
 use cranelift_module::{FuncId, Module};
-use oxc_ast::ast::FormalParameters;
 use oxc_span::Span;
 use oxc_syntax::symbol::SymbolId;
 
 use crate::error::Error;
+use crate::jit::clif::Annotations;
 use crate::jit::helpers::{Helper, PropertyCache};
-use crate::jit::numeric::Annotations;
 use crate::value::Value;
 
 pub(crate) use statement::statement_kind;
@@ -33,7 +32,14 @@ pub(super) enum FunctionKind {
     Factory(FuncId),
 }
 
+pub(super) struct Feedback<'a> {
+    pub(super) get_refinement: bool,
+    pub(super) owner: u64,
+    pub(super) caches: &'a mut Vec<Box<super::planner::ObservationCache>>,
+}
+
 pub(super) struct FunctionCompiler<'a, 'f> {
+    feedback: Option<Feedback<'a>>,
     names: &'a mut Vec<Box<str>>,
     cells: &'a mut Vec<Box<u64>>,
     property_caches: &'a mut Vec<Box<PropertyCache>>,
@@ -68,10 +74,11 @@ pub(super) fn build_function(
     cells: &mut Vec<Box<u64>>,
     property_caches: &mut Vec<Box<PropertyCache>>,
     source_name: (usize, usize),
-    params: &FormalParameters<'_>,
+    params: Span,
     closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
     kind: FunctionKind,
     graph: &super::semantic::Graph,
+    feedback: Option<Feedback<'_>>,
 ) -> Result<(), Error> {
     build_callable(
         b,
@@ -86,6 +93,7 @@ pub(super) fn build_function(
         closures,
         kind,
         CallableBody::Graph(graph),
+        feedback,
     )
 }
 
@@ -98,7 +106,7 @@ pub(super) fn build_factory(
     cells: &mut Vec<Box<u64>>,
     property_caches: &mut Vec<Box<PropertyCache>>,
     source_name: (usize, usize),
-    params: &FormalParameters<'_>,
+    params: Span,
     closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
     resume: FuncId,
 ) -> Result<(), Error> {
@@ -115,6 +123,7 @@ pub(super) fn build_factory(
         closures,
         FunctionKind::Factory(resume),
         CallableBody::Factory(resume),
+        None,
     )
 }
 
@@ -132,10 +141,11 @@ fn build_callable(
     cells: &mut Vec<Box<u64>>,
     property_caches: &mut Vec<Box<PropertyCache>>,
     source_name: (usize, usize),
-    params: &FormalParameters<'_>,
+    params: Span,
     closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
     kind: FunctionKind,
     body: CallableBody<'_>,
+    feedback: Option<Feedback<'_>>,
 ) -> Result<(), Error> {
     let entry = b.create_block();
     b.switch_to_block(entry);
@@ -146,11 +156,12 @@ fn build_callable(
 
     let pointer = module.target_config().pointer_type();
     let mut compiler = FunctionCompiler {
+        feedback,
         names,
         cells,
         property_caches,
         source_name,
-        source_span: params.span,
+        source_span: params,
         b,
         module,
         helpers,
@@ -247,6 +258,7 @@ pub(super) fn build_global(
     b.append_block_param(return_block, types::I64);
     let pointer = module.target_config().pointer_type();
     let mut compiler = FunctionCompiler {
+        feedback: None,
         names,
         cells,
         property_caches,
@@ -328,15 +340,30 @@ impl FunctionCompiler<'_, '_> {
     }
 
     pub(super) fn clear_temporaries(&mut self) {
-        let pending = self.b.ins().load(
+        let flags = MemFlags::trusted();
+        let len = self.b.ins().load(
             types::I64,
-            MemFlags::trusted(),
+            flags,
             self.ctx,
-            crate::jit::session::PENDING_OFFSET,
+            crate::jit::session::TEMPS_LEN_OFFSET,
         );
+        let floor = self.b.ins().load(
+            types::I64,
+            flags,
+            self.ctx,
+            crate::jit::session::TEMPS_FLOOR_OFFSET,
+        );
+        let pending = self.b.ins().icmp(IntCC::NotEqual, len, floor);
         let clear = self.b.create_block();
         let done = self.b.create_block();
         self.brif(pending, clear, &[], done, &[]);
+        let branch = self
+            .b
+            .func
+            .layout
+            .last_inst(self.b.current_block().unwrap())
+            .unwrap();
+        self.annotations.temporary_clears.insert(branch, done);
         self.switch(clear);
         let dummy = self.constant(Value::UNDEFINED);
         self.call_helper(Helper::TempClear, &[dummy]);

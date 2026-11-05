@@ -1314,6 +1314,31 @@ fn spread_arguments_preserve_order_receivers_and_values() {
 }
 
 #[test]
+fn sole_spread_snapshots_survive_source_mutation() {
+    for source in [
+        "function main(){ let a = [{x: 7}, 'texture'.split('x')[0]]; function f(x,y){ a.length = 0; for(let i=0;i<100;++i){ let temporary = [i]; } return x.x === 7 && y === 'te'; } return f(...a); }",
+        "function main(){ let a = [{x: 7}, 'texture'.split('x')[0]]; function C(x,y){ a.length = 0; for(let i=0;i<100;++i){ let temporary = [i]; } this.ok = x.x === 7 && y === 'te'; } return new C(...a).ok; }",
+        "function main(){ function f(a,b){ return a === 'é' && b === '😀'; } return f(...'é😀'); }",
+        "function main(){ function C(a,b){ this.ok = a === 7 && b === 9; } let a = new Uint8Array(2); a[0] = 7; a[1] = 9; return new C(...a).ok; }",
+        "function main(){ let a = new Array(2); a[1] = {x: 7}; const b = [...a]; function f(x,y){ return x === undefined && y.x === 7; } return f(...a) && f(...b) && b.length === 2; }",
+    ] {
+        for ssa_opt in [false, true] {
+            let mut engine = Engine::with_options(js_engine::EngineOptions {
+                ssa_opt,
+                ..Default::default()
+            })
+            .unwrap();
+            engine.compile(source, "spread-snapshot.js").unwrap();
+            assert_eq!(
+                engine.call("main", &[]).unwrap().value(),
+                Value::TRUE,
+                "{source}"
+            );
+        }
+    }
+}
+
+#[test]
 fn spread_arguments_reject_non_iterables() {
     for source in [
         "function f(){} function main(){ return f(...1); }",

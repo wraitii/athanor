@@ -5,6 +5,7 @@ use cranelift_codegen::entity::SecondaryMap;
 use oxc_syntax::operator::BinaryOperator;
 
 use super::{Block, Cfg, Constant, Graph, Inst, Op, TerminatorKind, UnaryOp, Value};
+use crate::heap::TypedKind;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(in crate::jit) struct Types(u16);
@@ -229,7 +230,16 @@ fn steps(graph: &Graph, cfg: &Cfg) -> HashMap<Inst, Vec<Value>> {
         let TerminatorKind::Branch(condition, yes, no) = &terminator.kind else {
             continue;
         };
-        let Some(&Op::Binary(operator, left, right)) = graph.defining_op(*condition) else {
+        let Some(
+            &(Op::Binary(operator, left, right)
+            | Op::GuardedCompare {
+                operator,
+                left,
+                right,
+                ..
+            }),
+        ) = graph.defining_op(*condition)
+        else {
             continue;
         };
         let Some(relation) = Relation::of(operator) else {
@@ -340,16 +350,30 @@ fn result_types(op: &Op, facts: &Facts) -> Types {
             Constant::String(_) => Types::STRING,
             Constant::Uninitialized => Types::UNINITIALIZED,
         },
-        Op::NewObject | Op::NewArray(_) | Op::IteratorNew(_) | Op::EnumerateNew(_) => Types::OBJECT,
+        Op::NewObject
+        | Op::NewInstance(_)
+        | Op::NewArray(_)
+        | Op::NewHoleyArray(_)
+        | Op::IteratorNew(_)
+        | Op::EnumerateNew(_) => Types::OBJECT,
+        Op::MapElement(..) => Types::ALL,
+        Op::IsArrayMap(..) => Types::BOOLEAN,
         Op::IteratorNext(_) | Op::EnumerateNext(_) => Types::ALL,
         Op::IsUninitialized(_) => Types::BOOLEAN,
-        Op::ProbeProperty(..) | Op::ProbeIndex(..) => Types::ALL,
+        Op::ProbeProperty(..) | Op::ProbeIndex(..) | Op::ConstructorPrototype(_) => Types::ALL,
         Op::View(_) => Types::VIEW,
+        Op::TypedIndex(.., read) if read.bounded => match read.element {
+            Some(TypedKind::Float32 | TypedKind::Float64 | TypedKind::Uint32) | None => {
+                Types::NUMBER
+            }
+            Some(_) => Types::INT32,
+        },
         Op::TypedIndex(..) => Types::NUMBER.union(Types::UNDEFINED),
-        Op::IsTyped(_) | Op::IsIndexed(_) => Types::BOOLEAN,
+        Op::IsTyped(..) | Op::IsIndexed(_) => Types::BOOLEAN,
         Op::IndexedLength(_) => Types::NUMBER,
         Op::IsNumber(_) | Op::IsString(_) => Types::BOOLEAN,
         Op::AsNumber(_) => Types::NUMBER,
+        Op::ToInt32(_) => Types::INT32,
         Op::ToNumeric(value) | Op::Unary(UnaryOp::Plus, value)
             if facts.of(*value).within(Types::NUMBER) =>
         {
@@ -391,6 +415,7 @@ fn result_types(op: &Op, facts: &Facts) -> Types {
             BinaryOperator::ShiftRightZeroFill => Types::NUMBER,
             _ => Types::BOOLEAN,
         },
+        Op::GuardedCompare { .. } => Types::BOOLEAN,
         Op::CallNative(..) => Types::NUMBER,
         Op::IsUndefined(_)
         | Op::IsNullish(_)

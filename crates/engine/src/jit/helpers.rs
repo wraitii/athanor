@@ -4,7 +4,6 @@ use cranelift_codegen::isa::CallConv;
 use crate::heap::{IndexRead, PropertyRead};
 use crate::value::Value;
 
-use super::numeric::Kind;
 use super::session::JitCtx;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,22 +66,34 @@ define_helpers! {
     MarkClass => Unary, js_mark_class;
     ClosureNew => Callable, js_closure_new;
     Construct => Callable, js_construct;
+    ConstructorPrototype => Unary, js_constructor_prototype;
+    NewInstance => Unary, js_new_instance;
+    ConstructorCall => MethodCallable, js_constructor_call;
+    ConstructorCallSpread => IndexSet, js_constructor_call_spread;
+    ConstructResolved => MethodCallable, js_construct_resolved;
+    ConstructSpreadResolved => IndexSet, js_construct_spread_resolved;
     ConstructSpread => Binary, js_construct_spread;
     CallSpread => IndexSet, js_call_spread;
     ArrayAppend => Binary, js_array_append;
     ArrayExtend => Binary, js_array_extend;
     Call => MethodCallable, js_call;
+    ObserveCall => Binary, js_observe_call;
+    ObserveGet => Binary, js_observe_get;
+    ObserveIndex => Binary, js_observe_index;
     SemanticGlobalProbe => GlobalGet, js_semantic_global_probe;
     SemanticPropertyProbe => PropertyGet, js_semantic_property_probe;
     SemanticIndexProbe => Binary, js_semantic_index_probe;
     SemanticMathNative => Binary, js_semantic_math_native;
     SemanticCode => Binary, js_semantic_code;
+    ClosureThis => Unary, js_closure_this;
+    ArrayMapGuard => Binary, js_array_map_guard;
+    ArrayMapNew => Unary, js_array_map_new;
+    ArrayMapElement => Binary, js_array_map_element;
     MathDirect => MethodCallable, js_math_direct;
     FrameEnter => Unary, js_frame_enter;
     FrameExit => Unary, js_frame_exit;
     LocalSet => Binary, js_local_set;
     LocalReplace => IndexSet, js_local_replace;
-    Retain => Unary, js_retain;
     Release => Unary, js_release;
     TempClear => Unary, js_temp_clear;
     TempRetain => Unary, js_temp_retain;
@@ -141,33 +152,11 @@ define_helpers! {
 }
 
 impl Helper {
-    pub(super) fn result_kind_on_success(self) -> Option<Kind> {
-        match self {
-            Self::BitwiseAnd
-            | Self::BitwiseOr
-            | Self::BitwiseXor
-            | Self::ShiftLeft
-            | Self::ShiftRight
-            | Self::BitwiseNot => Some(Kind::Int32),
-            Self::Sub
-            | Self::Mul
-            | Self::Div
-            | Self::Rem
-            | Self::Pow
-            | Self::ShiftRightUnsigned
-            | Self::UnaryPlus
-            | Self::UnaryNegation
-            | Self::MathDirect => Some(Kind::Number),
-            _ => None,
-        }
-    }
-
     pub(crate) fn can_throw(self) -> bool {
         // These helpers may report engine errors, but never execute JavaScript or throw.
         !matches!(
             self,
             Self::TempRetain
-                | Self::Retain
                 | Self::Release
                 | Self::IndexGet
                 | Self::IndexGetNumeric
@@ -607,23 +596,32 @@ extern "C" fn js_property_get(ctx: *mut JitCtx, object: Value, ptr: *const u8, l
     Value::UNDEFINED
 }
 
-/// A named property read site. Generated code compares a receiver's shape with `shape` and,
-/// on a match, loads its shaped value at `index`; a miss refills both from the receiver.
+/// A named property read site. Generated code compares a receiver's shape with `shape` and
+/// the holder's (the receiver itself when `holder` is 0) with `holder_shape`; on a match it
+/// loads the holder's shaped value at `index`. A miss refills the cache from the receiver.
+/// An empty cache expects a dictionary receiver holding a property with no shape, which none do.
 #[repr(C)]
 pub(crate) struct PropertyCache {
     pub(crate) shape: u32,
     pub(crate) index: u32,
+    pub(crate) holder: u64,
+    pub(crate) holder_shape: u32,
     pub(crate) name: Box<str>,
 }
 
 pub(crate) const CACHE_SHAPE_OFFSET: i32 = std::mem::offset_of!(PropertyCache, shape) as i32;
 pub(crate) const CACHE_INDEX_OFFSET: i32 = std::mem::offset_of!(PropertyCache, index) as i32;
+pub(crate) const CACHE_HOLDER_OFFSET: i32 = std::mem::offset_of!(PropertyCache, holder) as i32;
+pub(crate) const CACHE_HOLDER_SHAPE_OFFSET: i32 =
+    std::mem::offset_of!(PropertyCache, holder_shape) as i32;
 
 impl PropertyCache {
     pub(crate) fn new(name: &str) -> Self {
         Self {
             shape: crate::heap::DICTIONARY,
             index: 0,
+            holder: 0,
+            holder_shape: crate::heap::NO_SHAPE,
             name: name.into(),
         }
     }
@@ -636,9 +634,11 @@ extern "C" fn js_property_get_cached(
 ) -> Value {
     let cache = unsafe { &mut *cache };
     let heap = unsafe { &*ctx }.global.heap();
-    if let Some((shape, index)) = heap.cached_property(object, &cache.name) {
-        cache.shape = shape;
-        cache.index = index;
+    if let Some(found) = heap.cached_property(object, &cache.name) {
+        cache.shape = found.shape;
+        cache.index = found.index;
+        cache.holder = found.holder;
+        cache.holder_shape = found.holder_shape;
     }
     js_property_get(ctx, object, cache.name.as_ptr(), cache.name.len() as u64)
 }
@@ -715,13 +715,6 @@ extern "C" fn js_frame_exit(ctx: *mut JitCtx, value: Value) -> Value {
 }
 extern "C" fn js_local_set(ctx: *mut JitCtx, slot: u64, value: Value) -> Value {
     unsafe { &mut *ctx }.local_set(slot as usize, value)
-}
-extern "C" fn js_retain(ctx: *mut JitCtx, value: Value) -> Value {
-    let ctx = unsafe { &mut *ctx };
-    if !ctx.global.heap().retain(value) {
-        ctx.error = Some(Box::new(crate::Error::Runtime("invalid heap value".into())));
-    }
-    Value::UNDEFINED
 }
 extern "C" fn js_release(ctx: *mut JitCtx, value: Value) -> Value {
     unsafe { &*ctx }.global.heap().release(value);
@@ -1097,11 +1090,32 @@ extern "C" fn js_closure_new(
     }
 }
 
-fn argument_values(ctx: *mut JitCtx, arguments: Value) -> Vec<Value> {
-    let heap = unsafe { &*ctx }.global.heap();
-    (0..heap.len(arguments).unwrap())
-        .map(|index| heap.get(arguments, index).unwrap())
-        .collect()
+fn argument_values(ctx: *mut JitCtx, arguments: Value) -> Option<Vec<Value>> {
+    if let Some(values) = unsafe { &*ctx }
+        .global
+        .heap()
+        .owned_indexed_values(arguments)
+    {
+        return Some(values);
+    }
+    let state = js_iterate_new(ctx, arguments);
+    if unsafe { &*ctx }.error.is_some() {
+        return None;
+    }
+    let mut values = Vec::new();
+    loop {
+        let value = js_iterate_next(ctx, state);
+        if unsafe { &*ctx }.error.is_some() {
+            return None;
+        }
+        if value == Value::UNINITIALIZED {
+            for &value in &values {
+                unsafe { &*ctx }.global.heap().retain(value);
+            }
+            return Some(values);
+        }
+        values.push(value);
+    }
 }
 
 extern "C" fn js_call_spread(
@@ -1110,19 +1124,27 @@ extern "C" fn js_call_spread(
     receiver: Value,
     arguments: Value,
 ) -> Value {
-    let values = argument_values(ctx, arguments);
-    js_call(
+    let Some(values) = argument_values(ctx, arguments) else {
+        return Value::UNDEFINED;
+    };
+    let result = js_call(
         ctx,
         callable,
         receiver,
         values.as_ptr(),
         values.len() as u64,
-    )
+    );
+    unsafe { &*ctx }.global.heap().release_all(&values);
+    result
 }
 
 extern "C" fn js_construct_spread(ctx: *mut JitCtx, callable: Value, arguments: Value) -> Value {
-    let values = argument_values(ctx, arguments);
-    js_construct(ctx, callable, values.as_ptr(), values.len() as u64)
+    let Some(values) = argument_values(ctx, arguments) else {
+        return Value::UNDEFINED;
+    };
+    let result = js_construct(ctx, callable, values.as_ptr(), values.len() as u64);
+    unsafe { &*ctx }.global.heap().release_all(&values);
+    result
 }
 
 extern "C" fn js_array_append(ctx: *mut JitCtx, arguments: Value, value: Value) -> Value {
@@ -1137,6 +1159,18 @@ extern "C" fn js_array_append(ctx: *mut JitCtx, arguments: Value, value: Value) 
 }
 
 extern "C" fn js_array_extend(ctx: *mut JitCtx, arguments: Value, iterable: Value) -> Value {
+    if let Some(extended) = unsafe { &*ctx }
+        .global
+        .heap()
+        .extend_array(arguments, iterable)
+    {
+        if !extended {
+            unsafe { &mut *ctx }.error = Some(Box::new(crate::Error::Runtime(
+                "cannot extend array".into(),
+            )));
+        }
+        return Value::UNDEFINED;
+    }
     let state = js_iterate_new(ctx, iterable);
     if unsafe { &*ctx }.error.is_some() {
         return Value::UNDEFINED;
@@ -1158,8 +1192,8 @@ extern "C" fn js_semantic_global_probe(ctx: *mut JitCtx, ptr: *const u8, len: u6
     let name =
         unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len as usize)) };
     match unsafe { &*ctx }.global.get_raw(name) {
-        Some(value) if value != Value::UNINITIALIZED => value,
-        _ => Value::UNDEFINED,
+        Some(value) => value,
+        None => Value::UNINITIALIZED,
     }
 }
 
@@ -1207,10 +1241,49 @@ extern "C" fn js_semantic_math_native(ctx: *mut JitCtx, value: Value, operation:
 extern "C" fn js_semantic_code(ctx: *mut JitCtx, value: Value, code: u64) -> Value {
     let heap = unsafe { &*ctx }.global.heap();
     Value::boolean(
-        heap.closure_code(value) == Some(crate::heap::CodeId(code))
-            && !heap.is_class(value)
-            && heap.lexical_this(value).is_none(),
+        heap.closure_code(value) == Some(crate::heap::CodeId(code)) && !heap.is_class(value),
     )
+}
+
+extern "C" fn js_closure_this(ctx: *mut JitCtx, closure: Value) -> Value {
+    unsafe { &*ctx }
+        .global
+        .heap()
+        .lexical_this(closure)
+        .unwrap_or(Value::UNDEFINED)
+}
+
+extern "C" fn js_array_map_guard(ctx: *mut JitCtx, callee: Value, receiver: Value) -> Value {
+    let heap = unsafe { &*ctx }.global.heap();
+    Value::boolean(
+        heap.native(callee) == Some(crate::heap::NativeFunction::ArrayMap)
+            && heap.is_array(receiver),
+    )
+}
+
+extern "C" fn js_array_map_new(ctx: *mut JitCtx, length: Value) -> Value {
+    let context = unsafe { &mut *ctx };
+    match context
+        .global
+        .heap()
+        .array_of_length(length.as_number().unwrap() as usize)
+    {
+        Some(value) => context.own(value),
+        None => {
+            context.error = Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
+            Value::UNDEFINED
+        }
+    }
+}
+
+extern "C" fn js_array_map_element(ctx: *mut JitCtx, receiver: Value, index: Value) -> Value {
+    let context = unsafe { &mut *ctx };
+    let index = index.as_number().unwrap() as usize;
+    if !context.global.heap().present(receiver, index) {
+        return Value::UNINITIALIZED;
+    }
+    let value = context.global.heap().get(receiver, index).unwrap();
+    context.retain_temp(value)
 }
 
 extern "C" fn js_math_direct(
@@ -1227,6 +1300,51 @@ extern "C" fn js_math_direct(
         unsafe { std::slice::from_raw_parts(argv, argc as usize) }
     };
     super::builtins::math::call(unsafe { &mut *ctx }, operation, args)
+}
+
+extern "C" fn js_observe_get(ctx: *mut JitCtx, value: Value, cache: u64) -> Value {
+    observe_read(ctx, value, cache, super::planner::ReadKind::Result)
+}
+
+extern "C" fn js_observe_index(ctx: *mut JitCtx, value: Value, cache: u64) -> Value {
+    observe_read(ctx, value, cache, super::planner::ReadKind::Receiver)
+}
+
+fn observe_read(
+    ctx: *mut JitCtx,
+    value: Value,
+    cache: u64,
+    kind: super::planner::ReadKind,
+) -> Value {
+    let context = unsafe { &*ctx };
+    let cache = unsafe { &mut *(cache as *mut super::planner::ObservationCache) };
+    if cache.recorded == 0 {
+        let heap = context.global.heap();
+        let observed = if heap.is_array(value) {
+            Some(super::planner::ReadType::Array)
+        } else {
+            heap.typed_kind(value).map(super::planner::ReadType::Typed)
+        };
+        if let Some(observed) = observed {
+            context.engine.observe_get(cache, observed, kind);
+        } else {
+            cache.recorded = 1;
+        }
+    }
+    Value::UNDEFINED
+}
+
+extern "C" fn js_observe_call(ctx: *mut JitCtx, callee: Value, cache: u64) -> Value {
+    let context = unsafe { &*ctx };
+    let cache = unsafe { &mut *(cache as *mut super::planner::ObservationCache) };
+    if cache.recorded == 0 {
+        if let Some(code) = context.global.heap().closure_code(callee) {
+            context.engine.observe_call(cache, code.0);
+        } else {
+            cache.recorded = 1;
+        }
+    }
+    Value::UNDEFINED
 }
 
 pub(super) extern "C" fn js_call(
@@ -1328,6 +1446,109 @@ extern "C" fn js_catch(ctx: *mut JitCtx, _: Value) -> Value {
     unsafe { &mut *ctx }.catch()
 }
 
+extern "C" fn js_new_instance(ctx: *mut JitCtx, prototype: Value) -> Value {
+    let context = unsafe { &mut *ctx };
+    match context.global.heap().object_with_prototype(prototype) {
+        Some(instance) => context.own(instance),
+        None => {
+            context.error = Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
+            Value::UNDEFINED
+        }
+    }
+}
+
+extern "C" fn js_constructor_call(
+    ctx: *mut JitCtx,
+    constructor: Value,
+    instance: Value,
+    argv: *const Value,
+    argc: u64,
+) -> Value {
+    invoke(ctx, constructor, instance, argv, argc)
+}
+
+extern "C" fn js_constructor_call_spread(
+    ctx: *mut JitCtx,
+    constructor: Value,
+    instance: Value,
+    arguments: Value,
+) -> Value {
+    let Some(values) = argument_values(ctx, arguments) else {
+        return Value::UNDEFINED;
+    };
+    let result = invoke(
+        ctx,
+        constructor,
+        instance,
+        values.as_ptr(),
+        values.len() as u64,
+    );
+    unsafe { &*ctx }.global.heap().release_all(&values);
+    result
+}
+
+extern "C" fn js_constructor_prototype(ctx: *mut JitCtx, constructor: Value) -> Value {
+    unsafe { &*ctx }
+        .global
+        .heap()
+        .constructor_prototype(constructor)
+        .unwrap_or(Value::UNINITIALIZED)
+}
+
+extern "C" fn js_construct_resolved(
+    ctx: *mut JitCtx,
+    constructor: Value,
+    prototype: Value,
+    argv: *const Value,
+    argc: u64,
+) -> Value {
+    if prototype == Value::UNINITIALIZED {
+        return js_construct(ctx, constructor, argv, argc);
+    }
+    let context = unsafe { &mut *ctx };
+    let Some(instance) = context.global.heap().object_with_prototype(prototype) else {
+        context.error = Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
+        return Value::UNDEFINED;
+    };
+    invoke_constructor(ctx, constructor, instance, argv, argc)
+}
+
+extern "C" fn js_construct_spread_resolved(
+    ctx: *mut JitCtx,
+    constructor: Value,
+    prototype: Value,
+    arguments: Value,
+) -> Value {
+    let Some(values) = argument_values(ctx, arguments) else {
+        return Value::UNDEFINED;
+    };
+    let result = js_construct_resolved(
+        ctx,
+        constructor,
+        prototype,
+        values.as_ptr(),
+        values.len() as u64,
+    );
+    unsafe { &*ctx }.global.heap().release_all(&values);
+    result
+}
+
+fn invoke_constructor(
+    ctx: *mut JitCtx,
+    constructor: Value,
+    instance: Value,
+    argv: *const Value,
+    argc: u64,
+) -> Value {
+    let context = unsafe { &mut *ctx };
+    context.own(instance);
+    let result = invoke(ctx, constructor, instance, argv, argc);
+    if context.error.is_some() || context.exception_pending() {
+        return Value::UNDEFINED;
+    }
+    if result.is_object() { result } else { instance }
+}
+
 extern "C" fn js_construct(
     ctx: *mut JitCtx,
     constructor: Value,
@@ -1358,12 +1579,7 @@ extern "C" fn js_construct(
             ctx.error = Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
             return Value::UNDEFINED;
         };
-        ctx.own(instance);
-        let result = invoke(ctx, constructor, instance, argv, argc);
-        if ctx.error.is_some() || ctx.exception_pending() {
-            return Value::UNDEFINED;
-        }
-        return if result.is_object() { result } else { instance };
+        return invoke_constructor(ctx, constructor, instance, argv, argc);
     }
     if ctx.global.heap().native(constructor) == Some(crate::heap::NativeFunction::Set) {
         let argument = if argc == 0 {

@@ -8,13 +8,20 @@ use super::{Canonical, Cfg, Constant, Facts, Graph, Inst, Op, Result, Terminator
 #[derive(Default)]
 pub(in crate::jit) struct Repository {
     bodies: HashMap<FuncId, Body>,
+    pub(in crate::jit) feedback: HashMap<crate::jit::planner::Site, FuncId>,
+    pub(in crate::jit) read_feedback: HashMap<
+        (crate::jit::planner::Site, crate::jit::planner::ReadKind),
+        crate::jit::planner::ReadType,
+    >,
     locations: HashMap<(usize, u32), FuncId>,
-    globals: HashMap<(usize, String), FuncId>,
+    globals: HashMap<String, FuncId>,
+    pub(in crate::jit) sources: HashMap<usize, usize>,
 }
 
 struct Body {
     source: usize,
     canonical: Canonical,
+    arrow: bool,
 }
 
 impl Repository {
@@ -27,8 +34,47 @@ impl Repository {
     ) {
         self.locations
             .insert((source, canonical.graph.span.start), code);
-        self.globals.insert((source, name.to_owned()), code);
-        self.bodies.insert(code, Body { source, canonical });
+        self.globals.insert(name.to_owned(), code);
+        self.bodies.insert(
+            code,
+            Body {
+                source,
+                canonical,
+                arrow: false,
+            },
+        );
+    }
+
+    pub(in crate::jit) fn insert_closure(
+        &mut self,
+        source: usize,
+        code: FuncId,
+        canonical: Canonical,
+        arrow: bool,
+    ) {
+        self.locations
+            .insert((source, canonical.graph.span.start), code);
+        self.bodies.insert(
+            code,
+            Body {
+                source,
+                canonical,
+                arrow,
+            },
+        );
+    }
+
+    pub(in crate::jit) fn code(&self, source: usize, start: u32) -> Option<FuncId> {
+        self.locations.get(&(source, start)).copied()
+    }
+
+    pub(in crate::jit) fn emission(&self, code: FuncId) -> Option<(usize, Canonical)> {
+        let body = self.bodies.get(&code)?;
+        Some((body.source, body.canonical.clone()))
+    }
+
+    pub(super) fn closure(&self, source: usize, start: u32) -> Option<FuncId> {
+        self.locations.get(&(source, start)).copied()
     }
 
     pub(in crate::jit) fn canonical(&self, source: usize, start: u32) -> Option<&Canonical> {
@@ -36,9 +82,9 @@ impl Repository {
         Some(&self.bodies.get(code)?.canonical)
     }
 
-    fn body(&self, source: usize, code: FuncId) -> Option<&Graph> {
+    pub(super) fn body(&self, code: FuncId) -> Option<&Graph> {
         let body = self.bodies.get(&code)?;
-        (body.source == source).then_some(&body.canonical.graph)
+        Some(&body.canonical.graph)
     }
 }
 
@@ -52,13 +98,39 @@ pub(super) struct Plan {
     inlines: Vec<Inline>,
 }
 
-pub(super) struct Inline {
+pub(super) struct Budget {
+    remaining: usize,
+    sites: HashSet<Inst>,
+    pub(super) inlines: Vec<Inline>,
+}
+
+impl Default for Budget {
+    fn default() -> Self {
+        Self {
+            remaining: 128,
+            sites: HashSet::new(),
+            inlines: Vec::new(),
+        }
+    }
+}
+
+impl Plan {
+    pub(super) fn is_empty(&self) -> bool {
+        self.inlines.is_empty()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(in crate::jit) struct Inline {
     pub(super) call: Inst,
     pub(super) target: FuncId,
     pub(super) numbers: Vec<usize>,
+    pub(super) arrow: bool,
+    pub(super) guard_code: bool,
+    pub(super) source_name: Option<(usize, usize)>,
 }
 
-fn eligible(graph: &Graph) -> bool {
+fn numeric_body(graph: &Graph) -> bool {
     if graph.generator || graph.has_handlers {
         return false;
     }
@@ -97,20 +169,71 @@ fn eligible(graph: &Graph) -> bool {
     true
 }
 
+pub(super) fn eligible(graph: &Graph) -> bool {
+    if graph.generator || graph.has_handlers {
+        return false;
+    }
+    let mut count = 0;
+    for block in Cfg::new(graph).rpo {
+        if !matches!(
+            graph.blocks[block].terminator.as_ref().map(|t| &t.kind),
+            Some(TerminatorKind::Jump(_) | TerminatorKind::Branch(..) | TerminatorKind::Return(_))
+        ) {
+            return false;
+        }
+        for &inst in &graph.blocks[block].insts {
+            count += 1;
+            if count > 32
+                || matches!(
+                    graph.insts[inst].op,
+                    Op::Closure(..) | Op::Arguments | Op::Rest(_) | Op::Catch
+                )
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 pub(super) fn requests(graph: &Graph, bodies: &Repository, source: usize) -> Vec<Request> {
     let mut requests = Vec::new();
     for block in Cfg::new(graph).rpo {
         for &call in &graph.blocks[block].insts {
-            let Op::Call { callee, .. } = &graph.insts[call].op else {
-                continue;
+            let (callee, constructor) = match &graph.insts[call].op {
+                Op::Call { callee, .. } => (callee, false),
+                Op::ConstructorCall { callee, .. } => (callee, true),
+                _ => continue,
             };
-            let Some(Op::GlobalRead(name)) = graph.defining_op(*callee) else {
-                continue;
+            let data = &graph.insts[call];
+            let site = crate::jit::planner::Site {
+                source: data.source_name.map_or(source, |name| name.0),
+                start: data.span.start,
+                end: data.span.end,
             };
-            let Some(&target) = bodies.globals.get(&(source, name.clone())) else {
-                continue;
+            let (target, numeric) = if let Some(&target) = bodies.feedback.get(&site) {
+                (target, false)
+            } else {
+                match graph.defining_op(*callee) {
+                    Some(Op::GlobalRead(name)) => {
+                        let Some(&target) = bodies.globals.get(name) else {
+                            continue;
+                        };
+                        let Some(body) = bodies.body(target) else {
+                            continue;
+                        };
+                        (target, !constructor && numeric_body(body))
+                    }
+                    Some(Op::Closure(span, _, false, _)) => {
+                        let Some(target) = bodies.closure(source, span.start) else {
+                            continue;
+                        };
+                        (target, false)
+                    }
+                    _ => continue,
+                }
             };
-            let Some(body) = bodies.body(source, target).filter(|body| eligible(body)) else {
+            let Some(body) = bodies.body(target).filter(|body| eligible(body)) else {
                 continue;
             };
             let mut numeric_arguments: Vec<usize> = Cfg::new(body)
@@ -118,7 +241,7 @@ pub(super) fn requests(graph: &Graph, bodies: &Repository, source: usize) -> Vec
                 .iter()
                 .flat_map(|&block| &body.blocks[block].insts)
                 .filter_map(|&inst| match body.insts[inst].op {
-                    Op::Argument(index) => Some(index),
+                    Op::Argument(index) if numeric => Some(index),
                     _ => None,
                 })
                 .collect();
@@ -134,32 +257,41 @@ pub(super) fn requests(graph: &Graph, bodies: &Repository, source: usize) -> Vec
     requests
 }
 
+#[cfg(test)]
 pub(super) fn plan(
     graph: &Graph,
     bodies: &Repository,
     source: usize,
     requests: &[Request],
 ) -> Plan {
+    plan_round(graph, bodies, source, requests, &mut Budget::default())
+}
+
+pub(super) fn plan_round(
+    graph: &Graph,
+    bodies: &Repository,
+    source: usize,
+    requests: &[Request],
+    budget: &mut Budget,
+) -> Plan {
     let facts = Facts::compute(graph);
     let mut inlines = Vec::new();
-    let mut sites = HashSet::new();
-    let mut remaining = 128;
     for request in requests {
-        let Some(body) = bodies
-            .body(source, request.target)
-            .filter(|body| eligible(body))
-        else {
+        let Some(body) = bodies.body(request.target).filter(|body| eligible(body)) else {
             continue;
         };
-        let Op::Call { args, .. } = &graph.insts[request.call].op else {
-            continue;
+        let (callee, args) = match &graph.insts[request.call].op {
+            Op::Call { callee, args, .. } | Op::ConstructorCall { callee, args, .. } => {
+                (callee, args)
+            }
+            _ => continue,
         };
         let cost: usize = Cfg::new(body)
             .rpo
             .iter()
             .map(|&block| body.blocks[block].insts.len())
             .sum();
-        if cost > remaining || sites.contains(&request.call) {
+        if cost > budget.remaining || budget.sites.contains(&request.call) {
             continue;
         }
         let mut numbers = Vec::new();
@@ -181,34 +313,50 @@ pub(super) fn plan(
         if !possible {
             continue;
         }
-        sites.insert(request.call);
-        remaining -= cost;
+        budget.sites.insert(request.call);
+        budget.remaining -= cost;
+        let body_source = bodies.bodies[&request.target].source;
+        let source_name = if body_source == source {
+            None
+        } else {
+            bodies
+                .sources
+                .get(&body_source)
+                .map(|&length| (body_source, length))
+        };
         inlines.push(Inline {
             call: request.call,
             target: request.target,
+            source_name,
             numbers,
+            arrow: bodies.bodies[&request.target].arrow,
+            guard_code: !matches!(graph.defining_op(*callee), Some(Op::Closure(span, _, false, _))
+                if bodies.closure(source, span.start) == Some(request.target)
+                && !graph.insts.values().any(|data| matches!(data.op, Op::MarkClass(value) if value == *callee))),
         });
     }
+    budget.inlines.extend(inlines.iter().cloned());
     Plan { inlines }
 }
 
 pub(super) fn apply(
     graph: &mut Graph,
     bodies: &Repository,
-    source: usize,
+    _source: usize,
     plan: Plan,
     notes: &mut Vec<String>,
 ) -> Result<()> {
     for inline in plan.inlines {
-        let body = bodies.body(source, inline.target).unwrap();
+        let body = bodies.body(inline.target).unwrap();
         super::inlining::apply(graph, body, &inline);
         graph.verify()?;
         let span = graph.insts[inline.call].span;
         notes.push(format!(
-            "call at {}..{}: inline {} behind code identity and {} number check(s)",
+            "call at {}..{}: inline {} with {} code check(s) and {} number check(s)",
             span.start,
             span.end,
             inline.target,
+            usize::from(inline.guard_code),
             inline.numbers.len()
         ));
     }
@@ -259,6 +407,72 @@ mod tests {
     }
 
     #[test]
+    fn decision_records_include_nested_and_bounded_recursive_inlines() {
+        for (source, count) in [
+            (
+                "function leaf(x){return x*x;} function middle(x){return leaf(x);} function main(x){return middle(x);}",
+                2,
+            ),
+            (
+                "function recurse(n){if(n)return recurse(n-1);return 0;} function main(n){return recurse(n);}",
+                4,
+            ),
+        ] {
+            let (canonical, bodies) = fixture(source);
+            let first =
+                super::super::plan_canonical(canonical.clone(), true, Some((&bodies, 0))).unwrap();
+            let second = super::super::plan_canonical(canonical, true, Some((&bodies, 0))).unwrap();
+            assert_eq!(first.inlines.len(), count);
+            assert!(first.inlines == second.inlines);
+            let analysis = super::super::optimize_planned(first).unwrap();
+            assert!(analysis.inlines == second.inlines);
+            analysis.graph.verify().unwrap();
+        }
+    }
+
+    #[test]
+    fn feedback_supplies_guarded_targets_for_property_calls() {
+        let (canonical, mut bodies) = fixture(
+            "function square(x){return x*x;} function main(x){return Math.square(x)+Math.square(x+1);}",
+        );
+        let mut graph = canonical.graph;
+        assert!(requests(&graph, &bodies, 0).is_empty());
+        for data in graph.insts.values() {
+            if matches!(data.op, Op::Call { .. }) {
+                bodies.feedback.insert(
+                    crate::jit::planner::Site {
+                        source: 0,
+                        start: data.span.start,
+                        end: data.span.end,
+                    },
+                    FuncId::from_u32(0),
+                );
+            }
+        }
+        let requests = requests(&graph, &bodies, 0);
+        assert_eq!(requests.len(), 2);
+        let plan = plan(&graph, &bodies, 0, &requests);
+        assert!(plan.inlines.iter().all(|inline| inline.guard_code));
+        let mut notes = Vec::new();
+        apply(&mut graph, &bodies, 0, plan, &mut notes).unwrap();
+        assert_eq!(notes.len(), 2);
+        assert_eq!(
+            operations(&graph)
+                .iter()
+                .filter(|op| matches!(op, Op::IsCode(..)))
+                .count(),
+            2
+        );
+        assert_eq!(
+            operations(&graph)
+                .iter()
+                .filter(|op| matches!(op, Op::Binary(BinaryOperator::Multiplication, ..)))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
     fn explicit_request_has_one_inline_body_and_one_fallback() {
         let (canonical, bodies) =
             fixture("function square(x) { return x * x; } function main(x) { return square(x); }");
@@ -301,7 +515,7 @@ mod tests {
                 .to_string(),
             before
         );
-        let body = bodies.body(0, FuncId::from_u32(0)).unwrap();
+        let body = bodies.body(FuncId::from_u32(0)).unwrap();
         assert!(
             !operations(body)
                 .iter()
@@ -334,7 +548,7 @@ mod tests {
     }
 
     #[test]
-    fn planner_limits_expansion_and_rejects_unsupported_bodies() {
+    fn planner_limits_expansion_and_accepts_general_bodies() {
         let (canonical, bodies) =
             fixture("function square(x) { return x * x; } function main(x) { return square(x); }");
         let request = requests(&canonical.graph, &bodies, 0).pop().unwrap();
@@ -351,10 +565,11 @@ mod tests {
                 .len(),
             1
         );
-        assert!(
+        assert_eq!(
             plan(&canonical.graph, &bodies, 1, &duplicates)
                 .inlines
-                .is_empty()
+                .len(),
+            1
         );
         let calls = "square(x);".repeat(100);
         let (canonical, bodies) = fixture(&format!(
@@ -372,7 +587,29 @@ mod tests {
             let (canonical, bodies) = fixture(&format!(
                 "function helper(x) {{ {body} }} function main(x) {{ return helper(x); }}",
             ));
-            assert!(requests(&canonical.graph, &bodies, 0).is_empty());
+            let requests = requests(&canonical.graph, &bodies, 0);
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].numeric_arguments.is_empty());
         }
+    }
+    #[test]
+    fn cross_source_general_calls_and_constructors_are_inlined() {
+        let (canonical, bodies) = fixture(
+            "function C(x){this.value=x;} function touch(o){o.value+=2;return o;} function main(){C.prototype={};return touch(new C(7)).value;}",
+        );
+        let mut graph = canonical.graph;
+        super::super::construction::resolve(&mut graph);
+        super::super::construction::expand(&mut graph);
+        let requests = requests(&graph, &bodies, 1);
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.numeric_arguments.is_empty())
+        );
+        let plan = plan(&graph, &bodies, 1, &requests);
+        assert_eq!(plan.inlines.len(), 2);
+        apply(&mut graph, &bodies, 1, plan, &mut Vec::new()).unwrap();
+        graph.verify().unwrap();
     }
 }

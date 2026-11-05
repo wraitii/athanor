@@ -64,7 +64,7 @@ fn added_properties_and_dictionaries_miss() {
 }
 
 #[test]
-fn inherited_properties_are_not_cached_as_own() {
+fn inherited_properties_follow_their_prototype() {
     check(
         "function C() {}
         C.prototype.x = 5;
@@ -118,5 +118,55 @@ fn reused_slots_and_retained_values_stay_valid() {
             return sum + kept[0].v + kept[2].v;
         }",
         45464.0,
+    );
+}
+
+#[test]
+fn shadowing_and_prototype_changes_miss() {
+    check(
+        "function C() {}
+        C.prototype.x = 1;
+        function read(o) { return o.x; }
+        function main() {
+            const a = new C();
+            const b = new C();
+            let sum = read(a) + read(b);
+            b.x = 10;
+            sum += read(a) + read(b);
+            C.prototype.y = 0;
+            sum += read(a);
+            C.prototype.x = 100;
+            sum += read(a);
+            for (let i = 0; i < 70; ++i)
+                C.prototype['p' + i] = i;
+            sum += read(a);
+            C.prototype.x = 1000;
+            return sum + read(a) + read(b);
+        }",
+        1224.0,
+    );
+}
+
+#[test]
+fn reused_prototype_slots_stay_valid() {
+    check(
+        "function read(o) { return o.m; }
+        function make(i) {
+            function C() {}
+            if (i % 2)
+                C.prototype.pad = 0;
+            C.prototype.m = i;
+            return new C();
+        }
+        function main() {
+            let sum = 0;
+            for (let i = 0; i < 200; ++i) {
+                sum += read(make(i));
+                const filler = {m: -1};
+                sum += filler.m;
+            }
+            return sum;
+        }",
+        19700.0,
     );
 }

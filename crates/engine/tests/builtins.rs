@@ -58,6 +58,20 @@ fn strings_use_unicode_scalars() {
 }
 
 #[test]
+fn split_preserves_empty_pieces_and_owned_values() {
+    let source = r#"function main() {
+        const parts = '|texture||template|'.split('|');
+        const whole = 'texture'.split();
+        const empty = ''.split('');
+        for(let i = 0; i < 100; ++i) { let temporary = 'other'.split('t'); }
+        return parts.length === 5 && parts[0] === '' && parts[1] === 'texture' &&
+            parts[2] === '' && parts[3] === 'template' && parts[4] === '' &&
+            whole.length === 1 && whole[0] === 'texture' && empty.length === 0;
+    }"#;
+    assert_eq!(run(source).unwrap(), Value::TRUE);
+}
+
+#[test]
 fn unsupported_forms_report_errors() {
     for source in [
         "function main() { return 'a'.split(',', 1); }",

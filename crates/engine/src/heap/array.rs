@@ -21,6 +21,66 @@ impl Array {
 }
 
 impl Heap {
+    // Consumes the element references on both success and failure.
+    pub(crate) fn array_from_owned(&self, elements: Vec<Value>) -> Option<Value> {
+        self.drain(64);
+        let mut data = self.0.borrow_mut();
+        let Some(id) = data.reserve() else {
+            for value in elements {
+                data.release(value);
+            }
+            return None;
+        };
+        let holes = elements.iter().filter(|value| **value == HOLE).count();
+        data.store(id, Payload::Array(Box::new(Array { elements, holes })));
+        Some(Value::from_bits(TAG_OBJECT | id))
+    }
+
+    // The snapshot owns its references independently of mutations to the source.
+    pub(crate) fn owned_indexed_values(&self, value: Value) -> Option<Vec<Value>> {
+        let mut data = self.0.borrow_mut();
+        let id = heap_id(value)?;
+        let values: Vec<_> = if let Some(array) = data.array(id) {
+            (0..array.elements.len())
+                .map(|index| array.get(index))
+                .collect()
+        } else {
+            let array = data.typed_array(id)?;
+            (0..array.storage.len())
+                .map(|index| Value::number(array.storage.get(index).unwrap()))
+                .collect()
+        };
+        for &value in &values {
+            assert!(data.retain(value));
+        }
+        Some(values)
+    }
+
+    pub(crate) fn extend_array(&self, destination: Value, source: Value) -> Option<bool> {
+        let mut data = self.0.borrow_mut();
+        let source = heap_id(source)?;
+        let length = data.array(source)?.elements.len();
+        let Some(destination) = heap_id(destination).filter(|&id| data.array(id).is_some()) else {
+            return Some(false);
+        };
+        if data
+            .array_mut(destination)
+            .unwrap()
+            .elements
+            .try_reserve(length)
+            .is_err()
+        {
+            return Some(false);
+        }
+        for index in 0..length {
+            let value = data.array(source).unwrap().get(index);
+            assert!(data.retain(value));
+            data.array_mut(destination).unwrap().elements.push(value);
+        }
+        data.sync(destination);
+        Some(true)
+    }
+
     pub(crate) fn array(&self, elements: &[Value]) -> Option<Value> {
         self.drain(64);
         let mut data = self.0.borrow_mut();
