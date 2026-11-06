@@ -19,7 +19,7 @@ mod semantic;
 mod session;
 mod temporaries;
 
-pub(crate) use compiler::{Compiler, RecompileJob};
+pub(crate) use compiler::{CompilationMode, Compiler, RecompileJob};
 pub(crate) use entries::DirectEntries;
 pub(crate) use planner::Planner;
 pub(crate) use semantic::specialize::DEFAULT_RECOMPILE_INLINE_MULTIPLIER;

@@ -223,7 +223,8 @@ ownership. The `INLINE` kind bit distinguishes small objects while retaining the
 `OBJECT` family bit. Object allocation first checks the pending destruction head:
 if it is a small object, its remaining values and prototype are released and the
 slot is reset in place, leaving unused value bits intact. Other heads use the
-normal bounded drain and allocation path. Closures also use vector storage. Both inline and vector
+normal bounded drain and allocation path. Instances initialize both their prototype
+and its root shape directly, including when reusing a pending slot. Closures also use vector storage. Both inline and vector
 property values are indexed by their shape. Shapes are shared and immutable:
 they record the prototype, the ordered interned property names with enumerability,
 and are reached through
@@ -260,6 +261,8 @@ numeric storage without per-element reference counting.
 Named writes pass a site cache to the heap helper. It caches the property's atom
 and the last receiver shape's own-slot lookup, including an absent slot. A weak
 heap reference keeps these IDs scoped to their heap without retaining its values.
+The cache also remembers the shape transition for adding the property, keyed by
+the source shape and enumerability, for both inline and vector storage.
 Stores still use the normal retain/release, shape transition and invalidation
 paths; dictionary writes and special receiver properties retain their usual
 behavior.
@@ -1108,10 +1111,11 @@ read and callback assumptions of the shared property setter.
 Facts are sets of possible value types: int32, other doubles, boolean,
 undefined, null, string, object, other values (symbols and BigInts), the
 uninitialized-binding sentinel and internal typed-array views. They are computed flow-insensitively over SSA
-values to a fixed point; block parameters join their incoming arguments. An
-argument passed on the false edge of a branch on `is_uninitialized` of itself
-excludes the sentinel, so for-of elements reached through the iterator path need
-no initialization checks. The
+values to a fixed point; block parameters join their incoming arguments. Arguments
+forwarded by a branch on their own type test retain the corresponding type
+restriction on each edge, including undefined, nullish, string, number and
+uninitialized tests. For-of elements reached through the initialized iterator
+path therefore need no initialization checks. The
 engine has no BigInt, so numeric operators always produce numbers. Facts
 refine contracts: a coercing operation on numbers is pure, one on other
 primitives needs no callback assumption, and an initialization check of a value
@@ -1278,17 +1282,21 @@ String split calls have a conditional native effect summary with an explicit
 callee identity obligation. Within a proven string branch, the successful native
 split can enter a specialized continuation. Its result is then separate from
 the arbitrary replacement method's result. Constructor identity, prototype,
-storage and undefined-argument failures leave this copy for the original
+storage and undefined-texture failures leave this copy for the original
 continuation at the corresponding point; the split is not replayed. This pass
 selects at most one continuation of at most 512 instructions, and only when no
-other optimization region was selected.
+other optimization region was selected. Default argument initialization stays in
+the specialized copy so its joins retain the split element types.
 
 Successful split results have indexed storage. Spread reads yield strings or
 undefined; the first element is a string when the separator is statically absent,
 undefined or a nonempty string. Element facts survive only when no mutation or
 escape through an SSA alias can reach the read, including through loop backedges.
 Inlined constructor stores can remain private when their fresh instance reaches
-only a terminal constructor result and return. Dynamic separators retain the
+only a terminal constructor result and return. Freshness follows block parameters,
+including loop backedges, only when every incoming value is private. Escaping any
+alias invalidates the whole group; writes through aliases still clobber reads
+through the original value. Dynamic separators retain the
 undefined-argument error exit.
 
 This does not yet prove the full `createTerrain` workload closed: array method
@@ -1547,7 +1555,11 @@ cold blocks, laid out after the hot code. Graph values and block parameters whos
 or other heap values are rooted in frame slots; `this` and arguments are
 borrowed from the caller and are not rooted. Generator graphs root every value
 because resumption restores them from the frame. Incoming block parameters are
-retained before replacing their slots when they hold heap values. Temporary
+retained before replacing their slots when they hold heap values. After slot
+assignment, a parameter whose arguments already own its destination slot on every
+incoming edge forwards that ownership without a retain, store or release. Other
+parameters still retain in parallel before any slot is replaced, preserving swaps.
+Temporary
 values are cleared once per block, before its terminator, skipping the call when
 no temporary is pending, so they live at most until the end of their block;
 every heap result they could release early is also rooted. Frame exit releases
@@ -1562,7 +1574,7 @@ the last use, since stores retain before releasing. Either every receiver in the
 chain is known to be an object or reads it as an indexed iteration element (only
 arrays and typed arrays reach those reads), so it owns the result, or the read dies within
 its block before the temporary clear, which covers fresh slow-path results such
-as string characters. Block parameters and returns still retain what they
+as string characters. Other block parameters and returns still retain what they
 receive. `--semantic-ir` lists the borrowed reads.
 
 Frames share one contiguous slot stack and one temporary stack in `JitCtx`;
@@ -1570,13 +1582,19 @@ ordinary functions number their rooted values densely and reserve that many
 slots on entry, and `JitCtx` exposes the current frame's slot base and the
 temporary stack's storage, length, capacity and frame floor. Frame exit releases
 slots and temporaries under one heap borrow. A rooted graph value's slot takes
-a reference of its own and never takes over a temporary's: the store increments
-inline, and a temporary holding the same value keeps its reference until the
-block's clear. Reads stored this way skip the temporary entirely. A slot only
+a reference of its own: ordinary stores increment inline, and a temporary holding
+the same value keeps its reference until the block's clear. Object, array, map
+result, instance and string-split allocations instead use owned-result helpers
+when slotted. The frame adopts the allocation's reference directly; these helpers
+never register temporaries. Property, element and global reads stored this way
+skip temporary registration and acquire the slot's reference before replacing its
+old value. Global cache misses have a matching borrowed-result helper. Constructor
+results always have object facts; a proven primitive return selects the instance,
+and a proven object return selects that object before slot assignment. A slot only
 holds an old value to release when its defining block lies on a control-flow
 cycle (a strongly connected component, so hoisting out of a loop removes the
 release); functions with handlers or generators treat every block as cyclic.
-Block parameters follow the same rule, with every incoming heap value
+Other block parameters follow the same rule, with every incoming heap value
 incremented first so swapped parameters stay alive. Releases decrement inline
 while other references remain, and otherwise call the runtime, which queues the
 slot for disposal. Inline temporary pushes call the runtime only to grow the

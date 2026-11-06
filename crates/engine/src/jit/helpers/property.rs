@@ -23,17 +23,36 @@ impl GlobalCache {
 }
 
 pub(super) extern "C" fn js_global_get(ctx: *mut JitCtx, cache: *mut GlobalCache) -> Value {
-    global_get(ctx, cache, false)
+    global_get(ctx, cache, false, true)
 }
 
 pub(super) extern "C" fn js_global_get_optional(
     ctx: *mut JitCtx,
     cache: *mut GlobalCache,
 ) -> Value {
-    global_get(ctx, cache, true)
+    global_get(ctx, cache, true, true)
 }
 
-pub(super) fn global_get(ctx: *mut JitCtx, cache: *mut GlobalCache, optional: bool) -> Value {
+pub(super) extern "C" fn js_global_get_borrowed(
+    ctx: *mut JitCtx,
+    cache: *mut GlobalCache,
+) -> Value {
+    global_get(ctx, cache, false, false)
+}
+
+pub(super) extern "C" fn js_global_get_optional_borrowed(
+    ctx: *mut JitCtx,
+    cache: *mut GlobalCache,
+) -> Value {
+    global_get(ctx, cache, true, false)
+}
+
+pub(super) fn global_get(
+    ctx: *mut JitCtx,
+    cache: *mut GlobalCache,
+    optional: bool,
+    retain: bool,
+) -> Value {
     let ctx = unsafe { &mut *ctx };
     let cache = unsafe { &mut *cache };
     cache.owner = Some(ctx.global.clone());
@@ -56,7 +75,8 @@ pub(super) fn global_get(ctx: *mut JitCtx, cache: *mut GlobalCache, optional: bo
             ))));
             Value::UNDEFINED
         }
-        Some(value) => ctx.retain_temp(value),
+        Some(value) if retain => ctx.retain_temp(value),
+        Some(value) => value,
         None if optional => Value::UNDEFINED,
         None => {
             ctx.error = Some(Box::new(crate::Error::Runtime(format!(

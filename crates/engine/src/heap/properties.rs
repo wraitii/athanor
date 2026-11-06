@@ -9,6 +9,7 @@ pub(crate) struct PropertyWriteCache {
     heap: std::rc::Weak<RefCell<HeapData>>,
     atom: Option<Atom>,
     slot: Option<(ShapeId, Option<usize>)>,
+    transition: Option<(ShapeId, Key, ShapeId)>,
 }
 
 impl PropertyWriteCache {
@@ -17,6 +18,7 @@ impl PropertyWriteCache {
             self.heap = Rc::downgrade(&heap.0);
             self.atom = None;
             self.slot = None;
+            self.transition = None;
         }
         *self.atom.get_or_insert_with(|| data.atoms.intern(name))
     }
@@ -30,6 +32,18 @@ impl PropertyWriteCache {
         let index = shapes.get(shape).slot(atom);
         self.slot = Some((shape, index));
         index
+    }
+
+    fn transition(&mut self, shape: ShapeId, shapes: &mut Shapes, key: Key) -> ShapeId {
+        if let Some((cached, cached_key, next)) = self.transition
+            && cached == shape
+            && cached_key == key
+        {
+            return next;
+        }
+        let next = shapes.transition(shape, key);
+        self.transition = Some((shape, key, next));
+        next
     }
 }
 
@@ -189,13 +203,14 @@ impl HeapData {
                 return Some(std::mem::replace(&mut object.values[index], value));
             }
             if (object.len as usize) < INLINE_PROPERTIES && array_index_name(name).is_none() {
-                slot.shape = self.shapes.transition(
-                    slot.shape,
-                    Key {
-                        atom,
-                        enumerable: enumerable.unwrap_or(true),
-                    },
-                );
+                let key = Key {
+                    atom,
+                    enumerable: enumerable.unwrap_or(true),
+                };
+                slot.shape = match cache.as_deref_mut() {
+                    Some(cache) => cache.transition(slot.shape, &mut self.shapes, key),
+                    None => self.shapes.transition(slot.shape, key),
+                };
                 object.values[object.len as usize] = value;
                 object.len += 1;
                 return None;
@@ -234,7 +249,10 @@ impl HeapData {
                     atom,
                     enumerable: enumerable.unwrap_or(true),
                 };
-                slot.shape = self.shapes.transition(slot.shape, key);
+                slot.shape = match cache.as_deref_mut() {
+                    Some(cache) => cache.transition(slot.shape, &mut self.shapes, key),
+                    None => self.shapes.transition(slot.shape, key),
+                };
                 values.push(value);
                 return None;
             }
@@ -257,6 +275,7 @@ impl HeapData {
         table.set(name, value, enumerable)
     }
 
+    #[cfg(test)]
     pub(super) fn set_prototype(&mut self, id: u64, prototype: Value) {
         let slot = unsafe { &mut *self.arena.get(id).as_ptr() };
         match &mut slot.payload {

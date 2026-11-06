@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use crate::{EngineOptions, error::Error};
 
-use super::compiler::{Compiler, RecompileJob, Unpublished};
+use super::compiler::{CompilationMode, Compiler, RecompileJob, Unpublished};
 
 pub(crate) const REQUESTED: u8 = 1;
 pub(crate) const READY: u8 = 2;
@@ -264,6 +264,7 @@ fn spawn_worker(
                 if compiler.is_none() {
                     match Compiler::new(
                         options,
+                        CompilationMode::Background,
                         direct as *const usize,
                         Arc::as_ptr(&state) as usize,
                         log,

@@ -779,6 +779,7 @@ pub(super) fn apply(
 
 #[cfg(test)]
 mod tests {
+    use super::super::Types;
     use super::*;
     use oxc_allocator::Allocator;
     use oxc_ast::ast::Statement;
@@ -854,6 +855,41 @@ mod tests {
         assert!(listing.contains("string_split"));
         assert!(listing.contains("constructor_call_spread"));
         analysis.graph.verify().unwrap();
+    }
+
+    #[test]
+    fn split_leaf_keeps_default_arguments_in_the_typed_copy() {
+        let (canonical, bodies) = fixture(
+            "function Terrain(texture,template=undefined){if(texture===undefined)throw new Error('missing');this.texture=texture;this.template=template;} function main(t){return typeof t==='string' ? new Terrain(...t.split('|')) : t;}",
+        );
+        let analysis =
+            super::super::optimize_canonical(canonical, true, Some((&bodies, 0))).unwrap();
+        let graph = &analysis.graph;
+        let cfg = Cfg::new(graph);
+        let setters: Vec<_> = cfg
+            .rpo
+            .iter()
+            .flat_map(|&block| &graph.blocks[block].insts)
+            .filter_map(|&inst| match graph.insts[inst].op {
+                Op::Set(_, ref name, value)
+                    if name == "template" && !graph.cold.contains(&graph.insts[inst].block) =>
+                {
+                    Some(value)
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(!setters.is_empty(), "{analysis}");
+        for value in setters {
+            let types = analysis.facts.of(value);
+            assert!(
+                types.within(Types::STRING.union(Types::UNDEFINED)),
+                "{analysis}"
+            );
+            assert!(types.intersects(Types::STRING));
+            assert!(types.intersects(Types::UNDEFINED));
+        }
+        graph.verify().unwrap();
     }
 
     #[test]

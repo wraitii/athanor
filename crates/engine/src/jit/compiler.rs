@@ -25,6 +25,12 @@ use super::entries::Entry;
 use super::function_data::FunctionData;
 use super::{analysis::CaptureAnalysis, emit, jitdump, temporaries};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompilationMode {
+    Synchronous,
+    Background,
+}
+
 pub(crate) struct CompiledFunction {
     pub(crate) name: String,
     pub(crate) arity: usize,
@@ -190,12 +196,26 @@ impl Compiler {
 
     pub(crate) fn new(
         options: EngineOptions,
+        mode: CompilationMode,
         direct_entries: *const usize,
         compilation_state: usize,
         log: super::recompile::Log,
     ) -> Result<Self, Error> {
+        let opt_level = if mode == CompilationMode::Synchronous {
+            options.sync_opt_level.unwrap_or(options.opt_level)
+        } else {
+            options.opt_level
+        };
         let flags = [
-            ("opt_level", options.opt_level.as_flag()),
+            ("opt_level", opt_level.as_flag()),
+            (
+                "regalloc_algorithm",
+                if mode == CompilationMode::Synchronous && options.sync_single_pass {
+                    "single_pass"
+                } else {
+                    "backtracking"
+                },
+            ),
             (
                 "enable_verifier",
                 if options.osr { "true" } else { "false" },

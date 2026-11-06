@@ -9,6 +9,7 @@ use crate::jit::semantic::{Block, Cfg, Graph, Value, borrowed_receiver};
 pub(super) struct Slots {
     slot: SecondaryMap<Value, Option<u32>>,
     shared: Vec<bool>,
+    forwarded: HashSet<Value>,
 }
 
 impl Slots {
@@ -16,6 +17,7 @@ impl Slots {
         Self {
             slot: SecondaryMap::new(),
             shared: Vec::new(),
+            forwarded: HashSet::new(),
         }
     }
 
@@ -25,6 +27,11 @@ impl Slots {
 
     pub(super) fn of(&self, value: Value) -> Option<u32> {
         self.slot[value]
+    }
+
+    /// Every incoming edge already owns this value in its destination slot.
+    pub(super) fn forwarded(&self, value: Value) -> bool {
+        self.forwarded.contains(&value)
     }
 
     /// Whether a store to this value's slot may find an earlier value there.
@@ -185,6 +192,30 @@ pub(super) fn assign(
                     || (prefers(result) && used.contains(&result)))
             {
                 slots.take(&mut in_use, result);
+            }
+        }
+    }
+    for &block in &cfg.rpo {
+        if cfg.preds[block].is_empty() {
+            continue;
+        }
+        for (index, &param) in graph.blocks[block].params.iter().enumerate() {
+            let Some(slot) = slots.of(param) else {
+                continue;
+            };
+            let forwarded = cfg.preds[block].iter().all(|&pred| {
+                graph.blocks[pred]
+                    .terminator
+                    .as_ref()
+                    .unwrap()
+                    .kind
+                    .targets()
+                    .iter()
+                    .filter(|target| target.block == block)
+                    .all(|target| slots.of(target.args[index]) == Some(slot))
+            });
+            if forwarded {
+                slots.forwarded.insert(param);
             }
         }
     }

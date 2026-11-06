@@ -137,7 +137,7 @@ impl Facts {
                 let Some(terminator) = &graph.blocks[block].terminator else {
                     continue;
                 };
-                let initialized = initialized_edge(graph, &terminator.kind);
+                let refinement = refined_edge(graph, &terminator.kind);
                 for target in terminator.kind.targets() {
                     for (&param, &arg) in graph.blocks[target.block].params.iter().zip(&target.args)
                     {
@@ -145,8 +145,14 @@ impl Facts {
                             continue;
                         }
                         let mut types = facts.of(arg);
-                        if initialized == Some((target.block, arg)) {
-                            types = types.without(Types::UNINITIALIZED);
+                        if let Some((yes, value, mask)) = refinement
+                            && value == arg
+                        {
+                            types = if target.block == yes {
+                                Types(types.0 & mask.0)
+                            } else {
+                                types.without(mask)
+                            };
                         }
                         changed |= facts.widen(param, types);
                     }
@@ -173,18 +179,22 @@ impl Facts {
     }
 }
 
-// The false edge of a branch on `is_uninitialized v` passes an initialized `v`.
-fn initialized_edge(graph: &Graph, kind: &TerminatorKind) -> Option<(Block, Value)> {
+fn refined_edge(graph: &Graph, kind: &TerminatorKind) -> Option<(Block, Value, Types)> {
     let TerminatorKind::Branch(condition, yes, no) = kind else {
         return None;
     };
     if yes.block == no.block {
         return None;
     }
-    match graph.defining_op(*condition) {
-        Some(&Op::IsUninitialized(value)) => Some((no.block, value)),
-        _ => None,
-    }
+    let (value, mask) = match *graph.defining_op(*condition)? {
+        Op::IsUninitialized(value) => (value, Types::UNINITIALIZED),
+        Op::IsUndefined(value) => (value, Types::UNDEFINED),
+        Op::IsNullish(value) => (value, Types::UNDEFINED.union(Types::NULL)),
+        Op::IsString(value) => (value, Types::STRING),
+        Op::IsNumber(value) => (value, Types::NUMBER),
+        _ => return None,
+    };
+    Some((yes.block, value, mask))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -379,6 +389,7 @@ fn result_types(op: &Op, facts: &Facts) -> Types {
         },
         Op::NewObject
         | Op::NewInstance(_)
+        | Op::ConstructorResult(..)
         | Op::NewArray(_)
         | Op::NewHoleyArray(_)
         | Op::IteratorNew(_)

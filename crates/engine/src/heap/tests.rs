@@ -771,6 +771,90 @@ fn disposal_respects_budget_across_shared_array_edges() {
 }
 
 #[test]
+fn instances_reuse_slots_with_the_requested_prototype() {
+    let heap = Heap::default();
+    let first = heap.object().unwrap();
+    let second = heap.object().unwrap();
+    assert!(heap.set_property(first, "inherited", Value::TRUE));
+    assert!(heap.set_property(second, "inherited", Value::FALSE));
+    let mut previous = None;
+    for prototype in [first, first, second, Value::UNDEFINED] {
+        let object = heap.object_with_prototype(prototype).unwrap();
+        if let Some(previous) = previous {
+            assert_eq!(object, previous);
+        }
+        let expected = if prototype == Value::UNDEFINED {
+            Value::UNDEFINED
+        } else {
+            heap.property(prototype, "inherited").unwrap()
+        };
+        assert_eq!(heap.property(object, "inherited"), Some(expected));
+        {
+            let mut data = heap.0.borrow_mut();
+            let prototype = prototype.is_object().then_some(prototype);
+            let root = data.shapes.root(prototype);
+            let slot = data.slot(heap_id(object).unwrap());
+            assert_eq!(slot.shape, root);
+            assert_eq!(slot.length, 0);
+            assert_eq!(slot.references, 1);
+            for value in [first, second] {
+                let references = 1 + u32::from(prototype == Some(value));
+                assert_eq!(data.slot(heap_id(value).unwrap()).references, references);
+            }
+        }
+        assert!(heap.set_property(object, "old", Value::TRUE));
+        heap.release(object);
+        previous = Some(object);
+    }
+    heap.release(first);
+    heap.release(second);
+    heap.drain(1000);
+    assert!(!heap.valid(first));
+    assert!(!heap.valid(second));
+}
+
+#[test]
+fn cached_additions_preserve_layout_enumerability_and_owned_values() {
+    let heap = Heap::default();
+    let prototype = heap.object().unwrap();
+    let mut cache = PropertyWriteCache::default();
+    for padding in [0, 7, 8, 63, 64] {
+        for prototype in [Value::UNDEFINED, prototype] {
+            for enumerable in [true, true, false, false, true] {
+                let object = heap.object_with_prototype(prototype).unwrap();
+                for index in 0..padding {
+                    assert!(heap.set_property(object, &format!("p{index}"), Value::TRUE));
+                }
+                let child = heap.array(&[]).unwrap();
+                assert!(heap.write_property(
+                    object,
+                    "child",
+                    child,
+                    Some(enumerable),
+                    Some(&mut cache)
+                ));
+                heap.release(child);
+                assert_eq!(heap.property(object, "child"), Some(child));
+                assert_eq!(
+                    heap.own_property_names(object, true)
+                        .unwrap()
+                        .contains(&"child".to_owned()),
+                    enumerable
+                );
+                assert!(heap.set_property_cached(object, "child", Value::FALSE, &mut cache));
+                heap.drain(1000);
+                assert!(!heap.valid(child));
+                assert_eq!(heap.property(object, "child"), Some(Value::FALSE));
+                heap.release(object);
+            }
+        }
+    }
+    heap.release(prototype);
+    heap.drain(1000);
+    assert!(!heap.valid(prototype));
+}
+
+#[test]
 fn property_write_cache_follows_heap_identity() {
     let mut cache = PropertyWriteCache::default();
     for padding in [0, 5, 1] {

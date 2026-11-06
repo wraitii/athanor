@@ -18,6 +18,29 @@ fn check(source: &str, expected: f64) {
 }
 
 #[test]
+fn forwarding_constructor_results_and_mixed_joins_preserve_ownership() {
+    check(
+        "function Item(value) { this.value = value; return undefined; }
+        function forward(value, flag) { return flag ? value : value; }
+        function choose(a, b, flag) { return flag ? forward(a, flag) : b; }
+        function main() {
+            let a = new Item(1);
+            let b = new Item(2);
+            let sum = 0;
+            for (let i = 0; i < 100; ++i) {
+                const saved = choose(a, b, i % 2);
+                const previous = a;
+                a = b;
+                b = new Item(previous.value + 1);
+                sum += saved.value;
+            }
+            return sum + a.value + b.value;
+        }",
+        2753.0,
+    );
+}
+
+#[test]
 fn swapped_loop_values_stay_alive() {
     check(
         "function make(v) { return {v}; }

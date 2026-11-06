@@ -1,4 +1,4 @@
-use js_engine::{Engine, Value};
+use js_engine::{Engine, EngineOptions, Value};
 
 fn check(source: &str, expected: f64) {
     let mut engine = Engine::new().unwrap();
@@ -7,6 +7,58 @@ fn check(source: &str, expected: f64) {
         engine.call("main", &[]).unwrap().value(),
         Value::number(expected)
     );
+}
+
+#[test]
+fn allocation_results_are_released_after_forwarding_and_errors() {
+    for ssa_opt in [false, true] {
+        let mut engine = Engine::with_options(EngineOptions {
+            ssa_opt,
+            background_compile: false,
+            ..Default::default()
+        })
+        .unwrap();
+        engine
+            .compile(
+                "var witness;
+            function Item(texture, template = undefined) {
+                this.texture = texture;
+                this.template = template;
+                return undefined;
+            }
+            function forward(value) { return value; }
+            function make(flag) {
+                const parts = 'grass|tree'.split('|');
+                const value = new Item(...parts);
+                return flag ? forward(value) : value;
+            }
+            function texture(value) { return value.texture; }
+            function fail() { witness = make(true); return missing; }",
+                "owned_allocations.js",
+            )
+            .unwrap();
+        for flag in [Value::TRUE, Value::FALSE] {
+            let result = engine.call("make", &[flag]).unwrap();
+            let text = engine.call("texture", &[result.value()]).unwrap();
+            assert_eq!(text.text().as_deref(), Some("grass"));
+            let stale_result = result.value();
+            let stale_text = text.value();
+            drop(result);
+            engine.drain_disposals(1000);
+            assert_eq!(text.text().as_deref(), Some("grass"));
+            drop(text);
+            engine.drain_disposals(1000);
+            assert!(!engine.global().define("disposed", stale_result));
+            assert!(!engine.global().define("disposed", stale_text));
+        }
+        assert!(engine.call("fail", &[]).is_err());
+        let witness = engine.global().get("witness").unwrap();
+        let stale = witness.value();
+        assert!(engine.global().set("witness", Value::UNDEFINED));
+        drop(witness);
+        engine.drain_disposals(1000);
+        assert!(!engine.global().define("disposed", stale));
+    }
 }
 
 #[test]

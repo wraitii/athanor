@@ -3,6 +3,33 @@ use super::{arg, fail};
 use crate::heap::NativeFunction;
 use crate::value::Value;
 
+/// Returns an owned reference without registering a temporary.
+pub(in crate::jit) fn split(ctx: *mut JitCtx, receiver: Value, args: &[Value]) -> Value {
+    let context = unsafe { &mut *ctx };
+    let heap = context.global.heap().clone();
+    let arg = |index: usize| arg(args, index);
+    if heap.string_is_empty(receiver).is_none() {
+        return fail(context, "string method requires a string receiver");
+    }
+    if args.len() > 1 && arg(1) != Value::UNDEFINED {
+        return fail(context, "split limit is unsupported");
+    }
+    let separator = if arg(0) == Value::UNDEFINED {
+        None
+    } else if heap.string_is_empty(arg(0)).is_some() {
+        Some(arg(0))
+    } else {
+        return fail(context, "split separator must be a string");
+    };
+    let Some(values) = heap.split_string(receiver, separator) else {
+        return fail(context, "heap exhausted");
+    };
+    match heap.array_from_owned(values) {
+        Some(value) => value,
+        None => fail(context, "heap exhausted"),
+    }
+}
+
 pub(in crate::jit) fn call(
     ctx: *mut JitCtx,
     function: NativeFunction,
@@ -10,31 +37,13 @@ pub(in crate::jit) fn call(
     args: &[Value],
 ) -> Value {
     use NativeFunction::*;
+    if function == StringSplit {
+        let value = split(ctx, receiver, args);
+        return unsafe { &mut *ctx }.own(value);
+    }
     let context = unsafe { &mut *ctx };
     let heap = context.global.heap().clone();
     let arg = |index: usize| arg(args, index);
-    if function == NativeFunction::StringSplit {
-        if heap.string_is_empty(receiver).is_none() {
-            return fail(context, "string method requires a string receiver");
-        }
-        if args.len() > 1 && arg(1) != Value::UNDEFINED {
-            return fail(context, "split limit is unsupported");
-        }
-        let separator = if arg(0) == Value::UNDEFINED {
-            None
-        } else if heap.string_is_empty(arg(0)).is_some() {
-            Some(arg(0))
-        } else {
-            return fail(context, "split separator must be a string");
-        };
-        let Some(values) = heap.split_string(receiver, separator) else {
-            return fail(context, "heap exhausted");
-        };
-        return match heap.array_from_owned(values) {
-            Some(value) => context.own(value),
-            None => fail(context, "heap exhausted"),
-        };
-    }
     let Some(text) = heap.text(receiver) else {
         return fail(context, "string method requires a string receiver");
     };

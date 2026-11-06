@@ -48,14 +48,7 @@ impl SmallObject {
 
 impl Heap {
     pub(crate) fn object(&self) -> Option<Value> {
-        if let Some(id) = self.0.borrow_mut().reuse_object() {
-            return Some(Value::from_bits(TAG_OBJECT | id));
-        }
-        self.drain(64);
-        let mut data = self.0.borrow_mut();
-        let id = data.reserve()?;
-        data.store_shaped(id, Payload::SmallObject(SmallObject::new(false)));
-        Some(Value::from_bits(TAG_OBJECT | id))
+        self.object_with_prototype(Value::UNDEFINED)
     }
 
     pub(crate) fn has_properties(&self, value: Value) -> bool {
@@ -564,13 +557,26 @@ impl Heap {
     }
 
     pub(crate) fn object_with_prototype(&self, prototype: Value) -> Option<Value> {
-        let instance = self.object()?;
-        if prototype.is_object() {
-            let mut data = self.0.borrow_mut();
-            data.retain(prototype);
-            data.set_prototype(heap_id(instance)?, prototype);
+        let prototype = prototype.is_object().then_some(prototype);
+        if let Some(id) = self.0.borrow_mut().reuse_object(prototype) {
+            return Some(Value::from_bits(TAG_OBJECT | id));
         }
-        Some(instance)
+        self.drain(64);
+        let mut data = self.0.borrow_mut();
+        let id = data.reserve()?;
+        if let Some(prototype) = prototype {
+            data.retain(prototype);
+        }
+        let root = data.shapes.root(prototype);
+        data.store(
+            id,
+            Payload::SmallObject(SmallObject {
+                prototype,
+                ..SmallObject::new(false)
+            }),
+        );
+        data.slot_mut(id).shape = root;
+        Some(Value::from_bits(TAG_OBJECT | id))
     }
 
     pub(crate) fn constructed_object(&self, constructor: Value) -> Option<Value> {
@@ -621,7 +627,7 @@ pub(crate) struct CachedProperty {
 }
 
 impl HeapData {
-    fn reuse_object(&mut self) -> Option<u64> {
+    fn reuse_object(&mut self, prototype: Option<Value>) -> Option<u64> {
         let id = *self.pending.front()?;
         if !matches!(self.slot(id).payload, Payload::SmallObject(_)) {
             return None;
@@ -637,18 +643,21 @@ impl HeapData {
             };
             self.release(value);
         }
-        let root = self.shapes.root(None);
+        let root = self.shapes.root(prototype);
+        if let Some(prototype) = prototype {
+            self.retain(prototype);
+        }
         let slot = self.slot_mut(id);
         let Payload::SmallObject(object) = &mut slot.payload else {
             unreachable!();
         };
-        let prototype = object.prototype.take();
+        let previous = std::mem::replace(&mut object.prototype, prototype);
         object.error = false;
         slot.references = 1;
         slot.shape = root;
         slot.code = 0;
         slot.length = 0;
-        if let Some(prototype) = prototype {
+        if let Some(prototype) = previous {
             self.release(prototype);
         }
         Some(id)

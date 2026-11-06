@@ -260,7 +260,14 @@ impl FunctionCompiler<'_, '_> {
                             | Op::SpreadGet(..)
                             | Op::Call {
                                 target: Some(_), ..
-                            },
+                            }
+                            | Op::GlobalRead(_)
+                            | Op::GlobalReadOptional(_)
+                            | Op::NewObject
+                            | Op::NewArray(_)
+                            | Op::NewHoleyArray(_)
+                            | Op::NewInstance(_)
+                            | Op::StringSplit(..),
                         ) => true,
                         _ => false,
                     },
@@ -293,7 +300,9 @@ impl FunctionCompiler<'_, '_> {
                     continue;
                 }
                 if slotted {
-                    self.increment(param);
+                    if !cx.slots.forwarded(value) {
+                        self.increment(param);
+                    }
                     continue;
                 }
                 let uninitialized = self.b.ins().icmp_imm_s(
@@ -314,8 +323,12 @@ impl FunctionCompiler<'_, '_> {
             }
             for (&value, param) in data.params.iter().zip(params) {
                 if rooted(value) && slotted {
-                    let repeated = repeated(block) || cx.slots.shared(value);
-                    self.replace_local(values[value.index()], param, repeated);
+                    if cx.slots.forwarded(value) {
+                        self.b.def_var(values[value.index()], param);
+                    } else {
+                        let repeated = repeated(block) || cx.slots.shared(value);
+                        self.replace_local(values[value.index()], param, repeated);
+                    }
                 } else if rooted(value) {
                     self.initialize_local(values[value.index()], param);
                 } else if suspends {
@@ -486,7 +499,15 @@ impl FunctionCompiler<'_, '_> {
                         }
                         Op::NewHoleyArray(length) => {
                             let length = get(self, *length);
-                            let value = self.call_helper(Helper::ArrayMapNew, &[length]);
+                            owned = data
+                                .result
+                                .is_some_and(|value| self.slot_owned(graph, &cx, value));
+                            let helper = if owned {
+                                Helper::ArrayMapNewOwned
+                            } else {
+                                Helper::ArrayMapNew
+                            };
+                            let value = self.call_helper(helper, &[length]);
                             self.check_error();
                             Some(value)
                         }
@@ -562,8 +583,18 @@ impl FunctionCompiler<'_, '_> {
                                 result
                             }
                         }),
-                        Op::GlobalRead(name) => Some(self.global_access(name, None)),
-                        Op::GlobalReadOptional(name) => Some(self.global_get_optional(name)),
+                        Op::GlobalRead(name) => {
+                            let retain = data
+                                .result
+                                .is_none_or(|value| !self.slot_owned(graph, &cx, value));
+                            Some(self.cached_global_get(name, false, retain))
+                        }
+                        Op::GlobalReadOptional(name) => {
+                            let retain = data
+                                .result
+                                .is_none_or(|value| !self.slot_owned(graph, &cx, value));
+                            Some(self.global_get_optional(name, retain))
+                        }
                         Op::PropertyKey(value) => {
                             let value = get(self, *value);
                             let result = self.call_helper(Helper::PropertyKey, &[value]);
@@ -707,7 +738,15 @@ impl FunctionCompiler<'_, '_> {
                         }
                         Op::NewObject => {
                             let dummy = self.constant(Value::UNDEFINED);
-                            let value = self.call_helper(Helper::ObjectNew, &[dummy]);
+                            owned = data
+                                .result
+                                .is_some_and(|value| self.slot_owned(graph, &cx, value));
+                            let helper = if owned {
+                                Helper::ObjectNewOwned
+                            } else {
+                                Helper::ObjectNew
+                            };
+                            let value = self.call_helper(helper, &[dummy]);
                             self.check_error();
                             Some(value)
                         }
@@ -715,7 +754,15 @@ impl FunctionCompiler<'_, '_> {
                             let args: Vec<_> = args.iter().map(|&v| get(self, v)).collect();
                             let ptr = self.stack_values(&args, data.span)?;
                             let len = self.b.ins().iconst(types::I64, args.len() as i64);
-                            let value = self.call_helper(Helper::ArrayNew, &[ptr, len]);
+                            owned = data
+                                .result
+                                .is_some_and(|value| self.slot_owned(graph, &cx, value));
+                            let helper = if owned {
+                                Helper::ArrayNewOwned
+                            } else {
+                                Helper::ArrayNew
+                            };
+                            let value = self.call_helper(helper, &[ptr, len]);
                             self.check_error();
                             Some(value)
                         }
@@ -935,7 +982,15 @@ impl FunctionCompiler<'_, '_> {
                         }
                         Op::NewInstance(prototype) => {
                             let prototype = get(self, *prototype);
-                            let result = self.call_helper(Helper::NewInstance, &[prototype]);
+                            owned = data
+                                .result
+                                .is_some_and(|value| self.slot_owned(graph, &cx, value));
+                            let helper = if owned {
+                                Helper::NewInstanceOwned
+                            } else {
+                                Helper::NewInstance
+                            };
+                            let result = self.call_helper(helper, &[prototype]);
                             self.check_error();
                             Some(result)
                         }
@@ -1049,10 +1104,16 @@ impl FunctionCompiler<'_, '_> {
                             let argv = self.stack_values(&args, data.span)?;
                             let operation = self.b.ins().iconst(types::I64, 0);
                             let argc = self.b.ins().iconst(types::I64, args.len() as i64);
-                            let result = self.call_helper(
-                                Helper::StringSplit,
-                                &[operation, receiver, argv, argc],
-                            );
+                            owned = data
+                                .result
+                                .is_some_and(|value| self.slot_owned(graph, &cx, value));
+                            let helper = if owned {
+                                Helper::StringSplitOwned
+                            } else {
+                                Helper::StringSplit
+                            };
+                            let result =
+                                self.call_helper(helper, &[operation, receiver, argv, argc]);
                             self.check_error();
                             Some(result)
                         }

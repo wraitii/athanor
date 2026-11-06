@@ -131,9 +131,14 @@ pub(super) fn invoke(
 }
 
 pub(super) extern "C" fn js_new_instance(ctx: *mut JitCtx, prototype: Value) -> Value {
+    let value = js_new_instance_owned(ctx, prototype);
+    unsafe { &mut *ctx }.own(value)
+}
+
+pub(super) extern "C" fn js_new_instance_owned(ctx: *mut JitCtx, prototype: Value) -> Value {
     let context = unsafe { &mut *ctx };
     match context.global.heap().object_with_prototype(prototype) {
-        Some(instance) => context.own(instance),
+        Some(instance) => instance,
         None => {
             context.error = Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
             Value::UNDEFINED

@@ -85,6 +85,7 @@ define_helpers! {
     Construct => Callable, js_construct;
     ConstructorPrototype => Unary, js_constructor_prototype;
     NewInstance => Unary, js_new_instance;
+    NewInstanceOwned => Unary, js_new_instance_owned;
     ConstructorCall => MethodCallable, js_constructor_call;
     ConstructorCallSpread => IndexSet, js_constructor_call_spread;
     ConstructResolved => MethodCallable, js_construct_resolved;
@@ -107,7 +108,9 @@ define_helpers! {
     ArrayIterationGuard => IndexSet, js_array_iteration_guard;
     IsStringSplit => Unary, js_is_string_split;
     StringSplit => MethodCallable, js_string_split;
+    StringSplitOwned => MethodCallable, js_string_split_owned;
     ArrayMapNew => Unary, js_array_map_new;
+    ArrayMapNewOwned => Unary, js_array_map_new_owned;
     ArrayMapElement => Binary, js_array_map_element;
     MathDirect => MethodCallable, js_math_direct;
     FrameOverflow => Nullary, js_frame_overflow;
@@ -127,10 +130,12 @@ define_helpers! {
     IsTypeof => Binary, js_is_typeof;
     Truthy => Unary, js_truthy;
     ObjectNew => Unary, js_object_new;
+    ObjectNewOwned => Unary, js_object_new_owned;
     PropertyKey => Unary, js_property_key;
     StringNew => ArrayNew, js_string_new;
     RegExpNew => PropertyGet, js_regexp_new;
     ArrayNew => ArrayNew, js_array_new;
+    ArrayNewOwned => ArrayNew, js_array_new_owned;
     Rest => Rest, js_rest;
     IndexGet => Binary, js_index_get;
     IndexGetNumeric => NumericIndex, js_index_get_numeric;
@@ -142,6 +147,8 @@ define_helpers! {
     PropertyDefineHidden => PropertySet, js_property_define_hidden;
     GlobalGet => Pointer, js_global_get;
     GlobalGetOptional => Pointer, js_global_get_optional;
+    GlobalGetBorrowed => Pointer, js_global_get_borrowed;
+    GlobalGetOptionalBorrowed => Pointer, js_global_get_optional_borrowed;
     GlobalSet => GlobalSet, js_global_set;
     GlobalInitialize => GlobalSet, js_global_initialize;
     Throw => Unary, js_throw;
@@ -230,6 +237,8 @@ impl Helper {
                 | Self::PropertyGetCached
                 | Self::GlobalGet
                 | Self::GlobalGetOptional
+                | Self::GlobalGetBorrowed
+                | Self::GlobalGetOptionalBorrowed
                 | Self::BitwiseAnd
                 | Self::BitwiseOr
                 | Self::BitwiseXor
@@ -422,6 +431,11 @@ extern "C" fn js_temp_retain(ctx: *mut JitCtx, value: Value) -> Value {
     ctx.retain_temp(value)
 }
 extern "C" fn js_array_new(ctx: *mut JitCtx, argv: *const Value, argc: u64) -> Value {
+    let value = js_array_new_owned(ctx, argv, argc);
+    unsafe { &mut *ctx }.own(value)
+}
+
+extern "C" fn js_array_new_owned(ctx: *mut JitCtx, argv: *const Value, argc: u64) -> Value {
     let ctx = unsafe { &mut *ctx };
     let values = if argc == 0 {
         &[]
@@ -429,7 +443,7 @@ extern "C" fn js_array_new(ctx: *mut JitCtx, argv: *const Value, argc: u64) -> V
         unsafe { std::slice::from_raw_parts(argv, argc as usize) }
     };
     match ctx.global.heap().array(values) {
-        Some(value) => ctx.own(value),
+        Some(value) => value,
         None => {
             ctx.error = Some(Box::new(crate::Error::Runtime(
                 "invalid array elements or heap exhausted".into(),
@@ -598,17 +612,23 @@ extern "C" fn js_string_split(
     argv: *const Value,
     argc: u64,
 ) -> Value {
+    let value = js_string_split_owned(ctx, 0, receiver, argv, argc);
+    unsafe { &mut *ctx }.own(value)
+}
+
+extern "C" fn js_string_split_owned(
+    ctx: *mut JitCtx,
+    _: u64,
+    receiver: Value,
+    argv: *const Value,
+    argc: u64,
+) -> Value {
     let args = if argc == 0 {
         &[]
     } else {
         unsafe { std::slice::from_raw_parts(argv, argc as usize) }
     };
-    super::builtins::string::call(
-        ctx,
-        crate::heap::NativeFunction::StringSplit,
-        receiver,
-        args,
-    )
+    super::builtins::string::split(ctx, receiver, args)
 }
 
 extern "C" fn js_closure_this(ctx: *mut JitCtx, closure: Value) -> Value {
@@ -649,13 +669,18 @@ extern "C" fn js_array_iteration_guard(
 }
 
 extern "C" fn js_array_map_new(ctx: *mut JitCtx, length: Value) -> Value {
+    let value = js_array_map_new_owned(ctx, length);
+    unsafe { &mut *ctx }.own(value)
+}
+
+extern "C" fn js_array_map_new_owned(ctx: *mut JitCtx, length: Value) -> Value {
     let context = unsafe { &mut *ctx };
     match context
         .global
         .heap()
         .array_of_length(length.as_number().unwrap() as usize)
     {
-        Some(value) => context.own(value),
+        Some(value) => value,
         None => {
             context.error = Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
             Value::UNDEFINED
@@ -950,9 +975,14 @@ pub(super) extern "C" fn js_iterate_next(ctx: *mut JitCtx, state: Value) -> Valu
 }
 
 extern "C" fn js_object_new(ctx: *mut JitCtx, _: Value) -> Value {
+    let value = js_object_new_owned(ctx, Value::UNDEFINED);
+    unsafe { &mut *ctx }.own(value)
+}
+
+extern "C" fn js_object_new_owned(ctx: *mut JitCtx, _: Value) -> Value {
     let ctx = unsafe { &mut *ctx };
     match ctx.global.heap().object() {
-        Some(value) => ctx.own(value),
+        Some(value) => value,
         None => {
             ctx.error = Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
             Value::UNDEFINED

@@ -345,6 +345,19 @@ pub(in super::super) fn simplify(graph: &mut Graph) {
                 {
                     aliases.insert(result, *value);
                     dead.push(inst);
+                } else if let (Some(result), Op::ConstructorResult(returned, instance)) =
+                    (data.result, &data.op)
+                {
+                    let types = facts.of(*returned);
+                    if types != Types::default() && !types.intersects(Types::OBJECT) {
+                        aliases.insert(result, *instance);
+                        dead.push(inst);
+                    } else if types != Types::default() && types.within(Types::OBJECT) {
+                        aliases.insert(result, *returned);
+                        dead.push(inst);
+                    } else if uses[result] == 0 {
+                        dead.push(inst);
+                    }
                 } else if graph.contract(&data.op, &facts).is_pure()
                     && data.result.is_none_or(|result| uses[result] == 0)
                 {

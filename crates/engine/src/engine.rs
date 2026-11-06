@@ -34,9 +34,14 @@ impl OptLevel {
     }
 }
 
+const DEFAULT_SYNC_OPT_LEVEL: Option<OptLevel> = None;
+const DEFAULT_SYNC_SINGLE_PASS: bool = false;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EngineOptions {
     pub opt_level: OptLevel,
+    pub sync_opt_level: Option<OptLevel>,
+    pub sync_single_pass: bool,
     pub jitdump: bool,
     pub jitdump_ir: bool,
     pub ssa_opt: bool,
@@ -61,6 +66,16 @@ impl Default for EngineOptions {
         let jitdump = jitdump.as_deref();
         Self {
             opt_level: OptLevel::default(),
+            sync_opt_level: match std::env::var("JS_JIT_SYNC_OPT_LEVEL").as_deref() {
+                Ok("none") => Some(OptLevel::None),
+                Ok("speed") => Some(OptLevel::Speed),
+                _ => DEFAULT_SYNC_OPT_LEVEL,
+            },
+            sync_single_pass: match std::env::var("JS_JIT_SYNC_SINGLE_PASS").as_deref() {
+                Ok("1") => true,
+                Ok("0") => false,
+                _ => DEFAULT_SYNC_SINGLE_PASS,
+            },
             jitdump: matches!(jitdump, Some("1" | "2")),
             jitdump_ir: jitdump == Some("2"),
             ssa_opt: std::env::var("JS_JIT_SSA").as_deref() != Ok("0"),
@@ -321,6 +336,7 @@ impl Engine {
             osr_functions: RefCell::new(HashSet::new()),
             compiler: RefCell::new(Compiler::new(
                 options,
+                jit::CompilationMode::Synchronous,
                 direct.address(),
                 state_address,
                 recompile_log,
@@ -1895,6 +1911,7 @@ mod feedback_tests {
         let job = engine.compiler.borrow().lazy_compilation(code).unwrap();
         let mut worker = Compiler::new(
             engine.options,
+            jit::CompilationMode::Background,
             engine.direct.address(),
             Arc::as_ptr(&engine.compilation_state) as usize,
             engine.recompile_log,

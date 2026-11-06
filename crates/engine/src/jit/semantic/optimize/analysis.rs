@@ -67,7 +67,7 @@ fn terminal_result(graph: &Graph, scope: &HashSet<Block>, value: Value) -> bool 
     true
 }
 
-pub(super) fn unescaped(graph: &Graph, scope: &HashSet<Block>, cfg: &Cfg) -> HashSet<Value> {
+pub(super) fn unescaped(graph: &Graph, scope: &HashSet<Block>, cfg: &Cfg) -> HashMap<Value, Value> {
     let blocks: Vec<Block> = cfg
         .rpo
         .iter()
@@ -75,8 +75,13 @@ pub(super) fn unescaped(graph: &Graph, scope: &HashSet<Block>, cfg: &Cfg) -> Has
         .filter(|block| scope.contains(block))
         .collect();
     let mut allocations = HashSet::new();
-    let mut sources = Vec::new();
+    let mut aliases: HashMap<Value, Vec<Value>> = HashMap::new();
+    let mut sources: HashMap<Value, Vec<Value>> = HashMap::new();
     for &block in &blocks {
+        // Start optimistically so loop-carried aliases can survive; reject nonprivate inputs below.
+        if block != graph.entry && cfg.preds[block].iter().all(|pred| scope.contains(pred)) {
+            allocations.extend(graph.blocks[block].params.iter().copied());
+        }
         for &inst in &graph.blocks[block].insts {
             let data = &graph.insts[inst];
             match data.op {
@@ -85,12 +90,15 @@ pub(super) fn unescaped(graph: &Graph, scope: &HashSet<Block>, cfg: &Cfg) -> Has
                 }
                 Op::IteratorNew(source) | Op::EnumerateNew(source) => {
                     allocations.extend(data.result);
-                    sources.extend(data.result.map(|iterator| (iterator, source)));
+                    if let Some(iterator) = data.result {
+                        sources.entry(iterator).or_default().push(source);
+                    }
                 }
                 _ => {}
             }
         }
     }
+    let mut escaped = Vec::new();
     for &block in &blocks {
         for &inst in &graph.blocks[block].insts {
             let op = &graph.insts[inst].op;
@@ -102,26 +110,51 @@ pub(super) fn unescaped(graph: &Graph, scope: &HashSet<Block>, cfg: &Cfg) -> Has
                         .result
                         .is_some_and(|result| terminal_result(graph, scope, result));
                 if !contained_use(op, index) && !terminal_constructor {
-                    allocations.remove(&value);
+                    escaped.push(value);
                 }
             }
         }
         if let Some(terminator) = &graph.blocks[block].terminator {
             for target in terminator.kind.targets() {
                 if scope.contains(&target.block) {
-                    for value in &target.args {
-                        allocations.remove(value);
+                    for (&value, &param) in
+                        target.args.iter().zip(&graph.blocks[target.block].params)
+                    {
+                        aliases.entry(value).or_default().push(param);
+                        aliases.entry(param).or_default().push(value);
+                        if !allocations.contains(&value) {
+                            escaped.push(param);
+                        }
+                        if !allocations.contains(&param) {
+                            escaped.push(value);
+                        }
                     }
                 }
             }
         }
     }
-    for (iterator, source) in sources {
-        if !allocations.contains(&iterator) {
-            allocations.remove(&source);
+    let mut visited = HashSet::new();
+    while let Some(value) = escaped.pop() {
+        if !visited.insert(value) {
+            continue;
+        }
+        allocations.remove(&value);
+        escaped.extend(aliases.get(&value).into_iter().flatten().copied());
+        escaped.extend(sources.get(&value).into_iter().flatten().copied());
+    }
+    // Shared representatives keep writes through one alias visible to reads through another.
+    let mut private = HashMap::new();
+    for &value in &allocations {
+        let mut pending = vec![value];
+        while let Some(alias) = pending.pop() {
+            if private.contains_key(&alias) {
+                continue;
+            }
+            private.insert(alias, value);
+            pending.extend(aliases.get(&alias).into_iter().flatten().copied());
         }
     }
-    allocations
+    private
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -187,7 +220,7 @@ impl Access {
 pub(super) struct Writes {
     targets: Vec<(Option<Value>, Access)>,
     globals: Vec<Access>,
-    fresh: HashSet<Value>,
+    fresh: HashMap<Value, Value>,
     pub(super) facts: Facts,
 }
 
@@ -216,7 +249,7 @@ impl Writes {
                 } else if contract.flags & HEAP_WRITE != 0
                     && !op
                         .write_target()
-                        .is_some_and(|target| fresh.contains(&target))
+                        .is_some_and(|target| fresh.contains_key(&target))
                 {
                     globals.push(Access::written(op, &facts));
                 }
@@ -233,7 +266,9 @@ impl Writes {
     pub(super) fn clobbers(&self, receiver: Value, read: &Access) -> bool {
         self.targets.iter().any(|(target, write)| {
             let aliases = match target {
-                Some(target) if self.fresh.contains(target) => *target == receiver,
+                Some(target) if self.fresh.contains_key(target) => {
+                    self.fresh.get(target) == self.fresh.get(&receiver)
+                }
                 _ => true,
             };
             aliases && write.conflicts(read)
@@ -324,7 +359,7 @@ pub(super) fn closure_failure(
             }
             let private = op
                 .write_target()
-                .is_some_and(|target| fresh.contains(&target));
+                .is_some_and(|target| fresh.contains_key(&target));
             let writes = contract.flags & (GLOBAL_WRITE | HEAP_WRITE) != 0;
             if writes && !private && guarded.breaks(op, &facts) {
                 return Some(format!(

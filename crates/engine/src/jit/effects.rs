@@ -73,7 +73,7 @@ pub(super) fn effects(helper: Helper) -> Effects {
         | LexicalReceiver
         | ArrayIterationGuard
         | IsStringSplit => (Reentry::Closed, HEAP_READ, &[]),
-        StringSplit => (
+        StringSplit | StringSplitOwned => (
             Reentry::Closed,
             HEAP_READ | ALLOCATION | INTERNAL | ERROR,
             &[],
@@ -93,10 +93,13 @@ pub(super) fn effects(helper: Helper) -> Effects {
         ),
         Truthy => (Reentry::Closed, HEAP_READ, &[]),
         ArrayMapElement => (Reentry::Closed, HEAP_READ | INTERNAL, &[]),
-        ArrayNew | Rest | ObjectNew | NewInstance | StringNew | ArrayMapNew => {
+        ArrayNew | ArrayNewOwned | Rest | ObjectNew | ObjectNewOwned | NewInstance
+        | NewInstanceOwned | StringNew | ArrayMapNew | ArrayMapNewOwned => {
             (Reentry::Closed, ALLOCATION | INTERNAL | ERROR, &[])
         }
-        GlobalGet | GlobalGetOptional => (Reentry::Closed, GLOBAL_READ | INTERNAL | ERROR, &[]),
+        GlobalGet | GlobalGetOptional | GlobalGetBorrowed | GlobalGetOptionalBorrowed => {
+            (Reentry::Closed, GLOBAL_READ | INTERNAL | ERROR, &[])
+        }
         GlobalSet | GlobalInitialize => (Reentry::Closed, GLOBAL_WRITE | INTERNAL | ERROR, &[]),
         PropertyGet | PropertyGetCached | IndexGet | IndexGetNumeric => (
             Reentry::Closed,
@@ -138,7 +141,14 @@ pub(super) fn temporary_effect(helper: Helper) -> TemporaryEffect {
     match helper {
         TempClear => Clear,
         TempRetain | TempOwn | Add => MayRegister,
-        SemanticPropertyProbeCached => None,
+        SemanticPropertyProbeCached
+        | GlobalGetBorrowed
+        | GlobalGetOptionalBorrowed
+        | NewInstanceOwned
+        | StringSplitOwned
+        | ArrayNewOwned
+        | ObjectNewOwned
+        | ArrayMapNewOwned => None,
         FrameOverflow | FrameRelease | IndexUnroot | LocalSet | LocalReplace | Release
         | ErrorOrigin | Throw | MathDirect | ObserveCall | ObserveGet | ObserveIndex
         | CompilePoll | CompileLeave | CallProfileFlush | ClosureThis | LexicalReceiver

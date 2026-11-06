@@ -1146,7 +1146,7 @@ impl FunctionCompiler<'_, '_> {
 
     pub(super) fn global_access(&mut self, name: &str, value: Option<ClifValue>) -> ClifValue {
         let Some(value) = value else {
-            return self.cached_global_get(name, false);
+            return self.cached_global_get(name, false, true);
         };
         let name: Box<str> = name.into();
         let ptr = self.b.ins().iconst(self.pointer, name.as_ptr() as i64);
@@ -1157,11 +1157,16 @@ impl FunctionCompiler<'_, '_> {
         result
     }
 
-    pub(super) fn global_get_optional(&mut self, name: &str) -> ClifValue {
-        self.cached_global_get(name, true)
+    pub(super) fn global_get_optional(&mut self, name: &str, retain: bool) -> ClifValue {
+        self.cached_global_get(name, true, retain)
     }
 
-    fn cached_global_get(&mut self, name: &str, optional: bool) -> ClifValue {
+    pub(super) fn cached_global_get(
+        &mut self,
+        name: &str,
+        optional: bool,
+        retain: bool,
+    ) -> ClifValue {
         use crate::jit::helpers::GlobalCache;
         use crate::jit::session::{GLOBAL_IDENTITY_OFFSET, GLOBAL_REVISION_OFFSET};
 
@@ -1201,7 +1206,6 @@ impl FunctionCompiler<'_, '_> {
         let valid = self.b.ins().band(valid, present);
         let hit = self.b.create_block();
         let ready = self.b.create_block();
-        let retain = self.b.create_block();
         let slow = self.b.create_block();
         let done = self.b.create_block();
         self.b.append_block_param(done, types::I64);
@@ -1216,16 +1220,22 @@ impl FunctionCompiler<'_, '_> {
                 .icmp_imm_s(IntCC::Equal, value, Value::UNINITIALIZED.bits() as i64);
         self.brif(uninitialized, slow, &[], ready, &[]);
         self.switch(ready);
-        let heap = self.is_heap(value);
-        self.brif(heap, retain, &[], done, &[BlockArg::Value(value)]);
-        self.switch(retain);
-        let value = self.retain_temporary(value);
-        self.jump(done, &[BlockArg::Value(value)]);
-        self.switch(slow);
-        let helper = if optional {
-            Helper::GlobalGetOptional
+        if retain {
+            let retain_block = self.b.create_block();
+            let heap = self.is_heap(value);
+            self.brif(heap, retain_block, &[], done, &[BlockArg::Value(value)]);
+            self.switch(retain_block);
+            let value = self.retain_temporary(value);
+            self.jump(done, &[BlockArg::Value(value)]);
         } else {
-            Helper::GlobalGet
+            self.jump(done, &[BlockArg::Value(value)]);
+        }
+        self.switch(slow);
+        let helper = match (optional, retain) {
+            (false, true) => Helper::GlobalGet,
+            (true, true) => Helper::GlobalGetOptional,
+            (false, false) => Helper::GlobalGetBorrowed,
+            (true, false) => Helper::GlobalGetOptionalBorrowed,
         };
         let value = self.call_helper(helper, &[address]);
         self.check_error();

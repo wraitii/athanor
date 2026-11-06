@@ -122,6 +122,7 @@ impl Shapes {
         next
     }
 
+    #[cfg(test)]
     pub(super) fn rebase(&mut self, shape: ShapeId, prototype: Option<Value>) -> ShapeId {
         let keys = self.get(shape).keys.clone();
         keys.into_iter().fold(self.root(prototype), |shape, key| {

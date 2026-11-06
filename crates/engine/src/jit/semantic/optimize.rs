@@ -118,7 +118,6 @@ pub(super) fn version_string_leaves(
                 }
                 match graph.defining_op(*condition) {
                     Some(Op::IsUninitialized(_)) => graph.cold.contains(&yes.block),
-                    Some(Op::IsUndefined(_)) => true,
                     Some(Op::Binary(BinaryOperator::StrictEquality, left, right)) => {
                         [left, right].into_iter().any(|&value| {
                             matches!(
@@ -872,6 +871,118 @@ mod tests {
     use oxc_parser::Parser;
     use oxc_span::SourceType;
 
+    fn empty_graph() -> Graph {
+        let allocator = Allocator::default();
+        let parsed =
+            Parser::new(&allocator, "function f(){return 0;}", SourceType::script()).parse();
+        let Statement::FunctionDeclaration(function) = &parsed.program.body[0] else {
+            panic!()
+        };
+        let semantic = oxc_semantic::SemanticBuilder::new_compiler()
+            .build(&parsed.program)
+            .semantic;
+        super::super::build::lower(function, semantic.scoping(), &HashSet::new()).unwrap()
+    }
+
+    #[test]
+    fn fresh_block_parameters_keep_aliases_and_reject_external_inputs_and_escapes() {
+        for external in [false, true] {
+            let mut graph = empty_graph();
+            let entry = graph.entry;
+            let span = graph.span;
+            let object = graph.append(entry, span, Op::NewObject, true).1.unwrap();
+            let other = graph.append(entry, span, Op::NewObject, true).1.unwrap();
+            let argument = graph.append(entry, span, Op::Argument(0), true).1.unwrap();
+            let check = graph
+                .append(entry, span, Op::IsUndefined(argument), true)
+                .1
+                .unwrap();
+            let left = graph.blocks.push(BlockData::default());
+            let right = graph.blocks.push(BlockData::default());
+            let merge = graph.blocks.push(BlockData::default());
+            let receiver = graph.add_param(merge);
+            graph.blocks[entry].terminator = Some(Terminator {
+                source_name: None,
+                span,
+                kind: TerminatorKind::Branch(check, Target::new(left), Target::new(right)),
+            });
+            for (block, value) in [
+                (left, object),
+                (right, if external { argument } else { object }),
+            ] {
+                graph.blocks[block].terminator = Some(Terminator {
+                    source_name: None,
+                    span,
+                    kind: TerminatorKind::Jump(Target {
+                        block: merge,
+                        args: vec![value],
+                    }),
+                });
+            }
+            graph.append(merge, span, Op::Set(receiver, "x".into(), argument), false);
+            graph.blocks[merge].terminator = Some(Terminator {
+                source_name: None,
+                span,
+                kind: TerminatorKind::Return(receiver),
+            });
+            graph.verify().unwrap();
+            let scope = Cfg::new(&graph).rpo.into_iter().collect();
+            let fresh = unescaped(&graph, &scope, &Cfg::new(&graph));
+            assert_eq!(fresh.contains_key(&object), !external);
+            assert_eq!(fresh.contains_key(&receiver), !external);
+            let writes = Writes::collect(&graph, &scope);
+            assert!(writes.clobbers(object, &Access::Named("x".into())));
+            assert_eq!(writes.clobbers(other, &Access::Named("x".into())), external);
+            for value in [object, receiver] {
+                let mut escaped = graph.clone();
+                escaped.append(merge, span, Op::GlobalWrite("leak".into(), value), false);
+                let fresh = unescaped(&escaped, &scope, &Cfg::new(&escaped));
+                assert!(!fresh.contains_key(&object));
+                assert!(!fresh.contains_key(&receiver));
+            }
+            let partial = HashSet::from([left, right, merge]);
+            assert!(!unescaped(&graph, &partial, &Cfg::new(&graph)).contains_key(&receiver));
+        }
+    }
+
+    #[test]
+    fn fresh_aliases_survive_loop_backedges() {
+        let mut graph = empty_graph();
+        let entry = graph.entry;
+        let span = graph.span;
+        let object = graph.append(entry, span, Op::NewObject, true).1.unwrap();
+        let header = graph.blocks.push(BlockData::default());
+        let receiver = graph.add_param(header);
+        graph.blocks[entry].terminator = Some(Terminator {
+            source_name: None,
+            span,
+            kind: TerminatorKind::Jump(Target {
+                block: header,
+                args: vec![object],
+            }),
+        });
+        graph.blocks[header].terminator = Some(Terminator {
+            source_name: None,
+            span,
+            kind: TerminatorKind::Jump(Target {
+                block: header,
+                args: vec![receiver],
+            }),
+        });
+        graph.verify().unwrap();
+        let scope = HashSet::from([entry, header]);
+        let fresh = unescaped(&graph, &scope, &Cfg::new(&graph));
+        assert!(fresh.contains_key(&object));
+        assert_eq!(fresh.get(&object), fresh.get(&receiver));
+        graph.append(
+            header,
+            span,
+            Op::GlobalWrite("leak".into(), receiver),
+            false,
+        );
+        assert!(unescaped(&graph, &scope, &Cfg::new(&graph)).is_empty());
+    }
+
     #[test]
     fn numeric_and_typed_guards_share_one_loop_copy() {
         let allocator = Allocator::default();
@@ -951,8 +1062,8 @@ mod tests {
             kind: TerminatorKind::Return(result),
         });
         let scope = HashSet::from([block]);
-        assert!(unescaped(&graph, &scope, &Cfg::new(&graph)).contains(&object));
+        assert!(unescaped(&graph, &scope, &Cfg::new(&graph)).contains_key(&object));
         graph.append(block, span, Op::GlobalWrite("leak".into(), result), false);
-        assert!(!unescaped(&graph, &scope, &Cfg::new(&graph)).contains(&object));
+        assert!(!unescaped(&graph, &scope, &Cfg::new(&graph)).contains_key(&object));
     }
 }

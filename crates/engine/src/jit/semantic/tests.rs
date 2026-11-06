@@ -43,6 +43,124 @@ fn ops(graph: &Graph) -> Vec<&Op> {
 }
 
 #[test]
+fn constructor_result_facts_and_folding_preserve_object_returns() {
+    for returned in [
+        Op::Constant(Constant::Undefined),
+        Op::Constant(Constant::Null),
+        Op::Constant(Constant::Number(7.0)),
+        Op::Constant(Constant::Boolean(true)),
+        Op::Constant(Constant::String("ignored".into())),
+        Op::NewObject,
+        Op::Argument(0),
+    ] {
+        let mut graph = lower_source("function f(){return 0;}").unwrap();
+        let block = graph.entry;
+        let span = graph.span;
+        let instance = graph.append(block, span, Op::NewObject, true).1.unwrap();
+        let object_return = matches!(returned, Op::NewObject);
+        let unknown_return = matches!(returned, Op::Argument(_));
+        let returned = graph.append(block, span, returned, true).1.unwrap();
+        let result = graph
+            .append(block, span, Op::ConstructorResult(returned, instance), true)
+            .1
+            .unwrap();
+        graph.blocks[block].terminator = Some(Terminator {
+            source_name: None,
+            span,
+            kind: TerminatorKind::Return(result),
+        });
+        assert_eq!(Facts::compute(&graph).of(result), Types::OBJECT);
+        optimize::simplify(&mut graph);
+        graph.verify().unwrap();
+        let TerminatorKind::Return(value) = graph.blocks[block].terminator.as_ref().unwrap().kind
+        else {
+            panic!()
+        };
+        assert_eq!(
+            value,
+            if unknown_return {
+                result
+            } else if object_return {
+                returned
+            } else {
+                instance
+            }
+        );
+    }
+}
+
+#[test]
+fn block_arguments_retain_type_test_facts_without_narrowing_unrelated_edges() {
+    for kind in 0..5 {
+        let mut graph = lower_source("function f(){return 0;}").unwrap();
+        let entry = graph.entry;
+        let span = graph.span;
+        let value = graph.append(entry, span, Op::Argument(0), true).1.unwrap();
+        let (op, mask) = match kind {
+            0 => (Op::IsUndefined(value), Types::UNDEFINED),
+            1 => (Op::IsNullish(value), Types::UNDEFINED.union(Types::NULL)),
+            2 => (Op::IsString(value), Types::STRING),
+            3 => (Op::IsNumber(value), Types::NUMBER),
+            _ => (Op::IsUninitialized(value), Types::UNINITIALIZED),
+        };
+        let condition = graph.append(entry, span, op, true).1.unwrap();
+        let yes = graph.blocks.push(BlockData::default());
+        let no = graph.blocks.push(BlockData::default());
+        let join = graph.blocks.push(BlockData::default());
+        let positive = graph.add_param(yes);
+        let negative = graph.add_param(no);
+        let merged = graph.add_param(join);
+        graph.blocks[entry].terminator = Some(Terminator {
+            source_name: None,
+            span,
+            kind: TerminatorKind::Branch(
+                condition,
+                Target {
+                    block: yes,
+                    args: vec![value],
+                },
+                Target {
+                    block: no,
+                    args: vec![value],
+                },
+            ),
+        });
+        for (block, arg) in [(yes, positive), (no, negative)] {
+            graph.blocks[block].terminator = Some(Terminator {
+                source_name: None,
+                span,
+                kind: TerminatorKind::Jump(Target {
+                    block: join,
+                    args: vec![arg],
+                }),
+            });
+        }
+        graph.blocks[join].terminator = Some(Terminator {
+            source_name: None,
+            span,
+            kind: TerminatorKind::Return(merged),
+        });
+        graph.verify().unwrap();
+        let facts = Facts::compute(&graph);
+        let original = facts.of(value);
+        assert_eq!(
+            facts.of(positive),
+            if kind == 4 { Types::default() } else { mask }
+        );
+        assert_eq!(facts.of(negative), original.without(mask));
+        assert_eq!(facts.of(merged), original);
+        if let TerminatorKind::Branch(_, yes, no) =
+            &mut graph.blocks[entry].terminator.as_mut().unwrap().kind
+        {
+            *no = yes.clone();
+        }
+        let facts = Facts::compute(&graph);
+        assert_eq!(facts.of(positive), original);
+        assert_eq!(facts.of(merged), original);
+    }
+}
+
+#[test]
 fn comparisons_share_number_checks_with_refined_reads_without_splitting() {
     let graph =
         lower_source("function f(height,x,limit){if(x<0||x>=limit)return 0;return height[x][0];}")

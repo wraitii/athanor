@@ -134,6 +134,16 @@ completed replacement during dispatch. When JIT dumping is enabled, each worker
 writes a separate dump file. Set `JS_JIT_BACKGROUND=0` to recompile
 synchronously at the next dispatch instead (`EngineOptions::background_compile`).
 
+Set `JS_JIT_SYNC_SINGLE_PASS=1` to use Cranelift's `single_pass` register allocator
+on the execution thread (`EngineOptions::sync_single_pass`). Set
+`JS_JIT_SYNC_OPT_LEVEL=none` or `speed` to override its Cranelift optimization
+level (`EngineOptions::sync_opt_level`). By default it inherits
+`EngineOptions::opt_level` (`speed`) and uses the `backtracking` allocator.
+Background workers retain `opt_level` and `backtracking`, including for prefetched
+initial bodies. These switches affect all compilation on the execution thread,
+including recompilation when `JS_JIT_BACKGROUND=0`; semantic optimization is
+unchanged.
+
 Set `JS_JIT_RECOMPILE_LOG=1` (`EngineOptions::recompile_log`) to trace recompilation
 to stderr in either mode. Events include feedback sites and types, requests,
 outstanding job counts and queue wait time, plan changes, compilation outcomes and durations,
