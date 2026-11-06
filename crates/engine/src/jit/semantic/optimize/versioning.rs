@@ -21,6 +21,7 @@ fn retarget(graph: &mut Graph, blocks: &HashSet<Block>, from: Value, to: Value) 
 /// Entry conditions for a versioned copy, checked in this order.
 #[derive(Default)]
 pub(super) struct Speculation<'a> {
+    pub(super) fallback: Option<usize>,
     pub(super) requirements: &'a [Requirement],
     pub(super) reads: &'a [Inst],
     pub(super) guards: &'a [Block],
@@ -56,6 +57,7 @@ pub(super) fn apply_version(
     speculation: &Speculation<'_>,
 ) -> Version {
     let Speculation {
+        fallback,
         requirements,
         reads,
         guards,
@@ -69,14 +71,23 @@ pub(super) fn apply_version(
         closed_calls,
     } = *speculation;
     let head = entry.map_or(graph.entry, |(_, header)| header);
+    assert!(fallback.is_none() || entry.is_none());
+    let reuse = fallback.is_some()
+        && exits.iter().all(|block| guards.contains(block))
+        && exits_true.is_empty();
     let mut blocks = HashMap::new();
     let mut values = HashMap::new();
     let mut insts = HashMap::new();
     for &block in region {
-        let copy = graph.blocks.push(BlockData::default());
+        let copy = if reuse {
+            block
+        } else {
+            graph.blocks.push(BlockData::default())
+        };
         blocks.insert(block, copy);
         for param in graph.blocks[block].params.clone() {
-            values.insert(param, graph.add_param(copy));
+            let mapped = if reuse { param } else { graph.add_param(copy) };
+            values.insert(param, mapped);
         }
     }
     for &block in region {
@@ -91,7 +102,12 @@ pub(super) fn apply_version(
             for value in op.operands_mut() {
                 *value = values.get(value).copied().unwrap_or(*value);
             }
-            let (copy, result) = graph.append(blocks[&block], data.span, op, data.result.is_some());
+            let (copy, result) = if reuse {
+                graph.insts[inst].op = op;
+                (inst, data.result)
+            } else {
+                graph.append(blocks[&block], data.span, op, data.result.is_some())
+            };
             graph.insts[copy].source_name = data.source_name;
             if let (Some(old), Some(new)) = (data.result, result) {
                 values.insert(old, new);
@@ -159,7 +175,9 @@ pub(super) fn apply_version(
             graph.cold.insert(blocks[&block]);
         }
     }
-    graph.cold.extend(region.iter().copied());
+    if !reuse {
+        graph.cold.extend(region.iter().copied());
+    }
 
     let span = graph.span;
     let mut args = match entry {
@@ -172,9 +190,25 @@ pub(super) fn apply_version(
         },
         None => Vec::new(),
     };
-    let original = Target {
-        block: head,
-        args: args.clone(),
+    let previous = fallback.map(|address| {
+        let block = graph.blocks.push(BlockData {
+            terminator: Some(Terminator {
+                source_name: None,
+                span,
+                kind: TerminatorKind::Fallback(address),
+            }),
+            ..Default::default()
+        });
+        graph.cold.insert(block);
+        Target::new(block)
+    });
+    let original = if reuse {
+        previous.clone().unwrap()
+    } else {
+        Target {
+            block: head,
+            args: args.clone(),
+        }
     };
     let start = graph.blocks.push(BlockData::default());
     let mut current = start;
@@ -523,14 +557,31 @@ pub(super) fn apply_version(
         uses[value] = u32::MAX;
         graph.remove_inst(inst);
     }
-    let definitions: HashMap<Value, Vec<Value>> = values
-        .iter()
-        .map(|(&original, &copy)| {
-            let live = uses[copy] != u32::MAX;
-            (original, if live { vec![copy] } else { Vec::new() })
-        })
-        .collect();
-    repair(graph, &definitions);
+    if !reuse {
+        let definitions: HashMap<Value, Vec<Value>> = values
+            .iter()
+            .map(|(&original, &copy)| {
+                let live = uses[copy] != u32::MAX;
+                (original, if live { vec![copy] } else { Vec::new() })
+            })
+            .collect();
+        repair(graph, &definitions);
+    }
+    // Preserve the original entry during repair so generic loop updates merge with side exits.
+    if !reuse && let Some(previous) = previous {
+        for (block, data) in graph.blocks.iter_mut() {
+            if block < start {
+                continue;
+            }
+            if let Some(terminator) = &mut data.terminator {
+                for target in terminator.kind.targets_mut() {
+                    if target.block == head {
+                        *target = previous.clone();
+                    }
+                }
+            }
+        }
+    }
     // Disconnected fallbacks must not contribute writes to the closed copy.
     let reachable = Cfg::new(graph)
         .rpo

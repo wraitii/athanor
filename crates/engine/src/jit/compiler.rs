@@ -31,6 +31,7 @@ pub(crate) struct CompiledFunction {
 
 #[derive(Clone)]
 struct Emission {
+    current: FuncId,
     conditional: super::semantic::specialize::ConditionalPlan,
     inlines: Vec<super::semantic::specialize::Inline>,
     reads: Vec<super::semantic::reads::Read>,
@@ -173,7 +174,11 @@ impl Compiler {
             Some(&arity) => Some(self.adapter(arity)?),
             None => None,
         };
-        Ok(Entry { code, adapter })
+        Ok(Entry {
+            code,
+            adapter,
+            lexical_this: self.canonical.lexical_this(id),
+        })
     }
 
     fn adapter(&mut self, arity: u16) -> Result<usize, Error> {
@@ -896,7 +901,9 @@ impl Compiler {
         {
             return Ok(None);
         }
-        let graph = super::semantic::optimize_planned(planned).map_err(Error::Unsupported)?;
+        let previous = self.module.get_finalized_function(emission.current) as usize;
+        let graph = super::semantic::optimize_planned(planned, Some(previous))
+            .map_err(Error::Unsupported)?;
         if self.compile_dump && self.compile_semantic_ir {
             println!(
                 "[recompile {}] semantic IR\n{}",
@@ -955,6 +962,7 @@ impl Compiler {
         let lines = line_starts(&source);
         self.finish_functions(vec![(id, body)], &source, &filename, &lines)?;
         let emission = self.emissions.get_mut(&code).unwrap();
+        emission.current = id;
         emission.conditional = graph.conditional;
         emission.inlines = graph.inlines;
         emission.reads = graph.reads;
@@ -1080,6 +1088,7 @@ impl Compiler {
             self.emissions.insert(
                 code,
                 Emission {
+                    current: code,
                     conditional: graph.as_ref().unwrap().conditional.clone(),
                     inlines: graph.as_ref().unwrap().inlines.clone(),
                     reads: graph.as_ref().unwrap().reads.clone(),

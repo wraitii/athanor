@@ -748,7 +748,8 @@ impl FunctionCompiler<'_, '_> {
     fn direct_entry(&mut self, target: DirectTarget, callee: ClifValue) -> (ClifValue, ClifValue) {
         let slot = self.b.ins().iconst(
             self.pointer,
-            self.stubs.direct_entries as i64 + i64::from(target.code.as_u32()) * 8,
+            self.stubs.direct_entries as i64
+                + i64::from(target.code.as_u32()) * crate::jit::entries::DIRECT_ENTRY_SIZE as i64,
         );
         let entry = self
             .b

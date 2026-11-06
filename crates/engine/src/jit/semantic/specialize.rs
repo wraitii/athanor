@@ -5,9 +5,7 @@ use cranelift_module::FuncId;
 use super::super::effects::{
     Assumption, ERROR, GLOBAL_WRITE, HEAP_WRITE, INTERNAL, Reentry, UNKNOWN,
 };
-use super::{
-    Canonical, Cfg, DirectTarget, Facts, Graph, Inst, Native, Op, Result, TerminatorKind,
-};
+use super::{Canonical, Cfg, DirectTarget, Facts, Graph, Inst, Native, Op, Result, TerminatorKind};
 
 const SPECIALIZATION_BUDGET: usize = 256;
 const SPECIALIZATION_BODY_INSTS: usize = 64;
@@ -88,6 +86,12 @@ impl Repository {
     pub(in crate::jit) fn canonical(&self, source: usize, start: u32) -> Option<&Canonical> {
         let code = self.locations.get(&(source, start))?;
         Some(&self.bodies.get(code)?.canonical)
+    }
+
+    pub(in crate::jit) fn lexical_this(&self, code: FuncId) -> bool {
+        self.bodies
+            .get(&code)
+            .is_some_and(|body| body.arrow && super::inlining::uses_this(&body.canonical.graph))
     }
 
     pub(super) fn body(&self, code: FuncId) -> Option<&Graph> {
@@ -857,7 +861,7 @@ mod tests {
         let original_blocks = graph.blocks.len();
         let mut notes = Vec::new();
         assert!(
-            super::super::optimize::version(&mut graph, &plan, &mut notes)
+            super::super::optimize::version(&mut graph, &plan, None, &mut notes)
                 .unwrap()
                 .is_empty()
         );
@@ -879,7 +883,8 @@ mod tests {
         let plan = conditional_plan(&graph, &bodies, &mut Vec::new());
         assert_eq!(plan.calls.len(), 1);
         assert_eq!(plan.calls[0].identities.len(), 2);
-        let regions = super::super::optimize::version(&mut graph, &plan, &mut Vec::new()).unwrap();
+        let regions =
+            super::super::optimize::version(&mut graph, &plan, None, &mut Vec::new()).unwrap();
         assert_eq!(regions.len(), 1);
         let region = &regions[0];
         assert_eq!(graph.closed_calls.len(), 1);
@@ -908,7 +913,7 @@ mod tests {
         let plan = conditional_plan(&graph, &bodies, &mut Vec::new());
         let generic = plan.calls[0].inst;
         let mut notes = Vec::new();
-        let regions = super::super::optimize::version(&mut graph, &plan, &mut notes).unwrap();
+        let regions = super::super::optimize::version(&mut graph, &plan, None, &mut notes).unwrap();
         assert_eq!(regions.len(), 1);
         assert!(!graph.closed_calls.contains_key(&generic));
         assert_eq!(graph.closed_calls.len(), 1);
@@ -946,7 +951,7 @@ mod tests {
         let plan = conditional_plan(&graph, &bodies, &mut Vec::new());
         assert_eq!(plan.calls.len(), 2);
         let mut notes = Vec::new();
-        let regions = super::super::optimize::version(&mut graph, &plan, &mut notes).unwrap();
+        let regions = super::super::optimize::version(&mut graph, &plan, None, &mut notes).unwrap();
         assert_eq!(regions.len(), 1);
         assert_eq!(graph.closed_calls.len(), 1);
         let probes: Vec<_> = operations(&graph)
@@ -973,7 +978,8 @@ mod tests {
         );
         let mut graph = canonical.graph;
         let plan = conditional_plan(&graph, &bodies, &mut Vec::new());
-        let regions = super::super::optimize::version(&mut graph, &plan, &mut Vec::new()).unwrap();
+        let regions =
+            super::super::optimize::version(&mut graph, &plan, None, &mut Vec::new()).unwrap();
         assert!(regions.len() > 1);
         assert!(graph.closed_calls.len() > 1);
         let facts = Facts::compute(&graph);
@@ -994,7 +1000,8 @@ mod tests {
             panic!();
         };
         graph.insts[inst].op = Op::GlobalRead("other".into());
-        let regions = super::super::optimize::version(&mut graph, &plan, &mut Vec::new()).unwrap();
+        let regions =
+            super::super::optimize::version(&mut graph, &plan, None, &mut Vec::new()).unwrap();
         assert!(regions.is_empty());
         assert!(graph.closed_calls.is_empty());
         graph.verify().unwrap();
@@ -1086,7 +1093,7 @@ mod tests {
             let second = super::super::plan_canonical(canonical, true, Some((&bodies, 0))).unwrap();
             assert_eq!(first.inlines.len(), count);
             assert!(first.inlines == second.inlines);
-            let analysis = super::super::optimize_planned(first).unwrap();
+            let analysis = super::super::optimize_planned(first, None).unwrap();
             assert!(analysis.inlines == second.inlines);
             analysis.graph.verify().unwrap();
         }
@@ -1153,28 +1160,44 @@ mod tests {
                 );
             }
         }
-        let analysis =
-            super::super::optimize_canonical(canonical, true, Some((&bodies, 0))).unwrap();
-        let graph = &analysis.graph;
-        graph.verify().unwrap();
-        let mut fallbacks = Vec::new();
-        for block in Cfg::new(graph).rpo {
-            if let Some(super::super::Terminator {
-                kind: TerminatorKind::Branch(condition, _, otherwise),
-                ..
-            }) = &graph.blocks[block].terminator
-                && matches!(graph.defining_op(*condition), Some(Op::IsCode(_, code)) if *code == FuncId::from_u32(0))
-            {
-                fallbacks.push(otherwise.block);
+        for fallback in [None, Some(0x1234)] {
+            let planned =
+                super::super::plan_canonical(canonical.clone(), true, Some((&bodies, 0))).unwrap();
+            let analysis = super::super::optimize_planned(planned, fallback).unwrap();
+            let graph = &analysis.graph;
+            graph.verify().unwrap();
+            let mut fallbacks = Vec::new();
+            for block in Cfg::new(graph).rpo {
+                if let Some(super::super::Terminator {
+                    kind: TerminatorKind::Branch(condition, _, otherwise),
+                    ..
+                }) = &graph.blocks[block].terminator
+                    && matches!(graph.defining_op(*condition), Some(Op::IsCode(_, code)) if *code == FuncId::from_u32(0))
+                {
+                    fallbacks.push(otherwise.block);
+                }
             }
+            assert!(fallbacks.len() >= 2);
+            assert!(fallbacks.iter().all(|block| *block == fallbacks[0]));
+            assert!(
+                operations(graph)
+                    .iter()
+                    .any(|op| matches!(op, Op::CallNative(..)))
+            );
+            assert_eq!(
+                Cfg::new(graph)
+                    .rpo
+                    .iter()
+                    .filter(|&&block| {
+                        matches!(
+                            graph.blocks[block].terminator.as_ref().unwrap().kind,
+                            TerminatorKind::Fallback(0x1234)
+                        )
+                    })
+                    .count(),
+                usize::from(fallback.is_some())
+            );
         }
-        assert!(fallbacks.len() >= 2);
-        assert!(fallbacks.iter().all(|block| *block == fallbacks[0]));
-        assert!(
-            operations(graph)
-                .iter()
-                .any(|op| matches!(op, Op::CallNative(..)))
-        );
     }
 
     #[test]

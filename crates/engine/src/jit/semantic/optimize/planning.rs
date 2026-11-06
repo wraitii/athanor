@@ -83,6 +83,7 @@ impl RegionPlan {
     fn emit(
         mut self,
         graph: &mut Graph,
+        fallback: Option<usize>,
         regions: &mut Vec<HashSet<Block>>,
         notes: &mut Vec<String>,
     ) -> Result<()> {
@@ -106,7 +107,9 @@ impl RegionPlan {
                 .into_iter()
                 .filter(|block| self.body.contains(block))
                 .collect();
+            let fallback = fallback.filter(|_| self.entry.is_none());
             let speculation = Speculation {
+                fallback,
                 requirements: &self.requirements,
                 reads: &self.reads,
                 checks: &self.checks,
@@ -121,6 +124,9 @@ impl RegionPlan {
             };
             let version = apply_version(graph, &blocks, self.entry, &speculation);
             graph.verify()?;
+            if let Some(previous) = fallback {
+                notes.push(format!("function: entry guard failure reuses {previous:#x}"));
+            }
             if let Some(reason) = closure_failure(
                 graph,
                 &version.body,
@@ -148,7 +154,7 @@ impl RegionPlan {
         }
         for child in self.children {
             let first = regions.len();
-            child.emit(graph, regions, notes)?;
+            child.emit(graph, None, regions, notes)?;
             for region in &regions[first..] {
                 self.body.extend(region.iter().copied());
             }
@@ -362,12 +368,13 @@ fn plan(graph: &Graph, conditional: &ConditionalPlan, notes: &mut Vec<String>) -
 pub(in crate::jit::semantic) fn version(
     graph: &mut Graph,
     conditional: &ConditionalPlan,
+    fallback: Option<usize>,
     notes: &mut Vec<String>,
 ) -> Result<Vec<HashSet<Block>>> {
     let plans = plan(graph, conditional, notes);
     let mut regions = Vec::new();
     for plan in plans {
-        plan.emit(graph, &mut regions, notes)?;
+        plan.emit(graph, fallback, &mut regions, notes)?;
     }
     Ok(regions)
 }
@@ -414,6 +421,67 @@ mod tests {
         assert!(!root.checks.is_empty());
         assert!(!root.typed_reads.is_empty());
         assert_eq!(root.body.len(), Cfg::new(&graph).rpo.len());
+        graph.verify().unwrap();
+    }
+
+    #[test]
+    fn previous_entry_reuses_the_fast_body_without_a_generic_copy() {
+        let mut graph = graph(
+            "function f(xs,n){let sum=0;for(let i=0;i<n;++i)sum+=Math.floor(xs[i]);return sum;}",
+        );
+        let original = graph.entry;
+        let loops = natural_loops(&graph, &Cfg::new(&graph)).len();
+        let regions = version(
+            &mut graph,
+            &ConditionalPlan::default(),
+            Some(0x1234),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(regions.len(), 1);
+        assert!(regions[0].contains(&original));
+        let cfg = Cfg::new(&graph);
+        assert_eq!(natural_loops(&graph, &cfg).len(), loops);
+        assert_eq!(
+            cfg.rpo
+                .iter()
+                .filter(|&&block| {
+                    matches!(
+                        graph.blocks[block].terminator.as_ref().unwrap().kind,
+                        TerminatorKind::Fallback(0x1234)
+                    )
+                })
+                .count(),
+            1
+        );
+        assert!(!cfg.rpo.iter().any(|&block| {
+            graph.blocks[block]
+                .insts
+                .iter()
+                .any(|&inst| matches!(graph.insts[inst].op, Op::Call { .. }))
+        }));
+        graph.verify().unwrap();
+    }
+
+    #[test]
+    fn loop_versions_keep_their_local_fallback() {
+        let mut graph = graph(
+            "function f(g,xs){g();let sum=0;for(let i=0;i<2;++i)sum+=Math.floor(xs[i]);return sum;}",
+        );
+        let regions = version(
+            &mut graph,
+            &ConditionalPlan::default(),
+            Some(0x1234),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(!regions.is_empty());
+        assert!(Cfg::new(&graph).rpo.iter().all(|&block| {
+            !matches!(
+                graph.blocks[block].terminator.as_ref().unwrap().kind,
+                TerminatorKind::Fallback(_)
+            )
+        }));
         graph.verify().unwrap();
     }
 

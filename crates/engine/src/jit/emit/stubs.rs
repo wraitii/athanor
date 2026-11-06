@@ -9,6 +9,8 @@ use cranelift_module::{FuncId, Module};
 
 use super::scope::{heap_address, increment_references};
 use crate::error::Error;
+use crate::heap::CODE_OFFSET;
+use crate::jit::entries::{DIRECT_ENTRIES, DIRECT_ENTRY_SIZE};
 use crate::jit::helpers::Helper;
 use crate::jit::jitdump::Writer;
 use crate::jit::session::{ERROR_OFFSET, EXCEPTION_OFFSET};
@@ -34,7 +36,7 @@ impl Stubs {
         let mut misses = Vec::new();
         let mut adapters = Vec::new();
         for arity in 0..=STUB_ARITIES {
-            misses.push(build_miss(module, helpers, arity)?);
+            misses.push(build_miss(module, helpers, generic, direct_entries, arity)?);
             adapters.push(build_adapter(module, generic, arity)?);
         }
         module
@@ -122,9 +124,15 @@ fn define(
     Ok(Stub { id, size })
 }
 
-/// Taken by direct call sites when the callee lacks the expected code or its entry is
-/// withdrawn. Returns an owned result, like fixed-arity code.
-fn build_miss(module: &mut JITModule, helpers: &[FuncId], arity: u16) -> Result<Stub, Error> {
+/// Dispatches unexpected targets through their published adapters before trying the runtime.
+/// Returns an owned result, like fixed-arity code.
+fn build_miss(
+    module: &mut JITModule,
+    helpers: &[FuncId],
+    generic: &Signature,
+    direct_entries: *const usize,
+    arity: u16,
+) -> Result<Stub, Error> {
     let pointer = module.target_config().pointer_type();
     define(module, fixed_signature(pointer, arity), |b, module| {
         let flags = MemFlagsData::trusted();
@@ -147,23 +155,61 @@ fn build_miss(module: &mut JITModule, helpers: &[FuncId], arity: u16) -> Result<
             b.ins().stack_addr(pointer, slot, 0)
         };
         let argc = b.ins().iconst(types::I64, i64::from(arity));
+        let inspect = b.create_block();
+        let lookup = b.create_block();
+        let fast = b.create_block();
+        let slow = b.create_block();
+        let done = b.create_block();
+        b.append_block_param(done, types::I64);
+        let address = heap_address(b, callee);
+        b.ins().brif(address, inspect, &[], slow, &[]);
+        b.switch_to_block(inspect);
+        let code = b.ins().load(types::I32, flags, address, CODE_OFFSET);
+        let code = b.ins().uextend(pointer, code);
+        let index = b.ins().iadd_imm_s(code, -1);
+        let valid = b
+            .ins()
+            .icmp_imm_u(IntCC::UnsignedLessThan, index, DIRECT_ENTRIES as i64);
+        b.ins().brif(valid, lookup, &[], slow, &[]);
+        b.switch_to_block(lookup);
+        let offset = b.ins().imul_imm_s(index, DIRECT_ENTRY_SIZE as i64);
+        let table = b.ins().iconst(pointer, direct_entries as i64);
+        let slot = b.ins().iadd(table, offset);
+        let code = b.ins().load(pointer, flags, slot, 0);
+        let adapter = b.ins().load(pointer, flags, slot, pointer.bytes() as i32);
+        b.ins().brif(adapter, fast, &[], slow, &[]);
+        b.switch_to_block(fast);
+        let mut signature = generic.clone();
+        signature.params.push(AbiParam::new(pointer));
+        let signature = b.import_signature(signature);
+        let adapted = b.ins().call_indirect(
+            signature,
+            adapter,
+            &[ctx, callee, receiver, argv, argc, code],
+        );
+        let result = b.inst_results(adapted)[0];
+        b.ins().jump(done, &[result.into()]);
+        b.switch_to_block(slow);
         let call = b.ins().call(call, &[ctx, callee, receiver, argv, argc]);
         let result = b.inst_results(call)[0];
+        let address = heap_address(b, result);
+        let increment = b.create_block();
+        b.ins()
+            .brif(address, increment, &[], done, &[result.into()]);
+        b.switch_to_block(increment);
+        increment_references(b, address);
+        b.ins().jump(done, &[result.into()]);
+        b.switch_to_block(done);
+        let result = b.block_params(done)[0];
         let error = b.ins().load(types::I64, flags, ctx, ERROR_OFFSET);
         let error = b.ins().icmp_imm_s(IntCC::NotEqual, error, 0);
         let exception = b.ins().load(types::I64, flags, ctx, EXCEPTION_OFFSET);
-        let exception =
-            b.ins()
-                .icmp_imm_s(IntCC::NotEqual, exception, Value::UNINITIALIZED.bits() as i64);
+        let exception = b.ins().icmp_imm_s(
+            IntCC::NotEqual,
+            exception,
+            Value::UNINITIALIZED.bits() as i64,
+        );
         let status = b.ins().bor(error, exception);
-        let address = heap_address(b, result);
-        let increment = b.create_block();
-        let done = b.create_block();
-        b.ins().brif(address, increment, &[], done, &[]);
-        b.switch_to_block(increment);
-        increment_references(b, address);
-        b.ins().jump(done, &[]);
-        b.switch_to_block(done);
         b.ins().return_(&[result, status]);
     })
 }

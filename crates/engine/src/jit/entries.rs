@@ -4,10 +4,11 @@ use crate::jit::session::JitCtx;
 use crate::value::Value;
 
 pub(crate) const DIRECT_ENTRIES: usize = 1 << 20;
+pub(crate) const DIRECT_ENTRY_SIZE: usize = 2 * std::mem::size_of::<usize>();
 
-/// Indexed by code ID. Zero means callers must take the generic path, either because the code
-/// has no fixed-arity entry or because feedback asked for its recompilation on the next generic
-/// call. The table never moves, so generated code embeds its address.
+/// Each code ID has a fixed-arity entry and an argument adapter. Zero entries require runtime
+/// dispatch, including when feedback requests recompilation. Adapters stay zero for closures
+/// requiring lexical receiver resolution. The table never moves.
 pub(crate) struct DirectEntries(Box<[Cell<usize>]>);
 
 pub(crate) fn zeroed_cells(len: usize) -> Box<[Cell<usize>]> {
@@ -18,21 +19,31 @@ pub(crate) fn zeroed_cells(len: usize) -> Box<[Cell<usize>]> {
 
 impl DirectEntries {
     pub(crate) fn new() -> Self {
-        Self(zeroed_cells(DIRECT_ENTRIES))
+        Self(zeroed_cells(DIRECT_ENTRIES * 2))
     }
 
     pub(crate) fn address(&self) -> *const usize {
         self.0.as_ptr().cast()
     }
 
-    pub(crate) fn publish(&self, code: u64, entry: usize) {
-        if let Some(slot) = self.0.get(code as usize) {
-            slot.set(entry);
+    pub(crate) fn publish(&self, code: u64, entry: Entry) {
+        if code < DIRECT_ENTRIES as u64 {
+            let index = code as usize * 2;
+            self.0[index].set(entry.code);
+            self.0[index + 1].set(if entry.lexical_this {
+                0
+            } else {
+                entry.adapter.unwrap_or(0)
+            });
         }
     }
 
     pub(crate) fn withdraw(&self, code: u64) {
-        self.publish(code, 0);
+        if code < DIRECT_ENTRIES as u64 {
+            let index = code as usize * 2;
+            self.0[index].set(0);
+            self.0[index + 1].set(0);
+        }
     }
 }
 
@@ -44,6 +55,7 @@ type Adapter = extern "C" fn(*mut JitCtx, Value, Value, *const Value, u64, usize
 pub(crate) struct Entry {
     pub(crate) code: usize,
     pub(crate) adapter: Option<usize>,
+    pub(crate) lexical_this: bool,
 }
 
 impl Entry {
@@ -51,6 +63,7 @@ impl Entry {
         Self {
             code,
             adapter: None,
+            lexical_this: false,
         }
     }
 

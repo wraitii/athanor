@@ -96,6 +96,63 @@ fn missing_arguments_and_fallback_errors_agree() {
 }
 
 #[test]
+fn polymorphic_calls_preserve_arguments_receivers_and_owned_returns() {
+    let source = r#"
+        function initial(a, b) { return {value: this.base + a + b}; }
+        function fewer(a) { return {value: this.base + a}; }
+        function more(a, b, c = 10) { return {value: this.base + a + b + c}; }
+        function many(a, b, c, d, e, f, g, h, i, j = 20) {
+            return {value: this.base + a + b + j};
+        }
+        function rest(...args) { return {value: this.base + args.length}; }
+        function make(n) { return function(a, b) { return {value: this.base + n + a + b}; }; }
+        function makeArrow() { return (a, b) => ({value: this.base + a + b}); }
+        function invoke(o) { return o.run(2, 3); }
+        function main() {
+            let object = {base: 100, run: initial};
+            let arrow = {base: 200, make: makeArrow}.make();
+            let targets = [initial, fewer, more, many, rest, make(30), arrow];
+            let total = 0;
+            for (let i = 0; i < 40; ++i) {
+                for (let j = 0; j < targets.length; ++j) {
+                    object.run = targets[j];
+                    let result = invoke(object);
+                    total += result.value;
+                }
+            }
+            return total;
+        }
+    "#;
+    assert_eq!(run(source, true), Ok(Value::number(35560.0)));
+    assert_eq!(run(source, true), run(source, false));
+}
+
+#[test]
+fn polymorphic_calls_preserve_exceptions_and_recovery() {
+    let source = r#"
+        function initial(x) { return x + 1; }
+        function throwing(x) { throw {value: x + 10}; }
+        function invoke(o, x) { return o.run(x); }
+        function main() {
+            let object = {run: initial};
+            let total = 0;
+            for (let i = 0; i < 20; ++i) {
+                object.run = initial;
+                total += invoke(object, i);
+                object.run = throwing;
+                try { invoke(object, i); }
+                catch (error) { total += error.value; }
+                object.run = Math.abs;
+                total += invoke(object, -i);
+            }
+            return total;
+        }
+    "#;
+    assert_eq!(run(source, true), Ok(Value::number(790.0)));
+    assert_eq!(run(source, true), run(source, false));
+}
+
+#[test]
 fn loop_guard_exits_preserve_progress_captures_and_mutated_globals() {
     for enabled in [false, true] {
         let mut engine = Engine::with_options(EngineOptions {

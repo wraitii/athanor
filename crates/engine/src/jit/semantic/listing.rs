@@ -272,6 +272,7 @@ impl Listing<'_> {
                     }
                     TerminatorKind::Yield(_, value, target) => format!("yield {value}, {target}"),
                     TerminatorKind::Return(value) => format!("return {value}"),
+                    TerminatorKind::Fallback(entry) => format!("fallback {entry:#x}"),
                 };
                 let span = terminator.span;
                 lines.push((

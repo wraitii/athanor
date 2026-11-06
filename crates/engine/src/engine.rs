@@ -340,7 +340,7 @@ impl Engine {
 
     fn publish(&self, code: u64, entry: jit::entries::Entry) {
         match entry.adapter {
-            Some(_) => self.direct.publish(code, entry.code),
+            Some(_) => self.direct.publish(code, entry),
             None => self.direct.withdraw(code),
         }
     }
@@ -652,6 +652,37 @@ mod feedback_tests {
             }
         }
         assert_ne!(entry(&engine, code), original);
+    }
+
+    #[test]
+    fn previous_entry_fallback_preserves_arguments_heap_returns_and_errors() {
+        for invoke in [
+            "function invoke(x){return object.run(x);}",
+            "function invoke(){return object.run(arguments[0]);}",
+        ] {
+            let mut engine = Engine::new().unwrap();
+            engine.compile(&format!(
+                "var object={{run:function(x){{return x;}}}}; {invoke} function replace(){{object.run=function(x){{return {{value:x}};}};}} function fail(){{object.run=function(x){{throw x;}};}} function restore(){{object.run=function(x){{return x;}};}}"
+            ), "previous-entry.js").unwrap();
+            let code = code(&engine, "invoke");
+            let original = entry(&engine, code);
+            let input = engine.global.heap().object().unwrap();
+            for _ in 0..3 {
+                assert_eq!(engine.call("invoke", &[input]).unwrap().value(), input);
+            }
+            assert_ne!(entry(&engine, code), original);
+            engine.call("replace", &[]).unwrap();
+            for _ in 0..3 {
+                let result = engine.call("invoke", &[input]).unwrap();
+                engine.drain_disposals(1000);
+                assert_eq!(engine.global.heap().property(result.value(), "value"), Some(input));
+            }
+            engine.call("fail", &[]).unwrap();
+            assert!(engine.call("invoke", &[input]).is_err());
+            engine.call("restore", &[]).unwrap();
+            assert_eq!(engine.call("invoke", &[input]).unwrap().value(), input);
+            engine.global.heap().release(input);
+        }
     }
 
     #[test]

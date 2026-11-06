@@ -1182,6 +1182,25 @@ impl FunctionCompiler<'_, '_> {
                     let (block, args) = target(self, target_);
                     self.jump(block, &args);
                 }
+                TerminatorKind::Fallback(previous) => {
+                    let mut args = vec![self.ctx, closure, self.receiver];
+                    match &self.arguments {
+                        super::Arguments::Fixed(values) => args.extend(values),
+                        super::Arguments::Vector { argv, argc } => args.extend([*argv, *argc]),
+                    }
+                    let undefined = self.constant(Value::UNDEFINED);
+                    self.exit_frame(undefined);
+                    let signature = self.b.import_signature(self.b.func.signature.clone());
+                    let address = self.b.ins().iconst(self.pointer, *previous as i64);
+                    if matches!(self.arguments, super::Arguments::Fixed(_)) {
+                        self.b.ins().return_call_indirect(signature, address, &args);
+                    } else {
+                        let call = self.b.ins().call_indirect(signature, address, &args);
+                        let results = self.b.inst_results(call).to_vec();
+                        self.b.ins().return_(&results);
+                    }
+                    self.terminated = true;
+                }
                 TerminatorKind::Return(value) => {
                     let operand = self.operand(&cx, *value);
                     let value = self.convert(operand, Repr::Boxed);

@@ -375,6 +375,15 @@ and one cache per emitted read site, including retained compiled versions.
 Execution retains its global environment and refers to the active engine. Code
 lookup copies an entry address under a short registry borrow; no registry or
 compiler borrow remains held while generated code executes.
+Fixed-arity calls guard a predicted code ID and load its current published entry.
+For calls with matching argument counts up to eight, a shared miss stub resolves
+the actual callee's code ID through the same table. Its published argument adapter
+pads missing arguments and discards extras before entering fixed-arity code,
+without Rust dispatch. The adapter returns an owned result; only runtime results
+need an additional retain in the miss stub. Native functions, closures requiring
+lexical receiver resolution, and targets without a published adapter use the
+runtime. Feedback withdrawal clears both published pointers so the next call
+still triggers pending recompilation. The table uses two pointer words per code ID.
 Heap closures retain neither the engine nor an Environment, avoiding an external
 Rc cycle through the heap. Host handles may outlive the engine and keep captured
 values alive, but cannot execute the retired code or transfer it to another
@@ -1237,6 +1246,18 @@ require read-only descendants and reject unresolved calls, native identity
 obligations, generators and handlers. Only calls in the validated copy receive
 the conditional proof; guard failure enters the original region before its
 effects execute. Value substitution and nested copying preserve those proofs.
+Feedback recompilation retains the native entry of the previously emitted
+version. A function specialization sends entry guard failure directly to that
+previous version, passing the original closure, receiver and arguments. When
+all fallback guards move to entry, it reuses the planned fast body in place.
+Varying guards retain local generic continuations carrying the current SSA
+values; only entry failures restart the previous function. Side-exit SSA repair
+runs before redirecting entry failures, preserving merges between copied loop
+values and values updated by the generic continuation. Fixed entries use a
+native tail call; generic entries call and return after releasing the speculative
+frame. The fallback bypasses mutable dispatch tables. Initial compilation still
+includes its generic body because no earlier native version exists.
+
 Load reuse, hoisting and borrowing consume instruction-specific proofs, while
 generic calls retain their reentry and ownership barriers. Conditional decisions
 participate in the tiering decision record; inline budgets are unchanged.

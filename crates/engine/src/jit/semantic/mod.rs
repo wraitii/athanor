@@ -334,6 +334,7 @@ pub(super) enum TerminatorKind {
     Yield(Span, Value, Target),
     Branch(Value, Target, Target),
     Return(Value),
+    Fallback(usize),
 }
 
 #[derive(Clone)]
@@ -622,6 +623,7 @@ impl TerminatorKind {
             }
             TerminatorKind::Yield(_, value, target) => (Some(value), &mut target.args, &mut []),
             TerminatorKind::Return(value) => (Some(value), &mut [], &mut []),
+            TerminatorKind::Fallback(_) => (None, &mut [], &mut []),
         };
         first
             .into_iter()
@@ -642,6 +644,7 @@ impl TerminatorKind {
             }
             TerminatorKind::Yield(_, value, target) => (Some(*value), &target.args, &[]),
             TerminatorKind::Return(value) => (Some(*value), &[], &[]),
+            TerminatorKind::Fallback(_) => (None, &[], &[]),
         };
         first
             .into_iter()
@@ -655,7 +658,7 @@ impl TerminatorKind {
             TerminatorKind::CheckException(normal, error) => vec![normal, error],
             TerminatorKind::Branch(_, then, otherwise) => vec![then, otherwise],
             TerminatorKind::Yield(_, _, target) => vec![target],
-            TerminatorKind::Return(_) => Vec::new(),
+            TerminatorKind::Return(_) | TerminatorKind::Fallback(_) => Vec::new(),
         }
     }
 
@@ -665,7 +668,7 @@ impl TerminatorKind {
             TerminatorKind::CheckException(normal, error) => vec![normal, error],
             TerminatorKind::Branch(_, then, otherwise) => vec![then, otherwise],
             TerminatorKind::Yield(_, _, target) => vec![target],
-            TerminatorKind::Return(_) => Vec::new(),
+            TerminatorKind::Return(_) | TerminatorKind::Fallback(_) => Vec::new(),
         }
     }
 }
@@ -1154,7 +1157,7 @@ impl Graph {
             let Some(terminator) = &self.blocks[block].terminator else {
                 return Err(format!("{block} has no terminator"));
             };
-            if matches!(terminator.kind, TerminatorKind::Return(_)) && !stack.is_empty() {
+            if matches!(terminator.kind, TerminatorKind::Return(_) | TerminatorKind::Fallback(_)) && !stack.is_empty() {
                 return Err(format!("{block} returns with open scopes"));
             }
             for target in terminator.kind.targets() {
@@ -1345,7 +1348,7 @@ pub(super) fn optimize_canonical(
     ssa_opt: bool,
     specialization: Option<(&specialize::Repository, usize)>,
 ) -> Result<Analysis> {
-    optimize_planned(plan_canonical(canonical, ssa_opt, specialization)?)
+    optimize_planned(plan_canonical(canonical, ssa_opt, specialization)?, None)
 }
 
 #[derive(Default)]
@@ -1443,7 +1446,7 @@ pub(super) fn plan_canonical(
     })
 }
 
-pub(super) fn optimize_planned(planned: Planned) -> Result<Analysis> {
+pub(super) fn optimize_planned(planned: Planned, fallback: Option<usize>) -> Result<Analysis> {
     let Planned {
         inlines,
         reads,
@@ -1471,7 +1474,7 @@ pub(super) fn optimize_planned(planned: Planned) -> Result<Analysis> {
         optimize::simplify(&mut graph);
     }
     graph.verify()?;
-    let mut regions = optimize::version(&mut graph, &conditional, &mut notes)?;
+    let mut regions = optimize::version(&mut graph, &conditional, fallback, &mut notes)?;
     graph.verify()?;
     if regions.is_empty() {
         regions.extend(optimize::version_string_leaves(&mut graph, &mut notes)?);

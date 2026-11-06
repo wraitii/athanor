@@ -570,6 +570,7 @@ fn capture_cell_writes_preserve_guarded_globals_and_properties() {
     let regions = optimize::version(
         &mut graph,
         &specialize::ConditionalPlan::default(),
+        None,
         &mut Vec::new(),
     )
     .unwrap();
