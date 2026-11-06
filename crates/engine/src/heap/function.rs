@@ -13,6 +13,13 @@ pub(super) struct Closure {
     pub(super) properties: Properties,
 }
 
+pub(super) fn callable_code(closure: &Closure) -> u32 {
+    if closure.class {
+        return 0;
+    }
+    u32::try_from(closure.code.0 + 1).unwrap_or(0)
+}
+
 impl Heap {
     pub(crate) fn cell(&self, value: Value) -> Option<Value> {
         self.drain(64);
@@ -86,11 +93,10 @@ impl Heap {
     }
 
     pub(crate) fn mark_class(&self, closure: Value) {
-        self.0
-            .borrow_mut()
-            .closure_mut(heap_id(closure).unwrap())
-            .unwrap()
-            .class = true;
+        let id = heap_id(closure).unwrap();
+        let mut data = self.0.borrow_mut();
+        data.closure_mut(id).unwrap().class = true;
+        data.sync(id);
     }
 
     pub(crate) fn is_class(&self, closure: Value) -> bool {

@@ -1117,11 +1117,10 @@ inlining preserves the callee's error locations and resolved closure code IDs.
 
 `semantic/specialize.rs` separates specialization requests, guard planning, and
 application. The static producer recognizes global bindings and known local
-closures through their SSA definitions. Numeric helper bodies can request
-number guards; general bodies and observed call targets do not require them. The planner removes number checks
-already proven by caller facts, deduplicates equal argument checks, and bounds
-expansion to 512 callee instructions per caller, with at most 128 instructions
-per eligible callee. These counts use canonical semantic operations, including
+closures through their SSA definitions. Inlining substitutes ordinary argument
+values without numeric guards or type-based eligibility restrictions. The
+planner bounds expansion to 256 callee instructions per caller, with at most
+64 instructions per eligible callee. These counts use canonical semantic operations, including
 arguments, constants and scopes, but not block parameters or terminators.
 
 `semantic/inlining.rs` copies callee blocks, values, bindings and scopes, and
@@ -1170,10 +1169,12 @@ with no remaining closure uses need no cell. Ownership analysis runs after these
 transformations.
 
 For example, `square(x)` with `square(x) { return x * x; }` gets a code check,
-one number check, an inline multiply, and the original call as fallback.
-`square(x * 2)` needs only the code check because its argument is already known
-numeric. Call-specialization requests remain per-site; subsequent region
-planning combines guards whose dependencies are available at a shared entry.
+an inline multiply with generic semantics, and the original call as fallback.
+Subsequent region planning discovers numeric assumptions from the inlined
+operations and combines guards whose dependencies are available at a shared
+entry. `square(x * 2)` needs no numeric guard because its argument is already
+known numeric. Inlining decisions retain target identity and expansion costs;
+numeric specialization belongs to region planning.
 
 `planner.rs` collects feedback independently of code emission. Fixed argument
 calls and named or indexed reads in ordinary functions have a stable site
@@ -1207,7 +1208,7 @@ observations through SSA merges or specialize writes.
 At the owner's next dispatch, the compiler synchronously plans from its canonical
 graph with the accumulated feedback. Observations supply speculative candidates,
 with the evaluated callee checked by the existing code-identity guard. The planner
-runs at most four inlining rounds with one shared 512-instruction budget, allowing
+runs at most two inlining rounds with one shared 256-instruction budget, allowing
 calls exposed by earlier rounds to inline without expanding fallback calls again.
 The ordered inlining and read decisions form the decision record for the emitted
 version.

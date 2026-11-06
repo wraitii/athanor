@@ -646,7 +646,7 @@ impl HeapData {
         object.error = false;
         slot.references = 1;
         slot.shape = root;
-        slot.flags = 0;
+        slot.code = 0;
         slot.length = 0;
         if let Some(prototype) = prototype {
             self.release(prototype);

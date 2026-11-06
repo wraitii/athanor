@@ -261,7 +261,10 @@ impl FunctionCompiler<'_, '_> {
                             Op::GetIndex(..)
                             | Op::TypedIndex(..)
                             | Op::IndexedGet(..)
-                            | Op::SpreadGet(..),
+                            | Op::SpreadGet(..)
+                            | Op::Call {
+                                target: Some(_), ..
+                            },
                         ) => true,
                         _ => false,
                     },
@@ -358,20 +361,22 @@ impl FunctionCompiler<'_, '_> {
                     self.observe(object, data.span, Helper::ObserveIndex);
                 }
                 let typed = self.typed_op(&cx, graph, inst)?;
+                let mut owned = false;
                 let result = if let Some(typed) = typed {
                     typed
                 } else {
                     let result = match &data.op {
                         Op::Argument(index) => Some(self.load_arg(*index)),
                         Op::Arguments => {
-                            let value = self.call_helper(Helper::ArrayNew, &[self.argv, self.argc]);
+                            let (argv, argc) = self.argument_vector()?;
+                            let value = self.call_helper(Helper::ArrayNew, &[argv, argc]);
                             self.check_error();
                             Some(value)
                         }
                         Op::Rest(index) => {
                             let index = self.b.ins().iconst(types::I64, *index as i64);
-                            let value =
-                                self.call_helper(Helper::Rest, &[self.argv, self.argc, index]);
+                            let (argv, argc) = self.argument_vector()?;
+                            let value = self.call_helper(Helper::Rest, &[argv, argc, index]);
                             self.check_error();
                             Some(value)
                         }
@@ -714,7 +719,7 @@ impl FunctionCompiler<'_, '_> {
                             let no = self.constant(Value::FALSE);
                             Some(self.b.ins().select(condition, yes, no))
                         }
-                        Op::IsTyped(..) => unreachable!(),
+                        Op::IsTyped(..) | Op::IsCode(..) => unreachable!(),
                         Op::IsIndexed(value) => {
                             let value = get(self, *value);
                             let view = self.view(value);
@@ -806,18 +811,34 @@ impl FunctionCompiler<'_, '_> {
                             callee,
                             receiver,
                             args,
+                            target,
                         } => {
+                            let closure = graph.defining_op(*callee);
                             let callee = get(self, *callee);
                             let receiver = receiver
                                 .map(|v| get(self, v))
                                 .unwrap_or_else(|| self.constant(Value::UNDEFINED));
                             let args: Vec<_> = args.iter().map(|&v| get(self, v)).collect();
                             self.observe(callee, data.span, Helper::ObserveCall);
-                            let argv = self.stack_values(&args, data.span)?;
-                            let argc = self.b.ins().iconst(types::I64, args.len() as i64);
-                            let value =
-                                self.call_helper(Helper::Call, &[callee, receiver, argv, argc]);
-                            self.check_error();
+                            let value = match target {
+                                Some(target) => {
+                                    let receiver = match closure {
+                                        _ if !target.lexical_this => receiver,
+                                        Some(Op::Closure(_, _, true, _, true, _, lexical)) => {
+                                            lexical.map_or(self.receiver, |v| get(self, v))
+                                        }
+                                        _ => self.call_helper(
+                                            Helper::LexicalReceiver,
+                                            &[callee, receiver],
+                                        ),
+                                    };
+                                    owned = data
+                                        .result
+                                        .is_some_and(|value| self.slot_owned(graph, &cx, value));
+                                    self.direct_call(*target, callee, receiver, &args, data.span, owned)?
+                                }
+                                None => self.generic_call(callee, receiver, &args, data.span)?,
+                            };
                             Some(value)
                         }
                         Op::NewInstance(prototype) => {
@@ -947,11 +968,6 @@ impl FunctionCompiler<'_, '_> {
                             let value = get(self, *value);
                             let operation = self.b.ins().iconst(types::I64, native.index() as i64);
                             Some(self.call_helper(Helper::SemanticMathNative, &[value, operation]))
-                        }
-                        Op::IsCode(value, code) => {
-                            let value = get(self, *value);
-                            let code = self.b.ins().iconst(types::I64, code.as_u32() as i64);
-                            Some(self.call_helper(Helper::SemanticCode, &[value, code]))
                         }
                         Op::GuardValid(guard) => {
                             let epoch = self.epoch();
@@ -1091,7 +1107,10 @@ impl FunctionCompiler<'_, '_> {
                     let borrowed = (matches!(data.op, Op::This | Op::Argument(_))
                         || graph.borrowed.contains(&value))
                         && !suspends;
-                    if !borrowed && self.slot_owned(graph, &cx, value) {
+                    if owned {
+                        let repeated = repeated(block) || cx.slots.shared(value);
+                        self.replace_local(values[value.index()], result, repeated);
+                    } else if !borrowed && self.slot_owned(graph, &cx, value) {
                         let repeated = repeated(block) || cx.slots.shared(value);
                         self.own_local(values[value.index()], result, repeated);
                     } else if rooted(value) && !borrowed && !slotted {
@@ -1166,7 +1185,8 @@ impl FunctionCompiler<'_, '_> {
                 TerminatorKind::Return(value) => {
                     let operand = self.operand(&cx, *value);
                     let value = self.convert(operand, Repr::Boxed);
-                    self.jump(self.return_block, &[BlockArg::Value(value)]);
+                    let args = self.return_args(value, false);
+                    self.jump(self.return_block, &args);
                 }
             }
             for successor in graph.successors(block) {
@@ -1187,6 +1207,7 @@ impl FunctionCompiler<'_, '_> {
             self.b
                 .set_srcloc(cranelift_codegen::ir::SourceLoc::default());
         }
+        self.finish_failed_exit();
         self.switch(self.return_block);
         let result = self.b.block_params(self.return_block)[0];
         self.return_value(result);
@@ -1320,6 +1341,11 @@ impl FunctionCompiler<'_, '_> {
                 let truth = self.condition(operand, true);
                 let value = self.b.ins().icmp_imm_s(IntCC::Equal, truth, 0);
                 boolean(value)
+            }
+            Op::IsCode(value, code) => {
+                let operand = self.operand(cx, *value);
+                let value = self.convert(operand, Repr::Boxed);
+                boolean(self.is_code(value, *code))
             }
             Op::IsNumber(value) => {
                 let operand = self.operand(cx, *value);

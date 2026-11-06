@@ -1,14 +1,100 @@
+use std::cell::Cell;
+
 use crate::Engine;
+use crate::jit::entries::zeroed_cells;
 
 use crate::environment::Environment;
 use crate::error::Error;
 use crate::value::Value;
 
+/// A frame entered through the runtime rather than by generated code: generator resumption
+/// and tests. Generated frames keep the caller's state in their own SSA values instead.
 struct Frame {
-    locals: usize,
-    temps: usize,
-    index_root: Option<[Value; 3]>,
+    caller_start: usize,
+    caller_floor: usize,
     resume_state: usize,
+}
+
+pub(crate) const LOCAL_STACK_SIZE: usize = 1 << 20;
+const NATIVE_STACK_BUDGET: usize = 1 << 20;
+
+/// Starts zeroed (+0, a non-heap value), so untouched pages are never committed.
+pub(crate) struct LocalSlots {
+    storage: Box<[Cell<usize>]>,
+    active: Cell<bool>,
+}
+
+impl LocalSlots {
+    pub(crate) fn new() -> Self {
+        Self {
+            storage: zeroed_cells(LOCAL_STACK_SIZE),
+            active: Cell::new(false),
+        }
+    }
+
+    fn enter(&self) -> *mut Value {
+        assert!(!self.active.replace(true), "nested JIT sessions");
+        self.storage.as_ptr().cast_mut().cast()
+    }
+
+    fn exit(&self) {
+        self.active.set(false);
+    }
+}
+
+/// Frame slots of every active frame. Every slot above `len` holds a non-heap value, so
+/// entering a frame only bumps `len` and exiting resets the slots it wrote.
+#[repr(C)]
+pub(crate) struct LocalStack {
+    base: *mut Value,
+    start: usize,
+    len: usize,
+    limit: usize,
+    storage: *mut Value,
+}
+
+impl LocalStack {
+    fn new(storage: *mut Value) -> Self {
+        Self {
+            base: storage,
+            start: 0,
+            len: 0,
+            limit: LOCAL_STACK_SIZE,
+            storage,
+        }
+    }
+
+    fn values(&self) -> &[Value] {
+        unsafe { std::slice::from_raw_parts(self.storage, self.len) }
+    }
+
+    fn values_mut(&mut self) -> &mut [Value] {
+        unsafe { std::slice::from_raw_parts_mut(self.storage, self.len) }
+    }
+
+    fn set_start(&mut self, start: usize) {
+        self.start = start;
+        self.base = self.storage.wrapping_add(start);
+    }
+
+    fn grow(&mut self, len: usize) -> bool {
+        if len > self.limit {
+            return false;
+        }
+        let old = self.len;
+        self.len = len;
+        self.values_mut()[old..].fill(Value::UNDEFINED);
+        true
+    }
+
+    fn frame(&self) -> &[Value] {
+        &self.values()[self.start..]
+    }
+
+    fn reset_frame(&mut self) {
+        let start = self.start;
+        self.values_mut()[start..].fill(Value::UNDEFINED);
+    }
 }
 
 /// Values owned until the next clear. Generated code pushes and pops in place: `storage` is
@@ -60,9 +146,10 @@ pub(crate) struct JitCtx<'a> {
     pub(crate) error_origin: Option<(String, u32, u32)>,
     exception: Value,
     frames: Vec<Frame>,
-    locals: Vec<Value>,
-    locals_base: *mut Value,
+    locals: LocalStack,
+    stack_limit: usize,
     temps: TempStack,
+    index_root: [Value; 3],
     epoch: *const u64,
     global_identity: *const (),
     global_revision: *const u64,
@@ -71,7 +158,18 @@ pub(crate) struct JitCtx<'a> {
 
 pub(crate) const ERROR_OFFSET: i32 = std::mem::offset_of!(JitCtx<'static>, error) as i32;
 pub(crate) const EXCEPTION_OFFSET: i32 = std::mem::offset_of!(JitCtx<'static>, exception) as i32;
-pub(crate) const LOCALS_OFFSET: i32 = std::mem::offset_of!(JitCtx<'static>, locals_base) as i32;
+const LOCAL_STACK_OFFSET: usize = std::mem::offset_of!(JitCtx<'static>, locals);
+pub(crate) const LOCALS_OFFSET: i32 =
+    (LOCAL_STACK_OFFSET + std::mem::offset_of!(LocalStack, base)) as i32;
+pub(crate) const LOCALS_START_OFFSET: i32 =
+    (LOCAL_STACK_OFFSET + std::mem::offset_of!(LocalStack, start)) as i32;
+pub(crate) const LOCALS_LEN_OFFSET: i32 =
+    (LOCAL_STACK_OFFSET + std::mem::offset_of!(LocalStack, len)) as i32;
+pub(crate) const LOCALS_LIMIT_OFFSET: i32 =
+    (LOCAL_STACK_OFFSET + std::mem::offset_of!(LocalStack, limit)) as i32;
+pub(crate) const STACK_LIMIT_OFFSET: i32 =
+    std::mem::offset_of!(JitCtx<'static>, stack_limit) as i32;
+pub(crate) const INDEX_ROOT_OFFSET: i32 = std::mem::offset_of!(JitCtx<'static>, index_root) as i32;
 const TEMPS_OFFSET: usize = std::mem::offset_of!(JitCtx<'static>, temps);
 pub(crate) const TEMPS_VALUES_OFFSET: i32 =
     (TEMPS_OFFSET + std::mem::offset_of!(TempStack, values)) as i32;
@@ -90,15 +188,18 @@ pub(crate) const GLOBAL_REVISION_OFFSET: i32 =
 
 impl<'a> JitCtx<'a> {
     fn new(engine: &'a Engine) -> Self {
+        let marker = 0u8;
+        let stack_pointer = std::hint::black_box(&raw const marker) as usize;
         Self {
             global: engine.global().clone(),
             error: None,
             error_origin: None,
             exception: Value::UNINITIALIZED,
             frames: Vec::new(),
-            locals: Vec::new(),
-            locals_base: std::ptr::null_mut(),
+            locals: LocalStack::new(engine.locals.enter()),
+            stack_limit: stack_pointer.saturating_sub(NATIVE_STACK_BUDGET),
             temps: TempStack::new(),
+            index_root: [Value::UNDEFINED; 3],
             epoch: engine.global().heap().epoch(),
             global_identity: engine.global().identity(),
             global_revision: engine.global().revision_ptr(),
@@ -146,36 +247,41 @@ impl<'a> JitCtx<'a> {
         self.own(value)
     }
 
-    pub(crate) fn entry(&self, code: u64) -> Option<usize> {
+    pub(crate) fn entry(&self, code: u64) -> Option<crate::jit::entries::Entry> {
         self.engine.entry(code)
     }
 
-    pub(crate) fn resume(&mut self, locals: Vec<Value>, state: usize) {
+    pub(crate) fn resume(&mut self, locals: Vec<Value>, state: usize) -> Result<(), Vec<Value>> {
         self.push_frame(state);
-        self.locals.extend(locals);
-        self.sync_locals();
+        let start = self.locals.len;
+        if !self.locals.grow(start + locals.len()) {
+            self.pop_frame();
+            self.overflow();
+            return Err(locals);
+        }
+        self.locals.values_mut()[start..].copy_from_slice(&locals);
+        Ok(())
     }
 
     fn push_frame(&mut self, resume_state: usize) {
         self.frames.push(Frame {
-            locals: self.locals.len(),
-            temps: self.temps.len,
-            index_root: None,
+            caller_start: self.locals.start,
+            caller_floor: self.temps.floor,
             resume_state,
         });
+        self.locals.set_start(self.locals.len);
+        self.temps.floor = self.temps.len;
     }
 
-    fn sync_locals(&mut self) {
-        self.locals_base = match self.frames.last() {
-            Some(frame) => self.locals.as_mut_ptr().wrapping_add(frame.locals),
-            None => std::ptr::null_mut(),
-        };
-
-        self.temps.floor = self.frames.last().map_or(0, |frame| frame.temps);
+    fn pop_frame(&mut self) {
+        let frame = self.frames.pop().unwrap();
+        self.locals.len = self.locals.start;
+        self.locals.set_start(frame.caller_start);
+        self.temps.floor = frame.caller_floor;
     }
 
-    fn frame(&self) -> &Frame {
-        self.frames.last().unwrap()
+    pub(crate) fn overflow(&mut self) {
+        self.error = Some(Box::new(Error::Runtime("too much recursion".into())));
     }
 
     pub(crate) fn resume_state(&self) -> usize {
@@ -185,7 +291,8 @@ impl<'a> JitCtx<'a> {
     pub(crate) fn local_get(&mut self, slot: usize) -> Value {
         let value = self
             .locals
-            .get(self.frame().locals + slot)
+            .frame()
+            .get(slot)
             .copied()
             .unwrap_or(Value::UNDEFINED);
         self.retain_temp(value)
@@ -197,23 +304,21 @@ impl<'a> JitCtx<'a> {
             return self.exit(Value::UNDEFINED);
         }
         self.clear();
-        let frame = self.frames.pop().unwrap();
-        if let Some(values) = frame.index_root {
-            self.global.heap().release_all(&values);
-        }
-        let locals = self.locals.split_off(frame.locals);
-        self.sync_locals();
+        let locals = self.locals.frame().to_vec();
+        self.locals.reset_frame();
+        self.pop_frame();
         self.global
             .heap()
             .generator_suspend(generator, state, locals);
         value
     }
 
+    #[cfg(test)]
     pub(crate) fn enter(&mut self, size: usize) {
         self.push_frame(0);
-        self.locals
-            .resize(self.locals.len() + size, Value::UNDEFINED);
-        self.sync_locals();
+        if !self.locals.grow(self.locals.len + size) {
+            self.overflow();
+        }
     }
     pub(crate) fn own(&mut self, value: Value) -> Value {
         if (value.is_object() && value != Value::GLOBAL_OBJECT) || value.is_string() {
@@ -229,7 +334,7 @@ impl<'a> JitCtx<'a> {
         self.own(value)
     }
     pub(crate) fn clear(&mut self) {
-        let base = self.frame().temps;
+        let base = self.temps.floor;
         self.global.heap().release_all(self.temps.above(base));
         self.temps.len = base;
     }
@@ -253,12 +358,20 @@ impl<'a> JitCtx<'a> {
             }
             retained += 1;
         }
-        if let Some(old) = self.frames.last_mut().unwrap().index_root.replace(values) {
-            for value in old {
-                heap.release(value);
-            }
-        }
+        let old = std::mem::replace(&mut self.index_root, values);
+        heap.release_all(&old);
         true
+    }
+
+    /// Only call-free functions root an indexed read, so at most one frame owns the root.
+    pub(crate) fn release_index_root(&mut self) {
+        let old = std::mem::replace(&mut self.index_root, [Value::UNDEFINED; 3]);
+        self.global.heap().release_all(&old);
+    }
+
+    pub(crate) fn release_frame_locals(&mut self) {
+        self.global.heap().release_all(self.locals.frame());
+        self.locals.reset_frame();
     }
 
     fn take_ownership(&mut self, value: Value) -> bool {
@@ -275,8 +388,8 @@ impl<'a> JitCtx<'a> {
 
     pub(crate) fn local_replace(&mut self, slot: usize, value: Value, old: Value) -> Value {
         if !self.take_ownership(value) {
-            let index = self.frame().locals + slot;
-            self.locals[index] = old;
+            let index = self.locals.start + slot;
+            self.locals.values_mut()[index] = old;
             return Value::UNDEFINED;
         }
         self.global.heap().release(old);
@@ -287,49 +400,41 @@ impl<'a> JitCtx<'a> {
         if !self.take_ownership(value) {
             return Value::UNDEFINED;
         }
-        let frame = self.frames.last().unwrap();
-        let index = frame.locals + slot;
-        if index >= self.locals.len() {
-            self.locals.resize(index + 1, Value::UNDEFINED);
-            self.sync_locals();
+        let index = self.locals.start + slot;
+        if index >= self.locals.len && !self.locals.grow(index + 1) {
+            self.global.heap().release(value);
+            self.overflow();
+            return Value::UNDEFINED;
         }
-        let old = std::mem::replace(&mut self.locals[index], value);
+        let old = std::mem::replace(&mut self.locals.values_mut()[index], value);
         self.global.heap().release(old);
         value
     }
+
     pub(crate) fn exit(&mut self, value: Value) -> Value {
-        self.exit_frame(value, true)
-    }
-
-    pub(crate) fn exit_unrooted(&mut self, value: Value) -> Value {
-        self.exit_frame(value, false)
-    }
-
-    fn exit_frame(&mut self, value: Value, roots: bool) -> Value {
         let value = if self.global.heap().retain(value) {
             value
         } else {
             self.error = Some(Box::new(Error::Runtime("invalid heap value".into())));
             Value::UNDEFINED
         };
-        let frame = self.frames.pop().unwrap();
-        let heap = self.global.heap();
-        if roots {
-            heap.release_all(&self.locals[frame.locals..]);
-        }
-        self.locals.truncate(frame.locals);
-        heap.release_all(self.temps.above(frame.temps));
-        self.temps.len = frame.temps;
-        if let Some(roots) = frame.index_root {
-            heap.release_all(&roots);
-        }
-        self.sync_locals();
+        self.release_frame_locals();
+        self.clear();
+        self.release_index_root();
+        self.pop_frame();
         value
     }
 }
 
+impl Drop for JitCtx<'_> {
+    fn drop(&mut self) {
+        self.locals.values_mut().fill(Value::UNDEFINED);
+        self.engine.locals.exit();
+    }
+}
+
 pub(crate) unsafe fn call(
-    entry: usize,
+    entry: crate::jit::entries::Entry,
     args: &[Value],
     engine: &Engine,
     closure: Value,
@@ -340,17 +445,9 @@ pub(crate) unsafe fn call(
     let argv = if args.is_empty() {
         std::ptr::null()
     } else {
-        args.as_ptr().cast::<u64>()
+        args.as_ptr()
     };
-    let function: extern "C" fn(*mut JitCtx, Value, Value, *const u64, u64) -> u64 =
-        unsafe { std::mem::transmute(entry) };
-    let value = Value::from_bits(function(
-        &mut ctx,
-        closure,
-        receiver,
-        argv,
-        args.len() as u64,
-    ));
+    let value = entry.call(&mut ctx, closure, receiver, argv, args.len() as u64);
     let exception = std::mem::replace(&mut ctx.exception, Value::UNINITIALIZED);
     if exception != Value::UNINITIALIZED {
         let message = global
@@ -365,10 +462,10 @@ pub(crate) unsafe fn call(
             ))));
         }
     }
-    match ctx.error {
+    match ctx.error.take() {
         Some(error) => {
             global.heap().release(value);
-            match (*error, ctx.error_origin) {
+            match (*error, ctx.error_origin.take()) {
                 (Error::Runtime(message), Some((filename, start, end))) => Err(Error::Runtime(
                     format!("{filename}:{start}..{end}: {message}"),
                 )),
@@ -400,7 +497,7 @@ mod tests {
         heap.drain(100);
         assert!(heap.valid(first_array) && heap.valid(first));
         assert!(ctx.root_index_read(second_array, key, second));
-        assert!(ctx.frames.last().unwrap().index_root.is_some());
+        assert!(ctx.index_root[0] != Value::UNDEFINED);
         heap.drain(100);
         assert!(!heap.valid(first_array) && !heap.valid(first));
         heap.release(second_array);
@@ -462,7 +559,7 @@ mod tests {
             .unwrap();
         ctx.enter(0);
         assert!(!ctx.root_index_read(array, key, method));
-        assert!(ctx.frames.last().unwrap().index_root.is_none());
+        assert!(ctx.index_root[0] == Value::UNDEFINED);
         heap.release(array);
         heap.release(key);
         heap.release(method);

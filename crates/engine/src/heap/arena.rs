@@ -12,7 +12,9 @@ pub(super) struct Slot {
     pub(super) references: u32,
     pub(super) kind: u32,
     pub(super) shape: u32,
-    pub(super) flags: u32,
+    // Code id + 1 of a closure that may be called without `new`, otherwise zero, so generated
+    // call guards compare one word.
+    pub(super) code: u32,
     // Generated code reads elements or shaped property values through these; HeapData::sync
     // refreshes them after any change that can move or resize that storage.
     pub(super) data: *const u8,
@@ -25,6 +27,7 @@ const _: () = assert!(std::mem::size_of::<Slot>() == SLOT_SIZE);
 pub(crate) const REFERENCES_OFFSET: i32 = std::mem::offset_of!(Slot, references) as i32;
 pub(crate) const KIND_OFFSET: i32 = std::mem::offset_of!(Slot, kind) as i32;
 pub(crate) const SHAPE_OFFSET: i32 = std::mem::offset_of!(Slot, shape) as i32;
+pub(crate) const CODE_OFFSET: i32 = std::mem::offset_of!(Slot, code) as i32;
 pub(crate) const DATA_OFFSET: i32 = std::mem::offset_of!(Slot, data) as i32;
 pub(crate) const LENGTH_OFFSET: i32 = std::mem::offset_of!(Slot, length) as i32;
 
@@ -36,7 +39,7 @@ impl Slot {
             references: 0,
             kind: 0,
             shape: 0,
-            flags: 0,
+            code: 0,
             data: std::ptr::null(),
             length: 0,
             payload: Payload::Vacant,

@@ -1,14 +1,19 @@
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
-use cranelift_codegen::ir::{BlockArg, InstBuilder, MemFlagsData, Type, Value as ClifValue, types};
+use cranelift_codegen::ir::{
+    BlockArg, InstBuilder, MemFlagsData, SigRef, Type, Value as ClifValue, types,
+};
 use cranelift_frontend::Switch;
 use cranelift_module::Module;
+use oxc_span::Span;
 use oxc_syntax::operator::BinaryOperator;
 
 use crate::heap::{
-    DATA_OFFSET, HOLE, KIND_OFFSET, LENGTH_OFFSET, MathFunction, NO_ELEMENTS, SHAPE_OFFSET,
+    CODE_OFFSET, DATA_OFFSET, HOLE, KIND_OFFSET, LENGTH_OFFSET, MathFunction, NO_ELEMENTS, SHAPE_OFFSET,
     TypedKind, kind,
 };
+use crate::error::Error;
 use crate::jit::clif::IndexedRead;
+use crate::jit::semantic::DirectTarget;
 use crate::jit::helpers::{
     CACHE_BUILTIN_KIND_OFFSET, CACHE_BUILTIN_VALUE_OFFSET, CACHE_HOLDER_OFFSET,
     CACHE_HOLDER_SHAPE_OFFSET, CACHE_INDEX_OFFSET, CACHE_SHAPE_OFFSET, Helper, PropertyCache,
@@ -31,7 +36,7 @@ enum Element {
     F64,
 }
 
-const ADDRESS_MASK: i64 = (1 << TAG_SHIFT) - 1;
+use super::scope::ADDRESS_MASK;
 
 const TYPED_KINDS: [Element; 8] = [
     Element::U8,
@@ -602,6 +607,180 @@ impl FunctionCompiler<'_, '_> {
         self.b.ins().select(valid, address, empty)
     }
 
+    pub(super) fn generic_call(
+        &mut self,
+        callee: ClifValue,
+        receiver: ClifValue,
+        args: &[ClifValue],
+        span: Span,
+    ) -> Result<ClifValue, Error> {
+        let result = self.unchecked_call(callee, receiver, args, span)?;
+        self.check_error();
+        Ok(result)
+    }
+
+    fn unchecked_call(
+        &mut self,
+        callee: ClifValue,
+        receiver: ClifValue,
+        args: &[ClifValue],
+        span: Span,
+    ) -> Result<ClifValue, Error> {
+        let argv = self.stack_values(args, span)?;
+        let argc = self.b.ins().iconst(types::I64, args.len() as i64);
+        Ok(self.call_helper(Helper::Call, &[callee, receiver, argv, argc]))
+    }
+
+    /// With `owned`, the caller gets a reference of its own rather than a temporary. A direct
+    /// call that reports no failure skips the pending-error checks.
+    pub(super) fn direct_call(
+        &mut self,
+        target: DirectTarget,
+        callee: ClifValue,
+        receiver: ClifValue,
+        args: &[ClifValue],
+        span: Span,
+        owned: bool,
+    ) -> Result<ClifValue, Error> {
+        if target.code.as_u32() as usize >= crate::jit::entries::DIRECT_ENTRIES {
+            let result = self.generic_call(callee, receiver, args, span)?;
+            if owned {
+                self.increment(result);
+            }
+            return Ok(result);
+        }
+        if args.len() == usize::from(target.arity)
+            && let Some(miss) = self.stubs.miss(target.arity)
+        {
+            return Ok(self.selected_call(target, callee, receiver, args, miss, owned));
+        }
+        let (entry, direct) = self.direct_entry(target, callee);
+        let fast = self.b.create_block();
+        let slow = self.b.create_block();
+        let check = self.b.create_block();
+        let done = self.b.create_block();
+        self.b.append_block_param(check, types::I64);
+        self.b.append_block_param(done, types::I64);
+        self.b.set_cold_block(slow);
+        self.b.set_cold_block(check);
+        self.brif(direct, fast, &[], slow, &[]);
+        self.switch(fast);
+        let (result, status) = self.fixed_call(entry, target.arity, callee, receiver, args);
+        let succeeded = self.b.create_block();
+        let undefined = self.constant(Value::UNDEFINED);
+        self.brif(
+            status,
+            check,
+            &[BlockArg::Value(undefined)],
+            succeeded,
+            &[],
+        );
+        self.switch(succeeded);
+        let result = self.owned_result(result, owned);
+        self.jump(done, &[BlockArg::Value(result)]);
+        self.switch(slow);
+        let result = self.unchecked_call(callee, receiver, args, span)?;
+        self.jump(check, &[BlockArg::Value(result)]);
+        self.switch(check);
+        let result = self.b.block_params(check)[0];
+        self.check_error();
+        if owned {
+            self.increment(result);
+        }
+        self.jump(done, &[BlockArg::Value(result)]);
+        self.switch(done);
+        Ok(self.b.block_params(done)[0])
+    }
+
+    /// Falls back to the miss stub rather than an inline generic call.
+    fn selected_call(
+        &mut self,
+        target: DirectTarget,
+        callee: ClifValue,
+        receiver: ClifValue,
+        args: &[ClifValue],
+        miss: usize,
+        owned: bool,
+    ) -> ClifValue {
+        let (entry, direct) = self.direct_entry(target, callee);
+        let miss = self.b.ins().iconst(self.pointer, miss as i64);
+        let entry = self.b.ins().select(direct, entry, miss);
+        let (result, status) = self.fixed_call(entry, target.arity, callee, receiver, args);
+        let failed = self.b.create_block();
+        let succeeded = self.b.create_block();
+        self.b.set_cold_block(failed);
+        self.brif(status, failed, &[], succeeded, &[]);
+        self.switch(failed);
+        self.check_error();
+        self.jump(succeeded, &[]);
+        self.switch(succeeded);
+        self.owned_result(result, owned)
+    }
+
+    fn fixed_call(
+        &mut self,
+        entry: ClifValue,
+        arity: u16,
+        callee: ClifValue,
+        receiver: ClifValue,
+        args: &[ClifValue],
+    ) -> (ClifValue, ClifValue) {
+        let arity = usize::from(arity);
+        let signature = self.fixed_signature(arity as u16);
+        let mut call_args = vec![self.ctx, callee, receiver];
+        call_args.extend_from_slice(&args[..args.len().min(arity)]);
+        if args.len() < arity {
+            let undefined = self.constant(Value::UNDEFINED);
+            call_args.resize(arity + 3, undefined);
+        }
+        let call = self.b.ins().call_indirect(signature, entry, &call_args);
+        let [result, status] = self.b.inst_results(call).try_into().unwrap();
+        (result, status)
+    }
+
+    fn owned_result(&mut self, result: ClifValue, owned: bool) -> ClifValue {
+        if owned {
+            return result;
+        }
+        self.own_temporary(result)
+    }
+
+    fn direct_entry(&mut self, target: DirectTarget, callee: ClifValue) -> (ClifValue, ClifValue) {
+        let slot = self.b.ins().iconst(
+            self.pointer,
+            self.stubs.direct_entries as i64 + i64::from(target.code.as_u32()) * 8,
+        );
+        let entry = self
+            .b
+            .ins()
+            .load(self.pointer, MemFlagsData::trusted(), slot, 0);
+        let published = self.b.ins().icmp_imm_s(IntCC::NotEqual, entry, 0);
+        let expected = self.is_code(callee, target.code);
+        (entry, self.b.ins().band(expected, published))
+    }
+
+    fn fixed_signature(&mut self, arity: u16) -> SigRef {
+        if let Some(&signature) = self.fixed_signatures.get(&arity) {
+            return signature;
+        }
+        let signature = super::stubs::fixed_signature(self.pointer, arity);
+        let signature = self.b.import_signature(signature);
+        self.fixed_signatures.insert(arity, signature);
+        signature
+    }
+
+    /// Whether a value is a closure of this code that may be called without `new`.
+    pub(super) fn is_code(&mut self, value: ClifValue, code: cranelift_module::FuncId) -> ClifValue {
+        let view = self.view(value);
+        let word = self
+            .b
+            .ins()
+            .load(types::I32, MemFlagsData::trusted(), view, CODE_OFFSET);
+        self.b
+            .ins()
+            .icmp_imm_s(IntCC::Equal, word, i64::from(code.as_u32()) + 1)
+    }
+
     pub(super) fn view_kind(&mut self, view: ClifValue) -> ClifValue {
         self.b
             .ins()
@@ -1152,7 +1331,6 @@ impl FunctionCompiler<'_, '_> {
             .and_then(|block| self.b.func.layout.last_inst(block))
             .and_then(|inst| self.annotations.helpers.get(&inst))
             .is_none_or(|helper| helper.can_throw());
-        let dummy = self.constant(Value::UNDEFINED);
         let condition = self.pending(crate::jit::session::ERROR_OFFSET, 0);
         let failed = self.b.create_block();
         let done = self.b.create_block();
@@ -1166,7 +1344,8 @@ impl FunctionCompiler<'_, '_> {
             .iconst(types::I64, self.source_span.start as i64);
         let end = self.b.ins().iconst(types::I64, self.source_span.end as i64);
         self.call_helper(Helper::ErrorOrigin, &[ptr, len, start, end]);
-        self.jump(self.return_block, &[BlockArg::Value(dummy)]);
+        let exit = self.failed_exit();
+        self.jump(exit, &[]);
         self.switch(done);
         if !can_throw {
             return;
@@ -1179,13 +1358,8 @@ impl FunctionCompiler<'_, '_> {
         if let Some(handler) = self.handlers.last().copied() {
             self.brif(condition, handler, &[], done, &[]);
         } else {
-            self.brif(
-                condition,
-                self.return_block,
-                &[BlockArg::Value(dummy)],
-                done,
-                &[],
-            );
+            let exit = self.failed_exit();
+            self.brif(condition, exit, &[], done, &[]);
         }
         self.switch(done);
     }

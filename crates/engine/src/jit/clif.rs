@@ -20,6 +20,8 @@ pub(super) struct Annotations {
     pub helpers: HashMap<Inst, Helper>,
     pub temporary_pushes: HashSet<Inst>,
     pub temporary_clears: HashMap<Inst, Block>,
+    pub temporary_resets: HashSet<Inst>,
+    pub frame_stores: HashSet<Inst>,
 }
 
 #[derive(Clone)]

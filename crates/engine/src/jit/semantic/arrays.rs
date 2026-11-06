@@ -2,7 +2,6 @@ use std::collections::HashSet;
 
 use oxc_syntax::operator::BinaryOperator;
 
-use super::specialize::{self, Repository};
 use super::{
     ArrayMethod, BlockData, Cfg, Constant, Facts, Graph, Inst, Op, Result, Target, Terminator,
     TerminatorKind, Types,
@@ -15,6 +14,8 @@ impl ArrayMethod {
             Self::Some => "some",
             Self::Every => "every",
             Self::Filter => "filter",
+            Self::ForEach => "forEach",
+            Self::Find => "find",
         }
     }
 
@@ -24,6 +25,8 @@ impl ArrayMethod {
             "some" => Some(Self::Some),
             "every" => Some(Self::Every),
             "filter" => Some(Self::Filter),
+            "forEach" => Some(Self::ForEach),
+            "find" => Some(Self::Find),
             _ => None,
         }
     }
@@ -31,7 +34,6 @@ impl ArrayMethod {
 
 pub(super) fn expand(
     graph: &mut Graph,
-    bodies: &Repository,
     _source: usize,
     notes: &mut Vec<String>,
     expanded: &mut HashSet<Inst>,
@@ -47,6 +49,7 @@ pub(super) fn expand(
                 callee,
                 receiver: Some(_),
                 args,
+                ..
             } = &graph.insts[inst].op
             else {
                 continue;
@@ -66,10 +69,10 @@ pub(super) fn expand(
             {
                 continue;
             }
-            let Some(Op::Closure(_, code, _, false, _, _, _)) = graph.defining_op(callback) else {
-                continue;
-            };
-            if !bodies.body(*code).is_some_and(specialize::eligible) {
+            if !matches!(
+                graph.defining_op(callback),
+                Some(Op::Closure(_, _, _, false, _, _, _))
+            ) {
                 continue;
             }
             sites.push((inst, method));
@@ -97,6 +100,7 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
         callee,
         receiver: Some(receiver),
         args,
+        ..
     } = call.op
     else {
         unreachable!();
@@ -134,6 +138,7 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
         ArrayMethod::Some | ArrayMethod::Every => {
             Op::Constant(Constant::Boolean(method == ArrayMethod::Every))
         }
+        ArrayMethod::ForEach | ArrayMethod::Find => Op::Constant(Constant::Undefined),
     };
     let result = graph.append(start, span, result_op, true).1.unwrap();
     let zero = graph
@@ -175,10 +180,22 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
         .append(read, span, Op::IsUninitialized(element), true)
         .1
         .unwrap();
+    let value = graph.add_param(invoke);
+    let hole = match method {
+        ArrayMethod::Find => Target {
+            block: invoke,
+            args: vec![undefined],
+        },
+        _ => Target::new(advance),
+    };
+    let present = Target {
+        block: invoke,
+        args: vec![element],
+    };
     graph.blocks[read].terminator = Some(Terminator {
         source_name: call.source_name,
         span,
-        kind: TerminatorKind::Branch(absent, Target::new(advance), Target::new(invoke)),
+        kind: TerminatorKind::Branch(absent, hole, present),
     });
     let mapped = graph
         .append(
@@ -187,13 +204,37 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
             Op::Call {
                 callee: callback,
                 receiver: Some(undefined),
-                args: vec![element, index, receiver],
+                args: vec![value, index, receiver],
+                target: None,
             },
             true,
         )
         .1
         .unwrap();
     match method {
+        ArrayMethod::ForEach => {
+            graph.blocks[invoke].terminator = Some(Terminator {
+                source_name: call.source_name,
+                span,
+                kind: TerminatorKind::Jump(Target::new(advance)),
+            });
+        }
+        ArrayMethod::Find => {
+            let found = graph.blocks.push(BlockData::default());
+            graph.blocks[invoke].terminator = Some(Terminator {
+                source_name: call.source_name,
+                span,
+                kind: TerminatorKind::Branch(mapped, Target::new(found), Target::new(advance)),
+            });
+            graph.blocks[found].terminator = Some(Terminator {
+                source_name: call.source_name,
+                span,
+                kind: TerminatorKind::Jump(Target {
+                    block: continuation,
+                    args: vec![value],
+                }),
+            });
+        }
         ArrayMethod::Map => {
             graph.append(invoke, span, Op::SetIndex(result, index, mapped), false);
             graph.blocks[invoke].terminator = Some(Terminator {
@@ -209,7 +250,7 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
                 span,
                 kind: TerminatorKind::Branch(mapped, Target::new(keep), Target::new(advance)),
             });
-            graph.append(keep, span, Op::ArrayAppend(result, element, false), false);
+            graph.append(keep, span, Op::ArrayAppend(result, value, false), false);
             graph.blocks[keep].terminator = Some(Terminator {
                 source_name: call.source_name,
                 span,

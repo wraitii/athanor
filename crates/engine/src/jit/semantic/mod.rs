@@ -74,6 +74,9 @@ pub(super) struct Graph {
     pub(in crate::jit) cold: HashSet<Block>,
     pub(super) lazy_captures: HashSet<Binding>,
     pub(super) generator: bool,
+    /// Parameter count of a function whose entry takes its arguments in registers; `None` when
+    /// it reads `arguments` or a rest parameter, or is a generator.
+    pub(in crate::jit) arity: Option<u16>,
     pub(super) blocks: PrimaryMap<Block, BlockData>,
     pub(super) insts: PrimaryMap<Inst, InstData>,
     pub(super) values: PrimaryMap<Value, ValueDef>,
@@ -188,6 +191,15 @@ pub(super) enum ArrayMethod {
     Some,
     Every,
     Filter,
+    ForEach,
+    Find,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::jit) struct DirectTarget {
+    pub(in crate::jit) code: cranelift_module::FuncId,
+    pub(in crate::jit) arity: u16,
+    pub(in crate::jit) lexical_this: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -277,6 +289,7 @@ pub(super) enum Op {
         callee: Value,
         receiver: Option<Value>,
         args: Vec<Value>,
+        target: Option<DirectTarget>,
     },
     Construct {
         callee: Value,
@@ -472,6 +485,7 @@ impl Op {
                 callee,
                 receiver,
                 args,
+                ..
             } => ([Some(*callee), *receiver, None], args),
         };
         fixed.into_iter().flatten().chain(rest.iter().copied())
@@ -578,6 +592,7 @@ impl Op {
                 callee,
                 receiver,
                 args,
+                ..
             } => ([Some(callee), receiver.as_mut(), None], args),
         };
         fixed.into_iter().flatten().chain(rest.iter_mut())
@@ -1344,11 +1359,10 @@ impl Expansions {
     fn calls(
         &mut self,
         graph: &mut Graph,
-        bodies: &specialize::Repository,
         source: usize,
         notes: &mut Vec<String>,
     ) -> Result<()> {
-        arrays::expand(graph, bodies, source, notes, &mut self.arrays)?;
+        arrays::expand(graph, source, notes, &mut self.arrays)?;
         string_split::expand(graph, &mut self.splits);
         Ok(())
     }
@@ -1382,12 +1396,12 @@ pub(super) fn plan_canonical(
     let mut inline_budget = specialize::Budget::default();
     let mut expansions = Expansions::default();
     if let Some((bodies, source)) = specialization {
-        expansions.calls(&mut graph, bodies, source, &mut notes)?;
+        expansions.calls(&mut graph, source, &mut notes)?;
         let requests = specialize::requests(&graph, bodies, source);
         let plan = specialize::plan_round(&graph, bodies, source, &requests, &mut inline_budget);
         specialize::apply(&mut graph, bodies, source, plan, &mut notes)?;
         optimize::simplify(&mut graph);
-        expansions.calls(&mut graph, bodies, source, &mut notes)?;
+        expansions.calls(&mut graph, source, &mut notes)?;
         graph.verify()?;
     }
     expansions.constructors(&mut graph);
@@ -1401,13 +1415,16 @@ pub(super) fn plan_canonical(
             }
             specialize::apply(&mut graph, bodies, source, plan, &mut notes)?;
             optimize::simplify(&mut graph);
-            expansions.calls(&mut graph, bodies, source, &mut notes)?;
+            expansions.calls(&mut graph, source, &mut notes)?;
             expansions.constructors(&mut graph);
             graph.verify()?;
         }
     }
     if let Some((bodies, _)) = specialization {
         specialize::prove_closed_calls(&mut graph, bodies, &mut notes);
+    }
+    if let Some((bodies, source)) = specialization {
+        specialize::direct_calls(&mut graph, bodies, source);
     }
     let reads = specialization.map_or_else(Vec::new, |(bodies, source)| {
         reads::plan(&graph, bodies, source)

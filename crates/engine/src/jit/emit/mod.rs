@@ -7,12 +7,13 @@ pub(in crate::jit) mod scope;
 mod semantic_graph;
 mod slots;
 mod statement;
+pub(super) mod stubs;
 
 use std::collections::HashMap;
 
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
-    Block, BlockArg, Inst, InstBuilder, MemFlagsData, Type, Value as ClifValue, types,
+    Block, BlockArg, Inst, InstBuilder, MemFlagsData, SigRef, Type, Value as ClifValue, types,
 };
 use cranelift_frontend::{FunctionBuilder, Switch, Variable};
 use cranelift_jit::JITModule;
@@ -26,6 +27,7 @@ use crate::jit::helpers::{GlobalCache, Helper, PropertyCache};
 use crate::value::Value;
 
 pub(crate) use statement::statement_kind;
+pub(super) use stubs::Stubs;
 
 pub(super) enum FunctionKind {
     Ordinary,
@@ -50,13 +52,14 @@ pub(super) struct FunctionCompiler<'a, 'f> {
     b: &'a mut FunctionBuilder<'f>,
     module: &'a mut JITModule,
     helpers: &'a [FuncId],
+    stubs: Stubs,
     annotations: &'a mut Annotations,
     pointer: Type,
     ctx: ClifValue,
     receiver: ClifValue,
-    argv: ClifValue,
-    argc: ClifValue,
+    arguments: Arguments,
     return_block: Block,
+    failed_exit: Option<Block>,
     handlers: Vec<Block>,
     generator: Option<ClifValue>,
     resume_blocks: Vec<Block>,
@@ -64,14 +67,32 @@ pub(super) struct FunctionCompiler<'a, 'f> {
     terminated: bool,
     frame_size: Option<Inst>,
     frame_roots: Option<Variable>,
+    frame: Option<CallerFrame>,
+    frame_code: bool,
+    fixed_signatures: HashMap<u16, SigRef>,
     slots: HashMap<u32, u32>,
     slot_count: u32,
 }
+
+enum Arguments {
+    Vector { argv: ClifValue, argc: ClifValue },
+    Fixed(Vec<ClifValue>),
+}
+
+#[derive(Clone, Copy)]
+struct CallerFrame {
+    start: ClifValue,
+    base: ClifValue,
+    floor: ClifValue,
+}
+
+const INLINE_FRAME_RELEASES: u32 = 4;
 
 pub(super) fn build_function(
     b: &mut FunctionBuilder<'_>,
     module: &mut JITModule,
     helpers: &[FuncId],
+    stubs: Stubs,
     annotations: &mut Annotations,
     names: &mut Vec<Box<str>>,
     cells: &mut Vec<Box<u64>>,
@@ -88,6 +109,7 @@ pub(super) fn build_function(
         b,
         module,
         helpers,
+        stubs,
         annotations,
         names,
         cells,
@@ -105,6 +127,7 @@ pub(super) fn build_factory(
     b: &mut FunctionBuilder<'_>,
     module: &mut JITModule,
     helpers: &[FuncId],
+    stubs: Stubs,
     annotations: &mut Annotations,
     names: &mut Vec<Box<str>>,
     cells: &mut Vec<Box<u64>>,
@@ -119,6 +142,7 @@ pub(super) fn build_factory(
         b,
         module,
         helpers,
+        stubs,
         annotations,
         names,
         cells,
@@ -141,6 +165,7 @@ fn build_callable(
     b: &mut FunctionBuilder<'_>,
     module: &mut JITModule,
     helpers: &[FuncId],
+    stubs: Stubs,
     annotations: &mut Annotations,
     names: &mut Vec<Box<str>>,
     cells: &mut Vec<Box<u64>>,
@@ -155,9 +180,22 @@ fn build_callable(
     let entry = b.create_block();
     b.switch_to_block(entry);
     b.append_block_params_for_function_params(entry);
-    let [ctx, closure, receiver, argv, argc] = b.block_params(entry).try_into().unwrap();
+    let values = b.block_params(entry).to_vec();
+    let (ctx, closure, receiver) = (values[0], values[1], values[2]);
+    let arguments = match body {
+        CallableBody::Graph(graph) if graph.arity.is_some() => {
+            Arguments::Fixed(values[3..].to_vec())
+        }
+        _ => Arguments::Vector {
+            argv: values[3],
+            argc: values[4],
+        },
+    };
     let return_block = b.create_block();
     b.append_block_param(return_block, types::I64);
+    if matches!(arguments, Arguments::Fixed(_)) {
+        b.append_block_param(return_block, types::I8);
+    }
 
     let pointer = module.target_config().pointer_type();
     let mut compiler = FunctionCompiler {
@@ -171,13 +209,14 @@ fn build_callable(
         b,
         module,
         helpers,
+        stubs,
         annotations,
         pointer,
         ctx,
         receiver,
-        argv,
-        argc,
+        arguments,
         return_block,
+        failed_exit: None,
         handlers: Vec::new(),
         generator: None,
         resume_blocks: Vec::new(),
@@ -185,6 +224,9 @@ fn build_callable(
         terminated: false,
         frame_size: None,
         frame_roots: None,
+        frame: None,
+        frame_code: false,
+        fixed_signatures: HashMap::new(),
         slots: HashMap::new(),
         slot_count: 0,
     };
@@ -206,13 +248,16 @@ fn build_callable(
         None
     };
     if let CallableBody::Factory(resume) = body {
+        let (argv, argc) = compiler.argument_vector()?;
         let args = compiler.call_helper(Helper::ArrayNew, &[argv, argc]);
         compiler.check_error();
         let code = compiler.b.ins().iconst(types::I64, resume.as_u32() as i64);
         let generator =
             compiler.call_helper(Helper::GeneratorNew, &[closure, receiver, args, code]);
         compiler.check_error();
-        compiler.jump(return_block, &[BlockArg::Value(generator)]);
+        let args = compiler.return_args(generator, false);
+        compiler.jump(return_block, &args);
+        compiler.finish_failed_exit();
         compiler.switch(return_block);
         let result = compiler.b.block_params(return_block)[0];
         compiler.return_value(result);
@@ -237,7 +282,8 @@ fn build_callable(
             switch.emit(compiler.b, state, invalid);
             compiler.switch(invalid);
             let undefined = compiler.constant(Value::UNDEFINED);
-            compiler.jump(return_block, &[BlockArg::Value(undefined)]);
+            let args = compiler.return_args(undefined, false);
+            compiler.jump(return_block, &args);
         }
         return Ok(());
     }
@@ -248,6 +294,7 @@ pub(super) fn build_global(
     b: &mut FunctionBuilder<'_>,
     module: &mut JITModule,
     helpers: &[FuncId],
+    stubs: Stubs,
     annotations: &mut Annotations,
     names: &mut Vec<Box<str>>,
     cells: &mut Vec<Box<u64>>,
@@ -261,6 +308,7 @@ pub(super) fn build_global(
     b.switch_to_block(entry);
     b.append_block_params_for_function_params(entry);
     let [ctx, closure, receiver, argv, argc] = b.block_params(entry).try_into().unwrap();
+    let arguments = Arguments::Vector { argv, argc };
     let return_block = b.create_block();
     b.append_block_param(return_block, types::I64);
     let pointer = module.target_config().pointer_type();
@@ -275,13 +323,14 @@ pub(super) fn build_global(
         b,
         module,
         helpers,
+        stubs,
         annotations,
         pointer,
         ctx,
         receiver,
-        argv,
-        argc,
+        arguments,
         return_block,
+        failed_exit: None,
         handlers: Vec::new(),
         generator: None,
         resume_blocks: Vec::new(),
@@ -289,6 +338,9 @@ pub(super) fn build_global(
         terminated: false,
         frame_size: None,
         frame_roots: None,
+        frame: None,
+        frame_code: false,
+        fixed_signatures: HashMap::new(),
         slots: HashMap::new(),
         slot_count: 0,
     };
@@ -323,41 +375,180 @@ impl FunctionCompiler<'_, '_> {
         self.terminated = true;
     }
 
+    /// Fixed-arity code also returns whether it left with an error or exception pending,
+    /// sparing direct callers from checking.
+    pub(super) fn return_args(&mut self, value: ClifValue, failed: bool) -> Vec<BlockArg> {
+        let mut args = vec![BlockArg::Value(value)];
+        if matches!(self.arguments, Arguments::Fixed(_)) {
+            let status = self.b.ins().iconst(types::I8, i64::from(failed));
+            args.push(BlockArg::Value(status));
+        }
+        args
+    }
+
+    pub(super) fn failed_exit(&mut self) -> Block {
+        if let Some(block) = self.failed_exit {
+            return block;
+        }
+        let block = self.b.create_block();
+        self.b.set_cold_block(block);
+        self.failed_exit = Some(block);
+        block
+    }
+
+    pub(super) fn finish_failed_exit(&mut self) {
+        let Some(block) = self.failed_exit else {
+            return;
+        };
+        self.switch(block);
+        let undefined = self.constant(Value::UNDEFINED);
+        let args = self.return_args(undefined, true);
+        self.jump(self.return_block, &args);
+    }
+
     pub(super) fn return_value(&mut self, value: ClifValue) {
         let value = match self.generator {
             Some(generator) => self.call_helper(Helper::GeneratorComplete, &[generator, value]),
-            None => match self.frame_roots {
-                Some(roots) => {
-                    let rooted = self.b.create_block();
-                    let unrooted = self.b.create_block();
-                    let done = self.b.create_block();
-                    self.b.append_block_param(done, types::I64);
-                    let roots = self.b.use_var(roots);
-                    self.brif(roots, rooted, &[], unrooted, &[]);
-                    self.switch(rooted);
-                    let result = self.call_helper(Helper::FrameExit, &[value]);
-                    self.jump(done, &[BlockArg::Value(result)]);
-                    self.switch(unrooted);
-                    let result = self.call_helper(Helper::FrameExitUnrooted, &[value]);
-                    self.jump(done, &[BlockArg::Value(result)]);
-                    self.switch(done);
-                    self.b.block_params(done)[0]
-                }
-                None => self.call_helper(Helper::FrameExit, &[value]),
-            },
+            None => {
+                self.exit_frame(value);
+                value
+            }
         };
-        self.b.ins().return_(&[value]);
+        let mut results = vec![value];
+        if matches!(self.arguments, Arguments::Fixed(_)) {
+            results.push(self.b.block_params(self.return_block)[1]);
+        }
+        self.b.ins().return_(&results);
         self.terminated = true;
     }
 
+    fn exit_frame(&mut self, value: ClifValue) {
+        let caller = self.frame.unwrap();
+        self.frame_code = true;
+        self.increment(value);
+        if self.slot_count > 0 {
+            let release = self.b.create_block();
+            let done = self.b.create_block();
+            let roots = self.b.use_var(self.frame_roots.unwrap());
+            self.brif(roots, release, &[], done, &[]);
+            self.switch(release);
+            if self.slot_count <= INLINE_FRAME_RELEASES {
+                for slot in 0..self.slot_count {
+                    self.release_slot(slot);
+                }
+            } else {
+                self.call_helper(Helper::FrameRelease, &[]);
+            }
+            self.jump(done, &[]);
+            self.switch(done);
+        }
+        self.clear_temporaries();
+        let root = self.load_ctx(crate::jit::session::INDEX_ROOT_OFFSET);
+        let rooted = self
+            .b
+            .ins()
+            .icmp_imm_s(IntCC::NotEqual, root, Value::UNDEFINED.bits() as i64);
+        let unroot = self.b.create_block();
+        let done = self.b.create_block();
+        self.b.set_cold_block(unroot);
+        self.brif(rooted, unroot, &[], done, &[]);
+        self.switch(unroot);
+        self.call_helper(Helper::IndexUnroot, &[]);
+        self.jump(done, &[]);
+        self.switch(done);
+        let start = self.load_ctx(crate::jit::session::LOCALS_START_OFFSET);
+        self.store_ctx(start, crate::jit::session::LOCALS_LEN_OFFSET);
+        self.store_ctx(caller.start, crate::jit::session::LOCALS_START_OFFSET);
+        self.store_ctx(caller.base, crate::jit::session::LOCALS_OFFSET);
+        self.store_ctx(caller.floor, crate::jit::session::TEMPS_FLOOR_OFFSET);
+        self.frame_code = false;
+    }
+
+    fn release_slot(&mut self, slot: u32) {
+        let flags = MemFlagsData::trusted();
+        let base = self.load_ctx(crate::jit::session::LOCALS_OFFSET);
+        let offset = (slot * 8) as i32;
+        let value = self.b.ins().load(types::I64, flags, base, offset);
+        let empty = self.constant(Value::UNDEFINED);
+        let store = self.b.ins().store(flags, empty, base, offset);
+        self.mark_frame_store(store);
+        let heap = self.is_heap(value);
+        let release = self.b.create_block();
+        let done = self.b.create_block();
+        self.brif(heap, release, &[], done, &[]);
+        self.switch(release);
+        self.release_inline(value, done, true);
+        self.switch(done);
+    }
+
+    /// Slots above the stack's length are always empty, so nothing needs initializing.
     fn enter_frame(&mut self) {
+        use crate::jit::session::{
+            LOCALS_LEN_OFFSET, LOCALS_LIMIT_OFFSET, LOCALS_OFFSET, LOCALS_START_OFFSET,
+            STACK_LIMIT_OFFSET, TEMPS_FLOOR_OFFSET, TEMPS_LEN_OFFSET,
+        };
         let roots = self.b.declare_var(types::I8);
         let clean = self.b.ins().iconst(types::I8, 0);
         self.b.def_var(roots, clean);
         self.frame_roots = Some(roots);
+        self.frame_code = true;
+        let caller = CallerFrame {
+            start: self.load_ctx(LOCALS_START_OFFSET),
+            base: self.load_ctx(LOCALS_OFFSET),
+            floor: self.load_ctx(TEMPS_FLOOR_OFFSET),
+        };
+        let start = self.load_ctx(LOCALS_LEN_OFFSET);
         let size = self.b.ins().iconst(types::I64, 0);
         self.frame_size = Some(self.b.func.dfg.value_def(size).unwrap_inst());
-        self.call_helper(Helper::FrameEnter, &[size]);
+        let len = self.b.ins().iadd(start, size);
+        let limit = self.load_ctx(LOCALS_LIMIT_OFFSET);
+        let full = self.b.ins().icmp(IntCC::UnsignedGreaterThan, len, limit);
+        let stack_pointer = self.b.ins().get_stack_pointer(self.pointer);
+        let stack_limit = self.load_ctx(STACK_LIMIT_OFFSET);
+        let deep = self
+            .b
+            .ins()
+            .icmp(IntCC::UnsignedLessThan, stack_pointer, stack_limit);
+        let overflow = self.b.ins().bor(full, deep);
+        let fail = self.b.create_block();
+        let enter = self.b.create_block();
+        self.b.set_cold_block(fail);
+        self.brif(overflow, fail, &[], enter, &[]);
+        self.switch(fail);
+        self.call_helper(Helper::FrameOverflow, &[]);
+        let undefined = self.constant(Value::UNDEFINED);
+        let mut results = vec![undefined];
+        if matches!(self.arguments, Arguments::Fixed(_)) {
+            results.push(self.b.ins().iconst(types::I8, 1));
+        }
+        self.b.ins().return_(&results);
+        self.switch(enter);
+        let caller_slots = self.b.ins().isub(start, caller.start);
+        let offset = self.b.ins().ishl_imm_s(caller_slots, 3);
+        let base = self.b.ins().iadd(caller.base, offset);
+        self.store_ctx(base, LOCALS_OFFSET);
+        self.store_ctx(start, LOCALS_START_OFFSET);
+        self.store_ctx(len, LOCALS_LEN_OFFSET);
+        let temps = self.load_ctx(TEMPS_LEN_OFFSET);
+        let floor = self.store_ctx(temps, TEMPS_FLOOR_OFFSET);
+        self.annotations.temporary_resets.insert(floor);
+        self.frame = Some(caller);
+        self.frame_code = false;
+    }
+
+    fn store_ctx(&mut self, value: ClifValue, offset: i32) -> Inst {
+        let store = self
+            .b
+            .ins()
+            .store(MemFlagsData::trusted(), value, self.ctx, offset);
+        self.mark_frame_store(store);
+        store
+    }
+
+    pub(super) fn mark_frame_store(&mut self, store: Inst) {
+        if self.frame_code {
+            self.annotations.frame_stores.insert(store);
+        }
     }
 
     fn patch_frame_size(&mut self) {
@@ -401,11 +592,24 @@ impl FunctionCompiler<'_, '_> {
         self.switch(done);
     }
 
+    pub(super) fn argument_vector(&self) -> Result<(ClifValue, ClifValue), Error> {
+        match self.arguments {
+            Arguments::Vector { argv, argc } => Ok((argv, argc)),
+            Arguments::Fixed(_) => Err(Error::Compile(
+                "argument vector read in a fixed-arity function".into(),
+            )),
+        }
+    }
+
     pub(super) fn load_arg(&mut self, index: usize) -> ClifValue {
+        let (argv, argc) = match &self.arguments {
+            Arguments::Fixed(params) => return params[index],
+            Arguments::Vector { argv, argc } => (*argv, *argc),
+        };
         let present = self
             .b
             .ins()
-            .icmp_imm_s(IntCC::UnsignedGreaterThan, self.argc, index as i64);
+            .icmp_imm_s(IntCC::UnsignedGreaterThan, argc, index as i64);
         let load_block = self.b.create_block();
         let missing_block = self.b.create_block();
         let done = self.b.create_block();
@@ -416,7 +620,7 @@ impl FunctionCompiler<'_, '_> {
         let value = self.b.ins().load(
             types::I64,
             MemFlagsData::trusted(),
-            self.argv,
+            argv,
             (index * 8) as i32,
         );
         self.jump(done, &[BlockArg::Value(value)]);

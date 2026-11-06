@@ -5,6 +5,7 @@ mod compiler;
 mod conversion;
 mod effects;
 mod emit;
+pub(crate) mod entries;
 mod generator;
 mod helpers;
 mod jitdump;
@@ -16,5 +17,6 @@ mod session;
 mod temporaries;
 
 pub(crate) use compiler::Compiler;
+pub(crate) use entries::DirectEntries;
 pub(crate) use planner::Planner;
-pub(crate) use session::call;
+pub(crate) use session::{LocalSlots, call};

@@ -107,6 +107,17 @@ pub(super) fn direct_captures(
     Some(captures.clone())
 }
 
+pub(super) fn uses_this(body: &Graph) -> bool {
+    Cfg::new(body).rpo.iter().any(|&block| {
+        body.blocks[block].insts.iter().any(|&inst| {
+            matches!(
+                body.insts[inst].op,
+                Op::This | Op::Closure(_, _, true, _, true, _, None)
+            )
+        })
+    })
+}
+
 pub(super) fn apply(graph: &mut Graph, body: &Graph, plan: &Inline) {
     let call = graph.insts[plan.call].clone();
     let (callee, receiver, args, spread) = match &call.op {
@@ -114,6 +125,7 @@ pub(super) fn apply(graph: &mut Graph, body: &Graph, plan: &Inline) {
             callee,
             receiver,
             args,
+            ..
         } => (callee, *receiver, args.as_slice(), None),
         Op::ConstructorCall {
             callee,
@@ -157,42 +169,11 @@ pub(super) fn apply(graph: &mut Graph, body: &Graph, plan: &Inline) {
         });
         current = next;
     }
-    for &index in &plan.numbers {
-        let value = args[index];
-        let check = graph
-            .append(current, call.span, Op::IsNumber(value), true)
-            .1
-            .unwrap();
-        let next = graph.blocks.push(BlockData::default());
-        graph.blocks[current].terminator = Some(Terminator {
-            source_name: call.source_name,
-            span: call.span,
-            kind: TerminatorKind::Branch(check, Target::new(next), Target::new(fallback)),
-        });
-        current = next;
-    }
-    let mut narrowed = HashMap::new();
-    for &index in &plan.numbers {
-        let value = args[index];
-        let number = graph
-            .append(current, call.span, Op::AsNumber(value), true)
-            .1
-            .unwrap();
-        narrowed.insert(value, number);
-    }
     let undefined = graph
         .append(current, call.span, Op::Constant(Constant::Undefined), true)
         .1
         .unwrap();
-    let uses_this = Cfg::new(body).rpo.iter().any(|&block| {
-        body.blocks[block].insts.iter().any(|&inst| {
-            matches!(
-                body.insts[inst].op,
-                Op::This | Op::Closure(_, _, true, _, true, _, None)
-            )
-        })
-    });
-    let receiver = if plan.arrow && uses_this {
+    let receiver = if plan.arrow && uses_this(body) {
         let op = Op::ClosureThis(*callee);
         graph.append(current, call.span, op, true).1.unwrap()
     } else {
@@ -269,10 +250,7 @@ pub(super) fn apply(graph: &mut Graph, body: &Graph, plan: &Inline) {
                 } else {
                     args.get(index).copied().unwrap_or(undefined)
                 };
-                values.insert(
-                    data.result.unwrap(),
-                    narrowed.get(&value).copied().unwrap_or(value),
-                );
+                values.insert(data.result.unwrap(), value);
                 continue;
             }
             if matches!(data.op, Op::This) {

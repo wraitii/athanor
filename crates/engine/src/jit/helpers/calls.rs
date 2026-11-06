@@ -102,14 +102,12 @@ pub(super) fn invoke(
         };
         entry
     };
-    let function: extern "C" fn(*mut JitCtx, Value, Value, *const Value, u64) -> Value =
-        unsafe { std::mem::transmute(entry) };
     let receiver = unsafe { &*ctx }
         .global
         .heap()
         .lexical_this(closure)
         .unwrap_or(receiver);
-    let value = function(ctx, closure, receiver, argv, argc);
+    let value = entry.call(ctx, closure, receiver, argv, argc);
     unsafe { &mut *ctx }.own(value)
 }
 

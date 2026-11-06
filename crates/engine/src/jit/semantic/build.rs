@@ -786,6 +786,7 @@ impl<'a> Builder<'a> {
                 callee,
                 receiver: Some(receiver),
                 args,
+                target: None,
             },
         ))
     }
@@ -1595,6 +1596,7 @@ pub(super) fn lower_global(
             lazy_captures: HashSet::new(),
             cold: HashSet::new(),
             generator: false,
+            arity: None,
             blocks: PrimaryMap::new(),
             insts: PrimaryMap::new(),
             values: PrimaryMap::new(),
@@ -1683,6 +1685,7 @@ pub(super) fn lower_parts(
             lazy_captures: HashSet::new(),
             cold: HashSet::new(),
             generator,
+            arity: None,
             blocks: PrimaryMap::new(),
             insts: PrimaryMap::new(),
             values: PrimaryMap::new(),
@@ -1846,6 +1849,14 @@ pub(super) fn lower_parts(
     if builder.current.is_some() {
         let value = builder.constant(span, Constant::Undefined);
         builder.terminate(span, TerminatorKind::Return(value));
+    }
+    let dynamic = builder
+        .graph
+        .insts
+        .values()
+        .any(|data| matches!(data.op, Op::Arguments | Op::Rest(_)));
+    if !generator && !dynamic {
+        builder.graph.arity = u16::try_from(params.items.len()).ok();
     }
     builder.graph.verify()?;
     Ok(builder.graph)

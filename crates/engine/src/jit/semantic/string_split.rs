@@ -203,6 +203,7 @@ pub(super) fn expand(graph: &mut Graph, expanded: &mut HashSet<Inst>) {
             callee,
             receiver: Some(receiver),
             args,
+            ..
         } = data.op
         else {
             unreachable!()
@@ -257,6 +258,7 @@ mod tests {
                     callee,
                     receiver: Some(receiver),
                     args,
+                    ..
                 } = graph.insts[inst].op.clone()
                     && matches!(graph.defining_op(callee), Some(Op::Get(_, name)) if name == "split")
                 {

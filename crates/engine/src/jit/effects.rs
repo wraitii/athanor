@@ -58,8 +58,8 @@ pub(super) fn effects(helper: Helper) -> Effects {
         | ConstructorCall
         | ConstructorCallSpread
         | ConstructSpreadResolved => (Reentry::Arbitrary, UNKNOWN, &[]),
-        FrameEnter | FrameExit | FrameExitUnrooted | LocalSet | LocalReplace | Release
-        | LocalGet | TempClear | TempRetain | ErrorOrigin | Catch | Throw => {
+        FrameOverflow | FrameRelease | IndexUnroot | LocalSet | LocalReplace | Release
+        | LocalGet | TempClear | TempRetain | TempOwn | ErrorOrigin | Catch | Throw => {
             (Reentry::Closed, INTERNAL | ERROR, &[])
         }
         ObserveCall | ObserveGet | ObserveIndex => (Reentry::Closed, HEAP_READ | INTERNAL, &[]),
@@ -67,8 +67,8 @@ pub(super) fn effects(helper: Helper) -> Effects {
         ConstructorPrototype
         | SemanticPropertyProbeCached
         | SemanticMathNative
-        | SemanticCode
         | ClosureThis
+        | LexicalReceiver
         | ArrayIterationGuard
         | IsStringSplit => (Reentry::Closed, HEAP_READ, &[]),
         StringSplit => (
@@ -126,7 +126,6 @@ pub(super) fn effects(helper: Helper) -> Effects {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum TemporaryEffect {
     None,
-    Enter,
     Clear,
     MayRegister,
 }
@@ -135,12 +134,13 @@ pub(super) fn temporary_effect(helper: Helper) -> TemporaryEffect {
     use Helper::*;
     use TemporaryEffect::*;
     match helper {
-        FrameEnter => Enter,
         TempClear => Clear,
-        TempRetain | Add => MayRegister,
+        TempRetain | TempOwn | Add => MayRegister,
         SemanticPropertyProbeCached => None,
-        LocalSet | LocalReplace | Release | ErrorOrigin | Throw | MathDirect | SemanticCode
-        | ObserveCall | ObserveGet | ObserveIndex | ClosureThis | ArrayIterationGuard
+        FrameOverflow | FrameRelease | IndexUnroot | LocalSet | LocalReplace | Release
+        | ErrorOrigin | Throw | MathDirect
+        | ObserveCall | ObserveGet | ObserveIndex | ClosureThis | LexicalReceiver
+        | ArrayIterationGuard
         | IsStringSplit | IndexRoot | Truthy | BitwiseAnd | BitwiseOr | BitwiseXor | ShiftLeft
         | ShiftRight | ShiftRightUnsigned | Sub | Mul | Div | Rem | Pow | LooseEqual
         | LooseNotEqual | StrictEqual | StrictNotEqual | Less | LessEqual | Greater

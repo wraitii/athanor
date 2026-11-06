@@ -127,10 +127,17 @@ impl Graph {
                 callee,
                 receiver,
                 args,
-            } => match receiver {
-                Some(receiver) => format!("call {callee}({}) this={receiver}", list(args)),
-                None => format!("call {callee}({})", list(args)),
-            },
+                target,
+            } => {
+                let call = match receiver {
+                    Some(receiver) => format!("call {callee}({}) this={receiver}", list(args)),
+                    None => format!("call {callee}({})", list(args)),
+                };
+                match target {
+                    Some(target) => format!("{call} direct={}", target.code),
+                    None => call,
+                }
+            }
             Op::Construct { callee, args } => format!("construct {callee}({})", list(args)),
             Op::CallNative(native, args) => format!("call_native {native}({})", list(args)),
             Op::IsUndefined(value) => format!("is_undefined {value}"),

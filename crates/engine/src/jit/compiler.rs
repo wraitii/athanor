@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use cranelift_codegen::Context;
 use cranelift_codegen::ir::{AbiParam, Signature, types};
+use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::FunctionBuilderContext;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module, default_libcall_names};
@@ -18,6 +19,7 @@ use crate::EngineOptions;
 use crate::error::{Error, compile_at, unsupported_at};
 
 use super::clif::{Annotations, FunctionBody};
+use super::entries::Entry;
 use super::{analysis::CaptureAnalysis, emit, helpers, jitdump, temporaries};
 
 pub(crate) struct CompiledFunction {
@@ -37,6 +39,24 @@ struct Emission {
     closures: HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
 }
 
+#[derive(Default)]
+struct CompileStats {
+    functions: usize,
+    blocks: usize,
+    insts: usize,
+}
+
+impl Drop for Compiler {
+    fn drop(&mut self) {
+        if let Some(stats) = &self.stats {
+            eprintln!(
+                "js jit stats: {} functions, {} blocks, {} instructions",
+                stats.functions, stats.blocks, stats.insts
+            );
+        }
+    }
+}
+
 pub(crate) struct Compiler {
     emissions: HashMap<FuncId, Emission>,
     sources: HashMap<usize, (String, String)>,
@@ -49,7 +69,11 @@ pub(crate) struct Compiler {
     canonical: super::semantic::specialize::Repository,
     module: JITModule,
     signature: Signature,
+    fixed: HashMap<FuncId, u16>,
+    adapters: HashMap<u16, usize>,
+    stats: Option<CompileStats>,
     helpers: Vec<FuncId>,
+    stubs: emit::Stubs,
     functions: HashMap<String, FuncId>,
     function_names: HashMap<FuncId, String>,
     dump: Option<jitdump::Writer>,
@@ -68,7 +92,7 @@ pub(crate) struct Compiler {
 }
 
 impl Compiler {
-    pub(crate) fn new(options: EngineOptions) -> Result<Self, Error> {
+    pub(crate) fn new(options: EngineOptions, direct_entries: *const usize) -> Result<Self, Error> {
         let flags = [("opt_level", options.opt_level.as_flag())];
         let mut builder = JITBuilder::with_flags(&flags, default_libcall_names())
             .map_err(|error| Error::Compile(error.to_string()))?;
@@ -94,8 +118,15 @@ impl Compiler {
             helper_ids.push(id);
         }
 
+        let mut dump = options.jitdump.then(jitdump::Writer::new).flatten();
+        let stubs = emit::Stubs::new(
+            &mut module,
+            &helper_ids,
+            &signature,
+            direct_entries,
+            dump.as_mut(),
+        )?;
         let context = module.make_context();
-        let dump = options.jitdump.then(jitdump::Writer::new).flatten();
         let dump_ir = dump.is_some() && options.jitdump_ir;
         Ok(Self {
             emissions: HashMap::new(),
@@ -109,7 +140,11 @@ impl Compiler {
             canonical: super::semantic::specialize::Repository::default(),
             module,
             signature,
+            fixed: HashMap::new(),
+            adapters: HashMap::new(),
+            stats: std::env::var_os("JS_JIT_STATS").map(|_| CompileStats::default()),
             helpers: helper_ids,
+            stubs,
             functions: HashMap::new(),
             function_names: HashMap::new(),
             dump,
@@ -126,6 +161,35 @@ impl Compiler {
             context,
             builder_context: FunctionBuilderContext::new(),
         })
+    }
+
+    fn fixed_signature(&self, arity: u16) -> Signature {
+        emit::stubs::fixed_signature(self.module.target_config().pointer_type(), arity)
+    }
+
+    fn entry(&mut self, id: FuncId) -> Result<Entry, Error> {
+        let code = self.module.get_finalized_function(id) as usize;
+        let adapter = match self.fixed.get(&id) {
+            Some(&arity) => Some(self.adapter(arity)?),
+            None => None,
+        };
+        Ok(Entry { code, adapter })
+    }
+
+    fn adapter(&mut self, arity: u16) -> Result<usize, Error> {
+        if let Some(adapter) = self.stubs.adapter(arity) {
+            return Ok(adapter);
+        }
+        if let Some(&adapter) = self.adapters.get(&arity) {
+            return Ok(adapter);
+        }
+        let stub = emit::stubs::build_adapter(&mut self.module, &self.signature, arity)?;
+        self.module
+            .finalize_definitions()
+            .map_err(|error| Error::Compile(error.to_string()))?;
+        let adapter = stub.finalize(&self.module, self.dump.as_mut(), &format!("adapter/{arity}"));
+        self.adapters.insert(arity, adapter);
+        Ok(adapter)
     }
 
     fn declare(&mut self, name: &str) -> Result<FuncId, Error> {
@@ -155,7 +219,7 @@ impl Compiler {
             Vec<CompiledFunction>,
             Vec<String>,
             Option<usize>,
-            Vec<(u64, usize)>,
+            Vec<(u64, Entry)>,
         ),
         Error,
     > {
@@ -193,7 +257,7 @@ impl Compiler {
             Vec<CompiledFunction>,
             Vec<String>,
             Option<usize>,
-            Vec<(u64, usize)>,
+            Vec<(u64, Entry)>,
         ),
         Error,
     > {
@@ -575,6 +639,7 @@ impl Compiler {
                     &mut builder,
                     &mut self.module,
                     &self.helpers,
+                    self.stubs,
                     &mut annotations,
                     &mut self.names,
                     &mut self.cells,
@@ -625,13 +690,8 @@ impl Compiler {
             initializer.map(|id| self.module.get_finalized_function(id) as usize),
             compiled_ids
                 .into_iter()
-                .map(|id| {
-                    (
-                        id.as_u32() as u64,
-                        self.module.get_finalized_function(id) as usize,
-                    )
-                })
-                .collect(),
+                .map(|id| Ok((id.as_u32() as u64, self.entry(id)?)))
+                .collect::<Result<_, Error>>()?,
         ))
     }
 
@@ -678,6 +738,23 @@ impl Compiler {
                 if self.compile_ir {
                     println!("[{name}] IR\n{}", self.context.func.display());
                 }
+            }
+            if let Some(stats) = &mut self.stats {
+                stats.functions += 1;
+                stats.blocks += self.context.func.layout.blocks().count();
+                stats.insts += self
+                    .context
+                    .func
+                    .layout
+                    .blocks()
+                    .map(|block| self.context.func.layout.block_insts(block).count())
+                    .sum::<usize>();
+            }
+            if self.context.func.signature.call_conv == CallConv::Tail {
+                let arity = self.context.func.signature.params.len() - 3;
+                self.fixed.insert(id, arity as u16);
+            } else {
+                self.fixed.remove(&id);
             }
             self.module
                 .define_function(id, &mut self.context)
@@ -771,7 +848,7 @@ impl Compiler {
         &mut self,
         code: u64,
         planner: &super::planner::Planner,
-    ) -> Result<Option<usize>, Error> {
+    ) -> Result<Option<Entry>, Error> {
         let result = self.recompile_inner(code, planner);
         if result.is_err() {
             self.context.clear();
@@ -784,7 +861,7 @@ impl Compiler {
         &mut self,
         code: u64,
         planner: &super::planner::Planner,
-    ) -> Result<Option<usize>, Error> {
+    ) -> Result<Option<Entry>, Error> {
         let Ok(code) = u32::try_from(code) else {
             return Ok(None);
         };
@@ -831,7 +908,10 @@ impl Compiler {
             ..Annotations::default()
         };
         self.context.clear();
-        self.context.func.signature = self.signature.clone();
+        self.context.func.signature = match graph.graph.arity {
+            Some(arity) => self.fixed_signature(arity),
+            None => self.signature.clone(),
+        };
         {
             let mut builder = cranelift_frontend::FunctionBuilder::new(
                 &mut self.context.func,
@@ -841,6 +921,7 @@ impl Compiler {
                 &mut builder,
                 &mut self.module,
                 &self.helpers,
+                self.stubs,
                 &mut annotations,
                 &mut self.names,
                 &mut self.cells,
@@ -877,7 +958,7 @@ impl Compiler {
         emission.conditional = graph.conditional;
         emission.inlines = graph.inlines;
         emission.reads = graph.reads;
-        Ok(Some(self.module.get_finalized_function(id) as usize))
+        Ok(Some(self.entry(id)?))
     }
 
     fn compile_callable(
@@ -1013,7 +1094,10 @@ impl Compiler {
             ..Annotations::default()
         };
         self.context.clear();
-        self.context.func.signature = self.signature.clone();
+        self.context.func.signature = match graph.as_ref().and_then(|graph| graph.graph.arity) {
+            Some(arity) => self.fixed_signature(arity),
+            None => self.signature.clone(),
+        };
         {
             let mut builder = cranelift_frontend::FunctionBuilder::new(
                 &mut self.context.func,
@@ -1024,6 +1108,7 @@ impl Compiler {
                     &mut builder,
                     &mut self.module,
                     &self.helpers,
+                    self.stubs,
                     &mut annotations,
                     &mut self.names,
                     &mut self.cells,
@@ -1045,6 +1130,7 @@ impl Compiler {
                     &mut builder,
                     &mut self.module,
                     &self.helpers,
+                    self.stubs,
                     &mut annotations,
                     &mut self.names,
                     &mut self.cells,

@@ -99,10 +99,14 @@ pub(super) fn generator_next(ctx: *mut JitCtx, generator: Value) -> Value {
         .collect();
     let receiver = context.global.heap().generator_receiver(generator).unwrap();
     let (state, locals) = context.global.heap().generator_begin(generator).unwrap();
-    context.resume(locals, state);
-    let function: extern "C" fn(*mut JitCtx, Value, Value, *const Value, u64) -> Value =
-        unsafe { std::mem::transmute(entry) };
-    let value = function(ctx, generator, receiver, args.as_ptr(), args.len() as u64);
+    if let Err(locals) = context.resume(locals, state) {
+        context
+            .global
+            .heap()
+            .generator_suspend(generator, state, locals);
+        return Value::UNDEFINED;
+    }
+    let value = entry.call(ctx, generator, receiver, args.as_ptr(), args.len() as u64);
     let context = unsafe { &mut *ctx };
     if context.error.is_some() || context.exception_pending() {
         context.global.heap().release(value);

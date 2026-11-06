@@ -36,6 +36,8 @@ fn admitted(context: &Context, annotations: &Annotations) -> bool {
                 }
             } else if function.dfg.insts[inst].opcode().is_call() {
                 return false;
+            } else if annotations.frame_stores.contains(&inst) {
+                continue;
             } else if function.dfg.insts[inst].opcode().can_store() {
                 match function.dfg.insts[inst] {
                     InstructionData::Store { args, .. } => {

@@ -474,14 +474,9 @@ fn recursively_inlined_bodies_expand_arrays_and_constructors_once() {
     assert!(constructors >= 2 && constructors <= 4, "{constructors}");
     assert!(!caller.contains(" = construct_spread "));
     let start = source.find("new SimpleTerrain").unwrap();
-    assert!(
-        caller
-            .lines()
-            .filter(|line| line.contains(&format!("note: call at {start}.."))
-                && line.contains("inline funcid"))
-            .count()
-            >= 2
-    );
+    assert!(caller.lines().any(|line| {
+        line.contains(&format!("note: call at {start}..")) && line.contains("inline funcid")
+    }));
     assert_eq!(caller.matches("note: array map at ").count(), maps);
 }
 

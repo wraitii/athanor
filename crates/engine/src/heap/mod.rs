@@ -36,7 +36,7 @@ use shape::*;
 use typed::*;
 
 pub(crate) use arena::{
-    DATA_OFFSET, KIND_OFFSET, LENGTH_OFFSET, NO_ELEMENTS, REFERENCES_OFFSET, SHAPE_OFFSET,
+    CODE_OFFSET, DATA_OFFSET, KIND_OFFSET, LENGTH_OFFSET, NO_ELEMENTS, REFERENCES_OFFSET, SHAPE_OFFSET,
 };
 pub(crate) use array::HOLE;
 pub(crate) use natives::{MathFunction, NativeFunction};
@@ -415,6 +415,10 @@ impl HeapData {
     fn sync(&mut self, id: u64) {
         let slot = self.slot_mut(id);
         slot.kind = slot.payload.kind();
+        slot.code = match &slot.payload {
+            Payload::Closure(closure) => callable_code(closure),
+            _ => 0,
+        };
         (slot.data, slot.length) = match &slot.payload {
             Payload::Array(array) => (array.elements.as_ptr().cast(), array.elements.len()),
             Payload::TypedArray(array) => array.storage.raw(),
@@ -435,7 +439,7 @@ impl HeapData {
         let slot = self.slot_mut(id);
         slot.kind = 0;
         slot.shape = NO_SHAPE;
-        slot.flags = 0;
+        slot.code = 0;
         slot.data = std::ptr::null();
         slot.length = 0;
         let payload = std::mem::replace(&mut slot.payload, Payload::Vacant);

@@ -74,7 +74,9 @@ pub struct Engine {
     global: Environment,
     functions: RefCell<HashMap<String, Function>>,
     // Code IDs are function indices in this engine's persistent Cranelift module.
-    code: RefCell<Vec<Option<usize>>>,
+    code: RefCell<Vec<Option<jit::entries::Entry>>>,
+    direct: jit::DirectEntries,
+    pub(crate) locals: jit::LocalSlots,
     pub(crate) host: Option<Box<dyn Host>>,
 }
 
@@ -242,13 +244,16 @@ impl Engine {
             .ok_or_else(|| Error::Runtime("heap exhausted".into()))?;
         global.define("hostSeedRandom", seed_random);
         global.heap().release(seed_random);
+        let direct = jit::DirectEntries::new();
         Ok(Self {
-            compiler: RefCell::new(Compiler::new(options)?),
+            compiler: RefCell::new(Compiler::new(options, direct.address())?),
             planner: RefCell::new(jit::Planner::default()),
             random_state: Cell::new(0x330e),
             global,
             functions: RefCell::new(HashMap::new()),
             code: RefCell::new(Vec::new()),
+            direct,
+            locals: jit::LocalSlots::new(),
             host: None,
         })
     }
@@ -293,6 +298,7 @@ impl Engine {
         self.planner
             .borrow_mut()
             .observe(cache.owner, cache.site, target);
+        self.direct.withdraw(cache.owner);
         cache.recorded = 1;
     }
 
@@ -305,10 +311,11 @@ impl Engine {
         self.planner
             .borrow_mut()
             .observe_get(cache.owner, cache.site, kind, observed);
+        self.direct.withdraw(cache.owner);
         cache.recorded = 1;
     }
 
-    pub(crate) fn entry(&self, code: u64) -> Option<usize> {
+    pub(crate) fn entry(&self, code: u64) -> Option<jit::entries::Entry> {
         let recompile = self.planner.borrow_mut().take(code);
         if recompile {
             let result = self
@@ -321,11 +328,21 @@ impl Engine {
                 Err(error) => eprintln!("js jit: recompilation failed: {error}"),
             }
         }
-        self.code
+        let entry = self
+            .code
             .borrow()
             .get(usize::try_from(code).ok()?)
             .copied()
-            .flatten()
+            .flatten()?;
+        self.publish(code, entry);
+        Some(entry)
+    }
+
+    fn publish(&self, code: u64, entry: jit::entries::Entry) {
+        match entry.adapter {
+            Some(_) => self.direct.publish(code, entry.code),
+            None => self.direct.withdraw(code),
+        }
     }
 
     pub fn global(&self) -> &Environment {
@@ -345,7 +362,7 @@ impl Engine {
         if let Some(initializer) = self.prepare_source(source, filename)? {
             let value = unsafe {
                 jit::call(
-                    initializer,
+                    jit::entries::Entry::generic(initializer),
                     &[],
                     self,
                     Value::UNDEFINED,
@@ -458,6 +475,7 @@ impl Engine {
                     entries.resize(index + 1, None);
                 }
                 entries[index] = Some(entry);
+                self.publish(code, entry);
             }
         }
         for function in functions {
@@ -556,7 +574,7 @@ mod feedback_tests {
             .0
     }
 
-    fn entry(engine: &Engine, code: u64) -> usize {
+    fn entry(engine: &Engine, code: u64) -> jit::entries::Entry {
         engine.code.borrow()[code as usize].unwrap()
     }
 
@@ -678,7 +696,7 @@ mod feedback_tests {
                 r#"
             function C(x){this.set(x);}
             C.prototype.set=function(x){this.value=x;};
-            function make(x){return new C(x).value;}
+            function make(K,x){return new K(x).value;}
             function replace(){C.prototype.set=function(x){this.value=x+10;};}
         "#,
                 "constructors.js",
@@ -686,16 +704,18 @@ mod feedback_tests {
             .unwrap();
         let code = code(&engine, "make");
         let original = entry(&engine, code);
+        let constructor = engine.global.get("C").unwrap();
+        let args = [constructor.value(), Value::number(3.0)];
         for _ in 0..2 {
             assert_eq!(
-                engine.call("make", &[Value::number(3.0)]).unwrap().value(),
+                engine.call("make", &args).unwrap().value(),
                 Value::number(3.0)
             );
         }
         assert_ne!(entry(&engine, code), original);
         engine.call("replace", &[]).unwrap();
         assert_eq!(
-            engine.call("make", &[Value::number(3.0)]).unwrap().value(),
+            engine.call("make", &args).unwrap().value(),
             Value::number(13.0)
         );
     }

@@ -8,10 +8,13 @@ use super::effects::{self, TemporaryEffect};
 fn effect(function: &Function, annotations: &Annotations, inst: Inst) -> Option<bool> {
     if let Some(&helper) = annotations.helpers.get(&inst) {
         return match effects::temporary_effect(helper) {
-            TemporaryEffect::Enter | TemporaryEffect::Clear => Some(false),
+            TemporaryEffect::Clear => Some(false),
             TemporaryEffect::MayRegister => Some(true),
             TemporaryEffect::None => None,
         };
+    }
+    if annotations.temporary_resets.contains(&inst) {
+        return Some(false);
     }
     // Emission records inline pushes; other stores do not register temporaries.
     (annotations.temporary_pushes.contains(&inst) || function.dfg.insts[inst].opcode().is_call())
@@ -140,7 +143,9 @@ mod tests {
         b.append_block_params_for_function_params(entry);
         b.switch_to_block(entry);
         let mut annotations = Annotations::default();
-        call(&mut b, &mut annotations, Some(Helper::FrameEnter));
+        let address = b.block_params(entry)[0];
+        let floor = b.ins().store(MemFlagsData::trusted(), address, address, 0);
+        annotations.temporary_resets.insert(floor);
         emit(&mut b, &mut annotations, entry);
         b.ins().return_(&[]);
         b.seal_all_blocks();

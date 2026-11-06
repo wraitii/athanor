@@ -97,22 +97,23 @@ define_helpers! {
     SemanticPropertyProbeCached => Binary, js_semantic_property_probe_cached;
     SemanticIndexProbe => Binary, js_semantic_index_probe;
     SemanticMathNative => Binary, js_semantic_math_native;
-    SemanticCode => Binary, js_semantic_code;
     ClosureThis => Unary, js_closure_this;
+    LexicalReceiver => Binary, js_lexical_receiver;
     ArrayIterationGuard => IndexSet, js_array_iteration_guard;
     IsStringSplit => Unary, js_is_string_split;
     StringSplit => MethodCallable, js_string_split;
     ArrayMapNew => Unary, js_array_map_new;
     ArrayMapElement => Binary, js_array_map_element;
     MathDirect => MethodCallable, js_math_direct;
-    FrameEnter => Unary, js_frame_enter;
-    FrameExit => Unary, js_frame_exit;
-    FrameExitUnrooted => Unary, js_frame_exit_unrooted;
+    FrameOverflow => Nullary, js_frame_overflow;
+    FrameRelease => Nullary, js_frame_release;
+    IndexUnroot => Nullary, js_index_unroot;
     LocalSet => Binary, js_local_set;
     LocalReplace => IndexSet, js_local_replace;
     Release => Unary, js_release;
     TempClear => Unary, js_temp_clear;
     TempRetain => Unary, js_temp_retain;
+    TempOwn => Unary, js_temp_own;
     IterateNew => Unary, js_iterate_new;
     IterateNext => Unary, js_iterate_next;
     EnumerateNew => Unary, js_enumerate_new;
@@ -173,7 +174,12 @@ impl Helper {
         !matches!(
             self,
             Self::TempRetain
+                | Self::TempOwn
+                | Self::LexicalReceiver
                 | Self::Release
+                | Self::FrameOverflow
+                | Self::FrameRelease
+                | Self::IndexUnroot
                 | Self::IndexGet
                 | Self::IndexGetNumeric
                 | Self::PropertyGet
@@ -301,15 +307,17 @@ extern "C" fn js_error_origin(
     Value::UNDEFINED
 }
 
-extern "C" fn js_frame_enter(ctx: *mut JitCtx, size: u64) -> Value {
-    unsafe { &mut *ctx }.enter(size as usize);
+extern "C" fn js_frame_overflow(ctx: *mut JitCtx) -> Value {
+    unsafe { &mut *ctx }.overflow();
     Value::UNDEFINED
 }
-extern "C" fn js_frame_exit(ctx: *mut JitCtx, value: Value) -> Value {
-    unsafe { &mut *ctx }.exit(value)
+extern "C" fn js_frame_release(ctx: *mut JitCtx) -> Value {
+    unsafe { &mut *ctx }.release_frame_locals();
+    Value::UNDEFINED
 }
-extern "C" fn js_frame_exit_unrooted(ctx: *mut JitCtx, value: Value) -> Value {
-    unsafe { &mut *ctx }.exit_unrooted(value)
+extern "C" fn js_index_unroot(ctx: *mut JitCtx) -> Value {
+    unsafe { &mut *ctx }.release_index_root();
+    Value::UNDEFINED
 }
 extern "C" fn js_local_set(ctx: *mut JitCtx, slot: u64, value: Value) -> Value {
     unsafe { &mut *ctx }.local_set(slot as usize, value)
@@ -324,6 +332,9 @@ extern "C" fn js_local_replace(ctx: *mut JitCtx, slot: u64, value: Value, old: V
 extern "C" fn js_temp_clear(ctx: *mut JitCtx, _: Value) -> Value {
     unsafe { &mut *ctx }.clear();
     Value::UNDEFINED
+}
+extern "C" fn js_temp_own(ctx: *mut JitCtx, value: Value) -> Value {
+    unsafe { &mut *ctx }.own(value)
 }
 extern "C" fn js_temp_retain(ctx: *mut JitCtx, value: Value) -> Value {
     let ctx = unsafe { &mut *ctx };
@@ -525,19 +536,20 @@ extern "C" fn js_string_split(
     )
 }
 
-extern "C" fn js_semantic_code(ctx: *mut JitCtx, value: Value, code: u64) -> Value {
-    let heap = unsafe { &*ctx }.global.heap();
-    Value::boolean(
-        heap.closure_code(value) == Some(crate::heap::CodeId(code)) && !heap.is_class(value),
-    )
-}
-
 extern "C" fn js_closure_this(ctx: *mut JitCtx, closure: Value) -> Value {
     unsafe { &*ctx }
         .global
         .heap()
         .lexical_this(closure)
         .unwrap_or(Value::UNDEFINED)
+}
+
+extern "C" fn js_lexical_receiver(ctx: *mut JitCtx, closure: Value, receiver: Value) -> Value {
+    unsafe { &*ctx }
+        .global
+        .heap()
+        .lexical_this(closure)
+        .unwrap_or(receiver)
 }
 
 extern "C" fn js_array_iteration_guard(
@@ -553,6 +565,8 @@ extern "C" fn js_array_iteration_guard(
         x if x == ArrayMethod::Some as u64 => NativeFunction::ArraySome,
         x if x == ArrayMethod::Every as u64 => NativeFunction::ArrayEvery,
         x if x == ArrayMethod::Filter as u64 => NativeFunction::ArrayFilter,
+        x if x == ArrayMethod::ForEach as u64 => NativeFunction::ArrayForEach,
+        x if x == ArrayMethod::Find as u64 => NativeFunction::ArrayFind,
         _ => unreachable!(),
     };
     let heap = unsafe { &*ctx }.global.heap();
