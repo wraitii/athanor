@@ -366,6 +366,9 @@ fn number(value: f64) -> Types {
 
 fn result_types(op: &Op, facts: &Facts) -> Types {
     match op {
+        Op::OsrStart(..) => Types::BOOLEAN,
+        Op::OsrOutput(..) => Types::NUMBER,
+        Op::OsrStore(..) => Types::default(),
         Op::Constant(constant) => match constant {
             Constant::Undefined => Types::UNDEFINED,
             Constant::Null => Types::NULL,

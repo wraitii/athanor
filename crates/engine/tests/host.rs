@@ -172,3 +172,16 @@ fn print_and_console_log_write_to_the_host() {
     assert_eq!(engine.call("main", &[]).unwrap().value(), Value::UNDEFINED);
     assert_eq!(*output.borrow(), "a1true\nx 2 null [1, y]\n");
 }
+
+#[test]
+fn evaluated_sources_call_older_deferred_functions() {
+    let mut engine = engine();
+    engine
+        .compile("function older(x) { return () => x + 2; }", "older.js")
+        .unwrap();
+    engine.compile("function main() { hostEvaluateSource('function newer() { return older(40)(); }', 'newer.js'); return newer(); }", "main.js").unwrap();
+    assert_eq!(
+        engine.call("main", &[]).unwrap().value(),
+        Value::number(42.0)
+    );
+}

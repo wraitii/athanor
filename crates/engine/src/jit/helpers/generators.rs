@@ -88,7 +88,14 @@ pub(super) fn generator_next(ctx: *mut JitCtx, generator: Value) -> Value {
         return Value::UNDEFINED;
     }
     let (code, _, arguments) = context.global.heap().generator_parts(generator).unwrap();
-    let Some(entry) = context.entry(code.0) else {
+    let entry = match context.entry(code.0) {
+        Ok(entry) => entry,
+        Err(error) => {
+            context.error = Some(Box::new(error));
+            return Value::UNDEFINED;
+        }
+    };
+    let Some(entry) = entry else {
         context.error = Some(Box::new(crate::Error::Runtime(
             "generator code is unavailable".into(),
         )));

@@ -9,6 +9,7 @@ use super::{
 pub(in crate::jit) struct Read {
     inst: Inst,
     typed: bool,
+    element: Option<crate::heap::TypedKind>,
     guard_number: bool,
 }
 
@@ -21,8 +22,10 @@ pub(super) fn plan(
     let mut reads = Vec::new();
     for block in Cfg::new(graph).rpo {
         for &inst in &graph.blocks[block].insts {
-            let Op::GetIndex(object, key) = graph.insts[inst].op else {
-                continue;
+            let (object, key) = match graph.insts[inst].op {
+                Op::GetIndex(object, key)
+                | Op::TypedIndex(object, key, TypedRead { element: None, .. }) => (object, key),
+                _ => continue,
             };
             let site = |inst: Inst| {
                 let data = &graph.insts[inst];
@@ -55,6 +58,10 @@ pub(super) fn plan(
             reads.push(Read {
                 inst,
                 typed: matches!(observed, ReadType::Typed(_)),
+                element: match observed {
+                    ReadType::Typed(kind) => Some(kind),
+                    ReadType::Array => None,
+                },
                 guard_number: !types.within(Types::NUMBER),
             });
         }
@@ -69,13 +76,15 @@ pub(super) fn apply(
 ) -> super::Result<()> {
     for read in reads {
         let data = graph.insts[read.inst].clone();
-        let Op::GetIndex(object, key) = data.op else {
-            unreachable!();
+        let (object, key) = match data.op {
+            Op::GetIndex(object, key)
+            | Op::TypedIndex(object, key, TypedRead { element: None, .. }) => (object, key),
+            _ => unreachable!(),
         };
         let (block, continuation, fallback) = super::inlining::split_call(graph, read.inst);
         let fast = graph.blocks.push(BlockData::default());
         let guard = if read.typed {
-            Op::IsTyped(object, None)
+            Op::IsTyped(object, read.element)
         } else {
             Op::IsIndexed(object)
         };
@@ -112,7 +121,7 @@ pub(super) fn apply(
                     object,
                     key,
                     TypedRead {
-                        element: None,
+                        element: read.element,
                         bounded: false,
                     },
                 )
@@ -210,7 +219,14 @@ mod tests {
                 .values()
                 .filter(|data| matches!(
                     data.op,
-                    Op::TypedIndex(_, _, TypedRead { element: None, .. })
+                    Op::TypedIndex(
+                        _,
+                        _,
+                        TypedRead {
+                            element: Some(TypedKind::Float64),
+                            ..
+                        }
+                    )
                 ))
                 .count(),
             1

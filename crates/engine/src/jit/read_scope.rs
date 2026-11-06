@@ -4,11 +4,11 @@ use cranelift_codegen::ir::{
     BlockArg, InstBuilder, InstructionData, Opcode, condcodes::IntCC, types,
 };
 use cranelift_jit::JITModule;
-use cranelift_module::{FuncId, Module};
+use cranelift_module::Module;
 
 use super::clif::{Annotations, IndexedRead};
 use super::effects::{self, GLOBAL_WRITE, HEAP_WRITE, Reentry};
-use super::helpers::Helper;
+use super::helpers::{self, HELPERS, Helper};
 use crate::value::Value;
 
 fn admitted(context: &Context, annotations: &Annotations) -> bool {
@@ -59,12 +59,7 @@ fn admitted(context: &Context, annotations: &Annotations) -> bool {
     true
 }
 
-pub(super) fn specialize(
-    context: &mut Context,
-    annotations: &mut Annotations,
-    module: &mut JITModule,
-    root_id: FuncId,
-) {
+pub(super) fn specialize(context: &mut Context, annotations: &mut Annotations, module: &JITModule) {
     if !admitted(context, annotations) || annotations.indexed_reads.len() < 2 {
         return;
     }
@@ -103,13 +98,21 @@ pub(super) fn specialize(
         return;
     };
     let stable = {
-        let root = module.declare_func_in_func(root_id, function);
-        let ctx = function.dfg.inst_args(source.call)[0];
+        let target = module.target_config();
+        let signature = function.import_signature(helpers::signature(
+            HELPERS[Helper::IndexRoot as usize].shape,
+            target.default_call_conv,
+            target.pointer_type(),
+        ));
+        let ctx = function.dfg.inst_variable_args(source.call)[0];
         let mut cursor = FuncCursor::new(function).at_inst(first);
         cursor.set_srcloc(cranelift_codegen::ir::SourceLoc::new(source.source.0));
-        let call = cursor
-            .ins()
-            .call(root, &[ctx, source.receiver, source.key, source.result]);
+        let root = helpers::address(cursor.ins(), target.pointer_type(), ctx, Helper::IndexRoot);
+        let call = cursor.ins().call_indirect(
+            signature,
+            root,
+            &[ctx, source.receiver, source.key, source.result],
+        );
         annotations.helpers.insert(call, Helper::IndexRoot);
         cursor.func.dfg.first_result(call)
     };
@@ -121,10 +124,11 @@ pub(super) fn specialize(
     let done = function.dfg.make_block();
     function.layout.split_block(done, next);
     let merged = function.dfg.append_block_param(done, types::I64);
-    let InstructionData::Call { func_ref, .. } = function.dfg.insts[target.call] else {
+    let InstructionData::CallIndirect { sig_ref, .. } = function.dfg.insts[target.call] else {
         unreachable!()
     };
-    let args = function.dfg.inst_args(target.call).to_vec();
+    let callee = function.dfg.inst_args(target.call)[0];
+    let args = function.dfg.inst_variable_args(target.call).to_vec();
     let result = function.dfg.first_result(target.call);
     let loc = function.srcloc(target.call);
     function.dfg.clear_results(target.call);
@@ -136,7 +140,7 @@ pub(super) fn specialize(
         .retain(|read| read.call != target.call);
     let mut cursor = FuncCursor::new(function).at_bottom(slow);
     cursor.set_srcloc(loc);
-    let slow_call = cursor.ins().call(func_ref, &args);
+    let slow_call = cursor.ins().call_indirect(sig_ref, callee, &args);
     annotations.helpers.insert(slow_call, Helper::IndexGet);
     let slow_result = cursor.func.dfg.first_result(slow_call);
     cursor.ins().jump(done, &[BlockArg::Value(slow_result)]);

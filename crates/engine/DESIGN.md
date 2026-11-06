@@ -1128,8 +1128,8 @@ inlining preserves the callee's error locations and resolved closure code IDs.
 application. The static producer recognizes global bindings and known local
 closures through their SSA definitions. Inlining substitutes ordinary argument
 values without numeric guards or type-based eligibility restrictions. The
-planner bounds expansion to 256 callee instructions per caller, with at most
-64 instructions per eligible callee. These counts use canonical semantic operations, including
+planner bounds initial expansion to 128 callee instructions per caller, with at
+most 32 instructions per eligible callee. Recompilation multiplies both limits as described below. These counts use canonical semantic operations, including
 arguments, constants and scopes, but not block parameters or terminators.
 
 `semantic/inlining.rs` copies callee blocks, values, bindings and scopes, and
@@ -1208,17 +1208,29 @@ An indexed-storage or typed-array guard and, where needed, a number guard select
 the existing generic indexed or typed read. Other receivers and keys use the
 original read. Key categories are not profiled yet: numeric speculation uses IR
 facts and explicit guards. Indexed reads retain bounds checks, hole handling and
-heap-result ownership. Typed element kinds are retained in feedback but are not
-yet used to specialize these reads further. Feedback does not prove a property
+heap-result ownership. Typed element kinds select a matching kind guard and a
+direct element load, retaining index validity and bounds checks unless the
+region proves them redundant. Feedback does not prove a property
 immutable or retain the observed array. Read decisions join the inlining record
 when comparing plans. This initial policy does not propagate producer
 observations through SSA merges or specialize writes.
 
-At the owner's next dispatch, the compiler synchronously plans from its canonical
-graph with the accumulated feedback. Observations supply speculative candidates,
+Observations request compilation independently of scheduling. At function return,
+an eligible request submits an immutable snapshot of the canonical repository
+and accumulated feedback to a background worker pool. At most one job per logical
+code ID is outstanding; further requests remain pending and are coalesced into
+a follow-up job after completion. Canonical bodies and source text are shared
+between snapshots, while metadata uses copy-on-write updates. Each worker owns
+its Cranelift module and never accesses the runtime heap or published caches.
+Observations supply speculative candidates,
 with the evaluated callee checked by the existing code-identity guard. The planner
-runs at most two inlining rounds with one shared 256-instruction budget, allowing
-calls exposed by earlier rounds to inline without expanding fallback calls again.
+runs an initial inlining pass and up to two further rounds with one shared
+128-instruction base budget, allowing calls exposed by earlier rounds to inline
+without expanding fallback calls again.
+Both the shared instruction budget and per-callee size limit are multiplied by
+`EngineOptions::recompile_inline_multiplier` (default two) for feedback
+recompilation and OSR. Initial and prefetched compilation use the base budget.
+The multiplier leaves the number of rounds unchanged.
 The ordered inlining and read decisions form the decision record for the emitted
 version.
 Planning includes array, string split and construction expansion and simplification between
@@ -1285,12 +1297,91 @@ trace rejected calls into their canonical dependencies.
 Supporting writes that preserve particular dependencies, recursive native guards,
 and descendant escapes with continuation recovery remains future work.
 
-Re-emission declares a new machine function and replaces the entry for the
-original logical code ID only after finalization succeeds. Closures retain their
-identity, captures, and prototype. Active frames finish in the old code, which the
-JIT module retains. Failed recompilation reports a diagnostic and keeps the
-previous entry. There is no on-stack replacement, background compilation, or
-feedback for property writes yet.
+Re-emission declares a new machine function. Generated call dispatch checks a
+shared atomic completion flag before loading its target and enters the runtime
+only when results are ready. The execution thread takes ownership of the new
+version's previously unused caches before replacing the entry for the original
+logical code ID. Return-time scheduling also polls completions. Closures retain
+their identity, captures, and prototype. Active frames finish in the old code,
+which the JIT modules retain. Engine destruction joins the worker before
+releasing runtime resources. Failed recompilation reports a diagnostic and keeps
+the previous entry. `EngineOptions::background_compile = false` or
+`JS_JIT_BACKGROUND=0` retains synchronous recompilation at the next dispatch for
+deterministic tests and comparisons. Property writes are not profiled yet.
+
+The compilation service separates target identity from attempt identity. A
+function code ID or an emission's loop site identifies the target; a unique
+ticket identifies each queued attempt. The shared queue orders ready jobs by
+priority and submission order, coalesces duplicate targets, and supports
+promotion without changing an attempt's snapshot. Dependencies refer to attempt
+tickets and inherit the requesting job's priority transitively. Taking a job
+does not release dependents: the execution thread completes its ticket after
+handling publication or failure. Further feedback for a running target remains
+pending for a later attempt. The service starts two workers by default,
+configurable through `EngineOptions::compiler_threads` or `JS_JIT_WORKERS`. Each
+owns its compiler and code module. Publication remains confined to the execution
+thread. A worker exit stops the pool, joins the remaining workers, and cancels
+outstanding work
+after discarding remaining unpublished results; previously installed code remains
+usable.
+
+Synchronous initial compilation queues known callees that still have lazy bodies
+at prefetch priority, below next-call function recompilation. Callee discovery
+combines canonical call sites with calls remaining in the planned graph after
+inlining, including calls exposed inside inlined bodies. Original targets remain
+useful for later calls from other sites even when this caller inlines them.
+Discovery resolves global functions and local closures, including constructor
+and spread calls. Prefetch uses each callee's
+source-load repository snapshot and emits an initial body with its generic
+continuations, rather than a feedback version requiring an existing entry.
+Workers declare their own physical code IDs while preserving logical function
+identity and lexical receiver behavior. Background installation removes the lazy
+body but does not recursively discover more callees.
+
+Dispatch never waits for prefetch. It cancels a pending attempt before compiling
+synchronously; if a worker already took the attempt, both may finish. Publication
+rejects the worker's initial result once the logical function no longer has a
+lazy body, preserving synchronous code and any subsequent feedback versions.
+The running attempt retains its ticket until completion, so later feedback
+remains pending until the stale result is handled.
+
+`EngineOptions::osr` (`JS_JIT_OSR=1`) enables experimental loop replacement.
+Natural-loop discovery runs independently of the region-plan tree after guard
+placement and optimization. Merging region plans therefore does not suppress an
+inner loop that still contains unresolved call or indexed-read observations.
+The descriptor retains that emission's graph and records the preheader, entry
+arguments, external SSA inputs, exit values, and backedges. Read-result
+opportunities are restricted to values feeding an unresolved indexed receiver.
+Loops without remaining observations do not receive counters.
+
+The initial eligibility policy chooses the first transferable loop with numeric
+outputs. It requires promoted state, one normal exit, inputs dominating entry,
+and outputs available at exit. Generators, handlers, materialized scopes,
+nonlocal exits, and implicit function-frame reads are excluded. An explicit
+`OsrStart` operation exposes inputs to ownership analysis. A native stack buffer
+passes boxed input words and numeric output words; `OsrOutput` operations feed
+the existing exit continuation. No JS container is allocated for the transfer.
+The parent frame remains suspended and roots inputs while a separately framed
+fragment executes. Errors unwind the fragment frame before propagating through
+the parent's existing failure path.
+
+Every 32 entries, a site with applicable feedback can request one compilation
+attempt. Installed sites transfer on every subsequent entry. The fragment starts
+at the loop preheader, preserving its original entry arguments and accumulation
+order; backedge transfer with partially accumulated state is not implemented.
+Its extracted graph inherits facts established at that particular entry.
+Constants are rematerialized, established numeric inputs become numeric SSA
+values, and typed operations retain the enclosing guards' guarantees. Address
+views are discarded and rebuilt during fragment optimization, so re-versioning
+cannot retain stale view definitions. New feedback introduces guards and local
+generic continuations inside the fragment. A failed guard never restarts the
+parent function or replays completed iterations.
+
+Loop jobs use active priority. Ordinary function recompilation uses normal
+priority; after an OSR request, encompassing-function jobs use next-call priority
+for a future invocation, above speculative callee prefetch. Fragments record observations against their logical
+owner but do not report a parent function return. Publishing a fragment changes
+only its emission's loop entry cell, leaving the active function entry intact.
 
 ### Passes
 

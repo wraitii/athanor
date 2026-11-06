@@ -275,7 +275,7 @@ fn typed_objects(
     objects
 }
 
-fn element_guess(graph: &Graph, object: Value) -> Option<TypedKind> {
+pub(super) fn element_guess(graph: &Graph, object: Value) -> Option<TypedKind> {
     element_guess_at(graph, object, 0)
 }
 
@@ -422,7 +422,12 @@ fn counts_up(
     })
 }
 
-fn preheader(graph: &Graph, cfg: &Cfg, header: Block, body: &HashSet<Block>) -> Option<Block> {
+pub(super) fn preheader(
+    graph: &Graph,
+    cfg: &Cfg,
+    header: Block,
+    body: &HashSet<Block>,
+) -> Option<Block> {
     let outside: Vec<Block> = cfg.preds[header]
         .iter()
         .copied()
@@ -591,7 +596,7 @@ pub(super) fn reuse_loads(graph: &mut Graph, region: &HashSet<Block>, notes: &mu
     }
 }
 
-fn natural_loops(graph: &Graph, cfg: &Cfg) -> Vec<(Block, HashSet<Block>)> {
+pub(super) fn natural_loops(graph: &Graph, cfg: &Cfg) -> Vec<(Block, HashSet<Block>)> {
     let mut loops: HashMap<Block, HashSet<Block>> = HashMap::new();
     for &block in &cfg.rpo {
         for header in graph.successors(block) {

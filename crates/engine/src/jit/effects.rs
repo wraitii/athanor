@@ -51,6 +51,7 @@ pub(super) fn effects(helper: Helper) -> Effects {
     use Helper::*;
     let (reentry, flags, assumptions): (_, _, &'static [Assumption]) = match helper {
         Call
+        | CallOwned
         | CallSpread
         | Construct
         | ConstructSpread
@@ -63,6 +64,7 @@ pub(super) fn effects(helper: Helper) -> Effects {
             (Reentry::Closed, INTERNAL | ERROR, &[])
         }
         ObserveCall | ObserveGet | ObserveIndex => (Reentry::Closed, HEAP_READ | INTERNAL, &[]),
+        CompilePoll | CompileLeave | CallProfileFlush => (Reentry::Closed, INTERNAL, &[]),
         SemanticGlobalProbe => (Reentry::Closed, GLOBAL_READ, &[]),
         ConstructorPrototype
         | SemanticPropertyProbeCached
@@ -138,13 +140,12 @@ pub(super) fn temporary_effect(helper: Helper) -> TemporaryEffect {
         TempRetain | TempOwn | Add => MayRegister,
         SemanticPropertyProbeCached => None,
         FrameOverflow | FrameRelease | IndexUnroot | LocalSet | LocalReplace | Release
-        | ErrorOrigin | Throw | MathDirect
-        | ObserveCall | ObserveGet | ObserveIndex | ClosureThis | LexicalReceiver
-        | ArrayIterationGuard
-        | IsStringSplit | IndexRoot | Truthy | BitwiseAnd | BitwiseOr | BitwiseXor | ShiftLeft
-        | ShiftRight | ShiftRightUnsigned | Sub | Mul | Div | Rem | Pow | LooseEqual
-        | LooseNotEqual | StrictEqual | StrictNotEqual | Less | LessEqual | Greater
-        | GreaterEqual | UnaryPlus | UnaryNegation | LogicalNot | BitwiseNot => None,
+        | ErrorOrigin | Throw | MathDirect | ObserveCall | ObserveGet | ObserveIndex
+        | CompilePoll | CompileLeave | CallProfileFlush | ClosureThis | LexicalReceiver
+        | ArrayIterationGuard | IsStringSplit | IndexRoot | Truthy | BitwiseAnd | BitwiseOr
+        | BitwiseXor | ShiftLeft | ShiftRight | ShiftRightUnsigned | Sub | Mul | Div | Rem
+        | Pow | LooseEqual | LooseNotEqual | StrictEqual | StrictNotEqual | Less | LessEqual
+        | Greater | GreaterEqual | UnaryPlus | UnaryNegation | LogicalNot | BitwiseNot => None,
         _ => MayRegister,
     }
 }

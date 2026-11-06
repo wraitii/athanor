@@ -77,6 +77,17 @@ pub(in crate::jit) extern "C" fn js_call(
     invoke(ctx, closure, receiver, argv, argc)
 }
 
+pub(in crate::jit) extern "C" fn js_call_owned(
+    ctx: *mut JitCtx,
+    closure: Value,
+    receiver: Value,
+    argv: *const Value,
+    argc: u64,
+) -> Value {
+    let value = js_call(ctx, closure, receiver, argv, argc);
+    unsafe { &mut *ctx }.disown(value)
+}
+
 pub(super) fn invoke(
     ctx: *mut JitCtx,
     closure: Value,
@@ -93,7 +104,15 @@ pub(super) fn invoke(
             .global
             .heap()
             .closure_code(closure)
-            .and_then(|code| context.entry(code.0));
+            .map(|code| context.entry(code.0))
+            .transpose();
+        let entry = match entry {
+            Ok(entry) => entry.flatten(),
+            Err(error) => {
+                context.error = Some(Box::new(error));
+                return Value::UNDEFINED;
+            }
+        };
         let Some(entry) = entry else {
             context.error = Some(Box::new(crate::Error::Runtime(
                 "value is not callable in this engine".into(),

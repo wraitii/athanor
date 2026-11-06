@@ -7,13 +7,18 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::JITModule;
 use cranelift_module::{FuncId, Module};
 
-use super::scope::{heap_address, increment_references};
+use super::scope::heap_address;
 use crate::error::Error;
 use crate::heap::CODE_OFFSET;
-use crate::jit::entries::{DIRECT_ENTRIES, DIRECT_ENTRY_SIZE};
-use crate::jit::helpers::Helper;
+use crate::jit::entries::{
+    DIRECT_ADAPTER_OFFSET, DIRECT_ARITY_OFFSET, DIRECT_ENTRIES, DIRECT_ENTRY_SIZE,
+};
+use crate::jit::helpers::{self, Helper};
 use crate::jit::jitdump::Writer;
-use crate::jit::session::{ERROR_OFFSET, EXCEPTION_OFFSET};
+use crate::jit::session::{
+    CALL_SAMPLE_CODE_OFFSET, CALL_SAMPLE_SIZE, CALL_SAMPLES, CALL_SAMPLES_LEN_OFFSET,
+    CALL_SAMPLES_OFFSET, CALL_SITE_OFFSET, ERROR_OFFSET, EXCEPTION_OFFSET,
+};
 use crate::value::Value;
 
 pub(in crate::jit) const STUB_ARITIES: u16 = 8;
@@ -21,6 +26,7 @@ pub(in crate::jit) const STUB_ARITIES: u16 = 8;
 #[derive(Clone, Copy)]
 pub(in crate::jit) struct Stubs {
     pub(in crate::jit) direct_entries: *const usize,
+    pub(in crate::jit) compilation_state: usize,
     misses: [usize; STUB_ARITIES as usize + 1],
     adapters: [usize; STUB_ARITIES as usize + 1],
 }
@@ -28,15 +34,21 @@ pub(in crate::jit) struct Stubs {
 impl Stubs {
     pub(in crate::jit) fn new(
         module: &mut JITModule,
-        helpers: &[FuncId],
         generic: &Signature,
         direct_entries: *const usize,
+        compilation_state: usize,
         mut dump: Option<&mut Writer>,
     ) -> Result<Self, Error> {
         let mut misses = Vec::new();
         let mut adapters = Vec::new();
         for arity in 0..=STUB_ARITIES {
-            misses.push(build_miss(module, helpers, generic, direct_entries, arity)?);
+            misses.push(build_miss(
+                module,
+                generic,
+                direct_entries,
+                compilation_state,
+                arity,
+            )?);
             adapters.push(build_adapter(module, generic, arity)?);
         }
         module
@@ -51,6 +63,7 @@ impl Stubs {
         };
         Ok(Self {
             direct_entries,
+            compilation_state,
             misses: finalized("miss", misses),
             adapters: finalized("adapter", adapters),
         })
@@ -74,6 +87,45 @@ pub(in crate::jit) fn fixed_signature(pointer: Type, arity: u16) -> Signature {
     signature.returns.push(AbiParam::new(types::I64));
     signature.returns.push(AbiParam::new(types::I8));
     signature
+}
+
+pub(super) fn poll(
+    b: &mut FunctionBuilder<'_>,
+    module: &JITModule,
+    state: usize,
+    ctx: cranelift_codegen::ir::Value,
+    owner: Option<cranelift_codegen::ir::Value>,
+) -> Option<cranelift_codegen::ir::Inst> {
+    if state == 0 {
+        return None;
+    }
+    let target = module.target_config();
+    let pointer = target.pointer_type();
+    let address = b.ins().iconst(pointer, state as i64);
+    let flags = b
+        .ins()
+        .atomic_load(types::I8, MemFlagsData::trusted(), address);
+    let mask = if owner.is_some() {
+        crate::jit::recompile::REQUESTED
+    } else {
+        crate::jit::recompile::READY
+    };
+    let pending = b.ins().band_imm_u(flags, i64::from(mask));
+    let slow = b.create_block();
+    let done = b.create_block();
+    b.set_cold_block(slow);
+    b.ins().brif(pending, slow, &[], done, &[]);
+    b.switch_to_block(slow);
+    let helper = if owner.is_some() {
+        Helper::CompileLeave
+    } else {
+        Helper::CompilePoll
+    };
+    let args: Vec<_> = owner.into_iter().collect();
+    let call = helpers::call(b, target.default_call_conv, pointer, ctx, helper, &args);
+    b.ins().jump(done, &[]);
+    b.switch_to_block(done);
+    Some(call)
 }
 
 pub(in crate::jit) struct Stub {
@@ -124,22 +176,73 @@ fn define(
     Ok(Stub { id, size })
 }
 
-/// Dispatches unexpected targets through their published adapters before trying the runtime.
-/// Returns an owned result, like fixed-arity code.
+/// Tail calls published code of this arity, and otherwise dispatches through published
+/// adapters before trying the runtime. Returns an owned result, like fixed-arity code.
 fn build_miss(
     module: &mut JITModule,
-    helpers: &[FuncId],
     generic: &Signature,
     direct_entries: *const usize,
+    compilation_state: usize,
     arity: u16,
 ) -> Result<Stub, Error> {
-    let pointer = module.target_config().pointer_type();
+    let target = module.target_config();
+    let pointer = target.pointer_type();
     define(module, fixed_signature(pointer, arity), |b, module| {
         let flags = MemFlagsData::trusted();
-        let call = module.declare_func_in_func(helpers[Helper::Call as usize], b.func);
         let entry = b.current_block().unwrap();
         let params = b.block_params(entry).to_vec();
         let (ctx, callee, receiver) = (params[0], params[1], params[2]);
+        poll(b, module, compilation_state, ctx, None);
+        let inspect = b.create_block();
+        let lookup = b.create_block();
+        let direct = b.create_block();
+        let dispatch = b.create_block();
+        let fast = b.create_block();
+        let slow = b.create_block();
+        let done = b.create_block();
+        b.append_block_param(dispatch, pointer);
+        b.append_block_param(dispatch, pointer);
+        b.append_block_param(done, types::I64);
+        let none = b.ins().iconst(pointer, 0);
+        let address = heap_address(b, callee);
+        b.ins()
+            .brif(address, inspect, &[], dispatch, &[none.into(), none.into()]);
+        b.switch_to_block(inspect);
+        let code = b.ins().load(types::I32, flags, address, CODE_OFFSET);
+        let code = b.ins().uextend(pointer, code);
+        record_call(b, target.default_call_conv, pointer, ctx, code);
+        let index = b.ins().iadd_imm_s(code, -1);
+        let valid = b
+            .ins()
+            .icmp_imm_u(IntCC::UnsignedLessThan, index, DIRECT_ENTRIES as i64);
+        b.ins()
+            .brif(valid, lookup, &[], dispatch, &[none.into(), none.into()]);
+        b.switch_to_block(lookup);
+        let offset = b.ins().imul_imm_s(index, DIRECT_ENTRY_SIZE as i64);
+        let table = b.ins().iconst(pointer, direct_entries as i64);
+        let slot = b.ins().iadd(table, offset);
+        let code = b.ins().load(pointer, flags, slot, 0);
+        let adapter = b
+            .ins()
+            .load(pointer, flags, slot, DIRECT_ADAPTER_OFFSET as i32);
+        let published = b
+            .ins()
+            .load(pointer, flags, slot, DIRECT_ARITY_OFFSET as i32);
+        let matches = b
+            .ins()
+            .icmp_imm_s(IntCC::Equal, published, i64::from(arity) + 1);
+        b.ins().brif(
+            matches,
+            direct,
+            &[],
+            dispatch,
+            &[code.into(), adapter.into()],
+        );
+        b.switch_to_block(direct);
+        let fixed = b.import_signature(fixed_signature(pointer, arity));
+        b.ins().return_call_indirect(fixed, code, &params);
+        b.switch_to_block(dispatch);
+        let [code, adapter] = b.block_params(dispatch).try_into().unwrap();
         let argv = if arity == 0 {
             b.ins().iconst(pointer, 0)
         } else {
@@ -155,28 +258,6 @@ fn build_miss(
             b.ins().stack_addr(pointer, slot, 0)
         };
         let argc = b.ins().iconst(types::I64, i64::from(arity));
-        let inspect = b.create_block();
-        let lookup = b.create_block();
-        let fast = b.create_block();
-        let slow = b.create_block();
-        let done = b.create_block();
-        b.append_block_param(done, types::I64);
-        let address = heap_address(b, callee);
-        b.ins().brif(address, inspect, &[], slow, &[]);
-        b.switch_to_block(inspect);
-        let code = b.ins().load(types::I32, flags, address, CODE_OFFSET);
-        let code = b.ins().uextend(pointer, code);
-        let index = b.ins().iadd_imm_s(code, -1);
-        let valid = b
-            .ins()
-            .icmp_imm_u(IntCC::UnsignedLessThan, index, DIRECT_ENTRIES as i64);
-        b.ins().brif(valid, lookup, &[], slow, &[]);
-        b.switch_to_block(lookup);
-        let offset = b.ins().imul_imm_s(index, DIRECT_ENTRY_SIZE as i64);
-        let table = b.ins().iconst(pointer, direct_entries as i64);
-        let slot = b.ins().iadd(table, offset);
-        let code = b.ins().load(pointer, flags, slot, 0);
-        let adapter = b.ins().load(pointer, flags, slot, pointer.bytes() as i32);
         b.ins().brif(adapter, fast, &[], slow, &[]);
         b.switch_to_block(fast);
         let mut signature = generic.clone();
@@ -190,14 +271,15 @@ fn build_miss(
         let result = b.inst_results(adapted)[0];
         b.ins().jump(done, &[result.into()]);
         b.switch_to_block(slow);
-        let call = b.ins().call(call, &[ctx, callee, receiver, argv, argc]);
+        let call = helpers::call(
+            b,
+            target.default_call_conv,
+            pointer,
+            ctx,
+            Helper::CallOwned,
+            &[callee, receiver, argv, argc],
+        );
         let result = b.inst_results(call)[0];
-        let address = heap_address(b, result);
-        let increment = b.create_block();
-        b.ins()
-            .brif(address, increment, &[], done, &[result.into()]);
-        b.switch_to_block(increment);
-        increment_references(b, address);
         b.ins().jump(done, &[result.into()]);
         b.switch_to_block(done);
         let result = b.block_params(done)[0];
@@ -212,6 +294,40 @@ fn build_miss(
         let status = b.ins().bor(error, exception);
         b.ins().return_(&[result, status]);
     })
+}
+
+/// Appends the caller's site, stored in ctx before entering a miss stub, and the callee's
+/// code word to the sample buffer, draining it into the planner when full.
+fn record_call(
+    b: &mut FunctionBuilder<'_>,
+    call_conv: CallConv,
+    pointer: Type,
+    ctx: cranelift_codegen::ir::Value,
+    code: cranelift_codegen::ir::Value,
+) {
+    let flags = MemFlagsData::trusted();
+    let site = b.ins().load(pointer, flags, ctx, CALL_SITE_OFFSET);
+    let len = b.ins().load(pointer, flags, ctx, CALL_SAMPLES_LEN_OFFSET);
+    let offset = b.ins().imul_imm_s(len, CALL_SAMPLE_SIZE as i64);
+    let sample = b.ins().iadd(ctx, offset);
+    b.ins().store(flags, site, sample, CALL_SAMPLES_OFFSET);
+    b.ins().store(
+        flags,
+        code,
+        sample,
+        CALL_SAMPLES_OFFSET + CALL_SAMPLE_CODE_OFFSET,
+    );
+    let len = b.ins().iadd_imm_s(len, 1);
+    b.ins().store(flags, len, ctx, CALL_SAMPLES_LEN_OFFSET);
+    let full = b.ins().icmp_imm_u(IntCC::Equal, len, CALL_SAMPLES as i64);
+    let flush = b.create_block();
+    let done = b.create_block();
+    b.set_cold_block(flush);
+    b.ins().brif(full, flush, &[], done, &[]);
+    b.switch_to_block(flush);
+    helpers::call(b, call_conv, pointer, ctx, Helper::CallProfileFlush, &[]);
+    b.ins().jump(done, &[]);
+    b.switch_to_block(done);
 }
 
 /// Lets generic callers enter fixed-arity code, passed as the last argument.
@@ -235,7 +351,10 @@ pub(in crate::jit) fn build_adapter(
                 .icmp_imm_u(IntCC::UnsignedGreaterThan, argc, i64::from(index));
             let address = b.ins().iadd_imm_s(argv, i64::from(index) * 8);
             let address = b.ins().select(present, address, undefined);
-            args.push(b.ins().load(types::I64, MemFlagsData::trusted(), address, 0));
+            args.push(
+                b.ins()
+                    .load(types::I64, MemFlagsData::trusted(), address, 0),
+            );
         }
         let fixed = b.import_signature(fixed_signature(pointer, arity));
         let call = b.ins().call_indirect(fixed, code, &args);

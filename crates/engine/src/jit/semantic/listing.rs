@@ -23,6 +23,9 @@ impl Graph {
                 .join(", ")
         };
         match op {
+            Op::OsrStart(_, index, values) => format!("osr_start {index} [{}]", list(values)),
+            Op::OsrOutput(value, index) => format!("osr_output {value}, {index}"),
+            Op::OsrStore(offset, values) => format!("osr_store {offset} [{}]", list(values)),
             Op::Argument(index) => format!("argument {index}"),
             Op::Arguments => "arguments".into(),
             Op::Constant(Constant::Undefined) => "undefined".into(),
@@ -257,7 +260,10 @@ impl Listing<'_> {
                 let span = inst_data.span;
                 lines.push((
                     graph.inst_location(inst),
-                    Some(SourceLocation { source: inst_data.source_name.map(|name| name.0), span }),
+                    Some(SourceLocation {
+                        source: inst_data.source_name.map(|name| name.0),
+                        span,
+                    }),
                     format!("  {text:<48} ; {}..{}{note}", span.start, span.end),
                 ));
             }
@@ -277,7 +283,10 @@ impl Listing<'_> {
                 let span = terminator.span;
                 lines.push((
                     graph.terminator_location(block),
-                    Some(SourceLocation { source: terminator.source_name.map(|name| name.0), span }),
+                    Some(SourceLocation {
+                        source: terminator.source_name.map(|name| name.0),
+                        span,
+                    }),
                     format!("  {text:<48} ; {}..{}", span.start, span.end),
                 ));
             }

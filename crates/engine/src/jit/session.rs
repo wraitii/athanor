@@ -2,6 +2,8 @@ use std::cell::Cell;
 
 use crate::Engine;
 use crate::jit::entries::zeroed_cells;
+use crate::jit::helpers::HELPERS;
+use crate::jit::planner::CallSite;
 
 use crate::environment::Environment;
 use crate::error::Error;
@@ -137,6 +139,12 @@ impl TempStack {
     fn top(&self) -> Option<Value> {
         (self.len > self.floor).then(|| self.storage[self.len - 1])
     }
+
+    fn pop_if(&mut self, value: Value) -> bool {
+        let popped = self.top() == Some(value);
+        self.len -= usize::from(popped);
+        popped
+    }
 }
 
 #[repr(C)]
@@ -154,7 +162,22 @@ pub(crate) struct JitCtx<'a> {
     global_identity: *const (),
     global_revision: *const u64,
     pub(crate) engine: &'a Engine,
+    helpers: [*const u8; HELPERS.len()],
+    call_site: *const CallSite,
+    call_samples_len: usize,
+    call_samples: [CallSample; CALL_SAMPLES],
 }
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CallSample {
+    site: *const CallSite,
+    code: u64,
+}
+
+pub(crate) const CALL_SAMPLES: usize = 256;
+pub(crate) const CALL_SAMPLE_SIZE: usize = std::mem::size_of::<CallSample>();
+pub(crate) const CALL_SAMPLE_CODE_OFFSET: i32 = std::mem::offset_of!(CallSample, code) as i32;
 
 pub(crate) const ERROR_OFFSET: i32 = std::mem::offset_of!(JitCtx<'static>, error) as i32;
 pub(crate) const EXCEPTION_OFFSET: i32 = std::mem::offset_of!(JitCtx<'static>, exception) as i32;
@@ -185,6 +208,12 @@ pub(crate) const GLOBAL_IDENTITY_OFFSET: i32 =
     std::mem::offset_of!(JitCtx<'static>, global_identity) as i32;
 pub(crate) const GLOBAL_REVISION_OFFSET: i32 =
     std::mem::offset_of!(JitCtx<'static>, global_revision) as i32;
+pub(crate) const HELPERS_OFFSET: i32 = std::mem::offset_of!(JitCtx<'static>, helpers) as i32;
+pub(crate) const CALL_SITE_OFFSET: i32 = std::mem::offset_of!(JitCtx<'static>, call_site) as i32;
+pub(crate) const CALL_SAMPLES_LEN_OFFSET: i32 =
+    std::mem::offset_of!(JitCtx<'static>, call_samples_len) as i32;
+pub(crate) const CALL_SAMPLES_OFFSET: i32 =
+    std::mem::offset_of!(JitCtx<'static>, call_samples) as i32;
 
 impl<'a> JitCtx<'a> {
     fn new(engine: &'a Engine) -> Self {
@@ -204,6 +233,13 @@ impl<'a> JitCtx<'a> {
             global_identity: engine.global().identity(),
             global_revision: engine.global().revision_ptr(),
             engine,
+            helpers: std::array::from_fn(|index| HELPERS[index].pointer),
+            call_site: std::ptr::null(),
+            call_samples_len: 0,
+            call_samples: [CallSample {
+                site: std::ptr::null(),
+                code: 0,
+            }; CALL_SAMPLES],
         }
     }
 
@@ -247,7 +283,23 @@ impl<'a> JitCtx<'a> {
         self.own(value)
     }
 
-    pub(crate) fn entry(&self, code: u64) -> Option<crate::jit::entries::Entry> {
+    pub(crate) fn flush_call_samples(&mut self) {
+        let len = std::mem::take(&mut self.call_samples_len);
+        let samples = self.call_samples[..len]
+            .iter()
+            .filter(|sample| !sample.site.is_null())
+            .map(|sample| (unsafe { &*sample.site }, sample.code));
+        self.engine.record_calls(samples);
+    }
+
+    pub(crate) fn has_code(&self, code: u64) -> bool {
+        self.engine.has_code(code)
+    }
+
+    pub(crate) fn entry(
+        &self,
+        code: u64,
+    ) -> Result<Option<crate::jit::entries::Entry>, crate::Error> {
         self.engine.entry(code)
     }
 
@@ -326,6 +378,19 @@ impl<'a> JitCtx<'a> {
         }
         value
     }
+
+    /// Turns a temporary result into a reference owned by the caller.
+    pub(crate) fn disown(&mut self, value: Value) -> Value {
+        if value == Value::GLOBAL_OBJECT
+            || self.temps.pop_if(value)
+            || self.global.heap().retain(value)
+        {
+            return value;
+        }
+        self.error = Some(Box::new(Error::Runtime("invalid heap value".into())));
+        Value::UNDEFINED
+    }
+
     pub(crate) fn retain_temp(&mut self, value: Value) -> Value {
         if !self.global.heap().retain(value) {
             self.error = Some(Box::new(Error::Runtime("invalid heap value".into())));
@@ -428,6 +493,7 @@ impl<'a> JitCtx<'a> {
 
 impl Drop for JitCtx<'_> {
     fn drop(&mut self) {
+        self.flush_call_samples();
         self.locals.values_mut().fill(Value::UNDEFINED);
         self.engine.locals.exit();
     }

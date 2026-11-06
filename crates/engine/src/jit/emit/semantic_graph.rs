@@ -23,6 +23,7 @@ const HEAP: Types = Types::STRING.union(Types::OBJECT).union(Types::OTHER);
 const NUMERIC: Types = Types::NUMBER.union(Types::UNDEFINED);
 
 struct Context<'a> {
+    osr_buffers: RefCell<std::collections::HashMap<GraphValue, (ClifValue, usize)>>,
     values: &'a [Variable],
     direct: Option<RefCell<SecondaryMap<GraphValue, Option<ClifValue>>>>,
     reprs: &'a SecondaryMap<GraphValue, Repr>,
@@ -48,13 +49,13 @@ impl Context<'_> {
 
 impl FunctionCompiler<'_, '_> {
     fn observe(&mut self, value: ClifValue, span: oxc_span::Span, helper: Helper) {
-        let Some(feedback) = &mut self.feedback else {
+        let Some(feedback) = self.feedback else {
             return;
         };
         if !feedback.get_refinement && matches!(helper, Helper::ObserveGet | Helper::ObserveIndex) {
             return;
         }
-        let mut cache = Box::new(crate::jit::planner::ObservationCache {
+        let address = self.function_data(crate::jit::planner::ObservationCache {
             recorded: 0,
             owner: feedback.owner,
             site: crate::jit::planner::Site {
@@ -63,9 +64,6 @@ impl FunctionCompiler<'_, '_> {
                 end: span.end,
             },
         });
-        let address = &raw mut *cache as i64;
-        feedback.caches.push(cache);
-        let address = self.b.ins().iconst(self.pointer, address);
         let recorded = self
             .b
             .ins()
@@ -233,6 +231,7 @@ impl FunctionCompiler<'_, '_> {
             }
         }
         let cx = Context {
+            osr_buffers: RefCell::new(std::collections::HashMap::new()),
             values: &values,
             direct: (!suspends).then(|| RefCell::new(SecondaryMap::new())),
             reprs: &reprs,
@@ -246,10 +245,7 @@ impl FunctionCompiler<'_, '_> {
                     |value| {
                         facts.of(value).intersects(HEAP)
                             && !graph.borrowed.contains(&value)
-                            && !matches!(
-                                graph.defining_op(value),
-                                Some(Op::This | Op::Argument(_))
-                            )
+                            && !matches!(graph.defining_op(value), Some(Op::This | Op::Argument(_)))
                     },
                     |value| match graph.defining_op(value) {
                         Some(Op::Get(_, name)) => name != "length",
@@ -366,6 +362,100 @@ impl FunctionCompiler<'_, '_> {
                     typed
                 } else {
                     let result = match &data.op {
+                        Op::OsrStart(plan, candidate, inputs) => {
+                            let transfer = plan.loops[*candidate].transfer.as_ref().unwrap();
+                            let words = inputs.len() + transfer.outputs.len();
+                            let slot = self.b.create_sized_stack_slot(
+                                cranelift_codegen::ir::StackSlotData::new(
+                                    cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                                    (words * 8) as u32,
+                                    3,
+                                ),
+                            );
+                            let address = self.b.ins().stack_addr(self.pointer, slot, 0);
+                            cx.osr_buffers
+                                .borrow_mut()
+                                .insert(data.result.unwrap(), (address, inputs.len()));
+                            if let Some(feedback) = self.feedback {
+                                let site = self.data.pin(crate::jit::osr::Site::new(
+                                    feedback.owner,
+                                    plan.clone(),
+                                    *candidate,
+                                ));
+                                let site = self.b.ins().iconst(self.pointer, site as i64);
+                                let count = self.b.ins().load(
+                                    types::I64,
+                                    MemFlagsData::trusted(),
+                                    site,
+                                    crate::jit::osr::ENTRIES_OFFSET,
+                                );
+                                let count = self.b.ins().iadd_imm_s(count, 1);
+                                self.b.ins().store(
+                                    MemFlagsData::trusted(),
+                                    count,
+                                    site,
+                                    crate::jit::osr::ENTRIES_OFFSET,
+                                );
+                                let tick = self.b.ins().band_imm_s(count, 31);
+                                let tick = self.b.ins().icmp_imm_s(IntCC::Equal, tick, 0);
+                                let entry = self.b.ins().load(
+                                    self.pointer,
+                                    MemFlagsData::trusted(),
+                                    site,
+                                    crate::jit::osr::ENTRY_OFFSET,
+                                );
+                                let ready = self.b.ins().icmp_imm_s(IntCC::NotEqual, entry, 0);
+                                let poll = self.b.ins().bor(tick, ready);
+                                let slow = self.b.create_block();
+                                let done = self.b.create_block();
+                                self.b.append_block_param(done, types::I64);
+                                let no = self.constant(Value::FALSE);
+                                self.brif(poll, slow, &[], done, &[no.into()]);
+                                self.switch(slow);
+                                for (index, &value) in inputs.iter().enumerate() {
+                                    let value = get(self, value);
+                                    self.b.ins().store(
+                                        MemFlagsData::trusted(),
+                                        value,
+                                        address,
+                                        (index * 8) as i32,
+                                    );
+                                }
+                                let result = self.call_helper(Helper::OsrPoll, &[site, address]);
+                                self.check_error();
+                                self.jump(done, &[result.into()]);
+                                self.switch(done);
+                                Some(self.b.block_params(done)[0])
+                            } else {
+                                Some(self.constant(Value::FALSE))
+                            }
+                        }
+                        Op::OsrOutput(start, index) => {
+                            let (address, inputs) = cx.osr_buffers.borrow()[start];
+                            Some(self.b.ins().load(
+                                types::I64,
+                                MemFlagsData::trusted(),
+                                address,
+                                ((inputs + index) * 8) as i32,
+                            ))
+                        }
+                        Op::OsrStore(offset, values) => {
+                            let super::Arguments::Vector { argv, .. } = self.arguments else {
+                                return Err(Error::Compile(
+                                    "OSR fragment requires vector arguments".into(),
+                                ));
+                            };
+                            for (index, &value) in values.iter().enumerate() {
+                                let value = get(self, value);
+                                self.b.ins().store(
+                                    MemFlagsData::trusted(),
+                                    value,
+                                    argv,
+                                    ((offset + index) * 8) as i32,
+                                );
+                            }
+                            None
+                        }
                         Op::Argument(index) => Some(self.load_arg(*index)),
                         Op::Arguments => {
                             let (argv, argc) = self.argument_vector()?;
@@ -835,7 +925,9 @@ impl FunctionCompiler<'_, '_> {
                                     owned = data
                                         .result
                                         .is_some_and(|value| self.slot_owned(graph, &cx, value));
-                                    self.direct_call(*target, callee, receiver, &args, data.span, owned)?
+                                    self.direct_call(
+                                        *target, callee, receiver, &args, data.span, owned,
+                                    )?
                                 }
                                 None => self.generic_call(callee, receiver, &args, data.span)?,
                             };
@@ -1428,7 +1520,7 @@ impl FunctionCompiler<'_, '_> {
                 key,
                 TypedRead {
                     element: Some(element),
-                    bounded: true,
+                    bounded,
                 },
             ) => {
                 let view = match graph.views.get(&inst) {
@@ -1440,7 +1532,11 @@ impl FunctionCompiler<'_, '_> {
                     }
                 };
                 let key = self.operand(cx, *key);
-                Some(Some(self.bounded_element_read(view, key, *element)))
+                Some(Some(if *bounded {
+                    self.bounded_element_read(view, key, *element)
+                } else {
+                    self.checked_element_read(view, key, *element)
+                }))
             }
             Op::GetIndex(object, key)
             | Op::TypedIndex(object, key, _)

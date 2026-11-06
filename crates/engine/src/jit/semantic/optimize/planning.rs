@@ -125,7 +125,9 @@ impl RegionPlan {
             let version = apply_version(graph, &blocks, self.entry, &speculation);
             graph.verify()?;
             if let Some(previous) = fallback {
-                notes.push(format!("function: entry guard failure reuses {previous:#x}"));
+                notes.push(format!(
+                    "function: entry guard failure reuses {previous:#x}"
+                ));
             }
             if let Some(reason) = closure_failure(
                 graph,
@@ -286,11 +288,16 @@ fn plan_region(
                 && facts.of(key).within(NUMERIC)
                 && !reads.contains(&inst)
             {
+                let previous = match planning.insts[inst].op {
+                    Op::TypedIndex(_, _, read) => Some(read),
+                    _ => None,
+                };
                 typed_reads.push((
                     inst,
                     TypedRead {
-                        element,
-                        bounded: bounded.contains_key(&inst),
+                        element: previous.and_then(|read| read.element).or(element),
+                        bounded: previous.is_some_and(|read| read.bounded)
+                            || bounded.contains_key(&inst),
                     },
                 ));
             }
@@ -405,6 +412,47 @@ mod tests {
             .graph;
         super::super::super::comparisons::expose(&mut graph);
         graph
+    }
+
+    #[test]
+    fn versioning_keeps_feedback_specialized_typed_reads() {
+        use crate::heap::TypedKind;
+        use crate::jit::planner::{ReadKind, ReadType, Site};
+
+        let graph = graph(
+            "function f(xs,n){let sum=0;for(let i=0;i<n;++i)sum+=Math.floor(xs[i]);return sum;}",
+        );
+        let data = graph
+            .insts
+            .values()
+            .find(|data| matches!(data.op, Op::GetIndex(..)))
+            .unwrap();
+        let site = Site {
+            source: 7,
+            start: data.span.start,
+            end: data.span.end,
+        };
+        let mut repository = super::super::super::specialize::Repository::default();
+        repository.read_feedback.insert(
+            (site, ReadKind::Receiver),
+            ReadType::Typed(TypedKind::Uint16),
+        );
+        let canonical = super::super::super::Canonical::from_graph(graph);
+        let analysis =
+            super::super::super::optimize_canonical(canonical, true, Some((&repository, 7)))
+                .unwrap();
+        let graph = &analysis.graph;
+        let reads: Vec<_> = Cfg::new(graph)
+            .rpo
+            .iter()
+            .filter(|block| !graph.cold.contains(block))
+            .flat_map(|&block| graph.blocks[block].insts.iter())
+            .filter_map(|&inst| match graph.insts[inst].op {
+                Op::TypedIndex(_, _, read) => Some(read.element),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reads, [Some(TypedKind::Uint16)]);
     }
 
     #[test]

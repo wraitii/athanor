@@ -97,3 +97,101 @@ and tile data, plus generator timing.
 
 Set `JS_JIT_GET_REFINEMENT=0` to disable get feedback and refinement while keeping
 other optimizations enabled (`EngineOptions::get_refinement`).
+
+Set `JS_JIT_OSR=1` to enable experimental loop replacement
+(`EngineOptions::osr`). Hot eligible loops request a specialized native fragment
+and can enter it on a later loop entry during the same function invocation.
+The initial implementation supports one loop per emission, numeric outputs,
+and transfer at the preheader; it does not transfer an iteration already in
+progress. `JS_JIT_RECOMPILE_LOG=1` reports requests, queue priorities, publication,
+and the first transfer. `JS_JIT_BACKGROUND=0` compiles fragments synchronously
+for deterministic comparisons.
+
+Compilation uses a shared priority queue with two workers by default. Active
+loop jobs have highest priority; ordinary function jobs follow; whole-function
+recompilation after an OSR request follows those. After synchronous initial
+compilation, known callees and calls exposed by inlining are queued at the
+lowest priority. Background completion does not recursively prefetch more callees.
+Dispatch cancels a queued job when it needs to compile the same function
+synchronously; already-running initial results are discarded if synchronous
+compilation finishes first. Dependency tickets and inherited priorities support
+future callee preparation.
+
+Feedback requests are submitted at function return to the background compiler pool
+once the function has completed eight calls. Earlier feedback remains pending until
+that threshold is reached; calls before feedback also count. An OSR request makes
+the enclosing function eligible immediately and queues it after the loop fragment.
+Feedback recompilation and OSR multiply both the shared inlining instruction
+budget and the per-callee size limit by two; initial and prefetched compilation
+retain the base limits. Set
+`JS_JIT_RECOMPILE_INLINE_MULTIPLIER=1` to use the base budget for every compilation
+(`EngineOptions::recompile_inline_multiplier`). Zero disables inlining during
+recompilation.
+Set `JS_JIT_WORKERS=3` to use three compiler threads, or `JS_JIT_WORKERS=1`
+to use one (`EngineOptions::compiler_threads`, which must be positive).
+Calls continue using the current version until the execution thread installs a
+completed replacement during dispatch. When JIT dumping is enabled, each worker
+writes a separate dump file. Set `JS_JIT_BACKGROUND=0` to recompile
+synchronously at the next dispatch instead (`EngineOptions::background_compile`).
+
+Set `JS_JIT_RECOMPILE_LOG=1` (`EngineOptions::recompile_log`) to trace recompilation
+to stderr in either mode. Events include feedback sites and types, requests,
+outstanding job counts and queue wait time, plan changes, compilation outcomes and durations,
+installation, and worker shutdown. Prefetch events report installation, first
+observed use (`sync_compilation=avoided`), synchronous takeover of queued or
+running work, and discarded late results. Engine shutdown prints a prefetch
+summary; use is detected through completed-call counters, including calls that
+bypass runtime dispatch. Each line includes elapsed time since engine
+creation; function events include the logical code ID and function name. Requests
+made while a job is outstanding are marked `compiling=true`. An `unchanged` plan
+keeps the current entry without emitting replacement code. Logging is disabled
+by default and can affect timing when enabled.
+
+## cpp-quickjs
+
+The QuickJS runner mirrors the SpiderMonkey C++ runner while embedding QuickJS
+instead. QuickJS is vendored under `cpp-quickjs/quickjs` so the folder is
+self-contained; see its MIT license there. It implements the same host
+functions, CLI arguments, deterministic `Math.random()`, and JSON summary, so
+the generated map hashes match the SpiderMonkey runner.
+
+```sh
+make -C cranelift-exp/cpp-quickjs
+make -C cranelift-exp/cpp-quickjs run
+```
+
+`make run-test` executes `maps/random/tests/test_Generator.js`. The script path
+and data directory can be overridden with `SCRIPT` and `DATA`.
+
+Because QuickJS has no JIT, the map workload is much slower than under
+SpiderMonkey. For reference, `belgian_uplands.js` takes about 7.6 seconds
+under QuickJS, versus about 0.34 seconds under SpiderMonkey on the same
+machine. It is useful as a baseline for the experimental engine.
+
+### Profiling
+
+QuickJS emits no perf map or jitdump, and its internal bytecode line table is
+not exposed to native profilers, so `samply` or `perf` see only the interpreter
+and C builtins (`JS_CallInternal`, `JS_GetPropertyInternal`, ...), not JS
+function names.
+
+QuickJS has an upstream `OPCODE_ASM_LABEL` debug option that gives each
+bytecode dispatch case a global symbol. Build with it to attribute samples to
+opcodes:
+
+```sh
+cd cranelift-exp/cpp-quickjs
+make clean
+make QUICKJS_EXTRA_CFLAGS='-DOPCODE_ASM_LABEL -fno-omit-frame-pointer'
+samply record ./build/mapgen-runner --data ../../binaries/data/mods/public \
+	../../binaries/data/mods/public/maps/random/belgian_uplands.js
+```
+
+Samples then show entries such as `label_OP_get_loc_check` and
+`label_OP_get_array_el` alongside native helpers. This still does not identify
+the JS function or line. For that, sample from `JS_SetInterruptHandler` and use
+`JS_GetScriptOrModuleName`, or read an Error's `.stack`; both are in-process
+instrumentation rather than profiler output.
+
+Upstream `qjs`'s `-T/--trace` option traces memory allocation, and `-d/--dump`
+prints memory usage statistics. Neither is a CPU profiler.

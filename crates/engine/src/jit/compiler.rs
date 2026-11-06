@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
+use std::time::Instant;
 
 use cranelift_codegen::Context;
 use cranelift_codegen::ir::{AbiParam, Signature, types};
@@ -20,7 +22,8 @@ use crate::error::{Error, compile_at, unsupported_at};
 
 use super::clif::{Annotations, FunctionBody};
 use super::entries::Entry;
-use super::{analysis::CaptureAnalysis, emit, helpers, jitdump, temporaries};
+use super::function_data::FunctionData;
+use super::{analysis::CaptureAnalysis, emit, jitdump, temporaries};
 
 pub(crate) struct CompiledFunction {
     pub(crate) name: String,
@@ -31,55 +34,110 @@ pub(crate) struct CompiledFunction {
 
 #[derive(Clone)]
 struct Emission {
-    current: FuncId,
+    callees: Vec<FuncId>,
     conditional: super::semantic::specialize::ConditionalPlan,
     inlines: Vec<super::semantic::specialize::Inline>,
     reads: Vec<super::semantic::reads::Read>,
+    osr: Option<Arc<super::semantic::osr::Plan>>,
     source_name: (usize, usize),
     params: oxc_span::Span,
     closures: HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
 }
+
+pub(crate) struct RecompileJob {
+    pub(crate) code: FuncId,
+    initial: bool,
+    previous: Entry,
+    emission: Emission,
+    canonical: Arc<super::semantic::specialize::Repository>,
+    sources: Arc<HashMap<usize, Arc<(String, String)>>>,
+    pub(super) label: String,
+    pub(super) queued_at: Option<Instant>,
+    region: Option<OsrRequest>,
+}
+
+struct OsrRequest {
+    site: usize,
+    plan: Arc<super::semantic::osr::Plan>,
+    candidate: usize,
+}
+
+impl RecompileJob {
+    pub(crate) fn key(&self) -> super::recompile::Key {
+        self.region.as_ref().map_or(
+            super::recompile::Key::Function(self.code.as_u32() as u64),
+            |region| super::recompile::Key::Loop(region.site),
+        )
+    }
+}
+
+pub(crate) struct Replacement {
+    code: FuncId,
+    initial: bool,
+    entry: Entry,
+    emission: Emission,
+    region: bool,
+}
+
+pub(crate) struct Unpublished {
+    replacement: Replacement,
+    names: Vec<Box<str>>,
+    cells: Vec<Box<u64>>,
+    data: Vec<Box<FunctionData>>,
+}
+
+impl Unpublished {
+    pub(crate) fn initial(&self) -> bool {
+        self.replacement.initial
+    }
+}
+
+// These caches have never executed: global cache owners and runtime pointers are empty.
+// The worker relinquishes every cache before the execution thread publishes the entry.
+unsafe impl Send for Unpublished {}
 
 #[derive(Default)]
 struct CompileStats {
     functions: usize,
     blocks: usize,
     insts: usize,
+    bytes: usize,
 }
 
 impl Drop for Compiler {
     fn drop(&mut self) {
         if let Some(stats) = &self.stats {
             eprintln!(
-                "js jit stats: {} functions, {} blocks, {} instructions",
-                stats.functions, stats.blocks, stats.insts
+                "js jit stats: {} functions, {} blocks, {} instructions, {} code bytes",
+                stats.functions, stats.blocks, stats.insts, stats.bytes
             );
         }
     }
 }
 
 pub(crate) struct Compiler {
+    log: super::recompile::Log,
     emissions: HashMap<FuncId, Emission>,
-    sources: HashMap<usize, (String, String)>,
-    observation_caches: Vec<Box<super::planner::ObservationCache>>,
+    lazy: HashMap<FuncId, (Emission, Arc<super::semantic::specialize::Repository>)>,
+    sources: Arc<HashMap<usize, Arc<(String, String)>>>,
     names: Vec<Box<str>>,
     cells: Vec<Box<u64>>,
-    property_caches: Vec<Box<helpers::PropertyCache>>,
-    global_caches: Vec<Box<helpers::GlobalCache>>,
+    data: Vec<Box<FunctionData>>,
     source_name: (usize, usize),
-    canonical: super::semantic::specialize::Repository,
+    canonical: Arc<super::semantic::specialize::Repository>,
     module: JITModule,
     signature: Signature,
     fixed: HashMap<FuncId, u16>,
     adapters: HashMap<u16, usize>,
     stats: Option<CompileStats>,
-    helpers: Vec<FuncId>,
     stubs: emit::Stubs,
     functions: HashMap<String, FuncId>,
     function_names: HashMap<FuncId, String>,
     dump: Option<jitdump::Writer>,
     dump_ir: bool,
     ssa_opt: bool,
+    recompile_inline_multiplier: usize,
+    osr: bool,
     get_refinement: bool,
     ssa_dump: bool,
     compile_dump: bool,
@@ -93,11 +151,58 @@ pub(crate) struct Compiler {
 }
 
 impl Compiler {
-    pub(crate) fn new(options: EngineOptions, direct_entries: *const usize) -> Result<Self, Error> {
-        let flags = [("opt_level", options.opt_level.as_flag())];
-        let mut builder = JITBuilder::with_flags(&flags, default_libcall_names())
+    #[cfg(test)]
+    pub(crate) fn osr_transfers(&self) -> u64 {
+        self.data
+            .iter()
+            .flat_map(|data| data.pinned::<super::osr::Site>())
+            .map(|site| site.transfers.get())
+            .sum()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn osr_read_site(
+        &self,
+        owner: u64,
+    ) -> Option<(
+        *const super::osr::Site,
+        super::planner::Site,
+        super::planner::ReadKind,
+    )> {
+        self.data
+            .iter()
+            .flat_map(|data| data.pinned::<super::osr::Site>())
+            .find_map(|site| {
+                if site.owner != owner {
+                    return None;
+                }
+                site.plan.loops[site.candidate]
+                    .opportunities
+                    .iter()
+                    .find_map(|opportunity| {
+                        let super::semantic::osr::Observation::Read(kind) = opportunity.kind else {
+                            return None;
+                        };
+                        Some((site as *const _, opportunity.site, kind))
+                    })
+            })
+    }
+
+    pub(crate) fn new(
+        options: EngineOptions,
+        direct_entries: *const usize,
+        compilation_state: usize,
+        log: super::recompile::Log,
+    ) -> Result<Self, Error> {
+        let flags = [
+            ("opt_level", options.opt_level.as_flag()),
+            (
+                "enable_verifier",
+                if options.osr { "true" } else { "false" },
+            ),
+        ];
+        let builder = JITBuilder::with_flags(&flags, default_libcall_names())
             .map_err(|error| Error::Compile(error.to_string()))?;
-        builder.symbols(helpers::symbols());
         let mut module = JITModule::new(builder);
         let target = module.target_config();
         let pointer = target.pointer_type();
@@ -110,47 +215,39 @@ impl Compiler {
         signature.params.push(AbiParam::new(types::I64));
         signature.returns.push(AbiParam::new(types::I64));
 
-        let mut helper_ids = Vec::with_capacity(helpers::HELPERS.len());
-        for spec in helpers::HELPERS {
-            let signature = helpers::signature(spec.shape, call_conv, pointer);
-            let id = module
-                .declare_function(spec.name, Linkage::Import, &signature)
-                .map_err(|error| Error::Compile(error.to_string()))?;
-            helper_ids.push(id);
-        }
-
         let mut dump = options.jitdump.then(jitdump::Writer::new).flatten();
         let stubs = emit::Stubs::new(
             &mut module,
-            &helper_ids,
             &signature,
             direct_entries,
+            compilation_state,
             dump.as_mut(),
         )?;
         let context = module.make_context();
         let dump_ir = dump.is_some() && options.jitdump_ir;
         Ok(Self {
+            log,
+            osr: options.osr,
             emissions: HashMap::new(),
-            sources: HashMap::new(),
-            observation_caches: Vec::new(),
+            lazy: HashMap::new(),
+            sources: Arc::default(),
             names: Vec::new(),
             cells: Vec::new(),
-            property_caches: Vec::new(),
-            global_caches: Vec::new(),
+            data: Vec::new(),
             source_name: (0, 0),
-            canonical: super::semantic::specialize::Repository::default(),
+            canonical: Arc::default(),
             module,
             signature,
             fixed: HashMap::new(),
             adapters: HashMap::new(),
             stats: std::env::var_os("JS_JIT_STATS").map(|_| CompileStats::default()),
-            helpers: helper_ids,
             stubs,
             functions: HashMap::new(),
             function_names: HashMap::new(),
             dump,
             dump_ir,
             ssa_opt: options.ssa_opt,
+            recompile_inline_multiplier: options.recompile_inline_multiplier,
             get_refinement: options.get_refinement,
             ssa_dump: options.ssa_dump,
             compile_dump: options.compile_dump,
@@ -170,13 +267,15 @@ impl Compiler {
 
     fn entry(&mut self, id: FuncId) -> Result<Entry, Error> {
         let code = self.module.get_finalized_function(id) as usize;
-        let adapter = match self.fixed.get(&id) {
-            Some(&arity) => Some(self.adapter(arity)?),
+        let arity = self.fixed.get(&id).copied();
+        let adapter = match arity {
+            Some(arity) => Some(self.adapter(arity)?),
             None => None,
         };
         Ok(Entry {
             code,
             adapter,
+            arity: arity.unwrap_or(0),
             lexical_this: self.canonical.lexical_this(id),
         })
     }
@@ -192,7 +291,11 @@ impl Compiler {
         self.module
             .finalize_definitions()
             .map_err(|error| Error::Compile(error.to_string()))?;
-        let adapter = stub.finalize(&self.module, self.dump.as_mut(), &format!("adapter/{arity}"));
+        let adapter = stub.finalize(
+            &self.module,
+            self.dump.as_mut(),
+            &format!("adapter/{arity}"),
+        );
         self.adapters.insert(arity, adapter);
         Ok(adapter)
     }
@@ -235,11 +338,11 @@ impl Compiler {
         let filename: Box<str> = filename.into();
         self.source_name = (filename.as_ptr() as usize, filename.len());
         self.names.push(filename);
-        self.sources.insert(
+        Arc::make_mut(&mut self.sources).insert(
             self.source_name.0,
-            (source.to_owned(), source_path.to_owned()),
+            Arc::new((source.to_owned(), source_path.to_owned())),
         );
-        self.canonical
+        Arc::make_mut(&mut self.canonical)
             .sources
             .insert(self.source_name.0, self.source_name.1);
         let result = self.compile_program_inner(program, scoping, nodes, source, source_path);
@@ -457,8 +560,12 @@ impl Compiler {
                 self.ssa_opt,
             )
             .map_err(Error::Unsupported)?;
-            self.canonical
-                .insert(self.source_name.0, name, ids[name], canonical);
+            Arc::make_mut(&mut self.canonical).insert(
+                self.source_name.0,
+                name,
+                ids[name],
+                canonical,
+            );
         }
 
         let arrows: HashSet<u32> = nodes
@@ -487,7 +594,7 @@ impl Compiler {
                 self.ssa_opt,
             )
             .map_err(Error::Unsupported)?;
-            self.canonical.insert_closure(
+            Arc::make_mut(&mut self.canonical).insert_closure(
                 self.source_name.0,
                 *id,
                 canonical,
@@ -557,6 +664,25 @@ impl Compiler {
 
         for (name, function) in &ordered {
             let line = line_at(&lines, function.span.start);
+            if !function.generator && !self.compile_dump {
+                self.lazy.insert(
+                    ids[name],
+                    (
+                        Emission {
+                            callees: Vec::new(),
+                            conditional: Default::default(),
+                            inlines: Vec::new(),
+                            reads: Vec::new(),
+                            osr: None,
+                            source_name: self.source_name,
+                            params: function.params.span,
+                            closures: closures.clone(),
+                        },
+                        self.canonical.clone(),
+                    ),
+                );
+                continue;
+            }
             let (code, resume) = self.compile_callable(
                 &function.params,
                 &function.body.as_ref().unwrap().statements,
@@ -582,6 +708,25 @@ impl Compiler {
         }
         for (id, span, params, statements, expression, generator, label, line) in nested {
             let captures = &closures[&span.start].1;
+            if !generator && !self.compile_dump {
+                self.lazy.insert(
+                    id,
+                    (
+                        Emission {
+                            callees: Vec::new(),
+                            conditional: Default::default(),
+                            inlines: Vec::new(),
+                            reads: Vec::new(),
+                            osr: None,
+                            source_name: self.source_name,
+                            params: params.span,
+                            closures: closures.clone(),
+                        },
+                        self.canonical.clone(),
+                    ),
+                );
+                continue;
+            }
             let (code, resume) = self.compile_callable(
                 params,
                 statements,
@@ -636,6 +781,7 @@ impl Compiler {
             )
             .map_err(Error::Unsupported)?;
             {
+                let mut data = FunctionData::new();
                 let mut builder = cranelift_frontend::FunctionBuilder::new(
                     &mut self.context.func,
                     &mut self.builder_context,
@@ -643,19 +789,19 @@ impl Compiler {
                 emit::build_global(
                     &mut builder,
                     &mut self.module,
-                    &self.helpers,
                     self.stubs,
                     &mut annotations,
                     &mut self.names,
                     &mut self.cells,
-                    &mut self.property_caches,
-                    &mut self.global_caches,
+                    &mut data,
                     self.source_name,
                     &closures,
                     &graph.graph,
                 )?;
                 builder.seal_all_blocks();
                 builder.finalize(self.module.target_config());
+                data.seal();
+                self.data.push(data);
             }
             pending.push((
                 id,
@@ -722,7 +868,6 @@ impl Compiler {
                     &mut self.context,
                     &mut code.annotations,
                     &mut self.module,
-                    self.helpers[helpers::Helper::IndexRoot as usize],
                 );
                 let removed =
                     temporaries::remove_empty_clears(&mut self.context.func, &code.annotations);
@@ -763,7 +908,13 @@ impl Compiler {
             }
             self.module
                 .define_function(id, &mut self.context)
-                .map_err(|error| Error::Compile(error.to_string()))?;
+                .map_err(|error| Error::Compile(format!("{error:?}")))?;
+            if let Some(stats) = &mut self.stats {
+                stats.bytes += self
+                    .context
+                    .compiled_code()
+                    .map_or(0, |compiled| compiled.code_buffer().len());
+            }
             if self.compile_dump && self.compile_asm {
                 let compiled = self
                     .context
@@ -849,12 +1000,161 @@ impl Compiler {
         Ok(())
     }
 
-    pub(crate) fn recompile(
-        &mut self,
-        code: u64,
-        planner: &super::planner::Planner,
-    ) -> Result<Option<Entry>, Error> {
-        let result = self.recompile_inner(code, planner);
+    pub(crate) fn update_feedback(&mut self, planner: &super::planner::Planner) {
+        if planner.targets().all(|(site, target)| {
+            u32::try_from(target).map_or(true, |target| {
+                self.canonical.feedback.get(&site) == Some(&FuncId::from_u32(target))
+            })
+        }) && (!self.get_refinement
+            || planner
+                .reads()
+                .all(|(site, observed)| self.canonical.read_feedback.get(&site) == Some(&observed)))
+        {
+            return;
+        }
+        let canonical = Arc::make_mut(&mut self.canonical);
+        for (site, target) in planner.targets() {
+            if let Ok(target) = u32::try_from(target) {
+                canonical.feedback.insert(site, FuncId::from_u32(target));
+            }
+        }
+        if self.get_refinement {
+            for (site, element) in planner.reads() {
+                canonical.read_feedback.insert(site, element);
+            }
+        }
+    }
+
+    pub(crate) fn call_profile(&self, planner: &super::Planner) -> String {
+        let mut sites = planner.calls();
+        sites.sort_by_key(|(_, profile)| std::cmp::Reverse(profile.calls()));
+        let total: u64 = sites.iter().map(|(_, profile)| profile.calls()).sum();
+        let guarded: u64 = sites.iter().map(|(_, profile)| profile.guarded).sum();
+        let native: u64 = sites.iter().map(|(_, profile)| profile.native).sum();
+        let mut report = format!(
+            "js call profile: {total} stub calls at {} sites \
+             ({guarded} from guarded sites, {native} to natives)\n",
+            sites.len()
+        );
+        for (label, range) in [
+            ("1", 1..2),
+            ("2", 2..3),
+            ("3-4", 3..5),
+            ("5+", 5..usize::MAX),
+        ] {
+            let (count, calls) = sites
+                .iter()
+                .filter(|(_, profile)| range.contains(&profile.target_count()))
+                .fold((0, 0), |(count, calls), (_, profile)| {
+                    (count + 1, calls + profile.calls())
+                });
+            report += &format!("  {label} targets: {count} sites, {calls} calls\n");
+        }
+        for (site, profile) in sites.iter().take(20) {
+            let location = self.sources.get(&site.source).map_or_else(
+                || format!("?:{}", site.start),
+                |source| {
+                    let before = &source.0[..site.start as usize];
+                    let line = before.matches('\n').count() + 1;
+                    let column = before.len() - before.rfind('\n').map_or(0, |index| index + 1);
+                    format!("{}:{line}:{}", source.1, column + 1)
+                },
+            );
+            let mut targets = profile.targets.clone();
+            targets.sort_by_key(|&(_, count)| std::cmp::Reverse(count));
+            let mut targets: Vec<_> = targets
+                .iter()
+                .take(4)
+                .map(|&(code, count)| format!("{}={count}", self.function_name(code)))
+                .collect();
+            if profile.native != 0 {
+                targets.push(format!("<native>={}", profile.native));
+            }
+            report += &format!(
+                "  {location} generic={} guarded={} [{}]\n",
+                profile.generic,
+                profile.guarded,
+                targets.join(", ")
+            );
+        }
+        report
+    }
+
+    pub(crate) fn function_name(&self, code: u64) -> &str {
+        u32::try_from(code)
+            .ok()
+            .and_then(|code| self.function_names.get(&FuncId::from_u32(code)))
+            .map_or("<unknown>", String::as_str)
+    }
+
+    pub(crate) fn recompilation(&self, code: u64, previous: Entry) -> Option<RecompileJob> {
+        let code = FuncId::from_u32(u32::try_from(code).ok()?);
+        Some(RecompileJob {
+            region: None,
+            code,
+            initial: false,
+            previous,
+            emission: self.emissions.get(&code)?.clone(),
+            canonical: self.canonical.clone(),
+            sources: self.sources.clone(),
+            label: self.function_names.get(&code)?.clone(),
+            queued_at: None,
+        })
+    }
+
+    pub(crate) fn osr_compilation(&self, site: &super::osr::Site) -> Option<RecompileJob> {
+        let mut job = self.recompilation(site.owner, Entry::generic(0))?;
+        let has_feedback =
+            site.plan.loops[site.candidate]
+                .opportunities
+                .iter()
+                .any(|opportunity| {
+                    let mut location = opportunity.site;
+                    if location.source == 0 {
+                        location.source = job.emission.source_name.0;
+                    }
+                    match opportunity.kind {
+                        super::semantic::osr::Observation::Call => {
+                            self.canonical.feedback.contains_key(&location)
+                        }
+                        super::semantic::osr::Observation::Read(kind) => {
+                            self.canonical.read_feedback.contains_key(&(location, kind))
+                        }
+                    }
+                });
+        if !has_feedback {
+            return None;
+        }
+        job.label += &format!(".loop{}", site.plan.loops[site.candidate].header);
+        job.region = Some(OsrRequest {
+            site: site as *const _ as usize,
+            plan: site.plan.clone(),
+            candidate: site.candidate,
+        });
+        Some(job)
+    }
+
+    pub(crate) fn recompile(&mut self, job: RecompileJob) -> Result<Option<Replacement>, Error> {
+        let trace = self
+            .log
+            .enabled()
+            .then(|| (job.code.as_u32(), job.label.clone(), Instant::now()));
+        if let Some((code, label, _)) = &trace {
+            self.log
+                .event(format_args!("compiling code={code} function={label}"));
+        }
+        let result = self.recompile_inner(job, false);
+        if let Some((code, label, started)) = trace {
+            let outcome = match &result {
+                Ok(Some(_)) => "compiled",
+                Ok(None) => "unchanged",
+                Err(_) => "failed",
+            };
+            self.log.event(format_args!(
+                "{outcome} code={code} function={label} compile_ms={:.3}",
+                started.elapsed().as_secs_f64() * 1000.0
+            ));
+        }
         if result.is_err() {
             self.context.clear();
             self.builder_context = FunctionBuilderContext::new();
@@ -864,51 +1164,87 @@ impl Compiler {
 
     fn recompile_inner(
         &mut self,
-        code: u64,
-        planner: &super::planner::Planner,
-    ) -> Result<Option<Entry>, Error> {
-        let Ok(code) = u32::try_from(code) else {
-            return Ok(None);
+        job: RecompileJob,
+        declared: bool,
+    ) -> Result<Option<Replacement>, Error> {
+        let RecompileJob {
+            code,
+            initial,
+            previous,
+            mut emission,
+            canonical,
+            sources,
+            label,
+            queued_at: _,
+            region,
+        } = job;
+        self.canonical = canonical;
+        self.sources = sources;
+        let (source, canonical) = if let Some(region) = &region {
+            (
+                emission.source_name.0,
+                super::semantic::Canonical::from_graph(
+                    region
+                        .plan
+                        .extract(region.candidate)
+                        .map_err(Error::Unsupported)?,
+                ),
+            )
+        } else {
+            let Some(canonical) = self.canonical.emission(code) else {
+                return Ok(None);
+            };
+            canonical
         };
-        let code = FuncId::from_u32(code);
-        let Some(emission) = self.emissions.get(&code).cloned() else {
-            return Ok(None);
+        let inline_multiplier = if initial {
+            1
+        } else {
+            self.recompile_inline_multiplier
         };
-        for (site, target) in planner.targets() {
-            if let Ok(target) = u32::try_from(target) {
-                self.canonical
-                    .feedback
-                    .insert(site, FuncId::from_u32(target));
-            }
-        }
-        if self.get_refinement {
-            for (site, element) in planner.reads() {
-                self.canonical.read_feedback.insert(site, element);
-            }
-        }
-        let Some((source, canonical)) = self.canonical.emission(code) else {
-            return Ok(None);
-        };
-        let planned = super::semantic::plan_canonical(
+        let planned = super::semantic::plan_canonical_with_budget(
             canonical,
             self.ssa_opt,
             Some((&self.canonical, source)),
+            inline_multiplier,
         )
         .map_err(Error::Unsupported)?;
-        if planned.inlines == emission.inlines
+        emission.callees = self.canonical.graph_callees(&planned.graph, source);
+        if region.is_some()
+            && planned.inlines.is_empty()
+            && planned.reads.is_empty()
+            && planned.conditional == Default::default()
+        {
+            return Ok(None);
+        }
+        if self.log.enabled() {
+            self.log.event(format_args!(
+                "plan code={} function={label} inlines={}->{} reads={}->{} conditional_changed={} inline_multiplier={inline_multiplier}",
+                code.as_u32(),
+                emission.inlines.len(),
+                planned.inlines.len(),
+                emission.reads.len(),
+                planned.reads.len(),
+                emission.conditional != planned.conditional,
+            ));
+        }
+        if !initial
+            && region.is_none()
+            && planned.inlines == emission.inlines
             && planned.reads == emission.reads
             && planned.conditional == emission.conditional
         {
             return Ok(None);
         }
-        let previous = self.module.get_finalized_function(emission.current) as usize;
-        let graph = super::semantic::optimize_planned(planned, Some(previous))
-            .map_err(Error::Unsupported)?;
+        let mut graph = super::semantic::optimize_planned(
+            planned,
+            (!initial && region.is_none()).then_some(previous.code),
+        )
+        .map_err(Error::Unsupported)?;
+        if self.osr && region.is_none() {
+            graph.prepare_osr(source).map_err(Error::Unsupported)?;
+        }
         if self.compile_dump && self.compile_semantic_ir {
-            println!(
-                "[recompile {}] semantic IR\n{}",
-                self.function_names[&code], graph
-            );
+            println!("[recompile {}] semantic IR\n{}", label, graph);
         }
         let mut annotations = Annotations {
             semantic_locations: self.dump_ir,
@@ -920,6 +1256,7 @@ impl Compiler {
             None => self.signature.clone(),
         };
         {
+            let mut data = FunctionData::new();
             let mut builder = cranelift_frontend::FunctionBuilder::new(
                 &mut self.context.func,
                 &mut self.builder_context,
@@ -927,26 +1264,26 @@ impl Compiler {
             emit::build_function(
                 &mut builder,
                 &mut self.module,
-                &self.helpers,
                 self.stubs,
                 &mut annotations,
                 &mut self.names,
                 &mut self.cells,
-                &mut self.property_caches,
-                &mut self.global_caches,
+                &mut data,
                 emission.source_name,
                 emission.params,
                 &emission.closures,
                 emit::FunctionKind::Ordinary,
                 &graph.graph,
-                Some(emit::Feedback {
+                self.ssa_opt.then_some(emit::Feedback {
+                    function_return: region.is_none(),
                     get_refinement: self.get_refinement,
                     owner: code.as_u32() as u64,
-                    caches: &mut self.observation_caches,
                 }),
             )?;
             builder.seal_all_blocks();
             builder.finalize(self.module.target_config());
+            data.seal();
+            self.data.push(data);
         }
         let body = FunctionBody {
             function: std::mem::replace(
@@ -956,17 +1293,139 @@ impl Compiler {
             annotations,
             listing: self.dump_ir.then(|| graph.listing_lines()),
         };
-        let label = self.function_names[&code].clone();
-        let id = self.declare_js(&format!("{label}.feedback"), 1)?;
-        let (source, filename) = self.sources[&source].clone();
+        let id = if declared {
+            code
+        } else {
+            let suffix = if initial { "prefetch" } else { "feedback" };
+            self.declare_js(&format!("{label}.{suffix}"), 1)?
+        };
+        let (source, filename) = self.sources[&source].as_ref().clone();
         let lines = line_starts(&source);
         self.finish_functions(vec![(id, body)], &source, &filename, &lines)?;
-        let emission = self.emissions.get_mut(&code).unwrap();
-        emission.current = id;
         emission.conditional = graph.conditional;
         emission.inlines = graph.inlines;
         emission.reads = graph.reads;
-        Ok(Some(self.entry(id)?))
+        emission.osr = graph.osr;
+        if self.log.enabled()
+            && let Some(plan) = &emission.osr
+        {
+            self.log.event(format_args!("{}", plan.report(&label)));
+        }
+        let mut entry = self.entry(id)?;
+        if region.is_none() {
+            entry.lexical_this = if initial {
+                self.canonical.lexical_this(code)
+            } else {
+                previous.lexical_this
+            };
+        }
+        Ok(Some(Replacement {
+            code,
+            initial,
+            entry,
+            emission,
+            region: region.is_some(),
+        }))
+    }
+
+    pub(crate) fn has_lazy(&self, code: u64) -> bool {
+        u32::try_from(code)
+            .ok()
+            .is_some_and(|id| self.lazy.contains_key(&FuncId::from_u32(id)))
+    }
+
+    pub(crate) fn lazy_compilation(&self, code: u64) -> Option<RecompileJob> {
+        let id = FuncId::from_u32(u32::try_from(code).ok()?);
+        let (emission, canonical) = self.lazy.get(&id)?.clone();
+        Some(RecompileJob {
+            region: None,
+            code: id,
+            initial: true,
+            previous: Entry::generic(0),
+            emission,
+            canonical,
+            sources: self.sources.clone(),
+            label: self.function_names[&id].clone(),
+            queued_at: None,
+        })
+    }
+
+    pub(crate) fn lazy_callees(&self, code: u64) -> Vec<RecompileJob> {
+        let Ok(index) = u32::try_from(code) else {
+            return Vec::new();
+        };
+        let id = FuncId::from_u32(index);
+        let mut callees = self.canonical.callees(id);
+        if let Some(emission) = self.emissions.get(&id) {
+            for &callee in &emission.callees {
+                if !callees.contains(&callee) {
+                    callees.push(callee);
+                }
+            }
+        }
+        callees
+            .into_iter()
+            .filter(|&callee| callee != id)
+            .filter_map(|callee| self.lazy_compilation(u64::from(callee.as_u32())))
+            .collect()
+    }
+
+    pub(crate) fn compile_lazy(&mut self, code: u64) -> Result<Option<Entry>, Error> {
+        let Some(job) = self.lazy_compilation(code) else {
+            return Ok(None);
+        };
+        // Initial emission uses the repository as it existed when the source was loaded,
+        // before later sources and runtime feedback change its specialization decisions.
+        let current = self.canonical.clone();
+        let started = self.log.enabled().then(Instant::now);
+        let label = started.map(|_| job.label.clone());
+        let result = self.recompile_inner(job, true);
+        if let (Some(started), Some(label)) = (started, label) {
+            self.log.event(format_args!(
+                "lazy-compiled code={code} function={label} compile_ms={:.3}",
+                started.elapsed().as_secs_f64() * 1000.0
+            ));
+        }
+        self.canonical = current;
+        if result.is_err() {
+            self.context.clear();
+            self.builder_context = FunctionBuilderContext::new();
+        }
+        let Some(replacement) = result? else {
+            return Ok(None);
+        };
+        Ok(Some(self.install(replacement).1))
+    }
+
+    pub(crate) fn install(&mut self, replacement: Replacement) -> (u64, Entry) {
+        if replacement.initial {
+            self.lazy.remove(&replacement.code);
+        }
+        if !replacement.region {
+            self.emissions
+                .insert(replacement.code, replacement.emission);
+        }
+        (replacement.code.as_u32() as u64, replacement.entry)
+    }
+
+    pub(crate) fn take_unpublished(&mut self, replacement: Replacement) -> Unpublished {
+        Unpublished {
+            replacement,
+            names: std::mem::take(&mut self.names),
+            cells: std::mem::take(&mut self.cells),
+            data: std::mem::take(&mut self.data),
+        }
+    }
+
+    pub(crate) fn install_unpublished(&mut self, compiled: Unpublished) -> Option<(u64, Entry)> {
+        // Dispatch may have compiled this lazy body while the worker was running.
+        if compiled.replacement.initial && !self.lazy.contains_key(&compiled.replacement.code) {
+            return None;
+        }
+        self.names.extend(compiled.names);
+        self.cells.extend(compiled.cells);
+        self.data.extend(compiled.data);
+        Some(self.install(compiled.replacement))
     }
 
     fn compile_callable(
@@ -1052,7 +1511,7 @@ impl Compiler {
         kind: emit::FunctionKind,
         semantic_function: Option<oxc_span::Span>,
     ) -> Result<FunctionBody, Error> {
-        let graph = semantic_function
+        let mut graph = semantic_function
             .map(|span| {
                 let canonical = match self.canonical.canonical(self.source_name.0, span.start) {
                     Some(canonical) => Ok(canonical.clone()),
@@ -1079,6 +1538,13 @@ impl Compiler {
             })
             .transpose()
             .map_err(Error::Unsupported)?;
+        if self.osr
+            && let Some(graph) = &mut graph
+        {
+            graph
+                .prepare_osr(self.source_name.0)
+                .map_err(Error::Unsupported)?;
+        }
         let feedback = if self.ssa_opt && matches!(kind, emit::FunctionKind::Ordinary) {
             semantic_function.and_then(|span| self.canonical.code(self.source_name.0, span.start))
         } else {
@@ -1088,10 +1554,13 @@ impl Compiler {
             self.emissions.insert(
                 code,
                 Emission {
-                    current: code,
+                    callees: self
+                        .canonical
+                        .graph_callees(&graph.as_ref().unwrap().graph, self.source_name.0),
                     conditional: graph.as_ref().unwrap().conditional.clone(),
                     inlines: graph.as_ref().unwrap().inlines.clone(),
                     reads: graph.as_ref().unwrap().reads.clone(),
+                    osr: graph.as_ref().unwrap().osr.clone(),
                     source_name: self.source_name,
                     params: params.span,
                     closures: closures.clone(),
@@ -1108,6 +1577,7 @@ impl Compiler {
             None => self.signature.clone(),
         };
         {
+            let mut data = FunctionData::new();
             let mut builder = cranelift_frontend::FunctionBuilder::new(
                 &mut self.context.func,
                 &mut self.builder_context,
@@ -1116,35 +1586,31 @@ impl Compiler {
                 emit::build_function(
                     &mut builder,
                     &mut self.module,
-                    &self.helpers,
                     self.stubs,
                     &mut annotations,
                     &mut self.names,
                     &mut self.cells,
-                    &mut self.property_caches,
-                    &mut self.global_caches,
+                    &mut data,
                     self.source_name,
                     params.span,
                     closures,
                     kind,
                     &graph.graph,
                     feedback.map(|owner| emit::Feedback {
+                        function_return: true,
                         get_refinement: self.get_refinement,
                         owner: owner.as_u32() as u64,
-                        caches: &mut self.observation_caches,
                     }),
                 )?;
             } else if let emit::FunctionKind::Factory(resume) = kind {
                 emit::build_factory(
                     &mut builder,
                     &mut self.module,
-                    &self.helpers,
                     self.stubs,
                     &mut annotations,
                     &mut self.names,
                     &mut self.cells,
-                    &mut self.property_caches,
-                    &mut self.global_caches,
+                    &mut data,
                     self.source_name,
                     params.span,
                     closures,
@@ -1153,6 +1619,8 @@ impl Compiler {
             }
             builder.seal_all_blocks();
             builder.finalize(self.module.target_config());
+            data.seal();
+            self.data.push(data);
         }
         Ok(FunctionBody {
             function: std::mem::replace(
@@ -1269,7 +1737,7 @@ fn ir_lines(
     source: &str,
     filename: &str,
     starts: &[u32],
-    sources: &HashMap<usize, (String, String)>,
+    sources: &HashMap<usize, Arc<(String, String)>>,
 ) -> Vec<(u32, String)> {
     let mut result = Vec::new();
     let mut last_location = None;
@@ -1277,8 +1745,11 @@ fn ir_lines(
     for (id, location, text) in semantic {
         if let Some(location) = location {
             let origin = match location.source {
-                Some(key) => sources.get(&key).map(|(source, filename)| {
-                    let starts = source_lines.entry(key).or_insert_with(|| line_starts(source));
+                Some(key) => sources.get(&key).map(|source| {
+                    let (source, filename) = source.as_ref();
+                    let starts = source_lines
+                        .entry(key)
+                        .or_insert_with(|| line_starts(source));
                     (source.as_str(), filename.as_str(), starts.as_slice())
                 }),
                 None => Some((source, filename, starts)),
@@ -1293,8 +1764,13 @@ fn ir_lines(
                     }
                     last_location = Some(current);
                     let start = starts[line as usize - 1] as usize;
-                    let end = starts.get(line as usize).map_or(source.len(), |&end| end as usize);
-                    result.push((0, format!("  ;;; JS {line:>5} | {}", source[start..end].trim())));
+                    let end = starts
+                        .get(line as usize)
+                        .map_or(source.len(), |&end| end as usize);
+                    result.push((
+                        0,
+                        format!("  ;;; JS {line:>5} | {}", source[start..end].trim()),
+                    ));
                 }
             }
         }
@@ -1367,19 +1843,46 @@ fn validate_params(
 mod listing_tests {
     use super::{ir_lines, line_starts};
     use crate::jit::semantic::SourceLocation;
-    use std::collections::HashMap;
     use oxc_span::Span;
+    use std::collections::HashMap;
 
     #[test]
     fn semantic_listing_interleaves_source_and_keeps_ids() {
         let source = "let x = 1;\nreturn x;\n";
         let semantic = vec![
             (0, None, "block0:".into()),
-            (1, Some(SourceLocation { source: None, span: Span::new(8, 9) }), "constant".into()),
-            (2, Some(SourceLocation { source: None, span: Span::new(8, 9) }), "store".into()),
-            (3, Some(SourceLocation { source: None, span: Span::new(11, 20) }), "return".into()),
+            (
+                1,
+                Some(SourceLocation {
+                    source: None,
+                    span: Span::new(8, 9),
+                }),
+                "constant".into(),
+            ),
+            (
+                2,
+                Some(SourceLocation {
+                    source: None,
+                    span: Span::new(8, 9),
+                }),
+                "store".into(),
+            ),
+            (
+                3,
+                Some(SourceLocation {
+                    source: None,
+                    span: Span::new(11, 20),
+                }),
+                "return".into(),
+            ),
         ];
-        let lines = ir_lines(&semantic, source, "caller.js", &line_starts(source), &HashMap::new());
+        let lines = ir_lines(
+            &semantic,
+            source,
+            "caller.js",
+            &line_starts(source),
+            &HashMap::new(),
+        );
         assert_eq!(
             lines
                 .iter()

@@ -7,17 +7,20 @@ use cranelift_module::Module;
 use oxc_span::Span;
 use oxc_syntax::operator::BinaryOperator;
 
-use crate::heap::{
-    CODE_OFFSET, DATA_OFFSET, HOLE, KIND_OFFSET, LENGTH_OFFSET, MathFunction, NO_ELEMENTS, SHAPE_OFFSET,
-    TypedKind, kind,
-};
 use crate::error::Error;
-use crate::jit::clif::IndexedRead;
-use crate::jit::semantic::DirectTarget;
-use crate::jit::helpers::{
-    CACHE_BUILTIN_KIND_OFFSET, CACHE_BUILTIN_VALUE_OFFSET, CACHE_HOLDER_OFFSET,
-    CACHE_HOLDER_SHAPE_OFFSET, CACHE_INDEX_OFFSET, CACHE_SHAPE_OFFSET, Helper, PropertyCache,
+use crate::heap::{
+    CODE_OFFSET, DATA_OFFSET, HOLE, KIND_OFFSET, LENGTH_OFFSET, MathFunction, NO_ELEMENTS,
+    SHAPE_OFFSET, TypedKind, kind,
 };
+use crate::jit::clif::IndexedRead;
+use crate::jit::helpers::{
+    self, CACHE_BUILTIN_KIND_OFFSET, CACHE_BUILTIN_VALUE_OFFSET, CACHE_HOLDER_OFFSET,
+    CACHE_HOLDER_SHAPE_OFFSET, CACHE_INDEX_OFFSET, CACHE_SHAPE_OFFSET, HELPERS, Helper,
+    PropertyCache,
+};
+use crate::jit::planner::{CallSite, Site};
+use crate::jit::semantic::DirectTarget;
+use crate::jit::session::CALL_SITE_OFFSET;
 use crate::value::Value;
 use crate::value::{TAG_FIRST, TAG_OBJECT, TAG_SHIFT, TAG_SPAN, TAG_STRING};
 
@@ -327,13 +330,25 @@ impl FunctionCompiler<'_, '_> {
         }
     }
 
+    pub(super) fn function_data<T>(&mut self, value: T) -> ClifValue {
+        let offset = self.data.push(value);
+        self.b.ins().iadd_imm_s(self.data_base, offset)
+    }
+
     pub(super) fn call_helper(&mut self, helper: Helper, args: &[ClifValue]) -> ClifValue {
-        let function = self.helpers[helper as usize];
-        let callee = self.module.declare_func_in_func(function, self.b.func);
+        let target = self.module.target_config();
+        let signature = *self.helper_signatures.entry(helper).or_insert_with(|| {
+            self.b.import_signature(helpers::signature(
+                HELPERS[helper as usize].shape,
+                target.default_call_conv,
+                self.pointer,
+            ))
+        });
+        let callee = helpers::address(self.b.ins(), self.pointer, self.ctx, helper);
         let mut call_args = Vec::with_capacity(args.len() + 1);
         call_args.push(self.ctx);
         call_args.extend_from_slice(args);
-        let call = self.b.ins().call(callee, &call_args);
+        let call = self.b.ins().call_indirect(signature, callee, &call_args);
         self.annotations.helpers.insert(call, helper);
         self.b.inst_results(call)[0]
     }
@@ -614,6 +629,13 @@ impl FunctionCompiler<'_, '_> {
         args: &[ClifValue],
         span: Span,
     ) -> Result<ClifValue, Error> {
+        if let Ok(arity) = u16::try_from(args.len())
+            && let Some(miss) = self.stubs.miss(arity)
+        {
+            self.mark_call_site(span, false);
+            let entry = self.b.ins().iconst(self.pointer, miss as i64);
+            return Ok(self.checked_fixed_call(entry, arity, callee, receiver, args, false));
+        }
         let result = self.unchecked_call(callee, receiver, args, span)?;
         self.check_error();
         Ok(result)
@@ -652,7 +674,7 @@ impl FunctionCompiler<'_, '_> {
         if args.len() == usize::from(target.arity)
             && let Some(miss) = self.stubs.miss(target.arity)
         {
-            return Ok(self.selected_call(target, callee, receiver, args, miss, owned));
+            return Ok(self.selected_call(target, callee, receiver, args, span, miss, owned));
         }
         let (entry, direct) = self.direct_entry(target, callee);
         let fast = self.b.create_block();
@@ -668,13 +690,7 @@ impl FunctionCompiler<'_, '_> {
         let (result, status) = self.fixed_call(entry, target.arity, callee, receiver, args);
         let succeeded = self.b.create_block();
         let undefined = self.constant(Value::UNDEFINED);
-        self.brif(
-            status,
-            check,
-            &[BlockArg::Value(undefined)],
-            succeeded,
-            &[],
-        );
+        self.brif(status, check, &[BlockArg::Value(undefined)], succeeded, &[]);
         self.switch(succeeded);
         let result = self.owned_result(result, owned);
         self.jump(done, &[BlockArg::Value(result)]);
@@ -699,13 +715,42 @@ impl FunctionCompiler<'_, '_> {
         callee: ClifValue,
         receiver: ClifValue,
         args: &[ClifValue],
+        span: Span,
         miss: usize,
         owned: bool,
     ) -> ClifValue {
+        self.mark_call_site(span, true);
         let (entry, direct) = self.direct_entry(target, callee);
         let miss = self.b.ins().iconst(self.pointer, miss as i64);
         let entry = self.b.ins().select(direct, entry, miss);
-        let (result, status) = self.fixed_call(entry, target.arity, callee, receiver, args);
+        self.checked_fixed_call(entry, target.arity, callee, receiver, args, owned)
+    }
+
+    fn mark_call_site(&mut self, span: Span, guarded: bool) {
+        let site = self.data.pin(CallSite {
+            site: Site {
+                source: self.source_name.0,
+                start: span.start,
+                end: span.end,
+            },
+            guarded,
+        });
+        let site = self.b.ins().iconst(self.pointer, site as i64);
+        self.b
+            .ins()
+            .store(MemFlagsData::trusted(), site, self.ctx, CALL_SITE_OFFSET);
+    }
+
+    fn checked_fixed_call(
+        &mut self,
+        entry: ClifValue,
+        arity: u16,
+        callee: ClifValue,
+        receiver: ClifValue,
+        args: &[ClifValue],
+        owned: bool,
+    ) -> ClifValue {
+        let (result, status) = self.fixed_call(entry, arity, callee, receiver, args);
         let failed = self.b.create_block();
         let succeeded = self.b.create_block();
         self.b.set_cold_block(failed);
@@ -746,6 +791,15 @@ impl FunctionCompiler<'_, '_> {
     }
 
     fn direct_entry(&mut self, target: DirectTarget, callee: ClifValue) -> (ClifValue, ClifValue) {
+        if let Some(call) = super::stubs::poll(
+            self.b,
+            self.module,
+            self.stubs.compilation_state,
+            self.ctx,
+            None,
+        ) {
+            self.annotations.helpers.insert(call, Helper::CompilePoll);
+        }
         let slot = self.b.ins().iconst(
             self.pointer,
             self.stubs.direct_entries as i64
@@ -771,7 +825,11 @@ impl FunctionCompiler<'_, '_> {
     }
 
     /// Whether a value is a closure of this code that may be called without `new`.
-    pub(super) fn is_code(&mut self, value: ClifValue, code: cranelift_module::FuncId) -> ClifValue {
+    pub(super) fn is_code(
+        &mut self,
+        value: ClifValue,
+        code: cranelift_module::FuncId,
+    ) -> ClifValue {
         let view = self.view(value);
         let word = self
             .b
@@ -876,6 +934,40 @@ impl FunctionCompiler<'_, '_> {
             }
             Element::I32 => Operand::new(raw, Repr::Int32),
         }
+    }
+
+    pub(super) fn checked_element_read(
+        &mut self,
+        view: ClifValue,
+        key: Operand,
+        kind: TypedKind,
+    ) -> Operand {
+        let length = self
+            .b
+            .ins()
+            .load(types::I64, MemFlagsData::trusted(), view, LENGTH_OFFSET);
+        let inside = if key.repr == Repr::Int32 {
+            let position = self.b.ins().sextend(types::I64, key.value);
+            self.b.ins().icmp(IntCC::UnsignedLessThan, position, length)
+        } else {
+            let number = self.convert(key, Repr::Float);
+            let position = self.b.ins().fcvt_to_sint_sat(types::I64, number);
+            let exact = self.b.ins().fcvt_from_sint(types::F64, position);
+            let integral = self.b.ins().fcmp(FloatCC::Equal, exact, number);
+            let inside = self.b.ins().icmp(IntCC::UnsignedLessThan, position, length);
+            self.b.ins().band(integral, inside)
+        };
+        let read = self.b.create_block();
+        let done = self.b.create_block();
+        self.b.append_block_param(done, types::I64);
+        let undefined = self.constant(Value::UNDEFINED);
+        self.brif(inside, read, &[], done, &[undefined.into()]);
+        self.switch(read);
+        let value = self.bounded_element_read(view, key, kind);
+        let value = self.convert(value, Repr::Boxed);
+        self.jump(done, &[value.into()]);
+        self.switch(done);
+        Operand::new(self.b.block_params(done)[0], Repr::Boxed)
     }
 
     pub(super) fn viewed_index_access(
@@ -1073,12 +1165,7 @@ impl FunctionCompiler<'_, '_> {
         use crate::jit::helpers::GlobalCache;
         use crate::jit::session::{GLOBAL_IDENTITY_OFFSET, GLOBAL_REVISION_OFFSET};
 
-        let cache = Box::new(GlobalCache::new(name));
-        let address = self
-            .b
-            .ins()
-            .iconst(self.pointer, (&*cache as *const GlobalCache) as i64);
-        self.global_caches.push(cache);
+        let address = self.function_data(GlobalCache::new(name));
         let flags = MemFlagsData::trusted();
         let identity = self
             .b
@@ -1176,9 +1263,7 @@ impl FunctionCompiler<'_, '_> {
         retain: bool,
         probe: bool,
     ) -> ClifValue {
-        let cache = Box::new(PropertyCache::new(name));
-        let address = self.b.ins().iconst(self.pointer, &raw const *cache as i64);
-        self.property_caches.push(cache);
+        let address = self.function_data(PropertyCache::new(name));
         let flags = MemFlagsData::trusted();
         let heap = self.is_heap(object);
         let address_bits = self.b.ins().band_imm_s(object, ADDRESS_MASK);
@@ -1286,9 +1371,7 @@ impl FunctionCompiler<'_, '_> {
         value: Option<ClifValue>,
     ) -> ClifValue {
         if let Some(value) = value {
-            let cache = Box::new(PropertyCache::new(name));
-            let address = self.b.ins().iconst(self.pointer, &raw const *cache as i64);
-            self.property_caches.push(cache);
+            let address = self.function_data(PropertyCache::new(name));
             let result = self.call_helper(Helper::PropertySetCached, &[object, address, value]);
             self.check_error();
             return result;
@@ -1337,14 +1420,18 @@ impl FunctionCompiler<'_, '_> {
         let done = self.b.create_block();
         self.brif(condition, failed, &[], done, &[]);
         self.switch(failed);
-        let ptr = self.b.ins().iconst(self.pointer, self.source_name.0 as i64);
-        let len = self.b.ins().iconst(types::I64, self.source_name.1 as i64);
+        let source_name = self.source_name;
+        let offset = *self
+            .source_names
+            .entry(source_name.0)
+            .or_insert_with(|| self.data.push(source_name));
+        let source = self.b.ins().iadd_imm_s(self.data_base, offset);
         let start = self
             .b
             .ins()
             .iconst(types::I64, self.source_span.start as i64);
         let end = self.b.ins().iconst(types::I64, self.source_span.end as i64);
-        self.call_helper(Helper::ErrorOrigin, &[ptr, len, start, end]);
+        self.call_helper(Helper::ErrorOrigin, &[source, start, end]);
         let exit = self.failed_exit();
         self.jump(exit, &[]);
         self.switch(done);

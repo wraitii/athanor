@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use cranelift_module::FuncId;
 
@@ -7,13 +8,14 @@ use super::super::effects::{
 };
 use super::{Canonical, Cfg, DirectTarget, Facts, Graph, Inst, Native, Op, Result, TerminatorKind};
 
-const SPECIALIZATION_BUDGET: usize = 256;
+const SPECIALIZATION_BUDGET: usize = 128;
 const SPECIALIZATION_BODY_INSTS: usize = 64;
-pub(super) const SPECIALIZATION_ROUNDS: usize = 1;
+pub(super) const SPECIALIZATION_ROUNDS: usize = 2;
+pub(crate) const DEFAULT_RECOMPILE_INLINE_MULTIPLIER: usize = 4;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(in crate::jit) struct Repository {
-    bodies: HashMap<FuncId, Body>,
+    bodies: HashMap<FuncId, Arc<Body>>,
     pub(in crate::jit) feedback: HashMap<crate::jit::planner::Site, FuncId>,
     pub(in crate::jit) read_feedback: HashMap<
         (crate::jit::planner::Site, crate::jit::planner::ReadKind),
@@ -24,6 +26,7 @@ pub(in crate::jit) struct Repository {
     pub(in crate::jit) sources: HashMap<usize, usize>,
 }
 
+#[derive(Clone)]
 struct Body {
     name: String,
     source: usize,
@@ -32,6 +35,38 @@ struct Body {
 }
 
 impl Repository {
+    pub(in crate::jit) fn callees(&self, code: FuncId) -> Vec<FuncId> {
+        let Some(body) = self.bodies.get(&code) else {
+            return Vec::new();
+        };
+        self.graph_callees(&body.canonical.graph, body.source)
+    }
+
+    pub(in crate::jit) fn graph_callees(&self, graph: &Graph, source: usize) -> Vec<FuncId> {
+        let mut targets = Vec::new();
+        for block in Cfg::new(graph).rpo {
+            for &call in &graph.blocks[block].insts {
+                let callee = match graph.insts[call].op {
+                    Op::Call { callee, .. }
+                    | Op::CallSpread(callee, ..)
+                    | Op::Construct { callee, .. }
+                    | Op::ConstructorCall { callee, .. }
+                    | Op::ConstructSpread(callee, ..)
+                    | Op::ConstructSpreadResolved(callee, ..)
+                    | Op::ConstructorCallSpread(callee, ..)
+                    | Op::ConstructResolved { callee, .. } => callee,
+                    _ => continue,
+                };
+                if let Some(target) = call_target(graph, self, source, call, callee)
+                    && !targets.contains(&target)
+                {
+                    targets.push(target);
+                }
+            }
+        }
+        targets
+    }
+
     pub(in crate::jit) fn insert(
         &mut self,
         source: usize,
@@ -44,12 +79,12 @@ impl Repository {
         self.globals.insert(name.to_owned(), code);
         self.bodies.insert(
             code,
-            Body {
+            Arc::new(Body {
                 name: name.to_owned(),
                 source,
                 canonical,
                 arrow: false,
-            },
+            }),
         );
     }
 
@@ -65,12 +100,12 @@ impl Repository {
         let name = canonical.graph.name.clone();
         self.bodies.insert(
             code,
-            Body {
+            Arc::new(Body {
                 name,
                 source,
                 canonical,
                 arrow,
-            },
+            }),
         );
     }
 
@@ -505,14 +540,22 @@ pub(super) struct Plan {
 
 pub(super) struct Budget {
     remaining: usize,
+    body_limit: usize,
     sites: HashSet<Inst>,
     pub(super) inlines: Vec<Inline>,
 }
 
 impl Default for Budget {
     fn default() -> Self {
+        Self::new(1)
+    }
+}
+
+impl Budget {
+    pub(super) fn new(multiplier: usize) -> Self {
         Self {
-            remaining: SPECIALIZATION_BUDGET,
+            remaining: SPECIALIZATION_BUDGET.saturating_mul(multiplier),
+            body_limit: SPECIALIZATION_BODY_INSTS.saturating_mul(multiplier),
             sites: HashSet::new(),
             inlines: Vec::new(),
         }
@@ -534,7 +577,7 @@ pub(in crate::jit) struct Inline {
     pub(super) source_name: Option<(usize, usize)>,
 }
 
-pub(super) fn eligible(graph: &Graph) -> bool {
+fn eligible(graph: &Graph, body_limit: usize) -> bool {
     if graph.generator || graph.has_handlers {
         return false;
     }
@@ -548,7 +591,7 @@ pub(super) fn eligible(graph: &Graph) -> bool {
         }
         for &inst in &graph.blocks[block].insts {
             count += 1;
-            if count > SPECIALIZATION_BODY_INSTS
+            if count > body_limit
                 || matches!(
                     graph.insts[inst].op,
                     Op::Arguments | Op::Rest(_) | Op::Catch
@@ -618,7 +661,12 @@ pub(super) fn direct_calls(graph: &mut Graph, bodies: &Repository, source: usize
     }
 }
 
-pub(super) fn requests(graph: &Graph, bodies: &Repository, source: usize) -> Vec<Request> {
+pub(super) fn requests(
+    graph: &Graph,
+    bodies: &Repository,
+    source: usize,
+    budget: &Budget,
+) -> Vec<Request> {
     let mut requests = Vec::new();
     for block in Cfg::new(graph).rpo {
         for &call in &graph.blocks[block].insts {
@@ -631,7 +679,10 @@ pub(super) fn requests(graph: &Graph, bodies: &Repository, source: usize) -> Vec
             let Some(target) = call_target(graph, bodies, source, call, *callee) else {
                 continue;
             };
-            if bodies.body(target).is_some_and(eligible) {
+            if bodies
+                .body(target)
+                .is_some_and(|body| eligible(body, budget.body_limit))
+            {
                 requests.push(Request { call, target });
             }
         }
@@ -658,7 +709,10 @@ pub(super) fn plan_round(
 ) -> Plan {
     let mut inlines = Vec::new();
     for request in requests {
-        let Some(body) = bodies.body(request.target).filter(|body| eligible(body)) else {
+        let Some(body) = bodies
+            .body(request.target)
+            .filter(|body| eligible(body, budget.body_limit))
+        else {
             continue;
         };
         let callee = match &graph.insts[request.call].op {
@@ -830,10 +884,7 @@ mod tests {
         let (canonical, mut bodies) = fixture(
             "function createTerrain(t){if(typeof t==='string')return t.split('|');return t.map(createTerrain);} function main(t){return createTerrain(t);}",
         );
-        bodies
-            .bodies
-            .get_mut(&FuncId::from_u32(0))
-            .unwrap()
+        Arc::make_mut(bodies.bodies.get_mut(&FuncId::from_u32(0)).unwrap())
             .canonical
             .graph
             .name = "<function>".into();
@@ -1024,7 +1075,9 @@ mod tests {
         let (canonical, bodies) =
             fixture("function helper(x){return unknown(x);} function main(x){return helper(x);}");
         let mut graph = canonical.graph;
-        let request = requests(&graph, &bodies, 0).pop().unwrap();
+        let request = requests(&graph, &bodies, 0, &Budget::default())
+            .pop()
+            .unwrap();
         let Op::Call { callee, .. } = graph.insts[request.call].op else {
             panic!()
         };
@@ -1049,7 +1102,9 @@ mod tests {
         let (canonical, bodies) =
             fixture("function helper(x){return x.value;} function main(x){return helper(x);}");
         let mut graph = canonical.graph;
-        let request = requests(&graph, &bodies, 0).pop().unwrap();
+        let request = requests(&graph, &bodies, 0, &Budget::default())
+            .pop()
+            .unwrap();
         let Op::Call { callee, .. } = graph.insts[request.call].op else {
             panic!()
         };
@@ -1105,7 +1160,7 @@ mod tests {
             "function square(x){return x*x;} function main(x){return Math.square(x)+Math.square(x+1);}",
         );
         let mut graph = canonical.graph;
-        assert!(requests(&graph, &bodies, 0).is_empty());
+        assert!(requests(&graph, &bodies, 0, &Budget::default()).is_empty());
         for data in graph.insts.values() {
             if matches!(data.op, Op::Call { .. }) {
                 bodies.feedback.insert(
@@ -1118,7 +1173,7 @@ mod tests {
                 );
             }
         }
-        let requests = requests(&graph, &bodies, 0);
+        let requests = requests(&graph, &bodies, 0, &Budget::default());
         assert_eq!(requests.len(), 2);
         let plan = plan(&graph, &bodies, 0, &requests);
         assert!(plan.inlines.iter().all(|inline| inline.guard_code));
@@ -1204,7 +1259,9 @@ mod tests {
     fn explicit_request_has_one_inline_body_and_one_fallback() {
         let (canonical, bodies) =
             fixture("function square(x) { return x * x; } function main(x) { return square(x); }");
-        let request = requests(&canonical.graph, &bodies, 0).pop().unwrap();
+        let request = requests(&canonical.graph, &bodies, 0, &Budget::default())
+            .pop()
+            .unwrap();
         let mut graph = canonical.graph.clone();
         let before = canonical
             .graph
@@ -1258,7 +1315,7 @@ mod tests {
                 "function sum(a, b) {{ return a + b; }} function main(x) {{ let y = {argument}; return sum(y, y); }}",
             ));
             let mut graph = canonical.graph;
-            let requests = requests(&graph, &bodies, 0);
+            let requests = requests(&graph, &bodies, 0, &Budget::default());
             let plan = plan(&graph, &bodies, 0, &requests);
             apply(&mut graph, &bodies, 0, plan, &mut Vec::new()).unwrap();
             assert!(
@@ -1281,10 +1338,27 @@ mod tests {
     }
 
     #[test]
+    fn recompilation_budget_admits_larger_callees() {
+        let body = "x = x.value;".repeat(SPECIALIZATION_BODY_INSTS);
+        let (canonical, bodies) = fixture(&format!(
+            "function helper(x){{{body}return x;}} function main(x){{return helper(x);}}"
+        ));
+        let initial =
+            super::super::plan_canonical(canonical.clone(), true, Some((&bodies, 0))).unwrap();
+        let recompiled =
+            super::super::plan_canonical_with_budget(canonical, true, Some((&bodies, 0)), 2)
+                .unwrap();
+        assert!(initial.inlines.is_empty());
+        assert!(!recompiled.inlines.is_empty());
+    }
+
+    #[test]
     fn planner_limits_expansion_and_accepts_general_bodies() {
         let (canonical, bodies) =
             fixture("function square(x) { return x * x; } function main(x) { return square(x); }");
-        let request = requests(&canonical.graph, &bodies, 0).pop().unwrap();
+        let request = requests(&canonical.graph, &bodies, 0, &Budget::default())
+            .pop()
+            .unwrap();
         let duplicates = (0..100)
             .map(|_| Request {
                 call: request.call,
@@ -1307,10 +1381,28 @@ mod tests {
         let (canonical, bodies) = fixture(&format!(
             "function square(x) {{ return x * x; }} function main(x) {{ {calls} return x; }}",
         ));
-        let candidates = requests(&canonical.graph, &bodies, 0);
+        let candidates = requests(&canonical.graph, &bodies, 0, &Budget::default());
         let selected = plan(&canonical.graph, &bodies, 0, &candidates);
         assert!(!selected.inlines.is_empty());
         assert!(selected.inlines.len() < candidates.len());
+        let expanded = plan_round(
+            &canonical.graph,
+            &bodies,
+            0,
+            &candidates,
+            &mut Budget::new(2),
+        );
+        assert!(expanded.inlines.len() > selected.inlines.len());
+        assert!(
+            plan_round(
+                &canonical.graph,
+                &bodies,
+                0,
+                &candidates,
+                &mut Budget::new(0)
+            )
+            .is_empty()
+        );
         for body in [
             "return x.value;",
             "return other(x);",
@@ -1319,7 +1411,7 @@ mod tests {
             let (canonical, bodies) = fixture(&format!(
                 "function helper(x) {{ {body} }} function main(x) {{ return helper(x); }}",
             ));
-            let requests = requests(&canonical.graph, &bodies, 0);
+            let requests = requests(&canonical.graph, &bodies, 0, &Budget::default());
             assert_eq!(requests.len(), 1);
         }
     }
@@ -1331,7 +1423,7 @@ mod tests {
         let mut graph = canonical.graph;
         super::super::construction::resolve(&mut graph);
         super::super::construction::expand(&mut graph, &mut HashSet::new());
-        let requests = requests(&graph, &bodies, 1);
+        let requests = requests(&graph, &bodies, 1, &Budget::default());
         assert_eq!(requests.len(), 2);
         let plan = plan(&graph, &bodies, 1, &requests);
         assert_eq!(plan.inlines.len(), 2);

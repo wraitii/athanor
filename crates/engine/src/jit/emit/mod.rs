@@ -23,7 +23,8 @@ use oxc_syntax::symbol::SymbolId;
 
 use crate::error::Error;
 use crate::jit::clif::Annotations;
-use crate::jit::helpers::{GlobalCache, Helper, PropertyCache};
+use crate::jit::function_data::{FUNCTION_DATA_BASE_OFFSET, FunctionData};
+use crate::jit::helpers::Helper;
 use crate::value::Value;
 
 pub(crate) use statement::statement_kind;
@@ -35,23 +36,25 @@ pub(super) enum FunctionKind {
     Factory(FuncId),
 }
 
-pub(super) struct Feedback<'a> {
+#[derive(Clone, Copy)]
+pub(super) struct Feedback {
+    pub(super) function_return: bool,
     pub(super) get_refinement: bool,
     pub(super) owner: u64,
-    pub(super) caches: &'a mut Vec<Box<super::planner::ObservationCache>>,
 }
 
 pub(super) struct FunctionCompiler<'a, 'f> {
-    feedback: Option<Feedback<'a>>,
+    feedback: Option<Feedback>,
     names: &'a mut Vec<Box<str>>,
     cells: &'a mut Vec<Box<u64>>,
-    property_caches: &'a mut Vec<Box<PropertyCache>>,
-    global_caches: &'a mut Vec<Box<GlobalCache>>,
+    data: &'a mut FunctionData,
+    data_base: ClifValue,
     source_name: (usize, usize),
     source_span: Span,
     b: &'a mut FunctionBuilder<'f>,
     module: &'a mut JITModule,
-    helpers: &'a [FuncId],
+    helper_signatures: HashMap<Helper, SigRef>,
+    source_names: HashMap<usize, i64>,
     stubs: Stubs,
     annotations: &'a mut Annotations,
     pointer: Type,
@@ -88,33 +91,39 @@ struct CallerFrame {
 
 const INLINE_FRAME_RELEASES: u32 = 4;
 
+fn data_base(b: &mut FunctionBuilder<'_>, pointer: Type, data: &FunctionData) -> ClifValue {
+    let holder = b.ins().iconst(pointer, &raw const *data as i64);
+    b.ins().load(
+        pointer,
+        MemFlagsData::trusted(),
+        holder,
+        FUNCTION_DATA_BASE_OFFSET,
+    )
+}
+
 pub(super) fn build_function(
     b: &mut FunctionBuilder<'_>,
     module: &mut JITModule,
-    helpers: &[FuncId],
     stubs: Stubs,
     annotations: &mut Annotations,
     names: &mut Vec<Box<str>>,
     cells: &mut Vec<Box<u64>>,
-    property_caches: &mut Vec<Box<PropertyCache>>,
-    global_caches: &mut Vec<Box<GlobalCache>>,
+    data: &mut FunctionData,
     source_name: (usize, usize),
     params: Span,
     _closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
     kind: FunctionKind,
     graph: &super::semantic::Graph,
-    feedback: Option<Feedback<'_>>,
+    feedback: Option<Feedback>,
 ) -> Result<(), Error> {
     build_callable(
         b,
         module,
-        helpers,
         stubs,
         annotations,
         names,
         cells,
-        property_caches,
-        global_caches,
+        data,
         source_name,
         params,
         kind,
@@ -126,13 +135,11 @@ pub(super) fn build_function(
 pub(super) fn build_factory(
     b: &mut FunctionBuilder<'_>,
     module: &mut JITModule,
-    helpers: &[FuncId],
     stubs: Stubs,
     annotations: &mut Annotations,
     names: &mut Vec<Box<str>>,
     cells: &mut Vec<Box<u64>>,
-    property_caches: &mut Vec<Box<PropertyCache>>,
-    global_caches: &mut Vec<Box<GlobalCache>>,
+    data: &mut FunctionData,
     source_name: (usize, usize),
     params: Span,
     _closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
@@ -141,13 +148,11 @@ pub(super) fn build_factory(
     build_callable(
         b,
         module,
-        helpers,
         stubs,
         annotations,
         names,
         cells,
-        property_caches,
-        global_caches,
+        data,
         source_name,
         params,
         FunctionKind::Factory(resume),
@@ -164,18 +169,16 @@ enum CallableBody<'g> {
 fn build_callable(
     b: &mut FunctionBuilder<'_>,
     module: &mut JITModule,
-    helpers: &[FuncId],
     stubs: Stubs,
     annotations: &mut Annotations,
     names: &mut Vec<Box<str>>,
     cells: &mut Vec<Box<u64>>,
-    property_caches: &mut Vec<Box<PropertyCache>>,
-    global_caches: &mut Vec<Box<GlobalCache>>,
+    data: &mut FunctionData,
     source_name: (usize, usize),
     params: Span,
     kind: FunctionKind,
     body: CallableBody<'_>,
-    feedback: Option<Feedback<'_>>,
+    feedback: Option<Feedback>,
 ) -> Result<(), Error> {
     let entry = b.create_block();
     b.switch_to_block(entry);
@@ -198,17 +201,19 @@ fn build_callable(
     }
 
     let pointer = module.target_config().pointer_type();
+    let data_base = data_base(b, pointer, data);
     let mut compiler = FunctionCompiler {
         feedback,
         names,
         cells,
-        property_caches,
-        global_caches,
+        data,
+        data_base,
         source_name,
         source_span: params,
         b,
         module,
-        helpers,
+        helper_signatures: HashMap::new(),
+        source_names: HashMap::new(),
         stubs,
         annotations,
         pointer,
@@ -293,13 +298,11 @@ fn build_callable(
 pub(super) fn build_global(
     b: &mut FunctionBuilder<'_>,
     module: &mut JITModule,
-    helpers: &[FuncId],
     stubs: Stubs,
     annotations: &mut Annotations,
     names: &mut Vec<Box<str>>,
     cells: &mut Vec<Box<u64>>,
-    property_caches: &mut Vec<Box<PropertyCache>>,
-    global_caches: &mut Vec<Box<GlobalCache>>,
+    data: &mut FunctionData,
     source_name: (usize, usize),
     _closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
     graph: &super::semantic::Graph,
@@ -312,17 +315,19 @@ pub(super) fn build_global(
     let return_block = b.create_block();
     b.append_block_param(return_block, types::I64);
     let pointer = module.target_config().pointer_type();
+    let data_base = data_base(b, pointer, data);
     let mut compiler = FunctionCompiler {
         feedback: None,
         names,
         cells,
-        property_caches,
-        global_caches,
+        data,
+        data_base,
         source_name,
         source_span: Span::new(0, 0),
         b,
         module,
-        helpers,
+        helper_signatures: HashMap::new(),
+        source_names: HashMap::new(),
         stubs,
         annotations,
         pointer,
@@ -407,6 +412,60 @@ impl FunctionCompiler<'_, '_> {
     }
 
     pub(super) fn return_value(&mut self, value: ClifValue) {
+        if let Some(feedback) = self.feedback.filter(|feedback| feedback.function_return)
+            && self.stubs.compilation_state != 0
+            && feedback.owner >= crate::jit::entries::DIRECT_ENTRIES as u64
+        {
+            let owner = self.b.ins().iconst(types::I64, feedback.owner as i64);
+            self.call_helper(Helper::CompileLeave, &[owner]);
+        } else if let Some(feedback) = self.feedback.filter(|feedback| feedback.function_return)
+            && self.stubs.compilation_state != 0
+        {
+            let address = self.stubs.direct_entries as usize
+                + feedback.owner as usize * crate::jit::entries::DIRECT_ENTRY_SIZE
+                + crate::jit::entries::DIRECT_CALLS_OFFSET;
+            let address = self.b.ins().iconst(self.pointer, address as i64);
+            let count = self
+                .b
+                .ins()
+                .load(self.pointer, MemFlagsData::trusted(), address, 0);
+            let calls = self
+                .b
+                .ins()
+                .band_imm_u(count, (crate::jit::entries::RECOMPILE_PENDING - 1) as i64);
+            let next = self.b.ins().iadd_imm_u(count, 1);
+            let cold = self.b.ins().icmp_imm_u(
+                IntCC::UnsignedLessThan,
+                calls,
+                crate::jit::entries::RECOMPILE_WARMUP as i64,
+            );
+            let count = self.b.ins().select(cold, next, count);
+            self.b
+                .ins()
+                .store(MemFlagsData::trusted(), count, address, 0);
+            let warm = self.b.ins().icmp_imm_u(
+                IntCC::UnsignedGreaterThanOrEqual,
+                count,
+                (crate::jit::entries::RECOMPILE_PENDING + crate::jit::entries::RECOMPILE_WARMUP)
+                    as i64,
+            );
+            let poll = self.b.create_block();
+            let done = self.b.create_block();
+            self.b.ins().brif(warm, poll, &[], done, &[]);
+            self.b.switch_to_block(poll);
+            let owner = self.b.ins().iconst(types::I64, feedback.owner as i64);
+            if let Some(call) = stubs::poll(
+                self.b,
+                self.module,
+                self.stubs.compilation_state,
+                self.ctx,
+                Some(owner),
+            ) {
+                self.annotations.helpers.insert(call, Helper::CompileLeave);
+            }
+            self.b.ins().jump(done, &[]);
+            self.b.switch_to_block(done);
+        }
         let value = match self.generator {
             Some(generator) => self.call_helper(Helper::GeneratorComplete, &[generator, value]),
             None => {

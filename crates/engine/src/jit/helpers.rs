@@ -8,13 +8,16 @@ pub(in crate::jit) use calls::*;
 use generators::*;
 pub(in crate::jit) use property::*;
 
-use cranelift_codegen::ir::{AbiParam, Signature, Type, types};
+use cranelift_codegen::ir::{
+    AbiParam, Inst, InstBuilder, MemFlagsData, Signature, Type, Value as ClifValue, types,
+};
 use cranelift_codegen::isa::CallConv;
+use cranelift_frontend::FunctionBuilder;
 
 use crate::heap::{IndexRead, PropertyRead};
 use crate::value::Value;
 
-use super::session::JitCtx;
+use super::session::{HELPERS_OFFSET, JitCtx};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HelperShape {
@@ -38,7 +41,6 @@ pub(crate) enum HelperShape {
 }
 
 pub(crate) struct HelperSpec {
-    pub(crate) name: &'static str,
     pub(crate) shape: HelperShape,
     pub(crate) pointer: *const u8,
 }
@@ -46,14 +48,13 @@ pub(crate) struct HelperSpec {
 macro_rules! define_helpers {
     ($($variant:ident => $shape:ident, $function:ident;)*) => {
         #[repr(usize)]
-        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
         pub(crate) enum Helper {
             $($variant),*
         }
 
         pub(crate) const HELPERS: &[HelperSpec] = &[
             $(HelperSpec {
-                name: stringify!($function),
                 shape: HelperShape::$shape,
                 pointer: $function as *const () as *const u8,
             }),*
@@ -62,6 +63,9 @@ macro_rules! define_helpers {
 }
 
 define_helpers! {
+    CompilePoll => Nullary, js_compile_poll;
+    OsrPoll => Binary, js_osr_poll;
+    CompileLeave => Unary, js_compile_leave;
     Instanceof => Binary, js_instanceof;
     In => Binary, js_in;
     GeneratorNew => Quaternary, js_generator_new;
@@ -90,6 +94,7 @@ define_helpers! {
     ArrayAppend => Binary, js_array_append;
     ArrayExtend => Binary, js_array_extend;
     Call => MethodCallable, js_call;
+    CallOwned => MethodCallable, js_call_owned;
     ObserveCall => Binary, js_observe_call;
     ObserveGet => Binary, js_observe_get;
     ObserveIndex => Binary, js_observe_index;
@@ -142,6 +147,7 @@ define_helpers! {
     Throw => Unary, js_throw;
     Catch => Unary, js_catch;
     ErrorOrigin => SourceLocation, js_error_origin;
+    CallProfileFlush => Nullary, js_call_profile_flush;
     BitwiseAnd => Binary, js_bitwise_and;
     BitwiseOr => Binary, js_bitwise_or;
     BitwiseXor => Binary, js_bitwise_xor;
@@ -168,6 +174,42 @@ define_helpers! {
     BitwiseNot => Unary, js_bitwise_not;
 }
 
+extern "C" fn js_compile_poll(ctx: *mut JitCtx) -> Value {
+    unsafe { &*ctx }.engine.poll_compilation();
+    Value::UNDEFINED
+}
+
+extern "C" fn js_osr_poll(
+    ctx: *mut JitCtx,
+    site: *const super::osr::Site,
+    buffer: *mut Value,
+) -> Value {
+    let site = unsafe { &*site };
+    let entry = unsafe { &*ctx }.engine.osr_entry(site);
+    if entry == 0 {
+        return Value::FALSE;
+    }
+    unsafe { &*ctx }.engine.osr_entered(site);
+    let transfer = site.plan.loops[site.candidate].transfer.as_ref().unwrap();
+    let function: unsafe extern "C" fn(*mut JitCtx, Value, Value, *const Value, u64) -> Value =
+        unsafe { std::mem::transmute(entry) };
+    unsafe {
+        function(
+            ctx,
+            Value::UNDEFINED,
+            Value::UNDEFINED,
+            buffer,
+            transfer.inputs.len() as u64,
+        )
+    };
+    Value::TRUE
+}
+
+extern "C" fn js_compile_leave(ctx: *mut JitCtx, code: u64) -> Value {
+    unsafe { &*ctx }.engine.leave_function(code);
+    Value::UNDEFINED
+}
+
 impl Helper {
     pub(crate) fn can_throw(self) -> bool {
         // These helpers may report engine errors, but never execute JavaScript or throw.
@@ -175,6 +217,8 @@ impl Helper {
             self,
             Self::TempRetain
                 | Self::TempOwn
+                | Self::CompilePoll
+                | Self::CompileLeave
                 | Self::LexicalReceiver
                 | Self::Release
                 | Self::FrameOverflow
@@ -214,8 +258,34 @@ impl Helper {
     }
 }
 
-pub(crate) fn symbols() -> impl Iterator<Item = (&'static str, *const u8)> {
-    HELPERS.iter().map(|spec| (spec.name, spec.pointer))
+pub(crate) fn address<'f>(
+    ins: impl InstBuilder<'f>,
+    pointer: Type,
+    ctx: ClifValue,
+    helper: Helper,
+) -> ClifValue {
+    let offset = HELPERS_OFFSET + helper as i32 * std::mem::size_of::<usize>() as i32;
+    ins.load(pointer, MemFlagsData::trusted(), ctx, offset)
+}
+
+pub(crate) fn call(
+    b: &mut FunctionBuilder<'_>,
+    call_conv: CallConv,
+    pointer: Type,
+    ctx: ClifValue,
+    helper: Helper,
+    args: &[ClifValue],
+) -> Inst {
+    let signature = b.import_signature(signature(
+        HELPERS[helper as usize].shape,
+        call_conv,
+        pointer,
+    ));
+    let callee = address(b.ins(), pointer, ctx, helper);
+    let mut call_args = Vec::with_capacity(args.len() + 1);
+    call_args.push(ctx);
+    call_args.extend_from_slice(args);
+    b.ins().call_indirect(signature, callee, &call_args)
 }
 
 pub(crate) fn signature(shape: HelperShape, call_conv: CallConv, pointer: Type) -> Signature {
@@ -252,9 +322,8 @@ pub(crate) fn signature(shape: HelperShape, call_conv: CallConv, pointer: Type) 
         }
         HelperShape::SourceLocation => {
             signature.params.push(AbiParam::new(pointer));
-            for _ in 0..3 {
-                signature.params.push(AbiParam::new(types::I64));
-            }
+            signature.params.push(AbiParam::new(types::I64));
+            signature.params.push(AbiParam::new(types::I64));
         }
         HelperShape::Quaternary => {
             for _ in 0..4 {
@@ -292,18 +361,24 @@ pub(crate) fn signature(shape: HelperShape, call_conv: CallConv, pointer: Type) 
 
 extern "C" fn js_error_origin(
     ctx: *mut JitCtx,
-    ptr: *const u8,
-    len: u64,
+    source: *const (usize, usize),
     start: u64,
     end: u64,
 ) -> Value {
     let ctx = unsafe { &mut *ctx };
     if ctx.error_origin.is_none() && matches!(ctx.error.as_deref(), Some(crate::Error::Runtime(_)))
     {
-        let filename =
-            unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len as usize)) };
+        let (ptr, len) = unsafe { *source };
+        let filename = unsafe {
+            std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr as *const u8, len))
+        };
         ctx.error_origin = Some((filename.to_owned(), start as u32, end as u32));
     }
+    Value::UNDEFINED
+}
+
+extern "C" fn js_call_profile_flush(ctx: *mut JitCtx) -> Value {
+    unsafe { &mut *ctx }.flush_call_samples();
     Value::UNDEFINED
 }
 
@@ -434,7 +509,7 @@ extern "C" fn js_closure_new(
     count: u64,
 ) -> Value {
     let ctx = unsafe { &mut *ctx };
-    if ctx.entry(code).is_none() {
+    if !ctx.has_code(code) {
         ctx.error = Some(Box::new(crate::Error::Runtime(
             "unknown closure code".into(),
         )));

@@ -7,6 +7,7 @@ pub(in crate::jit) mod facts;
 mod inlining;
 mod listing;
 mod optimize;
+pub(super) mod osr;
 mod promote;
 pub(super) mod reads;
 pub(super) mod specialize;
@@ -204,6 +205,9 @@ pub(in crate::jit) struct DirectTarget {
 
 #[derive(Clone, Debug)]
 pub(super) enum Op {
+    OsrStart(std::sync::Arc<osr::Plan>, usize, Vec<Value>),
+    OsrOutput(Value, usize),
+    OsrStore(usize, Vec<Value>),
     Argument(usize),
     Arguments,
     Rest(usize),
@@ -387,6 +391,8 @@ impl Op {
 
     pub(super) fn operands_iter(&self) -> impl Iterator<Item = Value> + '_ {
         let (fixed, rest): ([Option<Value>; 3], &[Value]) = match self {
+            Op::OsrStart(_, _, values) | Op::OsrStore(_, values) => ([None, None, None], values),
+            Op::OsrOutput(value, _) => ([Some(*value), None, None], &[]),
             Op::Argument(_)
             | Op::Arguments
             | Op::Rest(_)
@@ -494,6 +500,8 @@ impl Op {
 
     pub(super) fn operands_mut(&mut self) -> impl Iterator<Item = &mut Value> + '_ {
         let (fixed, rest): ([Option<&mut Value>; 3], &mut [Value]) = match self {
+            Op::OsrStart(_, _, values) | Op::OsrStore(_, values) => ([None, None, None], values),
+            Op::OsrOutput(value, _) => ([Some(value), None, None], &mut []),
             Op::Argument(_)
             | Op::Arguments
             | Op::Rest(_)
@@ -959,6 +967,14 @@ impl Graph {
             }
         };
         match op {
+            Op::OsrStart(..) => Contract {
+                reentry: Reentry::Unknown,
+                flags: UNKNOWN,
+                assumptions: &[],
+                result: Unowned,
+            },
+            Op::OsrOutput(..) => closed(INTERNAL, &[], Unowned),
+            Op::OsrStore(..) => closed(INTERNAL, &[], None),
             Op::NewInstance(_) => closed(ALLOCATION | INTERNAL | ERROR, &[], Owned),
             Op::ConstructorResult(..) => closed(0, &[], Borrowed),
             Op::Rest(_) | Op::Arguments => closed(ALLOCATION | INTERNAL | ERROR, &[], Owned),
@@ -1157,7 +1173,11 @@ impl Graph {
             let Some(terminator) = &self.blocks[block].terminator else {
                 return Err(format!("{block} has no terminator"));
             };
-            if matches!(terminator.kind, TerminatorKind::Return(_) | TerminatorKind::Fallback(_)) && !stack.is_empty() {
+            if matches!(
+                terminator.kind,
+                TerminatorKind::Return(_) | TerminatorKind::Fallback(_)
+            ) && !stack.is_empty()
+            {
                 return Err(format!("{block} returns with open scopes"));
             }
             for target in terminator.kind.targets() {
@@ -1247,7 +1267,7 @@ fn unsupported<T>(what: &str, span: Span) -> Result<T> {
 pub(super) struct Planned {
     pub(super) inlines: Vec<specialize::Inline>,
     pub(super) reads: Vec<reads::Read>,
-    graph: Graph,
+    pub(super) graph: Graph,
     notes: Vec<String>,
     optimize: bool,
     pub(super) conditional: specialize::ConditionalPlan,
@@ -1258,8 +1278,21 @@ pub(super) struct Analysis {
     pub(super) inlines: Vec<specialize::Inline>,
     pub(super) reads: Vec<reads::Read>,
     pub(super) graph: Graph,
+    pub(super) osr: Option<std::sync::Arc<osr::Plan>>,
     facts: Facts,
     notes: Vec<String>,
+}
+
+impl Analysis {
+    pub(in crate::jit) fn prepare_osr(&mut self, source: usize) -> Result<()> {
+        self.osr = osr::Plan::discover(&self.graph, None, source).map(std::sync::Arc::new);
+        if let Some(plan) = &self.osr {
+            plan.instrument(&mut self.graph)?;
+            self.facts = Facts::compute(&self.graph);
+            borrow::borrows(&mut self.graph, &self.facts, &mut self.notes);
+        }
+        Ok(())
+    }
 }
 
 pub(super) fn lower_global(
@@ -1327,6 +1360,15 @@ pub(super) struct Canonical {
     notes: Vec<String>,
 }
 
+impl Canonical {
+    pub(in crate::jit) fn from_graph(graph: Graph) -> Self {
+        Self {
+            graph,
+            notes: Vec::new(),
+        }
+    }
+}
+
 fn canonicalize(mut graph: Graph, ssa_opt: bool) -> Result<Canonical> {
     let mut notes = Vec::new();
     if ssa_opt && !graph.has_handlers && !graph.generator {
@@ -1359,12 +1401,7 @@ struct Expansions {
 }
 
 impl Expansions {
-    fn calls(
-        &mut self,
-        graph: &mut Graph,
-        source: usize,
-        notes: &mut Vec<String>,
-    ) -> Result<()> {
+    fn calls(&mut self, graph: &mut Graph, source: usize, notes: &mut Vec<String>) -> Result<()> {
         arrays::expand(graph, source, notes, &mut self.arrays)?;
         string_split::expand(graph, &mut self.splits);
         Ok(())
@@ -1381,6 +1418,15 @@ pub(super) fn plan_canonical(
     ssa_opt: bool,
     specialization: Option<(&specialize::Repository, usize)>,
 ) -> Result<Planned> {
+    plan_canonical_with_budget(canonical, ssa_opt, specialization, 1)
+}
+
+pub(super) fn plan_canonical_with_budget(
+    canonical: Canonical,
+    ssa_opt: bool,
+    specialization: Option<(&specialize::Repository, usize)>,
+    inline_multiplier: usize,
+) -> Result<Planned> {
     let Canonical {
         mut graph,
         mut notes,
@@ -1396,11 +1442,11 @@ pub(super) fn plan_canonical(
             conditional: specialize::ConditionalPlan::default(),
         });
     }
-    let mut inline_budget = specialize::Budget::default();
+    let mut inline_budget = specialize::Budget::new(inline_multiplier);
     let mut expansions = Expansions::default();
     if let Some((bodies, source)) = specialization {
         expansions.calls(&mut graph, source, &mut notes)?;
-        let requests = specialize::requests(&graph, bodies, source);
+        let requests = specialize::requests(&graph, bodies, source, &inline_budget);
         let plan = specialize::plan_round(&graph, bodies, source, &requests, &mut inline_budget);
         specialize::apply(&mut graph, bodies, source, plan, &mut notes)?;
         optimize::simplify(&mut graph);
@@ -1410,7 +1456,7 @@ pub(super) fn plan_canonical(
     expansions.constructors(&mut graph);
     if let Some((bodies, source)) = specialization {
         for _ in 0..specialize::SPECIALIZATION_ROUNDS {
-            let requests = specialize::requests(&graph, bodies, source);
+            let requests = specialize::requests(&graph, bodies, source, &inline_budget);
             let plan =
                 specialize::plan_round(&graph, bodies, source, &requests, &mut inline_budget);
             if plan.is_empty() {
@@ -1464,6 +1510,7 @@ pub(super) fn optimize_planned(planned: Planned, fallback: Option<usize>) -> Res
             graph,
             facts,
             notes,
+            osr: None,
         });
     }
     reads::apply(&mut graph, &reads, &mut notes)?;
@@ -1514,6 +1561,7 @@ pub(super) fn optimize_planned(planned: Planned, fallback: Option<usize>) -> Res
         graph,
         facts,
         notes,
+        osr: None,
     })
 }
 
