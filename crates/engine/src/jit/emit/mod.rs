@@ -5,6 +5,7 @@ mod ops;
 mod repr;
 pub(in crate::jit) mod scope;
 mod semantic_graph;
+mod slots;
 mod statement;
 
 use std::collections::HashMap;
@@ -64,6 +65,7 @@ pub(super) struct FunctionCompiler<'a, 'f> {
     frame_size: Option<Inst>,
     frame_roots: Option<Variable>,
     slots: HashMap<u32, u32>,
+    slot_count: u32,
 }
 
 pub(super) fn build_function(
@@ -184,6 +186,7 @@ fn build_callable(
         frame_size: None,
         frame_roots: None,
         slots: HashMap::new(),
+        slot_count: 0,
     };
 
     let dispatch = if let FunctionKind::Generator(plan) = &kind {
@@ -287,6 +290,7 @@ pub(super) fn build_global(
         frame_size: None,
         frame_roots: None,
         slots: HashMap::new(),
+        slot_count: 0,
     };
     compiler.enter_frame();
     compiler.emit_semantic_graph(graph, closure)?;
@@ -361,7 +365,7 @@ impl FunctionCompiler<'_, '_> {
             self.b
                 .func
                 .replace(inst)
-                .iconst(types::I64, self.slots.len() as i64);
+                .iconst(types::I64, self.slot_count as i64);
         }
     }
 

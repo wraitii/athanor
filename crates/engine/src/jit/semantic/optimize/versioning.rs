@@ -28,16 +28,25 @@ pub(super) struct Speculation<'a> {
     pub(super) exits_true: &'a [Block],
     pub(super) typed: &'a [(Value, Option<TypedKind>)],
     pub(super) bounds: &'a [(Value, Value)],
+    pub(super) typed_reads: &'a [(Inst, TypedRead)],
     pub(super) checks: &'a [Value],
     pub(super) code_guards: &'a [(String, cranelift_module::FuncId)],
-    pub(super) closed_calls: &'a [(Inst, Value, String, u16)],
+    pub(super) closed_calls: &'a [super::super::specialize::ConditionalCall],
 }
 
 #[derive(PartialEq, Eq, Hash)]
 enum EntryGuard {
     Code(Value, cranelift_module::FuncId),
     Number(Value),
+    Typed(Value),
     Value(Value),
+}
+
+pub(super) struct Version {
+    pub(super) body: HashSet<Block>,
+    pub(super) blocks: HashMap<Block, Block>,
+    pub(super) insts: HashMap<Inst, Inst>,
+    pub(super) values: HashMap<Value, Value>,
 }
 
 pub(super) fn apply_version(
@@ -45,7 +54,7 @@ pub(super) fn apply_version(
     region: &[Block],
     entry: Option<(Block, Block)>,
     speculation: &Speculation<'_>,
-) -> (HashSet<Block>, Block) {
+) -> Version {
     let Speculation {
         requirements,
         reads,
@@ -54,6 +63,7 @@ pub(super) fn apply_version(
         exits_true,
         typed,
         bounds,
+        typed_reads,
         checks,
         code_guards,
         closed_calls,
@@ -73,6 +83,11 @@ pub(super) fn apply_version(
         for inst in graph.blocks[block].insts.clone() {
             let data = graph.insts[inst].clone();
             let mut op = data.op;
+            if let Some((_, read)) = typed_reads.iter().find(|(original, _)| *original == inst)
+                && let Op::GetIndex(object, key) | Op::TypedIndex(object, key, _) = op
+            {
+                op = Op::TypedIndex(object, key, *read);
+            }
             for value in op.operands_mut() {
                 *value = values.get(value).copied().unwrap_or(*value);
             }
@@ -81,12 +96,19 @@ pub(super) fn apply_version(
             if let (Some(old), Some(new)) = (data.result, result) {
                 values.insert(old, new);
             }
-            if let Some((_, _, _, flags)) = closed_calls
+            let flags = closed_calls
                 .iter()
-                .find(|(original, _, _, _)| *original == inst)
+                .find(|call| call.inst == inst)
+                .map(|call| call.flags)
+                .or_else(|| {
+                    graph.closed_calls.get(&inst)
+                        .filter(|(expected, _)| matches!(graph.insts[inst].op, Op::Call { callee, .. } if callee == *expected))
+                        .map(|(_, flags)| *flags)
+                });
+            if let Some(flags) = flags
                 && let Op::Call { callee, .. } = graph.insts[copy].op
             {
-                graph.closed_calls.insert(copy, (callee, *flags));
+                graph.closed_calls.insert(copy, (callee, flags));
             }
             insts.insert(inst, copy);
         }
@@ -167,6 +189,7 @@ pub(super) fn apply_version(
             .unwrap();
         let next = graph.blocks.push(BlockData::default());
         graph.blocks[current].terminator = Some(Terminator {
+            source_name: None,
             span,
             kind: TerminatorKind::Branch(check, Target::new(next), original.clone()),
         });
@@ -187,6 +210,7 @@ pub(super) fn apply_version(
             .1
             .unwrap();
         graph.blocks[current].terminator = Some(Terminator {
+            source_name: None,
             span,
             kind: TerminatorKind::Branch(valid, Target::new(validated), Target::new(probes)),
         });
@@ -224,6 +248,7 @@ pub(super) fn apply_version(
                 next
             };
             graph.blocks[chain].terminator = Some(Terminator {
+                source_name: None,
                 span,
                 kind: TerminatorKind::Branch(check, Target::new(next), original.clone()),
             });
@@ -231,6 +256,7 @@ pub(super) fn apply_version(
         }
         graph.append(commit, span, Op::GuardCommit(guard), false);
         graph.blocks[commit].terminator = Some(Terminator {
+            source_name: None,
             span,
             kind: TerminatorKind::Jump(Target::new(validated)),
         });
@@ -263,6 +289,7 @@ pub(super) fn apply_version(
             .unwrap();
         let next = graph.blocks.push(BlockData::default());
         graph.blocks[current].terminator = Some(Terminator {
+            source_name: None,
             span,
             kind: TerminatorKind::Branch(check, Target::new(next), original.clone()),
         });
@@ -306,6 +333,7 @@ pub(super) fn apply_version(
                         .unwrap();
                     let next = graph.blocks.push(BlockData::default());
                     graph.blocks[current].terminator = Some(Terminator {
+                        source_name: data.source_name,
                         span: data.span,
                         kind: TerminatorKind::Branch(failed, original.clone(), Target::new(next)),
                     });
@@ -326,6 +354,7 @@ pub(super) fn apply_version(
     let mut tested = HashSet::new();
     for &block in guards {
         let Some(Terminator {
+            source_name,
             span,
             kind: TerminatorKind::Branch(condition, _, _),
         }) = graph.blocks[block].terminator.clone()
@@ -348,6 +377,7 @@ pub(super) fn apply_version(
             let key = match op {
                 Op::IsCode(value, code) => Some(EntryGuard::Code(value, code)),
                 Op::IsNumber(value) => Some(EntryGuard::Number(value)),
+                Op::IsTyped(value, None) => Some(EntryGuard::Typed(value)),
                 _ => None,
             };
             let ValueDef::Result(inst) = graph.values[condition] else {
@@ -366,12 +396,12 @@ pub(super) fn apply_version(
         });
         let next = graph.blocks.push(BlockData::default());
         graph.blocks[current].terminator = Some(Terminator {
+            source_name,
             span,
             kind: TerminatorKind::Branch(condition, Target::new(next), original.clone()),
         });
         current = next;
     }
-    current = typed_guards(graph, current, &original, typed, bounds);
     for &value in checks {
         let checked = values.get(&value).copied().unwrap_or(value);
         if !tested.insert(EntryGuard::Number(checked)) {
@@ -383,17 +413,21 @@ pub(super) fn apply_version(
             .unwrap();
         let next = graph.blocks.push(BlockData::default());
         graph.blocks[current].terminator = Some(Terminator {
+            source_name: None,
             span,
             kind: TerminatorKind::Branch(check, Target::new(next), original.clone()),
         });
         current = next;
     }
+    let mut numbers = HashMap::new();
     for &value in checks {
         let checked = values.get(&value).copied().unwrap_or(value);
-        let number = graph
-            .append(current, span, Op::AsNumber(checked), true)
-            .1
-            .unwrap();
+        let number = *numbers.entry(checked).or_insert_with(|| {
+            graph
+                .append(current, span, Op::AsNumber(checked), true)
+                .1
+                .unwrap()
+        });
         retarget(graph, &copies, checked, number);
         for arg in &mut args {
             if *arg == checked {
@@ -404,7 +438,29 @@ pub(super) fn apply_version(
             values.insert(value, number);
         }
     }
+    let mut mapped_typed = Vec::new();
+    for &(object, element) in typed {
+        let guard = (values.get(&object).copied().unwrap_or(object), element);
+        if !mapped_typed.contains(&guard)
+            && !(element.is_none() && tested.contains(&EntryGuard::Typed(guard.0)))
+        {
+            mapped_typed.push(guard);
+        }
+    }
+    let mut bounds: Vec<_> = bounds
+        .iter()
+        .map(|&(object, bound)| {
+            (
+                values.get(&object).copied().unwrap_or(object),
+                values.get(&bound).copied().unwrap_or(bound),
+            )
+        })
+        .collect();
+    bounds.sort();
+    bounds.dedup();
+    current = typed_guards(graph, current, &original, &mapped_typed, &bounds);
     graph.blocks[current].terminator = Some(Terminator {
+        source_name: None,
         span,
         kind: TerminatorKind::Jump(Target {
             block: blocks[&head],
@@ -414,6 +470,7 @@ pub(super) fn apply_version(
     match entry {
         Some((preheader, _)) => {
             graph.blocks[preheader].terminator = Some(Terminator {
+                source_name: None,
                 span,
                 kind: TerminatorKind::Jump(Target::new(start)),
             });
@@ -480,7 +537,12 @@ pub(super) fn apply_version(
         .into_iter()
         .filter(|block| copies.contains(block))
         .collect();
-    (reachable, blocks[&head])
+    Version {
+        body: reachable,
+        blocks,
+        insts,
+        values,
+    }
 }
 
 fn repair(graph: &mut Graph, values: &HashMap<Value, Vec<Value>>) {
@@ -497,6 +559,12 @@ fn repair(graph: &mut Graph, values: &HashMap<Value, Vec<Value>>) {
                 if values.contains_key(value) && !cfg.dominates(graph.def_block(*value), block) {
                     *value = repair.entering(graph, block, *value);
                 }
+            }
+            if let Some((expected, _)) = graph.closed_calls.get_mut(&inst)
+                && matches!(graph.insts[inst].op, Op::Call { callee, .. } if callee == *expected)
+                && let Op::Call { callee, .. } = &op
+            {
+                *expected = *callee;
             }
             graph.insts[inst].op = op;
         }
@@ -564,7 +632,7 @@ impl Repair<'_> {
     }
 }
 
-pub(super) fn typed_guards(
+fn typed_guards(
     graph: &mut Graph,
     mut current: Block,
     fallback: &Target,
@@ -579,6 +647,7 @@ pub(super) fn typed_guards(
             .unwrap();
         let next = graph.blocks.push(BlockData::default());
         graph.blocks[current].terminator = Some(Terminator {
+            source_name: None,
             span,
             kind: TerminatorKind::Branch(check, Target::new(next), fallback.clone()),
         });
@@ -593,6 +662,7 @@ pub(super) fn typed_guards(
         let fits = graph.append(current, span, fits, true).1.unwrap();
         let next = graph.blocks.push(BlockData::default());
         graph.blocks[current].terminator = Some(Terminator {
+            source_name: None,
             span,
             kind: TerminatorKind::Branch(fits, Target::new(next), fallback.clone()),
         });

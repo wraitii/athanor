@@ -283,6 +283,12 @@ impl Guarded {
         }
     }
 
+    pub(super) fn with_code(mut self, identities: &[(String, cranelift_module::FuncId)]) -> Self {
+        self.globals
+            .extend(identities.iter().map(|(name, _)| name.clone()));
+        self
+    }
+
     fn is_empty(&self) -> bool {
         self.globals.is_empty() && self.properties.is_empty()
     }

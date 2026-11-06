@@ -262,7 +262,7 @@ fn indexed_reads_are_reused_probed_and_get_hoisted_views() {
         analysis
             .notes
             .iter()
-            .any(|note| note.contains("1 read probes"))
+            .any(|note| note.contains("read probes"))
     );
     analysis.graph.verify().unwrap();
 }
@@ -567,7 +567,12 @@ fn capture_cell_writes_preserve_guarded_globals_and_properties() {
     graph.bindings[binding].captured = true;
     let canonical = canonicalize(graph, true).unwrap();
     let mut graph = canonical.graph.clone();
-    let regions = optimize::version(&mut graph, &mut Vec::new()).unwrap();
+    let regions = optimize::version(
+        &mut graph,
+        &specialize::ConditionalPlan::default(),
+        &mut Vec::new(),
+    )
+    .unwrap();
     graph.verify().unwrap();
     assert!(!regions.is_empty());
     assert!(

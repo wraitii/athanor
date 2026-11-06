@@ -17,6 +17,7 @@ use crate::value::{TAG_SHIFT, TAG_STRING, Value};
 use super::FunctionCompiler;
 use super::ops::{self, BinaryOp, UnaryOp as EmitUnaryOp};
 use super::repr::{Operand, Repr};
+use super::slots::{self, Slots};
 
 const HEAP: Types = Types::STRING.union(Types::OBJECT).union(Types::OTHER);
 const NUMERIC: Types = Types::NUMBER.union(Types::UNDEFINED);
@@ -26,6 +27,7 @@ struct Context<'a> {
     direct: Option<RefCell<SecondaryMap<GraphValue, Option<ClifValue>>>>,
     reprs: &'a SecondaryMap<GraphValue, Repr>,
     facts: &'a Facts,
+    slots: Slots,
 }
 
 impl Context<'_> {
@@ -106,7 +108,7 @@ impl FunctionCompiler<'_, '_> {
         self.check_error();
         self.jump(done, &[value.into()]);
         self.switch(direct);
-        let value = self.checked_temporary(raw);
+        let value = self.checked_temporary(raw, true);
         self.jump(done, &[value.into()]);
         self.switch(done);
         self.b.block_params(done)[0]
@@ -235,7 +237,41 @@ impl FunctionCompiler<'_, '_> {
             direct: (!suspends).then(|| RefCell::new(SecondaryMap::new())),
             reprs: &reprs,
             facts: &facts,
+            slots: if suspends || self.frame_size.is_none() {
+                Slots::none()
+            } else {
+                slots::assign(
+                    graph,
+                    &cfg,
+                    |value| {
+                        facts.of(value).intersects(HEAP)
+                            && !graph.borrowed.contains(&value)
+                            && !matches!(
+                                graph.defining_op(value),
+                                Some(Op::This | Op::Argument(_))
+                            )
+                    },
+                    |value| match graph.defining_op(value) {
+                        Some(Op::Get(_, name)) => name != "length",
+                        Some(Op::Read(binding)) => {
+                            !graph.bindings[*binding].captured
+                                && !graph.lazy_captures.contains(binding)
+                        }
+                        Some(
+                            Op::GetIndex(..)
+                            | Op::TypedIndex(..)
+                            | Op::IndexedGet(..)
+                            | Op::SpreadGet(..),
+                        ) => true,
+                        _ => false,
+                    },
+                )
+            },
         };
+        for (value, slot) in cx.slots.assigned() {
+            self.slots.insert(values[value.index()].as_u32(), slot);
+        }
+        self.slot_count = cx.slots.count();
         self.jump(blocks[graph.entry.index()], &[]);
         if pending[graph.entry] == 0 {
             self.b.seal_block(blocks[graph.entry.index()]);
@@ -279,7 +315,8 @@ impl FunctionCompiler<'_, '_> {
             }
             for (&value, param) in data.params.iter().zip(params) {
                 if rooted(value) && slotted {
-                    self.replace_local(values[value.index()], param, repeated(block));
+                    let repeated = repeated(block) || cx.slots.shared(value);
+                    self.replace_local(values[value.index()], param, repeated);
                 } else if rooted(value) {
                     self.initialize_local(values[value.index()], param);
                 } else if suspends {
@@ -483,7 +520,10 @@ impl FunctionCompiler<'_, '_> {
                                 self.check_error();
                                 value
                             } else {
-                                self.checked_temporary(value)
+                                let retain = data
+                                    .result
+                                    .is_none_or(|value| !self.slot_owned(graph, &cx, value));
+                                self.checked_temporary(value, retain)
                             };
                             Some(value)
                         }
@@ -518,7 +558,7 @@ impl FunctionCompiler<'_, '_> {
                         }
                         Op::CheckInitialized(value) => {
                             let value = get(self, *value);
-                            let value = self.checked_temporary(value);
+                            let value = self.checked_temporary(value, true);
                             Some(value)
                         }
                         Op::IteratorNew(value)
@@ -615,7 +655,7 @@ impl FunctionCompiler<'_, '_> {
                             let object = get(self, *object);
                             let retain = data.result.is_none_or(|value| {
                                 !graph.borrowed.contains(&value)
-                                    && !self.slot_owned(graph, &facts, value)
+                                    && !self.slot_owned(graph, &cx, value)
                             });
                             Some(self.cached_property_get(object, name, retain))
                         }
@@ -625,9 +665,10 @@ impl FunctionCompiler<'_, '_> {
                         | Op::SpreadGet(object, index) => {
                             let object = get(self, *object);
                             let index = get(self, *index);
-                            let retain = data
-                                .result
-                                .is_none_or(|value| !graph.borrowed.contains(&value));
+                            let retain = data.result.is_none_or(|value| {
+                                !graph.borrowed.contains(&value)
+                                    && !self.slot_owned(graph, &cx, value)
+                            });
                             Some(self.element_read(
                                 object,
                                 Operand::new(index, Repr::Boxed),
@@ -1050,9 +1091,10 @@ impl FunctionCompiler<'_, '_> {
                     let borrowed = (matches!(data.op, Op::This | Op::Argument(_))
                         || graph.borrowed.contains(&value))
                         && !suspends;
-                    if !borrowed && self.slot_owned(graph, &facts, value) {
-                        self.own_local(values[value.index()], result, repeated(block));
-                    } else if rooted(value) && !borrowed {
+                    if !borrowed && self.slot_owned(graph, &cx, value) {
+                        let repeated = repeated(block) || cx.slots.shared(value);
+                        self.own_local(values[value.index()], result, repeated);
+                    } else if rooted(value) && !borrowed && !slotted {
                         self.initialize_local(values[value.index()], result);
                     } else if suspends {
                         self.b.def_var(values[value.index()], result);
@@ -1068,11 +1110,7 @@ impl FunctionCompiler<'_, '_> {
             }
             let terminator = data.terminator.as_ref().unwrap();
             self.source_span = terminator.span;
-            self.source_name = data
-                .insts
-                .last()
-                .and_then(|&inst| graph.insts[inst].source_name)
-                .unwrap_or(source_name);
+            self.source_name = terminator.source_name.unwrap_or(source_name);
             let location = if self.annotations.semantic_locations {
                 cranelift_codegen::ir::SourceLoc::new(graph.terminator_location(block))
             } else if self.source_name == source_name {
@@ -1158,11 +1196,13 @@ impl FunctionCompiler<'_, '_> {
 
 impl FunctionCompiler<'_, '_> {
     /// Whether a result is stored straight into its frame slot, which takes its own reference.
-    fn slot_owned(&self, graph: &Graph, facts: &Facts, value: GraphValue) -> bool {
+    /// Values that die within their block stay owned by their temporary instead.
+    fn slot_owned(&self, graph: &Graph, cx: &Context<'_>, value: GraphValue) -> bool {
         self.frame_size.is_some()
             && self.generator.is_none()
-            && facts.of(value).intersects(HEAP)
+            && cx.facts.of(value).intersects(HEAP)
             && !graph.borrowed.contains(&value)
+            && cx.slots.of(value).is_some()
     }
 
     fn operand(&mut self, cx: &Context<'_>, value: GraphValue) -> Operand {
@@ -1375,7 +1415,7 @@ impl FunctionCompiler<'_, '_> {
                     key => key,
                 };
                 let retain = data.result.is_none_or(|value| {
-                    !graph.borrowed.contains(&value) && !self.slot_owned(graph, cx.facts, value)
+                    !graph.borrowed.contains(&value) && !self.slot_owned(graph, cx, value)
                 });
                 let result = self.viewed_index_access(view, object, key, None, fallback, retain);
                 Some(Some(Operand::new(result, Repr::Boxed)))

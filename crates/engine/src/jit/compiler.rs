@@ -666,7 +666,7 @@ impl Compiler {
                 }
             }
             if let Some(semantic) = &code.listing {
-                let ir = ir_lines(semantic, source, &lines);
+                let ir = ir_lines(semantic, source, source_path, &lines, &self.sources);
                 if let Some(dump) = self.dump.as_mut() {
                     match dump.listing(&name, &ir) {
                         Ok(written) => listing = Some(written),
@@ -1170,26 +1170,37 @@ fn line_at(starts: &[u32], offset: u32) -> u32 {
 }
 
 fn ir_lines(
-    semantic: &[(u32, Option<oxc_span::Span>, String)],
+    semantic: &[super::semantic::ListingLine],
     source: &str,
+    filename: &str,
     starts: &[u32],
+    sources: &HashMap<usize, (String, String)>,
 ) -> Vec<(u32, String)> {
     let mut result = Vec::new();
-    let mut last_line = 0;
-    for (id, span, text) in semantic {
-        if let Some(span) = span {
-            let line = line_at(starts, span.start);
-            if line != last_line {
-                last_line = line;
-                let start = starts[line as usize - 1] as usize;
-                let end = starts
-                    .get(line as usize)
-                    .map_or(source.len(), |&end| end as usize);
-                result.push((0, String::new()));
-                result.push((
-                    0,
-                    format!("  ;;; JS {line:>5} | {}", source[start..end].trim()),
-                ));
+    let mut last_location = None;
+    let mut source_lines = HashMap::new();
+    for (id, location, text) in semantic {
+        if let Some(location) = location {
+            let origin = match location.source {
+                Some(key) => sources.get(&key).map(|(source, filename)| {
+                    let starts = source_lines.entry(key).or_insert_with(|| line_starts(source));
+                    (source.as_str(), filename.as_str(), starts.as_slice())
+                }),
+                None => Some((source, filename, starts)),
+            };
+            if let Some((source, filename, starts)) = origin {
+                let line = line_at(starts, location.span.start);
+                let current = (location.source, line);
+                if last_location != Some(current) {
+                    result.push((0, String::new()));
+                    if last_location.is_none_or(|(source, _)| source != location.source) {
+                        result.push((0, format!("  ;;; SOURCE {filename}")));
+                    }
+                    last_location = Some(current);
+                    let start = starts[line as usize - 1] as usize;
+                    let end = starts.get(line as usize).map_or(source.len(), |&end| end as usize);
+                    result.push((0, format!("  ;;; JS {line:>5} | {}", source[start..end].trim())));
+                }
             }
         }
         result.push((*id, text.clone()));
@@ -1260,6 +1271,8 @@ fn validate_params(
 #[cfg(test)]
 mod listing_tests {
     use super::{ir_lines, line_starts};
+    use crate::jit::semantic::SourceLocation;
+    use std::collections::HashMap;
     use oxc_span::Span;
 
     #[test]
@@ -1267,11 +1280,11 @@ mod listing_tests {
         let source = "let x = 1;\nreturn x;\n";
         let semantic = vec![
             (0, None, "block0:".into()),
-            (1, Some(Span::new(8, 9)), "constant".into()),
-            (2, Some(Span::new(8, 9)), "store".into()),
-            (3, Some(Span::new(11, 20)), "return".into()),
+            (1, Some(SourceLocation { source: None, span: Span::new(8, 9) }), "constant".into()),
+            (2, Some(SourceLocation { source: None, span: Span::new(8, 9) }), "store".into()),
+            (3, Some(SourceLocation { source: None, span: Span::new(11, 20) }), "return".into()),
         ];
-        let lines = ir_lines(&semantic, source, &line_starts(source));
+        let lines = ir_lines(&semantic, source, "caller.js", &line_starts(source), &HashMap::new());
         assert_eq!(
             lines
                 .iter()

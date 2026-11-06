@@ -223,7 +223,7 @@ impl<'a> Builder<'a> {
             .current
             .take()
             .expect("termination of unreachable code");
-        self.graph.blocks[block].terminator = Some(Terminator { span, kind });
+        self.graph.blocks[block].terminator = Some(Terminator { source_name: None, span, kind });
     }
 
     fn jump(&mut self, span: Span, block: Block, args: Vec<Value>) {

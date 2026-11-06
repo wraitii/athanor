@@ -753,7 +753,7 @@ mod feedback_tests {
     }
 
     #[test]
-    fn get_feedback_specializes_nested_reads_and_guards_replacements() {
+    fn entry_guards_specialize_nested_reads_and_guard_replacements() {
         let mut engine = Engine::new().unwrap();
         engine.compile(
             "var matrix=[Float64Array.from([1.5,2.5])]; function read(i,j){return matrix[i][j];} function replace(){matrix[0]=[7,8];}",
@@ -772,7 +772,7 @@ mod feedback_tests {
             Value::number(2.5)
         );
         let optimized = entry(&engine, code);
-        assert_ne!(optimized, original);
+        assert_eq!(optimized, original);
         assert_eq!(
             engine
                 .call("read", &[Value::number(0.0), Value::number(-1.0)])
@@ -802,7 +802,6 @@ mod feedback_tests {
             engine.call("read", &args).unwrap().value(),
             Value::number(8.0)
         );
-        assert_eq!(entry(&engine, code), optimized);
     }
 
     #[test]
@@ -881,7 +880,7 @@ mod feedback_tests {
     }
 
     #[test]
-    fn get_feedback_specializes_named_typed_array_properties() {
+    fn entry_guards_specialize_named_typed_array_properties() {
         let mut engine = Engine::new().unwrap();
         engine.compile(
             "var holder={values:Int32Array.from([3,4])}; function read(i){return holder.values[i];} function replace(){holder.values=Float64Array.from([5.5,6.5]);}",
@@ -897,7 +896,7 @@ mod feedback_tests {
             );
         }
         let optimized = entry(&engine, code);
-        assert_ne!(optimized, original);
+        assert_eq!(optimized, original);
         engine.call("replace", &[]).unwrap();
         assert_eq!(
             engine.call("read", &args).unwrap().value(),

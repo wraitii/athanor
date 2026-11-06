@@ -27,6 +27,7 @@ pub(super) fn split_call(graph: &mut Graph, inst: Inst) -> (Block, Block, Block)
     let fallback = graph.blocks.push(BlockData::default());
     graph.move_inst(inst, fallback);
     graph.blocks[fallback].terminator = Some(Terminator {
+        source_name: call.source_name,
         span: call.span,
         kind: TerminatorKind::Jump(Target {
             block: continuation,
@@ -131,6 +132,7 @@ pub(super) fn apply(graph: &mut Graph, body: &Graph, plan: &Inline) {
     let (block, continuation, fallback) = split_call(graph, plan.call);
     let mut current = graph.blocks.push(BlockData::default());
     graph.blocks[block].terminator = Some(Terminator {
+        source_name: call.source_name,
         span: call.span,
         kind: if plan.guard_code {
             let check = graph
@@ -149,6 +151,7 @@ pub(super) fn apply(graph: &mut Graph, body: &Graph, plan: &Inline) {
             .unwrap();
         let next = graph.blocks.push(BlockData::default());
         graph.blocks[current].terminator = Some(Terminator {
+            source_name: call.source_name,
             span: call.span,
             kind: TerminatorKind::Branch(check, Target::new(next), Target::new(fallback)),
         });
@@ -162,6 +165,7 @@ pub(super) fn apply(graph: &mut Graph, body: &Graph, plan: &Inline) {
             .unwrap();
         let next = graph.blocks.push(BlockData::default());
         graph.blocks[current].terminator = Some(Terminator {
+            source_name: call.source_name,
             span: call.span,
             kind: TerminatorKind::Branch(check, Target::new(next), Target::new(fallback)),
         });
@@ -326,6 +330,7 @@ pub(super) fn apply(graph: &mut Graph, body: &Graph, plan: &Inline) {
     }
     for &block in &reachable {
         let mut terminator = body.blocks[block].terminator.clone().unwrap();
+        terminator.source_name = terminator.source_name.or(plan.source_name);
         for value in terminator.kind.operands_mut() {
             *value = values[value];
         }
@@ -342,6 +347,7 @@ pub(super) fn apply(graph: &mut Graph, body: &Graph, plan: &Inline) {
         graph.blocks[blocks[&block]].terminator = Some(terminator);
     }
     graph.blocks[current].terminator = Some(Terminator {
+        source_name: call.source_name,
         span: call.span,
         kind: TerminatorKind::Jump(Target::new(blocks[&body.entry])),
     });

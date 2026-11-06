@@ -1044,8 +1044,8 @@ generator graphs; the shared CLIF optimization passes still apply.
 
 ```text
 Oxc AST -> build -> promote -> simplify -> canonical graph
-        -> plan specialization -> inline -> simplify -> version
-        -> reuse loads -> hoist -> loop number checks -> reuse loads -> hoist
+        -> plan specialization -> inline -> simplify -> plan regions -> version
+        -> reuse loads -> hoist -> coercions and bit tests -> reuse loads -> hoist
         -> views -> simplify -> borrow
 ```
 
@@ -1172,8 +1172,8 @@ transformations.
 For example, `square(x)` with `square(x) { return x * x; }` gets a code check,
 one number check, an inline multiply, and the original call as fallback.
 `square(x * 2)` needs only the code check because its argument is already known
-numeric. This prototype does not yet merge requirements across calls or compact
-enclosing regions.
+numeric. Call-specialization requests remain per-site; subsequent region
+planning combines guards whose dependencies are available at a shared entry.
 
 `planner.rs` collects feedback independently of code emission. Fixed argument
 calls and named or indexed reads in ordinary functions have a stable site
@@ -1226,12 +1226,16 @@ calls retain arbitrary effects; global code and recognized native identities
 remain explicit conditions rather than facts inferred from observations.
 
 Exact local closure calls can use unconditional closed, read-only summaries.
-When existing region versioning cannot find a closed region, a whole-function
-copy can instead check the transitive global code identities at entry. This
-initial consumer requires every descendant and the complete caller copy to be
-read-only and closed, and rejects unresolved calls, native identity obligations,
-generators and handlers. Only calls in the validated copy receive the conditional
-proof; guard failure enters the original body before any effects execute.
+Conditional call proofs participate in the same bottom-up region planning as
+numeric, native and typed assumptions. Each call retains its transitive global
+code requirements. A candidate loop or function checks only its own requirements,
+merges covered child proofs and emits one combined guarded copy. The region must
+remain closed and preserve the guarded identities; unrelated writes are allowed
+when the ordinary region stability checks permit them. Callee summaries still
+require read-only descendants and reject unresolved calls, native identity
+obligations, generators and handlers. Only calls in the validated copy receive
+the conditional proof; guard failure enters the original region before its
+effects execute. Value substitution and nested copying preserve those proofs.
 Load reuse, hoisting and borrowing consume instruction-specific proofs, while
 generic calls retain their reentry and ownership barriers. Conditional decisions
 participate in the tiering decision record; inline budgets are unchanged.
@@ -1290,16 +1294,16 @@ successful coercing comparison does not change the original index key's type.
 Optimization works on regions: the whole function, or a loop whose body is
 closed. A region is closed when nothing in it reenters JavaScript and nothing
 writes state the region is guarded on. Typed versions of a region are selected
-by checks that run before it is entered; a region never exits mid-way. Each
-versioned region keeps exactly one generic sibling, which is not versioned
+by checks that run before it is entered. Varying inline guards can transfer to
+the original continuation before reentry. Each versioned region keeps exactly
+one generic sibling, which is not versioned
 further, so the result is a tree of loop versions that join again at loop exits.
 Values defined inside the version and used after it reach those exits through
 block parameters, placed by dominance-based SSA reconstruction.
 
 A call whose callee is a property read of a global, such as `Math.min`, reenters
 unless the callee is the expected native function. Versioning collects these
-requirements for the recognized `Math` natives, first for the function and,
-failing that, for the largest closed loops. The copy calls `CallNative` and drops
+requirements for the recognized `Math` natives while planning each region. The copy calls `CallNative` and drops
 its now unused callee reads. Its entry compares a per-guard cell against the
 realm epoch. On a mismatch the global and method probes run without invoking
 JavaScript, and on success the cell records the epoch; any identity failure
@@ -1318,8 +1322,7 @@ internal-state effect, so it stays in execution order and cannot be removed or
 hoisted. It does not clobber globals or heap properties, allowing their reads
 to move outside closed loops.
 
-When inline fallbacks prevent whole-function closure, the same entry-check
-planner used for loops attempts a function copy. Arguments and `this` seed its
+The same entry-check planner handles loops and the function body. Arguments and `this` seed its
 probe dependencies; preserved global and property reads can then feed code and
 number guards at entry. Repeated probes and identical code or number checks are
 shared. The copy takes hoisted guard branches unconditionally. Guards that
@@ -1345,39 +1348,38 @@ directly and use the existing ownership rules for the result.
 Lazy binding reads check initialization inline and retain heap temporaries with
 the inline retain-and-push path; immediate values need no runtime helper.
 
-After loads are reused and hoisted, a loop inside an optimized region whose body
-uses values defined before it as numeric operands (arithmetic, comparison,
-bitwise, Math, index keys) gets a typed copy behind `is_number` checks on those
-values; inside, `as_number` marks them as numbers. Inner loops of a typed copy
-may be checked again on values their outer loop defines. A check only replaces
-the tag test the generic code would run per operation, so no cost model is
-needed yet. Invariant read probes share these entry guards, and their results
-can also receive number checks. Other values loaded inside the loop stay generic.
+Region planning visits natural loops from innermost to outermost, then the
+function body. Each plan records native identities, numeric assumptions,
+preserved read probes, existing inline guards, typed receivers and bounds checks
+without copying control flow. Arguments and `this` can seed function-entry
+probes. Numeric assumptions feed a separate fact analysis for the candidate;
+they do not narrow the generic graph. Typed-read selection uses these facts,
+so numeric and typed conditions share a single entry decision.
 
-Loops are versioned outermost first. Each new copy reuses dominating reads before
-nested loops are considered, so reads exposed by outer guards do not become
-redundant inner-loop probes. A loop's entry checks come from its own
-blocks and from loops at most one level deeper whose header every iteration of
-the outer loop reaches; exits are ignored, as are zero-trip loops. Checks that
-cannot be placed that high stay for the inner loop, so a guard is never hoisted
-past a condition or out of more than two loops. Inline guards whose condition
-(`is_code`, `is_number`, `is_typed`, `is_array_map`) only depends on values
-defined before the loop or on probed reads, global reads included, are
-checked on entry too; the copy jumps straight to the fast path. A loop that only
-reenters through such guards' cold fallbacks is versioned the same way and its
-copy becomes a closed region. Capture-cell accesses have their own alias
-category, so writing a binding does not invalidate global or property guards.
-Unused closures and unnecessary capture cells are removed before region
-planning, and bindings that no longer need cells are promoted to SSA again.
-Unknown reentrant calls still prevent closed-region optimization.
-Typed-array checks remain a separate layer on top
-of the number copy, since a wrong typed guess should still keep the number
-copy.
+A parent absorbs a child whenever its entry assumptions establish the child's
+number facts, native identities, inline guards and typed-read guarantees. There
+is no profitability threshold yet. A receiver defined by an outer iteration, a
+read clobbered by parent writes, or a bound unavailable at parent entry can keep
+a child region separate. Preserved reads can be probed speculatively even when
+their original path is not taken: probes do not throw or invoke JavaScript, and
+failure selects the original region before its effects run.
+
+Only the resulting region tree is emitted. Each speculative node gets one copy
+behind all its guards; children already covered by an ancestor emit no copy.
+Separate child plans are remapped into the parent's fast body. Their entry
+assumptions are refreshed against the repaired SSA graph before emission, so
+exit phis and probes or guards already handled by an ancestor are respected. Native callee reads made unused by the
+planned native calls are excluded from probe discovery. Load reuse and hoisting
+run after emission. Capture-cell accesses have their own alias category, so
+writing a binding does not invalidate global or property guards. Unused
+closures and unnecessary capture cells are removed before region planning, and
+bindings that no longer need cells are promoted to SSA again. Unknown reentrant
+calls still prevent closed-region optimization.
 
 A typed-array receiver created by a typed-array constructor or its `from` or
 `of`, looked up by global name, is guessed to have that element kind; the entry
 check then compares the exact kind, so a wrong guess or a replaced constructor
-only selects the number copy. A read whose key is a loop counter starting at a
+only selects the generic sibling. A read whose key is a loop counter starting at a
 non-negative integer constant, stepping by one, and tested with `<` against a
 number defined before the copy, on a header whose false edge leaves the loop, is
 also checked once on entry: the bound must not exceed the receiver's length.

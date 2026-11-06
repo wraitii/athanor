@@ -29,8 +29,12 @@ use super::effects::{
 use super::math::METHODS;
 use crate::heap::TypedKind;
 
+pub(super) use borrow::receiver as borrowed_receiver;
 pub(super) use facts::{Facts, Types};
 pub(super) use ids::{Binding, Block, Inst, Scope, Value};
+pub(in crate::jit) use listing::ListingLine;
+#[cfg(test)]
+pub(in crate::jit) use listing::SourceLocation;
 
 #[allow(deprecated)]
 mod ids {
@@ -321,6 +325,7 @@ pub(super) enum TerminatorKind {
 
 #[derive(Clone)]
 pub(super) struct Terminator {
+    pub(super) source_name: Option<(usize, usize)>,
     pub(super) span: Span,
     pub(super) kind: TerminatorKind,
 }
@@ -844,6 +849,9 @@ impl Graph {
     pub(super) fn replace_uses(&mut self, aliases: &HashMap<Value, Value>) {
         if aliases.is_empty() {
             return;
+        }
+        for (callee, _) in self.closed_calls.values_mut() {
+            *callee = resolve(aliases, *callee);
         }
         for data in self.insts.values_mut() {
             for value in data.op.operands_mut() {
@@ -1384,7 +1392,7 @@ pub(super) fn plan_canonical(
     }
     expansions.constructors(&mut graph);
     if let Some((bodies, source)) = specialization {
-        for _ in 0..3 {
+        for _ in 0..specialize::SPECIALIZATION_ROUNDS {
             let requests = specialize::requests(&graph, bodies, source);
             let plan =
                 specialize::plan_round(&graph, bodies, source, &requests, &mut inline_budget);
@@ -1446,12 +1454,7 @@ pub(super) fn optimize_planned(planned: Planned) -> Result<Analysis> {
         optimize::simplify(&mut graph);
     }
     graph.verify()?;
-    let mut regions = optimize::version(&mut graph, &mut notes)?;
-    if regions.is_empty()
-        && let Some(region) = optimize::version_conditional(&mut graph, &conditional, &mut notes)?
-    {
-        regions.push(region);
-    }
+    let mut regions = optimize::version(&mut graph, &conditional, &mut notes)?;
     graph.verify()?;
     if regions.is_empty() {
         regions.extend(optimize::version_string_leaves(&mut graph, &mut notes)?);
@@ -1465,11 +1468,10 @@ pub(super) fn optimize_planned(planned: Planned) -> Result<Analysis> {
         optimize::hoist(&mut graph, region, &mut notes);
         graph.verify()?;
     }
-    let copies = optimize::check_loops(&mut graph, &mut regions, &mut notes)?;
     optimize::coercions(&mut graph);
     optimize::bit_tests(&mut graph);
     graph.verify()?;
-    for region in regions.iter().chain(&copies) {
+    for region in &regions {
         optimize::reuse_loads(&mut graph, region, &mut notes);
         graph.verify()?;
         optimize::hoist(&mut graph, region, &mut notes);

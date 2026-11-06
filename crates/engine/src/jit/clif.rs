@@ -26,5 +26,5 @@ pub(super) struct Annotations {
 pub(super) struct FunctionBody {
     pub function: Function,
     pub annotations: Annotations,
-    pub listing: Option<Vec<(u32, Option<oxc_span::Span>, String)>>,
+    pub listing: Option<Vec<super::semantic::ListingLine>>,
 }

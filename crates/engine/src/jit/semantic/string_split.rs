@@ -212,12 +212,14 @@ pub(super) fn expand(graph: &mut Graph, expanded: &mut HashSet<Inst>) {
         let (guard, check) = graph.append(block, data.span, Op::IsStringSplit(callee), true);
         graph.insts[guard].source_name = data.source_name;
         graph.blocks[block].terminator = Some(Terminator {
+            source_name: data.source_name,
             span: data.span,
             kind: TerminatorKind::Branch(check.unwrap(), Target::new(fast), Target::new(fallback)),
         });
         let (call, result) = graph.append(fast, data.span, Op::StringSplit(receiver, args), true);
         graph.insts[call].source_name = data.source_name;
         graph.blocks[fast].terminator = Some(Terminator {
+            source_name: data.source_name,
             span: data.span,
             kind: TerminatorKind::Jump(Target {
                 block: continuation,

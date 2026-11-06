@@ -120,6 +120,7 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
         .1
         .unwrap();
     graph.blocks[block].terminator = Some(Terminator {
+        source_name: call.source_name,
         span,
         kind: TerminatorKind::Branch(check, Target::new(start), Target::new(fallback)),
     });
@@ -145,6 +146,7 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
         .unwrap();
     let index = graph.add_param(header);
     graph.blocks[start].terminator = Some(Terminator {
+        source_name: call.source_name,
         span,
         kind: TerminatorKind::Jump(Target {
             block: header,
@@ -161,6 +163,7 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
         .1
         .unwrap();
     graph.blocks[header].terminator = Some(Terminator {
+        source_name: call.source_name,
         span,
         kind: TerminatorKind::Branch(more, Target::new(read), Target::new(exit)),
     });
@@ -173,6 +176,7 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
         .1
         .unwrap();
     graph.blocks[read].terminator = Some(Terminator {
+        source_name: call.source_name,
         span,
         kind: TerminatorKind::Branch(absent, Target::new(advance), Target::new(invoke)),
     });
@@ -193,6 +197,7 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
         ArrayMethod::Map => {
             graph.append(invoke, span, Op::SetIndex(result, index, mapped), false);
             graph.blocks[invoke].terminator = Some(Terminator {
+                source_name: call.source_name,
                 span,
                 kind: TerminatorKind::Jump(Target::new(advance)),
             });
@@ -200,11 +205,13 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
         ArrayMethod::Filter => {
             let keep = graph.blocks.push(BlockData::default());
             graph.blocks[invoke].terminator = Some(Terminator {
+                source_name: call.source_name,
                 span,
                 kind: TerminatorKind::Branch(mapped, Target::new(keep), Target::new(advance)),
             });
             graph.append(keep, span, Op::ArrayAppend(result, element, false), false);
             graph.blocks[keep].terminator = Some(Terminator {
+                source_name: call.source_name,
                 span,
                 kind: TerminatorKind::Jump(Target::new(advance)),
             });
@@ -217,6 +224,7 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
                 (Target::new(advance), Target::new(stop))
             };
             graph.blocks[invoke].terminator = Some(Terminator {
+                source_name: call.source_name,
                 span,
                 kind: TerminatorKind::Branch(mapped, targets.0, targets.1),
             });
@@ -230,6 +238,7 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
                 .1
                 .unwrap();
             graph.blocks[stop].terminator = Some(Terminator {
+                source_name: call.source_name,
                 span,
                 kind: TerminatorKind::Jump(Target {
                     block: continuation,
@@ -252,6 +261,7 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
         .1
         .unwrap();
     graph.blocks[advance].terminator = Some(Terminator {
+        source_name: call.source_name,
         span,
         kind: TerminatorKind::Jump(Target {
             block: header,
@@ -259,6 +269,7 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
         }),
     });
     graph.blocks[exit].terminator = Some(Terminator {
+        source_name: call.source_name,
         span,
         kind: TerminatorKind::Jump(Target {
             block: continuation,

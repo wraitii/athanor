@@ -9,92 +9,19 @@ use super::{
 };
 use crate::heap::TypedKind;
 
+const SPECIALIZATION_REGION_LIMIT: usize = 512;
+
 mod analysis;
+mod planning;
 mod simplify;
 mod versioning;
 
 #[cfg(test)]
 use analysis::unescaped;
 use analysis::{Access, Guarded, Requirement, Writes, closure_failure, requirements};
+pub(super) use planning::version;
 pub(super) use simplify::{bit_tests, coercions, simplify, typeof_comparisons};
 use versioning::{Speculation, apply_version};
-
-pub(super) fn version_conditional(
-    graph: &mut Graph,
-    plan: &super::specialize::ConditionalPlan,
-    notes: &mut Vec<String>,
-) -> Result<Option<HashSet<Block>>> {
-    if plan.calls.is_empty() || plan.identities.is_empty() {
-        return Ok(None);
-    }
-    let blocks = Cfg::new(graph).rpo;
-    let facts = Facts::compute(graph);
-    let calls: HashMap<_, _> = plan
-        .calls
-        .iter()
-        .map(|(inst, callee, name, flags)| (*inst, (*callee, name, *flags)))
-        .collect();
-    for &block in &blocks {
-        for &inst in &graph.blocks[block].insts {
-            let op = &graph.insts[inst].op;
-            let mut contract = graph.inst_contract(inst, &facts);
-            if let Some(&(expected, name, flags)) = calls.get(&inst) {
-                if !matches!(op, Op::Call { callee, .. } if *callee == expected)
-                    || !matches!(graph.defining_op(expected), Some(Op::GlobalRead(current)) if current == name)
-                {
-                    notes.push(format!(
-                        "function: conditional call proof rejected at {inst}: callee changed"
-                    ));
-                    return Ok(None);
-                }
-                contract.reentry = Reentry::Closed;
-                contract.flags = flags;
-            }
-            if contract.reentry != Reentry::Closed
-                || contract.flags & (GLOBAL_WRITE | HEAP_WRITE) != 0
-                || matches!(op, Op::Define(..) | Op::DefineHidden(..))
-            {
-                notes.push(format!(
-                    "function: conditional call proof rejected at {inst} ({})",
-                    graph.op_text(op)
-                ));
-                return Ok(None);
-            }
-        }
-    }
-    let mut candidate = graph.clone();
-    let speculation = Speculation {
-        code_guards: &plan.identities,
-        closed_calls: &plan.calls,
-        ..Default::default()
-    };
-    let (copy, _) = apply_version(&mut candidate, &blocks, None, &speculation);
-    candidate.verify()?;
-    let facts = Facts::compute(&candidate);
-    for &block in &copy {
-        for &inst in &candidate.blocks[block].insts {
-            let op = &candidate.insts[inst].op;
-            let contract = candidate.inst_contract(inst, &facts);
-            if contract.reentry != Reentry::Closed
-                || contract.flags & (GLOBAL_WRITE | HEAP_WRITE) != 0
-                || matches!(op, Op::Define(..) | Op::DefineHidden(..))
-            {
-                notes.push(format!(
-                    "function: conditional call proof rejected at {inst} ({})",
-                    candidate.op_text(op)
-                ));
-                return Ok(None);
-            }
-        }
-    }
-    notes.push(format!(
-        "function: {} global code checks prove {} read-only call(s)",
-        plan.identities.len(),
-        plan.calls.len()
-    ));
-    *graph = candidate;
-    Ok(Some(copy))
-}
 
 pub(super) fn version_string_leaves(
     graph: &mut Graph,
@@ -167,7 +94,7 @@ pub(super) fn version_string_leaves(
             .iter()
             .map(|&block| graph.blocks[block].insts.len())
             .sum();
-        if cost > 512 {
+        if cost > SPECIALIZATION_REGION_LIMIT {
             continue;
         }
         let exits: Vec<_> = blocks
@@ -213,12 +140,13 @@ pub(super) fn version_string_leaves(
             exits_true: &exits_true,
             ..Default::default()
         };
-        let (copy, _) = apply_version(
+        let version = apply_version(
             &mut candidate,
             &blocks,
             Some((preheader, header)),
             &speculation,
         );
+        let copy = version.body;
         simplify(&mut candidate);
         candidate.verify()?;
         let reachable: HashSet<_> = Cfg::new(&candidate).rpo.into_iter().collect();
@@ -238,282 +166,6 @@ pub(super) fn version_string_leaves(
         break;
     }
     Ok(regions)
-}
-
-pub(super) fn version(graph: &mut Graph, notes: &mut Vec<String>) -> Result<Vec<HashSet<Block>>> {
-    let blocks = Cfg::new(graph).rpo;
-    let mut reasons = Vec::new();
-    if let Some(region) = region(graph, &blocks, None, "", &mut reasons)? {
-        notes.extend(reasons);
-        return Ok(vec![region]);
-    }
-    let mut checked = Vec::new();
-    if let Some((copy, _)) =
-        checked_region(graph, &blocks, None, &blocks, "function: ", &mut checked)?
-    {
-        notes.extend(checked);
-        return Ok(vec![copy]);
-    }
-    notes.extend(reasons);
-    notes.extend(checked);
-    let mut regions = Vec::new();
-    let mut covered = HashSet::new();
-    let mut tried = HashSet::new();
-    loop {
-        let cfg = Cfg::new(graph);
-        let Some((header, body)) = natural_loops(graph, &cfg)
-            .into_iter()
-            .rev()
-            .find(|(header, body)| !tried.contains(header) && body.is_disjoint(&covered))
-        else {
-            return Ok(regions);
-        };
-        tried.insert(header);
-        let Some(preheader) = preheader(graph, &cfg, header, &body) else {
-            continue;
-        };
-        let blocks: Vec<Block> = cfg
-            .rpo
-            .iter()
-            .copied()
-            .filter(|block| body.contains(block))
-            .collect();
-        let label = format!("loop at {header}: ");
-        if let Some(region) = region(graph, &blocks, Some((preheader, header)), &label, notes)? {
-            covered.extend(body);
-            covered.extend(region.iter().copied());
-            regions.push(region);
-        }
-    }
-}
-
-fn region(
-    graph: &mut Graph,
-    blocks: &[Block],
-    entry: Option<(Block, Block)>,
-    label: &str,
-    notes: &mut Vec<String>,
-) -> Result<Option<HashSet<Block>>> {
-    let all: HashSet<Block> = blocks.iter().copied().collect();
-    let requirements = requirements(graph, blocks);
-    if requirements.is_empty() {
-        if let Some(reason) = closure_failure(graph, &all, &Guarded::default()) {
-            notes.push(format!("{label}not optimized: {reason}"));
-            return Ok(None);
-        }
-    }
-    if requirements.is_empty() {
-        notes.push(format!("{label}closed without guards"));
-        return Ok(Some(all));
-    }
-    let mut candidate = graph.clone();
-    let speculation = Speculation {
-        requirements: &requirements,
-        ..Default::default()
-    };
-    let (fast, _) = apply_version(&mut candidate, blocks, entry, &speculation);
-    candidate.verify()?;
-    if let Some(reason) = closure_failure(&candidate, &fast, &Guarded::new(&requirements)) {
-        notes.push(format!("{label}not versioned: guarded copy {reason}"));
-        return Ok(None);
-    }
-    for requirement in &requirements {
-        let span = graph.insts[requirement.call].span;
-        notes.push(format!(
-            "{label}call at {}..{} reenters unless its callee is {}",
-            span.start, span.end, requirement.native
-        ));
-    }
-    let head = entry.map_or(graph.entry, |(_, header)| header);
-    notes.push(format!(
-        "{label}versioned: entry guards select the closed copy, {head} keeps the original"
-    ));
-    *graph = candidate;
-    Ok(Some(fast))
-}
-
-const LIFT: usize = 2;
-
-/// Blocks of loop `index` whose guards may be checked on entry to it: those at most `LIFT` loops
-/// deep, where each nested loop on the way is entered on every iteration of its parent.
-fn placed_blocks(graph: &Graph, loops: &[(Block, HashSet<Block>)], index: usize) -> HashSet<Block> {
-    let (_, body) = &loops[index];
-    let mut entered = HashMap::new();
-    body.iter()
-        .copied()
-        .filter(|&block| {
-            let chain: Vec<usize> = (0..=index)
-                .filter(|&inner| loops[inner].1.contains(&block))
-                .collect();
-            chain.len() <= LIFT
-                && chain.windows(2).all(|pair| {
-                    *entered
-                        .entry((pair[1], pair[0]))
-                        .or_insert_with(|| enters(graph, &loops[pair[1]], loops[pair[0]].0))
-                })
-        })
-        .collect()
-}
-
-fn enters(graph: &Graph, (header, body): &(Block, HashSet<Block>), inner: Block) -> bool {
-    let mut visited = HashSet::new();
-    let mut pending = graph.successors(*header);
-    while let Some(block) = pending.pop() {
-        if block == *header {
-            return false;
-        }
-        if block != inner && body.contains(&block) && visited.insert(block) {
-            pending.extend(graph.successors(block));
-        }
-    }
-    true
-}
-
-fn checked_region(
-    graph: &mut Graph,
-    blocks: &[Block],
-    entry: Option<(Block, Block)>,
-    scan: &[Block],
-    label: &str,
-    notes: &mut Vec<String>,
-) -> Result<Option<(HashSet<Block>, Block)>> {
-    let body: HashSet<_> = blocks.iter().copied().collect();
-    let branches: Vec<_> = blocks
-        .iter()
-        .copied()
-        .filter(|&block| guard_fallback(graph, block).is_some())
-        .collect();
-    let fallbacks: HashSet<_> = branches
-        .iter()
-        .filter_map(|&block| guard_fallback(graph, block))
-        .collect();
-    let written: HashSet<_> = body.difference(&fallbacks).copied().collect();
-    let requirements = requirements(graph, blocks);
-    let guarded = Guarded::new(&requirements);
-    let mut planning = graph.clone();
-    // These effects apply only after the native identity checks at region entry.
-    for requirement in &requirements {
-        let Op::Call { args, .. } = &graph.insts[requirement.call].op else {
-            unreachable!();
-        };
-        planning.insts[requirement.call].op = Op::CallNative(requirement.native, args.clone());
-    }
-    if closure_failure(&planning, &written, &guarded).is_some() {
-        return Ok(None);
-    }
-    let probes = probe_reads(&planning, &body, &written, scan, entry.is_none());
-    let checks = entry_checks(&planning, &body, scan, &probes);
-    let guards = invariant_guards(&planning, &body, scan, &probes);
-    if requirements.is_empty() && checks.is_empty() && probes.is_empty() && guards.is_empty() {
-        return Ok(None);
-    }
-    let speculation = Speculation {
-        requirements: &requirements,
-        checks: &checks,
-        reads: &probes,
-        guards: &guards,
-        exits: &branches,
-        ..Default::default()
-    };
-    let mut candidate = graph.clone();
-    let (copy, header) = apply_version(&mut candidate, blocks, entry, &speculation);
-    candidate.verify()?;
-    if let Some(reason) = closure_failure(&candidate, &copy, &guarded) {
-        notes.push(format!("{label}not versioned: guarded copy {reason}"));
-        return Ok(None);
-    }
-    let list: Vec<_> = checks.iter().map(ToString::to_string).collect();
-    notes.push(format!(
-        "{label}versioned: number checks on [{}], {} read probes and {} hoisted guards select the closed copy",
-        list.join(", "), probes.len(), guards.len()
-    ));
-    *graph = candidate;
-    Ok(Some((copy, header)))
-}
-
-pub(super) fn check_loops(
-    graph: &mut Graph,
-    regions: &mut Vec<HashSet<Block>>,
-    notes: &mut Vec<String>,
-) -> Result<Vec<HashSet<Block>>> {
-    let mut copies = Vec::new();
-    let mut tried = HashSet::new();
-    loop {
-        let cfg = Cfg::new(graph);
-        let loops = natural_loops(graph, &cfg);
-        let Some(index) = (0..loops.len()).rev().find(|&index| {
-            let header = loops[index].0;
-            !tried.contains(&header) && !graph.cold.contains(&header)
-        }) else {
-            return Ok(copies);
-        };
-        let (header, body) = loops[index].clone();
-        tried.insert(header);
-        let Some(preheader) = preheader(graph, &cfg, header, &body) else {
-            continue;
-        };
-        let placed = placed_blocks(graph, &loops, index);
-        let blocks: Vec<Block> = cfg
-            .rpo
-            .iter()
-            .copied()
-            .filter(|block| body.contains(block))
-            .collect();
-        let scan: Vec<Block> = blocks
-            .iter()
-            .copied()
-            .filter(|block| placed.contains(block))
-            .collect();
-        let Some(Terminator {
-            kind: TerminatorKind::Jump(fallback),
-            ..
-        }) = graph.blocks[preheader].terminator.clone()
-        else {
-            unreachable!();
-        };
-        let closed = regions.iter().any(|region| body.is_subset(region));
-        let mut candidate = graph.clone();
-        let label = format!("loop at {header}: ");
-        let numbered = checked_region(
-            &mut candidate,
-            &blocks,
-            Some((preheader, header)),
-            &scan,
-            &label,
-            notes,
-        )?;
-        let (layer_body, layer_header) = match &numbered {
-            Some((copy, copy_header)) => (copy.clone(), *copy_header),
-            None => (body.clone(), header),
-        };
-        if !closed && numbered.is_none() {
-            continue;
-        }
-        let typed = typed_version(
-            &mut candidate,
-            layer_header,
-            &layer_body,
-            numbered.as_ref().map(|_| &fallback),
-            notes,
-        )?;
-        if numbered.is_none() && typed.is_none() {
-            continue;
-        }
-        *graph = candidate;
-        let (copy, copy_header) = typed.or(numbered).unwrap();
-        tried.insert(copy_header);
-        reuse_loads(graph, &copy, notes);
-        if !closed {
-            regions.push(copy.clone());
-        } else {
-            for region in regions.iter_mut() {
-                if body.is_subset(region) {
-                    region.extend(copy.iter().copied());
-                }
-            }
-        }
-        copies.push(copy);
-    }
 }
 
 fn guard_fallback(graph: &Graph, block: Block) -> Option<Block> {
@@ -584,14 +236,19 @@ fn receiver_use(op: &Op, index: usize) -> bool {
     }
 }
 
-fn typed_objects(graph: &Graph, body: &HashSet<Block>, scan: &HashSet<Block>) -> Vec<Value> {
-    let facts = Facts::compute(graph);
+fn typed_objects(
+    graph: &Graph,
+    body: &HashSet<Block>,
+    available: &HashSet<Value>,
+    facts: &Facts,
+) -> Vec<Value> {
     let mut reads = HashMap::new();
-    for &block in scan {
+    for &block in body {
         for &inst in &graph.blocks[block].insts {
             let data = &graph.insts[inst];
-            if let (Op::GetIndex(object, key), Some(result)) = (&data.op, data.result)
-                && !body.contains(&graph.def_block(*object))
+            if let (Op::GetIndex(object, key) | Op::TypedIndex(object, key, _), Some(result)) =
+                (&data.op, data.result)
+                && (!body.contains(&graph.def_block(*object)) || available.contains(object))
                 && facts.of(*object).intersects(Types::OBJECT)
                 && facts.of(*key).within(NUMERIC)
             {
@@ -616,101 +273,6 @@ fn typed_objects(graph: &Graph, body: &HashSet<Block>, scan: &HashSet<Block>) ->
     let mut objects: Vec<Value> = objects.difference(&excluded).copied().collect();
     objects.sort();
     objects
-}
-
-fn typed_version(
-    graph: &mut Graph,
-    header: Block,
-    body: &HashSet<Block>,
-    fallback: Option<&Target>,
-    notes: &mut Vec<String>,
-) -> Result<Option<(HashSet<Block>, Block)>> {
-    let cfg = Cfg::new(graph);
-    let Some(preheader) = preheader(graph, &cfg, header, body) else {
-        return Ok(None);
-    };
-    let loops = natural_loops(graph, &cfg);
-    let Some(index) = loops.iter().position(|(candidate, _)| *candidate == header) else {
-        return Ok(None);
-    };
-    let objects = typed_objects(graph, body, &placed_blocks(graph, &loops, index));
-    if objects.is_empty() {
-        return Ok(None);
-    }
-    let blocks: Vec<Block> = cfg
-        .rpo
-        .iter()
-        .copied()
-        .filter(|block| body.contains(block))
-        .collect();
-    let typed: Vec<(Value, Option<TypedKind>)> = objects
-        .iter()
-        .map(|&object| (object, element_guess(graph, object)))
-        .collect();
-    let mut bounds: Vec<(Value, Value)> = bounded_reads(graph, &cfg, body, &objects)
-        .into_values()
-        .collect();
-    bounds.sort();
-    bounds.dedup();
-    let mut candidate = graph.clone();
-    let speculation = Speculation {
-        typed: &typed,
-        bounds: &bounds,
-        ..Default::default()
-    };
-    let (copy, copy_header) = if let Some(fallback) = fallback {
-        let continuation = candidate.blocks[preheader].terminator.take().unwrap();
-        let current =
-            versioning::typed_guards(&mut candidate, preheader, fallback, &typed, &bounds);
-        candidate.blocks[current].terminator = Some(continuation);
-        (body.clone(), header)
-    } else {
-        apply_version(
-            &mut candidate,
-            &blocks,
-            Some((preheader, header)),
-            &speculation,
-        )
-    };
-    let facts = Facts::compute(&candidate);
-    let bounded = bounded_reads(&candidate, &Cfg::new(&candidate), &copy, &objects);
-    for &block in &copy {
-        for inst in candidate.blocks[block].insts.clone() {
-            if let Op::GetIndex(object, key) = candidate.insts[inst].op
-                && let Some(&(_, element)) = typed.iter().find(|(typed, _)| *typed == object)
-                && facts.of(key).within(NUMERIC)
-            {
-                let read = TypedRead {
-                    element,
-                    bounded: bounded.contains_key(&inst),
-                };
-                candidate.insts[inst].op = Op::TypedIndex(object, key, read);
-            }
-        }
-    }
-    candidate.verify()?;
-    if closure_failure(&candidate, &copy, &Guarded::default()).is_some() {
-        return Ok(None);
-    }
-    let list: Vec<String> = typed
-        .iter()
-        .map(|(object, element)| match element {
-            Some(element) => format!("{object} as {element:?}"),
-            None => object.to_string(),
-        })
-        .collect();
-    notes.push(format!(
-        "loop at {header}: typed array checks on [{}] and {} length checks select the {}copy",
-        list.join(", "),
-        bounds.len(),
-        if fallback.is_some() {
-            "combined "
-        } else {
-            "typed "
-        }
-    ));
-    *graph = candidate;
-    Ok(Some((copy, copy_header)))
 }
 
 fn element_guess(graph: &Graph, object: Value) -> Option<TypedKind> {
@@ -767,8 +329,9 @@ fn bounded_reads(
     cfg: &Cfg,
     region: &HashSet<Block>,
     objects: &[Value],
+    available: &HashSet<Value>,
+    facts: &Facts,
 ) -> HashMap<Inst, (Value, Value)> {
-    let facts = Facts::compute(graph);
     let mut counters = HashMap::new();
     for (header, body) in natural_loops(graph, cfg) {
         if !region.contains(&header) {
@@ -795,7 +358,7 @@ fn bounded_reads(
         };
         if !body.contains(&inside.block)
             || body.contains(&outside.block)
-            || region.contains(&graph.def_block(bound))
+            || region.contains(&graph.def_block(bound)) && !available.contains(&bound)
             || !facts.of(bound).within(Types::NUMBER)
             || !counts_up(graph, cfg, header, &body, counter)
         {
@@ -1341,7 +904,7 @@ mod tests {
             analysis
                 .notes
                 .iter()
-                .any(|note| note.contains("select the combined copy"))
+                .any(|note| note.contains("function: combined entry guards"))
         );
         graph.verify().unwrap();
     }
@@ -1378,6 +941,7 @@ mod tests {
             .1
             .unwrap();
         graph.blocks[block].terminator = Some(Terminator {
+            source_name: None,
             span,
             kind: TerminatorKind::Return(result),
         });

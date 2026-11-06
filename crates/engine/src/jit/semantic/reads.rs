@@ -81,6 +81,7 @@ pub(super) fn apply(
         };
         let check = graph.append(block, data.span, guard, true).1.unwrap();
         graph.blocks[block].terminator = Some(Terminator {
+            source_name: data.source_name,
             span: data.span,
             kind: TerminatorKind::Branch(check, Target::new(fast), Target::new(fallback)),
         });
@@ -91,6 +92,7 @@ pub(super) fn apply(
                 .1
                 .unwrap();
             graph.blocks[fast].terminator = Some(Terminator {
+                source_name: data.source_name,
                 span: data.span,
                 kind: TerminatorKind::Branch(check, Target::new(typed), Target::new(fallback)),
             });
@@ -121,6 +123,7 @@ pub(super) fn apply(
         );
         graph.insts[inst].source_name = data.source_name;
         graph.blocks[fast].terminator = Some(Terminator {
+            source_name: data.source_name,
             span: data.span,
             kind: TerminatorKind::Jump(Target {
                 block: continuation,

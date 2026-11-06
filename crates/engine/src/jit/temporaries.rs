@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use cranelift_codegen::ir::{Function, Inst, InstBuilder};
+use cranelift_codegen::ir::{BlockArg, Function, Inst, InstBuilder};
 
 use super::clif::Annotations;
 use super::effects::{self, TemporaryEffect};
@@ -78,7 +78,15 @@ pub(super) fn remove_empty_clears(function: &mut Function, annotations: &Annotat
         }
     }
     for &(inst, done) in &remove {
-        function.replace(inst).jump(done, &[]);
+        // SSA construction may still pass variables to the continuation.
+        let dfg = &function.dfg;
+        let args: Vec<BlockArg> = dfg.insts[inst]
+            .branch_destination(&dfg.jump_tables, &dfg.exception_tables)
+            .iter()
+            .find(|destination| destination.block(&dfg.value_lists) == done)
+            .map(|destination| destination.args(&dfg.value_lists).collect())
+            .unwrap_or_default();
+        function.replace(inst).jump(done, &args);
     }
     remove.len()
 }

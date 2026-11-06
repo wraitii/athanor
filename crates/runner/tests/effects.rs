@@ -11,7 +11,7 @@ fn semantic_graph_versions_math_calls_and_preserves_fallbacks() {
     let dump = String::from_utf8(dump.stdout).unwrap();
     assert!(dump.contains("probe_global Math"));
     assert!(dump.contains("call_native Math.floor"));
-    assert!(dump.contains("note: versioned:"));
+    assert!(dump.contains("combined entry guards:"));
     let disabled = Command::new(env!("CARGO_BIN_EXE_js-runner"))
         .env("JS_JIT_SSA", "0")
         .args(["--compile", "--no-ir", "--semantic-ir", "--eval", source])
@@ -62,7 +62,7 @@ fn private_iteration_does_not_block_versioning() {
         f.split("semantic IR")
             .next()
             .unwrap()
-            .contains("note: versioned:")
+            .contains("combined entry guards:")
     );
     for enabled in [false, true] {
         let result = Command::new(env!("CARGO_BIN_EXE_js-runner"))
@@ -90,7 +90,7 @@ fn loops_version_independently_of_their_function() {
         f.split("semantic IR")
             .next()
             .unwrap()
-            .contains(": versioned:")
+            .contains(": combined entry guards:")
     );
     for enabled in [false, true] {
         let result = Command::new(env!("CARGO_BIN_EXE_js-runner"))
@@ -350,7 +350,7 @@ fn whole_function_guards_expose_closed_inlined_arithmetic() {
         .split("semantic IR")
         .next()
         .unwrap();
-    assert!(function.contains("function: versioned:"));
+    assert!(function.contains("function: combined entry guards:"));
     let fast = function.split("\nblock0:").next().unwrap();
     assert_eq!(fast.matches("probe_global square").count(), 1);
     assert_eq!(fast.matches(" = is_code ").count(), 1);
@@ -528,5 +528,5 @@ fn string_split_guard_can_select_a_closed_version() {
         .next()
         .unwrap();
     assert!(caller.contains("probe") && caller.contains("is_string_split"));
-    assert!(caller.contains("hoisted guards select the closed copy"));
+    assert!(caller.contains("hoisted guards"));
 }

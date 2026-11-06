@@ -40,7 +40,7 @@ impl FunctionCompiler<'_, '_> {
         self.call_helper(Helper::LocalReplace, &[slot, value, old]);
         self.jump(done, &[]);
         self.switch(release);
-        self.release_inline(old, done);
+        self.release_inline(old, done, false);
         self.switch(done);
         self.b.def_var(variable, value);
     }
@@ -75,15 +75,13 @@ impl FunctionCompiler<'_, '_> {
         self.switch(done);
     }
 
-    pub(super) fn checked_temporary(&mut self, value: ClifValue) -> ClifValue {
+    pub(super) fn checked_temporary(&mut self, value: ClifValue, retain: bool) -> ClifValue {
         let missing =
             self.b
                 .ins()
                 .icmp_imm_s(IntCC::Equal, value, Value::UNINITIALIZED.bits() as i64);
         let error = self.b.create_block();
         let valid = self.b.create_block();
-        let retain = self.b.create_block();
-        let done = self.b.create_block();
         self.b.set_cold_block(error);
         self.brif(missing, error, &[], valid, &[]);
         self.switch(error);
@@ -91,9 +89,14 @@ impl FunctionCompiler<'_, '_> {
         self.check_error();
         self.jump(valid, &[]);
         self.switch(valid);
+        if !retain {
+            return value;
+        }
         let heap = self.is_heap(value);
-        self.brif(heap, retain, &[], done, &[]);
-        self.switch(retain);
+        let push = self.b.create_block();
+        let done = self.b.create_block();
+        self.brif(heap, push, &[], done, &[]);
+        self.switch(push);
         self.retain_temporary(value);
         self.jump(done, &[]);
         self.switch(done);
@@ -161,7 +164,7 @@ impl FunctionCompiler<'_, '_> {
         let done = self.b.create_block();
         self.brif(heap, release, &[], done, &[]);
         self.switch(release);
-        self.release_inline(old, done);
+        self.release_inline(old, done, true);
         self.switch(done);
         self.b.def_var(variable, value);
     }
@@ -172,8 +175,10 @@ impl FunctionCompiler<'_, '_> {
             let dirty = self.b.ins().iconst(types::I8, 1);
             self.b.def_var(roots, dirty);
         }
-        let next = self.slots.len() as u32;
-        let index = *self.slots.entry(variable.as_u32()).or_insert(next);
+        let index = *self.slots.entry(variable.as_u32()).or_insert_with(|| {
+            self.slot_count += 1;
+            self.slot_count - 1
+        });
         let flags = MemFlagsData::trusted();
         let base = self.b.ins().load(
             types::I64,
@@ -188,7 +193,7 @@ impl FunctionCompiler<'_, '_> {
     }
 
     /// Releases a heap-tagged value, calling the runtime only when its count would reach zero.
-    fn release_inline(&mut self, value: ClifValue, done: Block) {
+    fn release_inline(&mut self, value: ClifValue, done: Block, cold_drop: bool) {
         let address = self.b.ins().band_imm_s(value, ADDRESS_MASK);
         let load = self.b.create_block();
         let decrement = self.b.create_block();
@@ -212,6 +217,9 @@ impl FunctionCompiler<'_, '_> {
             .store(flags, references, address, REFERENCES_OFFSET);
         self.jump(done, &[]);
         self.switch(last);
+        if cold_drop {
+            self.b.set_cold_block(last);
+        }
         self.call_helper(Helper::Release, &[value]);
         self.jump(done, &[]);
     }

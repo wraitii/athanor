@@ -676,3 +676,55 @@ fn mixed_relational_comparisons_preserve_coercions_and_string_ordering() {
         assert!(matches!(engine.call("fail", &[]), Err(Error::Runtime(_))));
     }
 }
+
+#[test]
+fn conditional_region_guards_preserve_recursive_calls_and_replacements() {
+    let source = r#"
+        let state = { value: 3 };
+        function first(n) { if (n) return second(n - 1); return state.value; }
+        function second(n) { if (n) return first(n - 1); return state.value; }
+        function sum(xs, n) {
+            let total = 0;
+            for (let i = 0; i < n; ++i) total += Math.floor(xs[i]);
+            return total + first(n);
+        }
+        function rows(xs) {
+            let total = 0;
+            for (let y = 0; y < 2; ++y) {
+                const row = xs[y];
+                for (let x = 0; x < 2; ++x) total += row[x] + first(x);
+            }
+            return total;
+        }
+        function change() {
+            second = n => 20;
+            Math.floor = n => n + 10;
+            state.value = 7;
+        }
+    "#;
+    for mut engine in engines() {
+        engine.compile(source, "conditional-regions.js").unwrap();
+        engine.compile("function runSum(){return sum([1.5,2.5],2);} function runRows(){return rows([[1,2],[3,4]]);}", "conditional-callers.js").unwrap();
+        for _ in 0..3 {
+            assert_eq!(
+                engine.call("runSum", &[]).unwrap().value(),
+                Value::number(6.0)
+            );
+            assert_eq!(
+                engine.call("runRows", &[]).unwrap().value(),
+                Value::number(22.0)
+            );
+        }
+        engine.call("change", &[]).unwrap();
+        for _ in 0..3 {
+            assert_eq!(
+                engine.call("runSum", &[]).unwrap().value(),
+                Value::number(44.0)
+            );
+            assert_eq!(
+                engine.call("runRows", &[]).unwrap().value(),
+                Value::number(64.0)
+            );
+        }
+    }
+}

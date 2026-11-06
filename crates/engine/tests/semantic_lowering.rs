@@ -142,6 +142,57 @@ fn bit_test_branches_preserve_signed_bits_and_shift_counts() {
 }
 
 #[test]
+fn region_entry_checks_observe_parent_writes_and_iteration_local_receivers() {
+    let source = r#"
+        function mutate(state) {
+            let sum = 0;
+            for (let y = 0; y < 2; ++y) {
+                state.width = y + 1;
+                for (let x = 0; x < 2; ++x)
+                    sum += state.grid[x * state.width];
+            }
+            return sum;
+        }
+        function rows(values) {
+            let sum = 0;
+            for (let y = 0; y < values.length; ++y) {
+                const row = values[y];
+                for (let x = 0; x < row.length; ++x)
+                    sum += row[x];
+            }
+            return sum;
+        }
+        function separated(grid, count, callback) {
+            let sum = 0;
+            for (let i = 0; i < count; ++i)
+                sum += grid[i];
+            callback();
+            let result = 0;
+            for (let i = 0; i < 2; ++i)
+                result += sum * i;
+            return result;
+        }
+        function main() {
+            const state = {grid: Uint16Array.from([1, 2, 3]), width: 99};
+            for (let warmup = 0; warmup < 3; ++warmup) {
+                if (mutate(state) !== 7 || state.width !== 2)
+                    return false;
+                if (rows([state.grid, Float64Array.from([0.5, 1.5])]) !== 8)
+                    return false;
+            }
+            state.grid = ["1", 2, 3];
+            return mutate(state) === "01213" && state.width === 2 &&
+                rows([[1, 2], ["3", 4]]) === "334" && rows([[], [5]]) === 5 &&
+                separated(Uint16Array.from([1, 2, 3]), 3, function() {}) === 6 &&
+                separated(["1", 2], 2, function() {}) === 12;
+        }
+    "#;
+    for ssa_opt in [false, true] {
+        assert_eq!(run(source, ssa_opt), Ok(Value::TRUE));
+    }
+}
+
+#[test]
 fn repeated_typed_reads_preserve_fallbacks_and_mutations() {
     let source = r#"
         function count(grid, width) {

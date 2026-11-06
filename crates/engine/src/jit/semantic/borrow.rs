@@ -7,7 +7,7 @@ use super::{Block, Cfg, Facts, Graph, Inst, Op, Types, Value};
 
 const HEAP: Types = Types::STRING.union(Types::OBJECT).union(Types::OTHER);
 
-fn receiver(op: &Op) -> Option<Value> {
+pub(in crate::jit) fn receiver(op: &Op) -> Option<Value> {
     match op {
         Op::Get(object, _)
         | Op::ProbeProperty(object, _)

@@ -98,6 +98,10 @@ impl Facts {
     }
 
     pub(in crate::jit) fn compute(graph: &Graph) -> Self {
+        Self::assuming(graph, &HashMap::new())
+    }
+
+    pub(super) fn assuming(graph: &Graph, assumptions: &HashMap<Value, Types>) -> Self {
         let cfg = Cfg::new(graph);
         let steps = steps(graph, &cfg);
         let (indexed, reads) = super::string_split::result_facts(graph);
@@ -106,6 +110,9 @@ impl Facts {
             indexed,
             known: true,
         };
+        for (&value, &types) in assumptions {
+            facts.types[value] = types;
+        }
         let mut changed = true;
         while changed {
             changed = false;
@@ -113,6 +120,9 @@ impl Facts {
                 for &inst in &graph.blocks[block].insts {
                     let data = &graph.insts[inst];
                     if let Some(result) = data.result {
+                        if assumptions.contains_key(&result) {
+                            continue;
+                        }
                         let types = if let Some(&types) = reads.get(&inst) {
                             types
                         } else {
@@ -131,6 +141,9 @@ impl Facts {
                 for target in terminator.kind.targets() {
                     for (&param, &arg) in graph.blocks[target.block].params.iter().zip(&target.args)
                     {
+                        if assumptions.contains_key(&param) {
+                            continue;
+                        }
                         let mut types = facts.of(arg);
                         if initialized == Some((target.block, arg)) {
                             types = types.without(Types::UNINITIALIZED);

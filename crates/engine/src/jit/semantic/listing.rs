@@ -1,6 +1,14 @@
 use super::*;
 use std::fmt;
 
+#[derive(Clone, Copy)]
+pub(in crate::jit) struct SourceLocation {
+    pub(in crate::jit) source: Option<usize>,
+    pub(in crate::jit) span: Span,
+}
+
+pub(in crate::jit) type ListingLine = (u32, Option<SourceLocation>, String);
+
 impl Graph {
     fn binding_name(&self, binding: Binding) -> String {
         format!("{}#{}", self.bindings[binding].name, binding.index())
@@ -191,7 +199,7 @@ impl fmt::Display for Target {
 }
 
 impl Listing<'_> {
-    pub(in crate::jit) fn lines(&self) -> Vec<(u32, Option<Span>, String)> {
+    pub(in crate::jit) fn lines(&self) -> Vec<ListingLine> {
         let graph = self.graph;
         let mut lines = vec![(0, None, format!("function {}", graph.name))];
         for (scope, data) in &graph.scopes {
@@ -242,7 +250,7 @@ impl Listing<'_> {
                 let span = inst_data.span;
                 lines.push((
                     graph.inst_location(inst),
-                    inst_data.source_name.is_none().then_some(span),
+                    Some(SourceLocation { source: inst_data.source_name.map(|name| name.0), span }),
                     format!("  {text:<48} ; {}..{}{note}", span.start, span.end),
                 ));
             }
@@ -261,10 +269,7 @@ impl Listing<'_> {
                 let span = terminator.span;
                 lines.push((
                     graph.terminator_location(block),
-                    data.insts
-                        .last()
-                        .is_none_or(|&inst| graph.insts[inst].source_name.is_none())
-                        .then_some(span),
+                    Some(SourceLocation { source: terminator.source_name.map(|name| name.0), span }),
                     format!("  {text:<48} ; {}..{}", span.start, span.end),
                 ));
             }
@@ -293,7 +298,7 @@ impl Graph {
 }
 
 impl Analysis {
-    pub(in crate::jit) fn listing_lines(&self) -> Vec<(u32, Option<Span>, String)> {
+    pub(in crate::jit) fn listing_lines(&self) -> Vec<ListingLine> {
         self.graph.listing(&self.facts).lines()
     }
 }

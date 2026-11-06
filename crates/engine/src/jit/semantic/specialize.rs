@@ -10,6 +10,10 @@ use super::{
     Canonical, Cfg, Constant, Facts, Graph, Inst, Native, Op, Result, TerminatorKind, Types,
 };
 
+const SPECIALIZATION_BUDGET: usize = 256;
+const SPECIALIZATION_BODY_INSTS: usize = 64;
+pub(super) const SPECIALIZATION_ROUNDS: usize = 1;
+
 #[derive(Default)]
 pub(in crate::jit) struct Repository {
     bodies: HashMap<FuncId, Body>,
@@ -408,7 +412,15 @@ pub(super) fn prove_closed_calls(graph: &mut Graph, bodies: &Repository, notes: 
 
 #[derive(Clone, Default, PartialEq, Eq)]
 pub(in crate::jit) struct ConditionalPlan {
-    pub(super) calls: Vec<(Inst, super::Value, String, u16)>,
+    pub(super) calls: Vec<ConditionalCall>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct ConditionalCall {
+    pub(super) inst: Inst,
+    pub(super) callee: super::Value,
+    pub(super) name: String,
+    pub(super) flags: u16,
     pub(super) identities: Vec<(String, FuncId)>,
 }
 
@@ -434,7 +446,6 @@ pub(super) fn conditional_plan(
     }
     let summaries = bodies.effect_summaries(candidates.iter().map(|(_, _, _, target)| *target));
     let mut plan = ConditionalPlan::default();
-    let mut identities = HashMap::new();
     for (inst, callee, name, target) in candidates {
         let Some(summary) = summaries.get(&target) else {
             continue;
@@ -454,15 +465,8 @@ pub(super) fn conditional_plan(
         }
         let mut required = summary.identities.clone();
         required.insert((name.clone(), target));
-        if required
-            .iter()
-            .any(|(name, target)| identities.get(name).is_some_and(|other| other != target))
-        {
-            continue;
-        }
-        for (name, target) in required {
-            identities.insert(name, target);
-        }
+        let mut identities: Vec<_> = required.into_iter().collect();
+        identities.sort_by(|a, b| a.0.cmp(&b.0));
         let mut assumptions: Vec<_> = summary
             .assumptions
             .iter()
@@ -475,10 +479,14 @@ pub(super) fn conditional_plan(
                 assumptions.join(", ")
             ));
         }
-        plan.calls.push((inst, callee, name, summary.flags));
+        plan.calls.push(ConditionalCall {
+            inst,
+            callee,
+            name,
+            flags: summary.flags,
+            identities,
+        });
     }
-    plan.identities = identities.into_iter().collect();
-    plan.identities.sort_by(|a, b| a.0.cmp(&b.0));
     plan
 }
 
@@ -501,7 +509,7 @@ pub(super) struct Budget {
 impl Default for Budget {
     fn default() -> Self {
         Self {
-            remaining: 512,
+            remaining: SPECIALIZATION_BUDGET,
             sites: HashSet::new(),
             inlines: Vec::new(),
         }
@@ -539,7 +547,7 @@ fn numeric_body(graph: &Graph) -> bool {
         }
         for &inst in &graph.blocks[block].insts {
             count += 1;
-            if count > 128 {
+            if count > SPECIALIZATION_BODY_INSTS {
                 return false;
             }
             match graph.insts[inst].op {
@@ -577,7 +585,7 @@ pub(super) fn eligible(graph: &Graph) -> bool {
         }
         for &inst in &graph.blocks[block].insts {
             count += 1;
-            if count > 128
+            if count > SPECIALIZATION_BODY_INSTS
                 || matches!(
                     graph.insts[inst].op,
                     Op::Arguments | Op::Rest(_) | Op::Catch
@@ -882,9 +890,9 @@ mod tests {
     }
 
     #[test]
-    fn global_call_preflight_rejects_root_writes() {
+    fn global_call_proof_rejects_writes_to_guarded_identity() {
         let (canonical, bodies) = fixture(
-            "function first(n){if(n)return first(n-1);return 0;} function main(n){state.value=1;return first(n);}",
+            "function first(n){if(n)return first(n-1);return 0;} function main(n){first=other;return first(n);}",
         );
         let mut graph = canonical.graph;
         let plan = conditional_plan(&graph, &bodies, &mut Vec::new());
@@ -892,16 +900,16 @@ mod tests {
         let original_blocks = graph.blocks.len();
         let mut notes = Vec::new();
         assert!(
-            super::super::optimize::version_conditional(&mut graph, &plan, &mut notes)
+            super::super::optimize::version(&mut graph, &plan, &mut notes)
                 .unwrap()
-                .is_none()
+                .is_empty()
         );
         assert_eq!(graph.entry, original_entry);
         assert_eq!(graph.blocks.len(), original_blocks);
         assert!(
             notes
                 .iter()
-                .any(|note| note.contains("conditional call proof rejected"))
+                .any(|note| note.contains("writes guarded state"))
         );
     }
 
@@ -913,11 +921,10 @@ mod tests {
         let mut graph = canonical.graph;
         let plan = conditional_plan(&graph, &bodies, &mut Vec::new());
         assert_eq!(plan.calls.len(), 1);
-        assert_eq!(plan.identities.len(), 2);
-        let region =
-            super::super::optimize::version_conditional(&mut graph, &plan, &mut Vec::new())
-                .unwrap()
-                .unwrap();
+        assert_eq!(plan.calls[0].identities.len(), 2);
+        let regions = super::super::optimize::version(&mut graph, &plan, &mut Vec::new()).unwrap();
+        assert_eq!(regions.len(), 1);
+        let region = &regions[0];
         assert_eq!(graph.closed_calls.len(), 1);
         assert!(
             graph
@@ -932,6 +939,107 @@ mod tests {
                 .count(),
             2
         );
+        graph.verify().unwrap();
+    }
+
+    #[test]
+    fn conditional_calls_merge_with_loop_and_native_assumptions() {
+        let (canonical, bodies) = fixture(
+            "function first(n){if(n)return first(n-1);return state.value;} function main(xs,n){let sum=0;for(let i=0;i<n;++i)sum+=Math.floor(xs[i]);return sum+first(n);}",
+        );
+        let mut graph = canonical.graph;
+        let plan = conditional_plan(&graph, &bodies, &mut Vec::new());
+        let generic = plan.calls[0].inst;
+        let mut notes = Vec::new();
+        let regions = super::super::optimize::version(&mut graph, &plan, &mut notes).unwrap();
+        assert_eq!(regions.len(), 1);
+        assert!(!graph.closed_calls.contains_key(&generic));
+        assert_eq!(graph.closed_calls.len(), 1);
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.starts_with("function: combined entry guards:"))
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|note| note == "function: 1 global code checks prove 1 read-only call(s)")
+        );
+        assert!(
+            operations(&graph)
+                .iter()
+                .any(|op| matches!(op, Op::CallNative(..)))
+        );
+        assert_eq!(
+            operations(&graph)
+                .iter()
+                .filter(|op| matches!(op, Op::IsCode(..)))
+                .count(),
+            1
+        );
+        graph.verify().unwrap();
+    }
+
+    #[test]
+    fn conditional_loop_guards_only_its_own_calls() {
+        let (canonical, bodies) = fixture(
+            "function first(n){if(n)return first(n-1);return 1;} function second(n){return n;} function main(n){let sum=0;for(let i=0;i<n;++i)sum+=first(i);second=other;return sum+second(n);}",
+        );
+        let mut graph = canonical.graph;
+        let plan = conditional_plan(&graph, &bodies, &mut Vec::new());
+        assert_eq!(plan.calls.len(), 2);
+        let mut notes = Vec::new();
+        let regions = super::super::optimize::version(&mut graph, &plan, &mut notes).unwrap();
+        assert_eq!(regions.len(), 1);
+        assert_eq!(graph.closed_calls.len(), 1);
+        let probes: Vec<_> = operations(&graph)
+            .into_iter()
+            .filter_map(|op| match op {
+                Op::ProbeGlobal(name) => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(!probes.is_empty());
+        assert!(probes.iter().all(|name| *name == "first"));
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.starts_with("loop at ") && note.contains("read-only call(s)"))
+        );
+        graph.verify().unwrap();
+    }
+
+    #[test]
+    fn conditional_proofs_survive_retained_inner_copies() {
+        let (canonical, bodies) = fixture(
+            "function first(n){if(n)return first(n-1);return 1;} function main(rows){let sum=0;for(let y=0;y<2;++y){const row=rows[y];for(let x=0;x<2;++x)sum+=row[x]+first(x);}return sum;}",
+        );
+        let mut graph = canonical.graph;
+        let plan = conditional_plan(&graph, &bodies, &mut Vec::new());
+        let regions = super::super::optimize::version(&mut graph, &plan, &mut Vec::new()).unwrap();
+        assert!(regions.len() > 1);
+        assert!(graph.closed_calls.len() > 1);
+        let facts = Facts::compute(&graph);
+        for &inst in graph.closed_calls.keys() {
+            assert_eq!(graph.inst_contract(inst, &facts).reentry, Reentry::Closed);
+        }
+        graph.verify().unwrap();
+    }
+
+    #[test]
+    fn conditional_proof_rejects_a_changed_callee() {
+        let (canonical, bodies) = fixture(
+            "function first(n){if(n)return first(n-1);return 1;} function main(n){return first(n);}",
+        );
+        let mut graph = canonical.graph;
+        let plan = conditional_plan(&graph, &bodies, &mut Vec::new());
+        let super::super::ValueDef::Result(inst) = graph.values[plan.calls[0].callee] else {
+            panic!();
+        };
+        graph.insts[inst].op = Op::GlobalRead("other".into());
+        let regions = super::super::optimize::version(&mut graph, &plan, &mut Vec::new()).unwrap();
+        assert!(regions.is_empty());
+        assert!(graph.closed_calls.is_empty());
         graph.verify().unwrap();
     }
 
@@ -1211,7 +1319,7 @@ mod tests {
                 .len(),
             1
         );
-        let calls = "square(x);".repeat(Budget::default().remaining + 1);
+        let calls = "square(x);".repeat(SPECIALIZATION_BUDGET + 1);
         let (canonical, bodies) = fixture(&format!(
             "function square(x) {{ return x * x; }} function main(x) {{ {calls} return x; }}",
         ));
