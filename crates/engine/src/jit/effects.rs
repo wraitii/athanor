@@ -7,7 +7,7 @@ pub(super) struct Effects {
     pub(super) assumptions: &'static [Assumption],
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum Assumption {
     NoAccessors,
     NoCoercionCallbacks,
@@ -69,8 +69,14 @@ pub(super) fn effects(helper: Helper) -> Effects {
         | SemanticMathNative
         | SemanticCode
         | ClosureThis
-        | ArrayIterationGuard => (Reentry::Closed, HEAP_READ, &[]),
-        IndexRoot | IndexProbe => (
+        | ArrayIterationGuard
+        | IsStringSplit => (Reentry::Closed, HEAP_READ, &[]),
+        StringSplit => (
+            Reentry::Closed,
+            HEAP_READ | ALLOCATION | INTERNAL | ERROR,
+            &[],
+        ),
+        IndexRoot => (
             Reentry::Closed,
             HEAP_READ | INTERNAL,
             &[Assumption::StableIndexStorage],
@@ -135,7 +141,7 @@ pub(super) fn temporary_effect(helper: Helper) -> TemporaryEffect {
         SemanticPropertyProbeCached => None,
         LocalSet | LocalReplace | Release | ErrorOrigin | Throw | MathDirect | SemanticCode
         | ObserveCall | ObserveGet | ObserveIndex | ClosureThis | ArrayIterationGuard
-        | IndexRoot | IndexProbe | Truthy | BitwiseAnd | BitwiseOr | BitwiseXor | ShiftLeft
+        | IsStringSplit | IndexRoot | Truthy | BitwiseAnd | BitwiseOr | BitwiseXor | ShiftLeft
         | ShiftRight | ShiftRightUnsigned | Sub | Mul | Div | Rem | Pow | LooseEqual
         | LooseNotEqual | StrictEqual | StrictNotEqual | Less | LessEqual | Greater
         | GreaterEqual | UnaryPlus | UnaryNegation | LogicalNot | BitwiseNot => None,

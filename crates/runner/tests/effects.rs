@@ -135,7 +135,6 @@ fn array_iteration_exposes_and_inlines_known_closures() {
             assert_eq!(caller.contains("map_element"), enabled);
             if enabled {
                 assert!(caller.contains("inline") && caller.contains("0 code check(s)"));
-                assert!(!caller.contains("is_code"));
                 assert!(caller.contains("materialized only in fallback"));
                 assert!(
                     caller.find(&format!("is_array_{method}")).unwrap()
@@ -427,4 +426,107 @@ function main() {
         );
         assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "5000:9");
     }
+}
+
+#[test]
+fn spread_constructor_has_guarded_inline_and_generic_fallback() {
+    let source =
+        "function C(a,b=4){this.x=a+b;} function main(){C.prototype={};return new C(...[3,5]).x;}";
+    let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
+        .args(["--compile", "--no-ir", "--semantic-ir", "--eval", source])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let dump = String::from_utf8(output.stdout).unwrap();
+    let caller = dump.split("semantic IR main\n").nth(1).unwrap();
+    assert!(caller.contains("constructor_call_spread"));
+    assert!(caller.contains("inline funcid"));
+    assert!(caller.contains("is_code"));
+}
+
+#[test]
+fn recursively_inlined_bodies_expand_arrays_and_constructors_once() {
+    let source = "function SimpleTerrain(a){this.x=a;} function createTerrain(t){return typeof t === 'string' ? new SimpleTerrain(...[t]) : t.map(x=>createTerrain(x));} function main(t){return createTerrain(t);}";
+    let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
+        .args(["--compile", "--no-ir", "--semantic-ir", "--eval", source])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let dump = String::from_utf8(output.stdout).unwrap();
+    let caller = dump
+        .split("semantic IR createTerrain\n")
+        .nth(1)
+        .unwrap()
+        .split("semantic IR")
+        .next()
+        .unwrap();
+    let maps = caller.matches(" = is_array_map ").count();
+    let constructors = caller.matches(" = construct_spread_resolved ").count();
+    assert!(maps >= 2 && maps <= 4, "{maps}");
+    assert!(constructors >= 2 && constructors <= 4, "{constructors}");
+    assert!(!caller.contains(" = construct_spread "));
+    let start = source.find("new SimpleTerrain").unwrap();
+    assert!(
+        caller
+            .lines()
+            .filter(|line| line.contains(&format!("note: call at {start}.."))
+                && line.contains("inline funcid"))
+            .count()
+            >= 2
+    );
+    assert_eq!(caller.matches("note: array map at ").count(), maps);
+}
+
+#[test]
+fn split_and_spread_inline_have_guarded_semantic_operations() {
+    let source = "function C(a,b){this.a=a;this.b=b;} function main(s){C.prototype={};return new C(...s.split('|')).a;}";
+    let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
+        .args(["--compile", "--no-ir", "--semantic-ir", "--eval", source])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let dump = String::from_utf8(output.stdout).unwrap();
+    let caller = dump.split("semantic IR main\n").nth(1).unwrap();
+    assert!(caller.contains("is_string_split"));
+    assert!(caller.contains(" = string_split "));
+    assert!(caller.contains("is_indexed"));
+    assert_eq!(caller.matches(" = spread_get ").count(), 2);
+    assert!(caller.contains("constructor_call_spread"));
+    assert!(caller.contains("reenters, throws"));
+}
+
+#[test]
+fn string_split_guard_can_select_a_closed_version() {
+    let source = "function f(s,n){let x=0;for(let i=0;i<n;i++){x+=s.split(',').length;}return x;} function main(){return f('a,b',3);}";
+    let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
+        .args(["--compile", "--no-ir", "--semantic-ir", "--eval", source])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let dump = String::from_utf8(output.stdout).unwrap();
+    let caller = dump
+        .split("semantic IR f\n")
+        .nth(1)
+        .unwrap()
+        .split("semantic IR")
+        .next()
+        .unwrap();
+    assert!(caller.contains("probe") && caller.contains("is_string_split"));
+    assert!(caller.contains("hoisted guards select the closed copy"));
 }

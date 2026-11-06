@@ -47,9 +47,11 @@ fn list(path: &Path, filter: &str, recursive: bool, files: &mut Vec<String>) -> 
         let file_type = entry.file_type().map_err(|error| error.to_string())?;
         if recursive && file_type.is_dir() {
             list(&entry.path(), filter, true, files)?;
-        } else if fs::metadata(entry.path())
-            .map_err(|error| error.to_string())?
-            .is_file()
+        } else if file_type.is_file()
+            || (file_type.is_symlink()
+                && fs::metadata(entry.path())
+                    .map_err(|error| error.to_string())?
+                    .is_file())
         {
             let name = entry.file_name();
             let name = name.to_str().ok_or("filename is not valid UTF-8")?;

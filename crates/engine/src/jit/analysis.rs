@@ -15,7 +15,7 @@ use oxc_syntax::{
 pub(super) struct CaptureAnalysis {
     pub(super) functions: HashMap<u32, FunctionCaptures>,
     pub(super) captured: HashSet<SymbolId>,
-    pub(super) class_name_writes: Vec<Span>,
+    pub(super) class_name_write: Option<Span>,
     pub(super) arguments_bindings: HashMap<u32, SymbolId>,
     pub(super) arguments_references: HashMap<u32, SymbolId>,
 }
@@ -39,6 +39,14 @@ struct Analyzer<'s> {
 }
 
 impl CaptureAnalysis {
+    fn add_capture(&mut self, function: u32, symbol: SymbolId) {
+        let captures = &mut self.functions.get_mut(&function).unwrap().captures;
+        if !captures.contains(&symbol) {
+            captures.push(symbol);
+        }
+        self.captured.insert(symbol);
+    }
+
     pub(super) fn analyze<'a>(program: &Program<'a>, scoping: &Scoping) -> Self {
         let mut analyzer = Analyzer {
             scoping,
@@ -123,10 +131,11 @@ impl<'a> Visit<'a> for Analyzer<'_> {
     }
 
     fn visit_identifier_reference(&mut self, identifier: &IdentifierReference<'a>) {
-        let resolved = identifier
+        let reference = identifier
             .reference_id
             .get()
-            .and_then(|id| self.scoping.get_reference(id).symbol_id());
+            .map(|id| self.scoping.get_reference(id));
+        let resolved = reference.and_then(|reference| reference.symbol_id());
         if identifier.name == "arguments" {
             if let Some(owner_index) = self.active.iter().rposition(|function| !function.arrow) {
                 let owner = &self.active[owner_index];
@@ -140,35 +149,18 @@ impl<'a> Visit<'a> for Analyzer<'_> {
                         .arguments_references
                         .insert(identifier.span.start, symbol);
                     for function in &self.active[owner_index + 1..] {
-                        let captures = &mut self
-                            .result
-                            .functions
-                            .get_mut(&function.start)
-                            .unwrap()
-                            .captures;
-                        if !captures.contains(&symbol) {
-                            captures.push(symbol);
-                        }
-                        self.result.captured.insert(symbol);
+                        self.result.add_capture(function.start, symbol);
                     }
                     return;
                 }
             }
         }
-        let Some(symbol) = identifier
-            .reference_id
-            .get()
-            .and_then(|id| self.scoping.get_reference(id).symbol_id())
-        else {
+        let Some(symbol) = resolved else {
             return;
         };
-        if self.classes.contains(&symbol)
-            && identifier
-                .reference_id
-                .get()
-                .is_some_and(|id| self.scoping.get_reference(id).is_write())
+        if self.classes.contains(&symbol) && reference.is_some_and(|reference| reference.is_write())
         {
-            self.result.class_name_writes.push(identifier.span);
+            self.result.class_name_write.get_or_insert(identifier.span);
         }
         let binding_scope = self.scoping.symbol_scope_id(symbol);
         if binding_scope == self.scoping.root_scope_id() && !self.classes.contains(&symbol) {
@@ -182,16 +174,7 @@ impl<'a> Visit<'a> for Analyzer<'_> {
             {
                 break;
             }
-            let captures = &mut self
-                .result
-                .functions
-                .get_mut(&function.start)
-                .unwrap()
-                .captures;
-            if !captures.contains(&symbol) {
-                captures.push(symbol);
-            }
-            self.result.captured.insert(symbol);
+            self.result.add_capture(function.start, symbol);
         }
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use cranelift_codegen::entity::SecondaryMap;
@@ -80,10 +80,15 @@ impl fmt::Display for Types {
 
 pub(in crate::jit) struct Facts {
     types: SecondaryMap<Value, Types>,
+    indexed: HashSet<Value>,
     known: bool,
 }
 
 impl Facts {
+    pub(super) fn indexed(&self, value: Value) -> bool {
+        self.indexed.contains(&value)
+    }
+
     pub(in crate::jit) fn of(&self, value: Value) -> Types {
         if self.known {
             self.types[value]
@@ -95,8 +100,10 @@ impl Facts {
     pub(in crate::jit) fn compute(graph: &Graph) -> Self {
         let cfg = Cfg::new(graph);
         let steps = steps(graph, &cfg);
+        let (indexed, reads) = super::string_split::result_facts(graph);
         let mut facts = Self {
             types: SecondaryMap::new(),
+            indexed,
             known: true,
         };
         let mut changed = true;
@@ -106,9 +113,13 @@ impl Facts {
                 for &inst in &graph.blocks[block].insts {
                     let data = &graph.insts[inst];
                     if let Some(result) = data.result {
-                        let types = match steps.get(&inst) {
-                            Some(bounds) if facts.bounded(&data.op, bounds) => Types::INT32,
-                            _ => result_types(&data.op, &facts),
+                        let types = if let Some(&types) = reads.get(&inst) {
+                            types
+                        } else {
+                            match steps.get(&inst) {
+                                Some(bounds) if facts.bounded(&data.op, bounds) => Types::INT32,
+                                _ => result_types(&data.op, &facts),
+                            }
                         };
                         changed |= facts.widen(result, types);
                     }
@@ -371,7 +382,10 @@ fn result_types(op: &Op, facts: &Facts) -> Types {
         Op::TypedIndex(..) => Types::NUMBER.union(Types::UNDEFINED),
         Op::IsTyped(..) | Op::IsIndexed(_) => Types::BOOLEAN,
         Op::IndexedLength(_) => Types::NUMBER,
-        Op::IsNumber(_) | Op::IsString(_) | Op::IsTypeof(..) => Types::BOOLEAN,
+        Op::IsNumber(_) | Op::IsString(_) | Op::IsStringSplit(_) | Op::IsTypeof(..) => {
+            Types::BOOLEAN
+        }
+        Op::StringSplit(..) => Types::OBJECT,
         Op::AsNumber(_) => Types::NUMBER,
         Op::ToInt32(_) => Types::INT32,
         Op::ToNumeric(value) | Op::Unary(UnaryOp::Plus, value)

@@ -1,11 +1,10 @@
 use super::super::session::JitCtx;
-use crate::heap::NativeFunction;
+use crate::heap::{Heap, NativeFunction};
 use crate::value::Value;
 
-fn printable(context: &mut JitCtx, value: Value) -> Option<String> {
-    let heap = context.global.heap().clone();
+fn printable(heap: &Heap, value: Value) -> String {
     if let Some(text) = heap.text(value).or_else(|| heap.error_text(value)) {
-        return Some(text);
+        return text;
     }
     if heap.is_array(value) {
         let length = heap.len(value).unwrap();
@@ -22,12 +21,12 @@ fn printable(context: &mut JitCtx, value: Value) -> Option<String> {
                 element.to_string()
             });
         }
-        return Some(format!("[{}]", parts.join(", ")));
+        return format!("[{}]", parts.join(", "));
     }
     if value.is_object() {
-        return Some("[object Object]".into());
+        return "[object Object]".into();
     }
-    Some(value.to_string())
+    value.to_string()
 }
 
 pub(super) fn call(ctx: *mut JitCtx, function: NativeFunction, args: &[Value]) -> Value {
@@ -37,9 +36,7 @@ pub(super) fn call(ctx: *mut JitCtx, function: NativeFunction, args: &[Value]) -
         if function == NativeFunction::ConsoleLog && index > 0 {
             output.push(' ');
         }
-        let Some(text) = printable(context, value) else {
-            return Value::UNDEFINED;
-        };
+        let text = printable(context.global.heap(), value);
         output.push_str(&text);
     }
     if function == NativeFunction::ConsoleLog {

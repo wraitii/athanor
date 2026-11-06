@@ -8,7 +8,7 @@ use crate::heap::{
     DATA_OFFSET, HOLE, KIND_OFFSET, LENGTH_OFFSET, MathFunction, NO_ELEMENTS, SHAPE_OFFSET,
     TypedKind, kind,
 };
-use crate::jit::clif::{IndexedRead, IndexedReadContract};
+use crate::jit::clif::IndexedRead;
 use crate::jit::helpers::{
     CACHE_BUILTIN_KIND_OFFSET, CACHE_BUILTIN_VALUE_OFFSET, CACHE_HOLDER_OFFSET,
     CACHE_HOLDER_SHAPE_OFFSET, CACHE_INDEX_OFFSET, CACHE_SHAPE_OFFSET, Helper, PropertyCache,
@@ -579,7 +579,6 @@ impl FunctionCompiler<'_, '_> {
                 result,
                 success: self.b.current_block().unwrap(),
                 source: (self.source_span.start, self.source_span.end),
-                contract: IndexedReadContract::RuntimeValue,
             });
         }
         result
@@ -874,26 +873,98 @@ impl FunctionCompiler<'_, '_> {
     }
 
     pub(super) fn global_access(&mut self, name: &str, value: Option<ClifValue>) -> ClifValue {
+        let Some(value) = value else {
+            return self.cached_global_get(name, false);
+        };
         let name: Box<str> = name.into();
         let ptr = self.b.ins().iconst(self.pointer, name.as_ptr() as i64);
         let len = self.b.ins().iconst(types::I64, name.len() as i64);
         self.names.push(name);
-        let result = match value {
-            Some(value) => self.call_helper(Helper::GlobalSet, &[ptr, len, value]),
-            None => self.call_helper(Helper::GlobalGet, &[ptr, len]),
-        };
+        let result = self.call_helper(Helper::GlobalSet, &[ptr, len, value]);
         self.check_error();
         result
     }
 
     pub(super) fn global_get_optional(&mut self, name: &str) -> ClifValue {
-        let name: Box<str> = name.into();
-        let ptr = self.b.ins().iconst(self.pointer, name.as_ptr() as i64);
-        let len = self.b.ins().iconst(types::I64, name.len() as i64);
-        self.names.push(name);
-        let value = self.call_helper(Helper::GlobalGetOptional, &[ptr, len]);
+        self.cached_global_get(name, true)
+    }
+
+    fn cached_global_get(&mut self, name: &str, optional: bool) -> ClifValue {
+        use crate::jit::helpers::GlobalCache;
+        use crate::jit::session::{GLOBAL_IDENTITY_OFFSET, GLOBAL_REVISION_OFFSET};
+
+        let cache = Box::new(GlobalCache::new(name));
+        let address = self
+            .b
+            .ins()
+            .iconst(self.pointer, (&*cache as *const GlobalCache) as i64);
+        self.global_caches.push(cache);
+        let flags = MemFlagsData::trusted();
+        let identity = self
+            .b
+            .ins()
+            .load(self.pointer, flags, self.ctx, GLOBAL_IDENTITY_OFFSET);
+        let expected_identity = self.b.ins().load(
+            self.pointer,
+            flags,
+            address,
+            std::mem::offset_of!(GlobalCache, identity) as i32,
+        );
+        let same = self.b.ins().icmp(IntCC::Equal, identity, expected_identity);
+        let revision_ptr = self
+            .b
+            .ins()
+            .load(self.pointer, flags, self.ctx, GLOBAL_REVISION_OFFSET);
+        let revision = self.b.ins().load(types::I64, flags, revision_ptr, 0);
+        let expected_revision = self.b.ins().load(
+            types::I64,
+            flags,
+            address,
+            std::mem::offset_of!(GlobalCache, revision) as i32,
+        );
+        let valid = self.b.ins().icmp(IntCC::Equal, revision, expected_revision);
+        let valid = self.b.ins().band(same, valid);
+        let slot = self.b.ins().load(
+            self.pointer,
+            flags,
+            address,
+            std::mem::offset_of!(GlobalCache, slot) as i32,
+        );
+        let present = self.b.ins().icmp_imm_s(IntCC::NotEqual, slot, 0);
+        let valid = self.b.ins().band(valid, present);
+        let hit = self.b.create_block();
+        let ready = self.b.create_block();
+        let retain = self.b.create_block();
+        let slow = self.b.create_block();
+        let done = self.b.create_block();
+        self.b.append_block_param(done, types::I64);
+        self.b.set_cold_block(slow);
+        self.brif(valid, hit, &[], slow, &[]);
+        self.switch(hit);
+        // No reentry occurs between validating resolution and loading the current binding value.
+        let value = self.b.ins().load(types::I64, flags, slot, 0);
+        let uninitialized =
+            self.b
+                .ins()
+                .icmp_imm_s(IntCC::Equal, value, Value::UNINITIALIZED.bits() as i64);
+        self.brif(uninitialized, slow, &[], ready, &[]);
+        self.switch(ready);
+        let heap = self.is_heap(value);
+        self.brif(heap, retain, &[], done, &[BlockArg::Value(value)]);
+        self.switch(retain);
+        let value = self.retain_temporary(value);
+        self.jump(done, &[BlockArg::Value(value)]);
+        self.switch(slow);
+        let helper = if optional {
+            Helper::GlobalGetOptional
+        } else {
+            Helper::GlobalGet
+        };
+        let value = self.call_helper(helper, &[address]);
         self.check_error();
-        value
+        self.jump(done, &[BlockArg::Value(value)]);
+        self.switch(done);
+        self.b.block_params(done)[0]
     }
 
     pub(super) fn global_initialize(&mut self, name: &str, value: ClifValue) {
@@ -1034,14 +1105,19 @@ impl FunctionCompiler<'_, '_> {
         name: &str,
         value: Option<ClifValue>,
     ) -> ClifValue {
+        if let Some(value) = value {
+            let cache = Box::new(PropertyCache::new(name));
+            let address = self.b.ins().iconst(self.pointer, &raw const *cache as i64);
+            self.property_caches.push(cache);
+            let result = self.call_helper(Helper::PropertySetCached, &[object, address, value]);
+            self.check_error();
+            return result;
+        }
         let name: Box<str> = name.into();
         let ptr = self.b.ins().iconst(self.pointer, name.as_ptr() as i64);
         let len = self.b.ins().iconst(types::I64, name.len() as i64);
         self.names.push(name);
-        let result = match value {
-            Some(value) => self.call_helper(Helper::PropertySet, &[object, ptr, len, value]),
-            None => self.call_helper(Helper::PropertyGet, &[object, ptr, len]),
-        };
+        let result = self.call_helper(Helper::PropertyGet, &[object, ptr, len]);
         self.check_error();
         result
     }

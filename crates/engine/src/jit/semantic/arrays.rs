@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use oxc_syntax::operator::BinaryOperator;
 
 use super::specialize::{self, Repository};
@@ -30,13 +32,17 @@ impl ArrayMethod {
 pub(super) fn expand(
     graph: &mut Graph,
     bodies: &Repository,
-    source: usize,
+    _source: usize,
     notes: &mut Vec<String>,
+    expanded: &mut HashSet<Inst>,
 ) -> Result<()> {
     let facts = Facts::compute(graph);
     let mut sites = Vec::new();
     for block in Cfg::new(graph).rpo {
         for &inst in &graph.blocks[block].insts {
+            if expanded.contains(&inst) {
+                continue;
+            }
             let Op::Call {
                 callee,
                 receiver: Some(_),
@@ -60,19 +66,17 @@ pub(super) fn expand(
             {
                 continue;
             }
-            let Some(Op::Closure(span, _, false, _)) = graph.defining_op(callback) else {
+            let Some(Op::Closure(_, code, _, false, _, _, _)) = graph.defining_op(callback) else {
                 continue;
             };
-            let Some(code) = bodies.closure(source, span.start) else {
-                continue;
-            };
-            if !bodies.body(code).is_some_and(specialize::eligible) {
+            if !bodies.body(*code).is_some_and(specialize::eligible) {
                 continue;
             }
             sites.push((inst, method));
         }
     }
     for (inst, method) in sites {
+        expanded.insert(inst);
         iteration(graph, inst, method);
         graph.verify()?;
         let span = graph.insts[inst].span;
@@ -88,6 +92,7 @@ pub(super) fn expand(
 
 fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
     let call = graph.insts[inst].clone();
+    let first_new = graph.insts.len();
     let Op::Call {
         callee,
         receiver: Some(receiver),
@@ -260,4 +265,7 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
             args: vec![result],
         }),
     });
+    for data in graph.insts.values_mut().skip(first_new) {
+        data.source_name = call.source_name;
+    }
 }

@@ -72,9 +72,32 @@ fn split_preserves_empty_pieces_and_owned_values() {
 }
 
 #[test]
+fn split_retains_results_and_handles_unicode_boundaries() {
+    let source = r#"function make() {
+        let source = 'terrain' + '/grass';
+        return [source.split('|'), source.split(undefined), source.split('/')];
+    }
+    function main() {
+        let results = make();
+        for (let i = 0; i < 200; ++i) { let temporary = ('x' + i).split('x'); }
+        let a = 'abc'.split('|');
+        let b = 'abc'.split('|');
+        a[0] = 'changed';
+        return results[0][0] === 'terrain/grass' && results[1][0] === 'terrain/grass' &&
+            results[2].join('|') === 'terrain|grass' && a !== b && b[0] === 'abc' &&
+            ''.split('|').length === 1 && ''.split('|')[0] === '' &&
+            ''.split('').length === 0 && '😀é😀'.split('😀').join('|') === '|é|' &&
+            '😀é'.split('').join('|') === '😀|é' &&
+            'aaaa'.split('aa').join('|') === '||';
+    }"#;
+    assert_eq!(run(source).unwrap(), Value::TRUE);
+}
+
+#[test]
 fn unsupported_forms_report_errors() {
     for source in [
         "function main() { return 'a'.split(',', 1); }",
+        "function main() { return 'a'.split(1); }",
         "function main() { return 'a'.replace('a', '$&'); }",
         "function main() { return [1].join({}); }",
         "function main() { return [1].map(x => x, {}); }",
@@ -805,5 +828,33 @@ fn string_pad_start_pads_by_unicode_scalars() {
         "function main(){ let pad = ''.padStart; return pad(2); }",
     ] {
         assert!(run(source).is_err(), "{source}");
+    }
+}
+
+#[test]
+fn exponentiation_special_values() {
+    let source = "function main() {
+            let nan = 0 / 0, inf = 1 / 0;
+            let a = 1 ** inf, b = 1 ** nan, c = Math.pow(1, nan);
+            let d = (-1) ** inf, e = Math.pow(-1, -inf);
+            return a !== a && b !== b && c !== c && d !== d && e !== e &&
+                nan ** 0 === 1 && Math.pow(nan, 0) === 1 &&
+                1 / ((-0) ** 3) === -inf && 1 / Math.pow(-0, 3) === -inf &&
+                1 / ((-0) ** 2) === inf && 1 / Math.pow(-0, 2) === inf &&
+                ((-0) ** -3) === -inf && Math.pow(-0, -3) === -inf &&
+                ((-0) ** -2) === inf && Math.pow(-0, -2) === inf;
+        }";
+    for (opt_level, ssa_opt) in [js_engine::OptLevel::None, js_engine::OptLevel::Speed]
+        .into_iter()
+        .flat_map(|level| [false, true].map(|ssa| (level, ssa)))
+    {
+        let mut engine = Engine::with_options(js_engine::EngineOptions {
+            opt_level,
+            ssa_opt,
+            ..Default::default()
+        })
+        .unwrap();
+        engine.compile(source, "builtins.js").unwrap();
+        assert_eq!(engine.call("main", &[]).unwrap().value(), Value::TRUE);
     }
 }

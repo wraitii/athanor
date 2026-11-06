@@ -1,5 +1,5 @@
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use crate::Value;
@@ -9,11 +9,13 @@ use crate::heap::{Heap, OwnedValue};
 pub struct Environment {
     data: Rc<RefCell<EnvironmentData>>,
     heap: Heap,
+    revision: Rc<Cell<u64>>,
 }
 
 struct EnvironmentData {
-    bindings: HashMap<String, Value>,
-    lexical: HashMap<String, (Value, bool)>,
+    // JIT binding locations must survive map growth; Cell permits reads through cached pointers.
+    bindings: HashMap<String, Box<Cell<Value>>>,
+    lexical: HashMap<String, (Box<Cell<Value>>, bool)>,
     readonly: HashSet<String>,
     parent: Option<Environment>,
     heap: Heap,
@@ -31,6 +33,7 @@ impl Default for Environment {
                 heap: heap.clone(),
             })),
             heap,
+            revision: Rc::new(Cell::new(0)),
         }
     }
 }
@@ -38,10 +41,10 @@ impl Default for Environment {
 impl Drop for EnvironmentData {
     fn drop(&mut self) {
         for value in self.bindings.values() {
-            self.heap.release(*value);
+            self.heap.release(value.get());
         }
         for (value, _) in self.lexical.values() {
-            self.heap.release(*value);
+            self.heap.release(value.get());
         }
     }
 }
@@ -61,6 +64,7 @@ impl Environment {
                 heap: self.heap.clone(),
             })),
             heap: self.heap.clone(),
+            revision: self.revision.clone(),
         }
     }
 
@@ -73,7 +77,8 @@ impl Environment {
         }
         match self.data.borrow_mut().bindings.entry(name.into()) {
             Entry::Vacant(entry) if self.heap.retain(value) => {
-                entry.insert(value);
+                entry.insert(Box::new(Cell::new(value)));
+                self.invalidate_bindings();
                 self.heap.invalidate();
                 true
             }
@@ -115,18 +120,55 @@ impl Environment {
             .map(|binding| &binding.0)
             .or_else(|| data.bindings.get(name))
         {
-            Some(value) => Some(*value),
+            Some(value) => Some(value.get()),
             None => data.parent.as_ref().and_then(|parent| parent.get_raw(name)),
         }
     }
 
+    pub(crate) fn identity(&self) -> *const () {
+        Rc::as_ptr(&self.data).cast()
+    }
+
+    pub(crate) fn revision_ptr(&self) -> *const u64 {
+        self.revision.as_ptr()
+    }
+
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision.get()
+    }
+
+    fn invalidate_bindings(&self) {
+        // Descendants share this revision because declarations can shadow inherited bindings.
+        self.revision.set(self.revision.get().wrapping_add(1));
+    }
+
+    pub(crate) fn binding_slot(&self, name: &str) -> Option<*const Value> {
+        let data = self.data.borrow();
+        data.lexical
+            .get(name)
+            .map(|binding| binding.0.as_ptr().cast_const())
+            .or_else(|| {
+                data.bindings
+                    .get(name)
+                    .map(|value| value.as_ptr().cast_const())
+            })
+            .or_else(|| {
+                data.parent
+                    .as_ref()
+                    .and_then(|parent| parent.binding_slot(name))
+            })
+    }
+
     pub(crate) fn get_object_raw(&self, name: &str) -> Option<Value> {
         let data = self.data.borrow();
-        data.bindings.get(name).copied().or_else(|| {
-            data.parent
-                .as_ref()
-                .and_then(|parent| parent.get_object_raw(name))
-        })
+        data.bindings
+            .get(name)
+            .map(|value| value.get())
+            .or_else(|| {
+                data.parent
+                    .as_ref()
+                    .and_then(|parent| parent.get_object_raw(name))
+            })
     }
 
     pub(crate) fn has_lexical(&self, name: &str) -> bool {
@@ -135,10 +177,15 @@ impl Environment {
 
     pub(crate) fn define_lexical(&self, name: String, mutable: bool) {
         self.heap.invalidate();
-        self.data
+        self.invalidate_bindings();
+        if let Some((old, _)) = self
+            .data
             .borrow_mut()
             .lexical
-            .insert(name, (Value::UNINITIALIZED, mutable));
+            .insert(name, (Box::new(Cell::new(Value::UNINITIALIZED)), mutable))
+        {
+            self.heap.release(old.get());
+        }
     }
 
     pub(crate) fn initialize_lexical(&self, name: &str, value: Value) -> bool {
@@ -146,17 +193,17 @@ impl Environment {
         let Some(binding) = data.lexical.get_mut(name) else {
             return false;
         };
-        if binding.0 != Value::UNINITIALIZED || !self.heap.retain(value) {
+        if binding.0.get() != Value::UNINITIALIZED || !self.heap.retain(value) {
             return false;
         }
-        binding.0 = value;
+        binding.0.set(value);
         true
     }
 
     pub(crate) fn set_binding(&self, name: &str, value: Value) -> Result<(), &'static str> {
         let mut data = self.data.borrow_mut();
         if let Some(binding) = data.lexical.get_mut(name) {
-            if binding.0 == Value::UNINITIALIZED {
+            if binding.0.get() == Value::UNINITIALIZED {
                 return Err("accessed before initialization");
             }
             if !binding.1 {
@@ -165,7 +212,7 @@ impl Environment {
             if !self.heap.retain(value) {
                 return Err("has invalid value");
             }
-            let old = std::mem::replace(&mut binding.0, value);
+            let old = binding.0.replace(value);
             self.replaced(old);
             return Ok(());
         }
@@ -193,7 +240,7 @@ impl Environment {
             if !self.heap.retain(value) {
                 return false;
             }
-            let old = std::mem::replace(binding, value);
+            let old = binding.replace(value);
             self.replaced(old);
             return true;
         }
@@ -211,5 +258,46 @@ impl Environment {
 
     pub(crate) fn heap(&self) -> &Heap {
         &self.heap
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn binding_locations_survive_growth_and_value_replacement() {
+        let environment = Environment::new();
+        assert!(environment.define("value", Value::number(1.0)));
+        let slot = environment.binding_slot("value").unwrap();
+        for i in 0..1000 {
+            assert!(environment.define(format!("other{i}"), Value::number(i as f64)));
+        }
+        assert_eq!(environment.binding_slot("value"), Some(slot));
+        let revision = environment.revision();
+        assert!(environment.set("value", Value::number(2.0)));
+        assert_eq!(environment.revision(), revision);
+        assert_eq!(unsafe { *slot }, Value::number(2.0));
+    }
+
+    #[test]
+    fn resolution_revision_tracks_parent_and_lexical_shadowing() {
+        let parent = Environment::new();
+        assert!(parent.define("value", Value::number(1.0)));
+        let child = parent.child();
+        assert_eq!(child.binding_slot("value"), parent.binding_slot("value"));
+        let revision = child.revision();
+        parent.define_lexical("value".into(), true);
+        assert_ne!(child.revision(), revision);
+        assert_eq!(child.get_raw("value"), Some(Value::UNINITIALIZED));
+        let slot = child.binding_slot("value").unwrap();
+        let revision = child.revision();
+        assert!(parent.initialize_lexical("value", Value::number(2.0)));
+        assert_eq!(child.revision(), revision);
+        assert_eq!(unsafe { *slot }, Value::number(2.0));
+        assert!(child.define("value", Value::number(3.0)));
+        assert_ne!(child.revision(), revision);
+        assert_ne!(child.binding_slot("value"), Some(slot));
+        assert_eq!(child.get_raw("value"), Some(Value::number(3.0)));
     }
 }

@@ -372,7 +372,7 @@ impl<'a> Builder<'a> {
     }
 
     fn closure(&self, span: Span, arrow: bool, generator: bool) -> Result<Op> {
-        let Some((_, symbols, _)) = self.closures.get(&span.start) else {
+        let Some((code, symbols, lexical_this)) = self.closures.get(&span.start) else {
             return unsupported("closure capture metadata", span);
         };
         let captures = symbols
@@ -386,7 +386,15 @@ impl<'a> Builder<'a> {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(Op::Closure(span, arrow, generator, captures))
+        Ok(Op::Closure(
+            span,
+            *code,
+            arrow,
+            generator,
+            *lexical_this,
+            captures,
+            None,
+        ))
     }
 
     fn expression(&mut self, expr: &Expression<'_>) -> Result<Value> {
@@ -1583,6 +1591,7 @@ pub(super) fn lower_global(
             guards: 0,
             views: HashMap::new(),
             borrowed: HashSet::new(),
+            closed_calls: HashMap::new(),
             lazy_captures: HashSet::new(),
             cold: HashSet::new(),
             generator: false,
@@ -1670,6 +1679,7 @@ pub(super) fn lower_parts(
             guards: 0,
             views: HashMap::new(),
             borrowed: HashSet::new(),
+            closed_calls: HashMap::new(),
             lazy_captures: HashSet::new(),
             cold: HashSet::new(),
             generator,

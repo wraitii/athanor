@@ -170,3 +170,100 @@ fn reused_prototype_slots_stay_valid() {
         19700.0,
     );
 }
+
+#[test]
+fn writes_follow_shape_growth_and_preserve_replaced_values() {
+    check(
+        "function write(o, value) { o.x = value; }
+        function main() {
+            const o = {};
+            write(o, {v: 1});
+            const kept = o.x;
+            for (let i = 0; i < 80; ++i) {
+                o['p' + i] = i;
+                write(o, {v: i});
+            }
+            const other = {y: 0, x: null};
+            write(other, kept);
+            const fresh = {};
+            write(fresh, other.x);
+            return o.x.v + other.x.v + fresh.x.v;
+        }",
+        81.0,
+    );
+}
+
+#[test]
+fn cached_writes_preserve_special_properties() {
+    check(
+        "function writeLength(o, value) { o.length = value; }
+        function writeIndex(o, value) { o.lastIndex = value; }
+        function writePrototype(o, value) { o.prototype = value; }
+        function C() {}
+        function main() {
+            const a = [1, 2, 3];
+            writeLength(a, 1);
+            const r = /a/g;
+            writeIndex(r, 2);
+            writePrototype(C, {x: 7});
+            let keys = 0;
+            for (const key in C) ++keys;
+            return a.length + r.lastIndex + (new C()).x + keys;
+        }",
+        10.0,
+    );
+}
+
+#[test]
+fn computed_named_properties_match_named_access() {
+    check(
+        "function read(f, k) { let sum = 0; for (let i = 0; i < 4; ++i) sum += f[k]; return sum; }
+        function main() {
+            function f() {};
+            f.x = 10;
+            let k = 'x';
+            let sum = read(f, k);
+            f[k] = 42;
+            let a = [1, 2, 3];
+            let length = 'length';
+            a[length] = 1;
+            let index = '0';
+            a[index] = 7;
+            let isArray = 'isArray';
+            return sum + f.x + a.length + a[0] + (Array[isArray](a) ? 1 : 0);
+        }",
+        91.0,
+    );
+}
+
+#[test]
+fn computed_index_probes_follow_index_semantics() {
+    check(
+        "function read(a, k) { let n = 0; for (let i = 0; i < 4; ++i) n += a[k]; return n; }
+        function main() {
+            let a = [3, 4], t = new Uint8Array(2);
+            t[0] = 5; t[1] = 6;
+            let minusZero = '-0';
+            return read(a, '0') + read(a, '1') + read(t, '0') + read(t, '1') +
+                (t[minusZero] === undefined ? 1 : 0) + (t[-0] === 5 ? 1 : 0);
+        }",
+        74.0,
+    );
+    for ssa_opt in [true, false] {
+        for expression in ["a['01']", "a['-0']", "t['01']"] {
+            let mut engine = Engine::with_options(EngineOptions {
+                ssa_opt,
+                ..Default::default()
+            })
+            .unwrap();
+            let source = format!(
+                "function main() {{ let a = [1], t = new Uint8Array(1); let n = 0; for (let i = 0; i < 4; ++i) n += {expression}; return n; }}"
+            );
+            engine.compile(&source, "property_caches.js").unwrap();
+            assert!(
+                engine.call("main", &[]).is_err(),
+                "{expression}, ssa_opt: {ssa_opt}"
+            );
+        }
+    }
+}

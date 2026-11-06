@@ -377,3 +377,147 @@ fn loop_hoisted_guards_match_generic_execution() {
         assert_eq!(run(&source, true), expected, "{body}");
     }
 }
+
+#[test]
+fn inlined_closures_preserve_cells_and_lexical_receivers() {
+    let source = r#"
+        function Make(x = 3) {
+            this.value = x * 10;
+            let result = [];
+            for (let i = 0; i < 3; ++i)
+                result.push(() => this.value + x + i);
+            x += 2;
+            return result;
+        }
+        function main() {
+            Make.prototype = {};
+            let a = new Make();
+            let b = new Make(1);
+            return a[0]() + a[1]() * 10 + a[2]() * 100 + b[2]() * 1000;
+        }
+    "#;
+    assert_eq!(run(source, false), Ok(Value::number(19095.0)));
+    assert_eq!(run(source, true), run(source, false));
+}
+
+#[test]
+fn spread_constructor_inlining_preserves_arguments_and_fallbacks() {
+    let source = r#"
+        let log = 0;
+        function C(a, b = 4) { this.x = a.value + b; a.value = 90; }
+        function object(a) { return { x: a }; }
+        function main() {
+            C.prototype = {};
+            let a = { value: 2 };
+            let first = new C(...[a, 3, (log = 7)]);
+            let second = new C(...[{ value: 5 }]);
+            let native = new Array(...[2]);
+            C = object;
+            let third = new C(...[11]);
+            return first.x * 10000 + second.x * 1000 + native.length * 100 + third.x * 10 + log;
+        }
+    "#;
+    assert_eq!(run(source, false), Ok(Value::number(59317.0)));
+    assert_eq!(run(source, true), run(source, false));
+}
+
+#[test]
+fn cross_source_inline_closures_use_their_own_code_and_receiver() {
+    for enabled in [false, true] {
+        let mut engine = Engine::with_options(EngineOptions {
+            ssa_opt: enabled,
+            ..Default::default()
+        })
+        .unwrap();
+        engine
+            .compile(
+                "function C(x){this.value=x;this.get=()=>this.value;}",
+                "first.js",
+            )
+            .unwrap();
+        engine
+            .compile(
+                "function main(){C.prototype={};let o=new C(10);let f=o.get;return f();}",
+                "second.js",
+            )
+            .unwrap();
+        assert_eq!(
+            engine.call("main", &[]).unwrap().value(),
+            Value::number(10.0)
+        );
+    }
+}
+
+#[test]
+fn recursively_inlined_terrain_preserves_constructor_replacements() {
+    let source = r#"
+        function SimpleTerrain(a) { this.x = a.length; }
+        function createTerrain(t) {
+            return typeof t === 'string' ? new SimpleTerrain(...[t]) : t.map(x => createTerrain(x));
+        }
+        function replacement(a) { return { x: a.length + 10 }; }
+        function main() {
+            SimpleTerrain.prototype = {};
+            let a = createTerrain(['a', ['bc', ['def']]]);
+            SimpleTerrain = replacement;
+            let b = createTerrain(['abcd', ['ef']]);
+            return a[0].x + a[1][0].x + a[1][1][0].x + b[0].x + b[1][0].x;
+        }
+    "#;
+    assert_eq!(run(source, false), Ok(Value::number(32.0)));
+    assert_eq!(run(source, true), run(source, false));
+}
+
+#[test]
+fn inlined_spread_validates_and_snapshots_inputs() {
+    for function in ["function C(a){this.a=a;}", "function C(){this.a=1;}"] {
+        let source = format!(
+            "{function} function main(){{C.prototype={{}};return new C(...{{0:42,length:1}}).a;}}"
+        );
+        for enabled in [false, true] {
+            assert!(run(&source, enabled).is_err(), "{source}");
+        }
+    }
+    for (source, expected) in [
+        (
+            "function C(a,b=7){this.a=(a===undefined?2:a)+b;} function main(){C.prototype={};return new C(...Array(1)).a;}",
+            9.0,
+        ),
+        (
+            "function C(a,b=7){this.a=a+b;} function main(){C.prototype={};return new C(...[3]).a;}",
+            10.0,
+        ),
+        (
+            "function C(a,b){this.a=a.length*10+b.length;} function main(){C.prototype={};return new C(...'é🌲').a;}",
+            11.0,
+        ),
+        (
+            "let source; function C(a=(source.length=0),b){this.a=b.x;} function main(){C.prototype={};source=[undefined,{x:19},42];return new C(...source).a;}",
+            19.0,
+        ),
+        (
+            "function C(a){this.a=a;} function R(a){return {a:a+5};} function main(){C.prototype={};let x=new C(...[3]); C=R;return x.a+new C(...[4]).a+new Array(...[2]).length;}",
+            14.0,
+        ),
+    ] {
+        for enabled in [false, true] {
+            assert_eq!(
+                run(source, enabled),
+                Ok(Value::number(expected)),
+                "{source}, ssa={enabled}"
+            );
+        }
+    }
+}
+
+#[test]
+fn string_split_specialization_preserves_replacements_and_errors() {
+    for source in [
+        "function main(){return 'a,b'.split(',').length;}",
+        "function split(x){return [x,x];} function main(){let o={split:split};return o.split(3).length;}",
+        "function main(){return 'x'.split(1).length;}",
+        "function main(){return 'x'.split('x',1).length;}",
+    ] {
+        assert_eq!(run(source, true), run(source, false), "{source}");
+    }
+}

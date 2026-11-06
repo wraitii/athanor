@@ -37,6 +37,29 @@ fn evaluation_reenters_the_same_engine_and_globals() {
 }
 
 #[test]
+fn cached_bindings_observe_reentrant_declarations_and_keep_live_values() {
+    let mut engine = engine();
+    engine
+        .compile(
+            r#"
+        var shared='old';
+        function read(){return shared;}
+        function kind(){return typeof later;}
+        function main(){
+            read();
+            const saved=read();
+            const before=kind();
+            hostEvaluateSource("shared='new'; let later=7;", 'nested.js');
+            return saved==='old' && read()==='new' && before==='undefined' && kind()==='number';
+        }
+    "#,
+            "cached.js",
+        )
+        .unwrap();
+    assert_eq!(engine.call("main", &[]).unwrap().value(), Value::TRUE);
+}
+
+#[test]
 fn evaluation_during_initialization_and_callbacks_keeps_frames_alive() {
     let mut engine = engine();
     engine.compile("hostEvaluateSource('var x = 40;', 'first.js'); function main() { let a = [1, 2]; let b = a.map(v => { hostEvaluateSource('x += 1;', 'update.js'); return v + x; }); return b[0] === 42 && b[1] === 44; }", "main.js").unwrap();

@@ -23,6 +23,57 @@ impl Heap {
         Some(Value::from_bits(TAG_STRING | id))
     }
 
+    pub(crate) fn split_string(
+        &self,
+        value: Value,
+        separator: Option<Value>,
+    ) -> Option<Vec<Value>> {
+        self.drain(64);
+        let mut data = self.0.borrow_mut();
+        let id = heap_id(value)?;
+        let text = data.string(id)?;
+        let ranges = if let Some(separator) = separator {
+            let separator = data.string(heap_id(separator)?)?;
+            if separator.is_empty() {
+                text.char_indices()
+                    .map(|(start, character)| start..start + character.len_utf8())
+                    .collect::<Vec<_>>()
+            } else if text.contains(separator) {
+                let mut start = 0;
+                let mut ranges = Vec::new();
+                for (end, _) in text.match_indices(separator) {
+                    ranges.push(start..end);
+                    start = end + separator.len();
+                }
+                ranges.push(start..text.len());
+                ranges
+            } else {
+                data.retain(value);
+                return Some(vec![value]);
+            }
+        } else {
+            data.retain(value);
+            return Some(vec![value]);
+        };
+        // The caller keeps the source alive while draining and allocating pieces.
+        drop(data);
+        self.drain(64usize.saturating_mul(ranges.len()));
+        let mut data = self.0.borrow_mut();
+        let mut values = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            let Some(piece_id) = data.reserve() else {
+                for value in values {
+                    data.release(value);
+                }
+                return None;
+            };
+            let piece = data.string(id).unwrap()[range].to_owned();
+            data.store(piece_id, Payload::String(piece));
+            values.push(Value::from_bits(TAG_STRING | piece_id));
+        }
+        Some(values)
+    }
+
     pub(crate) fn next_character(&self, value: Value, offset: usize) -> Option<(char, usize)> {
         if !value.is_string() {
             return None;
@@ -49,6 +100,13 @@ impl Heap {
         let data = self.0.borrow();
         let text = data.string(heap_id(value)?)?;
         Some(text.clone())
+    }
+
+    pub(crate) fn compare_strings(&self, left: Value, right: Value) -> std::cmp::Ordering {
+        let data = self.0.borrow();
+        let left = data.string(heap_id(left).unwrap()).unwrap();
+        let right = data.string(heap_id(right).unwrap()).unwrap();
+        left.cmp(right)
     }
 
     pub(crate) fn strings_equal(&self, left: Value, right: Value) -> bool {

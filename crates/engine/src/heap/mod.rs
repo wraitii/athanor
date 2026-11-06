@@ -40,6 +40,7 @@ pub(crate) use arena::{
 };
 pub(crate) use array::HOLE;
 pub(crate) use natives::{MathFunction, NativeFunction};
+pub(crate) use properties::PropertyWriteCache;
 pub use owned::OwnedValue;
 pub(crate) use regexp::regexp_flags;
 pub(crate) use shape::{DICTIONARY, NO_SHAPE};

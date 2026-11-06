@@ -323,7 +323,7 @@ impl Heap {
     }
 
     pub(crate) fn set_property(&self, object: Value, name: &str, value: Value) -> bool {
-        self.write_property(object, name, value, None)
+        self.write_property(object, name, value, None, None)
     }
 
     pub(crate) fn define_property(
@@ -333,7 +333,17 @@ impl Heap {
         value: Value,
         enumerable: bool,
     ) -> bool {
-        self.write_property(object, name, value, Some(enumerable))
+        self.write_property(object, name, value, Some(enumerable), None)
+    }
+
+    pub(crate) fn set_property_cached(
+        &self,
+        object: Value,
+        name: &str,
+        value: Value,
+        cache: &mut PropertyWriteCache,
+    ) -> bool {
+        self.write_property(object, name, value, None, Some(cache))
     }
 
     pub(super) fn write_property(
@@ -342,6 +352,7 @@ impl Heap {
         name: &str,
         value: Value,
         enumerable: Option<bool>,
+        cache: Option<&mut PropertyWriteCache>,
     ) -> bool {
         let Some(id) = heap_id(object) else {
             return false;
@@ -362,7 +373,14 @@ impl Heap {
         } else {
             enumerable
         };
-        if let Some(old) = data.put_property(id, name, value, enumerable) {
+        let old = match cache {
+            Some(cache) => {
+                let atom = cache.atom(self, &mut data, name);
+                data.put_property_cached(id, name, value, enumerable, atom, cache)
+            }
+            None => data.put_property(id, name, value, enumerable),
+        };
+        if let Some(old) = old {
             if heap_id(old)
                 .and_then(|id| data.live(id))
                 .is_some_and(|slot| matches!(slot.payload, Payload::Native(_)))

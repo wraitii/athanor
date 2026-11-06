@@ -38,7 +38,7 @@ struct Borrows<'g> {
 
 impl Borrows<'_> {
     fn effects(&self, inst: Inst) -> (bool, bool) {
-        let contract = self.graph.contract(&self.graph.insts[inst].op, self.facts);
+        let contract = self.graph.inst_contract(inst, self.facts);
         (
             contract.reentry != Reentry::Closed,
             contract.flags & (GLOBAL_WRITE | HEAP_WRITE) != 0,

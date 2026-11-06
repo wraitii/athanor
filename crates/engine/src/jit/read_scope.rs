@@ -6,7 +6,7 @@ use cranelift_codegen::ir::{
 use cranelift_jit::JITModule;
 use cranelift_module::{FuncId, Module};
 
-use super::clif::{Annotations, IndexedRead, IndexedReadContract};
+use super::clif::{Annotations, IndexedRead};
 use super::effects::{self, GLOBAL_WRITE, HEAP_WRITE, Reentry};
 use super::helpers::Helper;
 use crate::value::Value;
@@ -62,10 +62,9 @@ pub(super) fn specialize(
     annotations: &mut Annotations,
     module: &mut JITModule,
     root_id: FuncId,
-    probe_id: FuncId,
-) -> Option<super::lifetime::ReadLifetime> {
+) {
     if !admitted(context, annotations) || annotations.indexed_reads.len() < 2 {
-        return None;
+        return;
     }
     context.flowgraph();
     context.compute_loop_analysis();
@@ -79,11 +78,6 @@ pub(super) fn specialize(
             continue;
         };
         for &source in &annotations.indexed_reads {
-            if source.contract != IndexedReadContract::RuntimeValue
-                || target.contract != source.contract
-            {
-                continue;
-            }
             if source.call == target.call || context.loop_analysis.is_in_loop(source.success, lp) {
                 continue;
             }
@@ -100,35 +94,21 @@ pub(super) fn specialize(
         }
     }
     let Some((source, target)) = pair else {
-        return None;
+        return;
     };
-    let lifetime = super::lifetime::read_lifetime(&context.func, annotations, source.receiver);
-    let rooted = lifetime == super::lifetime::ReadLifetime::Invocation;
     let function = &mut context.func;
     let Some(first) = function.layout.first_inst(source.success) else {
-        return None;
+        return;
     };
     let stable = {
-        let helper = if rooted {
-            Helper::IndexProbe
-        } else {
-            Helper::IndexRoot
-        };
-        let id = if rooted { probe_id } else { root_id };
-        let root = module.declare_func_in_func(id, function);
+        let root = module.declare_func_in_func(root_id, function);
         let ctx = function.dfg.inst_args(source.call)[0];
         let mut cursor = FuncCursor::new(function).at_inst(first);
         cursor.set_srcloc(cranelift_codegen::ir::SourceLoc::new(source.source.0));
-        let call = if rooted {
-            cursor.ins().call(root, &[ctx, source.receiver, source.key])
-        } else {
-            let slot = cursor.ins().iconst(types::I64, 0);
-            cursor.ins().call(
-                root,
-                &[ctx, slot, source.receiver, source.key, source.result],
-            )
-        };
-        annotations.helpers.insert(call, helper);
+        let call = cursor
+            .ins()
+            .call(root, &[ctx, source.receiver, source.key, source.result]);
+        annotations.helpers.insert(call, Helper::IndexRoot);
         cursor.func.dfg.first_result(call)
     };
 
@@ -173,5 +153,4 @@ pub(super) fn specialize(
         .ins()
         .brif(reuse, done, &[BlockArg::Value(source.result)], slow, &[]);
     context.flowgraph();
-    Some(lifetime)
 }

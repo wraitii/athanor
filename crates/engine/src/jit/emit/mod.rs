@@ -21,7 +21,7 @@ use oxc_syntax::symbol::SymbolId;
 
 use crate::error::Error;
 use crate::jit::clif::Annotations;
-use crate::jit::helpers::{Helper, PropertyCache};
+use crate::jit::helpers::{GlobalCache, Helper, PropertyCache};
 use crate::value::Value;
 
 pub(crate) use statement::statement_kind;
@@ -43,6 +43,7 @@ pub(super) struct FunctionCompiler<'a, 'f> {
     names: &'a mut Vec<Box<str>>,
     cells: &'a mut Vec<Box<u64>>,
     property_caches: &'a mut Vec<Box<PropertyCache>>,
+    global_caches: &'a mut Vec<Box<GlobalCache>>,
     source_name: (usize, usize),
     source_span: Span,
     b: &'a mut FunctionBuilder<'f>,
@@ -54,7 +55,6 @@ pub(super) struct FunctionCompiler<'a, 'f> {
     receiver: ClifValue,
     argv: ClifValue,
     argc: ClifValue,
-    closures: &'a HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
     return_block: Block,
     handlers: Vec<Block>,
     generator: Option<ClifValue>,
@@ -74,9 +74,10 @@ pub(super) fn build_function(
     names: &mut Vec<Box<str>>,
     cells: &mut Vec<Box<u64>>,
     property_caches: &mut Vec<Box<PropertyCache>>,
+    global_caches: &mut Vec<Box<GlobalCache>>,
     source_name: (usize, usize),
     params: Span,
-    closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
+    _closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
     kind: FunctionKind,
     graph: &super::semantic::Graph,
     feedback: Option<Feedback<'_>>,
@@ -89,9 +90,9 @@ pub(super) fn build_function(
         names,
         cells,
         property_caches,
+        global_caches,
         source_name,
         params,
-        closures,
         kind,
         CallableBody::Graph(graph),
         feedback,
@@ -106,9 +107,10 @@ pub(super) fn build_factory(
     names: &mut Vec<Box<str>>,
     cells: &mut Vec<Box<u64>>,
     property_caches: &mut Vec<Box<PropertyCache>>,
+    global_caches: &mut Vec<Box<GlobalCache>>,
     source_name: (usize, usize),
     params: Span,
-    closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
+    _closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
     resume: FuncId,
 ) -> Result<(), Error> {
     build_callable(
@@ -119,9 +121,9 @@ pub(super) fn build_factory(
         names,
         cells,
         property_caches,
+        global_caches,
         source_name,
         params,
-        closures,
         FunctionKind::Factory(resume),
         CallableBody::Factory(resume),
         None,
@@ -141,9 +143,9 @@ fn build_callable(
     names: &mut Vec<Box<str>>,
     cells: &mut Vec<Box<u64>>,
     property_caches: &mut Vec<Box<PropertyCache>>,
+    global_caches: &mut Vec<Box<GlobalCache>>,
     source_name: (usize, usize),
     params: Span,
-    closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
     kind: FunctionKind,
     body: CallableBody<'_>,
     feedback: Option<Feedback<'_>>,
@@ -161,6 +163,7 @@ fn build_callable(
         names,
         cells,
         property_caches,
+        global_caches,
         source_name,
         source_span: params,
         b,
@@ -172,7 +175,6 @@ fn build_callable(
         receiver,
         argv,
         argc,
-        closures,
         return_block,
         handlers: Vec::new(),
         generator: None,
@@ -223,8 +225,7 @@ fn build_callable(
         compiler.patch_frame_size();
         if let Some(dispatch) = dispatch {
             compiler.switch(dispatch);
-            let dummy = compiler.constant(Value::UNDEFINED);
-            let state = compiler.call_helper(Helper::GeneratorState, &[dummy]);
+            let state = compiler.call_helper(Helper::GeneratorState, &[]);
             let mut switch = Switch::new();
             for (state, block) in compiler.resume_blocks.iter().enumerate() {
                 switch.set_entry(state as u128, *block);
@@ -248,8 +249,9 @@ pub(super) fn build_global(
     names: &mut Vec<Box<str>>,
     cells: &mut Vec<Box<u64>>,
     property_caches: &mut Vec<Box<PropertyCache>>,
+    global_caches: &mut Vec<Box<GlobalCache>>,
     source_name: (usize, usize),
-    closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
+    _closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
     graph: &super::semantic::Graph,
 ) -> Result<(), Error> {
     let entry = b.create_block();
@@ -264,6 +266,7 @@ pub(super) fn build_global(
         names,
         cells,
         property_caches,
+        global_caches,
         source_name,
         source_span: Span::new(0, 0),
         b,
@@ -275,7 +278,6 @@ pub(super) fn build_global(
         receiver,
         argv,
         argc,
-        closures,
         return_block,
         handlers: Vec::new(),
         generator: None,

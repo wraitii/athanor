@@ -68,7 +68,7 @@ pub(super) fn direct_captures(
     call: Inst,
     callee: super::Value,
 ) -> Option<Vec<super::Binding>> {
-    let Op::Closure(_, _, false, captures) = graph.defining_op(callee)? else {
+    let Op::Closure(_, _, _, false, _, captures, _) = graph.defining_op(callee)? else {
         return None;
     };
     let origin = graph.def_block(callee);
@@ -108,17 +108,20 @@ pub(super) fn direct_captures(
 
 pub(super) fn apply(graph: &mut Graph, body: &Graph, plan: &Inline) {
     let call = graph.insts[plan.call].clone();
-    let (callee, receiver, args) = match &call.op {
+    let (callee, receiver, args, spread) = match &call.op {
         Op::Call {
             callee,
             receiver,
             args,
-        } => (callee, *receiver, args),
+        } => (callee, *receiver, args.as_slice(), None),
         Op::ConstructorCall {
             callee,
             receiver,
             args,
-        } => (callee, Some(*receiver), args),
+        } => (callee, Some(*receiver), args.as_slice(), None),
+        Op::ConstructorCallSpread(callee, receiver, args) => {
+            (callee, Some(*receiver), &[][..], Some(*args))
+        }
         _ => unreachable!(),
     };
     let captures = (!plan.guard_code)
@@ -139,6 +142,18 @@ pub(super) fn apply(graph: &mut Graph, body: &Graph, plan: &Inline) {
             TerminatorKind::Jump(Target::new(current))
         },
     });
+    if let Some(array) = spread {
+        let check = graph
+            .append(current, call.span, Op::IsIndexed(array), true)
+            .1
+            .unwrap();
+        let next = graph.blocks.push(BlockData::default());
+        graph.blocks[current].terminator = Some(Terminator {
+            span: call.span,
+            kind: TerminatorKind::Branch(check, Target::new(next), Target::new(fallback)),
+        });
+        current = next;
+    }
     for &index in &plan.numbers {
         let value = args[index];
         let check = graph
@@ -166,17 +181,15 @@ pub(super) fn apply(graph: &mut Graph, body: &Graph, plan: &Inline) {
         .1
         .unwrap();
     let uses_this = Cfg::new(body).rpo.iter().any(|&block| {
-        body.blocks[block]
-            .insts
-            .iter()
-            .any(|&inst| matches!(body.insts[inst].op, Op::This))
+        body.blocks[block].insts.iter().any(|&inst| {
+            matches!(
+                body.insts[inst].op,
+                Op::This | Op::Closure(_, _, true, _, true, _, None)
+            )
+        })
     });
     let receiver = if plan.arrow && uses_this {
-        let op = if plan.guard_code {
-            Op::ClosureThis(*callee)
-        } else {
-            Op::This
-        };
+        let op = Op::ClosureThis(*callee);
         graph.append(current, call.span, op, true).1.unwrap()
     } else {
         receiver.unwrap_or(undefined)
@@ -219,6 +232,8 @@ pub(super) fn apply(graph: &mut Graph, body: &Graph, plan: &Inline) {
     let mut blocks = HashMap::new();
     let mut values = HashMap::new();
     let mut insts = Vec::new();
+    let mut spread_args = HashMap::new();
+    let mut lexical_closures = Vec::new();
     let reachable = Cfg::new(body).rpo;
     for &block in &reachable {
         let copy = graph.blocks.push(BlockData::default());
@@ -231,7 +246,25 @@ pub(super) fn apply(graph: &mut Graph, body: &Graph, plan: &Inline) {
         for &inst in &body.blocks[block].insts {
             let data = &body.insts[inst];
             if let Op::Argument(index) = data.op {
-                let value = args.get(index).copied().unwrap_or(undefined);
+                let value = if let Some(array) = spread {
+                    *spread_args.entry(index).or_insert_with(|| {
+                        let key = graph
+                            .append(
+                                current,
+                                call.span,
+                                Op::Constant(Constant::Number(index as f64)),
+                                true,
+                            )
+                            .1
+                            .unwrap();
+                        graph
+                            .append(current, call.span, Op::SpreadGet(array, key), true)
+                            .1
+                            .unwrap()
+                    })
+                } else {
+                    args.get(index).copied().unwrap_or(undefined)
+                };
                 values.insert(
                     data.result.unwrap(),
                     narrowed.get(&value).copied().unwrap_or(value),
@@ -244,6 +277,11 @@ pub(super) fn apply(graph: &mut Graph, body: &Graph, plan: &Inline) {
             }
             let mut op = data.op.clone();
             match &mut op {
+                Op::Closure(_, _, _, _, _, captures, _) => {
+                    for binding in captures {
+                        *binding = bindings[binding];
+                    }
+                }
                 Op::Read(binding) | Op::Write(binding, _) | Op::Initialize(binding, _) => {
                     *binding = bindings[binding];
                 }
@@ -264,6 +302,9 @@ pub(super) fn apply(graph: &mut Graph, body: &Graph, plan: &Inline) {
             }
             let (copy, result) = graph.append(blocks[&block], data.span, op, data.result.is_some());
             graph.insts[copy].source_name = data.source_name.or(plan.source_name);
+            if matches!(data.op, Op::Closure(_, _, true, _, true, _, None)) {
+                lexical_closures.push(copy);
+            }
             if let Some(value) = data.result {
                 values.insert(value, result.unwrap());
             }
@@ -276,6 +317,11 @@ pub(super) fn apply(graph: &mut Graph, body: &Graph, plan: &Inline) {
         }
         for value in graph.insts[inst].op.operands_mut() {
             *value = values[value];
+        }
+    }
+    for inst in lexical_closures {
+        if let Op::Closure(_, _, _, _, _, _, lexical_receiver) = &mut graph.insts[inst].op {
+            *lexical_receiver = Some(receiver);
         }
     }
     for &block in &reachable {

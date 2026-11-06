@@ -3,14 +3,7 @@ use num_bigint::BigUint;
 use super::super::session::JitCtx;
 use super::{arg, fail};
 use crate::heap::NativeFunction;
-use crate::value::Value;
-
-pub(in crate::jit) fn number_text(value: f64) -> String {
-    if value == 0.0 {
-        return "0".into();
-    }
-    dragonbox_ecma::Buffer::new().format(value).to_owned()
-}
+use crate::value::{Value, number_text};
 
 fn parts(value: f64) -> (u64, i32) {
     let bits = value.to_bits();

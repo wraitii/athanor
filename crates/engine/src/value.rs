@@ -153,39 +153,31 @@ impl fmt::Display for Value {
     }
 }
 
-fn number_text(value: f64) -> String {
-    if value.is_nan() {
-        return "NaN".into();
-    }
+pub(crate) fn number_text(value: f64) -> String {
     if value == 0.0 {
         return "0".into();
     }
-    if value.is_infinite() {
-        return if value > 0.0 { "Infinity" } else { "-Infinity" }.into();
-    }
-    if value.fract() == 0.0 && value.abs() < 1e21 {
-        return format!("{value}");
-    }
-    if value < 0.0 {
-        return format!("-{}", number_text(-value));
-    }
-    let scientific = format!("{value:e}");
-    let (mantissa, exponent) = scientific.split_once('e').unwrap();
-    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
-    let k = digits.len() as i32;
-    let n = exponent.parse::<i32>().unwrap() + 1;
-    if k <= n && n <= 21 {
-        format!("{digits}{}", "0".repeat((n - k) as usize))
-    } else if 0 < n && n <= 21 {
-        format!("{}.{}", &digits[..n as usize], &digits[n as usize..])
-    } else if -6 < n && n <= 0 {
-        format!("0.{}{digits}", "0".repeat(-n as usize))
-    } else {
-        let sign = if n - 1 < 0 { '-' } else { '+' };
-        let power = (n - 1).abs();
-        match digits.split_at(1) {
-            (first, "") => format!("{first}e{sign}{power}"),
-            (first, rest) => format!("{first}.{rest}e{sign}{power}"),
+    dragonbox_ecma::Buffer::new().format(value).to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn number_formatting_handles_special_values_and_notation_boundaries() {
+        for (value, expected) in [
+            (f64::NAN, "NaN"),
+            (f64::INFINITY, "Infinity"),
+            (f64::NEG_INFINITY, "-Infinity"),
+            (-0.0, "0"),
+            (1e-7, "1e-7"),
+            (1e-6, "0.000001"),
+            (1e20, "100000000000000000000"),
+            (1e21, "1e+21"),
+            (-1e21, "-1e+21"),
+        ] {
+            assert_eq!(Value::number(value).to_string(), expected);
         }
     }
 }

@@ -29,6 +29,7 @@ pub(crate) struct CompiledFunction {
 
 #[derive(Clone)]
 struct Emission {
+    conditional: super::semantic::specialize::ConditionalPlan,
     inlines: Vec<super::semantic::specialize::Inline>,
     reads: Vec<super::semantic::reads::Read>,
     source_name: (usize, usize),
@@ -43,6 +44,7 @@ pub(crate) struct Compiler {
     names: Vec<Box<str>>,
     cells: Vec<Box<u64>>,
     property_caches: Vec<Box<helpers::PropertyCache>>,
+    global_caches: Vec<Box<helpers::GlobalCache>>,
     source_name: (usize, usize),
     canonical: super::semantic::specialize::Repository,
     module: JITModule,
@@ -102,6 +104,7 @@ impl Compiler {
             names: Vec::new(),
             cells: Vec::new(),
             property_caches: Vec::new(),
+            global_caches: Vec::new(),
             source_name: (0, 0),
             canonical: super::semantic::specialize::Repository::default(),
             module,
@@ -250,8 +253,8 @@ impl Compiler {
         }
 
         let analysis = CaptureAnalysis::analyze(program, scoping);
-        if let Some(span) = analysis.class_name_writes.first() {
-            return Err(unsupported_at(*span, "assignment to inner class name"));
+        if let Some(span) = analysis.class_name_write {
+            return Err(unsupported_at(span, "assignment to inner class name"));
         }
         let mut closures = HashMap::new();
         let mut nested = Vec::new();
@@ -576,6 +579,7 @@ impl Compiler {
                     &mut self.names,
                     &mut self.cells,
                     &mut self.property_caches,
+                    &mut self.global_caches,
                     self.source_name,
                     &closures,
                     &graph.graph,
@@ -654,7 +658,6 @@ impl Compiler {
                     &mut code.annotations,
                     &mut self.module,
                     self.helpers[helpers::Helper::IndexRoot as usize],
-                    self.helpers[helpers::Helper::IndexProbe as usize],
                 );
                 let removed =
                     temporaries::remove_empty_clears(&mut self.context.func, &code.annotations);
@@ -810,7 +813,10 @@ impl Compiler {
             Some((&self.canonical, source)),
         )
         .map_err(Error::Unsupported)?;
-        if planned.inlines == emission.inlines && planned.reads == emission.reads {
+        if planned.inlines == emission.inlines
+            && planned.reads == emission.reads
+            && planned.conditional == emission.conditional
+        {
             return Ok(None);
         }
         let graph = super::semantic::optimize_planned(planned).map_err(Error::Unsupported)?;
@@ -839,6 +845,7 @@ impl Compiler {
                 &mut self.names,
                 &mut self.cells,
                 &mut self.property_caches,
+                &mut self.global_caches,
                 emission.source_name,
                 emission.params,
                 &emission.closures,
@@ -867,6 +874,7 @@ impl Compiler {
         let lines = line_starts(&source);
         self.finish_functions(vec![(id, body)], &source, &filename, &lines)?;
         let emission = self.emissions.get_mut(&code).unwrap();
+        emission.conditional = graph.conditional;
         emission.inlines = graph.inlines;
         emission.reads = graph.reads;
         Ok(Some(self.module.get_finalized_function(id) as usize))
@@ -991,6 +999,7 @@ impl Compiler {
             self.emissions.insert(
                 code,
                 Emission {
+                    conditional: graph.as_ref().unwrap().conditional.clone(),
                     inlines: graph.as_ref().unwrap().inlines.clone(),
                     reads: graph.as_ref().unwrap().reads.clone(),
                     source_name: self.source_name,
@@ -1019,6 +1028,7 @@ impl Compiler {
                     &mut self.names,
                     &mut self.cells,
                     &mut self.property_caches,
+                    &mut self.global_caches,
                     self.source_name,
                     params.span,
                     closures,
@@ -1039,6 +1049,7 @@ impl Compiler {
                     &mut self.names,
                     &mut self.cells,
                     &mut self.property_caches,
+                    &mut self.global_caches,
                     self.source_name,
                     params.span,
                     closures,

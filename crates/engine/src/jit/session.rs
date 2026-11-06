@@ -7,7 +7,7 @@ use crate::value::Value;
 struct Frame {
     locals: usize,
     temps: usize,
-    index_roots: Vec<Option<[Value; 3]>>,
+    index_root: Option<[Value; 3]>,
     resume_state: usize,
 }
 
@@ -64,6 +64,8 @@ pub(crate) struct JitCtx<'a> {
     locals_base: *mut Value,
     temps: TempStack,
     epoch: *const u64,
+    global_identity: *const (),
+    global_revision: *const u64,
     pub(crate) engine: &'a Engine,
 }
 
@@ -81,6 +83,11 @@ pub(crate) const TEMPS_FLOOR_OFFSET: i32 =
     (TEMPS_OFFSET + std::mem::offset_of!(TempStack, floor)) as i32;
 pub(crate) const EPOCH_OFFSET: i32 = std::mem::offset_of!(JitCtx<'static>, epoch) as i32;
 
+pub(crate) const GLOBAL_IDENTITY_OFFSET: i32 =
+    std::mem::offset_of!(JitCtx<'static>, global_identity) as i32;
+pub(crate) const GLOBAL_REVISION_OFFSET: i32 =
+    std::mem::offset_of!(JitCtx<'static>, global_revision) as i32;
+
 impl<'a> JitCtx<'a> {
     fn new(engine: &'a Engine) -> Self {
         Self {
@@ -93,6 +100,8 @@ impl<'a> JitCtx<'a> {
             locals_base: std::ptr::null_mut(),
             temps: TempStack::new(),
             epoch: engine.global().heap().epoch(),
+            global_identity: engine.global().identity(),
+            global_revision: engine.global().revision_ptr(),
             engine,
         }
     }
@@ -151,7 +160,7 @@ impl<'a> JitCtx<'a> {
         self.frames.push(Frame {
             locals: self.locals.len(),
             temps: self.temps.len,
-            index_roots: Vec::new(),
+            index_root: None,
             resume_state,
         });
     }
@@ -161,10 +170,7 @@ impl<'a> JitCtx<'a> {
             Some(frame) => self.locals.as_mut_ptr().wrapping_add(frame.locals),
             None => std::ptr::null_mut(),
         };
-        self.sync_temps();
-    }
 
-    fn sync_temps(&mut self) {
         self.temps.floor = self.frames.last().map_or(0, |frame| frame.temps);
     }
 
@@ -192,10 +198,8 @@ impl<'a> JitCtx<'a> {
         }
         self.clear();
         let frame = self.frames.pop().unwrap();
-        for values in frame.index_roots.into_iter().flatten() {
-            for value in values {
-                self.global.heap().release(value);
-            }
+        if let Some(values) = frame.index_root {
+            self.global.heap().release_all(&values);
         }
         let locals = self.locals.split_off(frame.locals);
         self.sync_locals();
@@ -229,13 +233,7 @@ impl<'a> JitCtx<'a> {
         self.global.heap().release_all(self.temps.above(base));
         self.temps.len = base;
     }
-    pub(crate) fn root_index_read(
-        &mut self,
-        slot: usize,
-        receiver: Value,
-        key: Value,
-        result: Value,
-    ) -> bool {
+    pub(crate) fn root_index_read(&mut self, receiver: Value, key: Value, result: Value) -> bool {
         let heap = self.global.heap();
         if !heap.supports_indexed_storage(
             receiver,
@@ -255,9 +253,7 @@ impl<'a> JitCtx<'a> {
             }
             retained += 1;
         }
-        let roots = &mut self.frames.last_mut().unwrap().index_roots;
-        roots.resize(roots.len().max(slot + 1), None);
-        if let Some(old) = roots[slot].replace(values) {
+        if let Some(old) = self.frames.last_mut().unwrap().index_root.replace(values) {
             for value in old {
                 heap.release(value);
             }
@@ -324,7 +320,7 @@ impl<'a> JitCtx<'a> {
         self.locals.truncate(frame.locals);
         heap.release_all(self.temps.above(frame.temps));
         self.temps.len = frame.temps;
-        for roots in frame.index_roots.into_iter().flatten() {
+        if let Some(roots) = frame.index_root {
             heap.release_all(&roots);
         }
         self.sync_locals();
@@ -398,13 +394,13 @@ mod tests {
         let second_array = heap.array(&[second]).unwrap();
         let key = Value::number(0.0);
         ctx.enter(0);
-        assert!(ctx.root_index_read(0, first_array, key, first));
+        assert!(ctx.root_index_read(first_array, key, first));
         heap.release(first_array);
         heap.release(first);
         heap.drain(100);
         assert!(heap.valid(first_array) && heap.valid(first));
-        assert!(ctx.root_index_read(0, second_array, key, second));
-        assert_eq!(ctx.frames.last().unwrap().index_roots.len(), 1);
+        assert!(ctx.root_index_read(second_array, key, second));
+        assert!(ctx.frames.last().unwrap().index_root.is_some());
         heap.drain(100);
         assert!(!heap.valid(first_array) && !heap.valid(first));
         heap.release(second_array);
@@ -465,8 +461,8 @@ mod tests {
             .native_function(crate::heap::NativeFunction::ArrayMap)
             .unwrap();
         ctx.enter(0);
-        assert!(!ctx.root_index_read(0, array, key, method));
-        assert!(ctx.frames.last().unwrap().index_roots.is_empty());
+        assert!(!ctx.root_index_read(array, key, method));
+        assert!(ctx.frames.last().unwrap().index_root.is_none());
         heap.release(array);
         heap.release(key);
         heap.release(method);

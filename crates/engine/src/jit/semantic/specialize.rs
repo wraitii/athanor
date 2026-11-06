@@ -3,7 +3,12 @@ use std::collections::{HashMap, HashSet};
 use cranelift_module::FuncId;
 use oxc_syntax::operator::BinaryOperator;
 
-use super::{Canonical, Cfg, Constant, Facts, Graph, Inst, Op, Result, TerminatorKind, Types};
+use super::super::effects::{
+    Assumption, ERROR, GLOBAL_WRITE, HEAP_WRITE, INTERNAL, Reentry, UNKNOWN,
+};
+use super::{
+    Canonical, Cfg, Constant, Facts, Graph, Inst, Native, Op, Result, TerminatorKind, Types,
+};
 
 #[derive(Default)]
 pub(in crate::jit) struct Repository {
@@ -19,6 +24,7 @@ pub(in crate::jit) struct Repository {
 }
 
 struct Body {
+    name: String,
     source: usize,
     canonical: Canonical,
     arrow: bool,
@@ -38,6 +44,7 @@ impl Repository {
         self.bodies.insert(
             code,
             Body {
+                name: name.to_owned(),
                 source,
                 canonical,
                 arrow: false,
@@ -54,9 +61,11 @@ impl Repository {
     ) {
         self.locations
             .insert((source, canonical.graph.span.start), code);
+        let name = canonical.graph.name.clone();
         self.bodies.insert(
             code,
             Body {
+                name,
                 source,
                 canonical,
                 arrow,
@@ -73,10 +82,6 @@ impl Repository {
         Some((body.source, body.canonical.clone()))
     }
 
-    pub(super) fn closure(&self, source: usize, start: u32) -> Option<FuncId> {
-        self.locations.get(&(source, start)).copied()
-    }
-
     pub(in crate::jit) fn canonical(&self, source: usize, start: u32) -> Option<&Canonical> {
         let code = self.locations.get(&(source, start))?;
         Some(&self.bodies.get(code)?.canonical)
@@ -86,6 +91,395 @@ impl Repository {
         let body = self.bodies.get(&code)?;
         Some(&body.canonical.graph)
     }
+}
+
+#[derive(Clone, Default, PartialEq, Eq)]
+struct ConditionalEffects {
+    flags: u16,
+    globals_read: HashSet<String>,
+    globals_written: HashSet<String>,
+    properties_read: HashSet<String>,
+    properties_written: HashSet<String>,
+    assumptions: HashSet<Assumption>,
+    identities: HashSet<(String, FuncId)>,
+    natives: HashSet<Native>,
+    string_splits: HashSet<(FuncId, Inst)>,
+    unresolved: HashSet<(FuncId, Inst)>,
+    unsupported: bool,
+}
+
+impl ConditionalEffects {
+    fn merge(&mut self, other: &Self) {
+        self.flags |= other.flags;
+        self.unsupported |= other.unsupported;
+        self.globals_read.extend(other.globals_read.iter().cloned());
+        self.globals_written
+            .extend(other.globals_written.iter().cloned());
+        self.properties_read
+            .extend(other.properties_read.iter().cloned());
+        self.properties_written
+            .extend(other.properties_written.iter().cloned());
+        self.assumptions.extend(other.assumptions.iter().copied());
+        self.identities.extend(other.identities.iter().cloned());
+        self.natives.extend(other.natives.iter().copied());
+        self.string_splits
+            .extend(other.string_splits.iter().copied());
+        self.unresolved.extend(other.unresolved.iter().copied());
+    }
+}
+
+struct LocalEffects {
+    effects: ConditionalEffects,
+    calls: Vec<(Inst, FuncId)>,
+}
+
+impl Repository {
+    fn local_effects(&self, code: FuncId) -> Option<LocalEffects> {
+        let graph = self.body(code)?;
+        let facts = Facts::compute(graph);
+        let mut effects = ConditionalEffects::default();
+        if graph.generator || graph.has_handlers {
+            effects.flags |= UNKNOWN;
+            effects.unsupported = true;
+        }
+        let mut calls = Vec::new();
+        for block in Cfg::new(graph).rpo {
+            for &inst in &graph.blocks[block].insts {
+                let op = &graph.insts[inst].op;
+                match op {
+                    Op::GlobalRead(name) | Op::GlobalReadOptional(name) => {
+                        effects.globals_read.insert(name.clone());
+                    }
+                    Op::GlobalWrite(name, _) | Op::GlobalInitialize(name, _) => {
+                        effects.globals_written.insert(name.clone());
+                    }
+                    Op::Get(_, name) => {
+                        effects.properties_read.insert(name.clone());
+                    }
+                    Op::Set(_, name, _) | Op::Define(_, name, _) | Op::DefineHidden(_, name, _) => {
+                        effects.properties_written.insert(name.clone());
+                        effects.flags |= HEAP_WRITE;
+                    }
+                    Op::GetIndex(..) | Op::IndexedGet(..) | Op::TypedIndex(..) => {
+                        effects.properties_read.insert("*".into());
+                    }
+                    Op::SetIndex(..) | Op::ArrayAppend(..) => {
+                        effects.properties_written.insert("*".into());
+                        effects.flags |= HEAP_WRITE;
+                    }
+                    _ => {}
+                }
+                if let Op::Call {
+                    callee,
+                    receiver,
+                    args,
+                } = op
+                {
+                    let target = match graph.defining_op(*callee) {
+                        Some(Op::GlobalRead(name)) => {
+                            self.globals.get(name).copied().map(|target| {
+                                effects.identities.insert((name.clone(), target));
+                                target
+                            })
+                        }
+                        Some(Op::Closure(_, target, _, false, _, _, _)) => Some(*target),
+                        _ => None,
+                    };
+                    if let Some(target) = target.filter(|target| self.body(*target).is_some()) {
+                        effects.flags |= INTERNAL | ERROR;
+                        calls.push((inst, target));
+                        continue;
+                    }
+                    if let Some(Op::Get(object, property)) = graph.defining_op(*callee)
+                        && property == "split"
+                        && *receiver == Some(*object)
+                    {
+                        effects.string_splits.insert((code, inst));
+                        let contract =
+                            graph.contract(&Op::StringSplit(*object, args.clone()), &facts);
+                        effects.flags |= contract.flags;
+                        effects
+                            .assumptions
+                            .extend(contract.assumptions.iter().copied());
+                        continue;
+                    }
+                    if let Some(Op::Get(object, property)) = graph.defining_op(*callee)
+                        && let Some(Op::GlobalRead(global)) = graph.defining_op(*object)
+                        && let Some(native) = Native::lookup(global, property)
+                    {
+                        effects.natives.insert(native);
+                        let contract =
+                            graph.contract(&Op::CallNative(native, args.clone()), &facts);
+                        effects.flags |= contract.flags;
+                        for assumption in contract.assumptions {
+                            effects.assumptions.insert(*assumption);
+                        }
+                        continue;
+                    }
+                }
+                let contract = graph.contract(op, &facts);
+                effects.flags |= contract.flags;
+                for assumption in contract.assumptions {
+                    effects.assumptions.insert(*assumption);
+                }
+                if contract.reentry != Reentry::Closed {
+                    effects.unresolved.insert((code, inst));
+                    effects.flags |= UNKNOWN;
+                }
+            }
+        }
+        Some(LocalEffects { effects, calls })
+    }
+
+    fn effect_summaries(
+        &self,
+        roots: impl IntoIterator<Item = FuncId>,
+    ) -> HashMap<FuncId, ConditionalEffects> {
+        let mut local = HashMap::new();
+        let mut pending: Vec<_> = roots.into_iter().collect();
+        while let Some(code) = pending.pop() {
+            if local.contains_key(&code) {
+                continue;
+            }
+            let Some(body) = self.local_effects(code) else {
+                continue;
+            };
+            pending.extend(body.calls.iter().map(|&(_, target)| target));
+            local.insert(code, body);
+        }
+        let mut summaries: HashMap<_, _> = local
+            .iter()
+            .map(|(&code, body)| (code, body.effects.clone()))
+            .collect();
+        loop {
+            let mut changed = false;
+            for (&code, body) in &local {
+                let mut summary = body.effects.clone();
+                for (_, target) in &body.calls {
+                    if let Some(callee) = summaries.get(target) {
+                        summary.merge(callee);
+                    }
+                }
+                if summaries.get(&code) != Some(&summary) {
+                    summaries.insert(code, summary);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        summaries
+    }
+    fn obligation_chain(&self, root: FuncId, identities_block: bool) -> String {
+        let label = |code| {
+            self.bodies.get(&code).map_or_else(
+                || code.to_string(),
+                |body| format!("{} ({code})", body.name),
+            )
+        };
+        let mut pending = vec![(root, label(root))];
+        let mut visited = HashSet::new();
+        while let Some((code, path)) = pending.pop() {
+            if !visited.insert(code) {
+                continue;
+            }
+            let Some(local) = self.local_effects(code) else {
+                continue;
+            };
+            let effects = &local.effects;
+            if effects.unsupported {
+                return format!("{path}: generator or exception handler");
+            }
+            if let Some((_, inst)) = effects.unresolved.iter().min_by_key(|(_, inst)| *inst) {
+                let graph = self.body(code).unwrap();
+                return format!(
+                    "{path} -> {inst}: unresolved {}",
+                    unresolved_operation(graph, &graph.insts[*inst].op)
+                );
+            }
+            if identities_block
+                && let Some((name, target)) = effects.identities.iter().min_by_key(|(name, _)| name)
+            {
+                return format!("{path}: requires global {name} to remain {target}");
+            }
+            if let Some((_, inst)) = effects.string_splits.iter().min_by_key(|(_, inst)| *inst) {
+                return format!(
+                    "{path} -> {inst}: method .split requires native String.split identity and its original receiver"
+                );
+            }
+            if let Some(native) = effects.natives.iter().min_by_key(|native| native.index()) {
+                return format!("{path}: requires native {native} identity");
+            }
+            if effects.flags & (GLOBAL_WRITE | HEAP_WRITE) != 0
+                || !effects.properties_written.is_empty()
+            {
+                return format!("{path}: writes state");
+            }
+            for (inst, target) in local.calls.into_iter().rev() {
+                pending.push((target, format!("{path} -> {inst} -> {}", label(target))));
+            }
+        }
+        format!("{root}: missing proof")
+    }
+}
+
+fn unresolved_operation(graph: &Graph, op: &Op) -> String {
+    let (callee, constructor) = match op {
+        Op::Call { callee, .. } | Op::CallSpread(callee, ..) => (*callee, false),
+        Op::Construct { callee, .. }
+        | Op::ConstructorCall { callee, .. }
+        | Op::ConstructSpread(callee, ..)
+        | Op::ConstructSpreadResolved(callee, ..)
+        | Op::ConstructorCallSpread(callee, ..)
+        | Op::ConstructResolved { callee, .. } => (*callee, true),
+        _ => return graph.op_text(op),
+    };
+    match graph.defining_op(callee) {
+        Some(Op::Get(_, name)) if constructor => {
+            format!("constructor .{name}: requires runtime constructor identity and effects")
+        }
+        Some(Op::Get(_, name)) => {
+            format!("method .{name}: requires runtime callee identity and receiver effects")
+        }
+        Some(Op::GlobalRead(name) | Op::GlobalReadOptional(name)) if constructor => {
+            format!("constructor {name}: requires runtime constructor identity and effects")
+        }
+        Some(Op::GlobalRead(name) | Op::GlobalReadOptional(name)) => {
+            format!("call {name}: requires runtime callee identity and effects")
+        }
+        _ if constructor => format!(
+            "{}: requires runtime constructor identity and effects",
+            graph.op_text(op)
+        ),
+        _ => format!(
+            "{}: requires runtime callee identity and receiver effects",
+            graph.op_text(op)
+        ),
+    }
+}
+
+pub(super) fn prove_closed_calls(graph: &mut Graph, bodies: &Repository, notes: &mut Vec<String>) {
+    let mut candidates = Vec::new();
+    for block in Cfg::new(graph).rpo {
+        for &inst in &graph.blocks[block].insts {
+            let Op::Call { callee, .. } = graph.insts[inst].op else {
+                continue;
+            };
+            let Some(Op::Closure(_, target, _, false, _, _, _)) = graph.defining_op(callee) else {
+                continue;
+            };
+            if graph
+                .insts
+                .values()
+                .any(|data| matches!(data.op, Op::MarkClass(value) if value == callee))
+            {
+                continue;
+            }
+            candidates.push((inst, callee, *target));
+        }
+    }
+    if candidates.is_empty() {
+        return;
+    }
+    let summaries = bodies.effect_summaries(candidates.iter().map(|&(_, _, target)| target));
+    for (inst, callee, target) in candidates {
+        let Some(summary) = summaries.get(&target) else {
+            continue;
+        };
+        if summary.unsupported
+            || !summary.unresolved.is_empty()
+            || !summary.identities.is_empty()
+            || !summary.natives.is_empty()
+            || !summary.string_splits.is_empty()
+            || summary.flags & (GLOBAL_WRITE | HEAP_WRITE) != 0
+            || !summary.properties_written.is_empty()
+        {
+            notes.push(format!(
+                "call {inst}: closed-call proof rejected: {}",
+                bodies.obligation_chain(target, true)
+            ));
+            continue;
+        }
+        graph.closed_calls.insert(inst, (callee, summary.flags));
+        notes.push(format!("call {inst}: {target} proved closed and read-only"));
+    }
+}
+
+#[derive(Clone, Default, PartialEq, Eq)]
+pub(in crate::jit) struct ConditionalPlan {
+    pub(super) calls: Vec<(Inst, super::Value, String, u16)>,
+    pub(super) identities: Vec<(String, FuncId)>,
+}
+
+pub(super) fn conditional_plan(
+    graph: &Graph,
+    bodies: &Repository,
+    notes: &mut Vec<String>,
+) -> ConditionalPlan {
+    let mut candidates = Vec::new();
+    for block in Cfg::new(graph).rpo {
+        for &inst in &graph.blocks[block].insts {
+            let Op::Call { callee, .. } = graph.insts[inst].op else {
+                continue;
+            };
+            let Some(Op::GlobalRead(name)) = graph.defining_op(callee) else {
+                continue;
+            };
+            let Some(&target) = bodies.globals.get(name) else {
+                continue;
+            };
+            candidates.push((inst, callee, name.clone(), target));
+        }
+    }
+    let summaries = bodies.effect_summaries(candidates.iter().map(|(_, _, _, target)| *target));
+    let mut plan = ConditionalPlan::default();
+    let mut identities = HashMap::new();
+    for (inst, callee, name, target) in candidates {
+        let Some(summary) = summaries.get(&target) else {
+            continue;
+        };
+        if summary.unsupported
+            || !summary.unresolved.is_empty()
+            || !summary.natives.is_empty()
+            || !summary.string_splits.is_empty()
+            || summary.flags & (GLOBAL_WRITE | HEAP_WRITE) != 0
+            || !summary.properties_written.is_empty()
+        {
+            notes.push(format!(
+                "call {inst}: conditional proof rejected: {}",
+                bodies.obligation_chain(target, false)
+            ));
+            continue;
+        }
+        let mut required = summary.identities.clone();
+        required.insert((name.clone(), target));
+        if required
+            .iter()
+            .any(|(name, target)| identities.get(name).is_some_and(|other| other != target))
+        {
+            continue;
+        }
+        for (name, target) in required {
+            identities.insert(name, target);
+        }
+        let mut assumptions: Vec<_> = summary
+            .assumptions
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assumptions.sort();
+        if !assumptions.is_empty() {
+            notes.push(format!(
+                "call {inst}: conditional effects require {}",
+                assumptions.join(", ")
+            ));
+        }
+        plan.calls.push((inst, callee, name, summary.flags));
+    }
+    plan.identities = identities.into_iter().collect();
+    plan.identities.sort_by(|a, b| a.0.cmp(&b.0));
+    plan
 }
 
 pub(super) struct Request {
@@ -186,7 +580,7 @@ pub(super) fn eligible(graph: &Graph) -> bool {
             if count > 128
                 || matches!(
                     graph.insts[inst].op,
-                    Op::Closure(..) | Op::Arguments | Op::Rest(_) | Op::Catch
+                    Op::Arguments | Op::Rest(_) | Op::Catch
                 )
             {
                 return false;
@@ -202,7 +596,9 @@ pub(super) fn requests(graph: &Graph, bodies: &Repository, source: usize) -> Vec
         for &call in &graph.blocks[block].insts {
             let (callee, constructor) = match &graph.insts[call].op {
                 Op::Call { callee, .. } => (callee, false),
-                Op::ConstructorCall { callee, .. } => (callee, true),
+                Op::ConstructorCall { callee, .. } | Op::ConstructorCallSpread(callee, ..) => {
+                    (callee, true)
+                }
                 _ => continue,
             };
             let data = &graph.insts[call];
@@ -224,12 +620,7 @@ pub(super) fn requests(graph: &Graph, bodies: &Repository, source: usize) -> Vec
                         };
                         (target, !constructor && numeric_body(body))
                     }
-                    Some(Op::Closure(span, _, false, _)) => {
-                        let Some(target) = bodies.closure(source, span.start) else {
-                            continue;
-                        };
-                        (target, false)
-                    }
+                    Some(Op::Closure(_, target, _, false, _, _, _)) => (*target, false),
                     _ => continue,
                 }
             };
@@ -282,8 +673,9 @@ pub(super) fn plan_round(
         };
         let (callee, args) = match &graph.insts[request.call].op {
             Op::Call { callee, args, .. } | Op::ConstructorCall { callee, args, .. } => {
-                (callee, args)
+                (callee, args.as_slice())
             }
+            Op::ConstructorCallSpread(callee, _, _) => (callee, &[][..]),
             _ => continue,
         };
         let cost: usize = Cfg::new(body)
@@ -330,8 +722,8 @@ pub(super) fn plan_round(
             source_name,
             numbers,
             arrow: bodies.bodies[&request.target].arrow,
-            guard_code: !matches!(graph.defining_op(*callee), Some(Op::Closure(span, _, false, _))
-                if bodies.closure(source, span.start) == Some(request.target)
+            guard_code: !matches!(graph.defining_op(*callee), Some(Op::Closure(_, code, _, false, _, _, _))
+                if *code == request.target
                 && !graph.insts.values().any(|data| matches!(data.op, Op::MarkClass(value) if value == *callee))),
         });
     }
@@ -404,6 +796,211 @@ mod tests {
             .flat_map(|block| &graph.blocks[block].insts)
             .map(|&inst| &graph.insts[inst].op)
             .collect()
+    }
+
+    #[test]
+    fn recursive_effects_reach_a_fixed_point_and_keep_obligations() {
+        let (_, bodies) = fixture(
+            "function first(n){if(n)return second(n-1);return state.value;} function second(n){if(n)return first(n-1);state.value=1;return Math.floor(n);} function main(){return first(2);}",
+        );
+        let summaries = bodies.effect_summaries([FuncId::from_u32(0)]);
+        for code in [FuncId::from_u32(0), FuncId::from_u32(1)] {
+            let summary = &summaries[&code];
+            assert!(summary.unresolved.is_empty());
+            assert!(summary.globals_read.contains("state"));
+            assert!(summary.properties_read.contains("value"));
+            assert!(summary.properties_written.contains("value"));
+            assert_eq!(summary.identities.len(), 2);
+            assert_eq!(summary.natives.len(), 1);
+        }
+    }
+
+    #[test]
+    fn string_leaf_versions_only_after_split_native_guard() {
+        let (canonical, bodies) = fixture(
+            "function Terrain(x,y){this.x=x;this.y=y;} function main(t){return typeof t==='string' ? new Terrain(...t.split('|')) : t;}",
+        );
+        let analysis =
+            super::super::optimize_canonical(canonical, true, Some((&bodies, 0))).unwrap();
+        let listing = analysis.to_string();
+        assert!(
+            listing.contains("string split continuation versioned after native identity check"),
+            "{listing}"
+        );
+        assert!(listing.contains("is_string_split"));
+        assert!(listing.contains("string_split"));
+        assert!(listing.contains("constructor_call_spread"));
+        analysis.graph.verify().unwrap();
+    }
+
+    #[test]
+    fn split_effects_require_native_identity_before_call_proof() {
+        let (canonical, bodies) =
+            fixture("function leaf(t){return t.split('|');} function main(t){return leaf(t);}");
+        let summaries = bodies.effect_summaries([FuncId::from_u32(0)]);
+        let summary = &summaries[&FuncId::from_u32(0)];
+        assert!(summary.unresolved.is_empty());
+        assert_eq!(summary.string_splits.len(), 1);
+        assert!(summary.flags & super::super::ALLOCATION != 0);
+        assert!(summary.flags & super::super::ERROR != 0);
+        let mut notes = Vec::new();
+        assert!(
+            conditional_plan(&canonical.graph, &bodies, &mut notes)
+                .calls
+                .is_empty()
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("native String.split identity"))
+        );
+    }
+
+    #[test]
+    fn recursive_terrain_method_rejection_names_its_obligation() {
+        let (canonical, mut bodies) = fixture(
+            "function createTerrain(t){if(typeof t==='string')return t.split('|');return t.map(createTerrain);} function main(t){return createTerrain(t);}",
+        );
+        bodies
+            .bodies
+            .get_mut(&FuncId::from_u32(0))
+            .unwrap()
+            .canonical
+            .graph
+            .name = "<function>".into();
+        let mut notes = Vec::new();
+        let plan = conditional_plan(&canonical.graph, &bodies, &mut notes);
+        assert!(plan.calls.is_empty());
+        let summaries = bodies.effect_summaries([FuncId::from_u32(0)]);
+        assert_eq!(summaries[&FuncId::from_u32(0)].string_splits.len(), 1);
+        assert!(
+            notes.iter().any(|note| note.contains("createTerrain")
+                && note.contains("method .map")
+                && note.contains("runtime callee identity and receiver effects")),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn global_call_preflight_rejects_root_writes() {
+        let (canonical, bodies) = fixture(
+            "function first(n){if(n)return first(n-1);return 0;} function main(n){state.value=1;return first(n);}",
+        );
+        let mut graph = canonical.graph;
+        let plan = conditional_plan(&graph, &bodies, &mut Vec::new());
+        let original_entry = graph.entry;
+        let original_blocks = graph.blocks.len();
+        let mut notes = Vec::new();
+        assert!(
+            super::super::optimize::version_conditional(&mut graph, &plan, &mut notes)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(graph.entry, original_entry);
+        assert_eq!(graph.blocks.len(), original_blocks);
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("conditional call proof rejected"))
+        );
+    }
+
+    #[test]
+    fn recursive_global_calls_are_guarded_as_a_group() {
+        let (canonical, bodies) = fixture(
+            "function first(n){if(n)return second(n-1);return state.value;} function second(n){if(n)return first(n-1);return state.value;} function main(n){return first(n);}",
+        );
+        let mut graph = canonical.graph;
+        let plan = conditional_plan(&graph, &bodies, &mut Vec::new());
+        assert_eq!(plan.calls.len(), 1);
+        assert_eq!(plan.identities.len(), 2);
+        let region =
+            super::super::optimize::version_conditional(&mut graph, &plan, &mut Vec::new())
+                .unwrap()
+                .unwrap();
+        assert_eq!(graph.closed_calls.len(), 1);
+        assert!(
+            graph
+                .closed_calls
+                .keys()
+                .all(|inst| region.contains(&graph.insts[*inst].block))
+        );
+        assert_eq!(
+            operations(&graph)
+                .iter()
+                .filter(|op| matches!(op, Op::IsCode(..)))
+                .count(),
+            2
+        );
+        graph.verify().unwrap();
+    }
+
+    #[test]
+    fn recursive_global_group_with_descendant_write_is_rejected() {
+        let (canonical, bodies) = fixture(
+            "function first(n){if(n)return second(n-1);return 0;} function second(n){if(n)return first(n-1);first=other;return 0;} function main(n){return first(n);}",
+        );
+        assert!(
+            conditional_plan(&canonical.graph, &bodies, &mut Vec::new())
+                .calls
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn unresolved_descendant_blocks_exact_closure_proof() {
+        let (canonical, bodies) =
+            fixture("function helper(x){return unknown(x);} function main(x){return helper(x);}");
+        let mut graph = canonical.graph;
+        let request = requests(&graph, &bodies, 0).pop().unwrap();
+        let Op::Call { callee, .. } = graph.insts[request.call].op else {
+            panic!()
+        };
+        let super::super::ValueDef::Result(def) = graph.values[callee] else {
+            panic!()
+        };
+        graph.insts[def].op = Op::Closure(
+            graph.insts[def].span,
+            request.target,
+            false,
+            false,
+            false,
+            vec![],
+            None,
+        );
+        prove_closed_calls(&mut graph, &bodies, &mut Vec::new());
+        assert!(!graph.closed_calls.contains_key(&request.call));
+    }
+
+    #[test]
+    fn exact_read_only_closure_call_has_a_local_proof() {
+        let (canonical, bodies) =
+            fixture("function helper(x){return x.value;} function main(x){return helper(x);}");
+        let mut graph = canonical.graph;
+        let request = requests(&graph, &bodies, 0).pop().unwrap();
+        let Op::Call { callee, .. } = graph.insts[request.call].op else {
+            panic!()
+        };
+        let super::super::ValueDef::Result(def) = graph.values[callee] else {
+            panic!()
+        };
+        graph.insts[def].op = Op::Closure(
+            graph.insts[def].span,
+            request.target,
+            false,
+            false,
+            false,
+            vec![],
+            None,
+        );
+        prove_closed_calls(&mut graph, &bodies, &mut Vec::new());
+        assert!(graph.closed_calls.contains_key(&request.call));
+        assert_eq!(
+            graph
+                .inst_contract(request.call, &Facts::compute(&graph))
+                .reentry,
+            Reentry::Closed
+        );
     }
 
     #[test]
@@ -642,7 +1239,7 @@ mod tests {
         );
         let mut graph = canonical.graph;
         super::super::construction::resolve(&mut graph);
-        super::super::construction::expand(&mut graph);
+        super::super::construction::expand(&mut graph, &mut HashSet::new());
         let requests = requests(&graph, &bodies, 1);
         assert_eq!(requests.len(), 2);
         assert!(

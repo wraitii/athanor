@@ -1,4 +1,6 @@
-use super::{BlockData, Cfg, Graph, Op, Target, Terminator, TerminatorKind};
+use std::collections::HashSet;
+
+use super::{BlockData, Cfg, Graph, Inst, Op, Target, Terminator, TerminatorKind};
 
 pub(super) fn resolve(graph: &mut Graph) {
     for block in Cfg::new(graph).rpo {
@@ -13,13 +15,14 @@ pub(super) fn resolve(graph: &mut Graph) {
                 .position(|&current| current == inst)
                 .unwrap();
             let span = graph.insts[inst].span;
-            let (_, prototype) = graph.insert(
+            let (probe, prototype) = graph.insert(
                 block,
                 position,
                 span,
                 Op::ConstructorPrototype(callee),
                 true,
             );
+            graph.insts[probe].source_name = graph.insts[inst].source_name;
             let prototype = prototype.unwrap();
             graph.insts[inst].op = match graph.insts[inst].op.clone() {
                 Op::Construct { callee, args } => Op::ConstructResolved {
@@ -36,19 +39,21 @@ pub(super) fn resolve(graph: &mut Graph) {
     }
 }
 
-pub(super) fn expand(graph: &mut Graph) {
+pub(super) fn expand(graph: &mut Graph, expanded: &mut HashSet<Inst>) {
     let sites: Vec<_> = Cfg::new(graph)
         .rpo
         .into_iter()
         .flat_map(|block| graph.blocks[block].insts.clone())
         .filter(|&inst| {
-            matches!(
-                graph.insts[inst].op,
-                Op::ConstructResolved { .. } | Op::ConstructSpreadResolved(..)
-            )
+            !expanded.contains(&inst)
+                && matches!(
+                    graph.insts[inst].op,
+                    Op::ConstructResolved { .. } | Op::ConstructSpreadResolved(..)
+                )
         })
         .collect();
     for inst in sites {
+        expanded.insert(inst);
         let data = graph.insts[inst].clone();
         let (callee, prototype) = match data.op {
             Op::ConstructResolved {

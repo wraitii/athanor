@@ -156,15 +156,23 @@ fn run() -> Result<(), String> {
     if compile {
         return engine.compile_only(&source, &filename).map_err(display);
     }
-    engine.install_host(host::FileHost).map_err(display)?;
+    install_host(&mut engine)?;
     for path in preloads {
-        let preload = fs::read_to_string(&path).map_err(|error| format!("{path}: {error}"))?;
-        engine.compile(&preload, &path).map_err(display)?;
+        compile_file(&mut engine, &path)?;
     }
     engine.compile(&source, &filename).map_err(display)?;
     let result = engine.call(&function, &values).map_err(display)?;
     print_value(&result);
     Ok(())
+}
+
+fn install_host(engine: &mut Engine) -> Result<(), String> {
+    engine.install_host(host::FileHost).map_err(display)
+}
+
+fn compile_file(engine: &mut Engine, path: &str) -> Result<(), String> {
+    let source = fs::read_to_string(path).map_err(|error| format!("{path}: {error}"))?;
+    engine.compile(&source, path).map_err(display)
 }
 
 fn print_value(value: &js_engine::OwnedValue) {
@@ -186,9 +194,8 @@ fn run_map(
     let bootstrap = bootstrap.unwrap_or_else(|| DEFAULT_BOOTSTRAP.to_string());
 
     let mut engine = Engine::new().map_err(display)?;
-    engine.install_host(host::FileHost).map_err(display)?;
-    let source = fs::read_to_string(&bootstrap).map_err(|error| format!("{bootstrap}: {error}"))?;
-    engine.compile(&source, &bootstrap).map_err(display)?;
+    install_host(&mut engine)?;
+    compile_file(&mut engine, &bootstrap)?;
 
     let script = engine.string(&script).map_err(display)?;
     let data = engine.string(&data).map_err(display)?;
@@ -201,7 +208,7 @@ fn run_map(
 
 fn run_repl() -> Result<(), String> {
     let mut engine = Engine::new().map_err(display)?;
-    engine.install_host(host::FileHost).map_err(display)?;
+    install_host(&mut engine)?;
     let stdin = io::stdin();
     let mut lines = stdin.lock().lines();
     loop {

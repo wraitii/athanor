@@ -1,5 +1,5 @@
 pub(super) mod array;
-pub(super) mod console;
+mod console;
 mod date;
 mod host;
 pub(super) mod json;
@@ -7,7 +7,7 @@ pub(super) mod math;
 mod number;
 pub(super) mod object;
 mod regexp;
-mod string;
+pub(super) mod string;
 pub(super) mod typed_array;
 
 use super::session::JitCtx;
@@ -20,20 +20,6 @@ fn arg(args: &[Value], index: usize) -> Value {
 fn fail(context: &mut JitCtx, message: &str) -> Value {
     context.error = Some(Box::new(crate::Error::Runtime(message.into())));
     Value::UNDEFINED
-}
-
-pub(super) fn property_get(ctx: &mut JitCtx, object: Value, name: &str) -> Option<Value> {
-    let heap = ctx.global.heap();
-    let crate::heap::PropertyRead::Native(function) = heap.read_property(object, name)? else {
-        return None;
-    };
-    Some(match heap.native_function(function) {
-        Some(value) => ctx.own(value),
-        None => {
-            ctx.error = Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
-            Value::UNDEFINED
-        }
-    })
 }
 
 pub(super) fn call(

@@ -1,5 +1,22 @@
 use super::*;
 
+#[test]
+fn split_results_own_reused_source() {
+    let heap = Heap::default();
+    let source = heap.string("terrain/grass").unwrap();
+    let separator = heap.string("|").unwrap();
+    let values = heap.split_string(source, Some(separator)).unwrap();
+    assert_eq!(values, vec![source]);
+    let array = heap.array_from_owned(values).unwrap();
+    heap.release(source);
+    heap.release(separator);
+    heap.drain(100);
+    assert_eq!(heap.text(source).as_deref(), Some("terrain/grass"));
+    heap.release(array);
+    heap.drain(100);
+    assert!(!heap.valid(source));
+}
+
 impl Payload {
     fn capture_count(&self) -> usize {
         match self {
@@ -751,4 +768,26 @@ fn disposal_respects_budget_across_shared_array_edges() {
     drop(data);
     heap.drain(1000);
     assert!(!heap.valid(child));
+}
+
+#[test]
+fn property_write_cache_follows_heap_identity() {
+    let mut cache = PropertyWriteCache::default();
+    for padding in [0, 5, 1] {
+        let heap = Heap::default();
+        let object = heap.object().unwrap();
+        for index in 0..padding {
+            heap.set_property(object, &format!("p{index}"), Value::TRUE);
+        }
+        let child = heap.object().unwrap();
+        assert!(heap.set_property_cached(object, "child", child, &mut cache));
+        heap.release(child);
+        assert_eq!(heap.property(object, "child"), Some(child));
+        assert!(heap.set_property_cached(object, "child", Value::FALSE, &mut cache));
+        heap.drain(1000);
+        assert!(!heap.valid(child));
+        assert_eq!(heap.property(object, "child"), Some(Value::FALSE));
+        heap.release(object);
+        heap.drain(1000);
+    }
 }

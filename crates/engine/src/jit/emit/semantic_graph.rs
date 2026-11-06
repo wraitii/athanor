@@ -5,7 +5,7 @@ use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{BlockArg, InstBuilder, MemFlagsData, Value as ClifValue, types};
 use cranelift_frontend::Variable;
 
-use crate::error::{Error, compile_at};
+use crate::error::Error;
 use crate::heap::kind;
 use crate::jit::helpers::Helper;
 use crate::jit::semantic::{
@@ -373,12 +373,15 @@ impl FunctionCompiler<'_, '_> {
                             let dummy = self.constant(Value::UNDEFINED);
                             Some(self.call_helper(Helper::Catch, &[dummy]))
                         }
-                        Op::Closure(span, arrow, generator, captures) => {
-                            let (id, _, lexical_this) = self
-                                .closures
-                                .get(&span.start)
-                                .cloned()
-                                .ok_or_else(|| compile_at(*span, "missing closure code"))?;
+                        Op::Closure(
+                            span,
+                            id,
+                            arrow,
+                            generator,
+                            lexical_this,
+                            captures,
+                            lexical_receiver,
+                        ) => {
                             let cells: Vec<_> = captures
                                 .iter()
                                 .map(|binding| {
@@ -395,8 +398,10 @@ impl FunctionCompiler<'_, '_> {
                             let result = self.call_helper(Helper::ClosureNew, &[code, argv, count]);
                             self.check_error();
                             if *arrow {
-                                let receiver = if lexical_this {
-                                    self.receiver
+                                let receiver = if *lexical_this {
+                                    lexical_receiver
+                                        .map(|value| get(self, value))
+                                        .unwrap_or(self.receiver)
                                 } else {
                                     self.constant(Value::UNDEFINED)
                                 };
@@ -616,7 +621,8 @@ impl FunctionCompiler<'_, '_> {
                         }
                         Op::GetIndex(object, index)
                         | Op::TypedIndex(object, index, _)
-                        | Op::IndexedGet(object, index) => {
+                        | Op::IndexedGet(object, index)
+                        | Op::SpreadGet(object, index) => {
                             let object = get(self, *object);
                             let index = get(self, *index);
                             let retain = data
@@ -878,6 +884,23 @@ impl FunctionCompiler<'_, '_> {
                             let object = get(self, *object);
                             let key = get(self, *key);
                             Some(self.call_helper(Helper::SemanticIndexProbe, &[object, key]))
+                        }
+                        Op::IsStringSplit(value) => {
+                            let value = get(self, *value);
+                            Some(self.call_helper(Helper::IsStringSplit, &[value]))
+                        }
+                        Op::StringSplit(receiver, args) => {
+                            let receiver = get(self, *receiver);
+                            let args: Vec<_> = args.iter().map(|&v| get(self, v)).collect();
+                            let argv = self.stack_values(&args, data.span)?;
+                            let operation = self.b.ins().iconst(types::I64, 0);
+                            let argc = self.b.ins().iconst(types::I64, args.len() as i64);
+                            let result = self.call_helper(
+                                Helper::StringSplit,
+                                &[operation, receiver, argv, argc],
+                            );
+                            self.check_error();
+                            Some(result)
                         }
                         Op::IsNative(value, native) => {
                             let value = get(self, *value);
@@ -1336,8 +1359,9 @@ impl FunctionCompiler<'_, '_> {
             }
             Op::GetIndex(object, key)
             | Op::TypedIndex(object, key, _)
-            | Op::IndexedGet(object, key) => {
-                let fallback = !matches!(data.op, Op::TypedIndex(..));
+            | Op::IndexedGet(object, key)
+            | Op::SpreadGet(object, key) => {
+                let fallback = !matches!(data.op, Op::TypedIndex(..) | Op::SpreadGet(..));
                 let object = self.operand(cx, *object);
                 let object = self.convert(object, Repr::Boxed);
                 let view = match graph.views.get(&inst) {

@@ -3,7 +3,7 @@ use super::{arg, fail};
 use crate::heap::NativeFunction;
 use crate::value::Value;
 
-pub(super) fn call(
+pub(in crate::jit) fn call(
     ctx: *mut JitCtx,
     function: NativeFunction,
     receiver: Value,
@@ -13,6 +13,28 @@ pub(super) fn call(
     let context = unsafe { &mut *ctx };
     let heap = context.global.heap().clone();
     let arg = |index: usize| arg(args, index);
+    if function == NativeFunction::StringSplit {
+        if heap.string_is_empty(receiver).is_none() {
+            return fail(context, "string method requires a string receiver");
+        }
+        if args.len() > 1 && arg(1) != Value::UNDEFINED {
+            return fail(context, "split limit is unsupported");
+        }
+        let separator = if arg(0) == Value::UNDEFINED {
+            None
+        } else if heap.string_is_empty(arg(0)).is_some() {
+            Some(arg(0))
+        } else {
+            return fail(context, "split separator must be a string");
+        };
+        let Some(values) = heap.split_string(receiver, separator) else {
+            return fail(context, "heap exhausted");
+        };
+        return match heap.array_from_owned(values) {
+            Some(value) => context.own(value),
+            None => fail(context, "heap exhausted"),
+        };
+    }
     let Some(text) = heap.text(receiver) else {
         return fail(context, "string method requires a string receiver");
     };
@@ -55,41 +77,6 @@ pub(super) fn call(
                     .collect::<String>()
                     .starts_with(&search),
             );
-        }
-        StringSplit => {
-            if args.len() > 1 && arg(1) != Value::UNDEFINED {
-                return fail(context, "split limit is unsupported");
-            }
-            let separator = if arg(0) == Value::UNDEFINED {
-                None
-            } else {
-                let Some(separator) = string_arg(arg(0)) else {
-                    return fail(context, "split separator must be a string");
-                };
-                Some(separator)
-            };
-            let mut values = Vec::new();
-            let mut push = |piece: &str| {
-                let value = heap.string(piece)?;
-                values.push(value);
-                Some(())
-            };
-            let result = match separator.as_deref() {
-                None => push(&text),
-                Some("") => text
-                    .chars()
-                    .try_for_each(|character| push(character.encode_utf8(&mut [0; 4]))),
-                Some(separator) => text.split(separator).try_for_each(push),
-            };
-            if result.is_none() {
-                heap.release_all(&values);
-                return fail(context, "heap exhausted");
-            }
-            let result = heap.array_from_owned(values);
-            return match result {
-                Some(value) => context.own(value),
-                None => fail(context, "heap exhausted"),
-            };
         }
         StringReplace => {
             if heap.regexp_state(arg(0)).is_some() {

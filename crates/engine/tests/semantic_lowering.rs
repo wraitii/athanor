@@ -16,6 +16,34 @@ fn run(source: &str, ssa_opt: bool) -> Result<Value, String> {
 }
 
 #[test]
+fn dependent_read_probes_preserve_loop_fallbacks() {
+    let read = "function read(a, key, count) {
+        let sum = 0;
+        for (let i = 0; i < count; ++i)
+            sum += a.x.y + a.x[key] + a.x.y;
+        return sum;
+    }";
+    let source = format!(
+        "{read}
+        function main() {{
+            const a = {{x: {{y: 2, z: 3}}}};
+            const missing = read(a, 'missing', 2);
+            return read(a, 'z', 3) === 21 && read(a, 'y', 2) === 12 &&
+                read({{}}, 'z', 0) === 0 && missing !== missing;
+        }}"
+    );
+    for ssa_opt in [false, true] {
+        assert_eq!(run(&source, ssa_opt), Ok(Value::TRUE));
+        let invalid = format!("{read} function main() {{ return read({{}}, 'z', 1); }}");
+        assert!(
+            run(&invalid, ssa_opt)
+                .unwrap_err()
+                .contains("runtime error")
+        );
+    }
+}
+
+#[test]
 fn explicit_integer_coercions_preserve_numeric_edges() {
     let source = r#"
         function check(input, expected) {

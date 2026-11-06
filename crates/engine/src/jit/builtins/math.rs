@@ -1,6 +1,6 @@
 use super::{arg, fail};
 use crate::heap::MathFunction;
-use crate::jit::helpers::{primitive_number, to_int32};
+use crate::jit::helpers::{number_pow, primitive_number, to_int32};
 use crate::jit::session::JitCtx;
 use crate::value::Value;
 
@@ -80,13 +80,7 @@ pub(in crate::jit) fn call(ctx: &mut JitCtx, function: MathFunction, args: &[Val
         Atan2 => x.atan2(y),
         Exp => x.exp(),
         Log => x.ln(),
-        Pow => {
-            if x.abs() == 1.0 && y.is_infinite() {
-                f64::NAN
-            } else {
-                x.powf(y)
-            }
-        }
+        Pow => number_pow(x, y),
         Imul => f64::from(to_int32(x).wrapping_mul(to_int32(y))),
         Sign => {
             if x == 0.0 || x.is_nan() {

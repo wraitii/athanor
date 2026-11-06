@@ -9,578 +9,235 @@ use super::{
 };
 use crate::heap::TypedKind;
 
-pub(super) fn typeof_comparisons(graph: &mut Graph) {
-    let uses = graph.use_counts();
-    for block in Cfg::new(graph).rpo {
-        for inst in graph.blocks[block].insts.clone() {
-            let Op::Binary(operator, left, right) = graph.insts[inst].op else {
-                continue;
-            };
-            if !matches!(
-                operator,
-                BinaryOperator::StrictEquality | BinaryOperator::StrictInequality
-            ) {
-                continue;
-            }
-            let pair = [(left, right), (right, left)]
-                .into_iter()
-                .find_map(|(value, literal)| {
-                    let Op::Unary(UnaryOp::Typeof, operand) = graph.defining_op(value)? else {
-                        return None;
-                    };
-                    let Op::Constant(Constant::String(text)) = graph.defining_op(literal)? else {
-                        return None;
-                    };
-                    let kind = [
-                        "string",
-                        "number",
-                        "boolean",
-                        "undefined",
-                        "object",
-                        "function",
-                    ]
-                    .iter()
-                    .position(|name| text == name)?;
-                    (uses[value] == 1).then_some((value, literal, *operand, kind as u8))
-                });
-            let Some((value, literal, operand, kind)) = pair else {
-                continue;
-            };
-            let ValueDef::Result(typeof_inst) = graph.values[value] else {
-                unreachable!();
-            };
-            // Keep TDZ errors at the original typeof evaluation point.
-            graph.insts[typeof_inst].op = Op::CheckInitialized(operand);
-            graph.insts[typeof_inst].result = None;
-            if uses[literal] == 1 {
-                let ValueDef::Result(literal_inst) = graph.values[literal] else {
-                    unreachable!();
-                };
-                graph.remove_inst(literal_inst);
-            }
-            let test = if kind == 0 {
-                Op::IsString(operand)
-            } else if kind == 1 {
-                Op::IsNumber(operand)
-            } else {
-                Op::IsTypeof(operand, kind)
-            };
-            graph.insts[inst].op = if operator == BinaryOperator::StrictEquality {
-                test
-            } else {
-                let position = graph.blocks[block]
-                    .insts
-                    .iter()
-                    .position(|&i| i == inst)
-                    .unwrap();
-                let span = graph.insts[inst].span;
-                let (_, result) = graph.insert(block, position, span, test, true);
-                Op::Unary(UnaryOp::Not, result.unwrap())
-            };
-        }
-    }
-}
+mod analysis;
+mod simplify;
+mod versioning;
 
-pub(super) fn coercions(graph: &mut Graph) {
+#[cfg(test)]
+use analysis::unescaped;
+use analysis::{Access, Guarded, Requirement, Writes, closure_failure, requirements};
+pub(super) use simplify::{bit_tests, coercions, simplify, typeof_comparisons};
+use versioning::{Speculation, apply_version};
+
+pub(super) fn version_conditional(
+    graph: &mut Graph,
+    plan: &super::specialize::ConditionalPlan,
+    notes: &mut Vec<String>,
+) -> Result<Option<HashSet<Block>>> {
+    if plan.calls.is_empty() || plan.identities.is_empty() {
+        return Ok(None);
+    }
+    let blocks = Cfg::new(graph).rpo;
     let facts = Facts::compute(graph);
-    for block in Cfg::new(graph).rpo {
-        for inst in graph.blocks[block].insts.clone() {
+    let calls: HashMap<_, _> = plan
+        .calls
+        .iter()
+        .map(|(inst, callee, name, flags)| (*inst, (*callee, name, *flags)))
+        .collect();
+    for &block in &blocks {
+        for &inst in &graph.blocks[block].insts {
             let op = &graph.insts[inst].op;
-            let bitwise = matches!(
-                op,
-                Op::Unary(UnaryOp::BitwiseNot, _)
-                    | Op::Binary(
-                        BinaryOperator::BitwiseAnd
-                            | BinaryOperator::BitwiseOR
-                            | BinaryOperator::BitwiseXOR
-                            | BinaryOperator::ShiftLeft
-                            | BinaryOperator::ShiftRight
-                            | BinaryOperator::ShiftRightZeroFill,
-                        ..
-                    )
-            );
-            if !bitwise {
-                continue;
-            }
-            let operands = op.operands();
-            if !operands
-                .iter()
-                .all(|&value| facts.of(value).within(NUMERIC))
-                || operands
-                    .iter()
-                    .all(|&value| facts.of(value).within(Types::INT32))
-            {
-                continue;
-            }
-            let mut op = op.clone();
-            let mut position = graph.blocks[block]
-                .insts
-                .iter()
-                .position(|&candidate| candidate == inst)
-                .unwrap();
-            let span = graph.insts[inst].span;
-            for operand in op.operands_mut() {
-                if facts.of(*operand).within(Types::INT32) {
-                    continue;
+            let mut contract = graph.inst_contract(inst, &facts);
+            if let Some(&(expected, name, flags)) = calls.get(&inst) {
+                if !matches!(op, Op::Call { callee, .. } if *callee == expected)
+                    || !matches!(graph.defining_op(expected), Some(Op::GlobalRead(current)) if current == name)
+                {
+                    notes.push(format!(
+                        "function: conditional call proof rejected at {inst}: callee changed"
+                    ));
+                    return Ok(None);
                 }
-                *operand = graph
-                    .insert(block, position, span, Op::ToInt32(*operand), true)
-                    .1
-                    .unwrap();
-                position += 1;
+                contract.reentry = Reentry::Closed;
+                contract.flags = flags;
             }
-            graph.insts[inst].op = op;
+            if contract.reentry != Reentry::Closed
+                || contract.flags & (GLOBAL_WRITE | HEAP_WRITE) != 0
+                || matches!(op, Op::Define(..) | Op::DefineHidden(..))
+            {
+                notes.push(format!(
+                    "function: conditional call proof rejected at {inst} ({})",
+                    graph.op_text(op)
+                ));
+                return Ok(None);
+            }
         }
     }
+    let mut candidate = graph.clone();
+    let speculation = Speculation {
+        code_guards: &plan.identities,
+        closed_calls: &plan.calls,
+        ..Default::default()
+    };
+    let (copy, _) = apply_version(&mut candidate, &blocks, None, &speculation);
+    candidate.verify()?;
+    let facts = Facts::compute(&candidate);
+    for &block in &copy {
+        for &inst in &candidate.blocks[block].insts {
+            let op = &candidate.insts[inst].op;
+            let contract = candidate.inst_contract(inst, &facts);
+            if contract.reentry != Reentry::Closed
+                || contract.flags & (GLOBAL_WRITE | HEAP_WRITE) != 0
+                || matches!(op, Op::Define(..) | Op::DefineHidden(..))
+            {
+                notes.push(format!(
+                    "function: conditional call proof rejected at {inst} ({})",
+                    candidate.op_text(op)
+                ));
+                return Ok(None);
+            }
+        }
+    }
+    notes.push(format!(
+        "function: {} global code checks prove {} read-only call(s)",
+        plan.identities.len(),
+        plan.calls.len()
+    ));
+    *graph = candidate;
+    Ok(Some(copy))
 }
 
-pub(super) fn bit_tests(graph: &mut Graph) {
-    let facts = Facts::compute(graph);
-    let uses = graph.use_counts();
-    for block in Cfg::new(graph).rpo {
-        let terminator = graph.blocks[block].terminator.as_ref().unwrap();
-        let TerminatorKind::Branch(condition, _, _) = terminator.kind else {
-            continue;
-        };
-        // The sign-bit mask may be negative; this rewrite preserves only truthiness.
-        if uses[condition] != 1 {
-            continue;
-        }
-        let Some(&Op::Binary(BinaryOperator::BitwiseAnd, left, right)) =
-            graph.defining_op(condition)
+pub(super) fn version_string_leaves(
+    graph: &mut Graph,
+    notes: &mut Vec<String>,
+) -> Result<Vec<HashSet<Block>>> {
+    let initial = Cfg::new(graph);
+    let mut sites = Vec::new();
+    for &block in &initial.rpo {
+        let Some(Terminator {
+            kind: TerminatorKind::Branch(condition, fast, _),
+            ..
+        }) = &graph.blocks[block].terminator
         else {
             continue;
         };
-        let test = [(left, right), (right, left)]
-            .into_iter()
-            .find_map(|(word, mask)| {
-                let &Op::Binary(BinaryOperator::ShiftLeft, one, index) = graph.defining_op(mask)?
-                else {
-                    return None;
-                };
-                (matches!(
-                    graph.defining_op(one),
-                    Some(Op::Constant(Constant::Number(1.0)))
-                ) && facts.of(word).within(Types::INT32)
-                    && facts.of(index).within(Types::INT32))
-                .then_some((word, index, one))
-            });
-        let Some((word, index, one)) = test else {
+        if !matches!(graph.defining_op(*condition), Some(Op::IsStringSplit(_))) {
+            continue;
+        }
+        let Some((receiver, header)) = graph.blocks[fast.block].insts.iter().find_map(|&inst| {
+            let Op::StringSplit(receiver, _) = graph.insts[inst].op else {
+                return None;
+            };
+            let Some(Terminator {
+                kind: TerminatorKind::Jump(target),
+                ..
+            }) = &graph.blocks[fast.block].terminator
+            else {
+                return None;
+            };
+            Some((receiver, target.block))
+        }) else {
             continue;
         };
-        let ValueDef::Result(inst) = graph.values[condition] else {
-            unreachable!();
-        };
-        let data = &graph.insts[inst];
-        let span = data.span;
-        let source_name = data.source_name;
-        let block = data.block;
-        let position = graph.blocks[block]
-            .insts
-            .iter()
-            .position(|&candidate| candidate == inst)
-            .unwrap();
-        let (shift, shifted) = graph.insert(
-            block,
-            position,
-            span,
-            Op::Binary(BinaryOperator::ShiftRight, word, index),
-            true,
-        );
-        graph.insts[shift].source_name = source_name;
-        graph.insts[inst].op = Op::Binary(BinaryOperator::BitwiseAnd, shifted.unwrap(), one);
-    }
-}
-
-pub(super) fn simplify(graph: &mut Graph) {
-    loop {
-        let facts = Facts::compute(graph);
-        let cfg = Cfg::new(graph);
-        let uses = graph.use_counts();
-        let mut aliases = HashMap::new();
-        let mut dead = Vec::new();
-        let mut changed = false;
-        for &block in &cfg.rpo {
-            for &inst in &graph.blocks[block].insts {
-                let data = &mut graph.insts[inst];
-                match data.op {
-                    Op::GuardedCompare {
-                        operator,
-                        left,
-                        right,
-                        ..
-                    } if [left, right]
-                        .iter()
-                        .all(|&value| facts.of(value).within(NUMERIC)) =>
-                    {
-                        data.op = Op::Binary(operator, left, right);
-                        changed = true;
-                    }
-                    Op::IsNumber(value) if facts.of(value).within(Types::NUMBER) => {
-                        data.op = Op::Constant(super::Constant::Boolean(true));
-                        changed = true;
-                    }
-                    Op::IsNumber(value) if !facts.of(value).intersects(Types::NUMBER) => {
-                        data.op = Op::Constant(super::Constant::Boolean(false));
-                        changed = true;
-                    }
-                    _ => {}
-                }
-                let data = &graph.insts[inst];
-                if let (
-                    Some(result),
-                    Op::ToNumeric(value) | Op::Unary(UnaryOp::Plus, value) | Op::AsNumber(value),
-                ) = (data.result, &data.op)
-                    && facts.of(*value).within(Types::NUMBER)
-                {
-                    aliases.insert(result, *value);
-                    dead.push(inst);
-                } else if graph.contract(&data.op, &facts).is_pure()
-                    && data.result.is_none_or(|result| uses[result] == 0)
-                {
-                    dead.push(inst);
-                }
-            }
-        }
-        graph.replace_uses(&aliases);
-        for inst in &dead {
-            graph.remove_inst(*inst);
-        }
-        for &block in &cfg.rpo {
+        let string_branch = initial.rpo.iter().any(|&branch| {
             let Some(Terminator {
-                kind: TerminatorKind::Branch(condition, yes, no),
+                kind: TerminatorKind::Branch(check, yes, no),
                 ..
-            }) = &graph.blocks[block].terminator
+            }) = &graph.blocks[branch].terminator
             else {
-                continue;
+                return false;
             };
-            let Some(Op::Constant(super::Constant::Boolean(taken))) = graph.defining_op(*condition)
-            else {
-                continue;
-            };
-            let target = if *taken { yes } else { no }.clone();
-            graph.blocks[block].terminator.as_mut().unwrap().kind = TerminatorKind::Jump(target);
-            changed = true;
-        }
-        if !changed && dead.is_empty() {
-            return;
-        }
-    }
-}
-
-fn contained_use(op: &Op, index: usize) -> bool {
-    match op {
-        Op::Get(..)
-        | Op::GetIndex(..)
-        | Op::TypedIndex(..)
-        | Op::IndexedGet(..)
-        | Op::Set(..)
-        | Op::SetIndex(..)
-        | Op::Define(..) => index == 0,
-        Op::IsUndefined(_)
-        | Op::IsNullish(_)
-        | Op::CheckInitialized(_)
-        | Op::IsIndexed(_)
-        | Op::IndexedLength(_) => true,
-        Op::Binary(BinaryOperator::StrictEquality | BinaryOperator::StrictInequality, ..) => true,
-        Op::IteratorNew(_) | Op::IteratorNext(_) | Op::EnumerateNew(_) | Op::EnumerateNext(_) => {
-            true
-        }
-        _ => false,
-    }
-}
-
-fn unescaped(graph: &Graph, scope: &HashSet<Block>) -> HashSet<Value> {
-    let cfg = Cfg::new(graph);
-    let blocks: Vec<Block> = cfg
-        .rpo
-        .iter()
-        .copied()
-        .filter(|block| scope.contains(block))
-        .collect();
-    let mut allocations = HashSet::new();
-    let mut sources = Vec::new();
-    for &block in &blocks {
-        for &inst in &graph.blocks[block].insts {
-            let data = &graph.insts[inst];
-            match data.op {
-                Op::NewObject | Op::NewInstance(_) | Op::NewArray(_) => {
-                    allocations.extend(data.result)
-                }
-                Op::IteratorNew(source) | Op::EnumerateNew(source) => {
-                    allocations.extend(data.result);
-                    sources.extend(data.result.map(|iterator| (iterator, source)));
-                }
-                _ => {}
-            }
+            matches!(graph.defining_op(*check), Some(Op::IsString(value)) if *value == receiver)
+                && yes.block != no.block
+                && yes.block != graph.entry
+                && initial.preds[yes.block].len() == 1
+                && initial.preds[yes.block][0] == branch
+                && initial.dominates(yes.block, block)
+        });
+        if string_branch {
+            sites.push((fast.block, header));
         }
     }
-    for &block in &blocks {
-        for &inst in &graph.blocks[block].insts {
-            let op = &graph.insts[inst].op;
-            for (index, value) in op.operands().into_iter().enumerate() {
-                if !contained_use(op, index) {
-                    allocations.remove(&value);
-                }
-            }
+    let mut regions = Vec::new();
+    for (preheader, header) in sites {
+        let cfg = Cfg::new(graph);
+        if !cfg.rpo.contains(&preheader) || !cfg.rpo.contains(&header) {
+            continue;
         }
-        if let Some(terminator) = &graph.blocks[block].terminator {
-            for target in terminator.kind.targets() {
-                if scope.contains(&target.block) {
-                    for value in &target.args {
-                        allocations.remove(value);
-                    }
-                }
-            }
+        if !matches!(&graph.blocks[preheader].terminator, Some(Terminator { kind: TerminatorKind::Jump(target), .. }) if target.block == header)
+        {
+            continue;
         }
-    }
-    for (iterator, source) in sources {
-        if !allocations.contains(&iterator) {
-            allocations.remove(&source);
-        }
-    }
-    allocations
-}
-
-#[derive(Clone, PartialEq, Eq, Hash)]
-enum Access {
-    Named(String),
-    // Cells can alias other captures, but cannot alias JavaScript properties.
-    Cells,
-    Length,
-    Elements,
-    Iteration,
-    Any,
-}
-
-impl Access {
-    fn named(name: &str) -> Self {
-        match name {
-            "length" => Self::Length,
-            _ if name.starts_with(|c: char| c.is_ascii_digit() || c == '-')
-                || matches!(name, "NaN" | "Infinity") =>
-            {
-                Self::Any
-            }
-            _ => Self::Named(name.to_owned()),
-        }
-    }
-
-    fn of(op: &Op, facts: &Facts) -> Self {
-        match op {
-            Op::Read(_) | Op::Initialize(..) | Op::Write(..) => Self::Cells,
-            Op::Get(_, name) | Op::Set(_, name, _) | Op::Define(_, name, _) => Self::named(name),
-            Op::GetIndex(_, key)
-            | Op::TypedIndex(_, key, _)
-            | Op::IndexedGet(_, key)
-            | Op::SetIndex(_, key, _)
-                if facts.of(*key).within(Types::NUMBER) =>
-            {
-                Self::Elements
-            }
-            Op::IteratorNext(_) | Op::EnumerateNext(_) => Self::Iteration,
-            _ => Self::Any,
-        }
-    }
-
-    fn written(op: &Op, facts: &Facts) -> Self {
-        match Self::of(op, facts) {
-            Self::Length => Self::Any,
-            access => access,
-        }
-    }
-
-    fn conflicts(&self, read: &Self) -> bool {
-        match (self, read) {
-            (Self::Iteration, _) | (_, Self::Iteration) => false,
-            (Self::Any, _) | (_, Self::Any) => true,
-            (Self::Cells, Self::Cells) => true,
-            (Self::Named(write), Self::Named(read)) => write == read,
-            (Self::Elements, Self::Elements | Self::Length) => true,
-            _ => false,
-        }
-    }
-}
-
-struct Writes {
-    targets: Vec<(Option<Value>, Access)>,
-    globals: Vec<Access>,
-    fresh: HashSet<Value>,
-    facts: Facts,
-}
-
-impl Writes {
-    fn collect(graph: &Graph, blocks: &HashSet<Block>) -> Self {
-        let facts = Facts::compute(graph);
-        let mut targets = Vec::new();
-        let mut globals = Vec::new();
-        let fresh = unescaped(graph, blocks);
-        for &block in blocks {
-            for &inst in &graph.blocks[block].insts {
-                let op = &graph.insts[inst].op;
-                let contract = graph.contract(op, &facts);
-                if contract.flags & HEAP_WRITE != 0 {
-                    targets.push((op.write_target(), Access::written(op, &facts)));
-                }
-                if contract.flags & GLOBAL_WRITE != 0 {
-                    let access = match op {
-                        Op::GlobalWrite(name, _) | Op::GlobalInitialize(name, _) => {
-                            Access::named(name)
-                        }
-                        _ => Access::Any,
-                    };
-                    targets.push((None, access.clone()));
-                    globals.push(access);
-                } else if contract.flags & HEAP_WRITE != 0
-                    && !op
-                        .write_target()
-                        .is_some_and(|target| fresh.contains(&target))
-                {
-                    globals.push(Access::written(op, &facts));
-                }
-            }
-        }
-        Self {
-            targets,
-            globals,
-            fresh,
-            facts,
-        }
-    }
-
-    fn clobbers(&self, receiver: Value, read: &Access) -> bool {
-        self.targets.iter().any(|(target, write)| {
-            let aliases = match target {
-                Some(target) if self.fresh.contains(target) => *target == receiver,
-                _ => true,
-            };
-            aliases && write.conflicts(read)
-        })
-    }
-
-    fn clobbers_global(&self, name: &str) -> bool {
-        self.globals
+        let blocks: Vec<_> = cfg
+            .rpo
             .iter()
-            .any(|write| write.conflicts(&Access::named(name)))
-    }
-
-    fn preserves(&self, op: &Op) -> bool {
-        match op {
-            Op::Get(object, _)
-            | Op::GetIndex(object, _)
-            | Op::TypedIndex(object, ..)
-            | Op::IndexedGet(object, _)
-            | Op::ConstructorPrototype(object) => {
-                !self.clobbers(*object, &Access::of(op, &self.facts))
-            }
-            Op::GlobalRead(name) => !self.clobbers_global(name),
-            _ => false,
+            .copied()
+            .filter(|&block| cfg.dominates(header, block))
+            .collect();
+        let cost: usize = blocks
+            .iter()
+            .map(|&block| graph.blocks[block].insts.len())
+            .sum();
+        if cost > 512 {
+            continue;
         }
-    }
-}
-
-#[derive(Default)]
-struct Guarded {
-    globals: HashSet<String>,
-    properties: HashSet<String>,
-}
-
-impl Guarded {
-    fn new(requirements: &[Requirement]) -> Self {
-        Self {
-            globals: requirements
-                .iter()
-                .filter(|r| r.captured.is_none() && r.object.is_none())
-                .map(|r| r.global.clone())
-                .collect(),
-            properties: requirements
-                .iter()
-                .filter(|r| r.captured.is_none())
-                .map(|r| r.property.clone())
-                .collect(),
+        let exits: Vec<_> = blocks
+            .iter()
+            .copied()
+            .filter(|&block| guard_fallback(graph, block).is_some())
+            .collect();
+        let exits_true: Vec<_> = blocks
+            .iter()
+            .copied()
+            .filter(|&block| {
+                let Some(Terminator {
+                    kind: TerminatorKind::Branch(condition, yes, no),
+                    ..
+                }) = &graph.blocks[block].terminator
+                else {
+                    return false;
+                };
+                if yes.block == no.block {
+                    return false;
+                }
+                match graph.defining_op(*condition) {
+                    Some(Op::IsUninitialized(_)) => graph.cold.contains(&yes.block),
+                    Some(Op::IsUndefined(_)) => true,
+                    Some(Op::Binary(BinaryOperator::StrictEquality, left, right)) => {
+                        [left, right].into_iter().any(|&value| {
+                            matches!(
+                                graph.defining_op(value),
+                                Some(Op::Constant(Constant::Undefined))
+                            )
+                        })
+                    }
+                    _ => false,
+                }
+            })
+            .collect();
+        if exits.is_empty() && exits_true.is_empty() {
+            continue;
         }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.globals.is_empty() && self.properties.is_empty()
-    }
-
-    fn breaks(&self, op: &Op, facts: &Facts) -> bool {
-        match (op, Access::written(op, facts)) {
-            (Op::GlobalWrite(name, _) | Op::GlobalInitialize(name, _), _) => {
-                self.globals.contains(name)
-            }
-            (_, Access::Named(name)) => {
-                self.properties.contains(&name) || self.globals.contains(&name)
-            }
-            (_, Access::Cells | Access::Elements | Access::Iteration) => false,
-            _ => !self.is_empty(),
+        let mut candidate = graph.clone();
+        let speculation = Speculation {
+            exits: &exits,
+            exits_true: &exits_true,
+            ..Default::default()
+        };
+        let (copy, _) = apply_version(
+            &mut candidate,
+            &blocks,
+            Some((preheader, header)),
+            &speculation,
+        );
+        simplify(&mut candidate);
+        candidate.verify()?;
+        let reachable: HashSet<_> = Cfg::new(&candidate).rpo.into_iter().collect();
+        let copy: HashSet<_> = copy.intersection(&reachable).copied().collect();
+        if let Some(reason) = closure_failure(&candidate, &copy, &Guarded::default()) {
+            notes.push(format!(
+                "string split continuation not versioned: guarded copy {reason}"
+            ));
+            continue;
         }
+        notes.push(format!(
+            "string split continuation versioned after native identity check; {} guarded exits",
+            exits.len() + exits_true.len()
+        ));
+        *graph = candidate;
+        regions.push(copy);
+        break;
     }
-}
-
-fn closure_failure(graph: &Graph, blocks: &HashSet<Block>, guarded: &Guarded) -> Option<String> {
-    let facts = Facts::compute(graph);
-    let fresh = unescaped(graph, blocks);
-    let cfg = Cfg::new(graph);
-    for &block in cfg.rpo.iter().filter(|block| blocks.contains(block)) {
-        for &inst in &graph.blocks[block].insts {
-            let op = &graph.insts[inst].op;
-            let contract = graph.contract(op, &facts);
-            if contract.reentry != Reentry::Closed {
-                return Some(format!("reenters at {inst} ({})", graph.op_text(op)));
-            }
-            let private = op
-                .write_target()
-                .is_some_and(|target| fresh.contains(&target));
-            let writes = contract.flags & (GLOBAL_WRITE | HEAP_WRITE) != 0;
-            if writes && !private && guarded.breaks(op, &facts) {
-                return Some(format!(
-                    "writes guarded state at {inst} ({})",
-                    graph.op_text(op)
-                ));
-            }
-        }
-    }
-    None
-}
-
-struct Requirement {
-    call: Inst,
-    global: String,
-    property: String,
-    native: Native,
-    captured: Option<Value>,
-    object: Option<Value>,
-}
-
-fn requirements(graph: &Graph, blocks: &[Block]) -> Vec<Requirement> {
-    let mut requirements = Vec::new();
-    let inside: HashSet<Block> = blocks.iter().copied().collect();
-    for &block in blocks {
-        for &inst in &graph.blocks[block].insts {
-            let Op::Call { callee, .. } = graph.insts[inst].op else {
-                continue;
-            };
-            let Some(Op::Get(object, property)) = graph.defining_op(callee) else {
-                continue;
-            };
-            let Some(Op::GlobalRead(global)) = graph.defining_op(*object) else {
-                continue;
-            };
-            if let Some(native) = Native::lookup(global, property) {
-                requirements.push(Requirement {
-                    call: inst,
-                    global: global.clone(),
-                    property: property.clone(),
-                    native,
-                    captured: (!inside.contains(&graph.def_block(callee))).then_some(callee),
-                    object: (!inside.contains(&graph.def_block(*object))).then_some(*object),
-                });
-            }
-        }
-    }
-    requirements
+    Ok(regions)
 }
 
 pub(super) fn version(graph: &mut Graph, notes: &mut Vec<String>) -> Result<Vec<HashSet<Block>>> {
@@ -807,6 +464,13 @@ pub(super) fn check_loops(
             .copied()
             .filter(|block| placed.contains(block))
             .collect();
+        let Some(Terminator {
+            kind: TerminatorKind::Jump(fallback),
+            ..
+        }) = graph.blocks[preheader].terminator.clone()
+        else {
+            unreachable!();
+        };
         let closed = regions.iter().any(|region| body.is_subset(region));
         let mut candidate = graph.clone();
         let label = format!("loop at {header}: ");
@@ -825,32 +489,30 @@ pub(super) fn check_loops(
         if !closed && numbered.is_none() {
             continue;
         }
-        let typed = typed_version(&mut candidate, layer_header, &layer_body, notes)?;
+        let typed = typed_version(
+            &mut candidate,
+            layer_header,
+            &layer_body,
+            numbered.as_ref().map(|_| &fallback),
+            notes,
+        )?;
         if numbered.is_none() && typed.is_none() {
             continue;
         }
         *graph = candidate;
-        let mut added: Vec<HashSet<Block>> = Vec::new();
-        if let Some((copy, copy_header)) = numbered {
-            tried.insert(copy_header);
-            added.push(copy);
-        }
-        if let Some((copy, copy_header)) = typed {
-            tried.insert(copy_header);
-            added.push(copy);
-        }
+        let (copy, copy_header) = typed.or(numbered).unwrap();
+        tried.insert(copy_header);
+        reuse_loads(graph, &copy, notes);
         if !closed {
-            regions.push(HashSet::new());
-        }
-        for copy in added {
-            reuse_loads(graph, &copy, notes);
+            regions.push(copy.clone());
+        } else {
             for region in regions.iter_mut() {
-                if body.is_subset(region) || !closed && region.is_empty() {
+                if body.is_subset(region) {
                     region.extend(copy.iter().copied());
                 }
             }
-            copies.push(copy);
         }
+        copies.push(copy);
     }
 }
 
@@ -870,6 +532,7 @@ fn guard_fallback(graph: &Graph, block: Block) -> Option<Block> {
                 | Op::IsTyped(..)
                 | Op::IsIndexed(_)
                 | Op::IsArrayIteration(..)
+                | Op::IsStringSplit(_)
         )
     );
     (guard && graph.cold.contains(&otherwise.block)).then_some(otherwise.block)
@@ -895,7 +558,7 @@ fn invariant_guards(
                     &graph.blocks[block].terminator,
                     Some(Terminator { kind: TerminatorKind::Branch(condition, ..), .. })
                         if invariant(*condition)
-                            || graph.defining_op(*condition).unwrap().operands().into_iter().all(invariant)
+                            || graph.defining_op(*condition).unwrap().operands_iter().all(invariant)
                 )
         })
         .collect()
@@ -940,7 +603,7 @@ fn typed_objects(graph: &Graph, body: &HashSet<Block>, scan: &HashSet<Block>) ->
     for &block in body {
         for &inst in &graph.blocks[block].insts {
             let op = &graph.insts[inst].op;
-            for (index, value) in op.operands().into_iter().enumerate() {
+            for (index, value) in op.operands_iter().enumerate() {
                 if let Some(&object) = reads.get(&value)
                     && receiver_use(op, index)
                 {
@@ -959,6 +622,7 @@ fn typed_version(
     graph: &mut Graph,
     header: Block,
     body: &HashSet<Block>,
+    fallback: Option<&Target>,
     notes: &mut Vec<String>,
 ) -> Result<Option<(HashSet<Block>, Block)>> {
     let cfg = Cfg::new(graph);
@@ -994,12 +658,20 @@ fn typed_version(
         bounds: &bounds,
         ..Default::default()
     };
-    let (copy, copy_header) = apply_version(
-        &mut candidate,
-        &blocks,
-        Some((preheader, header)),
-        &speculation,
-    );
+    let (copy, copy_header) = if let Some(fallback) = fallback {
+        let continuation = candidate.blocks[preheader].terminator.take().unwrap();
+        let current =
+            versioning::typed_guards(&mut candidate, preheader, fallback, &typed, &bounds);
+        candidate.blocks[current].terminator = Some(continuation);
+        (body.clone(), header)
+    } else {
+        apply_version(
+            &mut candidate,
+            &blocks,
+            Some((preheader, header)),
+            &speculation,
+        )
+    };
     let facts = Facts::compute(&candidate);
     let bounded = bounded_reads(&candidate, &Cfg::new(&candidate), &copy, &objects);
     for &block in &copy {
@@ -1028,9 +700,14 @@ fn typed_version(
         })
         .collect();
     notes.push(format!(
-        "loop at {header}: typed array checks on [{}] and {} length checks select the typed copy",
+        "loop at {header}: typed array checks on [{}] and {} length checks select the {}copy",
         list.join(", "),
-        bounds.len()
+        bounds.len(),
+        if fallback.is_some() {
+            "combined "
+        } else {
+            "typed "
+        }
     ));
     *graph = candidate;
     Ok(Some((copy, copy_header)))
@@ -1235,7 +912,7 @@ fn entry_checks(
     for &block in scan {
         for &inst in &graph.blocks[block].insts {
             let op = &graph.insts[inst].op;
-            for (index, value) in op.operands().into_iter().enumerate() {
+            for (index, value) in op.operands_iter().enumerate() {
                 if numeric_use(op, index)
                     && !facts.of(value).within(NUMERIC)
                     && (!inside.contains(&graph.def_block(value)) || probed.contains(&value))
@@ -1249,546 +926,6 @@ fn entry_checks(
     let mut checks: Vec<Value> = checks.into_iter().collect();
     checks.sort();
     checks
-}
-
-fn retarget(graph: &mut Graph, blocks: &HashSet<Block>, from: Value, to: Value) {
-    let aliases = HashMap::from([(from, to)]);
-    for &block in blocks {
-        for inst in graph.blocks[block].insts.clone() {
-            if !matches!(graph.insts[inst].op, Op::IsNumber(_) | Op::AsNumber(_)) {
-                for value in graph.insts[inst].op.operands_mut() {
-                    *value = resolve(&aliases, *value);
-                }
-            }
-        }
-        if let Some(terminator) = &mut graph.blocks[block].terminator {
-            for value in terminator.kind.operands_mut() {
-                *value = resolve(&aliases, *value);
-            }
-        }
-    }
-}
-
-/// Entry conditions for a versioned copy, checked in this order.
-#[derive(Default)]
-struct Speculation<'a> {
-    requirements: &'a [Requirement],
-    reads: &'a [Inst],
-    guards: &'a [Block],
-    exits: &'a [Block],
-    typed: &'a [(Value, Option<TypedKind>)],
-    bounds: &'a [(Value, Value)],
-    checks: &'a [Value],
-}
-
-#[derive(PartialEq, Eq, Hash)]
-enum EntryGuard {
-    Code(Value, cranelift_module::FuncId),
-    Number(Value),
-    Value(Value),
-}
-
-fn apply_version(
-    graph: &mut Graph,
-    region: &[Block],
-    entry: Option<(Block, Block)>,
-    speculation: &Speculation<'_>,
-) -> (HashSet<Block>, Block) {
-    let Speculation {
-        requirements,
-        reads,
-        guards,
-        exits,
-        typed,
-        bounds,
-        checks,
-    } = *speculation;
-    let head = entry.map_or(graph.entry, |(_, header)| header);
-    let mut blocks = HashMap::new();
-    let mut values = HashMap::new();
-    let mut insts = HashMap::new();
-    for &block in region {
-        let copy = graph.blocks.push(BlockData::default());
-        blocks.insert(block, copy);
-        for param in graph.blocks[block].params.clone() {
-            values.insert(param, graph.add_param(copy));
-        }
-    }
-    for &block in region {
-        for inst in graph.blocks[block].insts.clone() {
-            let data = graph.insts[inst].clone();
-            let mut op = data.op;
-            for value in op.operands_mut() {
-                *value = values.get(value).copied().unwrap_or(*value);
-            }
-            let (copy, result) = graph.append(blocks[&block], data.span, op, data.result.is_some());
-            graph.insts[copy].source_name = data.source_name;
-            if let (Some(old), Some(new)) = (data.result, result) {
-                values.insert(old, new);
-            }
-            insts.insert(inst, copy);
-        }
-        let mut terminator = graph.blocks[block].terminator.clone().unwrap();
-        for value in terminator.kind.operands_mut() {
-            *value = values.get(value).copied().unwrap_or(*value);
-        }
-        for target in terminator.kind.targets_mut() {
-            if let Some(&copy) = blocks.get(&target.block) {
-                target.block = copy;
-            }
-        }
-        graph.blocks[blocks[&block]].terminator = Some(terminator);
-    }
-    let copies: HashSet<Block> = blocks.values().copied().collect();
-    // A varying guard leaves the copy before reentry; SSA repair carries its current values.
-    for &block in exits {
-        if guards.contains(&block) {
-            continue;
-        }
-        let fallback = guard_fallback(graph, block).unwrap();
-        let terminator = graph.blocks[blocks[&block]].terminator.as_mut().unwrap();
-        let TerminatorKind::Branch(_, _, otherwise) = &mut terminator.kind else {
-            unreachable!();
-        };
-        otherwise.block = fallback;
-    }
-    for &block in region {
-        if graph.cold.contains(&block) {
-            graph.cold.insert(blocks[&block]);
-        }
-    }
-    graph.cold.extend(region.iter().copied());
-
-    let span = graph.span;
-    let mut args = match entry {
-        Some((preheader, _)) => match &graph.blocks[preheader].terminator {
-            Some(Terminator {
-                kind: TerminatorKind::Jump(target),
-                ..
-            }) => target.args.clone(),
-            _ => unreachable!(),
-        },
-        None => Vec::new(),
-    };
-    let original = Target {
-        block: head,
-        args: args.clone(),
-    };
-    let start = graph.blocks.push(BlockData::default());
-    let mut current = start;
-    if requirements
-        .iter()
-        .any(|r| r.captured.is_none() && r.object.is_none())
-    {
-        let guard = graph.guards;
-        graph.guards += 1;
-        let probes = graph.blocks.push(BlockData::default());
-        let commit = graph.blocks.push(BlockData::default());
-        graph.cold.extend([probes, commit]);
-        let validated = graph.blocks.push(BlockData::default());
-        let valid = graph
-            .append(start, span, Op::GuardValid(guard), true)
-            .1
-            .unwrap();
-        graph.blocks[start].terminator = Some(Terminator {
-            span,
-            kind: TerminatorKind::Branch(valid, Target::new(validated), Target::new(probes)),
-        });
-        let mut globals: HashMap<String, Value> = HashMap::new();
-        let mut methods = HashSet::new();
-        let mut probed = Vec::new();
-        for requirement in requirements
-            .iter()
-            .filter(|r| r.captured.is_none() && r.object.is_none())
-        {
-            let global = match globals.get(&requirement.global) {
-                Some(&value) => value,
-                None => {
-                    let op = Op::ProbeGlobal(requirement.global.clone());
-                    let value = graph.append(probes, span, op, true).1.unwrap();
-                    globals.insert(requirement.global.clone(), value);
-                    value
-                }
-            };
-            if !methods.insert((requirement.global.clone(), requirement.property.clone())) {
-                continue;
-            }
-            let op = Op::ProbeProperty(global, requirement.property.clone());
-            let method = graph.append(probes, span, op, true).1.unwrap();
-            let op = Op::IsNative(method, requirement.native);
-            probed.push(graph.append(probes, span, op, true).1.unwrap());
-        }
-        let mut chain = probes;
-        for (index, &check) in probed.iter().enumerate() {
-            let next = if index + 1 == probed.len() {
-                commit
-            } else {
-                let next = graph.blocks.push(BlockData::default());
-                graph.cold.insert(next);
-                next
-            };
-            graph.blocks[chain].terminator = Some(Terminator {
-                span,
-                kind: TerminatorKind::Branch(check, Target::new(next), original.clone()),
-            });
-            chain = next;
-        }
-        graph.append(commit, span, Op::GuardCommit(guard), false);
-        graph.blocks[commit].terminator = Some(Terminator {
-            span,
-            kind: TerminatorKind::Jump(Target::new(validated)),
-        });
-        current = validated;
-    }
-    for requirement in requirements
-        .iter()
-        .filter(|r| r.captured.is_some() || r.object.is_some())
-    {
-        let method = match requirement.captured {
-            Some(value) => value,
-            None => graph
-                .append(
-                    current,
-                    span,
-                    Op::ProbeProperty(requirement.object.unwrap(), requirement.property.clone()),
-                    true,
-                )
-                .1
-                .unwrap(),
-        };
-        let check = graph
-            .append(
-                current,
-                span,
-                Op::IsNative(method, requirement.native),
-                true,
-            )
-            .1
-            .unwrap();
-        let next = graph.blocks.push(BlockData::default());
-        graph.blocks[current].terminator = Some(Terminator {
-            span,
-            kind: TerminatorKind::Branch(check, Target::new(next), original.clone()),
-        });
-        current = next;
-    }
-    let mut probes = HashMap::new();
-    let mut available = HashMap::new();
-    for &inst in reads {
-        let data = graph.insts[inst].clone();
-        let mut op = match data.op {
-            Op::Get(object, name) => Op::ProbeProperty(object, name),
-            Op::GetIndex(object, key) | Op::IndexedGet(object, key) => Op::ProbeIndex(object, key),
-            Op::GlobalRead(name) => Op::ProbeGlobal(name),
-            Op::Argument(index) => Op::Argument(index),
-            Op::This => Op::This,
-            _ => unreachable!(),
-        };
-        for value in op.operands_mut() {
-            if let Some(&probe) = probes.get(value) {
-                *value = probe;
-            }
-        }
-        let key = match &op {
-            Op::ProbeGlobal(name) => LoadKey::Global(name.clone()),
-            Op::ProbeProperty(object, name) => LoadKey::Property(*object, name.clone()),
-            Op::ProbeIndex(object, key) => LoadKey::Index(*object, *key),
-            Op::Argument(index) => LoadKey::Argument(*index),
-            Op::This => LoadKey::This,
-            _ => unreachable!(),
-        };
-        let value = match available.get(&key) {
-            Some(&value) => value,
-            None => {
-                let input = matches!(op, Op::Argument(_) | Op::This);
-                let value = graph.append(current, data.span, op, true).1.unwrap();
-                if !input {
-                    let failed = graph
-                        .append(current, data.span, Op::IsUninitialized(value), true)
-                        .1
-                        .unwrap();
-                    let next = graph.blocks.push(BlockData::default());
-                    graph.blocks[current].terminator = Some(Terminator {
-                        span: data.span,
-                        kind: TerminatorKind::Branch(failed, original.clone(), Target::new(next)),
-                    });
-                    current = next;
-                }
-                available.insert(key, value);
-                value
-            }
-        };
-        let result = data.result.unwrap();
-        graph.replace_uses(&HashMap::from([(values[&result], value)]));
-        graph.remove_inst(insts[&inst]);
-        values.insert(result, value);
-        probes.insert(result, value);
-    }
-    let copied: HashSet<Block> = region.iter().copied().collect();
-    let mut tested = HashSet::new();
-    for &block in guards {
-        let Some(Terminator {
-            span,
-            kind: TerminatorKind::Branch(condition, _, _),
-        }) = graph.blocks[block].terminator.clone()
-        else {
-            unreachable!();
-        };
-        let copy = blocks[&block];
-        let terminator = graph.blocks[copy].terminator.as_mut().unwrap();
-        let TerminatorKind::Branch(_, taken, _) = &terminator.kind else {
-            unreachable!();
-        };
-        terminator.kind = TerminatorKind::Jump(taken.clone());
-        let (test, key) = if copied.contains(&graph.def_block(condition)) {
-            let mut op = graph.defining_op(condition).unwrap().clone();
-            for value in op.operands_mut() {
-                if copied.contains(&graph.def_block(*value)) {
-                    *value = values[value];
-                }
-            }
-            let key = match op {
-                Op::IsCode(value, code) => Some(EntryGuard::Code(value, code)),
-                Op::IsNumber(value) => Some(EntryGuard::Number(value)),
-                _ => None,
-            };
-            let ValueDef::Result(inst) = graph.values[condition] else {
-                unreachable!();
-            };
-            graph.insts[insts[&inst]].op = Op::Constant(Constant::Boolean(true));
-            (Some(op), key)
-        } else {
-            (None, Some(EntryGuard::Value(condition)))
-        };
-        if key.is_some_and(|key| !tested.insert(key)) {
-            continue;
-        }
-        let condition = test.map_or(condition, |op| {
-            graph.append(current, span, op, true).1.unwrap()
-        });
-        let next = graph.blocks.push(BlockData::default());
-        graph.blocks[current].terminator = Some(Terminator {
-            span,
-            kind: TerminatorKind::Branch(condition, Target::new(next), original.clone()),
-        });
-        current = next;
-    }
-    for &(object, element) in typed {
-        let check = graph
-            .append(current, span, Op::IsTyped(object, element), true)
-            .1
-            .unwrap();
-        let next = graph.blocks.push(BlockData::default());
-        graph.blocks[current].terminator = Some(Terminator {
-            span,
-            kind: TerminatorKind::Branch(check, Target::new(next), original.clone()),
-        });
-        current = next;
-    }
-    for &(object, bound) in bounds {
-        let length = graph
-            .append(current, span, Op::IndexedLength(object), true)
-            .1
-            .unwrap();
-        let fits = Op::Binary(BinaryOperator::LessEqualThan, bound, length);
-        let fits = graph.append(current, span, fits, true).1.unwrap();
-        let next = graph.blocks.push(BlockData::default());
-        graph.blocks[current].terminator = Some(Terminator {
-            span,
-            kind: TerminatorKind::Branch(fits, Target::new(next), original.clone()),
-        });
-        current = next;
-    }
-    for &value in checks {
-        let checked = values.get(&value).copied().unwrap_or(value);
-        if !tested.insert(EntryGuard::Number(checked)) {
-            continue;
-        }
-        let check = graph
-            .append(current, span, Op::IsNumber(checked), true)
-            .1
-            .unwrap();
-        let next = graph.blocks.push(BlockData::default());
-        graph.blocks[current].terminator = Some(Terminator {
-            span,
-            kind: TerminatorKind::Branch(check, Target::new(next), original.clone()),
-        });
-        current = next;
-    }
-    for &value in checks {
-        let checked = values.get(&value).copied().unwrap_or(value);
-        let number = graph
-            .append(current, span, Op::AsNumber(checked), true)
-            .1
-            .unwrap();
-        retarget(graph, &copies, checked, number);
-        for arg in &mut args {
-            if *arg == checked {
-                *arg = number;
-            }
-        }
-        if values.contains_key(&value) {
-            values.insert(value, number);
-        }
-    }
-    graph.blocks[current].terminator = Some(Terminator {
-        span,
-        kind: TerminatorKind::Jump(Target {
-            block: blocks[&head],
-            args,
-        }),
-    });
-    match entry {
-        Some((preheader, _)) => {
-            graph.blocks[preheader].terminator = Some(Terminator {
-                span,
-                kind: TerminatorKind::Jump(Target::new(start)),
-            });
-        }
-        None => graph.entry = start,
-    }
-
-    let mut callees = Vec::new();
-    for requirement in requirements {
-        let copy = insts[&requirement.call];
-        if let Op::Call { callee, args, .. } = &graph.insts[copy].op {
-            callees.push(*callee);
-            graph.insts[copy].op = Op::CallNative(requirement.native, args.clone());
-        }
-    }
-    let inside: HashSet<Block> = region.iter().chain(&copies).copied().collect();
-    let mut outside = HashSet::new();
-    for (block, data) in graph.blocks.iter() {
-        if inside.contains(&block) {
-            continue;
-        }
-        for &inst in &data.insts {
-            outside.extend(graph.insts[inst].op.operands());
-        }
-        if let Some(terminator) = &data.terminator {
-            outside.extend(terminator.kind.operands());
-        }
-    }
-    let pinned: HashSet<Value> = values
-        .iter()
-        .filter(|(original, _)| outside.contains(*original))
-        .map(|(_, &copy)| copy)
-        .collect();
-    let mut uses = graph.use_counts();
-    while let Some(value) = callees.pop() {
-        if uses[value] != 0 || pinned.contains(&value) {
-            continue;
-        }
-        let ValueDef::Result(inst) = graph.values[value] else {
-            continue;
-        };
-        match graph.insts[inst].op {
-            Op::Get(object, _) => {
-                uses[object] -= 1;
-                callees.push(object);
-            }
-            Op::GlobalRead(_) => {}
-            _ => continue,
-        }
-        uses[value] = u32::MAX;
-        graph.remove_inst(inst);
-    }
-    let definitions: HashMap<Value, Vec<Value>> = values
-        .iter()
-        .map(|(&original, &copy)| {
-            let live = uses[copy] != u32::MAX;
-            (original, if live { vec![copy] } else { Vec::new() })
-        })
-        .collect();
-    repair(graph, &definitions);
-    // Disconnected fallbacks must not contribute writes to the closed copy.
-    let reachable = Cfg::new(graph)
-        .rpo
-        .into_iter()
-        .filter(|block| copies.contains(block))
-        .collect();
-    (reachable, blocks[&head])
-}
-
-fn repair(graph: &mut Graph, values: &HashMap<Value, Vec<Value>>) {
-    let cfg = Cfg::new(graph);
-    let mut repair = Repair {
-        cfg: &cfg,
-        values,
-        reaching: HashMap::new(),
-    };
-    for &block in &cfg.rpo {
-        for inst in graph.blocks[block].insts.clone() {
-            let mut op = graph.insts[inst].op.clone();
-            for value in op.operands_mut() {
-                if values.contains_key(value) && !cfg.dominates(graph.def_block(*value), block) {
-                    *value = repair.entering(graph, block, *value);
-                }
-            }
-            graph.insts[inst].op = op;
-        }
-        let mut reaching = HashMap::new();
-        for value in graph.blocks[block]
-            .terminator
-            .as_ref()
-            .unwrap()
-            .kind
-            .operands()
-        {
-            if values.contains_key(&value) && !cfg.dominates(graph.def_block(value), block) {
-                let replacement = repair.entering(graph, block, value);
-                reaching.insert(value, replacement);
-            }
-        }
-        if let Some(terminator) = &mut graph.blocks[block].terminator {
-            for value in terminator.kind.operands_mut() {
-                if let Some(&replacement) = reaching.get(value) {
-                    *value = replacement;
-                }
-            }
-        }
-    }
-}
-
-struct Repair<'a> {
-    cfg: &'a Cfg,
-    values: &'a HashMap<Value, Vec<Value>>,
-    reaching: HashMap<(Block, Value), Value>,
-}
-
-impl Repair<'_> {
-    fn leaving(&mut self, graph: &mut Graph, block: Block, value: Value) -> Value {
-        if self.cfg.dominates(graph.def_block(value), block) {
-            return value;
-        }
-        let copy = self.values[&value]
-            .iter()
-            .copied()
-            .find(|&copy| self.cfg.dominates(graph.def_block(copy), block));
-        match copy {
-            Some(copy) => copy,
-            None => self.entering(graph, block, value),
-        }
-    }
-
-    fn entering(&mut self, graph: &mut Graph, block: Block, value: Value) -> Value {
-        if let Some(&reaching) = self.reaching.get(&(block, value)) {
-            return reaching;
-        }
-        let preds = self.cfg.preds[block].clone();
-        if let [pred] = preds[..] {
-            let reaching = self.leaving(graph, pred, value);
-            self.reaching.insert((block, value), reaching);
-            return reaching;
-        }
-        let param = graph.add_param(block);
-        self.reaching.insert((block, value), param);
-        for pred in preds {
-            let arg = self.leaving(graph, pred, value);
-            graph.push_edge_arg(pred, block, arg);
-        }
-        param
-    }
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -1926,8 +1063,7 @@ pub(super) fn hoist(graph: &mut Graph, region: &HashSet<Block>, notes: &mut Vec<
         };
         let writes = Writes::collect(graph, &body);
         let invariant = |graph: &Graph, op: &Op| {
-            op.operands()
-                .into_iter()
+            op.operands_iter()
                 .all(|value| !body.contains(&graph.def_block(value)))
         };
         let mut moved = Vec::new();
@@ -1987,8 +1123,8 @@ fn probe_reads(
                     data.op,
                     Op::Get(..) | Op::GetIndex(..) | Op::IndexedGet(..) | Op::GlobalRead(_)
                 ))
-                && data.op.operands().iter().all(|value| {
-                    !inside.contains(&graph.def_block(*value)) || probed.contains(value)
+                && data.op.operands_iter().all(|value| {
+                    !inside.contains(&graph.def_block(value)) || probed.contains(&value)
                 })
                 && (input || writes.preserves(&data.op))
             {
@@ -2053,10 +1189,10 @@ pub(super) fn sink_closures(graph: &mut Graph, notes: &mut Vec<String>) {
     for &block in &cfg.rpo {
         for &inst in &graph.blocks[block].insts {
             let data = &graph.insts[inst];
-            if matches!(&data.op, Op::Closure(_, _, false, _)) {
+            if matches!(&data.op, Op::Closure(_, _, _, false, _, _, _)) {
                 closures.push(inst);
             }
-            for value in data.op.operands() {
+            for value in data.op.operands_iter() {
                 uses.entry(value).or_default().insert(block);
             }
         }
@@ -2065,7 +1201,7 @@ pub(super) fn sink_closures(graph: &mut Graph, notes: &mut Vec<String>) {
             .as_ref()
             .unwrap()
             .kind
-            .operands()
+            .operands_iter()
         {
             uses.entry(value).or_default().insert(block);
         }
@@ -2090,12 +1226,14 @@ pub(super) fn sink_closures(graph: &mut Graph, notes: &mut Vec<String>) {
         {
             continue;
         }
-        if matches!(&graph.insts[inst].op, Op::Closure(_, _, _, captures) if !captures.is_empty()) {
-            let user = graph.blocks[target]
-                .insts
-                .iter()
-                .copied()
-                .find(|&user| graph.insts[user].op.operands().contains(&value));
+        if matches!(&graph.insts[inst].op, Op::Closure(_, _, _, _, _, captures, _) if !captures.is_empty())
+        {
+            let user = graph.blocks[target].insts.iter().copied().find(|&user| {
+                graph.insts[user]
+                    .op
+                    .operands_iter()
+                    .any(|operand| operand == value)
+            });
             if !user
                 .is_some_and(|user| super::inlining::direct_captures(graph, user, value).is_some())
             {
@@ -2106,7 +1244,12 @@ pub(super) fn sink_closures(graph: &mut Graph, notes: &mut Vec<String>) {
         let position = graph.blocks[target]
             .insts
             .iter()
-            .position(|&user| graph.insts[user].op.operands().contains(&value))
+            .position(|&user| {
+                graph.insts[user]
+                    .op
+                    .operands_iter()
+                    .any(|operand| operand == value)
+            })
             .unwrap_or(graph.blocks[target].insts.len());
         graph.blocks[target].insts.insert(position, inst);
         graph.insts[inst].block = target;
@@ -2123,10 +1266,10 @@ pub(super) fn lazy_captures(graph: &mut Graph, notes: &mut Vec<String>) -> bool 
     for block in Cfg::new(graph).rpo {
         for &inst in &graph.blocks[block].insts {
             match &graph.insts[inst].op {
-                Op::Closure(_, _, false, captures) if graph.cold.contains(&block) => {
+                Op::Closure(_, _, _, false, _, captures, _) if graph.cold.contains(&block) => {
                     candidates.extend(captures.iter().copied());
                 }
-                Op::Closure(_, _, _, captures) => eager.extend(captures.iter().copied()),
+                Op::Closure(_, _, _, _, _, captures, _) => eager.extend(captures.iter().copied()),
                 _ => {}
             }
         }
@@ -2151,4 +1294,96 @@ pub(super) fn lazy_captures(graph: &mut Graph, notes: &mut Vec<String>) -> bool 
         }
     }
     demoted
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxc_allocator::Allocator;
+    use oxc_ast::ast::Statement;
+    use oxc_parser::Parser;
+    use oxc_span::SourceType;
+
+    #[test]
+    fn numeric_and_typed_guards_share_one_loop_copy() {
+        let allocator = Allocator::default();
+        let source = "function f(grid,width){let sum=0;for(let y=0;y<2;++y){for(let x=0;x<2;++x)sum+=grid[y*width+x];}return sum;}";
+        let parsed = Parser::new(&allocator, source, SourceType::script()).parse();
+        let Statement::FunctionDeclaration(function) = &parsed.program.body[0] else {
+            panic!()
+        };
+        let semantic = oxc_semantic::SemanticBuilder::new_compiler()
+            .build(&parsed.program)
+            .semantic;
+        let analysis =
+            super::super::analyze(function, semantic.scoping(), &HashSet::new()).unwrap();
+        let graph = &analysis.graph;
+        let loops = natural_loops(graph, &Cfg::new(graph));
+        let outer = loops
+            .iter()
+            .filter(|(header, _)| {
+                !loops
+                    .iter()
+                    .any(|(other, body)| other != header && body.contains(header))
+            })
+            .count();
+        assert_eq!(outer, 2);
+        assert_eq!(
+            Cfg::new(graph)
+                .rpo
+                .iter()
+                .flat_map(|&block| &graph.blocks[block].insts)
+                .filter(|&&inst| matches!(graph.insts[inst].op, Op::IsTyped(..)))
+                .count(),
+            1
+        );
+        assert!(
+            analysis
+                .notes
+                .iter()
+                .any(|note| note.contains("select the combined copy"))
+        );
+        graph.verify().unwrap();
+    }
+
+    #[test]
+    fn fresh_constructor_result_remains_private_only_until_terminal_return() {
+        let allocator = Allocator::default();
+        let parsed =
+            Parser::new(&allocator, "function f(){return 0;}", SourceType::script()).parse();
+        let Statement::FunctionDeclaration(function) = &parsed.program.body[0] else {
+            panic!()
+        };
+        let semantic = oxc_semantic::SemanticBuilder::new_compiler()
+            .build(&parsed.program)
+            .semantic;
+        let mut graph =
+            super::super::build::lower(function, semantic.scoping(), &HashSet::new()).unwrap();
+        let block = graph.entry;
+        let span = graph.span;
+        let prototype = graph
+            .append(block, span, Op::Constant(Constant::Null), true)
+            .1
+            .unwrap();
+        let object = graph
+            .append(block, span, Op::NewInstance(prototype), true)
+            .1
+            .unwrap();
+        let undefined = graph
+            .append(block, span, Op::Constant(Constant::Undefined), true)
+            .1
+            .unwrap();
+        let result = graph
+            .append(block, span, Op::ConstructorResult(undefined, object), true)
+            .1
+            .unwrap();
+        graph.blocks[block].terminator = Some(Terminator {
+            span,
+            kind: TerminatorKind::Return(result),
+        });
+        let scope = HashSet::from([block]);
+        assert!(unescaped(&graph, &scope, &Cfg::new(&graph)).contains(&object));
+        graph.append(block, span, Op::GlobalWrite("leak".into(), result), false);
+        assert!(!unescaped(&graph, &scope, &Cfg::new(&graph)).contains(&object));
+    }
 }

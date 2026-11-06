@@ -2,6 +2,37 @@ use super::*;
 
 const SHAPED_LIMIT: usize = 64;
 
+/// A cache for one fixed property name. The weak heap reference prevents address reuse
+/// from making atom and shape IDs from a previous heap appear valid.
+#[derive(Default)]
+pub(crate) struct PropertyWriteCache {
+    heap: std::rc::Weak<RefCell<HeapData>>,
+    atom: Option<Atom>,
+    slot: Option<(ShapeId, Option<usize>)>,
+}
+
+impl PropertyWriteCache {
+    pub(super) fn atom(&mut self, heap: &Heap, data: &mut HeapData, name: &str) -> Atom {
+        if self.heap.as_ptr() != Rc::as_ptr(&heap.0) {
+            self.heap = Rc::downgrade(&heap.0);
+            self.atom = None;
+            self.slot = None;
+        }
+        *self.atom.get_or_insert_with(|| data.atoms.intern(name))
+    }
+
+    fn slot(&mut self, shape: ShapeId, shapes: &Shapes, atom: Atom) -> Option<usize> {
+        if let Some((cached, index)) = self.slot
+            && cached == shape
+        {
+            return index;
+        }
+        let index = shapes.get(shape).slot(atom);
+        self.slot = Some((shape, index));
+        index
+    }
+}
+
 pub(super) enum Properties {
     Shaped(Vec<Value>),
     Dictionary(PropertyTable),
@@ -111,7 +142,21 @@ impl HeapData {
         value: Value,
         enumerable: Option<bool>,
     ) -> Option<Value> {
-        let old = self.write_property(id, name, value, enumerable);
+        let old = self.write_property(id, name, value, enumerable, None, None);
+        self.sync(id);
+        old
+    }
+
+    pub(super) fn put_property_cached(
+        &mut self,
+        id: u64,
+        name: &str,
+        value: Value,
+        enumerable: Option<bool>,
+        atom: Atom,
+        cache: &mut PropertyWriteCache,
+    ) -> Option<Value> {
+        let old = self.write_property(id, name, value, enumerable, Some(atom), Some(cache));
         self.sync(id);
         old
     }
@@ -122,14 +167,20 @@ impl HeapData {
         name: &str,
         value: Value,
         enumerable: Option<bool>,
+        mut atom: Option<Atom>,
+        mut cache: Option<&mut PropertyWriteCache>,
     ) -> Option<Value> {
         // Slots live in arena chunks rather than in HeapData, so this borrow is disjoint
         // from the shape and atom tables.
         let slot = unsafe { &mut *self.arena.get(id).as_ptr() };
         if let Payload::SmallObject(object) = &mut slot.payload {
-            let atom = self.atoms.intern(name);
+            let atom = *atom.get_or_insert_with(|| self.atoms.intern(name));
             let shape = self.shapes.get(slot.shape);
-            if let Some(index) = shape.slot(atom) {
+            let index = match cache.as_deref_mut() {
+                Some(cache) => cache.slot(slot.shape, &self.shapes, atom),
+                None => shape.slot(atom),
+            };
+            if let Some(index) = index {
                 if let Some(enumerable) = enumerable
                     && shape.keys()[index].enumerable != enumerable
                 {
@@ -164,9 +215,13 @@ impl HeapData {
             _ => unreachable!(),
         };
         if let Properties::Shaped(values) = properties {
-            let atom = self.atoms.intern(name);
+            let atom = *atom.get_or_insert_with(|| self.atoms.intern(name));
             let shape = self.shapes.get(slot.shape);
-            if let Some(index) = shape.slot(atom) {
+            let index = match cache.as_deref_mut() {
+                Some(cache) => cache.slot(slot.shape, &self.shapes, atom),
+                None => shape.slot(atom),
+            };
+            if let Some(index) = index {
                 if let Some(enumerable) = enumerable
                     && shape.keys()[index].enumerable != enumerable
                 {
@@ -217,14 +272,14 @@ impl HeapData {
 
 #[derive(Default)]
 pub(super) struct PropertyTable {
-    pub(super) slots: Vec<PropertySlot>,
-    pub(super) index: HashMap<String, usize>,
+    slots: Vec<PropertySlot>,
+    index: HashMap<String, usize>,
 }
 
-pub(super) struct PropertySlot {
-    pub(super) name: String,
-    pub(super) value: Value,
-    pub(super) enumerable: bool,
+struct PropertySlot {
+    name: String,
+    value: Value,
+    enumerable: bool,
 }
 
 pub(super) fn array_index_name(name: &str) -> Option<u32> {
@@ -265,21 +320,20 @@ impl PropertyTable {
     }
 
     pub(super) fn keys(&self) -> Vec<String> {
-        let mut indices: Vec<_> = self
-            .slots
-            .iter()
-            .filter_map(|slot| array_index_name(&slot.name).map(|index| (index, slot.name.clone())))
-            .collect();
+        let mut indices = Vec::new();
+        let mut names = Vec::new();
+        for slot in &self.slots {
+            if let Some(index) = array_index_name(&slot.name) {
+                indices.push((index, slot.name.clone()));
+            } else {
+                names.push(slot.name.clone());
+            }
+        }
         indices.sort_unstable_by_key(|(index, _)| *index);
         indices
             .into_iter()
             .map(|(_, name)| name)
-            .chain(
-                self.slots
-                    .iter()
-                    .filter(|slot| array_index_name(&slot.name).is_none())
-                    .map(|slot| slot.name.clone()),
-            )
+            .chain(names)
             .collect()
     }
 

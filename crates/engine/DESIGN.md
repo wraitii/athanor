@@ -257,6 +257,13 @@ a cached holder address is always safe to read. Writes, `in` and probes
 still go through helpers. Typed arrays provide contiguous
 numeric storage without per-element reference counting.
 
+Named writes pass a site cache to the heap helper. It caches the property's atom
+and the last receiver shape's own-slot lookup, including an absent slot. A weak
+heap reference keeps these IDs scoped to their heap without retaining its values.
+Stores still use the normal retain/release, shape transition and invalidation
+paths; dictionary writes and special receiver properties retain their usual
+behavior.
+
 Ordinary prototype methods are needed by existing map code.
 
 ## Strings
@@ -347,6 +354,23 @@ are engine-local, never executable pointers, and resolve only against the live
 engine's registry. Compilations within that engine share global
 bindings, so existing closures observe subsequent global writes. A caller's
 local bindings do not replace the closure's defining globals.
+
+Global reads cache binding locations in separately allocated cells, which remain
+stable when the environment's name maps grow. Generated code checks the cached
+environment identity and binding-resolution revision, then loads the current
+cell value directly. Assignments update that cell without invalidating the
+location. New ordinary or lexical declarations advance a revision shared by
+the environment and its descendants, so inherited and shadowed bindings are
+resolved again. This revision is separate from the heap epoch used by native
+identity guards.
+
+Cache misses resolve lexical bindings before ordinary bindings and refresh the
+location. Missing bindings and uninitialized lexical cells use the existing
+error path; optional reads suppress only missing-name errors. Heap values are
+still retained as temporaries on cache hits. Each cache retains its environment
+to keep its identity and parent chain alive; cached lexical locations are used
+only after revision validation. The extra storage is one boxed cell per binding
+and one cache per emitted read site, including retained compiled versions.
 
 Execution retains its global environment and refers to the active engine. Code
 lookup copies an entry address under a short registry borrow; no registry or
@@ -731,12 +755,20 @@ destructuring and catchable TypeErrors for const writes remain unsupported.
 ## Spread arguments
 
 Calls and construction accept spread arguments mixed with ordinary arguments.
-The callee and receiver are evaluated once, then arguments expand in source
-order into an owned temporary array before invocation. Arrays and strings use
-the existing iteration behavior; other iterables fail explicitly. Expanded
-values remain owned through later argument evaluation and the call. Custom
+The callee and receiver are evaluated once. Mixed arguments expand in source
+order into an owned temporary array before invocation. A single spread operand
+is passed directly to the invocation, which snapshots its iterable values.
+Arrays, typed arrays and strings use the existing iteration behavior; other
+iterables fail explicitly. Expanded values remain owned through later argument
+evaluation and the call. Custom
 iterators, iterator closing, and object literal spread remain unsupported.
-Calls without spread retain the fixed-argument path.
+Calls without spread retain the fixed-argument path. An eligible known spread
+constructor can inline behind an array or typed-array guard. Its referenced
+arguments are snapshotted at the guarded inline entry, with holes and missing
+elements reading as undefined; heap values remain rooted across default
+initializers and the body. Other inputs use the original spread call, which
+validates and expands them, including strings. Extra mixed arguments are still
+evaluated and expanded before invocation.
 
 Array literals also accept spread mixed with ordinary elements, using the same
 append and iteration helpers in source order. Array holes read during spread
@@ -1081,8 +1113,7 @@ that cannot be uninitialized is pure.
 The compiler retains canonical graphs of ordinary top-level and nested functions, keyed by
 their code IDs, before specialization or region copying. Emission optimizes a
 clone. The repository also records the originating compilation. Cross-source
-inlining preserves the callee's error locations; closure creation remains
-ineligible until its source-local references can be remapped.
+inlining preserves the callee's error locations and resolved closure code IDs.
 
 `semantic/specialize.rs` separates specialization requests, guard planning, and
 application. The static producer recognizes global bindings and known local
@@ -1098,14 +1129,22 @@ joins returns through a continuation parameter. Mutable global targets keep a
 code-identity guard and the original call as fallback. Direct local closure
 creation proves the code identity without a repeated guard, except when class
 marking requires the ordinary call checks. Arguments and ordinary receivers are
-substituted at the call site; a known local arrow uses its enclosing receiver.
+substituted at the call site; an arrow uses its closure's lexical receiver.
 Known local closures access the original caller bindings directly when their
 captured environments have not changed since closure creation. Other captured
 scopes use an explicit closure operand to load the original cells, preserving
 shared writes, initialization checks and per-iteration environments.
-Nested calls, heap operations and ordinary control flow can be copied. Creating
-further closures, rest and arguments snapshots, generators, and exception
+Nested calls, heap operations, closure creation and ordinary control flow can be
+copied. Closure operations carry their resolved code ID, capture bindings and
+lexical receiver; copied closures remap the captures and take the inlined
+activation's receiver. Rest and arguments snapshots, generators, and exception
 handlers remain unsupported by the inliner.
+
+Calls to a property named `split` get a guard on the evaluated native identity.
+The guarded path calls the existing string split implementation with the original
+receiver and arguments; replacements keep the generic call. The operation reads
+the heap, allocates its owned array result, and can fail. Only that fast result
+is known to be an object; the merge with an arbitrary fallback remains unknown.
 
 `semantic/arrays.rs` exposes `map`, `some`, `every`, and `filter` calls with known
 closures as semantic loops behind a guard on the evaluated native identity and
@@ -1115,8 +1154,8 @@ call. The loop snapshots the initial length, skips absent indices at visitation,
 and passes `(value, index, array)`. `map` writes into a result initially
 containing holes; `filter` appends matching values to a dense result. `some` and
 `every` short-circuit on callback truthiness. Reads observe callback mutations.
-Exposing the callback lets ordinary inlining remove its dispatch and frame while retaining calls made by its body,
-such as the recursive `createTerrain(t)` in the rmgen library. Exception and
+Exposing the callback lets ordinary inlining remove its dispatch and frame. Later rounds can inline calls made by its body, including bounded
+recursive calls such as `createTerrain(t)` in the rmgen library. Exception and
 engine-error exits retain the caller's normal frame cleanup.
 
 After specialization, closure allocations with no reachable uses are removed. An allocation used only in one cold fallback block can move to
@@ -1172,10 +1211,53 @@ runs at most four inlining rounds with one shared 512-instruction budget, allowi
 calls exposed by earlier rounds to inline without expanding fallback calls again.
 The ordered inlining and read decisions form the decision record for the emitted
 version.
-Planning includes expansion and simplification between inlining rounds, so later
-decisions use facts exposed by earlier inlines. If the decision record is
+Planning includes array, string split and construction expansion and simplification between
+inlining rounds, so later decisions can use sites exposed by earlier inlines.
+Expansion tracks processed instructions within the planning run; preserved
+generic fallback sites are not expanded again. If the decision record is
 unchanged, recompilation stops before region versioning, ownership analysis and
 machine-code emission. Otherwise those passes continue on the planned graph.
+
+Call-effect analysis also follows canonical bodies independently of inlining.
+It collects reads, writes, allocation, errors and engine effect assumptions, then
+propagates effects and identity obligations through reachable calls to a fixed
+point. Recursive edges do not themselves introduce unknown effects. Unresolved
+calls retain arbitrary effects; global code and recognized native identities
+remain explicit conditions rather than facts inferred from observations.
+
+Exact local closure calls can use unconditional closed, read-only summaries.
+When existing region versioning cannot find a closed region, a whole-function
+copy can instead check the transitive global code identities at entry. This
+initial consumer requires every descendant and the complete caller copy to be
+read-only and closed, and rejects unresolved calls, native identity obligations,
+generators and handlers. Only calls in the validated copy receive the conditional
+proof; guard failure enters the original body before any effects execute.
+Load reuse, hoisting and borrowing consume instruction-specific proofs, while
+generic calls retain their reentry and ownership barriers. Conditional decisions
+participate in the tiering decision record; inline budgets are unchanged.
+
+String split calls have a conditional native effect summary with an explicit
+callee identity obligation. Within a proven string branch, the successful native
+split can enter a specialized continuation. Its result is then separate from
+the arbitrary replacement method's result. Constructor identity, prototype,
+storage and undefined-argument failures leave this copy for the original
+continuation at the corresponding point; the split is not replayed. This pass
+selects at most one continuation of at most 512 instructions, and only when no
+other optimization region was selected.
+
+Successful split results have indexed storage. Spread reads yield strings or
+undefined; the first element is a string when the separator is statically absent,
+undefined or a nonempty string. Element facts survive only when no mutation or
+escape through an SSA alias can reach the read, including through loop backedges.
+Inlined constructor stores can remain private when their fresh instance reaches
+only a terminal constructor result and return. Dynamic separators retain the
+undefined-argument error exit.
+
+This does not yet prove the full `createTerrain` workload closed: array method
+replacements and recursive array inputs remain generic barriers. Diagnostics
+trace rejected calls into their canonical dependencies.
+Supporting writes that preserve particular dependencies, recursive native guards,
+and descendant escapes with continuation recovery remains future work.
 
 Re-emission declares a new machine function and replaces the entry for the
 original logical code ID only after finalization succeeds. Closures retain their

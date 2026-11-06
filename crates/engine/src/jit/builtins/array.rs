@@ -220,7 +220,7 @@ fn sort_number(heap: &crate::heap::Heap, value: Value) -> Option<f64> {
 
 fn sort_text(heap: &crate::heap::Heap, value: Value) -> Option<String> {
     if let Some(number) = value.as_number() {
-        return Some(super::number::number_text(number));
+        return Some(crate::value::number_text(number));
     }
     if let Some(text) = heap.text(value) {
         return Some(text);

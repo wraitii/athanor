@@ -735,7 +735,7 @@ mod feedback_tests {
     fn ineligible_feedback_keeps_the_existing_entry() {
         let mut engine = Engine::new().unwrap();
         engine.compile(
-            "var object={run:function(x){return (()=>x)();}};function invoke(x){return object.run(x);}",
+            "var object={run:function(x){return arguments[0];}};function invoke(x){return object.run(x);}",
             "ineligible.js",
         ).unwrap();
         let code = code(&engine, "invoke");
