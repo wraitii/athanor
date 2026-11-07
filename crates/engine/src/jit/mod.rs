@@ -12,6 +12,7 @@ mod helpers;
 mod jitdump;
 mod math;
 pub(crate) mod osr;
+mod pack;
 pub(crate) mod planner;
 mod read_scope;
 pub(crate) mod recompile;

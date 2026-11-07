@@ -48,12 +48,12 @@ impl Repository {
             for &call in &graph.blocks[block].insts {
                 let callee = match graph.insts[call].op {
                     Op::Call { callee, .. }
-                    | Op::CallSpread(callee, ..)
+                    | Op::CallPack(callee, ..)
                     | Op::Construct { callee, .. }
                     | Op::ConstructorCall { callee, .. }
-                    | Op::ConstructSpread(callee, ..)
-                    | Op::ConstructSpreadResolved(callee, ..)
-                    | Op::ConstructorCallSpread(callee, ..)
+                    | Op::ConstructPack(callee, ..)
+                    | Op::ConstructPackResolved(callee, ..)
+                    | Op::ConstructorCallPack(callee, ..)
                     | Op::ConstructResolved { callee, .. } => callee,
                     _ => continue,
                 };
@@ -369,12 +369,12 @@ impl Repository {
 
 fn unresolved_operation(graph: &Graph, op: &Op) -> String {
     let (callee, constructor) = match op {
-        Op::Call { callee, .. } | Op::CallSpread(callee, ..) => (*callee, false),
+        Op::Call { callee, .. } | Op::CallPack(callee, ..) => (*callee, false),
         Op::Construct { callee, .. }
         | Op::ConstructorCall { callee, .. }
-        | Op::ConstructSpread(callee, ..)
-        | Op::ConstructSpreadResolved(callee, ..)
-        | Op::ConstructorCallSpread(callee, ..)
+        | Op::ConstructPack(callee, ..)
+        | Op::ConstructPackResolved(callee, ..)
+        | Op::ConstructorCallPack(callee, ..)
         | Op::ConstructResolved { callee, .. } => (*callee, true),
         _ => return graph.op_text(op),
     };
@@ -673,7 +673,7 @@ pub(super) fn requests(
             let callee = match &graph.insts[call].op {
                 Op::Call { callee, .. }
                 | Op::ConstructorCall { callee, .. }
-                | Op::ConstructorCallSpread(callee, ..) => callee,
+                | Op::ConstructorCallPack(callee, ..) => callee,
                 _ => continue,
             };
             let Some(target) = call_target(graph, bodies, source, call, *callee) else {
@@ -718,7 +718,7 @@ pub(super) fn plan_round(
         let callee = match &graph.insts[request.call].op {
             Op::Call { callee, .. }
             | Op::ConstructorCall { callee, .. }
-            | Op::ConstructorCallSpread(callee, ..) => callee,
+            | Op::ConstructorCallPack(callee, ..) => callee,
             _ => continue,
         };
         let cost: usize = Cfg::new(body)
@@ -853,7 +853,7 @@ mod tests {
         );
         assert!(listing.contains("is_string_split"));
         assert!(listing.contains("string_split"));
-        assert!(listing.contains("constructor_call_spread"));
+        assert!(listing.contains("constructor_call_pack"));
         analysis.graph.verify().unwrap();
     }
 
@@ -866,6 +866,13 @@ mod tests {
             super::super::optimize_canonical(canonical, true, Some((&bodies, 0))).unwrap();
         let graph = &analysis.graph;
         let cfg = Cfg::new(graph);
+        assert!(
+            cfg.rpo.iter().any(|&block| graph.blocks[block]
+                .insts
+                .iter()
+                .any(|&inst| matches!(graph.insts[inst].op, Op::StringSplitParts(..)))),
+            "{analysis}"
+        );
         let setters: Vec<_> = cfg
             .rpo
             .iter()

@@ -205,6 +205,37 @@ impl FunctionCompiler<'_, '_> {
             |value: crate::jit::semantic::Value| suspends || facts.of(value).intersects(HEAP);
         let cfg = crate::jit::semantic::Cfg::new(graph);
         let reachable = cfg.rpo.clone();
+        let mut pack_slots = SecondaryMap::new();
+        let mut pack_cleanup = Vec::new();
+        for &block in &reachable {
+            for &inst in &graph.blocks[block].insts {
+                if !matches!(
+                    graph.insts[inst].op,
+                    Op::NewPack | Op::Spread(_) | Op::StringSplitParts(..)
+                ) {
+                    continue;
+                }
+                if suspends {
+                    continue;
+                }
+                let address = {
+                    let slot =
+                        self.b
+                            .create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                                std::mem::size_of::<crate::jit::pack::StackPack>() as u32,
+                                std::mem::align_of::<crate::jit::pack::StackPack>().trailing_zeros()
+                                    as u8,
+                            ));
+                    let address = self.b.ins().stack_addr(self.pointer, slot, 0);
+                    self.call_helper(Helper::PackInit, &[address]);
+                    pack_cleanup.push(address);
+                    address
+                };
+                pack_slots[inst] = Some(address);
+            }
+        }
+
         let cyclic = cyclic_blocks(graph, &cfg);
         let repeated = |block: crate::jit::semantic::Block| {
             suspends || graph.has_handlers || cyclic.contains(&block)
@@ -257,7 +288,7 @@ impl FunctionCompiler<'_, '_> {
                             Op::GetIndex(..)
                             | Op::TypedIndex(..)
                             | Op::IndexedGet(..)
-                            | Op::SpreadGet(..)
+                            | Op::PackTake(..)
                             | Op::Call {
                                 target: Some(_), ..
                             }
@@ -523,6 +554,10 @@ impl FunctionCompiler<'_, '_> {
                             None
                         }
                         Op::Catch => {
+                            // A caught throw abandons argument evaluation in this frame.
+                            for &address in &pack_cleanup {
+                                self.call_helper(Helper::PackRelease, &[address]);
+                            }
                             let dummy = self.constant(Value::UNDEFINED);
                             Some(self.call_helper(Helper::Catch, &[dummy]))
                         }
@@ -803,8 +838,7 @@ impl FunctionCompiler<'_, '_> {
                         }
                         Op::GetIndex(object, index)
                         | Op::TypedIndex(object, index, _)
-                        | Op::IndexedGet(object, index)
-                        | Op::SpreadGet(object, index) => {
+                        | Op::IndexedGet(object, index) => {
                             let object = get(self, *object);
                             let index = get(self, *index);
                             let retain = data.result.is_none_or(|value| {
@@ -816,6 +850,53 @@ impl FunctionCompiler<'_, '_> {
                                 Operand::new(index, Repr::Boxed),
                                 retain,
                             ))
+                        }
+                        Op::NewPack => {
+                            let destination =
+                                pack_slots[inst].unwrap_or_else(|| self.constant(Value::UNDEFINED));
+                            let value = self.call_helper(Helper::NewPack, &[destination]);
+                            self.check_error();
+                            Some(value)
+                        }
+                        Op::Spread(value) => {
+                            let value = get(self, *value);
+                            let destination =
+                                pack_slots[inst].unwrap_or_else(|| self.constant(Value::UNDEFINED));
+                            let pack = self.call_helper(Helper::Spread, &[destination, value]);
+                            self.check_error();
+                            Some(pack)
+                        }
+                        Op::PackAppend(pack, value, spread) => {
+                            let pack = get(self, *pack);
+                            let value = get(self, *value);
+                            self.call_helper(
+                                if *spread {
+                                    Helper::PackExtend
+                                } else {
+                                    Helper::PackAppend
+                                },
+                                &[pack, value],
+                            );
+                            self.check_error();
+                            None
+                        }
+                        Op::PackRelease(pack) => {
+                            let pack = get(self, *pack);
+                            self.call_helper(Helper::PackRelease, &[pack]);
+                            None
+                        }
+                        Op::PackTake(pack, index) => {
+                            let pack = get(self, *pack);
+                            let index = get(self, *index);
+                            owned = data
+                                .result
+                                .is_some_and(|value| self.slot_owned(graph, &cx, value));
+                            let helper = if owned {
+                                Helper::PackTakeOwned
+                            } else {
+                                Helper::PackTake
+                            };
+                            Some(self.call_helper(helper, &[pack, index]))
                         }
                         Op::SetIndex(object, index, value) => {
                             let object = get(self, *object);
@@ -928,19 +1009,19 @@ impl FunctionCompiler<'_, '_> {
                             self.check_error();
                             None
                         }
-                        Op::CallSpread(callee, receiver, args) => {
+                        Op::CallPack(callee, receiver, args) => {
                             let callee = get(self, *callee);
                             let receiver = get(self, *receiver);
                             let args = get(self, *args);
                             let value =
-                                self.call_helper(Helper::CallSpread, &[callee, receiver, args]);
+                                self.call_helper(Helper::CallPack, &[callee, receiver, args]);
                             self.check_error();
                             Some(value)
                         }
-                        Op::ConstructSpread(callee, args) => {
+                        Op::ConstructPack(callee, args) => {
                             let callee = get(self, *callee);
                             let args = get(self, *args);
-                            let value = self.call_helper(Helper::ConstructSpread, &[callee, args]);
+                            let value = self.call_helper(Helper::ConstructPack, &[callee, args]);
                             self.check_error();
                             Some(value)
                         }
@@ -1026,12 +1107,12 @@ impl FunctionCompiler<'_, '_> {
                             self.check_error();
                             Some(result)
                         }
-                        Op::ConstructorCallSpread(callee, receiver, args) => {
+                        Op::ConstructorCallPack(callee, receiver, args) => {
                             let callee = get(self, *callee);
                             let receiver = get(self, *receiver);
                             let args = get(self, *args);
                             let result = self.call_helper(
-                                Helper::ConstructorCallSpread,
+                                Helper::ConstructorCallPack,
                                 &[callee, receiver, args],
                             );
                             self.check_error();
@@ -1058,12 +1139,12 @@ impl FunctionCompiler<'_, '_> {
                             self.check_error();
                             Some(value)
                         }
-                        Op::ConstructSpreadResolved(callee, prototype, args) => {
+                        Op::ConstructPackResolved(callee, prototype, args) => {
                             let callee = get(self, *callee);
                             let prototype = get(self, *prototype);
                             let args = get(self, *args);
                             let value = self.call_helper(
-                                Helper::ConstructSpreadResolved,
+                                Helper::ConstructPackResolved,
                                 &[callee, prototype, args],
                             );
                             self.check_error();
@@ -1098,16 +1179,26 @@ impl FunctionCompiler<'_, '_> {
                             let value = get(self, *value);
                             Some(self.call_helper(Helper::IsStringSplit, &[value]))
                         }
-                        Op::StringSplit(receiver, args) => {
+                        Op::StringSplit(receiver, args) | Op::StringSplitParts(receiver, args) => {
                             let receiver = get(self, *receiver);
                             let args: Vec<_> = args.iter().map(|&v| get(self, v)).collect();
                             let argv = self.stack_values(&args, data.span)?;
-                            let operation = self.b.ins().iconst(types::I64, 0);
+                            let operation = if matches!(data.op, Op::StringSplitParts(..)) {
+                                pack_slots[inst].unwrap_or_else(|| self.constant(Value::UNDEFINED))
+                            } else {
+                                self.b.ins().iconst(types::I64, 0)
+                            };
                             let argc = self.b.ins().iconst(types::I64, args.len() as i64);
                             owned = data
                                 .result
                                 .is_some_and(|value| self.slot_owned(graph, &cx, value));
-                            let helper = if owned {
+                            let helper = if matches!(data.op, Op::StringSplitParts(..)) {
+                                if owned {
+                                    Helper::StringSplitPartsOwned
+                                } else {
+                                    Helper::StringSplitParts
+                                }
+                            } else if owned {
                                 Helper::StringSplitOwned
                             } else {
                                 Helper::StringSplit
@@ -1382,6 +1473,9 @@ impl FunctionCompiler<'_, '_> {
         self.finish_failed_exit();
         self.switch(self.return_block);
         let result = self.b.block_params(self.return_block)[0];
+        for address in pack_cleanup {
+            self.call_helper(Helper::PackRelease, &[address]);
+        }
         self.return_value(result);
         Ok(())
     }
@@ -1601,9 +1695,8 @@ impl FunctionCompiler<'_, '_> {
             }
             Op::GetIndex(object, key)
             | Op::TypedIndex(object, key, _)
-            | Op::IndexedGet(object, key)
-            | Op::SpreadGet(object, key) => {
-                let fallback = !matches!(data.op, Op::TypedIndex(..) | Op::SpreadGet(..));
+            | Op::IndexedGet(object, key) => {
+                let fallback = !matches!(data.op, Op::TypedIndex(..) | Op::PackTake(..));
                 let object = self.operand(cx, *object);
                 let object = self.convert(object, Repr::Boxed);
                 let view = match graph.views.get(&inst) {

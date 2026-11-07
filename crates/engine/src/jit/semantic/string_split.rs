@@ -11,7 +11,7 @@ pub(super) fn result_facts(graph: &Graph) -> (HashSet<Value>, HashMap<Inst, Type
     for &block in &cfg.rpo {
         for &inst in &graph.blocks[block].insts {
             let data = &graph.insts[inst];
-            let Op::StringSplit(_, args) = &data.op else {
+            let (Op::StringSplit(_, args) | Op::StringSplitParts(_, args)) = &data.op else {
                 continue;
             };
             let nonempty = args.first().is_none_or(|separator| {
@@ -31,6 +31,13 @@ pub(super) fn result_facts(graph: &Graph) -> (HashSet<Value>, HashMap<Inst, Type
                 for (&param, &arg) in graph.blocks[target.block].params.iter().zip(&target.args) {
                     incoming.entry(param).or_default().push(arg);
                 }
+            }
+        }
+    }
+    for &block in &cfg.rpo {
+        for &inst in &graph.blocks[block].insts {
+            if let Op::Spread(source) = graph.insts[inst].op {
+                incoming.insert(graph.insts[inst].result.unwrap(), vec![source]);
             }
         }
     }
@@ -65,10 +72,11 @@ pub(super) fn result_facts(graph: &Graph) -> (HashSet<Value>, HashMap<Inst, Type
                     Op::Get(..)
                     | Op::GetIndex(..)
                     | Op::IndexedGet(..)
-                    | Op::SpreadGet(..)
+                    | Op::PackTake(..)
                     | Op::ProbeProperty(..)
                     | Op::ProbeIndex(..) => index == 0,
-                    Op::IsIndexed(_)
+                    Op::Spread(_)
+                    | Op::IsIndexed(_)
                     | Op::IndexedLength(_)
                     | Op::IsUndefined(_)
                     | Op::IsNullish(_)
@@ -78,10 +86,10 @@ pub(super) fn result_facts(graph: &Graph) -> (HashSet<Value>, HashMap<Inst, Type
                     | Op::IsUninitialized(_) => true,
                     Op::CheckInitialized(_) => data.result.is_none(),
                     // Spread passes elements, not the backing array, under direct iteration.
-                    Op::ConstructSpread(..) => index == 1,
-                    Op::ConstructSpreadResolved(..)
-                    | Op::ConstructorCallSpread(..)
-                    | Op::CallSpread(..) => index == 2,
+                    Op::ConstructPack(..) => index == 1,
+                    Op::ConstructPackResolved(..)
+                    | Op::ConstructorCallPack(..)
+                    | Op::CallPack(..) => index == 2,
                     _ => false,
                 };
                 if !safe {
@@ -98,7 +106,7 @@ pub(super) fn result_facts(graph: &Graph) -> (HashSet<Value>, HashMap<Inst, Type
             let (array, key) = match graph.insts[inst].op {
                 Op::GetIndex(array, key)
                 | Op::IndexedGet(array, key)
-                | Op::SpreadGet(array, key) => (array, key),
+                | Op::PackTake(array, key) => (array, key),
                 _ => continue,
             };
             let Some(&nonempty) = arrays.get(&array) else {
@@ -110,7 +118,7 @@ pub(super) fn result_facts(graph: &Graph) -> (HashSet<Value>, HashMap<Inst, Type
             if !index.is_finite() || *index < 0.0 || index.fract() != 0.0 {
                 continue;
             }
-            if !(nonempty && *index == 0.0) && !matches!(graph.insts[inst].op, Op::SpreadGet(..)) {
+            if !(nonempty && *index == 0.0) && !matches!(graph.insts[inst].op, Op::PackTake(..)) {
                 continue;
             }
             let hazards = array_hazards.entry(array).or_insert_with(|| {
@@ -165,7 +173,7 @@ pub(super) fn result_facts(graph: &Graph) -> (HashSet<Value>, HashMap<Inst, Type
             }
             reads.insert(
                 inst,
-                if nonempty && *index == 0.0 {
+                if nonempty && *index == 0.0 && !matches!(graph.insts[inst].op, Op::PackTake(..)) {
                     Types::STRING
                 } else {
                     Types::STRING.union(Types::UNDEFINED)
@@ -272,8 +280,8 @@ mod tests {
     #[test]
     fn split_spread_elements_retain_string_and_missing_argument_facts() {
         for (separator, expected) in [
-            ("'|'", Types::STRING),
-            ("undefined", Types::STRING),
+            ("'|'", Types::STRING.union(Types::UNDEFINED)),
+            ("undefined", Types::STRING.union(Types::UNDEFINED)),
             ("''", Types::STRING.union(Types::UNDEFINED)),
             ("other", Types::STRING.union(Types::UNDEFINED)),
         ] {
@@ -288,7 +296,7 @@ mod tests {
             let Op::GetIndex(array, index) = graph.insts[read].op else {
                 panic!()
             };
-            graph.insts[read].op = Op::SpreadGet(array, index);
+            graph.insts[read].op = Op::PackTake(array, index);
             let facts = super::super::Facts::compute(&graph);
             assert!(facts.indexed(array));
             assert_eq!(facts.of(graph.insts[read].result.unwrap()), expected);
@@ -339,4 +347,73 @@ mod tests {
         let (_, reads) = result_facts(&graph);
         assert!(reads.is_empty());
     }
+}
+
+pub(super) fn forward_packs(graph: &mut Graph) {
+    let cfg = Cfg::new(graph);
+    let mut uses = HashMap::<Value, usize>::new();
+    for &block in &cfg.rpo {
+        for &inst in &graph.blocks[block].insts {
+            for value in graph.insts[inst].op.operands() {
+                *uses.entry(value).or_default() += 1;
+            }
+        }
+        if let Some(term) = &graph.blocks[block].terminator {
+            for value in term.kind.operands() {
+                *uses.entry(value).or_default() += 1;
+            }
+        }
+    }
+    let mut aliases = HashMap::new();
+    for &block in &cfg.rpo {
+        for inst in graph.blocks[block].insts.clone() {
+            let Op::Spread(array) = graph.insts[inst].op else {
+                continue;
+            };
+            if uses.get(&array) != Some(&1) {
+                continue;
+            }
+            let mut source = array;
+            let mut seen = HashSet::new();
+            let producer = loop {
+                if !seen.insert(source) || uses.get(&source) != Some(&1) {
+                    break None;
+                }
+                match graph.values[source] {
+                    super::ValueDef::Result(inst) => break Some(inst),
+                    super::ValueDef::Param(block, index) => {
+                        let mut incoming = cfg.preds[block]
+                            .iter()
+                            .flat_map(|&pred| {
+                                graph.blocks[pred]
+                                    .terminator
+                                    .as_ref()
+                                    .unwrap()
+                                    .kind
+                                    .targets()
+                            })
+                            .filter(|target| target.block == block)
+                            .map(|target| target.args[index]);
+                        let Some(value) = incoming.next() else {
+                            break None;
+                        };
+                        if incoming.next().is_some() {
+                            break None;
+                        }
+                        source = value;
+                    }
+                }
+            };
+            let Some(producer) = producer else {
+                continue;
+            };
+            let Op::StringSplit(receiver, args) = graph.insts[producer].op.clone() else {
+                continue;
+            };
+            graph.insts[producer].op = Op::StringSplitParts(receiver, args);
+            aliases.insert(graph.insts[inst].result.unwrap(), array);
+            graph.remove_inst(inst);
+        }
+    }
+    graph.replace_uses(&aliases);
 }

@@ -5,7 +5,9 @@ fn split_results_own_reused_source() {
     let heap = Heap::default();
     let source = heap.string("terrain/grass").unwrap();
     let separator = heap.string("|").unwrap();
-    let values = heap.split_string(source, Some(separator)).unwrap();
+    let mut values = Vec::new();
+    heap.split_string_into(source, Some(separator), &mut values)
+        .unwrap();
     assert_eq!(values, vec![source]);
     let array = heap.array_from_owned(values).unwrap();
     heap.release(source);
@@ -704,8 +706,12 @@ fn bulk_array_extension_retains_values_and_refreshes_storage() {
     let source = heap.array(&[child, HOLE]).unwrap();
     heap.release(child);
     let destination = heap.array(&[]).unwrap();
-    assert_eq!(heap.extend_array(destination, source), Some(true));
-    assert_eq!(heap.extend_array(destination, destination), Some(true));
+    let values = heap.owned_indexed_values(source).unwrap();
+    assert!(heap.extend_array_values(destination, &values));
+    heap.release_all(&values);
+    let values = heap.owned_indexed_values(destination).unwrap();
+    assert!(heap.extend_array_values(destination, &values));
+    heap.release_all(&values);
     heap.release(source);
     heap.drain(1000);
     assert_eq!(heap.len(destination), Some(4));

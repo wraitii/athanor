@@ -20,6 +20,7 @@ impl Types {
     pub(in crate::jit) const OBJECT: Self = Self(64);
     pub(in crate::jit) const OTHER: Self = Self(128);
     pub(in crate::jit) const UNINITIALIZED: Self = Self(256);
+    pub(in crate::jit) const PACK: Self = Self(1024);
     pub(in crate::jit) const VIEW: Self = Self(512);
     pub(in crate::jit) const NUMBER: Self = Self(1 | 2);
     pub(in crate::jit) const PRIMITIVE: Self = Self(1 | 2 | 4 | 8 | 16 | 32);
@@ -66,6 +67,7 @@ impl fmt::Display for Types {
             (Self::OTHER, "other"),
             (Self::UNINITIALIZED, "uninit"),
             (Self::VIEW, "view"),
+            (Self::PACK, "pack"),
         ] {
             if self.intersects(types) {
                 names.push(name);
@@ -412,6 +414,7 @@ fn result_types(op: &Op, facts: &Facts) -> Types {
         Op::IsNumber(_) | Op::IsString(_) | Op::IsStringSplit(_) | Op::IsTypeof(..) => {
             Types::BOOLEAN
         }
+        Op::NewPack | Op::Spread(_) | Op::StringSplitParts(..) => Types::PACK,
         Op::StringSplit(..) => Types::OBJECT,
         Op::AsNumber(_) => Types::NUMBER,
         Op::ToInt32(_) => Types::INT32,

@@ -157,6 +157,7 @@ pub(crate) struct JitCtx<'a> {
     locals: LocalStack,
     stack_limit: usize,
     temps: TempStack,
+    pub(super) pack_buffers: Vec<Vec<Value>>,
     index_root: [Value; 3],
     epoch: *const u64,
     global_identity: *const (),
@@ -216,7 +217,7 @@ pub(crate) const CALL_SAMPLES_OFFSET: i32 =
     std::mem::offset_of!(JitCtx<'static>, call_samples) as i32;
 
 impl<'a> JitCtx<'a> {
-    fn new(engine: &'a Engine) -> Self {
+    pub(super) fn new(engine: &'a Engine) -> Self {
         let marker = 0u8;
         let stack_pointer = std::hint::black_box(&raw const marker) as usize;
         Self {
@@ -228,6 +229,7 @@ impl<'a> JitCtx<'a> {
             locals: LocalStack::new(engine.locals.enter()),
             stack_limit: stack_pointer.saturating_sub(NATIVE_STACK_BUDGET),
             temps: TempStack::new(),
+            pack_buffers: Vec::new(),
             index_root: [Value::UNDEFINED; 3],
             epoch: engine.global().heap().epoch(),
             global_identity: engine.global().identity(),

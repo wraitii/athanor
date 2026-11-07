@@ -767,23 +767,38 @@ destructuring and catchable TypeErrors for const writes remain unsupported.
 ## Spread arguments
 
 Calls and construction accept spread arguments mixed with ordinary arguments.
-The callee and receiver are evaluated once. Mixed arguments expand in source
-order into an owned temporary array before invocation. A single spread operand
-is passed directly to the invocation, which snapshots its iterable values.
-Arrays, typed arrays and strings use the existing iteration behavior; other
-iterables fail explicitly. Expanded values remain owned through later argument
-evaluation and the call. Custom
-iterators, iterator closing, and object literal spread remain unsupported.
-Calls without spread retain the fixed-argument path. An eligible known spread
-constructor can inline behind an array or typed-array guard. Its referenced
-arguments are snapshotted at the guarded inline entry, with holes and missing
-elements reading as undefined; heap values remain rooted across default
-initializers and the body. Other inputs use the original spread call, which
-validates and expands them, including strings. Extra mixed arguments are still
-evaluated and expanded before invocation.
+The callee and receiver are evaluated once. Each spread lowers to an explicit
+`Spread` operation that snapshots its iterable into an internal pack. Ordinary
+functions keep the vector descriptor on the native stack, without a heap slot
+or a JS value root. Each producer has a descriptor initialized at function entry.
+Mixed arguments append ordinary values and expanded packs in source order into
+an argument pack, without constructing a temporary JavaScript array. Arrays,
+typed arrays and strings use the existing iteration behavior; other iterables
+fail explicitly. Custom iterators and iterator closing remain unsupported.
+Calls without spread retain the fixed-argument path. Pack calls pass the owned
+vector's pointer and length directly to the invocation. Inlined constructors
+extract referenced arguments with `PackTake` before initializers or the body;
+missing arguments read as undefined. Extraction replaces the pack entry with
+undefined and transfers its owned reference into the argument root, without
+incrementing the refcount. Repeated parameter reads reuse the extracted SSA value.
+`PackRelease` releases remaining references immediately after the inlined argument
+reads and returns the cleared buffer to a context-local `Vec<Vec<Value>>` pool.
+Split and spread producers fill checked-out buffers directly. Nested calls keep
+their active buffers out of the pool; an empty pool falls back to `Vec::new()`.
+Zero-capacity buffers are not pooled.
+Generic invocations take the vector into a Rust owner that releases its values
+and returns the cleared buffer to the pool on return, including error returns. Array and pack appends consume
+the source pack. Catch entry and function exit release any unfinished stack
+packs; cleanup is idempotent. Generators materialize packs as internal arrays
+so they can survive suspension in the existing frame slots.
+A native split whose result reaches only a spread through single-input joins
+can produce `StringSplitParts` directly, eliminating the split array. Other
+split results retain ordinary materialization. This optimization does not depend
+on the global Array binding; explicit calls to Array still use the captured
+callee and ordinary native-constructor dispatch.
 
-Array literals also accept spread mixed with ordinary elements, using the same
-append and iteration helpers in source order. Array holes read during spread
+Array literals also accept spread mixed with ordinary elements, using explicit
+spread packs and appending their values in source order. Array holes read during spread
 become present undefined elements. Literal elisions remain unsupported. Arrays
 without spread retain their fixed-size construction path.
 

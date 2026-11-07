@@ -55,6 +55,10 @@ impl Graph {
             }
             Op::Write(binding, value) => format!("write {}, {value}", self.binding_name(*binding)),
             Op::CheckInitialized(value) => format!("check_initialized {value}"),
+            Op::NewPack => "new_pack".into(),
+            Op::PackRelease(value) => format!("pack_release {value}"),
+            Op::Spread(value) => format!("spread {value}"),
+            Op::PackAppend(pack, value, spread) => format!("pack_append {pack}, {value}, {spread}"),
             Op::NewObject => "new_object".into(),
             Op::NewArray(values) => format!("new_array [{}]", list(values)),
             Op::NewHoleyArray(length) => format!("new_holey_array {length}"),
@@ -65,8 +69,8 @@ impl Graph {
             Op::ArrayAppend(array, value, spread) => {
                 format!("array_append {array}, {value}, {spread}")
             }
-            Op::CallSpread(callee, receiver, args) => {
-                format!("call_spread {callee}, {receiver}, {args}")
+            Op::CallPack(callee, receiver, args) => {
+                format!("call_pack {callee}, {receiver}, {args}")
             }
             Op::NewInstance(prototype) => format!("new_instance {prototype}"),
             Op::ConstructorResult(result, instance) => {
@@ -77,8 +81,8 @@ impl Graph {
                 receiver,
                 args,
             } => format!("constructor_call {callee}, {receiver}({})", list(args)),
-            Op::ConstructorCallSpread(callee, receiver, args) => {
-                format!("constructor_call_spread {callee}, {receiver}, {args}")
+            Op::ConstructorCallPack(callee, receiver, args) => {
+                format!("constructor_call_pack {callee}, {receiver}, {args}")
             }
             Op::ConstructorPrototype(callee) => format!("constructor_prototype {callee}"),
             Op::ConstructResolved {
@@ -86,16 +90,16 @@ impl Graph {
                 prototype,
                 args,
             } => format!("construct_resolved {callee}, {prototype}({})", list(args)),
-            Op::ConstructSpreadResolved(callee, prototype, args) => {
-                format!("construct_spread_resolved {callee}, {prototype}, {args}")
+            Op::ConstructPackResolved(callee, prototype, args) => {
+                format!("construct_pack_resolved {callee}, {prototype}, {args}")
             }
-            Op::ConstructSpread(callee, args) => format!("construct_spread {callee}, {args}"),
+            Op::ConstructPack(callee, args) => format!("construct_pack {callee}, {args}"),
             Op::IteratorNew(value) => format!("iterator_new {value}"),
             Op::IteratorNext(value) => format!("iterator_next {value}"),
             Op::IsIndexed(value) => format!("is_indexed {value}"),
             Op::IndexedLength(value) => format!("indexed_length {value}"),
             Op::IndexedGet(object, key) => format!("get_indexed {object}[{key}]"),
-            Op::SpreadGet(object, key) => format!("spread_get {object}[{key}]"),
+            Op::PackTake(object, key) => format!("pack_take {object}[{key}]"),
             Op::EnumerateNew(value) => format!("enumerate_new {value}"),
             Op::EnumerateNext(value) => format!("enumerate_next {value}"),
             Op::IsUninitialized(value) => format!("is_uninitialized {value}"),
@@ -165,6 +169,13 @@ impl Graph {
             Op::IsNumber(value) => format!("is_number {value}"),
             Op::IsString(value) => format!("is_string {value}"),
             Op::IsStringSplit(value) => format!("is_string_split {value}"),
+            Op::StringSplitParts(receiver, args) => format!(
+                "split_parts {receiver}({})",
+                args.iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             Op::StringSplit(receiver, args) => format!("string_split {receiver}({})", list(args)),
             Op::IsTypeof(value, kind) => format!("is_typeof {value} {kind}"),
             Op::AsNumber(value) => format!("as_number {value}"),

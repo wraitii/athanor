@@ -480,6 +480,11 @@ impl<'a> Builder<'a> {
                             _ => (element.as_expression().unwrap(), false),
                         };
                         let value = self.expression(expression)?;
+                        let value = if spread {
+                            self.emit(element.span(), Op::Spread(value))
+                        } else {
+                            value
+                        };
                         self.effect(element.span(), Op::ArrayAppend(array, value, spread));
                     }
                     return Ok(array);
@@ -550,7 +555,7 @@ impl<'a> Builder<'a> {
             Expression::NewExpression(x) => {
                 let callee = self.expression(&x.callee)?;
                 if let Some(args) = self.spread_arguments(x.span, &x.arguments)? {
-                    Op::ConstructSpread(callee, args)
+                    Op::ConstructPack(callee, args)
                 } else {
                     let mut args = Vec::new();
                     for arg in &x.arguments {
@@ -751,7 +756,8 @@ impl<'a> Builder<'a> {
         arguments: &[Argument<'_>],
     ) -> Result<Option<Value>> {
         if let [Argument::SpreadElement(spread)] = arguments {
-            return self.expression(&spread.argument).map(Some);
+            let value = self.expression(&spread.argument)?;
+            return Ok(Some(self.emit(span, Op::Spread(value))));
         }
         if !arguments
             .iter()
@@ -759,14 +765,19 @@ impl<'a> Builder<'a> {
         {
             return Ok(None);
         }
-        let array = self.emit(span, Op::NewArray(Vec::new()));
+        let array = self.emit(span, Op::NewPack);
         for argument in arguments {
             let (expression, spread) = match argument {
                 Argument::SpreadElement(spread) => (&spread.argument, true),
                 _ => (argument.as_expression().unwrap(), false),
             };
             let value = self.expression(expression)?;
-            self.effect(argument.span(), Op::ArrayAppend(array, value, spread));
+            let value = if spread {
+                self.emit(argument.span(), Op::Spread(value))
+            } else {
+                value
+            };
+            self.effect(argument.span(), Op::PackAppend(array, value, spread));
         }
         Ok(Some(array))
     }
@@ -778,7 +789,7 @@ impl<'a> Builder<'a> {
         receiver: Value,
     ) -> Result<Value> {
         if let Some(args) = self.spread_arguments(x.span, &x.arguments)? {
-            return Ok(self.emit(x.span, Op::CallSpread(callee, receiver, args)));
+            return Ok(self.emit(x.span, Op::CallPack(callee, receiver, args)));
         }
         let mut args = Vec::new();
         for arg in &x.arguments {

@@ -23,11 +23,14 @@ impl Heap {
         Some(Value::from_bits(TAG_STRING | id))
     }
 
-    pub(crate) fn split_string(
+    // Appended values are owned by the caller, including partial results on failure.
+    pub(crate) fn split_string_into(
         &self,
         value: Value,
         separator: Option<Value>,
-    ) -> Option<Vec<Value>> {
+        values: &mut Vec<Value>,
+    ) -> Option<()> {
+        assert!(values.is_empty());
         self.drain(64);
         let mut data = self.0.borrow_mut();
         let id = heap_id(value)?;
@@ -49,29 +52,28 @@ impl Heap {
                 ranges
             } else {
                 data.retain(value);
-                return Some(vec![value]);
+                values.push(value);
+                return Some(());
             }
         } else {
             data.retain(value);
-            return Some(vec![value]);
+            values.push(value);
+            return Some(());
         };
         // The caller keeps the source alive while draining and allocating pieces.
         drop(data);
         self.drain(64usize.saturating_mul(ranges.len()));
         let mut data = self.0.borrow_mut();
-        let mut values = Vec::with_capacity(ranges.len());
+        values.reserve(ranges.len());
         for range in ranges {
             let Some(piece_id) = data.reserve() else {
-                for value in values {
-                    data.release(value);
-                }
                 return None;
             };
             let piece = data.string(id).unwrap()[range].to_owned();
             data.store(piece_id, Payload::String(piece));
             values.push(Value::from_bits(TAG_STRING | piece_id));
         }
-        Some(values)
+        Some(())
     }
 
     pub(crate) fn next_character(&self, value: Value, offset: usize) -> Option<(char, usize)> {

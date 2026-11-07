@@ -52,13 +52,13 @@ pub(super) fn effects(helper: Helper) -> Effects {
     let (reentry, flags, assumptions): (_, _, &'static [Assumption]) = match helper {
         Call
         | CallOwned
-        | CallSpread
+        | CallPack
         | Construct
-        | ConstructSpread
+        | ConstructPack
         | ConstructResolved
         | ConstructorCall
-        | ConstructorCallSpread
-        | ConstructSpreadResolved => (Reentry::Arbitrary, UNKNOWN, &[]),
+        | ConstructorCallPack
+        | ConstructPackResolved => (Reentry::Arbitrary, UNKNOWN, &[]),
         FrameOverflow | FrameRelease | IndexUnroot | LocalSet | LocalReplace | Release
         | LocalGet | TempClear | TempRetain | TempOwn | ErrorOrigin | Catch | Throw => {
             (Reentry::Closed, INTERNAL | ERROR, &[])
@@ -73,9 +73,21 @@ pub(super) fn effects(helper: Helper) -> Effects {
         | LexicalReceiver
         | ArrayIterationGuard
         | IsStringSplit => (Reentry::Closed, HEAP_READ, &[]),
-        StringSplit | StringSplitOwned => (
+        StringSplit
+        | StringSplitOwned
+        | StringSplitParts
+        | StringSplitPartsOwned
+        | Spread
+        | NewPack => (
             Reentry::Closed,
             HEAP_READ | ALLOCATION | INTERNAL | ERROR,
+            &[],
+        ),
+        PackInit | PackRelease => (Reentry::Closed, HEAP_WRITE | INTERNAL, &[]),
+        PackTake | PackTakeOwned => (Reentry::Closed, HEAP_READ | HEAP_WRITE | INTERNAL, &[]),
+        PackAppend | PackExtend => (
+            Reentry::Closed,
+            HEAP_READ | HEAP_WRITE | ALLOCATION | INTERNAL,
             &[],
         ),
         IndexRoot => (
@@ -146,6 +158,12 @@ pub(super) fn temporary_effect(helper: Helper) -> TemporaryEffect {
         | GlobalGetOptionalBorrowed
         | NewInstanceOwned
         | StringSplitOwned
+        | StringSplitPartsOwned
+        | PackTakeOwned
+        | PackInit
+        | PackRelease
+        | PackAppend
+        | PackExtend
         | ArrayNewOwned
         | ObjectNewOwned
         | ArrayMapNewOwned => None,

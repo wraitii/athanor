@@ -36,49 +36,92 @@ impl Heap {
         Some(Value::from_bits(TAG_OBJECT | id))
     }
 
-    // The snapshot owns its references independently of mutations to the source.
+    #[cfg(test)]
     pub(crate) fn owned_indexed_values(&self, value: Value) -> Option<Vec<Value>> {
-        let mut data = self.0.borrow_mut();
-        let id = heap_id(value)?;
-        let values: Vec<_> = if let Some(array) = data.array(id) {
-            (0..array.elements.len())
-                .map(|index| array.get(index))
-                .collect()
-        } else {
-            let array = data.typed_array(id)?;
-            (0..array.storage.len())
-                .map(|index| Value::number(array.storage.get(index).unwrap()))
-                .collect()
-        };
-        for &value in &values {
-            assert!(data.retain(value));
-        }
+        let mut values = Vec::new();
+        self.owned_indexed_values_into(value, &mut values)?;
         Some(values)
     }
 
-    pub(crate) fn extend_array(&self, destination: Value, source: Value) -> Option<bool> {
+    // The snapshot owns its references independently of mutations to the source.
+    pub(crate) fn owned_indexed_values_into(
+        &self,
+        value: Value,
+        values: &mut Vec<Value>,
+    ) -> Option<()> {
+        assert!(values.is_empty());
         let mut data = self.0.borrow_mut();
-        let source = heap_id(source)?;
-        let length = data.array(source)?.elements.len();
+        let id = heap_id(value)?;
+        if let Some(array) = data.array(id) {
+            values.extend((0..array.elements.len()).map(|index| array.get(index)));
+        } else {
+            let array = data.typed_array(id)?;
+            values.extend(
+                (0..array.storage.len())
+                    .map(|index| Value::number(array.storage.get(index).unwrap())),
+            );
+        }
+        for &value in values.iter() {
+            assert!(data.retain(value));
+        }
+        Some(())
+    }
+
+    pub(crate) fn take_array_element(&self, array: Value, index: usize) -> Value {
+        let mut data = self.0.borrow_mut();
+        let array = data.array_mut(heap_id(array).unwrap()).unwrap();
+        assert_eq!(array.holes, 0);
+        array
+            .elements
+            .get_mut(index)
+            .map(|value| std::mem::replace(value, Value::UNDEFINED))
+            .unwrap_or(Value::UNDEFINED)
+    }
+
+    pub(crate) fn take_array_values(&self, array: Value) -> Vec<Value> {
+        let mut data = self.0.borrow_mut();
+        let id = heap_id(array).unwrap();
+        let array = data.array_mut(id).unwrap();
+        assert_eq!(array.holes, 0);
+        let values = std::mem::take(&mut array.elements);
+        data.sync(id);
+        values
+    }
+
+    pub(crate) fn append_array_owned(&self, array: Value, values: &mut Vec<Value>) {
+        let mut data = self.0.borrow_mut();
+        let id = heap_id(array).unwrap();
+        data.array_mut(id).unwrap().elements.append(values);
+        data.sync(id);
+    }
+
+    pub(crate) fn push_array_owned(&self, array: Value, value: Value) {
+        let mut data = self.0.borrow_mut();
+        let id = heap_id(array).unwrap();
+        data.array_mut(id).unwrap().elements.push(value);
+        data.sync(id);
+    }
+
+    pub(crate) fn extend_array_values(&self, destination: Value, values: &[Value]) -> bool {
+        let mut data = self.0.borrow_mut();
         let Some(destination) = heap_id(destination).filter(|&id| data.array(id).is_some()) else {
-            return Some(false);
+            return false;
         };
         if data
             .array_mut(destination)
             .unwrap()
             .elements
-            .try_reserve(length)
+            .try_reserve(values.len())
             .is_err()
         {
-            return Some(false);
+            return false;
         }
-        for index in 0..length {
-            let value = data.array(source).unwrap().get(index);
+        for &value in values {
             assert!(data.retain(value));
             data.array_mut(destination).unwrap().elements.push(value);
         }
         data.sync(destination);
-        Some(true)
+        true
     }
 
     pub(crate) fn array(&self, elements: &[Value]) -> Option<Value> {

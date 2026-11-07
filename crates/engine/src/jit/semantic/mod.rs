@@ -241,11 +241,15 @@ pub(super) enum Op {
     MapElement(Value, Value),
     IsArrayIteration(Value, Value, ArrayMethod),
     ArrayAppend(Value, Value, bool),
-    CallSpread(Value, Value, Value),
-    ConstructSpread(Value, Value),
+    NewPack,
+    Spread(Value),
+    PackRelease(Value),
+    PackAppend(Value, Value, bool),
+    CallPack(Value, Value, Value),
+    ConstructPack(Value, Value),
     // UNINITIALIZED leaves native constructors and lazy prototypes to generic construction.
     ConstructorPrototype(Value),
-    ConstructSpreadResolved(Value, Value, Value),
+    ConstructPackResolved(Value, Value, Value),
     ConstructResolved {
         callee: Value,
         prototype: Value,
@@ -259,14 +263,14 @@ pub(super) enum Op {
         receiver: Value,
         args: Vec<Value>,
     },
-    ConstructorCallSpread(Value, Value, Value),
+    ConstructorCallPack(Value, Value, Value),
     IteratorNew(Value),
     IteratorNext(Value),
     IsIndexed(Value),
     IndexedLength(Value),
     IndexedGet(Value, Value),
-    // Dominated by an indexed guard; results stay rooted across argument initialization.
-    SpreadGet(Value, Value),
+    // Extracted values stay rooted independently of the pack across argument initialization.
+    PackTake(Value, Value),
     EnumerateNew(Value),
     EnumerateNext(Value),
     IsUninitialized(Value),
@@ -316,6 +320,7 @@ pub(super) enum Op {
     IsString(Value),
     IsStringSplit(Value),
     StringSplit(Value, Vec<Value>),
+    StringSplitParts(Value, Vec<Value>),
     IsTypeof(Value, u8),
     AsNumber(Value),
     EnterScope(Scope),
@@ -403,6 +408,7 @@ impl Op {
             | Op::GlobalReadOptional(_)
             | Op::RegExp(_, _)
             | Op::Read(_)
+            | Op::NewPack
             | Op::NewObject
             | Op::ProbeGlobal(_)
             | Op::GuardValid(_)
@@ -421,6 +427,8 @@ impl Op {
             | Op::Initialize(_, value)
             | Op::Write(_, value)
             | Op::CheckInitialized(value)
+            | Op::PackRelease(value)
+            | Op::Spread(value)
             | Op::IteratorNew(value)
             | Op::IteratorNext(value)
             | Op::IsIndexed(value)
@@ -457,15 +465,16 @@ impl Op {
             | Op::GetIndex(object, key)
             | Op::TypedIndex(object, key, _)
             | Op::IndexedGet(object, key)
-            | Op::SpreadGet(object, key)
+            | Op::PackTake(object, key)
             | Op::ProbeIndex(object, key)
             | Op::Binary(_, object, key)
+            | Op::PackAppend(object, key, _)
             | Op::ArrayAppend(object, key, _)
             | Op::ConstructorResult(object, key)
-            | Op::ConstructSpread(object, key) => ([Some(*object), Some(*key), None], &[]),
-            Op::CallSpread(callee, receiver, args)
-            | Op::ConstructorCallSpread(callee, receiver, args)
-            | Op::ConstructSpreadResolved(callee, receiver, args) => {
+            | Op::ConstructPack(object, key) => ([Some(*object), Some(*key), None], &[]),
+            Op::CallPack(callee, receiver, args)
+            | Op::ConstructorCallPack(callee, receiver, args)
+            | Op::ConstructPackResolved(callee, receiver, args) => {
                 ([Some(*callee), Some(*receiver), Some(*args)], &[])
             }
             Op::ConstructorCall {
@@ -486,7 +495,9 @@ impl Op {
             } => ([Some(*left), Some(*right), None], numbers),
             Op::SetIndex(object, key, value) => ([Some(*object), Some(*key), Some(*value)], &[]),
             Op::NewArray(values) | Op::CallNative(_, values) => ([None; 3], values),
-            Op::StringSplit(receiver, args) => ([Some(*receiver), None, None], args),
+            Op::StringSplit(receiver, args) | Op::StringSplitParts(receiver, args) => {
+                ([Some(*receiver), None, None], args)
+            }
             Op::Construct { callee, args } => ([Some(*callee), None, None], args),
             Op::Call {
                 callee,
@@ -512,6 +523,7 @@ impl Op {
             | Op::GlobalReadOptional(_)
             | Op::RegExp(_, _)
             | Op::Read(_)
+            | Op::NewPack
             | Op::NewObject
             | Op::ProbeGlobal(_)
             | Op::GuardValid(_)
@@ -530,6 +542,8 @@ impl Op {
             | Op::Initialize(_, value)
             | Op::Write(_, value)
             | Op::CheckInitialized(value)
+            | Op::PackRelease(value)
+            | Op::Spread(value)
             | Op::IteratorNew(value)
             | Op::IteratorNext(value)
             | Op::IsIndexed(value)
@@ -566,15 +580,16 @@ impl Op {
             | Op::GetIndex(object, key)
             | Op::TypedIndex(object, key, _)
             | Op::IndexedGet(object, key)
-            | Op::SpreadGet(object, key)
+            | Op::PackTake(object, key)
             | Op::ProbeIndex(object, key)
             | Op::Binary(_, object, key)
+            | Op::PackAppend(object, key, _)
             | Op::ArrayAppend(object, key, _)
             | Op::ConstructorResult(object, key)
-            | Op::ConstructSpread(object, key) => ([Some(object), Some(key), None], &mut []),
-            Op::CallSpread(callee, receiver, args)
-            | Op::ConstructorCallSpread(callee, receiver, args)
-            | Op::ConstructSpreadResolved(callee, receiver, args) => {
+            | Op::ConstructPack(object, key) => ([Some(object), Some(key), None], &mut []),
+            Op::CallPack(callee, receiver, args)
+            | Op::ConstructorCallPack(callee, receiver, args)
+            | Op::ConstructPackResolved(callee, receiver, args) => {
                 ([Some(callee), Some(receiver), Some(args)], &mut [])
             }
             Op::ConstructorCall {
@@ -595,7 +610,9 @@ impl Op {
             } => ([Some(left), Some(right), None], numbers),
             Op::SetIndex(object, key, value) => ([Some(object), Some(key), Some(value)], &mut []),
             Op::NewArray(values) | Op::CallNative(_, values) => ([None, None, None], values),
-            Op::StringSplit(receiver, args) => ([Some(receiver), None, None], args),
+            Op::StringSplit(receiver, args) | Op::StringSplitParts(receiver, args) => {
+                ([Some(receiver), None, None], args)
+            }
             Op::Construct { callee, args } => ([Some(callee), None, None], args),
             Op::Call {
                 callee,
@@ -985,7 +1002,9 @@ impl Graph {
             Op::NewHoleyArray(_) => closed(ALLOCATION | INTERNAL | ERROR, &[], Owned),
             Op::MapElement(..) => closed(HEAP_READ | INTERNAL, &[], Borrowed),
             Op::IsArrayIteration(..) | Op::IsStringSplit(_) => closed(HEAP_READ, &[], Unowned),
-            Op::StringSplit(..) => closed(HEAP_READ | ALLOCATION | INTERNAL | ERROR, &[], Owned),
+            Op::StringSplit(..) | Op::StringSplitParts(..) => {
+                closed(HEAP_READ | ALLOCATION | INTERNAL | ERROR, &[], Owned)
+            }
             Op::Constant(_) => closed(0, &[], Unowned),
             Op::GlobalRead(_) | Op::GlobalReadOptional(_) => {
                 closed(GLOBAL_READ | INTERNAL | ERROR, &[], Borrowed)
@@ -1019,10 +1038,17 @@ impl Graph {
                 }
             }
             Op::Closure(..)
+            | Op::NewPack
             | Op::NewObject
             | Op::NewArray(_)
             | Op::IteratorNew(_)
             | Op::EnumerateNew(_) => closed(ALLOCATION | INTERNAL | ERROR, &[], Owned),
+            Op::PackRelease(_) => closed(HEAP_WRITE | INTERNAL, &[], None),
+            Op::Spread(_) => closed(
+                HEAP_READ | ALLOCATION | INTERNAL | ERROR,
+                &[Assumption::DirectIteration],
+                Owned,
+            ),
             Op::IteratorNext(_) | Op::EnumerateNext(_) => closed(
                 HEAP_READ | HEAP_WRITE | ALLOCATION | INTERNAL | ERROR,
                 &[Assumption::DirectIteration],
@@ -1033,7 +1059,7 @@ impl Graph {
             Op::DefineHidden(..) | Op::MarkClass(_) | Op::DisableConstructor(_) => {
                 closed(HEAP_WRITE | ALLOCATION | INTERNAL | ERROR, &[], None)
             }
-            Op::ArrayAppend(..) => closed(
+            Op::PackAppend(..) | Op::ArrayAppend(..) => closed(
                 HEAP_READ | HEAP_WRITE | ALLOCATION | INTERNAL | ERROR,
                 &[],
                 None,
@@ -1087,12 +1113,12 @@ impl Graph {
             },
             Op::Call { .. }
             | Op::Construct { .. }
-            | Op::CallSpread(..)
-            | Op::ConstructSpread(..)
+            | Op::CallPack(..)
+            | Op::ConstructPack(..)
             | Op::ConstructorCall { .. }
-            | Op::ConstructorCallSpread(..)
+            | Op::ConstructorCallPack(..)
             | Op::ConstructResolved { .. }
-            | Op::ConstructSpreadResolved(..) => Contract {
+            | Op::ConstructPackResolved(..) => Contract {
                 reentry: Reentry::Arbitrary,
                 flags: UNKNOWN,
                 assumptions: &[],
@@ -1117,7 +1143,7 @@ impl Graph {
             Op::IsTyped(..) | Op::IsIndexed(_) => closed(0, &[], Unowned),
             Op::IndexedLength(_) => closed(HEAP_READ, &[], Unowned),
             Op::IndexedGet(..) => closed(HEAP_READ | INTERNAL | ERROR, &[], Borrowed),
-            Op::SpreadGet(..) => closed(HEAP_READ | INTERNAL, &[], Borrowed),
+            Op::PackTake(..) => closed(HEAP_READ | HEAP_WRITE | INTERNAL, &[], Owned),
             Op::TypedIndex(..) => closed(HEAP_READ, &[Assumption::FixedTypedStorage], Unowned),
             Op::IsNumber(_) | Op::IsString(_) => closed(0, &[], Unowned),
             Op::IsTypeof(..) => closed(HEAP_READ, &[], Unowned),
@@ -1551,6 +1577,8 @@ pub(super) fn optimize_planned(planned: Planned, fallback: Option<usize>) -> Res
     graph.verify()?;
     optimize::sink_closures(&mut graph, &mut notes);
     optimize::lazy_captures(&mut graph, &mut notes);
+    graph.verify()?;
+    string_split::forward_packs(&mut graph);
     graph.verify()?;
     let facts = Facts::compute(&graph);
     borrow::borrows(&mut graph, &facts, &mut notes);

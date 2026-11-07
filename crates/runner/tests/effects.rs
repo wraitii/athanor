@@ -183,10 +183,10 @@ fn construction_exposes_prototype_resolution() {
         let dump = String::from_utf8(output.stdout).unwrap();
         assert_eq!(dump.contains("constructor_prototype"), enabled);
         assert_eq!(dump.contains("construct_resolved"), enabled);
-        assert_eq!(dump.contains("construct_spread_resolved"), enabled);
+        assert_eq!(dump.contains("construct_pack_resolved"), enabled);
         assert_eq!(dump.contains("new_instance"), enabled);
         assert_eq!(dump.contains("constructor_call "), enabled);
-        assert_eq!(dump.contains("constructor_call_spread"), enabled);
+        assert_eq!(dump.contains("constructor_call_pack"), enabled);
         assert_eq!(dump.contains("constructor_result"), enabled);
         if enabled {
             assert!(dump.find("set ").unwrap() < dump.find("constructor_prototype").unwrap());
@@ -443,7 +443,7 @@ fn spread_constructor_has_guarded_inline_and_generic_fallback() {
     );
     let dump = String::from_utf8(output.stdout).unwrap();
     let caller = dump.split("semantic IR main\n").nth(1).unwrap();
-    assert!(caller.contains("constructor_call_spread"));
+    assert!(caller.contains("constructor_call_pack"));
     assert!(caller.contains("inline funcid"));
     assert!(caller.contains("is_code"));
 }
@@ -469,10 +469,10 @@ fn recursively_inlined_bodies_expand_arrays_and_constructors_once() {
         .next()
         .unwrap();
     let maps = caller.matches(" = is_array_map ").count();
-    let constructors = caller.matches(" = construct_spread_resolved ").count();
+    let constructors = caller.matches(" = construct_pack_resolved ").count();
     assert!(maps >= 2 && maps <= 4, "{maps}");
     assert!(constructors >= 2 && constructors <= 4, "{constructors}");
-    assert!(!caller.contains(" = construct_spread "));
+    assert!(!caller.contains(" = construct_pack "));
     let start = source.find("new SimpleTerrain").unwrap();
     assert!(caller.lines().any(|line| {
         line.contains(&format!("note: call at {start}..")) && line.contains("inline funcid")
@@ -496,9 +496,10 @@ fn split_and_spread_inline_have_guarded_semantic_operations() {
     let caller = dump.split("semantic IR main\n").nth(1).unwrap();
     assert!(caller.contains("is_string_split"));
     assert!(caller.contains(" = string_split "));
-    assert!(caller.contains("is_indexed"));
-    assert_eq!(caller.matches(" = spread_get ").count(), 2);
-    assert!(caller.contains("constructor_call_spread"));
+    assert!(caller.contains(" = spread "));
+    assert!(!caller.contains("is_indexed"));
+    assert_eq!(caller.matches(" = pack_take ").count(), 2);
+    assert!(caller.contains("constructor_call_pack"));
     assert!(caller.contains("reenters, throws"));
 }
 

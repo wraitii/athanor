@@ -161,3 +161,15 @@ fn generator_resume_preserves_tdz_and_arguments() {
         assert!(engine.call("main", &[]).is_err());
     }
 }
+
+#[test]
+fn spread_arguments_work_before_and_after_suspension() {
+    check(
+        "function f(a,b){return a.x+b;} function* gen(xs){let first=f(...xs,2);yield first;return f(...xs,2);} function main(){let xs=[{x:40}];let g=gen(xs);if(g.next().value!==42)return false;xs[0]={x:7};let r=g.next();return r.done && r.value===9;}",
+        Value::TRUE,
+    );
+    check(
+        "function* gen(){let a=[...'a,b'.split(',')];yield a;return [...a,'c'];} function main(){let g=gen();g.next();let r=g.next();return r.done && r.value.join('')==='abc';}",
+        Value::TRUE,
+    );
+}

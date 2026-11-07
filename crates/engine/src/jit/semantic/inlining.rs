@@ -132,7 +132,7 @@ pub(super) fn apply(graph: &mut Graph, body: &Graph, plan: &Inline) {
             receiver,
             args,
         } => (callee, Some(*receiver), args.as_slice(), None),
-        Op::ConstructorCallSpread(callee, receiver, args) => {
+        Op::ConstructorCallPack(callee, receiver, args) => {
             (callee, Some(*receiver), &[][..], Some(*args))
         }
         _ => unreachable!(),
@@ -142,7 +142,7 @@ pub(super) fn apply(graph: &mut Graph, body: &Graph, plan: &Inline) {
         .flatten();
     let parent = scope_at(graph, plan.call);
     let (block, continuation, fallback) = split_call(graph, plan.call);
-    let mut current = graph.blocks.push(BlockData::default());
+    let current = graph.blocks.push(BlockData::default());
     graph.blocks[block].terminator = Some(Terminator {
         source_name: call.source_name,
         span: call.span,
@@ -156,19 +156,6 @@ pub(super) fn apply(graph: &mut Graph, body: &Graph, plan: &Inline) {
             TerminatorKind::Jump(Target::new(current))
         },
     });
-    if let Some(array) = spread {
-        let check = graph
-            .append(current, call.span, Op::IsIndexed(array), true)
-            .1
-            .unwrap();
-        let next = graph.blocks.push(BlockData::default());
-        graph.blocks[current].terminator = Some(Terminator {
-            source_name: call.source_name,
-            span: call.span,
-            kind: TerminatorKind::Branch(check, Target::new(next), Target::new(fallback)),
-        });
-        current = next;
-    }
     let undefined = graph
         .append(current, call.span, Op::Constant(Constant::Undefined), true)
         .1
@@ -243,7 +230,7 @@ pub(super) fn apply(graph: &mut Graph, body: &Graph, plan: &Inline) {
                             .1
                             .unwrap();
                         graph
-                            .append(current, call.span, Op::SpreadGet(array, key), true)
+                            .append(current, call.span, Op::PackTake(array, key), true)
                             .1
                             .unwrap()
                     })
@@ -292,6 +279,9 @@ pub(super) fn apply(graph: &mut Graph, body: &Graph, plan: &Inline) {
             }
             insts.push(copy);
         }
+    }
+    if let Some(pack) = spread {
+        graph.append(current, call.span, Op::PackRelease(pack), false);
     }
     for inst in insts {
         if matches!(graph.insts[inst].op, Op::EnterCaptures(..)) {

@@ -1,10 +1,15 @@
 use super::*;
 
-pub(super) fn argument_values(ctx: *mut JitCtx, arguments: Value) -> Option<Vec<Value>> {
-    if let Some(values) = unsafe { &*ctx }
+pub(super) fn argument_values<'a>(
+    ctx: *mut JitCtx<'a>,
+    arguments: Value,
+) -> Option<super::super::pack::OwnedValues<'a>> {
+    let mut values = unsafe { super::super::pack::buffer(ctx) };
+    if unsafe { &*ctx }
         .global
         .heap()
-        .owned_indexed_values(arguments)
+        .owned_indexed_values_into(arguments, &mut values.values)
+        .is_some()
     {
         return Some(values);
     }
@@ -12,53 +17,40 @@ pub(super) fn argument_values(ctx: *mut JitCtx, arguments: Value) -> Option<Vec<
     if unsafe { &*ctx }.error.is_some() {
         return None;
     }
-    let mut values = Vec::new();
     loop {
         let value = js_iterate_next(ctx, state);
         if unsafe { &*ctx }.error.is_some() {
             return None;
         }
         if value == Value::UNINITIALIZED {
-            for &value in &values {
-                unsafe { &*ctx }.global.heap().retain(value);
-            }
             return Some(values);
         }
-        values.push(value);
+        unsafe { &*ctx }.global.heap().retain(value);
+        values.values.push(value);
     }
 }
 
-pub(in crate::jit) extern "C" fn js_call_spread(
+pub(in crate::jit) extern "C" fn js_call_pack(
     ctx: *mut JitCtx,
     callable: Value,
     receiver: Value,
     arguments: Value,
 ) -> Value {
-    let Some(values) = argument_values(ctx, arguments) else {
-        return Value::UNDEFINED;
-    };
-    let result = js_call(
-        ctx,
-        callable,
-        receiver,
-        values.as_ptr(),
-        values.len() as u64,
-    );
-    unsafe { &*ctx }.global.heap().release_all(&values);
-    result
+    let values = unsafe { super::super::pack::take(ctx, arguments) };
+    let argv = values.values.as_ptr();
+    let argc = values.values.len();
+    js_call(ctx, callable, receiver, argv, argc as u64)
 }
 
-pub(super) extern "C" fn js_construct_spread(
+pub(super) extern "C" fn js_construct_pack(
     ctx: *mut JitCtx,
     callable: Value,
     arguments: Value,
 ) -> Value {
-    let Some(values) = argument_values(ctx, arguments) else {
-        return Value::UNDEFINED;
-    };
-    let result = js_construct(ctx, callable, values.as_ptr(), values.len() as u64);
-    unsafe { &*ctx }.global.heap().release_all(&values);
-    result
+    let values = unsafe { super::super::pack::take(ctx, arguments) };
+    let argv = values.values.as_ptr();
+    let argc = values.values.len();
+    js_construct(ctx, callable, argv, argc as u64)
 }
 
 pub(in crate::jit) extern "C" fn js_call(
@@ -156,24 +148,16 @@ pub(super) extern "C" fn js_constructor_call(
     invoke(ctx, constructor, instance, argv, argc)
 }
 
-pub(super) extern "C" fn js_constructor_call_spread(
+pub(super) extern "C" fn js_constructor_call_pack(
     ctx: *mut JitCtx,
     constructor: Value,
     instance: Value,
     arguments: Value,
 ) -> Value {
-    let Some(values) = argument_values(ctx, arguments) else {
-        return Value::UNDEFINED;
-    };
-    let result = invoke(
-        ctx,
-        constructor,
-        instance,
-        values.as_ptr(),
-        values.len() as u64,
-    );
-    unsafe { &*ctx }.global.heap().release_all(&values);
-    result
+    let values = unsafe { super::super::pack::take(ctx, arguments) };
+    let argv = values.values.as_ptr();
+    let argc = values.values.len();
+    invoke(ctx, constructor, instance, argv, argc as u64)
 }
 
 pub(super) extern "C" fn js_constructor_prototype(ctx: *mut JitCtx, constructor: Value) -> Value {
@@ -202,24 +186,16 @@ pub(super) extern "C" fn js_construct_resolved(
     invoke_constructor(ctx, constructor, instance, argv, argc)
 }
 
-pub(super) extern "C" fn js_construct_spread_resolved(
+pub(super) extern "C" fn js_construct_pack_resolved(
     ctx: *mut JitCtx,
     constructor: Value,
     prototype: Value,
     arguments: Value,
 ) -> Value {
-    let Some(values) = argument_values(ctx, arguments) else {
-        return Value::UNDEFINED;
-    };
-    let result = js_construct_resolved(
-        ctx,
-        constructor,
-        prototype,
-        values.as_ptr(),
-        values.len() as u64,
-    );
-    unsafe { &*ctx }.global.heap().release_all(&values);
-    result
+    let values = unsafe { super::super::pack::take(ctx, arguments) };
+    let argv = values.values.as_ptr();
+    let argc = values.values.len();
+    js_construct_resolved(ctx, constructor, prototype, argv, argc as u64)
 }
 
 pub(super) fn invoke_constructor(

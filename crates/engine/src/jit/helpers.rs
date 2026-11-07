@@ -63,6 +63,14 @@ macro_rules! define_helpers {
 }
 
 define_helpers! {
+    PackInit => Unary, js_pack_init;
+    PackRelease => Unary, js_pack_release;
+    NewPack => Unary, js_new_pack;
+    Spread => Binary, js_spread;
+    PackAppend => Binary, js_pack_append;
+    PackExtend => Binary, js_pack_extend;
+    PackTake => Binary, js_pack_take;
+    PackTakeOwned => Binary, js_pack_take_owned;
     CompilePoll => Nullary, js_compile_poll;
     OsrPoll => Binary, js_osr_poll;
     CompileLeave => Unary, js_compile_leave;
@@ -87,11 +95,11 @@ define_helpers! {
     NewInstance => Unary, js_new_instance;
     NewInstanceOwned => Unary, js_new_instance_owned;
     ConstructorCall => MethodCallable, js_constructor_call;
-    ConstructorCallSpread => IndexSet, js_constructor_call_spread;
+    ConstructorCallPack => IndexSet, js_constructor_call_pack;
     ConstructResolved => MethodCallable, js_construct_resolved;
-    ConstructSpreadResolved => IndexSet, js_construct_spread_resolved;
-    ConstructSpread => Binary, js_construct_spread;
-    CallSpread => IndexSet, js_call_spread;
+    ConstructPackResolved => IndexSet, js_construct_pack_resolved;
+    ConstructPack => Binary, js_construct_pack;
+    CallPack => IndexSet, js_call_pack;
     ArrayAppend => Binary, js_array_append;
     ArrayExtend => Binary, js_array_extend;
     Call => MethodCallable, js_call;
@@ -107,6 +115,8 @@ define_helpers! {
     LexicalReceiver => Binary, js_lexical_receiver;
     ArrayIterationGuard => IndexSet, js_array_iteration_guard;
     IsStringSplit => Unary, js_is_string_split;
+    StringSplitParts => MethodCallable, js_string_split_parts;
+    StringSplitPartsOwned => MethodCallable, js_string_split_parts_owned;
     StringSplit => MethodCallable, js_string_split;
     StringSplitOwned => MethodCallable, js_string_split_owned;
     ArrayMapNew => Unary, js_array_map_new;
@@ -560,32 +570,17 @@ extern "C" fn js_array_append(ctx: *mut JitCtx, arguments: Value, value: Value) 
     Value::UNDEFINED
 }
 
-extern "C" fn js_array_extend(ctx: *mut JitCtx, arguments: Value, iterable: Value) -> Value {
-    if let Some(extended) = unsafe { &*ctx }
+extern "C" fn js_array_extend(ctx: *mut JitCtx, array: Value, pack: Value) -> Value {
+    let values = unsafe { super::pack::take(ctx, pack) };
+    let context = unsafe { &mut *ctx };
+    if !context
         .global
         .heap()
-        .extend_array(arguments, iterable)
+        .extend_array_values(array, &values.values)
     {
-        if !extended {
-            unsafe { &mut *ctx }.error = Some(Box::new(crate::Error::Runtime(
-                "cannot extend array".into(),
-            )));
-        }
-        return Value::UNDEFINED;
-    }
-    let state = js_iterate_new(ctx, iterable);
-    if unsafe { &*ctx }.error.is_some() {
-        return Value::UNDEFINED;
-    }
-    loop {
-        let value = js_iterate_next(ctx, state);
-        if unsafe { &*ctx }.error.is_some() || value == Value::UNINITIALIZED {
-            break;
-        }
-        js_array_append(ctx, arguments, value);
-        if unsafe { &*ctx }.error.is_some() {
-            break;
-        }
+        context.error = Some(Box::new(crate::Error::Runtime(
+            "cannot extend array".into(),
+        )));
     }
     Value::UNDEFINED
 }
@@ -1008,4 +1003,100 @@ extern "C" fn js_disable_constructor(ctx: *mut JitCtx, closure: Value) -> Value 
 extern "C" fn js_mark_class(ctx: *mut JitCtx, closure: Value) -> Value {
     unsafe { &*ctx }.global.heap().mark_class(closure);
     closure
+}
+
+extern "C" fn js_new_pack(ctx: *mut JitCtx, destination: Value) -> Value {
+    let mut values = unsafe { super::pack::buffer(ctx) };
+    match unsafe { super::pack::store(ctx, destination, std::mem::take(&mut values.values)) } {
+        Some(value) => unsafe { &mut *ctx }.own(value),
+        None => {
+            unsafe { &mut *ctx }.error =
+                Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
+            Value::UNDEFINED
+        }
+    }
+}
+
+extern "C" fn js_spread(ctx: *mut JitCtx, destination: Value, value: Value) -> Value {
+    let Some(mut values) = calls::argument_values(ctx, value) else {
+        return Value::UNDEFINED;
+    };
+    match unsafe { super::pack::store(ctx, destination, std::mem::take(&mut values.values)) } {
+        Some(value) => unsafe { &mut *ctx }.own(value),
+        None => {
+            unsafe { &mut *ctx }.error =
+                Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
+            Value::UNDEFINED
+        }
+    }
+}
+
+extern "C" fn js_pack_append(ctx: *mut JitCtx, pack: Value, value: Value) -> Value {
+    let heap = unsafe { &*ctx }.global.heap();
+    heap.retain(value);
+    unsafe {
+        super::pack::push(heap, pack, value);
+    }
+    Value::UNDEFINED
+}
+
+extern "C" fn js_pack_extend(ctx: *mut JitCtx, pack: Value, value: Value) -> Value {
+    let mut values = unsafe { super::pack::take(ctx, value) };
+    unsafe {
+        super::pack::append((&*ctx).global.heap(), pack, &mut values.values);
+    }
+    Value::UNDEFINED
+}
+
+extern "C" fn js_pack_take(ctx: *mut JitCtx, pack: Value, index: Value) -> Value {
+    let value = js_pack_take_owned(ctx, pack, index);
+    unsafe { &mut *ctx }.own(value)
+}
+
+extern "C" fn js_pack_take_owned(ctx: *mut JitCtx, pack: Value, index: Value) -> Value {
+    unsafe {
+        super::pack::take_element(
+            (&*ctx).global.heap(),
+            pack,
+            index.as_number().unwrap() as usize,
+        )
+    }
+}
+
+extern "C" fn js_string_split_parts(
+    ctx: *mut JitCtx,
+    destination: Value,
+    receiver: Value,
+    argv: *const Value,
+    argc: u64,
+) -> Value {
+    let value = js_string_split_parts_owned(ctx, destination, receiver, argv, argc);
+    unsafe { &mut *ctx }.own(value)
+}
+
+extern "C" fn js_string_split_parts_owned(
+    ctx: *mut JitCtx,
+    destination: Value,
+    receiver: Value,
+    argv: *const Value,
+    argc: u64,
+) -> Value {
+    let args = if argc == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(argv, argc as usize) }
+    };
+    super::builtins::string::split_result(ctx, receiver, args, destination)
+}
+
+extern "C" fn js_pack_init(_: *mut JitCtx, destination: Value) -> Value {
+    unsafe {
+        super::pack::initialize(destination);
+    }
+    Value::UNDEFINED
+}
+
+extern "C" fn js_pack_release(ctx: *mut JitCtx, pack: Value) -> Value {
+    drop(unsafe { super::pack::take(ctx, pack) });
+    Value::UNDEFINED
 }

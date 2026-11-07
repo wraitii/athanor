@@ -6,7 +6,7 @@ pub(super) fn resolve(graph: &mut Graph) {
     for block in Cfg::new(graph).rpo {
         for inst in graph.blocks[block].insts.clone() {
             let callee = match graph.insts[inst].op {
-                Op::Construct { callee, .. } | Op::ConstructSpread(callee, _) => callee,
+                Op::Construct { callee, .. } | Op::ConstructPack(callee, _) => callee,
                 _ => continue,
             };
             let position = graph.blocks[block]
@@ -30,8 +30,8 @@ pub(super) fn resolve(graph: &mut Graph) {
                     prototype,
                     args,
                 },
-                Op::ConstructSpread(callee, args) => {
-                    Op::ConstructSpreadResolved(callee, prototype, args)
+                Op::ConstructPack(callee, args) => {
+                    Op::ConstructPackResolved(callee, prototype, args)
                 }
                 _ => unreachable!(),
             };
@@ -48,7 +48,7 @@ pub(super) fn expand(graph: &mut Graph, expanded: &mut HashSet<Inst>) {
             !expanded.contains(&inst)
                 && matches!(
                     graph.insts[inst].op,
-                    Op::ConstructResolved { .. } | Op::ConstructSpreadResolved(..)
+                    Op::ConstructResolved { .. } | Op::ConstructPackResolved(..)
                 )
         })
         .collect();
@@ -59,7 +59,7 @@ pub(super) fn expand(graph: &mut Graph, expanded: &mut HashSet<Inst>) {
             Op::ConstructResolved {
                 callee, prototype, ..
             }
-            | Op::ConstructSpreadResolved(callee, prototype, _) => (callee, prototype),
+            | Op::ConstructPackResolved(callee, prototype, _) => (callee, prototype),
             _ => unreachable!(),
         };
         let (block, continuation, fallback) = super::inlining::split_call(graph, inst);
@@ -83,8 +83,8 @@ pub(super) fn expand(graph: &mut Graph, expanded: &mut HashSet<Inst>) {
                 receiver: instance,
                 args,
             },
-            Op::ConstructSpreadResolved(_, _, args) => {
-                Op::ConstructorCallSpread(callee, instance, args)
+            Op::ConstructPackResolved(_, _, args) => {
+                Op::ConstructorCallPack(callee, instance, args)
             }
             _ => unreachable!(),
         };

@@ -1664,3 +1664,59 @@ fn string_numeric_conversion_handles_complete_numeric_strings() {
         Value::TRUE,
     );
 }
+
+#[test]
+fn spread_packs_preserve_split_fallbacks_and_array_binding() {
+    let source = "function Pair(a,b){this.a=a;this.b=b;} function make(s){return typeof s==='string' ? new Pair(...s.split(',')) : null;} function main(){let original=Array; Array=function(a,b){this.a='replacement';this.b=b;}; let p=make('a,b'); let a=[...'a,b'.split(',')]; let c=new Array(...a); Array=original; let o={split:function(){return 'xy';}}; let fallback=new Pair(...o.split()); return p.a==='a' && p.b==='b' && a.length===2 && c.a==='replacement' && c.b==='b' && fallback.a==='x' && fallback.b==='y';}";
+    for ssa_opt in [false, true] {
+        let mut engine = Engine::with_options(js_engine::EngineOptions {
+            ssa_opt,
+            ..Default::default()
+        })
+        .unwrap();
+        engine.compile(source, "spread-packs.js").unwrap();
+        assert_eq!(engine.call("main", &[]).unwrap().value(), Value::TRUE);
+    }
+}
+
+#[test]
+fn spread_pack_cleanup_handles_caught_exceptions_and_repeated_calls() {
+    let source = "function fail(){throw 7;} function f(a,b){return a.x+b;} function C(a,b){this.x=a.x+b;} function main(){let total=0;for(let i=0;i<30;i++){try{f(...[{x:99}],fail());}catch(e){total+=e;}try{new C(...[{x:99}],fail());}catch(e){total+=e;}total+=f(...[{x:40}],2);total+=new C(...[{x:40},2]).x;}return total===2940;}";
+    for ssa_opt in [false, true] {
+        let mut engine = Engine::with_options(js_engine::EngineOptions {
+            ssa_opt,
+            ..Default::default()
+        })
+        .unwrap();
+        engine.compile(source, "pack-cleanup.js").unwrap();
+        assert_eq!(engine.call("main", &[]).unwrap().value(), Value::TRUE);
+    }
+}
+
+#[test]
+fn inlined_pack_take_preserves_repeated_parameters_and_unused_arguments() {
+    let source = "function C(a,b){this.a=a;this.again=a;this.b=b;} function make(s){return typeof s==='string' ? new C(...s.split('|')) : null;} function main(){let a=make('first|second|unused');let b=make('only');return a.a==='first' && a.again===a.a && a.b==='second' && b.a==='only' && b.again===b.a && b.b===undefined;}";
+    for ssa_opt in [false, true] {
+        let mut engine = Engine::with_options(js_engine::EngineOptions {
+            ssa_opt,
+            ..Default::default()
+        })
+        .unwrap();
+        engine.compile(source, "pack-take.js").unwrap();
+        assert_eq!(engine.call("main", &[]).unwrap().value(), Value::TRUE);
+    }
+}
+
+#[test]
+fn pooled_spread_buffers_survive_nested_calls_and_errors() {
+    let source = "function inner(a,b){return a+b;} function outer(a,b){let v=inner(...'x|y'.split('|'));return a+b+v;} function fail(){throw 7;} function main(){let result='';for(let i=0;i<20;i++){try{outer(...'discard|me'.split('|'),fail());}catch(e){if(e!==7)return false;}result=outer(...'a|b'.split('|'));}return result==='abxy';}";
+    for ssa_opt in [false, true] {
+        let mut engine = Engine::with_options(js_engine::EngineOptions {
+            ssa_opt,
+            ..Default::default()
+        })
+        .unwrap();
+        engine.compile(source, "pack-pool.js").unwrap();
+        assert_eq!(engine.call("main", &[]).unwrap().value(), Value::TRUE);
+    }
+}

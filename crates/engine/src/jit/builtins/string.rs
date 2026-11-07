@@ -5,28 +5,48 @@ use crate::value::Value;
 
 /// Returns an owned reference without registering a temporary.
 pub(in crate::jit) fn split(ctx: *mut JitCtx, receiver: Value, args: &[Value]) -> Value {
-    let context = unsafe { &mut *ctx };
-    let heap = context.global.heap().clone();
+    split_result(ctx, receiver, args, Value::UNINITIALIZED)
+}
+
+pub(in crate::jit) fn split_result(
+    ctx: *mut JitCtx,
+    receiver: Value,
+    args: &[Value],
+    destination: Value,
+) -> Value {
+    let heap = unsafe { &*ctx }.global.heap().clone();
     let arg = |index: usize| arg(args, index);
     if heap.string_is_empty(receiver).is_none() {
-        return fail(context, "string method requires a string receiver");
+        return fail(
+            unsafe { &mut *ctx },
+            "string method requires a string receiver",
+        );
     }
     if args.len() > 1 && arg(1) != Value::UNDEFINED {
-        return fail(context, "split limit is unsupported");
+        return fail(unsafe { &mut *ctx }, "split limit is unsupported");
     }
     let separator = if arg(0) == Value::UNDEFINED {
         None
     } else if heap.string_is_empty(arg(0)).is_some() {
         Some(arg(0))
     } else {
-        return fail(context, "split separator must be a string");
+        return fail(unsafe { &mut *ctx }, "split separator must be a string");
     };
-    let Some(values) = heap.split_string(receiver, separator) else {
-        return fail(context, "heap exhausted");
-    };
-    match heap.array_from_owned(values) {
+    let mut values = unsafe { super::super::pack::buffer(ctx) };
+    if heap
+        .split_string_into(receiver, separator, &mut values.values)
+        .is_none()
+    {
+        return fail(unsafe { &mut *ctx }, "heap exhausted");
+    }
+    let values = std::mem::take(&mut values.values);
+    match if destination == Value::UNINITIALIZED {
+        heap.array_from_owned(values)
+    } else {
+        unsafe { super::super::pack::store(ctx, destination, values) }
+    } {
         Some(value) => value,
-        None => fail(context, "heap exhausted"),
+        None => fail(unsafe { &mut *ctx }, "heap exhausted"),
     }
 }
 
