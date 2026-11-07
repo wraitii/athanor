@@ -20,6 +20,7 @@ pub(super) struct ObjectInfo {
 
 pub(super) const INLINE_PROPERTIES: usize = 8;
 
+#[repr(C)]
 pub(super) struct SmallObject {
     pub(super) values: [Value; INLINE_PROPERTIES],
     pub(super) prototype: Option<Value>,

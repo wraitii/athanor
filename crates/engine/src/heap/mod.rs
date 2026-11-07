@@ -36,13 +36,13 @@ use shape::*;
 use typed::*;
 
 pub(crate) use arena::{
-    CODE_OFFSET, DATA_OFFSET, KIND_OFFSET, LENGTH_OFFSET, NO_ELEMENTS, REFERENCES_OFFSET,
-    SHAPE_OFFSET,
+    CODE_OFFSET, DATA_OFFSET, INLINE_PROPERTY_LENGTH_OFFSET, KIND_OFFSET, LENGTH_OFFSET,
+    NO_ELEMENTS, REFERENCES_OFFSET, SHAPE_OFFSET,
 };
 pub(crate) use array::HOLE;
 pub(crate) use natives::{MathFunction, NativeFunction};
 pub use owned::OwnedValue;
-pub(crate) use properties::PropertyWriteCache;
+pub(crate) use properties::{PropertyAdditionCache, PropertyWriteCache};
 pub(crate) use regexp::regexp_flags;
 pub(crate) use shape::{DICTIONARY, NO_SHAPE};
 pub(crate) use typed::TypedKind;

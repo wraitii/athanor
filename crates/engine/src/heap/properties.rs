@@ -5,17 +5,30 @@ const SHAPED_LIMIT: usize = 64;
 /// A cache for one fixed property name. The weak heap reference prevents address reuse
 /// from making atom and shape IDs from a previous heap appear valid.
 #[derive(Default)]
+#[repr(C)]
 pub(crate) struct PropertyWriteCache {
+    pub(crate) addition: PropertyAdditionCache,
     heap: std::rc::Weak<RefCell<HeapData>>,
     atom: Option<Atom>,
     slot: Option<(ShapeId, Option<usize>)>,
     transition: Option<(ShapeId, Key, ShapeId)>,
 }
 
+/// Published only for an inline addition: the source shape fixes the slot count,
+/// and the destination preserves the prototype and property enumerability.
+#[derive(Default)]
+#[repr(C)]
+pub(crate) struct PropertyAdditionCache {
+    pub(crate) source: u32,
+    pub(crate) destination: u32,
+    pub(crate) index: u32,
+}
+
 impl PropertyWriteCache {
     pub(super) fn atom(&mut self, heap: &Heap, data: &mut HeapData, name: &str) -> Atom {
         if self.heap.as_ptr() != Rc::as_ptr(&heap.0) {
             self.heap = Rc::downgrade(&heap.0);
+            self.addition = PropertyAdditionCache::default();
             self.atom = None;
             self.slot = None;
             self.transition = None;
@@ -207,10 +220,18 @@ impl HeapData {
                     atom,
                     enumerable: enumerable.unwrap_or(true),
                 };
+                let source = slot.shape;
                 slot.shape = match cache.as_deref_mut() {
-                    Some(cache) => cache.transition(slot.shape, &mut self.shapes, key),
-                    None => self.shapes.transition(slot.shape, key),
+                    Some(cache) => cache.transition(source, &mut self.shapes, key),
+                    None => self.shapes.transition(source, key),
                 };
+                if let Some(cache) = cache {
+                    cache.addition = PropertyAdditionCache {
+                        source,
+                        destination: slot.shape,
+                        index: object.len as u32,
+                    };
+                }
                 object.values[object.len as usize] = value;
                 object.len += 1;
                 return None;

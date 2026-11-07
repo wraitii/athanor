@@ -9,14 +9,15 @@ use oxc_syntax::operator::BinaryOperator;
 
 use crate::error::Error;
 use crate::heap::{
-    CODE_OFFSET, DATA_OFFSET, HOLE, KIND_OFFSET, LENGTH_OFFSET, MathFunction, NO_ELEMENTS,
-    SHAPE_OFFSET, TypedKind, kind,
+    CODE_OFFSET, DATA_OFFSET, HOLE, INLINE_PROPERTY_LENGTH_OFFSET, KIND_OFFSET, LENGTH_OFFSET,
+    MathFunction, NO_ELEMENTS, SHAPE_OFFSET, TypedKind, kind,
 };
 use crate::jit::clif::IndexedRead;
 use crate::jit::helpers::{
-    self, CACHE_BUILTIN_KIND_OFFSET, CACHE_BUILTIN_VALUE_OFFSET, CACHE_HOLDER_OFFSET,
-    CACHE_HOLDER_SHAPE_OFFSET, CACHE_INDEX_OFFSET, CACHE_SHAPE_OFFSET, HELPERS, Helper,
-    PropertyCache,
+    self, CACHE_ADDITION_DESTINATION_OFFSET, CACHE_ADDITION_INDEX_OFFSET,
+    CACHE_ADDITION_SOURCE_OFFSET, CACHE_BUILTIN_KIND_OFFSET, CACHE_BUILTIN_VALUE_OFFSET,
+    CACHE_HOLDER_OFFSET, CACHE_HOLDER_SHAPE_OFFSET, CACHE_INDEX_OFFSET, CACHE_SHAPE_OFFSET,
+    HELPERS, Helper, PropertyCache,
 };
 use crate::jit::planner::{CallSite, Site};
 use crate::jit::semantic::DirectTarget;
@@ -1374,6 +1375,73 @@ impl FunctionCompiler<'_, '_> {
         self.b.block_params(done)[0]
     }
 
+    fn cached_property_set(
+        &mut self,
+        object: ClifValue,
+        name: &str,
+        value: ClifValue,
+    ) -> ClifValue {
+        let address = self.function_data(PropertyCache::new(name));
+        let flags = MemFlagsData::trusted();
+        let view = self.view(object);
+        let slow = self.b.create_block();
+        let inline = self.b.create_block();
+        let retain = self.b.create_block();
+        let store = self.b.create_block();
+        let done = self.b.create_block();
+        self.b.append_block_param(done, types::I64);
+        self.b.set_cold_block(slow);
+        let kind = self.view_kind(view);
+        let inline_object =
+            self.b
+                .ins()
+                .icmp_imm_s(IntCC::Equal, kind, (kind::OBJECT | kind::INLINE) as i64);
+        let shape = self.b.ins().load(types::I32, flags, view, SHAPE_OFFSET);
+        let expected = self
+            .b
+            .ins()
+            .load(types::I32, flags, address, CACHE_ADDITION_SOURCE_OFFSET);
+        let matches = self.b.ins().icmp(IntCC::Equal, shape, expected);
+        let hit = self.b.ins().band(inline_object, matches);
+        self.brif(hit, inline, &[], slow, &[]);
+        self.switch(inline);
+        let incoming = super::scope::heap_address(self.b, value);
+        self.brif(incoming, retain, &[], store, &[]);
+        self.switch(retain);
+        super::scope::increment_references(self.b, incoming);
+        self.jump(store, &[]);
+        self.switch(store);
+        let index = self
+            .b
+            .ins()
+            .load(types::I32, flags, address, CACHE_ADDITION_INDEX_OFFSET);
+        let index = self.b.ins().uextend(types::I64, index);
+        let data = self.b.ins().load(self.pointer, flags, view, DATA_OFFSET);
+        let offset = self.b.ins().ishl_imm_s(index, 3);
+        let slot = self.b.ins().iadd(data, offset);
+        self.b.ins().store(flags, value, slot, 0);
+        let destination = self.b.ins().load(
+            types::I32,
+            flags,
+            address,
+            CACHE_ADDITION_DESTINATION_OFFSET,
+        );
+        self.b.ins().store(flags, destination, view, SHAPE_OFFSET);
+        let length = self.b.ins().iadd_imm_s(index, 1);
+        self.b.ins().store(flags, length, view, LENGTH_OFFSET);
+        let small_length = self.b.ins().ireduce(types::I8, length);
+        self.b
+            .ins()
+            .store(flags, small_length, data, INLINE_PROPERTY_LENGTH_OFFSET);
+        self.jump(done, &[BlockArg::Value(value)]);
+        self.switch(slow);
+        let result = self.call_helper(Helper::PropertySetCached, &[object, address, value]);
+        self.check_error();
+        self.jump(done, &[BlockArg::Value(result)]);
+        self.switch(done);
+        self.b.block_params(done)[0]
+    }
+
     pub(super) fn property_access(
         &mut self,
         object: ClifValue,
@@ -1381,10 +1449,7 @@ impl FunctionCompiler<'_, '_> {
         value: Option<ClifValue>,
     ) -> ClifValue {
         if let Some(value) = value {
-            let address = self.function_data(PropertyCache::new(name));
-            let result = self.call_helper(Helper::PropertySetCached, &[object, address, value]);
-            self.check_error();
-            return result;
+            return self.cached_property_set(object, name, value);
         }
         let name: Box<str> = name.into();
         let ptr = self.b.ins().iconst(self.pointer, name.as_ptr() as i64);

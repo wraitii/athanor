@@ -267,3 +267,52 @@ fn computed_index_probes_follow_index_semantics() {
         }
     }
 }
+
+#[test]
+fn constructor_additions_cross_capacity_and_keep_children() {
+    check(
+        "function C(v) {
+            this.a = {v: v}; this.b = 'kept' + v;
+            this.c = 3; this.d = 4; this.e = 5; this.f = 6;
+            this.g = 7; this.h = 8; this.i = 9;
+        }
+        function main() {
+            const kept = [];
+            for (let i = 0; i < 100; ++i) kept.push(new C(i));
+            let sum = 0;
+            for (let i = 0; i < 100; ++i) {
+                const o = kept[i];
+                sum += o.a.v + o.i;
+                if (o.b !== 'kept' + i) return -1;
+                let keys = 0;
+                for (const key in o) ++keys;
+                if (keys !== 9) return -2;
+            }
+            return sum;
+        }",
+        5850.0,
+    );
+}
+
+#[test]
+fn addition_site_handles_layouts_prototypes_and_replacements() {
+    check(
+        "function A() {} function B() {}
+        A.prototype.p = 3; B.prototype.p = 5;
+        function write(o, v) { o.x = v; }
+        function main() {
+            let sum = 0;
+            for (let i = 0; i < 100; ++i) {
+                const o = i % 2 ? new A() : new B();
+                if (i % 3) o.pad = 0;
+                write(o, {v: i});
+                const kept = o.x;
+                write(o, kept);
+                write(o, null);
+                sum += kept.v + o.p;
+            }
+            return sum;
+        }",
+        5350.0,
+    );
+}

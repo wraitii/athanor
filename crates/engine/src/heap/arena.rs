@@ -1,6 +1,6 @@
 use std::ptr::NonNull;
 
-use super::Payload;
+use super::{Payload, SmallObject};
 
 pub(crate) const SLOT_SIZE: usize = 128;
 const FIRST_CHUNK: usize = 256;
@@ -30,6 +30,8 @@ pub(crate) const SHAPE_OFFSET: i32 = std::mem::offset_of!(Slot, shape) as i32;
 pub(crate) const CODE_OFFSET: i32 = std::mem::offset_of!(Slot, code) as i32;
 pub(crate) const DATA_OFFSET: i32 = std::mem::offset_of!(Slot, data) as i32;
 pub(crate) const LENGTH_OFFSET: i32 = std::mem::offset_of!(Slot, length) as i32;
+// Relative to the inline object values addressed by Slot::data.
+pub(crate) const INLINE_PROPERTY_LENGTH_OFFSET: i32 = std::mem::offset_of!(SmallObject, len) as i32;
 
 pub(crate) static NO_ELEMENTS: [u64; SLOT_SIZE / 8] = [0; SLOT_SIZE / 8];
 

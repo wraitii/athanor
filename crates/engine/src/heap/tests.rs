@@ -875,3 +875,82 @@ fn property_write_cache_follows_heap_identity() {
         heap.drain(1000);
     }
 }
+
+#[test]
+fn jit_cached_additions_retain_and_destroy_children() {
+    for ssa_opt in [true, false] {
+        let mut engine = crate::Engine::with_options(crate::EngineOptions {
+            ssa_opt,
+            ..Default::default()
+        })
+        .unwrap();
+        engine
+            .compile(
+                "function make(child) { const o = {}; o.child = child; return o; }",
+                "write_cache.js",
+            )
+            .unwrap();
+        let heap = engine.global().heap().clone();
+        for _ in 0..100 {
+            let child = heap.array(&[]).unwrap();
+            let result = engine.call("make", &[child]).unwrap();
+            let object = result.value();
+            assert_eq!(heap.property(object, "child"), Some(child));
+            assert_eq!(heap.0.borrow().slot(heap_id(child).unwrap()).references, 2);
+            assert_eq!(heap.0.borrow().slot(heap_id(object).unwrap()).length, 1);
+            heap.release(child);
+            drop(result);
+            heap.drain(1000);
+            assert!(!heap.valid(object));
+            assert!(!heap.valid(child));
+        }
+    }
+}
+
+#[test]
+fn jit_cached_additions_guard_representation_and_errors() {
+    for ssa_opt in [true, false] {
+        let mut engine = crate::Engine::with_options(crate::EngineOptions {
+            ssa_opt,
+            ..Default::default()
+        })
+        .unwrap();
+        engine
+            .compile(
+                "function write(o, child) { o.child = child; }",
+                "write_cache.js",
+            )
+            .unwrap();
+        let heap = engine.global().heap().clone();
+        let warm = heap.object().unwrap();
+        engine.call("write", &[warm, Value::TRUE]).unwrap();
+        let boxed = heap.object().unwrap();
+        {
+            let mut data = heap.0.borrow_mut();
+            let id = heap_id(boxed).unwrap();
+            let slot = data.slot_mut(id);
+            let Payload::SmallObject(object) = &slot.payload else {
+                panic!()
+            };
+            slot.payload = Payload::Object(Object {
+                properties: Properties::Shaped(Vec::new()),
+                error: object.error,
+                prototype: object.prototype,
+            });
+            data.sync(id);
+        }
+        let child = heap.array(&[]).unwrap();
+        engine.call("write", &[boxed, child]).unwrap();
+        assert_eq!(heap.property(boxed, "child"), Some(child));
+        assert_eq!(heap.0.borrow().slot(heap_id(child).unwrap()).references, 2);
+        for receiver in [Value::NULL, Value::number(1.0), child] {
+            assert!(engine.call("write", &[receiver, child]).is_err());
+            assert_eq!(heap.0.borrow().slot(heap_id(child).unwrap()).references, 2);
+        }
+        heap.release(child);
+        heap.release(warm);
+        heap.release(boxed);
+        heap.drain(1000);
+        assert!(!heap.valid(child));
+    }
+}
