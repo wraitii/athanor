@@ -386,6 +386,60 @@ fn indexed_reads_are_reused_probed_and_get_hoisted_views() {
 }
 
 #[test]
+fn indexed_rows_borrow_from_owned_receivers_through_guards() {
+    for (body, borrowed) in [
+        ("sum+=row[0];", true),
+        ("change(height);sum+=row[0];", false),
+        ("height[i&1]=null;sum+=row[0];", false),
+    ] {
+        let source = format!(
+            "function f(owner,n){{const height=owner.height;let sum=0;for(let i=0;i<n;++i){{const row=height[i&1];{body}}}return sum;}}"
+        );
+        let canonical = canonicalize(lower_source(&source).unwrap(), true).unwrap();
+        let mut repository = specialize::Repository::default();
+        for data in canonical.graph.insts.values() {
+            if !matches!(data.op, Op::GetIndex(..)) {
+                continue;
+            }
+            let text = &source[data.span.start as usize..data.span.end as usize];
+            repository.read_feedback.insert(
+                (
+                    crate::jit::planner::Site {
+                        source: 0,
+                        start: data.span.start,
+                        end: data.span.end,
+                    },
+                    crate::jit::planner::ReadKind::Receiver,
+                ),
+                if text == "height[i&1]" {
+                    crate::jit::planner::ReadType::Array
+                } else {
+                    crate::jit::planner::ReadType::Typed(crate::heap::TypedKind::Float32)
+                },
+            );
+        }
+        let analysis = optimize_canonical(canonical, true, Some((&repository, 0))).unwrap();
+        let rows: Vec<_> = analysis
+            .graph
+            .insts
+            .values()
+            .filter(|data| {
+                matches!(data.op, Op::IndexedGet(..))
+                    && &source[data.span.start as usize..data.span.end as usize] == "height[i&1]"
+            })
+            .collect();
+        assert!(!rows.is_empty());
+        assert_eq!(
+            analysis.graph.insts.values().any(|data| {
+                matches!(data.op, Op::TypedIndex(object, ..) if analysis.graph.borrowed.contains(&object))
+            }),
+            borrowed
+        );
+        analysis.graph.verify().unwrap();
+    }
+}
+
+#[test]
 fn typed_loop_reads_are_reused_before_inner_loop_versioning() {
     let graph = lower_source("function f(grid,width){let members=0;for(let y=0;y<2;++y){const indexY=y*width;for(let x=0;x<2;++x){if(grid[indexY+x])for(let i=0;i<16;++i)if(grid[indexY+x]&(1<<i))++members;}}return members;}").unwrap();
     let canonical = canonicalize(graph, true).unwrap();

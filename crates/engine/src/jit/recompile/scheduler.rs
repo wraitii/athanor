@@ -4,10 +4,10 @@ use std::hash::Hash;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Priority {
-    Active,
-    Normal,
-    NextCall,
+    Demanded,
+    Optimize,
     Prefetch,
+    Unlazify,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -25,7 +25,7 @@ pub(super) struct Queue<K, T> {
     keys: HashMap<K, Ticket>,
     outstanding: HashSet<Ticket>,
     pending: HashMap<Ticket, Pending<K, T>>,
-    ready: BinaryHeap<Reverse<(Priority, Ticket)>>,
+    ready: [BinaryHeap<Reverse<(Priority, Ticket)>>; 2],
 }
 
 impl<K: Copy + Eq + Hash, T> Queue<K, T> {
@@ -35,7 +35,7 @@ impl<K: Copy + Eq + Hash, T> Queue<K, T> {
             keys: HashMap::new(),
             outstanding: HashSet::new(),
             pending: HashMap::new(),
-            ready: BinaryHeap::new(),
+            ready: std::array::from_fn(|_| BinaryHeap::new()),
         }
     }
 
@@ -64,7 +64,8 @@ impl<K: Copy + Eq + Hash, T> Queue<K, T> {
             self.promote(dependency, priority);
         }
         if dependencies.is_empty() {
-            self.ready.push(Reverse((priority, ticket)));
+            self.ready[usize::from(priority == Priority::Demanded)]
+                .push(Reverse((priority, ticket)));
         }
         self.pending.insert(
             ticket,
@@ -90,15 +91,31 @@ impl<K: Copy + Eq + Hash, T> Queue<K, T> {
         pending.priority = priority;
         let dependencies: Vec<_> = pending.dependencies.iter().copied().collect();
         if dependencies.is_empty() {
-            self.ready.push(Reverse((priority, ticket)));
+            self.ready[usize::from(priority == Priority::Demanded)]
+                .push(Reverse((priority, ticket)));
         }
         for dependency in dependencies {
             self.promote(dependency, priority);
         }
     }
 
+    pub(super) fn pending_mut(&mut self, key: K) -> Option<&mut T> {
+        let ticket = self.keys.get(&key)?;
+        self.pending
+            .get_mut(ticket)
+            .map(|pending| &mut pending.value)
+    }
+
     pub(super) fn pop(&mut self) -> Option<(Ticket, K, T)> {
-        while let Some(Reverse((priority, ticket))) = self.ready.pop() {
+        self.pop_lane(false)
+    }
+
+    pub(super) fn pop_lazy(&mut self) -> Option<(Ticket, K, T)> {
+        self.pop_lane(true)
+    }
+
+    fn pop_lane(&mut self, lazy: bool) -> Option<(Ticket, K, T)> {
+        while let Some(Reverse((priority, ticket))) = self.ready[usize::from(lazy)].pop() {
             if !self
                 .pending
                 .get(&ticket)
@@ -117,16 +134,10 @@ impl<K: Copy + Eq + Hash, T> Queue<K, T> {
         assert!(self.outstanding.remove(&ticket));
         for (&waiting, pending) in &mut self.pending {
             if pending.dependencies.remove(&ticket) && pending.dependencies.is_empty() {
-                self.ready.push(Reverse((pending.priority, waiting)));
+                self.ready[usize::from(pending.priority == Priority::Demanded)]
+                    .push(Reverse((pending.priority, waiting)));
             }
         }
-    }
-
-    pub(super) fn cancel_pending(&mut self, key: K) -> Option<Ticket> {
-        let ticket = *self.keys.get(&key)?;
-        self.pending.remove(&ticket)?;
-        self.complete(ticket, key);
-        Some(ticket)
     }
 }
 
@@ -135,47 +146,59 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cancellation_releases_dependencies_but_cannot_cancel_running_jobs() {
+    fn lazy_demands_move_to_the_reserved_lane_without_duplicate_attempts() {
         let mut queue = Queue::new();
-        let callee = queue.submit(1, Priority::Prefetch, "callee", &[]);
-        let caller = queue.submit(2, Priority::Normal, "caller", &[callee]);
-        assert_eq!(queue.cancel_pending(1), Some(callee));
-        assert_eq!(queue.pop(), Some((caller, 2, "caller")));
-        assert_eq!(queue.cancel_pending(2), None);
-        queue.complete(caller, 2);
+        let demand = queue.submit(1, Priority::Unlazify, "demand", &[]);
+        queue.submit(2, Priority::Optimize, "loop", &[]);
+        assert!(queue.pop_lazy().is_none());
+        assert_eq!(
+            queue.submit(1, Priority::Demanded, "duplicate", &[]),
+            demand
+        );
+        assert_eq!(queue.pop().unwrap().2, "loop");
         assert!(queue.pop().is_none());
-        let next = queue.submit(1, Priority::Prefetch, "retry", &[]);
-        queue.submit(3, Priority::NextCall, "next call", &[]);
-        assert_eq!(queue.pop().unwrap().2, "next call");
-        assert_eq!(queue.pop(), Some((next, 1, "retry")));
+        assert_eq!(queue.pop_lazy(), Some((demand, 1, "demand")));
+        assert_eq!(
+            queue.submit(1, Priority::Demanded, "duplicate", &[]),
+            demand
+        );
+        assert!(queue.pop_lazy().is_none());
+        queue.complete(demand, 1);
+        let running = queue.submit(3, Priority::Unlazify, "running", &[]);
+        assert_eq!(queue.pop(), Some((running, 3, "running")));
+        assert_eq!(
+            queue.submit(3, Priority::Demanded, "duplicate", &[]),
+            running
+        );
+        assert!(queue.pop_lazy().is_none());
     }
 
     #[test]
     fn priorities_are_fifo_and_queued_requests_can_be_promoted() {
         let mut queue = Queue::new();
-        let low = queue.submit(1, Priority::NextCall, "parent", &[]);
-        queue.submit(2, Priority::Normal, "ordinary", &[]);
-        queue.submit(3, Priority::Active, "loop", &[]);
-        assert_eq!(queue.submit(1, Priority::Active, "duplicate", &[]), low);
+        let low = queue.submit(1, Priority::Prefetch, "parent", &[]);
+        queue.submit(2, Priority::Optimize, "ordinary", &[]);
+        queue.submit(3, Priority::Optimize, "loop", &[]);
+        assert_eq!(queue.submit(1, Priority::Optimize, "duplicate", &[]), low);
         assert_eq!(queue.pop(), Some((low, 1, "parent")));
-        assert_eq!(queue.pop().unwrap().2, "loop");
         assert_eq!(queue.pop().unwrap().2, "ordinary");
+        assert_eq!(queue.pop().unwrap().2, "loop");
         assert!(queue.pop().is_none());
     }
 
     #[test]
     fn dependencies_inherit_priority_and_wait_for_publication() {
         let mut queue = Queue::new();
-        let callee = queue.submit(1, Priority::NextCall, "callee", &[]);
-        let caller = queue.submit(2, Priority::Active, "caller", &[callee]);
-        queue.submit(3, Priority::Normal, "unrelated", &[]);
+        let callee = queue.submit(1, Priority::Prefetch, "callee", &[]);
+        let caller = queue.submit(2, Priority::Optimize, "caller", &[callee]);
+        queue.submit(3, Priority::Optimize, "unrelated", &[]);
         assert_eq!(queue.pop(), Some((callee, 1, "callee")));
         assert_eq!(queue.pop().unwrap().2, "unrelated");
         assert!(queue.pop().is_none());
         queue.complete(callee, 1);
         assert_eq!(queue.pop(), Some((caller, 2, "caller")));
         queue.complete(caller, 2);
-        let next = queue.submit(2, Priority::Normal, "new version", &[callee]);
+        let next = queue.submit(2, Priority::Optimize, "new version", &[callee]);
         assert_ne!(caller, next);
         assert_eq!(queue.pop(), Some((next, 2, "new version")));
     }
@@ -183,21 +206,21 @@ mod tests {
     #[test]
     fn workers_cannot_take_the_same_attempt_twice() {
         let mut queue = Queue::new();
-        let ticket = queue.submit(1, Priority::Normal, 42, &[]);
+        let ticket = queue.submit(1, Priority::Optimize, 42, &[]);
         assert_eq!(queue.pop(), Some((ticket, 1, 42)));
-        assert_eq!(queue.submit(1, Priority::Active, 99, &[]), ticket);
+        assert_eq!(queue.submit(1, Priority::Optimize, 99, &[]), ticket);
         assert!(queue.pop().is_none());
         queue.complete(ticket, 1);
-        assert_ne!(queue.submit(1, Priority::Normal, 99, &[]), ticket);
+        assert_ne!(queue.submit(1, Priority::Optimize, 99, &[]), ticket);
     }
 
     #[test]
     fn priority_inheritance_reaches_transitive_dependencies() {
         let mut queue = Queue::new();
-        let leaf = queue.submit(1, Priority::NextCall, "leaf", &[]);
-        let middle = queue.submit(2, Priority::NextCall, "middle", &[leaf]);
-        queue.submit(3, Priority::Normal, "unrelated", &[]);
-        let root = queue.submit(4, Priority::Active, "root", &[middle]);
+        let leaf = queue.submit(1, Priority::Prefetch, "leaf", &[]);
+        let middle = queue.submit(2, Priority::Prefetch, "middle", &[leaf]);
+        queue.submit(3, Priority::Unlazify, "unrelated", &[]);
+        let root = queue.submit(4, Priority::Optimize, "root", &[middle]);
         assert_eq!(queue.pop(), Some((leaf, 1, "leaf")));
         queue.complete(leaf, 1);
         assert_eq!(queue.pop(), Some((middle, 2, "middle")));

@@ -19,7 +19,9 @@ mod versioning;
 #[cfg(test)]
 use analysis::unescaped;
 use analysis::{Access, Guarded, Requirement, Writes, closure_failure, requirements};
+#[cfg(test)]
 pub(super) use planning::version;
+pub(super) use planning::version_with_report;
 pub(super) use simplify::{bit_tests, coercions, simplify, typeof_comparisons};
 use versioning::{Speculation, apply_version};
 
@@ -826,6 +828,67 @@ pub(super) fn sink_closures(graph: &mut Graph, notes: &mut Vec<String>) {
     }
 }
 
+pub(super) fn forward_captured_parameters(graph: &mut Graph, notes: &mut Vec<String>) {
+    let cfg = Cfg::new(graph);
+    let mut aliases = HashMap::new();
+    let mut removed = Vec::new();
+    for &binding in &graph.lazy_captures {
+        if graph.scopes[graph.bindings[binding].scope].kind != super::ScopeKind::Parameters {
+            continue;
+        }
+        let mut initializers = Vec::new();
+        let mut writes = false;
+        let mut escaped = HashSet::new();
+        let mut pending = Vec::new();
+        for &block in &cfg.rpo {
+            for &inst in &graph.blocks[block].insts {
+                match &graph.insts[inst].op {
+                    Op::Initialize(target, value) if *target == binding => {
+                        initializers.push((inst, *value))
+                    }
+                    Op::Write(target, _) if *target == binding => writes = true,
+                    Op::Closure(_, _, _, _, _, captures, _) if captures.contains(&binding) => {
+                        pending.push(block)
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if writes || initializers.len() != 1 {
+            continue;
+        }
+        let (initializer, value) = initializers[0];
+        let origin = graph.insts[initializer].block;
+        while let Some(block) = pending.pop() {
+            if escaped.insert(block) {
+                pending.extend(graph.successors(block));
+            }
+        }
+        for &block in &cfg.rpo {
+            if escaped.contains(&block) || !cfg.dominates(origin, block) {
+                continue;
+            }
+            let mut initialized = block != origin;
+            for &inst in &graph.blocks[block].insts {
+                if inst == initializer {
+                    initialized = true;
+                }
+                if initialized
+                    && matches!(graph.insts[inst].op, Op::Read(target) if target == binding)
+                {
+                    aliases.insert(graph.insts[inst].result.unwrap(), value);
+                    removed.push(inst);
+                }
+            }
+        }
+    }
+    graph.replace_uses(&aliases);
+    for inst in removed {
+        notes.push(format!("forwarded captured parameter read at {inst}"));
+        graph.remove_inst(inst);
+    }
+}
+
 pub(super) fn lazy_captures(graph: &mut Graph, notes: &mut Vec<String>) -> bool {
     let mut demoted = false;
     let mut candidates = HashSet::new();
@@ -882,6 +945,41 @@ mod tests {
             .build(&parsed.program)
             .semantic;
         super::super::build::lower(function, semantic.scoping(), &HashSet::new()).unwrap()
+    }
+
+    #[test]
+    fn append_writes_preserve_properties_but_invalidate_elements_and_length() {
+        for spread in [false, true] {
+            let mut graph = empty_graph();
+            let block = graph.entry;
+            let span = graph.span;
+            let array = graph.append(block, span, Op::Argument(0), true).1.unwrap();
+            let value = graph.append(block, span, Op::Argument(1), true).1.unwrap();
+            graph.append(block, span, Op::ArrayAppend(array, value, spread), false);
+            let scope = Cfg::new(&graph).rpo.into_iter().collect();
+            let writes = Writes::collect(&graph, &scope);
+            assert!(writes.clobbers(array, &Access::Elements));
+            assert!(writes.clobbers(array, &Access::Length));
+            assert!(!writes.clobbers(array, &Access::Named("allows".into())));
+            assert!(!writes.clobbers_global("g_Map"));
+        }
+    }
+
+    #[test]
+    fn pack_mutations_do_not_clobber_javascript_properties() {
+        let mut graph = empty_graph();
+        let block = graph.entry;
+        let span = graph.span;
+        let pack = graph.append(block, span, Op::NewPack, true).1.unwrap();
+        let value = graph.append(block, span, Op::Argument(0), true).1.unwrap();
+        graph.append(block, span, Op::PackAppend(pack, value, false), false);
+        graph.append(block, span, Op::PackRelease(pack), false);
+        let scope = Cfg::new(&graph).rpo.into_iter().collect();
+        let writes = Writes::collect(&graph, &scope);
+        assert!(writes.clobbers(pack, &Access::Packs));
+        assert!(!writes.clobbers(value, &Access::Length));
+        assert!(!writes.clobbers(value, &Access::Named("allows".into())));
+        assert!(!writes.clobbers_global("g_Map"));
     }
 
     #[test]

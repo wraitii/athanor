@@ -90,6 +90,7 @@ impl CallProfile {
 pub(crate) struct Planner {
     calls: FxHashMap<*const CallSite, (Site, CallProfile)>,
     targets: HashMap<Site, u64>,
+    natives: HashMap<Site, crate::heap::NativeFunction>,
     observed: HashSet<(u64, Site)>,
     reads: HashMap<(Site, ReadKind), ReadType>,
     observed_reads: HashSet<(u64, Site, ReadKind)>,
@@ -104,6 +105,23 @@ impl Planner {
         }
         self.targets.entry(site).or_insert(target);
         true
+    }
+
+    pub(crate) fn observe_native(
+        &mut self,
+        owner: u64,
+        site: Site,
+        target: crate::heap::NativeFunction,
+    ) -> bool {
+        if !self.observed.insert((owner, site)) {
+            return false;
+        }
+        self.natives.entry(site).or_insert(target);
+        true
+    }
+
+    pub(super) fn natives(&self) -> impl Iterator<Item = (Site, crate::heap::NativeFunction)> + '_ {
+        self.natives.iter().map(|(&site, &target)| (site, target))
     }
 
     pub(crate) fn observe_get(

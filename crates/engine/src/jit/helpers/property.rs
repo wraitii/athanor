@@ -398,6 +398,15 @@ pub(super) extern "C" fn js_index_get_numeric(ctx: *mut JitCtx, array: Value, in
     }
 }
 
+// The caller proves a typed receiver and an integral, in-bounds index.
+pub(super) extern "C" fn js_typed_index_get(ctx: *mut JitCtx, array: Value, index: u64) -> Value {
+    unsafe { &*ctx }
+        .global
+        .heap()
+        .get(array, index as usize)
+        .unwrap_or(Value::UNDEFINED)
+}
+
 #[cold]
 #[inline(never)]
 pub(super) fn index_get_character(ctx: &mut JitCtx, character: char) -> Value {

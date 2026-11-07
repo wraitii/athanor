@@ -65,11 +65,14 @@ impl Borrows<'_> {
 
 // A borrowed read skips frame rooting and the inline temporary retain. While it is live, no
 // write, reentry, or redefinition of a receiver in its chain may run, so a receiver that holds
-// the value keeps holding it. When a receiver might not hold it (string indexing allocates),
-// the value must die within its block: slow-path results stay owned by a temporary until the
-// block's clear, and the inline path only runs on arrays, which own their elements.
+// the value keeps holding it. Ownership proofs stop at receivers that remain rooted; borrowed
+// receivers must themselves be held along the rest of the chain. When a receiver might not
+// hold it (string indexing allocates), the value must die within its block: slow-path results
+// stay owned by a temporary until the block's clear, and the inline path only runs on arrays,
+// which own their elements.
 // Indexed iteration reads only run on arrays and typed arrays, so their receiver always holds them.
 pub(super) fn borrows(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>) {
+    graph.borrowed.clear();
     let mut reads = HashMap::new();
     let mut held = HashSet::new();
     for (_, data) in graph.insts.iter() {
@@ -89,10 +92,7 @@ pub(super) fn borrows(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>)
         while let Some(&next) = reads.get(chain.last().unwrap()) {
             chain.push(next);
         }
-        let results = std::iter::once(value).chain(chain.iter().copied());
-        if results.zip(&chain).all(|(result, object)| {
-            held.contains(&result) || facts.of(*object).within(Types::OBJECT)
-        }) {
+        if held.contains(&value) || facts.of(object).within(Types::OBJECT) {
             objects.insert(value);
         }
         chains.insert(value, chain);
@@ -144,7 +144,7 @@ pub(super) fn borrows(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>)
     for &block in &cfg.rpo {
         scan(&mut borrows, block, &live_in, true);
     }
-    let mut accepted: Vec<Value> = borrows
+    let mut accepted: HashSet<Value> = borrows
         .chains
         .keys()
         .filter(|value| {
@@ -152,9 +152,38 @@ pub(super) fn borrows(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>)
         })
         .copied()
         .collect();
+    loop {
+        let rejected: Vec<Value> = accepted
+            .iter()
+            .filter(|value| {
+                if local.contains(value) {
+                    return false;
+                }
+                let chain = &borrows.chains[value];
+                let results = std::iter::once(**value).chain(chain.iter().copied());
+                for (result, &object) in results.zip(chain) {
+                    if !held.contains(&result) && !facts.of(object).within(Types::OBJECT) {
+                        return true;
+                    }
+                    if !accepted.contains(&object) {
+                        break;
+                    }
+                }
+                false
+            })
+            .copied()
+            .collect();
+        if rejected.is_empty() {
+            break;
+        }
+        for value in rejected {
+            accepted.remove(&value);
+        }
+    }
     if accepted.is_empty() {
         return;
     }
+    let mut accepted: Vec<Value> = accepted.into_iter().collect();
     accepted.sort();
     let list: Vec<String> = accepted.iter().map(ToString::to_string).collect();
     notes.push(format!("borrowed reads: [{}]", list.join(", ")));

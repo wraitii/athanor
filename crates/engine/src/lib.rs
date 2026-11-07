@@ -12,6 +12,7 @@ pub use environment::Environment;
 pub use error::Error;
 pub use heap::OwnedValue;
 pub use host::Host;
+pub use jit::CompileOptions;
 pub use value::Value;
 
 pub type Result<T> = std::result::Result<T, Error>;

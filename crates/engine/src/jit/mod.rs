@@ -9,6 +9,7 @@ pub(crate) mod entries;
 mod function_data;
 mod generator;
 mod helpers;
+mod inspect;
 mod jitdump;
 mod math;
 pub(crate) mod osr;
@@ -20,8 +21,9 @@ mod semantic;
 mod session;
 mod temporaries;
 
-pub(crate) use compiler::{CompilationMode, Compiler, RecompileJob};
+pub(crate) use compiler::{CompilationTier, Compiler, RecompileJob};
 pub(crate) use entries::DirectEntries;
+pub use inspect::CompileOptions;
 pub(crate) use planner::Planner;
 pub(crate) use semantic::specialize::DEFAULT_RECOMPILE_INLINE_MULTIPLIER;
 pub(crate) use session::{LocalSlots, call};

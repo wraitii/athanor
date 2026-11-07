@@ -2,7 +2,7 @@ use super::*;
 
 pub(crate) const MAX_TYPED_ARRAY_BYTES: usize = 256 * 1024 * 1024;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum TypedKind {
     Uint8,
     Uint16,

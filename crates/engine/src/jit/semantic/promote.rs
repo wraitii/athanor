@@ -171,7 +171,7 @@ pub(super) fn promote(graph: &mut Graph, notes: &mut Vec<String>) {
     ));
 }
 
-fn remove_trivial_params(graph: &mut Graph) {
+pub(super) fn remove_trivial_params(graph: &mut Graph) {
     let blocks = Cfg::new(graph).rpo;
     loop {
         let mut incoming: HashMap<Value, Vec<Value>> = HashMap::new();

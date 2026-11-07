@@ -1,6 +1,6 @@
 use super::*;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NativeFunction {
     DateNow,
     ObjectKeys,
@@ -61,7 +61,7 @@ pub(crate) enum NativeFunction {
     StringPadStart,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MathFunction {
     Random,
     Abs,

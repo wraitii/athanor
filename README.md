@@ -28,15 +28,79 @@ interspersed whenever it changes. Profile samples are attributed to semantic
 instructions and terminators where machine-code source locations are available;
 generated code without a semantic location points to the listing header.
 
-Use `--compile --eval SOURCE` or `--compile SCRIPT` to print Cranelift IR
-without executing the source. Add `--semantic-ir` to print the semantic graph,
-inferred types, and optimization notes, including why a function was not
-versioned or optimized. Add `--ast` for the analyzed Oxc AST and generator
-resume plans, or `--asm` for disassembled machine code with relocations. Use
-`--no-ir` to omit IR. The compiler lowers the AST to a semantic graph before
-emitting Cranelift IR. Eligible functions get a guarded Math fast path that
-checks native identities once per invocation and falls back on mismatch.
-`JS_JIT_SSA=0` disables semantic graph optimization and CLIF cleanup.
+Use `--compile --eval SOURCE` or `--compile SCRIPT` to compile all functions
+without executing the source. Output is grouped by function. `--filter NAME`
+restricts output to functions whose generated name contains NAME; other functions
+remain available for specialization and inlining. A filter with no matches is an
+error. Compilation options cannot be combined with `--load`, `--function`,
+`--arg`, `--map`, or `--repl`.
+
+- Semantic IR is the default: the actual graph passed to CLIF emission, including
+  OSR instrumentation when enabled. `--no-semantic-ir` (also `--no-ir`) suppresses
+  it; `--semantic-ir` enables it again. `JS_JIT_SSA=0` selects the unoptimized
+  semantic graph and disables engine CLIF cleanup; Cranelift still uses its normal
+  optimization level.
+- `--clif` adds Cranelift IR before and after Cranelift optimization. The first
+  view includes the engine's CLIF cleanup and a helper-call legend; neither view
+  includes register allocation.
+- `--planner` prints the inline budget, available call/read feedback, selected
+  inlines, read refinements, conditional effects/identity guards, OSR plans, and
+  optimization notes. It also shows the region tree before versioning and the
+  replanned regions immediately before their emission: block membership, native
+  requirements, numeric assumptions, read probes, hoisted guards, fallback exits,
+  typed receivers/reads, and length checks. Rejected regions remain in the notes.
+  Region IDs refer to their respective planning stage, before subsequent copying
+  and simplification. Detailed region reports are collected only with this flag.
+  Feedback is empty until code has executed.
+- `--ast` prints each function's analyzed Oxc parameters/body and generator resume
+  plan, or the module AST for its initializer.
+- `--asm` prints native code with function-relative byte offsets, relocations,
+  trap information, and semantic-location IDs. Instructions without a semantic
+  location are explicitly marked `unattributed`.
+
+Semantic instructions and terminators carry hexadecimal `@NNNN` IDs, shared with
+CLIF source locations and assembly annotations within that function. These IDs
+are distinct from semantic value/instruction names and are local to each graph.
+Planner decisions refer to instruction IDs before their transformations.
+Compile-only inspection uses the initial specialization plan and base inline
+budget; it does not execute initializers or collect warmup feedback.
+
+```sh
+cargo run -p js-runner -- --compile --filter paint --planner --clif --asm SCRIPT
+```
+
+Add `--execute 'JS'` to run the source initializer and then a JavaScript setup/call
+snippet. The snippet runs inside an immediately invoked arrow function appended
+to the source, so it can use loops and local variables. Host functions are available.
+This mode uses synchronous compilation and prints initial code plus any variants
+compiled from runtime feedback, labeled `.feedback@...`. It does not force a new
+variant when the planner has no changes. All ordinary dump flags still apply.
+
+For example, pass a real object and inspect guarded method inlining:
+
+```sh
+cargo run -p js-runner -- --compile --filter selected --planner --clif --asm \
+  --eval 'function selected(object){return object.method(4);}' \
+  --execute 'const object = {method: function(x){return x+1;}}; const runner = {call: selected}; for(let i=0;i<32;++i) runner.call(object);'
+```
+
+Call feedback records native identities as well as JavaScript targets. `Array.push`
+is lowered to append operations and a resulting length after native feedback,
+guarded by the callee identity and array receiver. Directly proven array allocations
+use the same lowering at compile time without guards, relying on the engine's
+fixed named array methods. Other native identities are recorded for inspection but
+do not yet gain this lowering.
+
+The indirect call lets `selected` execute and collect its own feedback; direct
+calls may instead be statically inlined into the setup function. With a script
+path, the snippet can construct instances of the script's classes in the same way.
+Without `--execute`, compilation remains non-executing. Appended snippet locations
+refer to their positions after the original source in the same filename.
+
+The embedding API configures these views through
+`EngineOptions::compile: Option<Arc<CompileOptions>>`. Options are shared with
+compiler workers; `EngineOptions` is cloneable rather than copyable.
+
 Both runners provide deterministic `Math.random()` without a Boost dependency.
 The shared bootstrap calls `hostSeedRandom(settings.Seed)` before loading scripts;
 a missing seed defaults to zero. The generator matches the game's rand48 sequence.
@@ -107,15 +171,16 @@ progress. `JS_JIT_RECOMPILE_LOG=1` reports requests, queue priorities, publicati
 and the first transfer. `JS_JIT_BACKGROUND=0` compiles fragments synchronously
 for deterministic comparisons.
 
-Compilation uses a shared priority queue with two workers by default. Active
-loop jobs have highest priority; ordinary function jobs follow; whole-function
-recompilation after an OSR request follows those. After synchronous initial
-compilation, known callees and calls exposed by inlining are queued at the
-lowest priority. Background completion does not recursively prefetch more callees.
-Dispatch cancels a queued job when it needs to compile the same function
-synchronously; already-running initial results are discarded if synchronous
-compilation finishes first. Dependency tickets and inherited priorities support
-future callee preparation.
+Compilation uses four regular workers by default plus a separate worker reserved
+for demanded lazy bodies. Scheduling priorities are demanded lazy compilation,
+OSR/feedback optimization, known lazy callees, and the sweep of remaining lazy
+bodies, in that order. Demanded work uses the reserved worker; the other three
+priorities use the regular pool.
+Dispatch promotes a queued lazy body to the reserved worker's queue and waits
+while publishing completed results. If a regular worker has already started
+that body, dispatch waits for its result without duplicating compilation.
+Independent jobs keep compiling without waiting for publication. Dependency
+tickets and inherited priorities support future callee preparation.
 
 Feedback requests are submitted at function return to the background compiler pool
 once the function has completed eight calls. Earlier feedback remains pending until
@@ -127,30 +192,39 @@ retain the base limits. Set
 `JS_JIT_RECOMPILE_INLINE_MULTIPLIER=1` to use the base budget for every compilation
 (`EngineOptions::recompile_inline_multiplier`). Zero disables inlining during
 recompilation.
-Set `JS_JIT_WORKERS=3` to use three compiler threads, or `JS_JIT_WORKERS=1`
-to use one (`EngineOptions::compiler_threads`, which must be positive).
+Set `JS_JIT_WORKERS=3` to use three regular compiler threads, or `JS_JIT_WORKERS=1`
+to use one (`EngineOptions::compiler_threads`, which must be positive). The
+reserved lazy worker is additional to this count. Parsing, graph construction,
+and top-level initializer compilation still run on the execution thread.
 Calls continue using the current version until the execution thread installs a
 completed replacement during dispatch. When JIT dumping is enabled, each worker
 writes a separate dump file. Set `JS_JIT_BACKGROUND=0` to recompile
 synchronously at the next dispatch instead (`EngineOptions::background_compile`).
 
-Set `JS_JIT_SYNC_SINGLE_PASS=1` to use Cranelift's `single_pass` register allocator
-on the execution thread (`EngineOptions::sync_single_pass`). Set
-`JS_JIT_SYNC_OPT_LEVEL=none` or `speed` to override its Cranelift optimization
-level (`EngineOptions::sync_opt_level`). By default it inherits
-`EngineOptions::opt_level` (`speed`) and uses the `backtracking` allocator.
-Background workers retain `opt_level` and `backtracking`, including for prefetched
-initial bodies. These switches affect all compilation on the execution thread,
-including recompilation when `JS_JIT_BACKGROUND=0`; semantic optimization is
-unchanged.
+Scheduling priority and compilation tier are separate. Demanded lazy, prefetch,
+and unlazify jobs use the baseline tier: Cranelift `opt_level=none`, with semantic
+optimization and specialization still enabled. OSR and feedback jobs use the
+optimized tier and `EngineOptions::opt_level` (default `speed`). Both tiers use
+the backtracking register allocator. Initial bodies retain the base inlining
+budget; OSR and feedback use the recompilation multiplier described above.
+Promoting queued prefetch or unlazify work to a demand retains its baseline
+tier. A job already running retains its tier. Optimized recompilation can
+replace a baseline body even when its specialization plan is unchanged.
+`JS_JIT_SSA=0` still disables semantic optimization globally. Source initializers,
+compile-only output, and synchronous compilation with `JS_JIT_BACKGROUND=0` use
+the optimized tier. The former `JS_JIT_SYNC_OPT_LEVEL` and
+`JS_JIT_SYNC_SINGLE_PASS` settings and their `EngineOptions` fields were removed.
 
 Set `JS_JIT_RECOMPILE_LOG=1` (`EngineOptions::recompile_log`) to trace recompilation
 to stderr in either mode. Events include feedback sites and types, requests,
-outstanding job counts and queue wait time, plan changes, compilation outcomes and durations,
+outstanding job counts, priorities, tiers, queue wait time, plan changes,
+compilation outcomes and durations,
 installation, and worker shutdown. Prefetch events report installation, first
-observed use (`sync_compilation=avoided`), synchronous takeover of queued or
-running work, and discarded late results. Engine shutdown prints a prefetch
-summary; use is detected through completed-call counters, including calls that
+observed use (`sync_compilation=avoided`), and discarded late results. Lazy
+misses report wait begin/end events and elapsed wait time, including publication
+of other results during the wait. Engine shutdown prints the lazy wait count,
+total and maximum wait duration, time spent joining compiler threads, and a
+prefetch summary; use is detected through completed-call counters, including calls that
 bypass runtime dispatch. Each line includes elapsed time since engine
 creation; function events include the logical code ID and function name. Requests
 made while a job is outstanding are marked `compiling=true`. An `unchanged` plan

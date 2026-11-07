@@ -8,8 +8,8 @@ use super::super::effects::{
 };
 use super::{Canonical, Cfg, DirectTarget, Facts, Graph, Inst, Native, Op, Result, TerminatorKind};
 
-const SPECIALIZATION_BUDGET: usize = 128;
-const SPECIALIZATION_BODY_INSTS: usize = 64;
+pub(super) const SPECIALIZATION_BUDGET: usize = 128;
+pub(super) const SPECIALIZATION_BODY_INSTS: usize = 64;
 pub(super) const SPECIALIZATION_ROUNDS: usize = 2;
 pub(crate) const DEFAULT_RECOMPILE_INLINE_MULTIPLIER: usize = 4;
 
@@ -17,6 +17,8 @@ pub(crate) const DEFAULT_RECOMPILE_INLINE_MULTIPLIER: usize = 4;
 pub(in crate::jit) struct Repository {
     bodies: HashMap<FuncId, Arc<Body>>,
     pub(in crate::jit) feedback: HashMap<crate::jit::planner::Site, FuncId>,
+    pub(in crate::jit) native_feedback:
+        HashMap<crate::jit::planner::Site, crate::heap::NativeFunction>,
     pub(in crate::jit) read_feedback: HashMap<
         (crate::jit::planner::Site, crate::jit::planner::ReadKind),
         crate::jit::planner::ReadType,
@@ -127,6 +129,10 @@ impl Repository {
         self.bodies
             .get(&code)
             .is_some_and(|body| body.arrow && super::inlining::uses_this(&body.canonical.graph))
+    }
+
+    pub(super) fn name(&self, code: FuncId) -> Option<&str> {
+        self.bodies.get(&code).map(|body| body.name.as_str())
     }
 
     pub(super) fn body(&self, code: FuncId) -> Option<&Graph> {
@@ -451,6 +457,7 @@ pub(super) fn prove_closed_calls(graph: &mut Graph, bodies: &Repository, notes: 
 
 #[derive(Clone, Default, PartialEq, Eq)]
 pub(in crate::jit) struct ConditionalPlan {
+    pub(super) native_calls: Vec<crate::jit::planner::Site>,
     pub(super) calls: Vec<ConditionalCall>,
 }
 
@@ -1191,7 +1198,7 @@ mod tests {
             let second = super::super::plan_canonical(canonical, true, Some((&bodies, 0))).unwrap();
             assert_eq!(first.inlines.len(), count);
             assert!(first.inlines == second.inlines);
-            let analysis = super::super::optimize_planned(first, None).unwrap();
+            let analysis = super::super::optimize_planned(first, None, false).unwrap();
             assert!(analysis.inlines == second.inlines);
             analysis.graph.verify().unwrap();
         }
@@ -1261,7 +1268,7 @@ mod tests {
         for fallback in [None, Some(0x1234)] {
             let planned =
                 super::super::plan_canonical(canonical.clone(), true, Some((&bodies, 0))).unwrap();
-            let analysis = super::super::optimize_planned(planned, fallback).unwrap();
+            let analysis = super::super::optimize_planned(planned, fallback, false).unwrap();
             let graph = &analysis.graph;
             graph.verify().unwrap();
             let mut fallbacks = Vec::new();

@@ -8,7 +8,8 @@ fn contained_use(op: &Op, index: usize) -> bool {
         | Op::IndexedGet(..)
         | Op::Set(..)
         | Op::SetIndex(..)
-        | Op::Define(..) => index == 0,
+        | Op::Define(..)
+        | Op::ArrayAppend(..) => index == 0,
         Op::IsUndefined(_)
         | Op::IsNullish(_)
         | Op::CheckInitialized(_)
@@ -85,7 +86,7 @@ pub(super) fn unescaped(graph: &Graph, scope: &HashSet<Block>, cfg: &Cfg) -> Has
         for &inst in &graph.blocks[block].insts {
             let data = &graph.insts[inst];
             match data.op {
-                Op::NewObject | Op::NewInstance(_) | Op::NewArray(_) => {
+                Op::NewObject | Op::NewInstance(_) | Op::NewArray(_) | Op::NewHoleyArray(_) => {
                     allocations.extend(data.result)
                 }
                 Op::IteratorNew(source) | Op::EnumerateNew(source) => {
@@ -162,6 +163,7 @@ pub(super) enum Access {
     Named(String),
     // Cells can alias other captures, but cannot alias JavaScript properties.
     Cells,
+    Packs,
     Length,
     Elements,
     Iteration,
@@ -193,6 +195,8 @@ impl Access {
             {
                 Self::Elements
             }
+            Op::ArrayAppend(..) | Op::MapElement(..) => Self::Elements,
+            Op::PackAppend(..) | Op::PackRelease(_) => Self::Packs,
             Op::IteratorNext(_) | Op::EnumerateNext(_) => Self::Iteration,
             _ => Self::Any,
         }
@@ -209,7 +213,7 @@ impl Access {
         match (self, read) {
             (Self::Iteration, _) | (_, Self::Iteration) => false,
             (Self::Any, _) | (_, Self::Any) => true,
-            (Self::Cells, Self::Cells) => true,
+            (Self::Cells, Self::Cells) | (Self::Packs, Self::Packs) => true,
             (Self::Named(write), Self::Named(read)) => write == read,
             (Self::Elements, Self::Elements | Self::Length) => true,
             _ => false,
@@ -336,7 +340,7 @@ impl Guarded {
             (_, Access::Named(name)) => {
                 self.properties.contains(&name) || self.globals.contains(&name)
             }
-            (_, Access::Cells | Access::Elements | Access::Iteration) => false,
+            (_, Access::Cells | Access::Packs | Access::Elements | Access::Iteration) => false,
             _ => !self.is_empty(),
         }
     }

@@ -19,6 +19,92 @@ struct RegionPlan {
 }
 
 impl RegionPlan {
+    fn report(&self, graph: &Graph, depth: usize, children: bool) -> String {
+        use std::fmt::Write;
+
+        let indent = "  ".repeat(depth);
+        let mut out = String::new();
+        match self.entry {
+            Some((preheader, header)) => {
+                writeln!(out, "{indent}region loop at {header} preheader={preheader}").unwrap()
+            }
+            None => writeln!(out, "{indent}region function").unwrap(),
+        }
+        let mut blocks: Vec<_> = self.body.iter().copied().collect();
+        blocks.sort();
+        writeln!(
+            out,
+            "{indent}  blocks: {}",
+            blocks
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+        .unwrap();
+        writeln!(out, "{indent}  speculative: {}", self.speculative()).unwrap();
+        for requirement in &self.requirements {
+            writeln!(
+                out,
+                "{indent}  native {}: {}",
+                requirement.call, requirement.native
+            )
+            .unwrap();
+        }
+        for call in &self.calls {
+            writeln!(
+                out,
+                "{indent}  closed call {}: {} effects=0x{:04x}",
+                call.inst, call.name, call.flags
+            )
+            .unwrap();
+        }
+        for (name, code) in &self.identities {
+            writeln!(out, "{indent}  identity {name}={code}").unwrap();
+        }
+        for &value in &self.checks {
+            let origin = graph
+                .defining_op(value)
+                .map(|op| graph.op_text(op))
+                .unwrap_or_else(|| "block parameter".into());
+            writeln!(out, "{indent}  number assumption {value}: {origin}").unwrap();
+        }
+        for &inst in &self.reads {
+            writeln!(
+                out,
+                "{indent}  probe {inst}: {}",
+                graph.op_text(&graph.insts[inst].op)
+            )
+            .unwrap();
+        }
+        for &block in &self.guards {
+            writeln!(out, "{indent}  hoisted guard {block}").unwrap();
+        }
+        for &block in &self.exits {
+            writeln!(out, "{indent}  fallback exit {block}").unwrap();
+        }
+        for (value, element) in &self.typed {
+            writeln!(out, "{indent}  typed receiver {value}: {element:?}").unwrap();
+        }
+        for (object, bound) in &self.bounds {
+            writeln!(out, "{indent}  length check {bound} <= length({object})").unwrap();
+        }
+        for (inst, read) in &self.typed_reads {
+            writeln!(
+                out,
+                "{indent}  typed read {inst}: element={:?} bounded={}",
+                read.element, read.bounded
+            )
+            .unwrap();
+        }
+        if children {
+            for child in &self.children {
+                out.push_str(&child.report(graph, depth + 1, true));
+            }
+        }
+        out
+    }
+
     fn speculative(&self) -> bool {
         !self.identities.is_empty()
             || !self.requirements.is_empty()
@@ -86,6 +172,7 @@ impl RegionPlan {
         fallback: Option<usize>,
         regions: &mut Vec<HashSet<Block>>,
         notes: &mut Vec<String>,
+        report_regions: bool,
     ) -> Result<()> {
         let cfg = Cfg::new(graph);
         let live: HashSet<_> = cfg.rpo.iter().copied().collect();
@@ -97,6 +184,12 @@ impl RegionPlan {
         let (mut current, _) = plan_region(graph, self.body, self.entry, &self.calls)?;
         current.children = self.children;
         self = current;
+        if report_regions {
+            notes.push(format!(
+                "region emission:\n{}",
+                self.report(graph, 1, false)
+            ));
+        }
         let label = self.entry.map_or_else(
             || "function".to_owned(),
             |(_, header)| format!("loop at {header}"),
@@ -156,7 +249,7 @@ impl RegionPlan {
         }
         for child in self.children {
             let first = regions.len();
-            child.emit(graph, None, regions, notes)?;
+            child.emit(graph, None, regions, notes, report_regions)?;
             for region in &regions[first..] {
                 self.body.extend(region.iter().copied());
             }
@@ -372,16 +465,34 @@ fn plan(graph: &Graph, conditional: &ConditionalPlan, notes: &mut Vec<String>) -
     plans
 }
 
+#[cfg(test)]
 pub(in crate::jit::semantic) fn version(
     graph: &mut Graph,
     conditional: &ConditionalPlan,
     fallback: Option<usize>,
     notes: &mut Vec<String>,
 ) -> Result<Vec<HashSet<Block>>> {
+    version_with_report(graph, conditional, fallback, notes, false)
+}
+
+pub(in crate::jit::semantic) fn version_with_report(
+    graph: &mut Graph,
+    conditional: &ConditionalPlan,
+    fallback: Option<usize>,
+    notes: &mut Vec<String>,
+    report_regions: bool,
+) -> Result<Vec<HashSet<Block>>> {
     let plans = plan(graph, conditional, notes);
+    if report_regions {
+        let mut report = String::from("region plan before versioning:\n");
+        for plan in &plans {
+            report.push_str(&plan.report(graph, 1, true));
+        }
+        notes.push(report);
+    }
     let mut regions = Vec::new();
     for plan in plans {
-        plan.emit(graph, fallback, &mut regions, notes)?;
+        plan.emit(graph, fallback, &mut regions, notes, report_regions)?;
     }
     Ok(regions)
 }
@@ -550,6 +661,93 @@ mod tests {
             root.body.contains(&graph.def_block(*object))
                 && !child.body.contains(&graph.def_block(*object))
         }));
+    }
+
+    #[test]
+    fn versioning_shares_repeated_typed_receiver_guards() {
+        use crate::jit::planner::{ReadKind, ReadType, Site};
+
+        let graph = graph(
+            "function f(xs,n){unknown();let sum=0;for(let i=0;i<n;++i)sum+=xs[i]+xs[i+1];return sum;}",
+        );
+        let mut repository = super::super::super::specialize::Repository::default();
+        for data in graph
+            .insts
+            .values()
+            .filter(|data| matches!(data.op, Op::GetIndex(..)))
+        {
+            repository.read_feedback.insert(
+                (
+                    Site {
+                        source: 7,
+                        start: data.span.start,
+                        end: data.span.end,
+                    },
+                    ReadKind::Receiver,
+                ),
+                ReadType::Typed(TypedKind::Uint16),
+            );
+        }
+        let canonical = super::super::super::Canonical::from_graph(graph);
+        let analysis =
+            super::super::super::optimize_canonical(canonical, true, Some((&repository, 7)))
+                .unwrap();
+        let graph = &analysis.graph;
+        let cfg = Cfg::new(graph);
+        let checks = cfg
+            .rpo
+            .iter()
+            .filter(|block| !graph.cold.contains(block))
+            .flat_map(|&block| &graph.blocks[block].insts)
+            .filter(|&&inst| {
+                matches!(
+                    graph.insts[inst].op,
+                    Op::IsTyped(_, Some(TypedKind::Uint16))
+                )
+            })
+            .count();
+        assert_eq!(checks, 1);
+        graph.verify().unwrap();
+    }
+
+    #[test]
+    fn nested_regions_reuse_dominating_typed_guards() {
+        let mut graph = graph(
+            "function f(rows,xs){unknown();let sum=0;for(let y=0;y<2;++y){const n=rows[y];for(let x=0;x<n;++x)sum+=xs[x];}return sum;}",
+        );
+        let xs = graph
+            .insts
+            .values()
+            .find_map(|data| {
+                matches!(data.op, Op::Argument(1))
+                    .then_some(data.result)
+                    .flatten()
+            })
+            .unwrap();
+        let plans = plan(&graph, &ConditionalPlan::default(), &mut Vec::new());
+        assert!(plans[0].typed.iter().any(|&(object, _)| object == xs));
+        assert!(
+            plans[0]
+                .children
+                .iter()
+                .any(|child| { child.typed.iter().any(|&(object, _)| object == xs) })
+        );
+        version(
+            &mut graph,
+            &ConditionalPlan::default(),
+            None,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let cfg = Cfg::new(&graph);
+        let checks = cfg
+            .rpo
+            .iter()
+            .flat_map(|&block| &graph.blocks[block].insts)
+            .filter(|&&inst| matches!(graph.insts[inst].op, Op::IsTyped(object, _) if object == xs))
+            .count();
+        assert_eq!(checks, 1);
+        graph.verify().unwrap();
     }
 
     #[test]

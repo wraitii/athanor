@@ -39,8 +39,43 @@ pub(super) struct Speculation<'a> {
 enum EntryGuard {
     Code(Value, cranelift_module::FuncId),
     Number(Value),
-    Typed(Value),
+    Typed(Value, Option<TypedKind>),
+    Indexed(Value),
     Value(Value),
+}
+
+impl EntryGuard {
+    fn of(op: &Op) -> Option<Self> {
+        match *op {
+            Op::IsCode(value, code) => Some(Self::Code(value, code)),
+            Op::IsNumber(value) => Some(Self::Number(value)),
+            Op::IsTyped(value, element) => Some(Self::Typed(value, element)),
+            Op::IsIndexed(value) => Some(Self::Indexed(value)),
+            _ => None,
+        }
+    }
+
+    fn at_entry(graph: &Graph, entry: Block) -> HashSet<Self> {
+        // These predicates describe SSA values, so their proofs survive writes and reentry.
+        let cfg = Cfg::new(graph);
+        cfg.rpo
+            .iter()
+            .filter_map(|&block| {
+                let TerminatorKind::Branch(condition, yes, no) =
+                    &graph.blocks[block].terminator.as_ref()?.kind
+                else {
+                    return None;
+                };
+                if yes.block == no.block
+                    || cfg.preds[yes.block].len() != 1
+                    || !cfg.dominates(yes.block, entry)
+                {
+                    return None;
+                }
+                Self::of(graph.defining_op(*condition)?)
+            })
+            .collect()
+    }
 }
 
 pub(super) struct Version {
@@ -71,6 +106,8 @@ pub(super) fn apply_version(
         closed_calls,
     } = *speculation;
     let head = entry.map_or(graph.entry, |(_, header)| header);
+    let mut tested =
+        EntryGuard::at_entry(graph, entry.map_or(graph.entry, |(preheader, _)| preheader));
     assert!(fallback.is_none() || entry.is_none());
     let reuse = fallback.is_some()
         && exits.iter().all(|block| guards.contains(block))
@@ -385,7 +422,6 @@ pub(super) fn apply_version(
     }
     graph.replace_uses(&replacements);
     let copied: HashSet<Block> = region.iter().copied().collect();
-    let mut tested = HashSet::new();
     for &block in guards {
         let Some(Terminator {
             source_name,
@@ -408,19 +444,18 @@ pub(super) fn apply_version(
                     *value = values[value];
                 }
             }
-            let key = match op {
-                Op::IsCode(value, code) => Some(EntryGuard::Code(value, code)),
-                Op::IsNumber(value) => Some(EntryGuard::Number(value)),
-                Op::IsTyped(value, None) => Some(EntryGuard::Typed(value)),
-                _ => None,
-            };
+            let key = EntryGuard::of(&op);
             let ValueDef::Result(inst) = graph.values[condition] else {
                 unreachable!();
             };
             graph.insts[insts[&inst]].op = Op::Constant(Constant::Boolean(true));
             (Some(op), key)
         } else {
-            (None, Some(EntryGuard::Value(condition)))
+            let key = graph
+                .defining_op(condition)
+                .and_then(EntryGuard::of)
+                .unwrap_or(EntryGuard::Value(condition));
+            (None, Some(key))
         };
         if key.is_some_and(|key| !tested.insert(key)) {
             continue;
@@ -475,9 +510,14 @@ pub(super) fn apply_version(
     let mut mapped_typed = Vec::new();
     for &(object, element) in typed {
         let guard = (values.get(&object).copied().unwrap_or(object), element);
-        if !mapped_typed.contains(&guard)
-            && !(element.is_none() && tested.contains(&EntryGuard::Typed(guard.0)))
+        if element.is_none()
+            && tested
+                .iter()
+                .any(|known| matches!(known, EntryGuard::Typed(value, _) if *value == guard.0))
         {
+            continue;
+        }
+        if tested.insert(EntryGuard::Typed(guard.0, element)) {
             mapped_typed.push(guard);
         }
     }
@@ -720,4 +760,81 @@ fn typed_guards(
         current = next;
     }
     current
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn entry_proofs_require_the_success_edge_to_dominate() {
+        use oxc_ast::ast::Statement;
+
+        let allocator = oxc_allocator::Allocator::default();
+        let parsed = oxc_parser::Parser::new(
+            &allocator,
+            "function f(xs){if(xs){xs=1;}return 0;}",
+            oxc_span::SourceType::script(),
+        )
+        .parse();
+        let Statement::FunctionDeclaration(function) = &parsed.program.body[0] else {
+            panic!()
+        };
+        let semantic = oxc_semantic::SemanticBuilder::new_compiler()
+            .build(&parsed.program)
+            .semantic;
+        let mut graph =
+            super::super::super::build::lower(function, semantic.scoping(), &HashSet::new())
+                .unwrap();
+        let xs = graph
+            .insts
+            .values()
+            .find_map(|data| {
+                matches!(data.op, Op::Argument(0))
+                    .then_some(data.result)
+                    .flatten()
+            })
+            .unwrap();
+        let branch = Cfg::new(&graph)
+            .rpo
+            .into_iter()
+            .find(|&block| {
+                matches!(
+                    graph.blocks[block].terminator.as_ref().unwrap().kind,
+                    TerminatorKind::Branch(..)
+                )
+            })
+            .unwrap();
+        let condition = graph
+            .append(
+                branch,
+                graph.span,
+                Op::IsTyped(xs, Some(TypedKind::Float32)),
+                true,
+            )
+            .1
+            .unwrap();
+        let TerminatorKind::Branch(test, yes, no) =
+            &mut graph.blocks[branch].terminator.as_mut().unwrap().kind
+        else {
+            unreachable!()
+        };
+        *test = condition;
+        let (yes, no) = (yes.block, no.block);
+        let proof = EntryGuard::Typed(xs, Some(TypedKind::Float32));
+        assert!(EntryGuard::at_entry(&graph, yes).contains(&proof));
+        assert!(!EntryGuard::at_entry(&graph, no).contains(&proof));
+        assert!(!EntryGuard::at_entry(&graph, branch).contains(&proof));
+        let exit = Cfg::new(&graph)
+            .rpo
+            .into_iter()
+            .find(|&block| {
+                matches!(
+                    graph.blocks[block].terminator.as_ref().unwrap().kind,
+                    TerminatorKind::Return(_)
+                )
+            })
+            .unwrap();
+        assert!(!EntryGuard::at_entry(&graph, exit).contains(&proof));
+    }
 }

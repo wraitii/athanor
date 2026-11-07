@@ -10,7 +10,7 @@ use crate::heap::kind;
 use crate::jit::helpers::Helper;
 use crate::jit::semantic::{
     Constant, Facts, Graph, Op, ScopeKind, TerminatorKind, TypedRead, Types, UnaryOp,
-    Value as GraphValue,
+    Value as GraphValue, ValueDef,
 };
 use crate::value::{TAG_SHIFT, TAG_STRING, Value};
 
@@ -127,7 +127,7 @@ impl FunctionCompiler<'_, '_> {
         self.check_error();
         self.jump(done, &[]);
         self.switch(direct);
-        self.initialize_local(local, value);
+        self.initialize_binding(local, value);
         self.jump(done, &[]);
         self.switch(done);
     }
@@ -145,10 +145,10 @@ impl FunctionCompiler<'_, '_> {
         let value = self.b.use_var(local);
         let created = self.call_helper(Helper::CellNew, &[value]);
         self.check_error();
-        self.initialize_local(cell, created);
+        self.initialize_binding(cell, created);
         // The cell now owns the binding value, including updates made by escaped callbacks.
         let undefined = self.constant(Value::UNDEFINED);
-        self.initialize_local(local, undefined);
+        self.initialize_binding(local, undefined);
         self.jump(done, &[]);
         self.switch(done);
         self.b.use_var(cell)
@@ -171,6 +171,52 @@ impl FunctionCompiler<'_, '_> {
         if !suspends {
             for value in graph.values.keys() {
                 reprs[value] = Repr::of(facts.of(value));
+            }
+        }
+        if !suspends {
+            for data in graph.insts.values() {
+                let Op::Binary(oxc_syntax::operator::BinaryOperator::LessThan, index, length) =
+                    data.op
+                else {
+                    continue;
+                };
+                if !matches!(graph.defining_op(length), Some(Op::IndexedLength(_))) {
+                    continue;
+                }
+                let ValueDef::Param(header, position) = graph.values[index] else {
+                    continue;
+                };
+                let incoming: Vec<_> = graph
+                    .blocks
+                    .values()
+                    .filter_map(|block| block.terminator.as_ref())
+                    .flat_map(|term| term.kind.targets())
+                    .filter(|target| target.block == header)
+                    .map(|target| target.args[position])
+                    .collect();
+                let unit_step = |value| match graph.defining_op(value) {
+                    Some(Op::Constant(Constant::Number(n))) => *n == 0.0,
+                    Some(Op::Binary(
+                        oxc_syntax::operator::BinaryOperator::Addition,
+                        left,
+                        right,
+                    )) => {
+                        *left == index
+                            && matches!(
+                                graph.defining_op(*right),
+                                Some(Op::Constant(Constant::Number(n))) if *n == 1.0
+                            )
+                    }
+                    _ => false,
+                };
+                if incoming.is_empty() || !incoming.iter().copied().all(unit_step) {
+                    continue;
+                }
+                reprs[index] = Repr::Int64;
+                reprs[length] = Repr::Int64;
+                for value in incoming {
+                    reprs[value] = Repr::Int64;
+                }
             }
         }
         let values: Vec<Variable> = graph
@@ -544,7 +590,8 @@ impl FunctionCompiler<'_, '_> {
                         }
                         Op::MapElement(receiver, index) => {
                             let receiver = get(self, *receiver);
-                            let index = get(self, *index);
+                            let index = self.operand(&cx, *index);
+                            let index = self.convert(index, Repr::Int64);
                             Some(self.call_helper(Helper::ArrayMapElement, &[receiver, index]))
                         }
                         Op::Throw(value) => {
@@ -702,7 +749,7 @@ impl FunctionCompiler<'_, '_> {
                                 self.call_helper(Helper::CellSet, &[old, value]);
                                 self.check_error();
                             } else {
-                                self.initialize_local(bindings[binding.index()], value);
+                                self.initialize_binding(bindings[binding.index()], value);
                             }
                             None
                         }
@@ -713,7 +760,7 @@ impl FunctionCompiler<'_, '_> {
                                 self.call_helper(Helper::CellSet, &[cell, value]);
                                 self.check_error();
                             } else {
-                                self.initialize_local(bindings[binding.index()], value);
+                                self.initialize_binding(bindings[binding.index()], value);
                             }
                             None
                         }
@@ -1292,18 +1339,18 @@ impl FunctionCompiler<'_, '_> {
                                 };
                                 if let Some(cell) = lazy_cells[binding.index()] {
                                     let undefined = self.constant(Value::UNDEFINED);
-                                    self.initialize_local(cell, undefined);
+                                    self.initialize_binding(cell, undefined);
                                 }
-                                self.initialize_local(bindings[binding.index()], value);
+                                self.initialize_binding(bindings[binding.index()], value);
                             }
                             None
                         }
                         Op::LeaveScope(scope) => {
                             for &binding in &graph.scopes[*scope].bindings {
                                 let value = self.constant(Value::UNDEFINED);
-                                self.initialize_local(bindings[binding.index()], value);
+                                self.initialize_binding(bindings[binding.index()], value);
                                 if let Some(cell) = lazy_cells[binding.index()] {
-                                    self.initialize_local(cell, value);
+                                    self.initialize_binding(cell, value);
                                 }
                             }
                             None
@@ -1327,13 +1374,13 @@ impl FunctionCompiler<'_, '_> {
                                 };
                                 if let Some(cell) = lazy_cells[binding.index()] {
                                     let undefined = self.constant(Value::UNDEFINED);
-                                    self.initialize_local(cell, undefined);
-                                    self.initialize_local(bindings[binding.index()], initial);
+                                    self.initialize_binding(cell, undefined);
+                                    self.initialize_binding(bindings[binding.index()], initial);
                                     continue;
                                 }
                                 let cell = self.call_helper(Helper::CellNew, &[initial]);
                                 self.check_error();
-                                self.initialize_local(bindings[binding.index()], cell);
+                                self.initialize_binding(bindings[binding.index()], cell);
                             }
                             None
                         }
@@ -1402,9 +1449,31 @@ impl FunctionCompiler<'_, '_> {
                 TerminatorKind::Branch(value, yes, no) => {
                     let operand = self.operand(&cx, *value);
                     let condition = self.condition(operand, cx.numeric(*value));
-                    let (yes, yes_args) = target(self, yes);
-                    let (no, no_args) = target(self, no);
-                    self.brif(condition, yes, &yes_args, no, &no_args);
+                    let needs_edge = |target: &crate::jit::semantic::Target| {
+                        target
+                            .args
+                            .iter()
+                            .zip(&graph.blocks[target.block].params)
+                            .any(|(&value, &param)| reprs[value] != reprs[param])
+                    };
+                    let yes_edge = needs_edge(yes).then(|| self.b.create_block());
+                    let no_edge = needs_edge(no).then(|| self.b.create_block());
+                    let (yes_block, yes_args) =
+                        yes_edge.map_or_else(|| target(self, yes), |block| (block, Vec::new()));
+                    let (no_block, no_args) =
+                        no_edge.map_or_else(|| target(self, no), |block| (block, Vec::new()));
+                    self.brif(condition, yes_block, &yes_args, no_block, &no_args);
+                    for (edge, destination) in [(yes_edge, yes), (no_edge, no)] {
+                        let Some(edge) = edge else {
+                            continue;
+                        };
+                        self.switch(edge);
+                        if graph.cold.contains(&destination.block) {
+                            self.b.set_cold_block(edge);
+                        }
+                        let (block, args) = target(self, destination);
+                        self.jump(block, &args);
+                    }
                 }
                 TerminatorKind::Yield(span, value, target_) => {
                     let generator = self.generator.unwrap();
@@ -1514,6 +1583,10 @@ impl FunctionCompiler<'_, '_> {
                 Some(Repr::Float) => Some(Some(Operand::new(
                     self.b.ins().f64const(*number),
                     Repr::Float,
+                ))),
+                Some(Repr::Int64) => Some(Some(Operand::new(
+                    self.b.ins().iconst(types::I64, *number as i64),
+                    Repr::Int64,
                 ))),
                 Some(Repr::Int32) => Some(Some(Operand::new(
                     self.b.ins().iconst(types::I32, *number as i32 as i64),
@@ -1667,8 +1740,13 @@ impl FunctionCompiler<'_, '_> {
                 let operand = self.operand(cx, *object);
                 let object = self.convert(operand, Repr::Boxed);
                 let view = self.view(object);
-                let length = self.view_length(view);
-                Some(Some(Operand::new(length, Repr::Float)))
+                if target == Some(Repr::Int64) {
+                    let length = self.view_length_integer(view);
+                    Some(Some(Operand::new(length, Repr::Int64)))
+                } else {
+                    let length = self.view_length(view);
+                    Some(Some(Operand::new(length, Repr::Float)))
+                }
             }
             Op::TypedIndex(
                 object,

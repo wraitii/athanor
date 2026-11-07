@@ -3,6 +3,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::time::{Duration, Instant};
 
 use oxc_allocator::Allocator;
 use oxc_semantic::SemanticBuilder;
@@ -34,14 +35,9 @@ impl OptLevel {
     }
 }
 
-const DEFAULT_SYNC_OPT_LEVEL: Option<OptLevel> = None;
-const DEFAULT_SYNC_SINGLE_PASS: bool = false;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EngineOptions {
     pub opt_level: OptLevel,
-    pub sync_opt_level: Option<OptLevel>,
-    pub sync_single_pass: bool,
     pub jitdump: bool,
     pub jitdump_ir: bool,
     pub ssa_opt: bool,
@@ -53,11 +49,7 @@ pub struct EngineOptions {
     pub recompile_log: bool,
     pub call_profile: bool,
     pub ssa_dump: bool,
-    pub compile_dump: bool,
-    pub compile_ir: bool,
-    pub compile_ast: bool,
-    pub compile_semantic_ir: bool,
-    pub compile_asm: bool,
+    pub compile: Option<Arc<crate::CompileOptions>>,
 }
 
 impl Default for EngineOptions {
@@ -66,16 +58,6 @@ impl Default for EngineOptions {
         let jitdump = jitdump.as_deref();
         Self {
             opt_level: OptLevel::default(),
-            sync_opt_level: match std::env::var("JS_JIT_SYNC_OPT_LEVEL").as_deref() {
-                Ok("none") => Some(OptLevel::None),
-                Ok("speed") => Some(OptLevel::Speed),
-                _ => DEFAULT_SYNC_OPT_LEVEL,
-            },
-            sync_single_pass: match std::env::var("JS_JIT_SYNC_SINGLE_PASS").as_deref() {
-                Ok("1") => true,
-                Ok("0") => false,
-                _ => DEFAULT_SYNC_SINGLE_PASS,
-            },
             jitdump: matches!(jitdump, Some("1" | "2")),
             jitdump_ir: jitdump == Some("2"),
             ssa_opt: std::env::var("JS_JIT_SSA").as_deref() != Ok("0"),
@@ -93,11 +75,7 @@ impl Default for EngineOptions {
             recompile_log: std::env::var("JS_JIT_RECOMPILE_LOG").as_deref() == Ok("1"),
             call_profile: std::env::var("JS_JIT_CALL_PROFILE").as_deref() == Ok("1"),
             ssa_dump: std::env::var("JS_JIT_SSA_DUMP").as_deref() == Ok("1"),
-            compile_dump: false,
-            compile_ir: false,
-            compile_ast: false,
-            compile_semantic_ir: false,
-            compile_asm: false,
+            compile: None,
         }
     }
 }
@@ -107,15 +85,22 @@ struct PrefetchStats {
     unused: HashSet<u64>,
     installed: usize,
     used: usize,
-    cancelled: usize,
-    taken_over: usize,
     discarded: usize,
+}
+
+#[derive(Default)]
+struct LazyWaitStats {
+    count: usize,
+    total: Duration,
+    longest: Duration,
 }
 
 pub struct Engine {
     // Join the worker before releasing resources referenced by its compilation snapshots.
     worker: RefCell<Option<jit::recompile::Service>>,
-    osr_functions: RefCell<HashSet<u64>>,
+    unlazify_seen: RefCell<HashSet<u64>>,
+    compilation_errors: RefCell<HashMap<u64, Error>>,
+    lazy_wait_stats: RefCell<LazyWaitStats>,
     compilation_state: Arc<AtomicU8>,
     options: EngineOptions,
     recompile_log: jit::recompile::Log,
@@ -139,8 +124,20 @@ impl Drop for Engine {
         if self.recompile_log.enabled() {
             let stats = self.prefetch_stats.borrow();
             self.recompile_log.event(format_args!(
-                "prefetch summary installed={} used={} unused={} cancelled={} taken_over={} discarded={}",
-                stats.installed, stats.used, stats.unused.len(), stats.cancelled, stats.taken_over, stats.discarded
+                "prefetch summary installed={} used={} unused={} discarded={}",
+                stats.installed,
+                stats.used,
+                stats.unused.len(),
+                stats.discarded
+            ));
+        }
+        if self.recompile_log.enabled() {
+            let stats = self.lazy_wait_stats.borrow();
+            self.recompile_log.event(format_args!(
+                "lazy wait summary count={} total_ms={:.3} max_ms={:.3}",
+                stats.count,
+                stats.total.as_secs_f64() * 1000.0,
+                stats.longest.as_secs_f64() * 1000.0,
             ));
         }
         if self.options.call_profile {
@@ -329,14 +326,16 @@ impl Engine {
         };
         Ok(Self {
             worker: RefCell::new(None),
+            unlazify_seen: RefCell::new(HashSet::new()),
+            compilation_errors: RefCell::new(HashMap::new()),
+            lazy_wait_stats: RefCell::new(LazyWaitStats::default()),
             compilation_state,
-            options,
+            options: options.clone(),
             recompile_log,
             prefetch_stats: RefCell::new(PrefetchStats::default()),
-            osr_functions: RefCell::new(HashSet::new()),
             compiler: RefCell::new(Compiler::new(
                 options,
-                jit::CompilationMode::Synchronous,
+                jit::CompilationTier::Optimized,
                 direct.address(),
                 state_address,
                 recompile_log,
@@ -424,6 +423,21 @@ impl Engine {
                 cache.owner,
                 format_args!("call feedback site={} target={target}", cache.site),
             );
+            self.request_compilation(cache.owner);
+        }
+        cache.recorded = 1;
+    }
+
+    pub(crate) fn observe_native(
+        &self,
+        cache: &mut jit::planner::ObservationCache,
+        target: crate::heap::NativeFunction,
+    ) {
+        let observed = self
+            .planner
+            .borrow_mut()
+            .observe_native(cache.owner, cache.site, target);
+        if observed {
             self.request_compilation(cache.owner);
         }
         cache.recorded = 1;
@@ -527,27 +541,11 @@ impl Engine {
         };
         let mut entry = self.code.borrow().get(index).copied().flatten();
         if entry.is_none() {
-            if let Some(worker) = self.worker.borrow_mut().as_mut() {
-                let key = jit::recompile::Key::Function(code);
-                let outstanding = worker.in_flight.contains_key(&key);
-                let cancelled = worker.cancel_pending(key);
-                if outstanding && self.recompile_log.enabled() {
-                    let mut stats = self.prefetch_stats.borrow_mut();
-                    if cancelled {
-                        stats.cancelled += 1;
-                    } else {
-                        stats.taken_over += 1;
-                    }
-                    self.log_recompilation(
-                        code,
-                        format_args!(
-                            "prefetch takeover state={}",
-                            if cancelled { "queued" } else { "running" }
-                        ),
-                    );
-                }
-            }
-            entry = self.compiler.borrow_mut().compile_lazy(code)?;
+            entry = if self.options.background_compile {
+                self.wait_for_entry(code)?
+            } else {
+                self.compiler.borrow_mut().compile_lazy(code)?
+            };
             if let Some(compiled) = entry {
                 let mut entries = self.code.borrow_mut();
                 if entries.len() <= index {
@@ -570,9 +568,84 @@ impl Engine {
             return;
         }
         let jobs = self.compiler.borrow().lazy_callees(code);
-        for job in jobs {
+        for mut job in jobs {
+            job.tier = jit::CompilationTier::Baseline;
             if let Err(error) = self.enqueue_compilation(job, jit::recompile::Priority::Prefetch) {
                 eprintln!("js jit: callee compilation failed: {error}");
+            }
+        }
+    }
+
+    fn wait_for_entry(&self, code: u64) -> Result<Option<jit::entries::Entry>, Error> {
+        if let Some(error) = self.compilation_errors.borrow().get(&code) {
+            return Err(error.clone());
+        }
+        let Some(mut job) = self.compiler.borrow().lazy_compilation(code) else {
+            return Ok(None);
+        };
+        job.tier = jit::CompilationTier::Baseline;
+        let started = self.recompile_log.enabled().then(Instant::now);
+        if started.is_some() {
+            self.log_recompilation(code, format_args!("lazy wait begin"));
+        }
+        let result = (|| {
+            self.enqueue_compilation(job, jit::recompile::Priority::Demanded)?;
+            self.queue_callees(code);
+            loop {
+                self.poll_compilation();
+                if let Some(entry) = self.code.borrow().get(code as usize).copied().flatten() {
+                    return Ok(Some(entry));
+                }
+                if let Some(error) = self.compilation_errors.borrow().get(&code) {
+                    return Err(error.clone());
+                }
+                let mut service = self.worker.borrow_mut();
+                let service = service.as_mut().unwrap();
+                if !service
+                    .in_flight
+                    .contains_key(&jit::recompile::Key::Function(code))
+                {
+                    return Err(Error::Compile(format!(
+                        "compilation produced no entry for code={code}"
+                    )));
+                }
+                service.wait_for_completion()?;
+                self.compilation_state
+                    .fetch_or(jit::recompile::READY, Ordering::Release);
+            }
+        })();
+        if let Some(started) = started {
+            let elapsed = started.elapsed();
+            let mut stats = self.lazy_wait_stats.borrow_mut();
+            stats.count += 1;
+            stats.total += elapsed;
+            stats.longest = stats.longest.max(elapsed);
+            self.log_recompilation(
+                code,
+                format_args!(
+                    "lazy wait end wait_ms={:.3} success={}",
+                    elapsed.as_secs_f64() * 1000.0,
+                    result.is_ok(),
+                ),
+            );
+        }
+        result
+    }
+
+    fn queue_unlazification(&self) {
+        if !self.options.background_compile {
+            return;
+        }
+        let codes = self.compiler.borrow().lazy_codes();
+        for code in codes {
+            if !self.unlazify_seen.borrow_mut().insert(code) {
+                continue;
+            }
+            let mut job = self.compiler.borrow().lazy_compilation(code).unwrap();
+            job.tier = jit::CompilationTier::Baseline;
+            if let Err(error) = self.enqueue_compilation(job, jit::recompile::Priority::Unlazify) {
+                eprintln!("js jit: unlazification failed: {error}");
+                return;
             }
         }
     }
@@ -657,12 +730,7 @@ impl Engine {
         let Some(job) = compiler.recompilation(code, previous) else {
             return;
         };
-        let priority = if self.osr_functions.borrow().contains(&code) {
-            jit::recompile::Priority::NextCall
-        } else {
-            jit::recompile::Priority::Normal
-        };
-        if let Err(error) = self.enqueue_compilation(job, priority) {
+        if let Err(error) = self.enqueue_compilation(job, jit::recompile::Priority::Optimize) {
             eprintln!("js jit: recompilation failed: {error}");
         }
     }
@@ -675,7 +743,7 @@ impl Engine {
         let mut service = self.worker.borrow_mut();
         if service.is_none() {
             *service = Some(jit::recompile::Service::new(
-                self.options,
+                self.options.clone(),
                 self.direct.address() as usize,
                 self.compilation_state.clone(),
                 self.recompile_log,
@@ -720,7 +788,6 @@ impl Engine {
         };
         let Some(job) = job else { return 0 };
         site.requested.set(true);
-        self.osr_functions.borrow_mut().insert(site.owner);
         self.log_recompilation(
             site.owner,
             format_args!(
@@ -738,7 +805,7 @@ impl Engine {
             }
             return site.entry.get();
         }
-        if let Err(error) = self.enqueue_compilation(job, jit::recompile::Priority::Active) {
+        if let Err(error) = self.enqueue_compilation(job, jit::recompile::Priority::Optimize) {
             eprintln!("js jit: OSR compilation failed: {error}");
         }
         if site.owner < jit::entries::DIRECT_ENTRIES as u64 {
@@ -837,7 +904,15 @@ impl Engine {
                                 );
                             }
                             Ok(None) => {}
-                            Err(error) => eprintln!("js jit: recompilation failed: {error}"),
+                            Err(error) => {
+                                if let jit::recompile::Key::Function(code) = key
+                                    && self.compiler.borrow().has_lazy(code)
+                                {
+                                    self.compilation_errors.borrow_mut().insert(code, error);
+                                } else {
+                                    eprintln!("js jit: recompilation failed: {error}");
+                                }
+                            }
                         }
                         worker.complete(ticket, key);
                     }
@@ -1017,6 +1092,7 @@ impl Engine {
         for name in globals {
             self.global.define(name, Value::UNDEFINED);
         }
+        self.queue_unlazification();
         Ok(initializer)
     }
 
@@ -1867,6 +1943,119 @@ mod feedback_tests {
     }
 
     #[test]
+    fn baseline_bodies_upgrade_without_specialization_changes() {
+        let mut engine = Engine::with_options(EngineOptions {
+            background_compile: false,
+            ..Default::default()
+        })
+        .unwrap();
+        engine
+            .compile("function f(a){return a+1;}", "tier-upgrade.js")
+            .unwrap();
+        let code = code(&engine, "f");
+        let mut job = engine.compiler.borrow().lazy_compilation(code).unwrap();
+        job.tier = jit::CompilationTier::Baseline;
+        let mut baseline = Compiler::new(
+            engine.options.clone(),
+            jit::CompilationTier::Baseline,
+            engine.direct.address(),
+            0,
+            engine.recompile_log,
+        )
+        .unwrap();
+        let replacement = baseline.recompile(job).unwrap().unwrap();
+        let unpublished = baseline.take_unpublished(replacement);
+        let (_, original) = engine
+            .compiler
+            .borrow_mut()
+            .install_unpublished(unpublished)
+            .unwrap();
+        engine.code.borrow_mut().resize(code as usize + 1, None);
+        engine.code.borrow_mut()[code as usize] = Some(original);
+        assert_eq!(
+            engine.call("f", &[Value::number(2.0)]).unwrap().value(),
+            Value::number(3.0)
+        );
+        let job = engine
+            .compiler
+            .borrow()
+            .recompilation(code, original)
+            .unwrap();
+        let replacement = engine
+            .compiler
+            .borrow_mut()
+            .recompile(job)
+            .unwrap()
+            .unwrap();
+        let (_, optimized) = engine.compiler.borrow_mut().install(replacement);
+        engine.code.borrow_mut()[code as usize] = Some(optimized);
+        assert_ne!(original.code, optimized.code);
+        assert_eq!(
+            engine.call("f", &[Value::number(2.0)]).unwrap().value(),
+            Value::number(3.0)
+        );
+        let job = engine
+            .compiler
+            .borrow()
+            .recompilation(code, optimized)
+            .unwrap();
+        assert!(
+            engine
+                .compiler
+                .borrow_mut()
+                .recompile(job)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn workers_compile_independent_lazy_bodies_without_publication() {
+        let engine = Engine::with_options(EngineOptions {
+            background_compile: true,
+            compiler_threads: 1,
+            ..Default::default()
+        })
+        .unwrap();
+        engine.compile_only(
+            "function first(a){return a.x;} function second(a){return a.y;} function third(a){return a.z;}",
+            "independent.js",
+        ).unwrap();
+        let count = engine.compiler.borrow().lazy_codes().len();
+        assert_eq!(count, 3);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut service = engine.worker.borrow_mut();
+        let service = service.as_mut().unwrap();
+        for _ in 0..count {
+            let completion = loop {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "compilation did not complete"
+                );
+                service.wait_for_completion().unwrap();
+                if let Some(completion) = service.receive().unwrap() {
+                    break completion;
+                }
+            };
+            assert!(completion.result.unwrap().unwrap().initial());
+        }
+        assert_eq!(engine.compiler.borrow().lazy_codes().len(), count);
+    }
+
+    #[test]
+    fn background_unlazification_drains_uncalled_bodies_across_sources() {
+        let mut engine = background_engine();
+        for source in [
+            "function unused(a){return a.items[0];} function factory(a){return ()=>a;}",
+            "function later(a){return a.items[1];}",
+        ] {
+            engine.compile(source, "unlazify.js").unwrap();
+            finish_compilation(&engine);
+            assert!(engine.compiler.borrow().lazy_codes().is_empty());
+        }
+    }
+
+    #[test]
     fn synchronous_compilation_prefetches_callees_exposed_by_inlining() {
         let mut engine = Engine::with_options(EngineOptions {
             background_compile: true,
@@ -1882,7 +2071,7 @@ mod feedback_tests {
         finish_compilation(&engine);
         assert!(!engine.compiler.borrow().has_lazy(callee));
         assert!(!engine.compiler.borrow().has_lazy(leaf));
-        assert_eq!(engine.prefetch_stats.borrow().installed, 2);
+        assert!((2..=3).contains(&engine.prefetch_stats.borrow().installed));
         assert_eq!(engine.prefetch_stats.borrow().used, 0);
         engine
             .compile("var holder={items:[3]};", "holder.js")
@@ -1910,8 +2099,8 @@ mod feedback_tests {
         let code = code(&engine, "f");
         let job = engine.compiler.borrow().lazy_compilation(code).unwrap();
         let mut worker = Compiler::new(
-            engine.options,
-            jit::CompilationMode::Background,
+            engine.options.clone(),
+            jit::CompilationTier::Optimized,
             engine.direct.address(),
             Arc::as_ptr(&engine.compilation_state) as usize,
             engine.recompile_log,
@@ -1951,12 +2140,13 @@ mod feedback_tests {
     }
 
     #[test]
-    fn background_compilation_starts_after_eight_returns_and_guards_replacements() {
+    fn background_recompilation_starts_after_eight_returns_and_guards_replacements() {
         let mut engine = background_engine();
         engine.compile(
             "var holder={items:[3]}; function read(a){return a.items[0];} function replace(){holder.items={0:9};}",
             "read.js",
         ).unwrap();
+        finish_compilation(&engine);
         let code = code(&engine, "read");
         let original = entry(&engine, code);
         let holder = engine.global.get_raw("holder").unwrap();
@@ -1966,7 +2156,15 @@ mod feedback_tests {
                 Value::number(3.0)
             );
             assert_eq!(entry(&engine, code), original);
-            assert!(engine.worker.borrow().is_none());
+            assert!(
+                engine
+                    .worker
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .in_flight
+                    .is_empty()
+            );
         }
         assert_eq!(
             engine.call("read", &[holder]).unwrap().value(),
@@ -2011,6 +2209,7 @@ mod feedback_tests {
             &format!("var holder={{items:[3],extra:0}}; function read(a){{let n=0;{body}return a.items[0]+n;}} function drive(a){{return read(a);}}"),
             "dispatch.js",
         ).unwrap();
+        finish_compilation(&engine);
         let read = code(&engine, "read");
         let original = entry(&engine, read);
         let holder = engine.global.get_raw("holder").unwrap();

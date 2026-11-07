@@ -149,6 +149,7 @@ define_helpers! {
     Rest => Rest, js_rest;
     IndexGet => Binary, js_index_get;
     IndexGetNumeric => NumericIndex, js_index_get_numeric;
+    TypedIndexGet => Binary, js_typed_index_get;
     IndexRoot => IndexSet, js_index_root;
     IndexSet => IndexSet, js_index_set;
     PropertyGet => PropertyGet, js_property_get;
@@ -243,6 +244,7 @@ impl Helper {
                 | Self::IndexUnroot
                 | Self::IndexGet
                 | Self::IndexGetNumeric
+                | Self::TypedIndexGet
                 | Self::PropertyGet
                 | Self::PropertyGetCached
                 | Self::GlobalGet
@@ -657,6 +659,7 @@ extern "C" fn js_array_iteration_guard(
         x if x == ArrayMethod::Filter as u64 => NativeFunction::ArrayFilter,
         x if x == ArrayMethod::ForEach as u64 => NativeFunction::ArrayForEach,
         x if x == ArrayMethod::Find as u64 => NativeFunction::ArrayFind,
+        x if x == ArrayMethod::Push as u64 => NativeFunction::ArrayPush,
         _ => unreachable!(),
     };
     let heap = unsafe { &*ctx }.global.heap();
@@ -683,9 +686,8 @@ extern "C" fn js_array_map_new_owned(ctx: *mut JitCtx, length: Value) -> Value {
     }
 }
 
-extern "C" fn js_array_map_element(ctx: *mut JitCtx, receiver: Value, index: Value) -> Value {
+extern "C" fn js_array_map_element(ctx: *mut JitCtx, receiver: Value, index: usize) -> Value {
     let context = unsafe { &mut *ctx };
-    let index = index.as_number().unwrap() as usize;
     if !context.global.heap().present(receiver, index) {
         return Value::UNINITIALIZED;
     }
@@ -747,6 +749,8 @@ extern "C" fn js_observe_call(ctx: *mut JitCtx, callee: Value, cache: u64) -> Va
     if cache.recorded == 0 {
         if let Some(code) = context.global.heap().closure_code(callee) {
             context.engine.observe_call(cache, code.0);
+        } else if let Some(native) = context.global.heap().native(callee) {
+            context.engine.observe_native(cache, native);
         } else {
             cache.recorded = 1;
         }

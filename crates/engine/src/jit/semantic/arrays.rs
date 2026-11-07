@@ -16,6 +16,7 @@ impl ArrayMethod {
             Self::Filter => "filter",
             Self::ForEach => "forEach",
             Self::Find => "find",
+            Self::Push => "push",
         }
     }
 
@@ -139,6 +140,7 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
             Op::Constant(Constant::Boolean(method == ArrayMethod::Every))
         }
         ArrayMethod::ForEach | ArrayMethod::Find => Op::Constant(Constant::Undefined),
+        ArrayMethod::Push => unreachable!(),
     };
     let result = graph.append(start, span, result_op, true).1.unwrap();
     let zero = graph
@@ -212,6 +214,7 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
         .1
         .unwrap();
     match method {
+        ArrayMethod::Push => unreachable!(),
         ArrayMethod::ForEach => {
             graph.blocks[invoke].terminator = Some(Terminator {
                 source_name: call.source_name,
@@ -320,4 +323,111 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
     for data in graph.insts.values_mut().skip(first_new) {
         data.source_name = call.source_name;
     }
+}
+
+pub(super) fn push_calls(
+    graph: &mut Graph,
+    bodies: &super::specialize::Repository,
+    source: usize,
+    notes: &mut Vec<String>,
+) -> Result<Vec<crate::jit::planner::Site>> {
+    let mut sites = Vec::new();
+    for block in Cfg::new(graph).rpo {
+        for &inst in &graph.blocks[block].insts {
+            let data = &graph.insts[inst];
+            let Op::Call {
+                callee,
+                receiver: Some(receiver),
+                ..
+            } = data.op
+            else {
+                continue;
+            };
+            let site = crate::jit::planner::Site {
+                source: data.source_name.map_or(source, |name| name.0),
+                start: data.span.start,
+                end: data.span.end,
+            };
+            // Array named methods are fixed by Heap::property, including after escape.
+            let known_array = matches!(
+                graph.defining_op(receiver),
+                Some(Op::NewArray(_) | Op::NewHoleyArray(_))
+            ) && matches!(graph.defining_op(callee), Some(Op::Get(object, name)) if *object == receiver && name == "push");
+            if known_array
+                || bodies.native_feedback.get(&site)
+                    == Some(&crate::heap::NativeFunction::ArrayPush)
+            {
+                sites.push((inst, site, known_array));
+            }
+        }
+    }
+    for &(inst, site, known_array) in &sites {
+        let call = graph.insts[inst].clone();
+        let first_new = graph.insts.len();
+        let Op::Call {
+            callee,
+            receiver: Some(receiver),
+            args,
+            ..
+        } = call.op
+        else {
+            unreachable!()
+        };
+        let (block, continuation, fallback) = super::inlining::split_call(graph, inst);
+        let fast = graph.blocks.push(BlockData::default());
+        let kind = if known_array {
+            TerminatorKind::Jump(Target::new(fast))
+        } else {
+            let check = graph
+                .append(
+                    block,
+                    call.span,
+                    Op::IsArrayIteration(callee, receiver, ArrayMethod::Push),
+                    true,
+                )
+                .1
+                .unwrap();
+            TerminatorKind::Branch(check, Target::new(fast), Target::new(fallback))
+        };
+        graph.blocks[block].terminator = Some(Terminator {
+            source_name: call.source_name,
+            span: call.span,
+            kind,
+        });
+        for value in args {
+            graph.append(
+                fast,
+                call.span,
+                Op::ArrayAppend(receiver, value, false),
+                false,
+            );
+        }
+        let length = graph
+            .append(fast, call.span, Op::IndexedLength(receiver), true)
+            .1
+            .unwrap();
+        graph.blocks[fast].terminator = Some(Terminator {
+            source_name: call.source_name,
+            span: call.span,
+            kind: TerminatorKind::Jump(Target {
+                block: continuation,
+                args: vec![length],
+            }),
+        });
+        for data in graph.insts.values_mut().skip(first_new) {
+            data.source_name = call.source_name;
+        }
+        notes.push(if known_array {
+            format!("known array at {site}: lower Array.push without guards")
+        } else {
+            format!(
+                "native feedback at {site}: specialize Array.push behind native and array checks"
+            )
+        });
+        graph.verify()?;
+    }
+    Ok(sites
+        .into_iter()
+        .filter_map(|(_, site, known)| (!known).then_some(site))
+        .collect())
 }

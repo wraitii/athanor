@@ -340,3 +340,110 @@ impl fmt::Display for Analysis {
         Ok(())
     }
 }
+
+impl Analysis {
+    pub(in crate::jit) fn plan_report(
+        &self,
+        repository: &super::specialize::Repository,
+        source: usize,
+        inline_multiplier: usize,
+    ) -> String {
+        use std::fmt::Write;
+
+        let mut out = String::new();
+        writeln!(
+            out,
+            "inline budget: {} instructions, {} per callee (multiplier {inline_multiplier})",
+            super::specialize::SPECIALIZATION_BUDGET.saturating_mul(inline_multiplier),
+            super::specialize::SPECIALIZATION_BODY_INSTS.saturating_mul(inline_multiplier)
+        )
+        .unwrap();
+        let relevant = |site: &crate::jit::planner::Site| {
+            site.source == source
+                && self.graph.span.start <= site.start
+                && site.end <= self.graph.span.end
+        };
+        let mut feedback = Vec::new();
+        for (site, target) in &repository.feedback {
+            if relevant(site) {
+                feedback.push(format!(
+                    "  call {site} -> {target} ({})",
+                    repository.name(*target).unwrap_or("unknown")
+                ));
+            }
+        }
+        for (site, native) in &repository.native_feedback {
+            if relevant(site) {
+                feedback.push(format!("  call {site} -> native {native:?}"));
+            }
+        }
+        for ((site, kind), observed) in &repository.read_feedback {
+            if relevant(site) {
+                feedback.push(format!("  read {site} {kind:?} -> {observed:?}"));
+            }
+        }
+        feedback.sort();
+        writeln!(out, "feedback: {}", feedback.len()).unwrap();
+        for entry in feedback {
+            writeln!(out, "{entry}").unwrap();
+        }
+        writeln!(out, "inlines: {}", self.inlines.len()).unwrap();
+        for inline in &self.inlines {
+            writeln!(
+                out,
+                "  {} -> {} ({}) guard_code={} arrow={}",
+                inline.call,
+                inline.target,
+                repository.name(inline.target).unwrap_or("unknown"),
+                inline.guard_code,
+                inline.arrow
+            )
+            .unwrap();
+        }
+        writeln!(out, "read refinements: {}", self.reads.len()).unwrap();
+        for read in &self.reads {
+            writeln!(
+                out,
+                "  {} typed={} element={:?} guard_number={}",
+                read.inst, read.typed, read.element, read.guard_number
+            )
+            .unwrap();
+        }
+        writeln!(out, "conditional calls: {}", self.conditional.calls.len()).unwrap();
+        for call in &self.conditional.calls {
+            writeln!(
+                out,
+                "  {} {} callee={} effects=0x{:04x}",
+                call.inst, call.name, call.callee, call.flags
+            )
+            .unwrap();
+            for (name, target) in &call.identities {
+                writeln!(out, "    identity {name}={target}").unwrap();
+            }
+        }
+        if let Some(osr) = &self.osr {
+            writeln!(out, "{}", osr.report(&self.graph.name)).unwrap();
+        }
+        writeln!(out, "regions:").unwrap();
+        let mut reported = false;
+        for note in &self.notes {
+            if note.starts_with("region plan before versioning:")
+                || note.starts_with("region emission:")
+            {
+                writeln!(out, "{note}").unwrap();
+                reported = true;
+            }
+        }
+        if !reported {
+            writeln!(out, "  none").unwrap();
+        }
+        for note in &self.notes {
+            if !note.starts_with("region plan before versioning:")
+                && !note.starts_with("region emission:")
+            {
+                writeln!(out, "  note: {note}").unwrap();
+            }
+        }
+        out
+    }
+}

@@ -4,7 +4,14 @@ use std::process::Command;
 fn semantic_graph_versions_math_calls_and_preserves_fallbacks() {
     let source = "function f(a,n){ let x=0; for(let i=0;i<n;i++) x+=Math.floor(a[i]); return x; } function main(){ let a=f([1.2,2.8],2); Math.floor=x=>x+1; return a*10+f([1,2],2); }";
     let dump = Command::new(env!("CARGO_BIN_EXE_js-runner"))
-        .args(["--compile", "--no-ir", "--semantic-ir", "--eval", source])
+        .args([
+            "--compile",
+            "--no-ir",
+            "--semantic-ir",
+            "--planner",
+            "--eval",
+            source,
+        ])
         .output()
         .unwrap();
     assert!(dump.status.success());
@@ -14,7 +21,14 @@ fn semantic_graph_versions_math_calls_and_preserves_fallbacks() {
     assert!(dump.contains("combined entry guards:"));
     let disabled = Command::new(env!("CARGO_BIN_EXE_js-runner"))
         .env("JS_JIT_SSA", "0")
-        .args(["--compile", "--no-ir", "--semantic-ir", "--eval", source])
+        .args([
+            "--compile",
+            "--no-ir",
+            "--semantic-ir",
+            "--planner",
+            "--eval",
+            source,
+        ])
         .output()
         .unwrap();
     assert!(disabled.status.success());
@@ -52,7 +66,14 @@ fn semantic_index_reads_observe_writes_and_calls() {
 fn private_iteration_does_not_block_versioning() {
     let source = "function f(p,xs){ const [a,b]=[p.x,p.y]; let s=0; for(const v of xs) s+=Math.floor(v+a+b); return s; } function main(){ const xs=[0.5,1.5]; const r=f({x:1,y:2},xs); Math.floor=x=>x*10; return r+','+f({x:0,y:0},xs); }";
     let dump = Command::new(env!("CARGO_BIN_EXE_js-runner"))
-        .args(["--compile", "--no-ir", "--semantic-ir", "--eval", source])
+        .args([
+            "--compile",
+            "--no-ir",
+            "--semantic-ir",
+            "--planner",
+            "--eval",
+            source,
+        ])
         .output()
         .unwrap();
     assert!(dump.status.success());
@@ -80,7 +101,14 @@ fn loops_version_independently_of_their_function() {
     let source = "function f(g,xs){ const t=g(); let s=0; let last=-1; for(let i=0;i<xs.length;++i){ last=Math.floor(xs[i]); s+=last; } return s+':'+last+':'+t; } function main(){ const xs=[0.5,2.5]; const r=f(()=>1,xs); Math.floor=x=>x*10; return r+','+f(()=>2,xs); }";
     let dump = Command::new(env!("CARGO_BIN_EXE_js-runner"))
         .env("JS_JIT_SSA", "1")
-        .args(["--compile", "--no-ir", "--semantic-ir", "--eval", source])
+        .args([
+            "--compile",
+            "--no-ir",
+            "--semantic-ir",
+            "--planner",
+            "--eval",
+            source,
+        ])
         .output()
         .unwrap();
     assert!(dump.status.success());
@@ -115,7 +143,14 @@ fn array_iteration_exposes_and_inlines_known_closures() {
         for enabled in [false, true] {
             let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
                 .env("JS_JIT_SSA", if enabled { "1" } else { "0" })
-                .args(["--compile", "--no-ir", "--semantic-ir", "--eval", &source])
+                .args([
+                    "--compile",
+                    "--no-ir",
+                    "--semantic-ir",
+                    "--planner",
+                    "--eval",
+                    &source,
+                ])
                 .output()
                 .unwrap();
             assert!(
@@ -150,7 +185,14 @@ fn inlined_local_calls_remove_unused_closure_allocations() {
     let source = "function main(){ const f=x=>x*x; return f(3); }";
     let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
         .env("JS_JIT_SSA", "1")
-        .args(["--compile", "--no-ir", "--semantic-ir", "--eval", source])
+        .args([
+            "--compile",
+            "--no-ir",
+            "--semantic-ir",
+            "--planner",
+            "--eval",
+            source,
+        ])
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -172,7 +214,14 @@ fn construction_exposes_prototype_resolution() {
     for enabled in [false, true] {
         let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
             .env("JS_JIT_SSA", if enabled { "1" } else { "0" })
-            .args(["--compile", "--no-ir", "--semantic-ir", "--eval", source])
+            .args([
+                "--compile",
+                "--no-ir",
+                "--semantic-ir",
+                "--planner",
+                "--eval",
+                source,
+            ])
             .output()
             .unwrap();
         assert!(
@@ -198,7 +247,14 @@ fn construction_exposes_prototype_resolution() {
 fn known_constructor_bodies_can_be_inlined() {
     let source = "function C(x){this.x=x;} function main(){C.prototype={};return new C(7).x;}";
     let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
-        .args(["--compile", "--no-ir", "--semantic-ir", "--eval", source])
+        .args([
+            "--compile",
+            "--no-ir",
+            "--semantic-ir",
+            "--planner",
+            "--eval",
+            source,
+        ])
         .output()
         .unwrap();
     assert!(
@@ -256,7 +312,14 @@ fn inlined_captures_use_bindings_and_materialize_only_for_fallbacks() {
     let source = "function main(xs){ let limit=2; return xs.some(x=>x>limit); }";
     let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
         .env("JS_JIT_SSA", "1")
-        .args(["--compile", "--no-ir", "--semantic-ir", "--eval", source])
+        .args([
+            "--compile",
+            "--no-ir",
+            "--semantic-ir",
+            "--planner",
+            "--eval",
+            source,
+        ])
         .output()
         .unwrap();
     assert!(
@@ -334,7 +397,14 @@ fn whole_function_guards_expose_closed_inlined_arithmetic() {
     let source = "function square(x){return x*x;} function distance(x1,y1,x2,y2){return square(x2-x1)+square(y2-y1);}";
     let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
         .env("JS_JIT_SSA", "1")
-        .args(["--compile", "--no-ir", "--semantic-ir", "--eval", source])
+        .args([
+            "--compile",
+            "--no-ir",
+            "--semantic-ir",
+            "--planner",
+            "--eval",
+            source,
+        ])
         .output()
         .unwrap();
     assert!(
@@ -433,7 +503,14 @@ fn spread_constructor_has_guarded_inline_and_generic_fallback() {
     let source =
         "function C(a,b=4){this.x=a+b;} function main(){C.prototype={};return new C(...[3,5]).x;}";
     let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
-        .args(["--compile", "--no-ir", "--semantic-ir", "--eval", source])
+        .args([
+            "--compile",
+            "--no-ir",
+            "--semantic-ir",
+            "--planner",
+            "--eval",
+            source,
+        ])
         .output()
         .unwrap();
     assert!(
@@ -452,7 +529,14 @@ fn spread_constructor_has_guarded_inline_and_generic_fallback() {
 fn recursively_inlined_bodies_expand_arrays_and_constructors_once() {
     let source = "function SimpleTerrain(a){this.x=a;} function createTerrain(t){return typeof t === 'string' ? new SimpleTerrain(...[t]) : t.map(x=>createTerrain(x));} function main(t){return createTerrain(t);}";
     let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
-        .args(["--compile", "--no-ir", "--semantic-ir", "--eval", source])
+        .args([
+            "--compile",
+            "--no-ir",
+            "--semantic-ir",
+            "--planner",
+            "--eval",
+            source,
+        ])
         .output()
         .unwrap();
     assert!(
@@ -484,7 +568,14 @@ fn recursively_inlined_bodies_expand_arrays_and_constructors_once() {
 fn split_and_spread_inline_have_guarded_semantic_operations() {
     let source = "function C(a,b){this.a=a;this.b=b;} function main(s){C.prototype={};return new C(...s.split('|')).a;}";
     let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
-        .args(["--compile", "--no-ir", "--semantic-ir", "--eval", source])
+        .args([
+            "--compile",
+            "--no-ir",
+            "--semantic-ir",
+            "--planner",
+            "--eval",
+            source,
+        ])
         .output()
         .unwrap();
     assert!(
@@ -507,7 +598,14 @@ fn split_and_spread_inline_have_guarded_semantic_operations() {
 fn string_split_guard_can_select_a_closed_version() {
     let source = "function f(s,n){let x=0;for(let i=0;i<n;i++){x+=s.split(',').length;}return x;} function main(){return f('a,b',3);}";
     let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
-        .args(["--compile", "--no-ir", "--semantic-ir", "--eval", source])
+        .args([
+            "--compile",
+            "--no-ir",
+            "--semantic-ir",
+            "--planner",
+            "--eval",
+            source,
+        ])
         .output()
         .unwrap();
     assert!(

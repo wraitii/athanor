@@ -25,10 +25,19 @@ use super::entries::Entry;
 use super::function_data::FunctionData;
 use super::{analysis::CaptureAnalysis, emit, jitdump, temporaries};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CompilationMode {
-    Synchronous,
-    Background,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum CompilationTier {
+    Baseline,
+    Optimized,
+}
+
+impl CompilationTier {
+    fn options(self, mut options: EngineOptions) -> EngineOptions {
+        if self == Self::Baseline {
+            options.opt_level = crate::OptLevel::None;
+        }
+        options
+    }
 }
 
 pub(crate) struct CompiledFunction {
@@ -40,6 +49,7 @@ pub(crate) struct CompiledFunction {
 
 #[derive(Clone)]
 struct Emission {
+    tier: CompilationTier,
     callees: Vec<FuncId>,
     conditional: super::semantic::specialize::ConditionalPlan,
     inlines: Vec<super::semantic::specialize::Inline>,
@@ -51,6 +61,7 @@ struct Emission {
 }
 
 pub(crate) struct RecompileJob {
+    pub(crate) tier: CompilationTier,
     pub(crate) code: FuncId,
     initial: bool,
     previous: Entry,
@@ -146,11 +157,7 @@ pub(crate) struct Compiler {
     osr: bool,
     get_refinement: bool,
     ssa_dump: bool,
-    compile_dump: bool,
-    compile_ir: bool,
-    compile_ast: bool,
-    compile_semantic_ir: bool,
-    compile_asm: bool,
+    inspection: Option<Arc<super::inspect::CompileOptions>>,
     next_id: u64,
     context: Context,
     builder_context: FunctionBuilderContext,
@@ -196,26 +203,15 @@ impl Compiler {
 
     pub(crate) fn new(
         options: EngineOptions,
-        mode: CompilationMode,
+        tier: CompilationTier,
         direct_entries: *const usize,
         compilation_state: usize,
         log: super::recompile::Log,
     ) -> Result<Self, Error> {
-        let opt_level = if mode == CompilationMode::Synchronous {
-            options.sync_opt_level.unwrap_or(options.opt_level)
-        } else {
-            options.opt_level
-        };
+        let options = tier.options(options);
         let flags = [
-            ("opt_level", opt_level.as_flag()),
-            (
-                "regalloc_algorithm",
-                if mode == CompilationMode::Synchronous && options.sync_single_pass {
-                    "single_pass"
-                } else {
-                    "backtracking"
-                },
-            ),
+            ("opt_level", options.opt_level.as_flag()),
+            ("regalloc_algorithm", "backtracking"),
             (
                 "enable_verifier",
                 if options.osr { "true" } else { "false" },
@@ -270,11 +266,7 @@ impl Compiler {
             recompile_inline_multiplier: options.recompile_inline_multiplier,
             get_refinement: options.get_refinement,
             ssa_dump: options.ssa_dump,
-            compile_dump: options.compile_dump,
-            compile_ir: options.compile_ir,
-            compile_ast: options.compile_ast,
-            compile_semantic_ir: options.compile_semantic_ir,
-            compile_asm: options.compile_asm,
+            inspection: options.compile,
             next_id: 0,
             context,
             builder_context: FunctionBuilderContext::new(),
@@ -351,9 +343,6 @@ impl Compiler {
         ),
         Error,
     > {
-        if self.compile_dump && self.compile_ast {
-            println!("[{filename}] analyzed AST\n{program:#?}");
-        }
         let source_path = filename;
         let filename: Box<str> = filename.into();
         self.source_name = (filename.as_ptr() as usize, filename.len());
@@ -389,7 +378,7 @@ impl Compiler {
         ),
         Error,
     > {
-        let lines = if self.dump.is_some() || self.compile_dump {
+        let lines = if self.dump.is_some() || self.inspection.is_some() {
             line_starts(source)
         } else {
             Vec::new()
@@ -622,73 +611,14 @@ impl Compiler {
             );
         }
 
-        if self.compile_dump && self.compile_semantic_ir {
-            for (name, function) in &ordered {
-                let graph = super::semantic::canonical_for_emission(
-                    &function.params,
-                    &function.body.as_ref().unwrap().statements,
-                    None,
-                    function.span,
-                    scoping,
-                    &analysis.captured,
-                    &[],
-                    &closures,
-                    analysis
-                        .arguments_bindings
-                        .get(&function.span.start)
-                        .copied(),
-                    &analysis.arguments_references,
-                    function.generator,
-                    self.ssa_opt,
-                );
-                let graph = graph.and_then(|canonical| {
-                    super::semantic::optimize_canonical(
-                        canonical,
-                        self.ssa_opt,
-                        Some((&self.canonical, self.source_name.0)),
-                    )
-                });
-                match graph {
-                    Ok(graph) => println!("[{source_path}] semantic IR {name}\n{}", graph),
-                    Err(error) => println!("[{source_path}] semantic IR {name}: {error}"),
-                }
-            }
-            for (_, span, params, statements, expression, generator, label, _) in &nested {
-                let graph = super::semantic::canonical_for_emission(
-                    params,
-                    statements,
-                    *expression,
-                    *span,
-                    scoping,
-                    &analysis.captured,
-                    &closures[&span.start].1,
-                    &closures,
-                    analysis.arguments_bindings.get(&span.start).copied(),
-                    &analysis.arguments_references,
-                    *generator,
-                    self.ssa_opt,
-                );
-                let graph = graph.and_then(|canonical| {
-                    super::semantic::optimize_canonical(
-                        canonical,
-                        self.ssa_opt,
-                        Some((&self.canonical, self.source_name.0)),
-                    )
-                });
-                match graph {
-                    Ok(graph) => println!("[{source_path}] semantic IR {label}\n{}", graph),
-                    Err(error) => println!("[{source_path}] semantic IR {label}: {error}"),
-                }
-            }
-        }
-
         for (name, function) in &ordered {
             let line = line_at(&lines, function.span.start);
-            if !function.generator && !self.compile_dump {
+            if !function.generator && self.inspection.is_none() {
                 self.lazy.insert(
                     ids[name],
                     (
                         Emission {
+                            tier: CompilationTier::Optimized,
                             callees: Vec::new(),
                             conditional: Default::default(),
                             inlines: Vec::new(),
@@ -728,11 +658,12 @@ impl Compiler {
         }
         for (id, span, params, statements, expression, generator, label, line) in nested {
             let captures = &closures[&span.start].1;
-            if !generator && !self.compile_dump {
+            if !generator && self.inspection.is_none() {
                 self.lazy.insert(
                     id,
                     (
                         Emission {
+                            tier: CompilationTier::Optimized,
                             callees: Vec::new(),
                             conditional: Default::default(),
                             inlines: Vec::new(),
@@ -787,7 +718,7 @@ impl Compiler {
             self.context.clear();
             self.context.func.signature = self.signature.clone();
             let mut annotations = Annotations {
-                semantic_locations: self.dump_ir,
+                semantic_locations: self.dump_ir || self.inspection.is_some(),
                 ..Annotations::default()
             };
             let graph = super::semantic::lower_global(
@@ -798,6 +729,9 @@ impl Compiler {
                 &closures,
                 &analysis.arguments_references,
                 self.ssa_opt,
+                self.inspection
+                    .as_ref()
+                    .is_some_and(|options| options.planner),
             )
             .map_err(Error::Unsupported)?;
             {
@@ -831,7 +765,16 @@ impl Compiler {
                         cranelift_codegen::ir::Function::new(),
                     ),
                     annotations,
-                    listing: self.dump_ir.then(|| graph.listing_lines()),
+                    inspection: super::inspect::Inspection::new(
+                        self.inspection.as_deref(),
+                        &graph,
+                        &self.canonical,
+                        self.source_name.0,
+                        1,
+                    )
+                    .ast(self.inspection.as_deref(), &program),
+                    listing: (self.dump_ir || (self.dump.is_some() && self.inspection.is_some()))
+                        .then(|| graph.listing_lines()),
                 },
             ));
             Some(id)
@@ -843,6 +786,18 @@ impl Compiler {
             .filter(|id| Some(*id) != initializer)
             .collect();
 
+        if let Some(options) = self.inspection.as_deref()
+            && let Some(filter) = &options.filter
+            && !pending.iter().any(|(id, _)| {
+                self.function_names
+                    .get(id)
+                    .is_some_and(|name| options.matches(name))
+            })
+        {
+            return Err(Error::Compile(format!(
+                "no functions match filter `{filter}`"
+            )));
+        }
         self.finish_functions(pending, source, source_path, &lines)?;
 
         let mut functions = Vec::with_capacity(ordered.len());
@@ -895,7 +850,9 @@ impl Compiler {
                     eprintln!("js ssa [{name}]: removed {removed} empty temporary clears");
                 }
             }
-            if let Some(semantic) = &code.listing {
+            if self.dump_ir
+                && let Some(semantic) = &code.listing
+            {
                 let ir = ir_lines(semantic, source, source_path, &lines, &self.sources);
                 if let Some(dump) = self.dump.as_mut() {
                     match dump.listing(&name, &ir) {
@@ -904,10 +861,13 @@ impl Compiler {
                     }
                 }
             }
-            if self.compile_dump {
-                if self.compile_ir {
-                    println!("[{name}] IR\n{}", self.context.func.display());
-                }
+            if let Some(options) = self.inspection.as_deref().filter(|o| o.matches(&name)) {
+                options.print_body(
+                    &name,
+                    &code.inspection,
+                    &self.context.func,
+                    &code.annotations,
+                );
             }
             if let Some(stats) = &mut self.stats {
                 stats.functions += 1;
@@ -935,20 +895,8 @@ impl Compiler {
                     .compiled_code()
                     .map_or(0, |compiled| compiled.code_buffer().len());
             }
-            if self.compile_dump && self.compile_asm {
-                let compiled = self
-                    .context
-                    .compiled_code()
-                    .ok_or_else(|| Error::Compile("missing compiled code".into()))?;
-                let disassembler = self
-                    .module
-                    .isa()
-                    .to_capstone()
-                    .map_err(|error| Error::Compile(error.to_string()))?;
-                let asm = compiled
-                    .disassemble(Some(&self.context.func.params), &disassembler)
-                    .map_err(|error| Error::Compile(error.to_string()))?;
-                println!("[{name}] machine code\n{asm}");
+            if let Some(options) = self.inspection.as_deref().filter(|o| o.matches(&name)) {
+                options.print_compiled(&name, &self.context, &self.module)?;
             }
             if self.dump.is_some() {
                 let Some(compiled) = self.context.compiled_code() else {
@@ -975,12 +923,33 @@ impl Compiler {
                         );
                     }
                 } else {
+                    let source_locations: HashMap<_, _> = code
+                        .listing
+                        .iter()
+                        .flatten()
+                        .filter_map(|(id, location, _)| {
+                            let location = location.as_ref()?;
+                            location
+                                .source
+                                .is_none_or(|source| source == self.source_name.0)
+                                .then_some((*id, location.span.start))
+                        })
+                        .collect();
                     let mut default_line = None;
                     for location in ranges {
                         if location.loc.as_abs().is_default() {
                             continue;
                         }
-                        let line = line_at(&lines, location.loc.as_abs().bits());
+                        let offset = location.loc.as_abs().bits();
+                        let offset = if code.annotations.semantic_locations {
+                            let Some(offset) = source_locations.get(&offset) else {
+                                continue;
+                            };
+                            *offset
+                        } else {
+                            offset
+                        };
+                        let line = line_at(&lines, offset);
                         default_line.get_or_insert(line);
                         locations.insert(location.start, line);
                     }
@@ -1025,10 +994,13 @@ impl Compiler {
             u32::try_from(target).map_or(true, |target| {
                 self.canonical.feedback.get(&site) == Some(&FuncId::from_u32(target))
             })
-        }) && (!self.get_refinement
-            || planner
-                .reads()
-                .all(|(site, observed)| self.canonical.read_feedback.get(&site) == Some(&observed)))
+        }) && planner
+            .natives()
+            .all(|(site, target)| self.canonical.native_feedback.get(&site) == Some(&target))
+            && (!self.get_refinement
+                || planner.reads().all(|(site, observed)| {
+                    self.canonical.read_feedback.get(&site) == Some(&observed)
+                }))
         {
             return;
         }
@@ -1037,6 +1009,9 @@ impl Compiler {
             if let Ok(target) = u32::try_from(target) {
                 canonical.feedback.insert(site, FuncId::from_u32(target));
             }
+        }
+        for (site, target) in planner.natives() {
+            canonical.native_feedback.insert(site, target);
         }
         if self.get_refinement {
             for (site, element) in planner.reads() {
@@ -1110,6 +1085,7 @@ impl Compiler {
     pub(crate) fn recompilation(&self, code: u64, previous: Entry) -> Option<RecompileJob> {
         let code = FuncId::from_u32(u32::try_from(code).ok()?);
         Some(RecompileJob {
+            tier: CompilationTier::Optimized,
             region: None,
             code,
             initial: false,
@@ -1160,8 +1136,10 @@ impl Compiler {
             .enabled()
             .then(|| (job.code.as_u32(), job.label.clone(), Instant::now()));
         if let Some((code, label, _)) = &trace {
-            self.log
-                .event(format_args!("compiling code={code} function={label}"));
+            self.log.event(format_args!(
+                "compiling code={code} function={label} tier={:?}",
+                job.tier
+            ));
         }
         let result = self.recompile_inner(job, false);
         if let Some((code, label, started)) = trace {
@@ -1188,6 +1166,7 @@ impl Compiler {
         declared: bool,
     ) -> Result<Option<Replacement>, Error> {
         let RecompileJob {
+            tier,
             code,
             initial,
             previous,
@@ -1248,6 +1227,7 @@ impl Compiler {
             ));
         }
         if !initial
+            && emission.tier == tier
             && region.is_none()
             && planned.inlines == emission.inlines
             && planned.reads == emission.reads
@@ -1255,19 +1235,20 @@ impl Compiler {
         {
             return Ok(None);
         }
+        emission.tier = tier;
         let mut graph = super::semantic::optimize_planned(
             planned,
             (!initial && region.is_none()).then_some(previous.code),
+            self.inspection
+                .as_ref()
+                .is_some_and(|options| options.planner),
         )
         .map_err(Error::Unsupported)?;
         if self.osr && region.is_none() {
             graph.prepare_osr(source).map_err(Error::Unsupported)?;
         }
-        if self.compile_dump && self.compile_semantic_ir {
-            println!("[recompile {}] semantic IR\n{}", label, graph);
-        }
         let mut annotations = Annotations {
-            semantic_locations: self.dump_ir,
+            semantic_locations: self.dump_ir || self.inspection.is_some(),
             ..Annotations::default()
         };
         self.context.clear();
@@ -1311,7 +1292,15 @@ impl Compiler {
                 cranelift_codegen::ir::Function::new(),
             ),
             annotations,
-            listing: self.dump_ir.then(|| graph.listing_lines()),
+            listing: (self.dump_ir || (self.dump.is_some() && self.inspection.is_some()))
+                .then(|| graph.listing_lines()),
+            inspection: super::inspect::Inspection::new(
+                self.inspection.as_deref(),
+                &graph,
+                &self.canonical,
+                source,
+                inline_multiplier,
+            ),
         };
         let id = if declared {
             code
@@ -1354,10 +1343,17 @@ impl Compiler {
             .is_some_and(|id| self.lazy.contains_key(&FuncId::from_u32(id)))
     }
 
+    pub(crate) fn lazy_codes(&self) -> Vec<u64> {
+        let mut codes: Vec<_> = self.lazy.keys().map(|id| u64::from(id.as_u32())).collect();
+        codes.sort_unstable();
+        codes
+    }
+
     pub(crate) fn lazy_compilation(&self, code: u64) -> Option<RecompileJob> {
         let id = FuncId::from_u32(u32::try_from(code).ok()?);
         let (emission, canonical) = self.lazy.get(&id)?.clone();
         Some(RecompileJob {
+            tier: CompilationTier::Optimized,
             region: None,
             code: id,
             initial: true,
@@ -1465,30 +1461,31 @@ impl Compiler {
         semantic_function: Option<oxc_span::Span>,
     ) -> Result<(FunctionBody, Option<(FuncId, FunctionBody)>), Error> {
         if !generator {
-            return Ok((
-                self.compile_function(
-                    params,
-                    statements,
-                    expression,
-                    arguments_binding,
-                    arguments_references,
-                    captures,
-                    captured,
-                    closures,
-                    scoping,
-                    emit::FunctionKind::Ordinary,
-                    semantic_function,
-                )?,
-                None,
-            ));
+            let mut body = self.compile_function(
+                params,
+                statements,
+                expression,
+                arguments_binding,
+                arguments_references,
+                captures,
+                captured,
+                closures,
+                scoping,
+                emit::FunctionKind::Ordinary,
+                semantic_function,
+            )?;
+            body.inspection = body.inspection.named(label).ast(
+                self.inspection.as_deref(),
+                &(params, statements, expression),
+            );
+            return Ok((body, None));
         }
         let plan = super::generator::ResumePlan::lower(statements)?;
-        if self.compile_dump && self.compile_ast {
-            println!("[{label}@{line}] generator resume plan\n{plan:#?}");
-        }
+        let inspection = super::inspect::Inspection::default()
+            .ast(self.inspection.as_deref(), &(params, statements, &plan));
         let internal = format!("{label}.resume");
         let id = self.declare_js(&internal, line)?;
-        let resume = self.compile_function(
+        let mut resume = self.compile_function(
             params,
             statements,
             None,
@@ -1501,6 +1498,7 @@ impl Compiler {
             emit::FunctionKind::Generator(plan),
             semantic_function,
         )?;
+        resume.inspection = resume.inspection.named(&internal).with_ast(inspection);
         let factory = self.compile_function(
             params,
             &[],
@@ -1550,10 +1548,17 @@ impl Compiler {
                         self.ssa_opt,
                     ),
                 }?;
-                super::semantic::optimize_canonical(
+                let planned = super::semantic::plan_canonical(
                     canonical,
                     self.ssa_opt,
                     Some((&self.canonical, self.source_name.0)),
+                )?;
+                super::semantic::optimize_planned(
+                    planned,
+                    None,
+                    self.inspection
+                        .as_ref()
+                        .is_some_and(|options| options.planner),
                 )
             })
             .transpose()
@@ -1574,6 +1579,7 @@ impl Compiler {
             self.emissions.insert(
                 code,
                 Emission {
+                    tier: CompilationTier::Optimized,
                     callees: self
                         .canonical
                         .graph_callees(&graph.as_ref().unwrap().graph, self.source_name.0),
@@ -1588,7 +1594,7 @@ impl Compiler {
             );
         }
         let mut annotations = Annotations {
-            semantic_locations: self.dump_ir,
+            semantic_locations: self.dump_ir || self.inspection.is_some(),
             ..Annotations::default()
         };
         self.context.clear();
@@ -1648,7 +1654,16 @@ impl Compiler {
                 cranelift_codegen::ir::Function::new(),
             ),
             annotations,
-            listing: if self.dump_ir {
+            inspection: graph.as_ref().map_or_else(Default::default, |graph| {
+                super::inspect::Inspection::new(
+                    self.inspection.as_deref(),
+                    graph,
+                    &self.canonical,
+                    self.source_name.0,
+                    1,
+                )
+            }),
+            listing: if self.dump_ir || (self.dump.is_some() && self.inspection.is_some()) {
                 graph.as_ref().map(|graph| graph.listing_lines())
             } else {
                 None

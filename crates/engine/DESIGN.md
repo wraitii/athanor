@@ -1064,8 +1064,15 @@ those paths do not inflate the common getter's register saves and stack frame.
 
 The compiler lowers supported functions, nested callables, generator resumes,
 and script initializers through `jit/semantic/` before emitting Cranelift IR.
-`--compile --semantic-ir` prints callable graphs with inferred types and pass
-notes. The graph verifier checks scope and control-flow invariants. Semantic
+`--compile` prints the graph actually passed to emission by default, with
+inferred types and semantic-location IDs. `--planner` prints specialization
+plans, available feedback, the region tree and per-region assumptions, and pass
+notes separately. Detailed region snapshots are captured before versioning and
+after replanning each emitted region, only when requested. `jit/inspect.rs` formats
+the function views; `--filter NAME` restricts their output by name substring.
+`--clif` adds dumps from both sides of Cranelift optimization, and assembly includes
+byte offsets and semantic-location IDs. The graph verifier checks scope and
+control-flow invariants. Semantic
 optimization is disabled by `JS_JIT_SSA=0`, for graphs with exception handlers and for
 generator graphs; the shared CLIF optimization passes still apply.
 
@@ -1340,16 +1347,33 @@ promotion without changing an attempt's snapshot. Dependencies refer to attempt
 tickets and inherit the requesting job's priority transitively. Taking a job
 does not release dependents: the execution thread completes its ticket after
 handling publication or failure. Further feedback for a running target remains
-pending for a later attempt. The service starts two workers by default,
-configurable through `EngineOptions::compiler_threads` or `JS_JIT_WORKERS`. Each
-owns its compiler and code module. Publication remains confined to the execution
+pending for a later attempt. The service starts four regular workers by default,
+configurable through `EngineOptions::compiler_threads` or `JS_JIT_WORKERS`, plus
+one additional worker reserved for demanded lazy compilation. Each owns its
+compiler and code module. Regular and demanded jobs have separate ready heaps;
+promoting a queued lazy job preserves its ticket and snapshot while moving it
+to the reserved lane. Only the reserved worker takes demanded jobs, and it
+sleeps when no such job is ready. Publication remains confined to the execution
 thread. A worker exit stops the pool, joins the remaining workers, and cancels
 outstanding work
 after discarding remaining unpublished results; previously installed code remains
 usable.
 
-Synchronous initial compilation queues known callees that still have lazy bodies
-at prefetch priority, below next-call function recompilation. Callee discovery
+Scheduling has four priorities: demanded lazy compilation, OSR/feedback,
+prefetch, and unlazify. Compilation tier is carried separately on each job.
+Demanded lazy, prefetch, and unlazify jobs use the baseline tier with Cranelift
+`opt_level=none`; OSR and feedback jobs use the optimized tier with the configured
+`opt_level`. Both currently retain semantic specialization and optimization and
+the backtracking allocator. Workers retain a compiler/module per tier so emitted
+code outlives subsequent jobs. Promoting a queued lazy job to demanded priority
+retains its baseline tier and snapshot. Running jobs
+retain their original tier. Installed emissions record their tier, allowing
+optimized recompilation to replace baseline code even if the specialization
+plan has not changed. Main-thread compilation uses the optimized tier.
+
+Dispatch of a lazy function queues known callees that still have lazy bodies
+at prefetch priority, below OSR/feedback optimization. Loading source
+also queues all remaining unattempted lazy bodies below prefetch priority. Callee discovery
 combines canonical call sites with calls remaining in the planned graph after
 inlining, including calls exposed inside inlined bodies. Original targets remain
 useful for later calls from other sites even when this caller inlines them.
@@ -1361,12 +1385,15 @@ Workers declare their own physical code IDs while preserving logical function
 identity and lexical receiver behavior. Background installation removes the lazy
 body but does not recursively discover more callees.
 
-Dispatch never waits for prefetch. It cancels a pending attempt before compiling
-synchronously; if a worker already took the attempt, both may finish. Publication
-rejects the worker's initial result once the logical function no longer has a
-lazy body, preserving synchronous code and any subsequent feedback versions.
-The running attempt retains its ticket until completion, so later feedback
-remains pending until the stale result is handled.
+Dispatch promotes a queued lazy attempt to the reserved lane and waits for its
+entry. If a regular worker has already taken the attempt, dispatch waits for
+that result instead of compiling it again. While waiting, the execution thread
+publishes completed results and releases their dependency tickets. Independent
+jobs continue compiling without publication. Initial compilation failures are
+retained and returned when the function is called. With background compilation
+disabled, initial bodies still compile synchronously. Lazy wait logging records
+per-call durations and aggregate count, total, and maximum duration; shutdown
+still joins running compilations before releasing their referenced resources.
 
 `EngineOptions::osr` (`JS_JIT_OSR=1`) enables experimental loop replacement.
 Natural-loop discovery runs independently of the region-plan tree after guard
@@ -1586,11 +1613,13 @@ retained by the inline element path. The last semantic pass accepts a read when,
 throughout its live range, nothing writes the heap, reenters, or redefines a
 receiver along its chain of reads (`height` for `height[x][y]`). A store may be
 the last use, since stores retain before releasing. Either every receiver in the
-chain is known to be an object or reads it as an indexed iteration element (only
-arrays and typed arrays reach those reads), so it owns the result, or the read dies within
-its block before the temporary clear, which covers fresh slow-path results such
-as string characters. Other block parameters and returns still retain what they
-receive. `--semantic-ir` lists the borrowed reads.
+chain up to an owning receiver is known to be an object or reads it as an indexed
+iteration element (only arrays and typed arrays reach those reads), so it owns
+the result, or the read dies within its block before the temporary clear, which
+covers fresh slow-path results such as string characters. Other block parameters and returns still retain what they
+receive. Trivial block parameters introduced by specialization are folded before
+borrow analysis, preserving borrows through guard blocks. `--semantic-ir` lists
+the borrowed reads.
 
 Frames share one contiguous slot stack and one temporary stack in `JitCtx`;
 ordinary functions number their rooted values densely and reserve that many

@@ -38,14 +38,30 @@ pub(super) fn increment_references(b: &mut FunctionBuilder<'_>, address: ClifVal
 }
 
 impl FunctionCompiler<'_, '_> {
+    // Binding slots are not reused by SSA temporaries, so the variable tracks their contents.
+    pub(super) fn initialize_binding(&mut self, variable: Variable, value: ClifValue) {
+        let old = self.b.use_var(variable);
+        self.initialize_local_with_old(variable, value, Some(old));
+    }
+
     pub(super) fn initialize_local(&mut self, variable: Variable, value: ClifValue) {
+        self.initialize_local_with_old(variable, value, None);
+    }
+
+    fn initialize_local_with_old(
+        &mut self,
+        variable: Variable,
+        value: ClifValue,
+        known_old: Option<ClifValue>,
+    ) {
         if self.frame_size.is_none() {
             let slot = self.b.ins().iconst(types::I64, variable.as_u32() as i64);
             self.call_helper(Helper::LocalSet, &[slot, value]);
             self.b.def_var(variable, value);
             return;
         }
-        let (index, old) = self.store_local(variable, value);
+        let (index, stored) = self.store_local(variable, value);
+        let old = known_old.unwrap_or(stored);
         let new_heap = self.is_heap(value);
         let old_heap = self.is_heap(old);
         let heap = self.b.ins().bor(new_heap, old_heap);

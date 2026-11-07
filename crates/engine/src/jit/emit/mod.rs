@@ -63,6 +63,7 @@ pub(super) struct FunctionCompiler<'a, 'f> {
     arguments: Arguments,
     return_block: Block,
     failed_exit: Option<Block>,
+    error_origin: Option<Block>,
     handlers: Vec<Block>,
     generator: Option<ClifValue>,
     resume_blocks: Vec<Block>,
@@ -222,6 +223,7 @@ fn build_callable(
         arguments,
         return_block,
         failed_exit: None,
+        error_origin: None,
         handlers: Vec::new(),
         generator: None,
         resume_blocks: Vec::new(),
@@ -336,6 +338,7 @@ pub(super) fn build_global(
         arguments,
         return_block,
         failed_exit: None,
+        error_origin: None,
         handlers: Vec::new(),
         generator: None,
         resume_blocks: Vec::new(),
@@ -402,6 +405,13 @@ impl FunctionCompiler<'_, '_> {
     }
 
     pub(super) fn finish_failed_exit(&mut self) {
+        if let Some(block) = self.error_origin {
+            self.switch(block);
+            let args = self.b.block_params(block).to_vec();
+            self.call_helper(Helper::ErrorOrigin, &args);
+            let exit = self.failed_exit();
+            self.jump(exit, &[]);
+        }
         let Some(block) = self.failed_exit else {
             return;
         };

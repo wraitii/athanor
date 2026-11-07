@@ -194,6 +194,7 @@ pub(super) enum ArrayMethod {
     Filter,
     ForEach,
     Find,
+    Push,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -629,6 +630,7 @@ impl Op {
             Op::Define(object, ..)
             | Op::Set(object, ..)
             | Op::SetIndex(object, ..)
+            | Op::ArrayAppend(object, ..)
             | Op::IteratorNext(object)
             | Op::EnumerateNext(object) => Some(*object),
             _ => None,
@@ -1329,6 +1331,7 @@ pub(super) fn lower_global(
     closures: &std::collections::HashMap<u32, (cranelift_module::FuncId, Vec<SymbolId>, bool)>,
     arguments_references: &std::collections::HashMap<u32, SymbolId>,
     ssa_opt: bool,
+    report_regions: bool,
 ) -> Result<Analysis> {
     let graph = build::lower_global(
         statements,
@@ -1338,7 +1341,8 @@ pub(super) fn lower_global(
         closures,
         arguments_references,
     )?;
-    optimize_graph(graph, ssa_opt)
+    let planned = plan_canonical(canonicalize(graph, ssa_opt)?, ssa_opt, None)?;
+    optimize_planned(planned, None, report_regions)
 }
 
 pub(super) fn canonical_for_emission(
@@ -1407,16 +1411,22 @@ fn canonicalize(mut graph: Graph, ssa_opt: bool) -> Result<Canonical> {
     Ok(Canonical { graph, notes })
 }
 
+#[cfg(test)]
 fn optimize_graph(graph: Graph, ssa_opt: bool) -> Result<Analysis> {
     optimize_canonical(canonicalize(graph, ssa_opt)?, ssa_opt, None)
 }
 
+#[cfg(test)]
 pub(super) fn optimize_canonical(
     canonical: Canonical,
     ssa_opt: bool,
     specialization: Option<(&specialize::Repository, usize)>,
 ) -> Result<Analysis> {
-    optimize_planned(plan_canonical(canonical, ssa_opt, specialization)?, None)
+    optimize_planned(
+        plan_canonical(canonical, ssa_opt, specialization)?,
+        None,
+        false,
+    )
 }
 
 #[derive(Default)]
@@ -1504,10 +1514,13 @@ pub(super) fn plan_canonical_with_budget(
     let reads = specialization.map_or_else(Vec::new, |(bodies, source)| {
         reads::plan(&graph, bodies, source)
     });
-    let conditional = specialization
+    let mut conditional = specialization
         .map_or_else(specialize::ConditionalPlan::default, |(bodies, _)| {
             specialize::conditional_plan(&graph, bodies, &mut notes)
         });
+    if let Some((bodies, source)) = specialization {
+        conditional.native_calls = arrays::push_calls(&mut graph, bodies, source, &mut notes)?;
+    }
     Ok(Planned {
         conditional,
         inlines: inline_budget.inlines,
@@ -1518,7 +1531,11 @@ pub(super) fn plan_canonical_with_budget(
     })
 }
 
-pub(super) fn optimize_planned(planned: Planned, fallback: Option<usize>) -> Result<Analysis> {
+pub(super) fn optimize_planned(
+    planned: Planned,
+    fallback: Option<usize>,
+    report_regions: bool,
+) -> Result<Analysis> {
     let Planned {
         inlines,
         reads,
@@ -1547,7 +1564,15 @@ pub(super) fn optimize_planned(planned: Planned, fallback: Option<usize>) -> Res
         optimize::simplify(&mut graph);
     }
     graph.verify()?;
-    let mut regions = optimize::version(&mut graph, &conditional, fallback, &mut notes)?;
+    optimize::forward_captured_parameters(&mut graph, &mut notes);
+    graph.verify()?;
+    let mut regions = optimize::version_with_report(
+        &mut graph,
+        &conditional,
+        fallback,
+        &mut notes,
+        report_regions,
+    )?;
     graph.verify()?;
     if regions.is_empty() {
         regions.extend(optimize::version_string_leaves(&mut graph, &mut notes)?);
@@ -1579,6 +1604,7 @@ pub(super) fn optimize_planned(planned: Planned, fallback: Option<usize>) -> Res
     optimize::lazy_captures(&mut graph, &mut notes);
     graph.verify()?;
     string_split::forward_packs(&mut graph);
+    promote::remove_trivial_params(&mut graph);
     graph.verify()?;
     let facts = Facts::compute(&graph);
     borrow::borrows(&mut graph, &facts, &mut notes);

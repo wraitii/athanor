@@ -13,6 +13,7 @@ pub(super) enum Repr {
     Boxed,
     Float,
     Int32,
+    Int64,
     Bool,
 }
 
@@ -33,7 +34,7 @@ impl Repr {
 
     pub(super) fn clif(self) -> Type {
         match self {
-            Self::Boxed => types::I64,
+            Self::Boxed | Self::Int64 => types::I64,
             Self::Float => types::F64,
             Self::Int32 => types::I32,
             Self::Bool => types::I8,
@@ -59,6 +60,7 @@ impl FunctionCompiler<'_, '_> {
             Repr::Boxed => self.constant(Value::UNDEFINED),
             Repr::Float => self.b.ins().f64const(0.0),
             Repr::Int32 => self.b.ins().iconst(types::I32, 0),
+            Repr::Int64 => self.b.ins().iconst(types::I64, 0),
             Repr::Bool => self.b.ins().iconst(types::I8, 0),
         }
     }
@@ -69,6 +71,10 @@ impl FunctionCompiler<'_, '_> {
             (from, to) if from == to => value,
             (Repr::Boxed, Repr::Float) => {
                 self.b.ins().bitcast(types::F64, MemFlagsData::new(), value)
+            }
+            (Repr::Boxed, Repr::Int64) => {
+                let float = self.b.ins().bitcast(types::F64, MemFlagsData::new(), value);
+                self.b.ins().fcvt_to_sint_sat(types::I64, float)
             }
             (Repr::Boxed, Repr::Int32) => {
                 let float = self.b.ins().bitcast(types::F64, MemFlagsData::new(), value);
@@ -86,7 +92,7 @@ impl FunctionCompiler<'_, '_> {
                 let boxed = self.b.ins().select(unordered, nan, bits);
                 boxed
             }
-            (Repr::Int32, Repr::Boxed) => {
+            (Repr::Int64, Repr::Boxed) | (Repr::Int32, Repr::Boxed) => {
                 let float = self.b.ins().fcvt_from_sint(types::F64, value);
                 let boxed = self.b.ins().bitcast(types::I64, MemFlagsData::new(), float);
                 boxed
@@ -96,20 +102,27 @@ impl FunctionCompiler<'_, '_> {
                 let no = self.constant(Value::FALSE);
                 self.b.ins().select(value, yes, no)
             }
-            (Repr::Int32, Repr::Float) => self.b.ins().fcvt_from_sint(types::F64, value),
+            (Repr::Int64, Repr::Float) | (Repr::Int32, Repr::Float) => {
+                self.b.ins().fcvt_from_sint(types::F64, value)
+            }
             (Repr::Float, Repr::Int32) => self.to_int32(value),
             (Repr::Bool, Repr::Int32) => self.b.ins().uextend(types::I32, value),
             (Repr::Bool, Repr::Float) => {
                 let wide = self.b.ins().uextend(types::I32, value);
                 self.b.ins().fcvt_from_uint(types::F64, wide)
             }
-            (Repr::Int32, Repr::Bool) => self.b.ins().icmp_imm_s(IntCC::NotEqual, value, 0),
+            (Repr::Int64, Repr::Bool) | (Repr::Int32, Repr::Bool) => {
+                self.b.ins().icmp_imm_s(IntCC::NotEqual, value, 0)
+            }
             (Repr::Float, Repr::Bool) => {
                 let zero = self.b.ins().f64const(0.0);
                 let negative = self.b.ins().fcmp(FloatCC::LessThan, value, zero);
                 let positive = self.b.ins().fcmp(FloatCC::GreaterThan, value, zero);
                 self.b.ins().bor(negative, positive)
             }
+            (Repr::Int32, Repr::Int64) => self.b.ins().sextend(types::I64, value),
+            (Repr::Float, Repr::Int64) => self.b.ins().fcvt_to_sint_sat(types::I64, value),
+            (Repr::Int64, Repr::Int32) => self.b.ins().ireduce(types::I32, value),
             _ => unreachable!(),
         }
     }
@@ -131,6 +144,15 @@ impl FunctionCompiler<'_, '_> {
         left: Operand,
         right: Operand,
     ) -> Option<Operand> {
+        if op == BinaryOp::Add
+            && (left.repr == Repr::Int64 || right.repr == Repr::Int64)
+            && matches!(left.repr, Repr::Int32 | Repr::Int64)
+            && matches!(right.repr, Repr::Int32 | Repr::Int64)
+        {
+            let left = self.convert(left, Repr::Int64);
+            let right = self.convert(right, Repr::Int64);
+            return Some(Operand::new(self.b.ins().iadd(left, right), Repr::Int64));
+        }
         Some(match op {
             BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
                 let left = self.convert(left, Repr::Float);
@@ -151,29 +173,30 @@ impl FunctionCompiler<'_, '_> {
             | BinaryOp::StrictEqual
             | BinaryOp::LooseNotEqual
             | BinaryOp::StrictNotEqual => {
-                let result = if left.repr == Repr::Int32 && right.repr == Repr::Int32 {
-                    let condition = match op {
-                        BinaryOp::Less => IntCC::SignedLessThan,
-                        BinaryOp::LessEqual => IntCC::SignedLessThanOrEqual,
-                        BinaryOp::Greater => IntCC::SignedGreaterThan,
-                        BinaryOp::GreaterEqual => IntCC::SignedGreaterThanOrEqual,
-                        BinaryOp::LooseEqual | BinaryOp::StrictEqual => IntCC::Equal,
-                        _ => IntCC::NotEqual,
+                let result =
+                    if left.repr == right.repr && matches!(left.repr, Repr::Int32 | Repr::Int64) {
+                        let condition = match op {
+                            BinaryOp::Less => IntCC::SignedLessThan,
+                            BinaryOp::LessEqual => IntCC::SignedLessThanOrEqual,
+                            BinaryOp::Greater => IntCC::SignedGreaterThan,
+                            BinaryOp::GreaterEqual => IntCC::SignedGreaterThanOrEqual,
+                            BinaryOp::LooseEqual | BinaryOp::StrictEqual => IntCC::Equal,
+                            _ => IntCC::NotEqual,
+                        };
+                        self.b.ins().icmp(condition, left.value, right.value)
+                    } else {
+                        let condition = match op {
+                            BinaryOp::Less => FloatCC::LessThan,
+                            BinaryOp::LessEqual => FloatCC::LessThanOrEqual,
+                            BinaryOp::Greater => FloatCC::GreaterThan,
+                            BinaryOp::GreaterEqual => FloatCC::GreaterThanOrEqual,
+                            BinaryOp::LooseEqual | BinaryOp::StrictEqual => FloatCC::Equal,
+                            _ => FloatCC::NotEqual,
+                        };
+                        let left = self.convert(left, Repr::Float);
+                        let right = self.convert(right, Repr::Float);
+                        self.b.ins().fcmp(condition, left, right)
                     };
-                    self.b.ins().icmp(condition, left.value, right.value)
-                } else {
-                    let condition = match op {
-                        BinaryOp::Less => FloatCC::LessThan,
-                        BinaryOp::LessEqual => FloatCC::LessThanOrEqual,
-                        BinaryOp::Greater => FloatCC::GreaterThan,
-                        BinaryOp::GreaterEqual => FloatCC::GreaterThanOrEqual,
-                        BinaryOp::LooseEqual | BinaryOp::StrictEqual => FloatCC::Equal,
-                        _ => FloatCC::NotEqual,
-                    };
-                    let left = self.convert(left, Repr::Float);
-                    let right = self.convert(right, Repr::Float);
-                    self.b.ins().fcmp(condition, left, right)
-                };
                 Operand::new(result, Repr::Bool)
             }
             BinaryOp::BitwiseAnd

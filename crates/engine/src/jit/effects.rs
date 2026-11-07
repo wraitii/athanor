@@ -104,6 +104,7 @@ pub(super) fn effects(helper: Helper) -> Effects {
             ],
         ),
         Truthy => (Reentry::Closed, HEAP_READ, &[]),
+        TypedIndexGet => (Reentry::Closed, HEAP_READ, &[Assumption::FixedTypedStorage]),
         ArrayMapElement => (Reentry::Closed, HEAP_READ | INTERNAL, &[]),
         ArrayNew | ArrayNewOwned | Rest | ObjectNew | ObjectNewOwned | NewInstance
         | NewInstanceOwned | StringNew | ArrayMapNew | ArrayMapNewOwned => {
@@ -154,6 +155,7 @@ pub(super) fn temporary_effect(helper: Helper) -> TemporaryEffect {
         TempClear => Clear,
         TempRetain | TempOwn | Add => MayRegister,
         SemanticPropertyProbeCached
+        | TypedIndexGet
         | GlobalGetBorrowed
         | GlobalGetOptionalBorrowed
         | NewInstanceOwned

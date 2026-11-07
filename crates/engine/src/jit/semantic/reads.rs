@@ -7,10 +7,10 @@ use super::{
 
 #[derive(Clone, PartialEq, Eq)]
 pub(in crate::jit) struct Read {
-    inst: Inst,
-    typed: bool,
-    element: Option<crate::heap::TypedKind>,
-    guard_number: bool,
+    pub(super) inst: Inst,
+    pub(super) typed: bool,
+    pub(super) element: Option<crate::heap::TypedKind>,
+    pub(super) guard_number: bool,
 }
 
 pub(super) fn plan(

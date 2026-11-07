@@ -29,4 +29,5 @@ pub(super) struct FunctionBody {
     pub function: Function,
     pub annotations: Annotations,
     pub listing: Option<Vec<super::semantic::ListingLine>>,
+    pub inspection: super::inspect::Inspection,
 }

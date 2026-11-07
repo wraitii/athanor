@@ -1,3 +1,4 @@
+mod compile;
 mod host;
 
 use std::fs;
@@ -27,17 +28,15 @@ fn run() -> Result<(), String> {
     let mut values = Vec::new();
     let mut repl = false;
     let mut map = false;
-    let mut compile = false;
-    let mut compile_ir = true;
-    let mut compile_ast = false;
-    let mut compile_semantic_ir = false;
-    let mut output_option = false;
-    let mut compile_asm = false;
+    let mut compile = compile::Options::default();
     let mut data = None;
     let mut settings = None;
     let mut bootstrap = None;
 
     while let Some(argument) = arguments.next() {
+        if compile.parse(&argument, &mut arguments)? {
+            continue;
+        }
         match argument.as_str() {
             "--eval" | "-e" => {
                 eval = Some(arguments.next().ok_or("--eval expects source")?);
@@ -51,27 +50,6 @@ fn run() -> Result<(), String> {
             }
             "--load" => preloads.push(arguments.next().ok_or("--load expects a path")?),
             "--map" => map = true,
-            "--compile" => compile = true,
-            "--no-ir" => {
-                compile_ir = false;
-                output_option = true;
-            }
-            "--ir" => {
-                compile_ir = true;
-                output_option = true;
-            }
-            "--ast" => {
-                compile_ast = true;
-                output_option = true;
-            }
-            "--semantic-ir" => {
-                compile_semantic_ir = true;
-                output_option = true;
-            }
-            "--asm" => {
-                compile_asm = true;
-                output_option = true;
-            }
             "--data" => data = Some(arguments.next().ok_or("--data expects a path")?),
             "--settings" => settings = Some(arguments.next().ok_or("--settings expects JSON")?),
             "--bootstrap" => {
@@ -89,12 +67,10 @@ fn run() -> Result<(), String> {
         }
     }
 
-    if output_option && !compile {
-        return Err("--ir, --no-ir, --ast, --semantic-ir and --asm require --compile".into());
-    }
+    compile.validate()?;
 
     if map {
-        if compile
+        if compile.enabled
             || repl
             || eval.is_some()
             || function != "main"
@@ -107,7 +83,7 @@ fn run() -> Result<(), String> {
     }
 
     if repl {
-        if compile
+        if compile.enabled
             || eval.is_some()
             || script.is_some()
             || function != "main"
@@ -141,21 +117,13 @@ fn run() -> Result<(), String> {
         }
     };
 
-    if compile && (!preloads.is_empty() || function != "main" || !values.is_empty()) {
+    if compile.enabled && (!preloads.is_empty() || function != "main" || !values.is_empty()) {
         return Err("--compile cannot be combined with execution options".into());
     }
-    let options = js_engine::EngineOptions {
-        compile_dump: compile,
-        compile_ir,
-        compile_ast,
-        compile_semantic_ir,
-        compile_asm,
-        ..Default::default()
-    };
-    let mut engine = Engine::with_options(options).map_err(display)?;
-    if compile {
-        return engine.compile_only(&source, &filename).map_err(display);
+    if compile.enabled {
+        return compile.run(&source, &filename).map_err(display);
     }
+    let mut engine = Engine::new().map_err(display)?;
     install_host(&mut engine)?;
     for path in preloads {
         compile_file(&mut engine, &path)?;
@@ -271,7 +239,7 @@ fn display(error: Error) -> String {
 
 fn usage() {
     eprintln!(
-        "usage: js-runner [--load SCRIPT]... [--function NAME] [--arg VALUE]... <script>\n       js-runner [--function NAME] [--arg VALUE]... --eval SOURCE\n       js-runner --map [--data ROOT] [--settings JSON] [--bootstrap SCRIPT] [SCRIPT]\n       js-runner --compile [--no-ir] [--ast] [--semantic-ir] [--asm] (--eval SOURCE | SCRIPT)
+        "usage: js-runner [--load SCRIPT]... [--function NAME] [--arg VALUE]... <script>\n       js-runner [--function NAME] [--arg VALUE]... --eval SOURCE\n       js-runner --map [--data ROOT] [--settings JSON] [--bootstrap SCRIPT] [SCRIPT]\n       js-runner --compile [--filter NAME] [--no-semantic-ir] [--clif] [--ast] [--planner] [--asm] [--execute JS] (--eval SOURCE | SCRIPT)
        js-runner --repl"
     );
 }

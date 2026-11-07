@@ -728,3 +728,107 @@ fn conditional_region_guards_preserve_recursive_calls_and_replacements() {
         }
     }
 }
+
+#[test]
+fn array_iteration_indices_and_captured_parameters_survive_calls() {
+    let source = r#"
+        function select(values, threshold) {
+            return values.filter((value, index) => value + index >= threshold);
+        }
+        function mutate(values, threshold) {
+            return values.filter((value, index) => {
+                threshold += index;
+                return value >= threshold;
+            });
+        }
+        function main() {
+            const selected = select([1, 2, 3], 3);
+            const changed = mutate([1, 2, 3], 2);
+            const mapped = [10, 20, 30].map((value, index) => value + index);
+            const custom = {};
+            custom.filter = function(callback) {
+                return [callback(1, 0), callback(4, 1)];
+            };
+            const fallback = select(custom, 3);
+            return selected.length === 2 && selected[0] === 2 && selected[1] === 3 &&
+                changed.length === 0 && mapped[0] === 10 && mapped[2] === 32 &&
+                fallback[0] === false && fallback[1] === true;
+        }
+    "#;
+    for mut engine in engines() {
+        engine.compile(source, "array-indices-captures.js").unwrap();
+        assert_eq!(engine.call("main", &[]).unwrap().value(), Value::TRUE);
+    }
+}
+
+#[test]
+fn shared_error_origin_preserves_each_failing_span() {
+    let source = "function fail(first) { if (first) return {} * 2; return {} / 3; }";
+    for mut engine in engines() {
+        engine.compile(source, "shared-error-origin.js").unwrap();
+        for (first, expression) in [(true, "{} * 2"), (false, "{} / 3")] {
+            let start = source.find(expression).unwrap();
+            let end = start + expression.len();
+            let error = engine.call("fail", &[Value::boolean(first)]).err().unwrap();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("shared-error-origin.js:{start}..{end}")),
+                "{error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn borrowed_rows_preserve_guards_and_owner_invalidation() {
+    let source = r#"
+        function selected(owner) {
+            const height = owner.height;
+            let sum = 0;
+            for (let i = 0; i < 64; ++i) sum += height[i & 1][0];
+            return sum;
+        }
+        function mutate(owner, callback) {
+            const height = owner.height;
+            let sum = 0;
+            for (let i = 0; i < 2; ++i) {
+                const row = height[i];
+                callback(height, i);
+                sum += row[0];
+            }
+            return sum;
+        }
+        function main() {
+            const first = new Float32Array(1);
+            const second = new Float32Array(1);
+            first[0] = 3;
+            second[0] = 9;
+            const owner = {height: [first, second]};
+            const runner = {read: selected, mutate: mutate};
+            for (let i = 0; i < 40; ++i)
+                if (runner.read(owner) !== 384) return false;
+            owner.height = [[5], [7]];
+            if (runner.read(owner) !== 384) return false;
+            owner.height = [{0: 2}, {0: 6}];
+            if (runner.read(owner) !== 256) return false;
+            owner.height = [new Float32Array(1), new Float32Array(1)];
+            owner.height[0][0] = 3;
+            owner.height[1][0] = 9;
+            return runner.mutate(owner, function(height, i) {
+                height[i] = null;
+                for (let j = 0; j < 32; ++j) new Float32Array(1);
+            }) === 12;
+        }
+    "#;
+    for opt_level in [OptLevel::None, OptLevel::Speed] {
+        let mut engine = Engine::with_options(EngineOptions {
+            opt_level,
+            background_compile: false,
+            ..Default::default()
+        })
+        .unwrap();
+        engine.compile(source, "borrowed-rows.js").unwrap();
+        assert_eq!(engine.call("main", &[]).unwrap().value(), Value::TRUE);
+    }
+}

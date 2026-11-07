@@ -4,18 +4,18 @@ pub(crate) use scheduler::{Priority, Ticket};
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::{EngineOptions, error::Error};
 
-use super::compiler::{CompilationMode, Compiler, RecompileJob, Unpublished};
+use super::compiler::{CompilationTier, Compiler, RecompileJob, Unpublished};
 
 pub(crate) const REQUESTED: u8 = 1;
 pub(crate) const READY: u8 = 2;
-pub(crate) const DEFAULT_COMPILER_THREADS: usize = 2;
+pub(crate) const DEFAULT_COMPILER_THREADS: usize = 4;
 
 #[derive(Clone, Copy)]
 pub(crate) struct Log(Option<Instant>);
@@ -87,6 +87,7 @@ impl Shared {
 pub(crate) struct Service {
     shared: Arc<Shared>,
     receiver: Receiver<Completion>,
+    buffered: Option<Completion>,
     threads: Vec<JoinHandle<()>>,
     log: Log,
     pub(crate) in_flight: HashMap<Key, Ticket>,
@@ -110,6 +111,7 @@ impl Service {
         let mut service = Self {
             shared,
             receiver,
+            buffered: None,
             threads: Vec::new(),
             log,
             in_flight: HashMap::new(),
@@ -118,13 +120,22 @@ impl Service {
             service.threads.push(spawn_worker(
                 service.shared.clone(),
                 results.clone(),
-                options,
+                options.clone(),
                 direct,
                 state.clone(),
                 log,
-                index,
+                Worker::Background(index),
             )?);
         }
+        service.threads.push(spawn_worker(
+            service.shared.clone(),
+            results,
+            options,
+            direct,
+            state,
+            log,
+            Worker::Lazy,
+        )?);
         Ok(service)
     }
 
@@ -147,19 +158,29 @@ impl Service {
         if self.log.enabled() {
             job.queued_at = Some(Instant::now());
             self.log.event(format_args!(
-                "queued code={code} function={} priority={priority:?} outstanding={}",
+                "queued code={code} function={} priority={priority:?} tier={:?} outstanding={}",
                 job.label,
+                job.tier,
                 self.in_flight.len() + usize::from(!self.in_flight.contains_key(&key))
             ));
         }
+        let tier = job.tier;
         let ticket = work.queue.submit(key, priority, job, dependencies);
+        if tier == CompilationTier::Baseline
+            && let Some(job) = work.queue.pending_mut(key)
+        {
+            job.tier = tier;
+        }
         self.in_flight.insert(key, ticket);
         drop(work);
-        self.shared.available.notify_one();
+        self.shared.available.notify_all();
         Ok(ticket)
     }
 
     pub(crate) fn receive(&mut self) -> Result<Option<Completion>, Error> {
+        if let Some(completion) = self.buffered.take() {
+            return Ok(Some(completion));
+        }
         match self.receiver.try_recv() {
             Ok(completion) => Ok(Some(completion)),
             Err(TryRecvError::Empty)
@@ -194,20 +215,18 @@ impl Service {
         self.shared.available.notify_all();
     }
 
-    pub(crate) fn cancel_pending(&mut self, key: Key) -> bool {
-        let ticket = self
-            .shared
-            .work
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .queue
-            .cancel_pending(key);
-        if let Some(ticket) = ticket {
-            assert_eq!(self.in_flight.remove(&key), Some(ticket));
-            self.shared.available.notify_all();
-            return true;
+    pub(crate) fn wait_for_completion(&mut self) -> Result<(), Error> {
+        if self.buffered.is_some() {
+            return Ok(());
         }
-        false
+        match self.receiver.recv_timeout(Duration::from_millis(10)) {
+            Ok(completion) => self.buffered = Some(completion),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(Error::Compile("compilation workers stopped".into()));
+            }
+        }
+        Ok(())
     }
 
     fn join(&mut self) {
@@ -219,6 +238,12 @@ impl Service {
     }
 }
 
+#[derive(Clone, Copy)]
+enum Worker {
+    Background(usize),
+    Lazy,
+}
+
 fn spawn_worker(
     shared: Arc<Shared>,
     results: Sender<Completion>,
@@ -226,17 +251,21 @@ fn spawn_worker(
     direct: usize,
     state: Arc<AtomicU8>,
     log: Log,
-    index: usize,
+    worker: Worker,
 ) -> Result<JoinHandle<()>, Error> {
+    let name = match worker {
+        Worker::Background(index) => index.to_string(),
+        Worker::Lazy => "lazy".into(),
+    };
     thread::Builder::new()
-        .name(format!("js-jit-{index}"))
+        .name(format!("js-jit-{name}"))
         .spawn(move || {
             let _notify = NotifyOnExit {
                 state: state.clone(),
                 shared: shared.clone(),
             };
-            log.event(format_args!("worker {index} started"));
-            let mut compiler = None;
+            log.event(format_args!("worker {name} started"));
+            let mut compilers = HashMap::new();
             loop {
                 let next = {
                     let mut work = shared.work.lock().unwrap();
@@ -244,7 +273,11 @@ fn spawn_worker(
                         if work.stopped {
                             break None;
                         }
-                        if let Some(job) = work.queue.pop() {
+                        let next = match worker {
+                            Worker::Background(_) => work.queue.pop(),
+                            Worker::Lazy => work.queue.pop_lazy(),
+                        };
+                        if let Some(job) = next {
                             break Some(job);
                         }
                         work = shared.available.wait(work).unwrap();
@@ -256,20 +289,22 @@ fn spawn_worker(
                 let code = u64::from(job.code.as_u32());
                 if let Some(queued) = job.queued_at {
                     log.event(format_args!(
-                        "dequeued code={code} function={} queue_ms={:.3}",
+                        "dequeued code={code} function={} worker={name} queue_ms={:.3}",
                         job.label,
                         queued.elapsed().as_secs_f64() * 1000.0
                     ));
                 }
-                if compiler.is_none() {
+                if !compilers.contains_key(&job.tier) {
                     match Compiler::new(
-                        options,
-                        CompilationMode::Background,
+                        options.clone(),
+                        job.tier,
                         direct as *const usize,
                         Arc::as_ptr(&state) as usize,
                         log,
                     ) {
-                        Ok(created) => compiler = Some(created),
+                        Ok(created) => {
+                            compilers.insert(job.tier, created);
+                        }
                         Err(error) => {
                             let _ = results.send(Completion {
                                 ticket,
@@ -281,7 +316,7 @@ fn spawn_worker(
                         }
                     }
                 }
-                let compiler = compiler.as_mut().unwrap();
+                let compiler = compilers.get_mut(&job.tier).unwrap();
                 let result = compiler.recompile(job).map(|replacement| {
                     replacement.map(|replacement| compiler.take_unpublished(replacement))
                 });
@@ -297,7 +332,7 @@ fn spawn_worker(
                 }
                 state.fetch_or(READY, Ordering::Release);
             }
-            log.event(format_args!("worker {index} stopped"));
+            log.event(format_args!("worker {name} stopped"));
         })
         .map_err(|error| Error::Compile(error.to_string()))
 }
@@ -308,8 +343,15 @@ impl Drop for Service {
             "shutdown outstanding={}",
             self.in_flight.len()
         ));
+        let started = self.log.enabled().then(Instant::now);
         self.shared.stop();
         self.join();
+        if let Some(started) = started {
+            self.log.event(format_args!(
+                "shutdown complete join_ms={:.3}",
+                started.elapsed().as_secs_f64() * 1000.0,
+            ));
+        }
     }
 }
 
@@ -330,10 +372,10 @@ mod tests {
             Log::new(false),
         )
         .unwrap();
-        assert_eq!(service.threads.len(), 3);
+        assert_eq!(service.threads.len(), 4);
         let mut queue = scheduler::Queue::new();
         let key = Key::Function(1);
-        let ticket = queue.submit(key, Priority::Normal, (), &[]);
+        let ticket = queue.submit(key, Priority::Optimize, (), &[]);
         service.in_flight.insert(key, ticket);
         let shared = service.shared.clone();
         let failed = thread::spawn(move || {

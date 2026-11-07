@@ -853,11 +853,14 @@ impl FunctionCompiler<'_, '_> {
         self.b.ins().icmp_imm_s(IntCC::NotEqual, masked, 0)
     }
 
-    pub(super) fn view_length(&mut self, view: ClifValue) -> ClifValue {
-        let length = self
-            .b
+    pub(super) fn view_length_integer(&mut self, view: ClifValue) -> ClifValue {
+        self.b
             .ins()
-            .load(types::I64, MemFlagsData::trusted(), view, LENGTH_OFFSET);
+            .load(types::I64, MemFlagsData::trusted(), view, LENGTH_OFFSET)
+    }
+
+    pub(super) fn view_length(&mut self, view: ClifValue) -> ClifValue {
+        let length = self.view_length_integer(view);
         self.b.ins().fcvt_from_uint(types::F64, length)
     }
 
@@ -1006,6 +1009,7 @@ impl FunctionCompiler<'_, '_> {
         let mut switch = Switch::new();
         let kinds: Vec<_> = TYPED_KINDS
             .iter()
+            .filter(|_| value.is_some())
             .map(|&element| (element, self.b.create_block()))
             .collect();
         for (element, block) in &kinds {
@@ -1020,7 +1024,17 @@ impl FunctionCompiler<'_, '_> {
             let address = self.b.ins().iadd(data, offset);
             (packed, holey, address)
         });
-        switch.emit(self.b, kind, slow);
+        let typed = value.is_none().then(|| self.b.create_block());
+        switch.emit(self.b, kind, typed.unwrap_or(slow));
+        if let Some(typed) = typed {
+            self.switch(typed);
+            let typed = self.has_kind(view, kind::TYPED);
+            let read = self.b.create_block();
+            self.brif(typed, read, &[], slow, &[]);
+            self.switch(read);
+            let bits = self.call_helper(Helper::TypedIndexGet, &[object, position]);
+            self.jump(done, &[BlockArg::Value(bits)]);
+        }
         if let Some((packed, holey, address)) = elements {
             let element = self.b.create_block();
             self.b.append_block_param(element, types::I64);
@@ -1054,83 +1068,48 @@ impl FunctionCompiler<'_, '_> {
             self.switch(block);
             let offset = self.b.ins().imul_imm_s(position, element.bytes() as i64);
             let address = self.b.ins().iadd(data, offset);
-            match value {
-                None => {
-                    let raw = self.b.ins().load(element.into(), flags, address, 0);
-                    let number = match element {
-                        Element::F64 => raw,
-                        Element::F32 => self.b.ins().fpromote(types::F64, raw),
-                        Element::U32 => {
-                            let wide = self.b.ins().uextend(types::I64, raw);
-                            self.b.ins().fcvt_from_sint(types::F64, wide)
-                        }
-                        Element::U8 | Element::U16 => {
-                            let wide = self.b.ins().uextend(types::I32, raw);
-                            self.b.ins().fcvt_from_sint(types::F64, wide)
-                        }
-                        Element::I32 => self.b.ins().fcvt_from_sint(types::F64, raw),
-                        Element::I8 | Element::I16 => {
-                            let wide = self.b.ins().sextend(types::I32, raw);
-                            self.b.ins().fcvt_from_sint(types::F64, wide)
-                        }
-                    };
-                    let bits = self
-                        .b
-                        .ins()
-                        .bitcast(types::I64, MemFlagsData::new(), number);
-                    let bits = if element.is_float() {
-                        let nan = self.b.ins().fcmp(FloatCC::Unordered, number, number);
-                        let canonical = self.constant(Value::number(f64::NAN));
-                        self.b.ins().select(nan, canonical, bits)
-                    } else {
-                        bits
-                    };
-                    self.jump(done, &[BlockArg::Value(bits)]);
-                }
-                Some(value) => {
-                    let (stored, valid) = if element.is_float() {
-                        let valid = match value.repr {
-                            Repr::Boxed => self.is_number(value.value),
-                            _ => self.b.ins().iconst(types::I8, 1),
-                        };
-                        let number = self.convert(value, Repr::Float);
-                        let stored = if element == Element::F32 {
-                            self.b.ins().fdemote(types::F32, number)
-                        } else {
-                            number
-                        };
-                        (stored, valid)
-                    } else if value.repr == Repr::Int32 {
-                        let stored = if Type::from(element) == types::I32 {
-                            value.value
-                        } else {
-                            self.b.ins().ireduce(element.into(), value.value)
-                        };
-                        (stored, self.b.ins().iconst(types::I8, 1))
-                    } else {
-                        let number = self.convert(value, Repr::Float);
-                        let integer = self.b.ins().fcvt_to_sint_sat(types::I64, number);
-                        let exact = self.b.ins().fcvt_from_sint(types::F64, integer);
-                        let integral = self.b.ins().fcmp(FloatCC::Equal, exact, number);
-                        let upper = self.b.ins().f64const(9223372036854775808.0);
-                        let lower = self.b.ins().f64const(-9223372036854775808.0);
-                        let below = self.b.ins().fcmp(FloatCC::LessThan, number, upper);
-                        let above = self
-                            .b
-                            .ins()
-                            .fcmp(FloatCC::GreaterThanOrEqual, number, lower);
-                        let in_range = self.b.ins().band(below, above);
-                        let valid = self.b.ins().band(integral, in_range);
-                        (self.b.ins().ireduce(element.into(), integer), valid)
-                    };
-                    let store = self.b.create_block();
-                    self.brif(valid, store, &[], slow, &[]);
-                    self.switch(store);
-                    self.b.ins().store(flags, stored, address, 0);
-                    let undefined = self.constant(Value::UNDEFINED);
-                    self.jump(done, &[BlockArg::Value(undefined)]);
-                }
-            }
+            let value = value.unwrap();
+            let (stored, valid) = if element.is_float() {
+                let valid = match value.repr {
+                    Repr::Boxed => self.is_number(value.value),
+                    _ => self.b.ins().iconst(types::I8, 1),
+                };
+                let number = self.convert(value, Repr::Float);
+                let stored = if element == Element::F32 {
+                    self.b.ins().fdemote(types::F32, number)
+                } else {
+                    number
+                };
+                (stored, valid)
+            } else if value.repr == Repr::Int32 {
+                let stored = if Type::from(element) == types::I32 {
+                    value.value
+                } else {
+                    self.b.ins().ireduce(element.into(), value.value)
+                };
+                (stored, self.b.ins().iconst(types::I8, 1))
+            } else {
+                let number = self.convert(value, Repr::Float);
+                let integer = self.b.ins().fcvt_to_sint_sat(types::I64, number);
+                let exact = self.b.ins().fcvt_from_sint(types::F64, integer);
+                let integral = self.b.ins().fcmp(FloatCC::Equal, exact, number);
+                let upper = self.b.ins().f64const(9223372036854775808.0);
+                let lower = self.b.ins().f64const(-9223372036854775808.0);
+                let below = self.b.ins().fcmp(FloatCC::LessThan, number, upper);
+                let above = self
+                    .b
+                    .ins()
+                    .fcmp(FloatCC::GreaterThanOrEqual, number, lower);
+                let in_range = self.b.ins().band(below, above);
+                let valid = self.b.ins().band(integral, in_range);
+                (self.b.ins().ireduce(element.into(), integer), valid)
+            };
+            let store = self.b.create_block();
+            self.brif(valid, store, &[], slow, &[]);
+            self.switch(store);
+            self.b.ins().store(flags, stored, address, 0);
+            let undefined = self.constant(Value::UNDEFINED);
+            self.jump(done, &[BlockArg::Value(undefined)]);
         }
 
         self.switch(slow);
@@ -1506,9 +1485,27 @@ impl FunctionCompiler<'_, '_> {
             .ins()
             .iconst(types::I64, self.source_span.start as i64);
         let end = self.b.ins().iconst(types::I64, self.source_span.end as i64);
-        self.call_helper(Helper::ErrorOrigin, &[source, start, end]);
-        let exit = self.failed_exit();
-        self.jump(exit, &[]);
+        let origin = match self.error_origin {
+            Some(block) => block,
+            None => {
+                let block = self.b.create_block();
+                self.b.set_cold_block(block);
+                for _ in 0..3 {
+                    self.b.append_block_param(block, types::I64);
+                }
+                self.error_origin = Some(block);
+                block
+            }
+        };
+        self.b.set_cold_block(failed);
+        self.jump(
+            origin,
+            &[
+                BlockArg::Value(source),
+                BlockArg::Value(start),
+                BlockArg::Value(end),
+            ],
+        );
         self.switch(done);
         if !can_throw {
             return;

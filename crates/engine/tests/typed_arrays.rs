@@ -38,6 +38,33 @@ fn packed_numeric_conversion_and_bounds() {
 }
 
 #[test]
+fn indexed_reads_accept_mixed_element_kinds() {
+    check(
+        r#"function read(array, index) { return array[index]; }
+        function main() {
+            const arrays = [
+                Uint8Array.from([-1]), Uint16Array.from([-1]), Uint32Array.from([-1]),
+                Int8Array.from([255]), Int16Array.from([65535]), Int32Array.from([4294967295]),
+                Float32Array.from([1.5]), Float64Array.from([2.5])
+            ];
+            const expected = [255, 65535, 4294967295, -1, -1, -1, 1.5, 2.5];
+            for (let i = 0; i < 80; ++i) {
+                const k = i % arrays.length;
+                if (read(arrays[k], 0) !== expected[k] ||
+                    read(arrays[k], -1) !== undefined ||
+                    read(arrays[k], 0.5) !== undefined ||
+                    read(arrays[k], 1) !== undefined)
+                    return false;
+            }
+            const floats = Float64Array.from([-0, NaN, Infinity]);
+            const nan = read(floats, 1);
+            return 1 / read(floats, 0) === -Infinity &&
+                nan !== nan && read(floats, 2) === Infinity;
+        }"#,
+    );
+}
+
+#[test]
 fn typed_arrays_support_fill_iteration_and_branding() {
     check(
         r#"function main(){

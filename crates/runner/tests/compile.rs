@@ -1,0 +1,316 @@
+use std::process::{Command, Output};
+
+fn compile(arguments: &[&str], source: &str) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_js-runner"))
+        .env("JS_JIT_SSA", "1")
+        .env("JS_JIT_OSR", "0")
+        .env_remove("JS_JIT_JITDUMP")
+        .args(["--compile"])
+        .args(arguments)
+        .args(["--eval", source])
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn filter_selects_all_views_without_removing_inline_candidates() {
+    let output = compile(
+        &[
+            "--filter",
+            "selected",
+            "--ast",
+            "--clif",
+            "--planner",
+            "--asm",
+        ],
+        "function helper(x){return x+1;} function selected(x){return helper(x);} function unrelated(){return 42;}",
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    for heading in [
+        "analyzed AST selected",
+        "semantic IR selected",
+        "planner selected",
+        "Cranelift IR before optimization",
+        "Cranelift IR after optimization",
+        "machine code (",
+    ] {
+        assert!(text.contains(heading), "{heading}\n{text}");
+    }
+    assert!(!text.contains("[helper@"));
+    assert!(!text.contains("[unrelated@"));
+    let semantic = text
+        .split("semantic IR selected\n")
+        .nth(1)
+        .unwrap()
+        .split("[selected@")
+        .next()
+        .unwrap();
+    assert!(!semantic.contains("note:"));
+    assert!(text.contains("note: call at "));
+    assert!(text.contains("inline funcid"));
+    assert!(text.contains(" ; @"));
+    assert!(text.contains(" ; unattributed"));
+    let locations: Vec<_> = semantic
+        .lines()
+        .filter_map(|line| line.rsplit_once("  @").map(|(_, location)| location))
+        .collect();
+    let asm = text.split("machine code (").nth(1).unwrap();
+    for line in asm.lines() {
+        if let Some((_, location)) = line.split_once(" ; @") {
+            assert!(locations.contains(&location), "{line}");
+        }
+    }
+}
+
+#[test]
+fn filter_reports_no_matches_and_requires_compile_mode() {
+    let output = compile(&["--filter", "missing"], "function f(){return 1;}");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no functions match filter `missing`")
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
+        .args(["--filter", "f", "--eval", "function f(){return 1;}"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("require --compile"));
+}
+
+#[test]
+fn semantic_dump_includes_emitted_osr_instrumentation() {
+    let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
+        .env("JS_JIT_SSA", "1")
+        .env("JS_JIT_OSR", "1")
+        .env_remove("JS_JIT_JITDUMP")
+        .args([
+            "--compile",
+            "--no-ir",
+            "--filter",
+            "f",
+            "--semantic-ir",
+            "--eval",
+            "function f(rows,n){let total=0;for(let y=0;y<n;++y){let sum=0;for(let x=0;x<n;++x)sum+=rows[y][x]/1;total+=sum;}return total;}",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("osr_start"), "{text}");
+    assert!(!text.contains("note:"));
+}
+
+#[test]
+fn planner_can_be_printed_without_ir_or_execution() {
+    let output = compile(
+        &["--no-ir", "--planner"],
+        "function f(a){return a+1;} print('executed');",
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("planner f"));
+    assert!(text.contains("feedback: 0"));
+    assert!(text.contains("inline budget:"));
+    assert!(!text.contains("semantic IR"));
+    assert!(!text.contains("Cranelift IR"));
+    assert!(!text.contains("machine code"));
+    assert!(!text.lines().any(|line| line == "executed"));
+}
+
+#[test]
+fn semantic_ir_is_default_and_clif_is_explicit() {
+    let source = "function f(a){return a+1;}";
+    let output = compile(&[], source);
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("semantic IR f"));
+    assert!(!text.contains("Cranelift IR"));
+    assert!(!text.contains("planner f"));
+    let output = compile(&["--no-semantic-ir", "--clif"], source);
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(!text.contains("semantic IR"));
+    assert!(text.contains("Cranelift IR before optimization"));
+    assert!(text.contains("Cranelift IR after optimization"));
+}
+
+#[test]
+fn planner_reports_region_tree_and_emitted_assumptions() {
+    let output = compile(
+        &["--planner"],
+        "function f(rows){let sum=0;for(let y=0;y<2;++y){const row=rows[y];for(let x=0;x<2;++x)sum+=row[x];}return sum;}",
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    let planner = text.split("planner f\n").nth(1).unwrap();
+    for entry in [
+        "regions:",
+        "region plan before versioning:",
+        "region function",
+        "region loop at block",
+        "preheader=",
+        "blocks:",
+        "probe ",
+        "typed receiver ",
+        "typed read ",
+        "region emission:",
+    ] {
+        assert!(planner.contains(entry), "{entry}\n{planner}");
+    }
+    let semantic = text
+        .split("semantic IR f\n")
+        .nth(1)
+        .unwrap()
+        .split("planner f")
+        .next()
+        .unwrap();
+    assert!(!semantic.contains("region plan before versioning"));
+    let plain = compile(
+        &[],
+        "function f(rows){let sum=0;for(let y=0;y<2;++y){const row=rows[y];for(let x=0;x<2;++x)sum+=row[x];}return sum;}",
+    );
+    assert!(plain.status.success());
+    let plain = String::from_utf8(plain.stdout).unwrap();
+    assert_eq!(text.split("[f@1#0] planner").next().unwrap(), plain);
+}
+
+#[test]
+fn execution_collects_object_feedback_and_prints_guarded_variants() {
+    let output = compile(
+        &[
+            "--filter",
+            "selected",
+            "--planner",
+            "--clif",
+            "--asm",
+            "--execute",
+            "const object = {method: function(x){return x+1;}}; const runner = {call: selected}; for(let i=0;i<32;++i) runner.call(object); object.method = function(x){return x+2;}; print(runner.call(object));",
+        ],
+        "function selected(object){return object.method(4);}",
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("feedback: 0"), "{text}");
+    assert!(text.contains(".feedback@"), "{text}");
+    assert!(text.contains("guard_code=true"), "{text}");
+    assert!(
+        text.matches("Cranelift IR after optimization").count() >= 2,
+        "{text}"
+    );
+    assert!(text.matches("machine code (").count() >= 2, "{text}");
+    assert!(text.lines().any(|line| line == "6"), "{text}");
+}
+
+#[test]
+fn execution_requires_compile_and_reports_runtime_errors() {
+    let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
+        .args(["--execute", "main();", "--eval", "function main(){}"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("require --compile"));
+    let output = compile(&["--execute", "missing();"], "function f(){}");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("missing"));
+}
+
+#[test]
+fn filter_append_allows_loop_guards_and_preserves_method_replacement() {
+    let output = compile(
+        &[
+            "--filter",
+            "selected",
+            "--planner",
+            "--execute",
+            "const values = [1,2,3]; const constraint = {allows: function(value){return true;}}; const runner = {call:selected}; for(let i=0;i<32;++i) runner.call(values,constraint); const before = runner.call(values,constraint).length; constraint.allows = function(value){return false;}; print(before === 3 && runner.call(values,constraint).length === 0);",
+        ],
+        "function selected(values,constraint){return values.filter(value => constraint.allows(value));}",
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("combined entry guards:"), "{text}");
+    assert!(text.contains("hoisted guard"), "{text}");
+    assert!(text.lines().any(|line| line == "true"), "{text}");
+}
+
+#[test]
+fn native_push_feedback_specializes_unknown_receivers_and_keeps_fallback() {
+    let output = compile(
+        &[
+            "--filter",
+            "selected",
+            "--planner",
+            "--execute",
+            "const runner={call:selected}; const a=[]; for(let i=0;i<32;++i) runner.call(a,i); const custom={push:function(x){return x+100;}}; print(a.length===32 && runner.call(custom,7)===107);",
+        ],
+        "function selected(a,x){return a.push(x);}",
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    let (initial, specialized) = text.split_once(".feedback@").unwrap();
+    assert!(!initial.contains("array_append"), "{text}");
+    assert!(specialized.contains("native ArrayPush"), "{text}");
+    assert!(specialized.contains("is_array_push"), "{text}");
+    assert!(specialized.contains("array_append"), "{text}");
+    assert!(text.lines().any(|line| line == "true"), "{text}");
+}
+
+#[test]
+fn fresh_array_push_is_lowered_without_execution_or_identity_guards() {
+    let source = "function selected(x){const a=[]; const first=a.push(x,2); const second=a.push(); return first===2 && second===2 && a[0]===x && a[1]===2;}";
+    let output = compile(&["--filter", "selected", "--planner"], source);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("feedback: 0"), "{text}");
+    assert!(text.contains("lower Array.push without guards"), "{text}");
+    assert!(text.contains("array_append"), "{text}");
+    assert!(!text.contains("is_array_push"), "{text}");
+    assert!(!text.contains(".feedback@"), "{text}");
+    let output = compile(
+        &["--filter", "selected", "--execute", "print(selected(7));"],
+        source,
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line == "true")
+    );
+}
