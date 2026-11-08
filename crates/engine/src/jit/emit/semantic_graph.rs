@@ -1448,7 +1448,7 @@ impl FunctionCompiler<'_, '_> {
                             continue;
                         };
                         self.switch(edge);
-                        if graph.cold.contains(&destination.block) {
+                        if cold || graph.cold.contains(&destination.block) {
                             self.b.set_cold_block(edge);
                         }
                         let (block, args) = target(self, destination);

@@ -1,5 +1,44 @@
 use js_engine::{Engine, EngineOptions, Value};
 
+#[test]
+fn numeric_loop_continuations_preserve_accumulators_and_shared_bounds() {
+    let source = r#"
+        function accumulate(rows, offsets, bound) {
+            if (bound < 0)
+                offsets[0] = 0;
+            let sum = 0;
+            let weighted = 0;
+            for (let k = 0; k < bound; ++k) {
+                const x = offsets[k];
+                sum += rows[x][0];
+                weighted += rows[x][0] / (k + 1);
+            }
+            return sum + weighted;
+        }
+        function main() {
+            const runner = {call: accumulate};
+            const rows = [Float64Array.from([2]), Float64Array.from([4]), Float64Array.from([8])];
+            const offsets = Int32Array.from([0, 1, 2, 0, 1, 2]);
+            for (let i = 0; i < 40; ++i)
+                runner.call(rows, offsets, 6);
+            rows[2] = [8];
+            return runner.call(rows, offsets, 6);
+        }
+    "#;
+    let execute = |enabled| {
+        let mut engine = Engine::with_options(EngineOptions {
+            ssa_opt: enabled,
+            background_compile: false,
+            ..Default::default()
+        })
+        .unwrap();
+        engine.compile(source, "numeric_continuation.js").unwrap();
+        engine.call("main", &[]).unwrap().value()
+    };
+    assert_eq!(execute(true), Value::number(37.3));
+    assert_eq!(execute(true), execute(false));
+}
+
 fn run(source: &str, enabled: bool) -> Result<Value, String> {
     let mut engine = Engine::with_options(EngineOptions {
         ssa_opt: enabled,
