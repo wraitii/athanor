@@ -1,6 +1,7 @@
 mod arrays;
 mod borrow;
 mod build;
+mod caches;
 mod comparisons;
 mod construction;
 pub(in crate::jit) mod facts;
@@ -268,8 +269,10 @@ pub(super) enum Op {
     IteratorNew(Value),
     IteratorNext(Value),
     IsIndexed(Value),
+    IsArrayIndex(Value, Value),
     IndexedLength(Value),
     IndexedGet(Value, Value),
+    ArrayIndex(Value, Value),
     // Extracted values stay rooted independently of the pack across argument initialization.
     PackTake(Value, Value),
     EnumerateNew(Value),
@@ -280,6 +283,9 @@ pub(super) enum Op {
     MarkClass(Value),
     DisableConstructor(Value),
     Get(Value, String),
+    IsPropertyCached(Value, Inst, String),
+    CachedProperty(Value, Inst),
+    FillPropertyCache(Value, Inst, String),
     GetIndex(Value, Value),
     Set(Value, String, Value),
     SetIndex(Value, Value, Value),
@@ -438,6 +444,9 @@ impl Op {
             | Op::EnumerateNext(value)
             | Op::IsUninitialized(value)
             | Op::Get(value, _)
+            | Op::IsPropertyCached(value, _, _)
+            | Op::CachedProperty(value, _)
+            | Op::FillPropertyCache(value, _, _)
             | Op::MarkClass(value)
             | Op::DisableConstructor(value)
             | Op::PropertyKey(value)
@@ -466,6 +475,8 @@ impl Op {
             | Op::GetIndex(object, key)
             | Op::TypedIndex(object, key, _)
             | Op::IndexedGet(object, key)
+            | Op::ArrayIndex(object, key)
+            | Op::IsArrayIndex(object, key)
             | Op::PackTake(object, key)
             | Op::ProbeIndex(object, key)
             | Op::Binary(_, object, key)
@@ -553,6 +564,9 @@ impl Op {
             | Op::EnumerateNext(value)
             | Op::IsUninitialized(value)
             | Op::Get(value, _)
+            | Op::IsPropertyCached(value, _, _)
+            | Op::CachedProperty(value, _)
+            | Op::FillPropertyCache(value, _, _)
             | Op::MarkClass(value)
             | Op::DisableConstructor(value)
             | Op::PropertyKey(value)
@@ -581,6 +595,8 @@ impl Op {
             | Op::GetIndex(object, key)
             | Op::TypedIndex(object, key, _)
             | Op::IndexedGet(object, key)
+            | Op::ArrayIndex(object, key)
+            | Op::IsArrayIndex(object, key)
             | Op::PackTake(object, key)
             | Op::ProbeIndex(object, key)
             | Op::Binary(_, object, key)
@@ -1066,11 +1082,13 @@ impl Graph {
                 &[],
                 None,
             ),
-            Op::Get(..) | Op::GetIndex(..) => closed(
+            Op::Get(..) | Op::GetIndex(..) | Op::FillPropertyCache(..) => closed(
                 HEAP_READ | GLOBAL_READ | ALLOCATION | INTERNAL | ERROR,
                 PROPERTY,
                 Borrowed,
             ),
+            Op::IsPropertyCached(..) => closed(HEAP_READ, &[], Unowned),
+            Op::CachedProperty(..) => closed(HEAP_READ | INTERNAL | ERROR, &[], Borrowed),
             Op::Set(..) | Op::SetIndex(..) => closed(
                 HEAP_READ | HEAP_WRITE | ALLOCATION | INTERNAL | ERROR,
                 PROPERTY,
@@ -1143,8 +1161,11 @@ impl Graph {
             Op::GuardCommit(_) => closed(INTERNAL, &[], None),
             Op::View(_) => closed(HEAP_READ, &[Assumption::FixedTypedStorage], Unowned),
             Op::IsTyped(..) | Op::IsIndexed(_) => closed(0, &[], Unowned),
+            Op::IsArrayIndex(..) => closed(HEAP_READ, &[], Unowned),
             Op::IndexedLength(_) => closed(HEAP_READ, &[], Unowned),
-            Op::IndexedGet(..) => closed(HEAP_READ | INTERNAL | ERROR, &[], Borrowed),
+            Op::IndexedGet(..) | Op::ArrayIndex(..) => {
+                closed(HEAP_READ | INTERNAL | ERROR, &[], Borrowed)
+            }
             Op::PackTake(..) => closed(HEAP_READ | HEAP_WRITE | INTERNAL, &[], Owned),
             Op::TypedIndex(..) => closed(HEAP_READ, &[Assumption::FixedTypedStorage], Unowned),
             Op::IsNumber(_) | Op::IsString(_) => closed(0, &[], Unowned),
@@ -1556,6 +1577,7 @@ pub(super) fn optimize_planned(
             osr: None,
         });
     }
+    caches::apply(&mut graph)?;
     reads::apply(&mut graph, &reads, &mut notes)?;
     comparisons::expose(&mut graph);
     optimize::sink_closures(&mut graph, &mut notes);

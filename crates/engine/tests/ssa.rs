@@ -832,3 +832,33 @@ fn borrowed_rows_preserve_guards_and_owner_invalidation() {
         assert_eq!(engine.call("main", &[]).unwrap().value(), Value::TRUE);
     }
 }
+
+#[test]
+fn borrowed_phi_rows_keep_their_owners_alive() {
+    let source = r#"
+        function selected(choose) {
+            const first = [[3]];
+            const second = [[9]];
+            const row = choose ? first[0] : second[0];
+            const scratch = [1, 2, 3];
+            return row[0] + scratch[0];
+        }
+        function main() {
+            for (let i = 0; i < 64; ++i) {
+                if (selected(true) !== 4 || selected(false) !== 10)
+                    return false;
+            }
+            return true;
+        }
+    "#;
+    for opt_level in [OptLevel::None, OptLevel::Speed] {
+        let mut engine = Engine::with_options(EngineOptions {
+            opt_level,
+            background_compile: false,
+            ..Default::default()
+        })
+        .unwrap();
+        engine.compile(source, "borrowed-phi.js").unwrap();
+        assert_eq!(engine.call("main", &[]).unwrap().value(), Value::TRUE);
+    }
+}

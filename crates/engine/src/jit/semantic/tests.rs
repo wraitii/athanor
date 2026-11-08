@@ -424,7 +424,7 @@ fn indexed_rows_borrow_from_owned_receivers_through_guards() {
             .insts
             .values()
             .filter(|data| {
-                matches!(data.op, Op::IndexedGet(..))
+                matches!(data.op, Op::ArrayIndex(..))
                     && &source[data.span.start as usize..data.span.end as usize] == "height[i&1]"
             })
             .collect();
@@ -437,6 +437,67 @@ fn indexed_rows_borrow_from_owned_receivers_through_guards() {
         );
         analysis.graph.verify().unwrap();
     }
+}
+
+// Varying read guards alone do not trigger region versioning, so generic reads still
+// merge with the fast path and prevent borrowing. Enabling these regions also requires
+// repairing loop values correctly on guard-failure continuations.
+#[test]
+#[should_panic(expected = "guard-only region should borrow the array row")]
+fn guard_only_region_borrows_rows_without_entry_assumptions() {
+    use crate::jit::planner::{ReadKind, ReadType, Site};
+
+    let source =
+        "function f(height){let sum=0;for(let i=0;i<8;++i)sum+=height[i][0]/1;return sum;}";
+    let canonical = canonicalize(lower_source(source).unwrap(), true).unwrap();
+    let mut repository = specialize::Repository::default();
+    for data in canonical.graph.insts.values() {
+        if !matches!(data.op, Op::GetIndex(..)) {
+            continue;
+        }
+        let text = &source[data.span.start as usize..data.span.end as usize];
+        repository.read_feedback.insert(
+            (
+                Site {
+                    source: 0,
+                    start: data.span.start,
+                    end: data.span.end,
+                },
+                ReadKind::Receiver,
+            ),
+            if text == "height[i]" {
+                ReadType::Array
+            } else {
+                ReadType::Typed(crate::heap::TypedKind::Float32)
+            },
+        );
+    }
+    let analysis = optimize_canonical(canonical, true, Some((&repository, 0))).unwrap();
+    analysis.graph.verify().unwrap();
+    let graph = &analysis.graph;
+    let cfg = Cfg::new(graph);
+    let rows: Vec<_> = cfg
+        .rpo
+        .iter()
+        .filter(|block| !graph.cold.contains(block))
+        .flat_map(|&block| graph.blocks[block].insts.iter())
+        .filter_map(|&inst| match graph.insts[inst].op {
+            Op::TypedIndex(
+                object,
+                _,
+                TypedRead {
+                    element: Some(crate::heap::TypedKind::Float32),
+                    ..
+                },
+            ) => Some(object),
+            _ => None,
+        })
+        .collect();
+    assert!(!rows.is_empty());
+    assert!(
+        rows.iter().all(|row| graph.borrowed.contains(row)),
+        "guard-only region should borrow the array row"
+    );
 }
 
 #[test]
@@ -676,7 +737,7 @@ fn global_writes_prevent_versioning_and_load_reuse() {
 #[test]
 fn integer_coercions_are_reused_and_hoisted_out_of_bit_loops() {
     let analysis = analyze_source(
-        "function f(grid) { let sum=0; for(let x=0;x<grid.length;++x) { const word=grid[x]; for(let i=0;i<16;++i) { sum+=word&(1<<i); sum+=word^i; } } return sum; }",
+        "function f() { const grid=new Float64Array(4); let sum=0; for(let x=0;x<grid.length;++x) { const word=grid[x]; for(let i=0;i<16;++i) { sum+=word&(1<<i); sum+=word^i; } } return sum; }",
     );
     let graph = &analysis.graph;
     let cfg = Cfg::new(graph);
@@ -829,4 +890,44 @@ fn verifier_rejects_missing_late_and_mismatched_definitions() {
     assert_eq!(mismatch.insts[def].result, Some(value));
     mismatch.insts[def].result = None;
     assert!(mismatch.verify().is_err());
+}
+
+#[test]
+fn borrowed_rows_flow_through_phi_parameters() {
+    for (selection, body, expected) in [
+        ("choose ? rows[0] : rows[1]", "", true),
+        ("choose ? rows[0] : rows[1]", "change(rows);", false),
+        ("choose ? rows[0] : rows[1]", "rows[0]=null;", false),
+        ("choose ? rows[0] : {0: 3}", "", false),
+    ] {
+        let source =
+            format!("function f(rows,choose){{const row={selection};{body}return row[0];}}");
+        let mut graph = canonicalize(lower_source(&source).unwrap(), true)
+            .unwrap()
+            .graph;
+        let mut result = None;
+        for (_, data) in graph.insts.iter_mut() {
+            if let Op::GetIndex(object, key) = data.op {
+                let text = &source[data.span.start as usize..data.span.end as usize];
+                if text == "row[0]" {
+                    result = Some(object);
+                    data.op = Op::TypedIndex(
+                        object,
+                        key,
+                        TypedRead {
+                            element: Some(crate::heap::TypedKind::Float32),
+                            bounded: false,
+                        },
+                    );
+                } else {
+                    data.op = Op::ArrayIndex(object, key);
+                }
+            }
+        }
+        let row = result.unwrap();
+        assert!(matches!(graph.values[row], ValueDef::Param(..)));
+        let facts = Facts::compute(&graph);
+        borrow::borrows(&mut graph, &facts, &mut Vec::new());
+        assert_eq!(graph.borrowed.contains(&row), expected, "{source}");
+    }
 }

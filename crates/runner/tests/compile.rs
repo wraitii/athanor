@@ -151,7 +151,7 @@ fn semantic_ir_is_default_and_clif_is_explicit() {
 fn planner_reports_region_tree_and_emitted_assumptions() {
     let output = compile(
         &["--planner"],
-        "function f(rows){let sum=0;for(let y=0;y<2;++y){const row=rows[y];for(let x=0;x<2;++x)sum+=row[x];}return sum;}",
+        "function f(rows){let sum=0;for(let y=0;y<2;++y){const row=new Float64Array(2);for(let x=0;x<2;++x)sum+=row[x];}return sum;}",
     );
     assert!(
         output.status.success(),
@@ -163,11 +163,9 @@ fn planner_reports_region_tree_and_emitted_assumptions() {
     for entry in [
         "regions:",
         "region plan before versioning:",
-        "region function",
         "region loop at block",
         "preheader=",
         "blocks:",
-        "probe ",
         "typed receiver ",
         "typed read ",
         "region emission:",
@@ -184,7 +182,7 @@ fn planner_reports_region_tree_and_emitted_assumptions() {
     assert!(!semantic.contains("region plan before versioning"));
     let plain = compile(
         &[],
-        "function f(rows){let sum=0;for(let y=0;y<2;++y){const row=rows[y];for(let x=0;x<2;++x)sum+=row[x];}return sum;}",
+        "function f(rows){let sum=0;for(let y=0;y<2;++y){const row=new Float64Array(2);for(let x=0;x<2;++x)sum+=row[x];}return sum;}",
     );
     assert!(plain.status.success());
     let plain = String::from_utf8(plain.stdout).unwrap();

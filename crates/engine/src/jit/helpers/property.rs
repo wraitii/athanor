@@ -166,6 +166,7 @@ pub(super) extern "C" fn js_property_get(
 /// An empty cache expects a dictionary receiver holding a property with no shape, which none do.
 #[repr(C)]
 pub(crate) struct PropertyCache {
+    pub(crate) initialized: u32,
     pub(crate) shape: u32,
     pub(crate) index: u32,
     pub(crate) holder: u64,
@@ -176,6 +177,8 @@ pub(crate) struct PropertyCache {
     write: crate::heap::PropertyWriteCache,
 }
 
+pub(crate) const CACHE_INITIALIZED_OFFSET: i32 =
+    std::mem::offset_of!(PropertyCache, initialized) as i32;
 pub(crate) const CACHE_SHAPE_OFFSET: i32 = std::mem::offset_of!(PropertyCache, shape) as i32;
 pub(crate) const CACHE_INDEX_OFFSET: i32 = std::mem::offset_of!(PropertyCache, index) as i32;
 pub(crate) const CACHE_HOLDER_OFFSET: i32 = std::mem::offset_of!(PropertyCache, holder) as i32;
@@ -198,6 +201,7 @@ pub(crate) const CACHE_ADDITION_INDEX_OFFSET: i32 =
 impl PropertyCache {
     pub(crate) fn new(name: &str) -> Self {
         Self {
+            initialized: 0,
             shape: crate::heap::DICTIONARY,
             index: 0,
             holder: 0,
@@ -228,9 +232,11 @@ pub(super) extern "C" fn js_property_get_cached(
     let cache = unsafe { &mut *cache };
     let heap = unsafe { &*ctx }.global.heap();
     if let Some(value) = cache.builtin(heap, object) {
+        cache.initialized = 1;
         return unsafe { &mut *ctx }.retain_temp(value);
     }
     if let Some(found) = heap.cached_property(object, &cache.name) {
+        cache.initialized = 1;
         cache.shape = found.shape;
         cache.index = found.index;
         cache.holder = found.holder;

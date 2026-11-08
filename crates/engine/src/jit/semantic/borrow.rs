@@ -10,9 +10,11 @@ const HEAP: Types = Types::STRING.union(Types::OBJECT).union(Types::OTHER);
 pub(in crate::jit) fn receiver(op: &Op) -> Option<Value> {
     match op {
         Op::Get(object, _)
+        | Op::CachedProperty(object, _)
         | Op::ProbeProperty(object, _)
         | Op::GetIndex(object, _)
-        | Op::IndexedGet(object, _) => Some(*object),
+        | Op::IndexedGet(object, _)
+        | Op::ArrayIndex(object, _) => Some(*object),
         _ => None,
     }
 }
@@ -47,8 +49,21 @@ impl Borrows<'_> {
 
     fn redefined(&mut self, live: &HashSet<Value>, defined: Value) {
         for &value in live {
-            if value != defined && self.chains[&value].contains(&defined) {
-                self.rejected.insert(value);
+            if value == defined {
+                continue;
+            }
+            let mut pending = self.chains[&value].clone();
+            let mut visited = HashSet::new();
+            while let Some(receiver) = pending.pop() {
+                if receiver == defined {
+                    self.rejected.insert(value);
+                    break;
+                }
+                if visited.insert(receiver)
+                    && let Some(chain) = self.chains.get(&receiver)
+                {
+                    pending.extend(chain.iter().copied());
+                }
             }
         }
     }
@@ -80,7 +95,13 @@ pub(super) fn borrows(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>)
             && facts.of(result).intersects(HEAP)
         {
             reads.insert(result, object);
-            if matches!(data.op, Op::IndexedGet(..) | Op::ProbeProperty(..)) {
+            if matches!(
+                data.op,
+                Op::IndexedGet(..)
+                    | Op::ArrayIndex(..)
+                    | Op::ProbeProperty(..)
+                    | Op::CachedProperty(..)
+            ) {
                 held.insert(result);
             }
         }
@@ -96,6 +117,54 @@ pub(super) fn borrows(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>)
             objects.insert(value);
         }
         chains.insert(value, chain);
+    }
+    let cfg = Cfg::new(graph);
+    let mut merged = HashMap::new();
+    loop {
+        let mut changed = false;
+        for &block in &cfg.rpo {
+            for (index, &param) in graph.blocks[block].params.iter().enumerate() {
+                if chains.contains_key(&param) || !facts.of(param).intersects(HEAP) {
+                    continue;
+                }
+                let incoming: Vec<_> = cfg.preds[block]
+                    .iter()
+                    .flat_map(|&pred| {
+                        graph.blocks[pred]
+                            .terminator
+                            .as_ref()
+                            .unwrap()
+                            .kind
+                            .targets()
+                    })
+                    .filter(|target| target.block == block)
+                    .map(|target| target.args[index])
+                    .collect();
+                if incoming.is_empty() || incoming.iter().any(|value| !objects.contains(value)) {
+                    continue;
+                }
+                let mut chain: Vec<_> = incoming
+                    .iter()
+                    .flat_map(|value| chains[value].iter().copied())
+                    .collect();
+                chain.sort();
+                chain.dedup();
+                if chain
+                    .iter()
+                    .any(|&owner| !cfg.dominates(graph.def_block(owner), block))
+                {
+                    continue;
+                }
+                chains.insert(param, chain);
+                objects.insert(param);
+                held.insert(param);
+                merged.insert(param, incoming);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
     }
     // The environment owns these values until a write or reentry invalidates the borrow.
     for (_, data) in &graph.insts {
@@ -122,7 +191,6 @@ pub(super) fn borrows(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>)
             }
         }
     }
-    let cfg = Cfg::new(graph);
     let mut borrows = Borrows {
         graph,
         facts,
@@ -156,6 +224,9 @@ pub(super) fn borrows(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>)
         let rejected: Vec<Value> = accepted
             .iter()
             .filter(|value| {
+                if let Some(incoming) = merged.get(value) {
+                    return incoming.iter().any(|value| !accepted.contains(value));
+                }
                 if local.contains(value) {
                     return false;
                 }

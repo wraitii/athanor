@@ -84,17 +84,42 @@ pub(super) fn assign(
             && graph.borrowed.contains(&result)
             && let Some(receiver) = borrowed_receiver(&data.op)
         {
-            receivers.insert(result, receiver);
+            receivers.insert(result, vec![receiver]);
         }
     }
-    // A borrowed read stays valid only while its receiver holds the value.
+    for &block in &cfg.rpo {
+        for (index, &param) in graph.blocks[block].params.iter().enumerate() {
+            if graph.borrowed.contains(&param) {
+                let incoming = cfg.preds[block]
+                    .iter()
+                    .flat_map(|&pred| {
+                        graph.blocks[pred]
+                            .terminator
+                            .as_ref()
+                            .unwrap()
+                            .kind
+                            .targets()
+                    })
+                    .filter(|target| target.block == block)
+                    .map(|target| target.args[index])
+                    .collect();
+                receivers.insert(param, incoming);
+            }
+        }
+    }
     let anchored = |value: Value, live: &mut HashSet<Value>| {
-        let mut value = Some(value);
-        while let Some(current) = value {
+        let mut pending = vec![value];
+        let mut visited = HashSet::new();
+        while let Some(current) = pending.pop() {
+            if !visited.insert(current) {
+                continue;
+            }
             if owned(current) {
                 live.insert(current);
             }
-            value = receivers.get(&current).copied();
+            if let Some(owners) = receivers.get(&current) {
+                pending.extend(owners.iter().copied());
+            }
         }
     };
     let terminator_uses = |block: Block| {

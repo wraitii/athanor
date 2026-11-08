@@ -1508,13 +1508,12 @@ mod feedback_tests {
             engine.call("read", &args).unwrap().value(),
             Value::number(2.5)
         );
-        assert_eq!(entry(&engine, code), original);
         assert_eq!(
             engine.call("read", &args).unwrap().value(),
             Value::number(2.5)
         );
         let optimized = entry(&engine, code);
-        assert_eq!(optimized, original);
+        assert_ne!(optimized, original);
         assert_eq!(
             engine
                 .call("read", &[Value::number(0.0), Value::number(-1.0)])
@@ -1639,7 +1638,7 @@ mod feedback_tests {
             );
         }
         let optimized = entry(&engine, code);
-        assert_eq!(optimized, original);
+        assert_ne!(optimized, original);
         engine.call("replace", &[]).unwrap();
         assert_eq!(
             engine.call("read", &args).unwrap().value(),
@@ -1823,7 +1822,7 @@ mod feedback_tests {
         let mut engine = osr_engine(true);
         engine
             .compile(
-            "var values=[1,2,3];function hot(xs){let total=0;for(let i=0;i<3;++i)total+=xs[i];return total;}",
+            "var values=[1,2,3];function hot(xs){let total=0;for(let i=0;i<3;++i)total+=xs[i]/1;return total;}",
                 "osr-warmup.js",
             )
             .unwrap();

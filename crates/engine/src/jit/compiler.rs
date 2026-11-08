@@ -1278,6 +1278,7 @@ impl Compiler {
                 self.ssa_opt.then_some(emit::Feedback {
                     function_return: region.is_none(),
                     get_refinement: self.get_refinement,
+                    reads: &self.canonical.read_feedback,
                     owner: code.as_u32() as u64,
                 }),
             )?;
@@ -1625,6 +1626,7 @@ impl Compiler {
                     feedback.map(|owner| emit::Feedback {
                         function_return: true,
                         get_refinement: self.get_refinement,
+                        reads: &self.canonical.read_feedback,
                         owner: owner.as_u32() as u64,
                     }),
                 )?;

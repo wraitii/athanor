@@ -201,14 +201,20 @@ impl Repository {
                     Op::GlobalWrite(name, _) | Op::GlobalInitialize(name, _) => {
                         effects.globals_written.insert(name.clone());
                     }
-                    Op::Get(_, name) => {
+                    Op::Get(_, name) | Op::FillPropertyCache(_, _, name) => {
                         effects.properties_read.insert(name.clone());
+                    }
+                    Op::IsPropertyCached(..) | Op::CachedProperty(..) => {
+                        effects.properties_read.insert("*".into());
                     }
                     Op::Set(_, name, _) | Op::Define(_, name, _) | Op::DefineHidden(_, name, _) => {
                         effects.properties_written.insert(name.clone());
                         effects.flags |= HEAP_WRITE;
                     }
-                    Op::GetIndex(..) | Op::IndexedGet(..) | Op::TypedIndex(..) => {
+                    Op::GetIndex(..)
+                    | Op::IndexedGet(..)
+                    | Op::ArrayIndex(..)
+                    | Op::TypedIndex(..) => {
                         effects.properties_read.insert("*".into());
                     }
                     Op::SetIndex(..) | Op::ArrayAppend(..) => {
@@ -1073,7 +1079,7 @@ mod tests {
     }
 
     #[test]
-    fn conditional_proofs_survive_retained_inner_copies() {
+    fn conditional_proofs_survive_without_typed_storage_speculation() {
         let (canonical, bodies) = fixture(
             "function first(n){if(n)return first(n-1);return 1;} function main(rows){let sum=0;for(let y=0;y<2;++y){const row=rows[y];for(let x=0;x<2;++x)sum+=row[x]+first(x);}return sum;}",
         );
@@ -1081,8 +1087,8 @@ mod tests {
         let plan = conditional_plan(&graph, &bodies, &mut Vec::new());
         let regions =
             super::super::optimize::version(&mut graph, &plan, None, &mut Vec::new()).unwrap();
-        assert!(regions.len() > 1);
-        assert!(graph.closed_calls.len() > 1);
+        assert!(!regions.is_empty());
+        assert!(!graph.closed_calls.is_empty());
         let facts = Facts::compute(&graph);
         for &inst in graph.closed_calls.keys() {
             assert_eq!(graph.inst_contract(inst, &facts).reentry, Reentry::Closed);

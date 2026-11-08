@@ -578,7 +578,7 @@ mod tests {
         assert!(root.children.is_empty());
         assert!(!root.requirements.is_empty());
         assert!(!root.checks.is_empty());
-        assert!(!root.typed_reads.is_empty());
+        assert!(root.typed_reads.is_empty());
         assert_eq!(root.body.len(), Cfg::new(&graph).rpo.len());
         graph.verify().unwrap();
     }
@@ -645,7 +645,7 @@ mod tests {
     }
 
     #[test]
-    fn iteration_local_receivers_keep_an_inner_region() {
+    fn unobserved_rows_do_not_speculate_on_typed_storage() {
         let graph = graph(
             "function f(rows){let sum=0;for(let y=0;y<2;++y){const row=rows[y];for(let x=0;x<2;++x)sum+=row[x];}return sum;}",
         );
@@ -653,14 +653,9 @@ mod tests {
         assert_eq!(plans.len(), 1);
         let root = &plans[0];
         assert!(root.entry.is_none());
-        assert_eq!(root.children.len(), 1);
-        let child = &root.children[0];
-        assert!(child.entry.is_some());
-        assert!(!child.typed_reads.is_empty());
-        assert!(child.typed.iter().all(|(object, _)| {
-            root.body.contains(&graph.def_block(*object))
-                && !child.body.contains(&graph.def_block(*object))
-        }));
+        assert!(root.children.is_empty());
+        assert!(root.typed.is_empty());
+        assert!(root.typed_reads.is_empty());
     }
 
     #[test]
@@ -713,13 +708,13 @@ mod tests {
     #[test]
     fn nested_regions_reuse_dominating_typed_guards() {
         let mut graph = graph(
-            "function f(rows,xs){unknown();let sum=0;for(let y=0;y<2;++y){const n=rows[y];for(let x=0;x<n;++x)sum+=xs[x];}return sum;}",
+            "function f(rows){const xs=new Float64Array(2);unknown();let sum=0;for(let y=0;y<2;++y){const n=rows[y];for(let x=0;x<n;++x)sum+=xs[x];}return sum;}",
         );
         let xs = graph
             .insts
             .values()
             .find_map(|data| {
-                matches!(data.op, Op::Argument(1))
+                matches!(data.op, Op::Construct { .. })
                     .then_some(data.result)
                     .flatten()
             })

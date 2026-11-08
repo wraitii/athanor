@@ -37,14 +37,16 @@ pub(super) enum FunctionKind {
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct Feedback {
+pub(super) struct Feedback<'a> {
     pub(super) function_return: bool,
     pub(super) get_refinement: bool,
     pub(super) owner: u64,
+    pub(super) reads:
+        &'a HashMap<(super::planner::Site, super::planner::ReadKind), super::planner::ReadType>,
 }
 
 pub(super) struct FunctionCompiler<'a, 'f> {
-    feedback: Option<Feedback>,
+    feedback: Option<Feedback<'a>>,
     names: &'a mut Vec<Box<str>>,
     cells: &'a mut Vec<Box<u64>>,
     data: &'a mut FunctionData,
@@ -74,6 +76,7 @@ pub(super) struct FunctionCompiler<'a, 'f> {
     frame: Option<CallerFrame>,
     frame_code: bool,
     fixed_signatures: HashMap<u16, SigRef>,
+    property_caches: HashMap<super::semantic::Inst, i64>,
     slots: HashMap<u32, u32>,
     slot_count: u32,
 }
@@ -115,7 +118,7 @@ pub(super) fn build_function(
     _closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
     kind: FunctionKind,
     graph: &super::semantic::Graph,
-    feedback: Option<Feedback>,
+    feedback: Option<Feedback<'_>>,
 ) -> Result<(), Error> {
     build_callable(
         b,
@@ -179,7 +182,7 @@ fn build_callable(
     params: Span,
     kind: FunctionKind,
     body: CallableBody<'_>,
-    feedback: Option<Feedback>,
+    feedback: Option<Feedback<'_>>,
 ) -> Result<(), Error> {
     let entry = b.create_block();
     b.switch_to_block(entry);
@@ -234,6 +237,7 @@ fn build_callable(
         frame: None,
         frame_code: false,
         fixed_signatures: HashMap::new(),
+        property_caches: HashMap::new(),
         slots: HashMap::new(),
         slot_count: 0,
     };
@@ -349,6 +353,7 @@ pub(super) fn build_global(
         frame: None,
         frame_code: false,
         fixed_signatures: HashMap::new(),
+        property_caches: HashMap::new(),
         slots: HashMap::new(),
         slot_count: 0,
     };

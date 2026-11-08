@@ -55,14 +55,23 @@ impl FunctionCompiler<'_, '_> {
         if !feedback.get_refinement && matches!(helper, Helper::ObserveGet | Helper::ObserveIndex) {
             return;
         }
+        let site = crate::jit::planner::Site {
+            source: self.source_name.0,
+            start: span.start,
+            end: span.end,
+        };
+        let kind = match helper {
+            Helper::ObserveGet => Some(crate::jit::planner::ReadKind::Result),
+            Helper::ObserveIndex => Some(crate::jit::planner::ReadKind::Receiver),
+            _ => None,
+        };
+        if kind.is_some_and(|kind| feedback.reads.contains_key(&(site, kind))) {
+            return;
+        }
         let address = self.function_data(crate::jit::planner::ObservationCache {
             recorded: 0,
             owner: feedback.owner,
-            site: crate::jit::planner::Site {
-                source: self.source_name.0,
-                start: span.start,
-                end: span.end,
-            },
+            site,
         });
         let recorded = self
             .b
@@ -247,10 +256,20 @@ impl FunctionCompiler<'_, '_> {
                 address
             })
             .collect();
-        let rooted =
-            |value: crate::jit::semantic::Value| suspends || facts.of(value).intersects(HEAP);
+        let rooted = |value: crate::jit::semantic::Value| {
+            suspends || facts.of(value).intersects(HEAP) && !graph.borrowed.contains(&value)
+        };
         let cfg = crate::jit::semantic::Cfg::new(graph);
         let reachable = cfg.rpo.clone();
+        let indexed_receivers: std::collections::HashSet<_> = reachable
+            .iter()
+            .flat_map(|&block| graph.blocks[block].insts.iter())
+            .filter_map(|&inst| match graph.insts[inst].op {
+                Op::GetIndex(object, _)
+                | Op::TypedIndex(object, _, TypedRead { element: None, .. }) => Some(object),
+                _ => None,
+            })
+            .collect();
         let mut pack_slots = SecondaryMap::new();
         let mut pack_cleanup = Vec::new();
         for &block in &reachable {
@@ -334,6 +353,7 @@ impl FunctionCompiler<'_, '_> {
                             Op::GetIndex(..)
                             | Op::TypedIndex(..)
                             | Op::IndexedGet(..)
+                            | Op::ArrayIndex(..)
                             | Op::PackTake(..)
                             | Op::Call {
                                 target: Some(_), ..
@@ -441,6 +461,7 @@ impl FunctionCompiler<'_, '_> {
                     this.convert(operand, Repr::Boxed)
                 };
                 if let Op::GetIndex(object, _)
+                | Op::ProbeIndex(object, _)
                 | Op::TypedIndex(object, _, TypedRead { element: None, .. }) = data.op
                 {
                     let object = get(self, object);
@@ -875,6 +896,21 @@ impl FunctionCompiler<'_, '_> {
                             let object = get(self, *object);
                             Some(self.length_access(object))
                         }
+                        Op::CachedProperty(object, site) => {
+                            let object = get(self, *object);
+                            let offset = self.property_caches[site];
+                            let address = self.b.ins().iadd_imm_s(self.data_base, offset);
+                            let retain = data.result.is_none_or(|value| {
+                                !graph.borrowed.contains(&value)
+                                    && !self.slot_owned(graph, &cx, value)
+                            });
+                            Some(self.cached_property_load(object, address, retain))
+                        }
+                        Op::FillPropertyCache(object, site, name) => {
+                            let object = get(self, *object);
+                            let address = self.property_cache(*site, name);
+                            Some(self.fill_property_cache(object, address))
+                        }
                         Op::Get(object, name) => {
                             let object = get(self, *object);
                             let retain = data.result.is_none_or(|value| {
@@ -885,7 +921,8 @@ impl FunctionCompiler<'_, '_> {
                         }
                         Op::GetIndex(object, index)
                         | Op::TypedIndex(object, index, _)
-                        | Op::IndexedGet(object, index) => {
+                        | Op::IndexedGet(object, index)
+                        | Op::ArrayIndex(object, index) => {
                             let object = get(self, *object);
                             let index = get(self, *index);
                             let retain = data.result.is_none_or(|value| {
@@ -984,7 +1021,10 @@ impl FunctionCompiler<'_, '_> {
                             let no = self.constant(Value::FALSE);
                             Some(self.b.ins().select(condition, yes, no))
                         }
-                        Op::IsTyped(..) | Op::IsCode(..) => unreachable!(),
+                        Op::IsTyped(..)
+                        | Op::IsArrayIndex(..)
+                        | Op::IsPropertyCached(..)
+                        | Op::IsCode(..) => unreachable!(),
                         Op::IsIndexed(value) => {
                             let value = get(self, *value);
                             let view = self.view(value);
@@ -1388,7 +1428,10 @@ impl FunctionCompiler<'_, '_> {
                     result.map(|value| Operand::new(value, Repr::Boxed))
                 };
                 if let (Some(value), Some(result)) = (data.result, result) {
-                    if matches!(data.op, Op::Get(..) | Op::GetIndex(..) | Op::IndexedGet(..))
+                    if matches!(
+                        data.op,
+                        Op::Get(..) | Op::GetIndex(..) | Op::IndexedGet(..) | Op::ArrayIndex(..)
+                    ) && indexed_receivers.contains(&value)
                         && facts.of(value).intersects(Types::OBJECT)
                     {
                         let boxed = self.convert(result, Repr::Boxed);
@@ -1686,6 +1729,12 @@ impl FunctionCompiler<'_, '_> {
                 let value = self.convert(operand, Repr::Boxed);
                 boolean(self.is_code(value, *code))
             }
+            Op::IsPropertyCached(object, site, name) => {
+                let operand = self.operand(cx, *object);
+                let object = self.convert(operand, Repr::Boxed);
+                let address = self.property_cache(*site, name);
+                boolean(self.property_cache_hit(object, address))
+            }
             Op::IsNumber(value) => {
                 let operand = self.operand(cx, *value);
                 let value = match operand.repr {
@@ -1736,6 +1785,30 @@ impl FunctionCompiler<'_, '_> {
                 let view = self.view(object);
                 boolean(self.has_kind(view, kind::ARRAY | kind::TYPED))
             }
+            Op::IsArrayIndex(object, key) => {
+                let operand = self.operand(cx, *object);
+                let object = self.convert(operand, Repr::Boxed);
+                let view = self.view(object);
+                let array = self.has_kind(view, kind::ARRAY);
+                let length = self.view_length_integer(view);
+                let key = self.operand(cx, *key);
+                let inside = if key.repr == Repr::Int32 {
+                    let position = self.b.ins().sextend(types::I64, key.value);
+                    self.b.ins().icmp(IntCC::UnsignedLessThan, position, length)
+                } else {
+                    let number = self.convert(key, Repr::Float);
+                    let position = self.b.ins().fcvt_to_sint_sat(types::I64, number);
+                    let exact = self.b.ins().fcvt_from_sint(types::F64, position);
+                    let integral = self.b.ins().fcmp(
+                        cranelift_codegen::ir::condcodes::FloatCC::Equal,
+                        exact,
+                        number,
+                    );
+                    let inside = self.b.ins().icmp(IntCC::UnsignedLessThan, position, length);
+                    self.b.ins().band(integral, inside)
+                };
+                boolean(self.b.ins().band(array, inside))
+            }
             Op::IndexedLength(object) => {
                 let operand = self.operand(cx, *object);
                 let object = self.convert(operand, Repr::Boxed);
@@ -1773,8 +1846,13 @@ impl FunctionCompiler<'_, '_> {
             }
             Op::GetIndex(object, key)
             | Op::TypedIndex(object, key, _)
-            | Op::IndexedGet(object, key) => {
-                let fallback = !matches!(data.op, Op::TypedIndex(..) | Op::PackTake(..));
+            | Op::IndexedGet(object, key)
+            | Op::ArrayIndex(object, key) => {
+                let fallback = !matches!(
+                    data.op,
+                    Op::TypedIndex(..) | Op::ArrayIndex(..) | Op::PackTake(..)
+                );
+                let typed = !matches!(data.op, Op::ArrayIndex(..));
                 let object = self.operand(cx, *object);
                 let object = self.convert(object, Repr::Boxed);
                 let view = match graph.views.get(&inst) {
@@ -1790,7 +1868,8 @@ impl FunctionCompiler<'_, '_> {
                 let retain = data.result.is_none_or(|value| {
                     !graph.borrowed.contains(&value) && !self.slot_owned(graph, cx, value)
                 });
-                let result = self.viewed_index_access(view, object, key, None, fallback, retain);
+                let result =
+                    self.viewed_index_access(view, object, key, None, fallback, retain, typed);
                 Some(Some(Operand::new(result, Repr::Boxed)))
             }
             Op::SetIndex(object, key, value) => {
@@ -1802,7 +1881,7 @@ impl FunctionCompiler<'_, '_> {
                 let object = self.convert(object, Repr::Boxed);
                 let key = self.operand(cx, *key);
                 let value = self.operand(cx, *value);
-                self.viewed_index_access(view, object, key, Some(value), true, true);
+                self.viewed_index_access(view, object, key, Some(value), true, true, true);
                 Some(None)
             }
             _ => None,

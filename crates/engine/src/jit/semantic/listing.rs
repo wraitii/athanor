@@ -97,8 +97,10 @@ impl Graph {
             Op::IteratorNew(value) => format!("iterator_new {value}"),
             Op::IteratorNext(value) => format!("iterator_next {value}"),
             Op::IsIndexed(value) => format!("is_indexed {value}"),
+            Op::IsArrayIndex(object, key) => format!("is_array_index {object}[{key}]"),
             Op::IndexedLength(value) => format!("indexed_length {value}"),
             Op::IndexedGet(object, key) => format!("get_indexed {object}[{key}]"),
+            Op::ArrayIndex(object, key) => format!("get_array {object}[{key}]"),
             Op::PackTake(object, key) => format!("pack_take {object}[{key}]"),
             Op::EnumerateNew(value) => format!("enumerate_new {value}"),
             Op::EnumerateNext(value) => format!("enumerate_next {value}"),
@@ -110,6 +112,13 @@ impl Graph {
             Op::MarkClass(value) => format!("mark_class {value}"),
             Op::DisableConstructor(value) => format!("disable_constructor {value}"),
             Op::Get(object, name) => format!("get {object}.{name}"),
+            Op::IsPropertyCached(object, _, name) => {
+                format!("property_cached {object}.{name}")
+            }
+            Op::CachedProperty(object, _) => format!("cached_property {object}"),
+            Op::FillPropertyCache(object, _, name) => {
+                format!("fill_property_cache {object}.{name}")
+            }
             Op::GetIndex(object, key) => format!("get {object}[{key}]"),
             Op::Set(object, name, value) => format!("set {object}.{name}, {value}"),
             Op::SetIndex(object, key, value) => format!("set {object}[{key}], {value}"),

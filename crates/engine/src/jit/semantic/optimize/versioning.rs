@@ -373,7 +373,9 @@ pub(super) fn apply_version(
         let data = graph.insts[inst].clone();
         let mut op = match data.op {
             Op::Get(object, name) => Op::ProbeProperty(object, name),
-            Op::GetIndex(object, key) | Op::IndexedGet(object, key) => Op::ProbeIndex(object, key),
+            Op::GetIndex(object, key)
+            | Op::IndexedGet(object, key)
+            | Op::ArrayIndex(object, key) => Op::ProbeIndex(object, key),
             Op::GlobalRead(name) => Op::ProbeGlobal(name),
             Op::Argument(index) => Op::Argument(index),
             Op::This => Op::This,

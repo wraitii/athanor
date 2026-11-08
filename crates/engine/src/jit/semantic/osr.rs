@@ -104,16 +104,16 @@ impl Plan {
                     }
                     _ => {}
                 }
-                if matches!(data.op, Op::Get(..) | Op::GetIndex(..) | Op::IndexedGet(..))
-                    && data.result.is_some_and(|value| {
-                        receivers.contains(&value) && facts.of(value).intersects(Types::OBJECT)
-                    })
-                    && repository.is_none_or(|repository| {
-                        !repository
-                            .read_feedback
-                            .contains_key(&(site, ReadKind::Result))
-                    })
-                {
+                if matches!(
+                    data.op,
+                    Op::Get(..) | Op::GetIndex(..) | Op::IndexedGet(..) | Op::ArrayIndex(..)
+                ) && data.result.is_some_and(|value| {
+                    receivers.contains(&value) && facts.of(value).intersects(Types::OBJECT)
+                }) && repository.is_none_or(|repository| {
+                    !repository
+                        .read_feedback
+                        .contains_key(&(site, ReadKind::Result))
+                }) {
                     record(Observation::Read(ReadKind::Result));
                 }
             }

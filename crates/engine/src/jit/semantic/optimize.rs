@@ -184,6 +184,8 @@ fn guard_fallback(graph: &Graph, block: Block) -> Option<Block> {
                 | Op::IsNumber(_)
                 | Op::IsTyped(..)
                 | Op::IsIndexed(_)
+                | Op::IsArrayIndex(..)
+                | Op::IsPropertyCached(..)
                 | Op::IsArrayIteration(..)
                 | Op::IsStringSplit(_)
         )
@@ -219,59 +221,25 @@ fn invariant_guards(
 
 const NUMERIC: Types = Types::NUMBER.union(Types::UNDEFINED);
 
-fn receiver_use(op: &Op, index: usize) -> bool {
-    match op {
-        Op::Get(..)
-        | Op::GetIndex(..)
-        | Op::TypedIndex(..)
-        | Op::IndexedGet(..)
-        | Op::Set(..)
-        | Op::SetIndex(..)
-        | Op::Define(..)
-        | Op::Construct { .. }
-        | Op::ConstructResolved { .. }
-        | Op::IteratorNew(_)
-        | Op::EnumerateNew(_) => index == 0,
-        Op::Call { receiver, .. } => index == 0 || (index == 1 && receiver.is_some()),
-        _ => false,
-    }
-}
-
 fn typed_objects(
     graph: &Graph,
     body: &HashSet<Block>,
     available: &HashSet<Value>,
     facts: &Facts,
 ) -> Vec<Value> {
-    let mut reads = HashMap::new();
+    let mut objects = HashSet::new();
     for &block in body {
         for &inst in &graph.blocks[block].insts {
-            let data = &graph.insts[inst];
-            if let (Op::GetIndex(object, key) | Op::TypedIndex(object, key, _), Some(result)) =
-                (&data.op, data.result)
-                && (!body.contains(&graph.def_block(*object)) || available.contains(object))
-                && facts.of(*object).intersects(Types::OBJECT)
-                && facts.of(*key).within(NUMERIC)
+            if let Op::GetIndex(object, key) | Op::TypedIndex(object, key, _) = graph.insts[inst].op
+                && (!body.contains(&graph.def_block(object)) || available.contains(&object))
+                && facts.of(key).within(NUMERIC)
+                && element_guess(graph, object).is_some()
             {
-                reads.insert(result, *object);
+                objects.insert(object);
             }
         }
     }
-    let mut excluded = HashSet::new();
-    for &block in body {
-        for &inst in &graph.blocks[block].insts {
-            let op = &graph.insts[inst].op;
-            for (index, value) in op.operands_iter().enumerate() {
-                if let Some(&object) = reads.get(&value)
-                    && receiver_use(op, index)
-                {
-                    excluded.insert(object);
-                }
-            }
-        }
-    }
-    let objects: HashSet<Value> = reads.into_values().collect();
-    let mut objects: Vec<Value> = objects.difference(&excluded).copied().collect();
+    let mut objects: Vec<_> = objects.into_iter().collect();
     objects.sort();
     objects
 }
@@ -461,7 +429,11 @@ fn numeric_use(op: &Op, index: usize) -> bool {
         ),
         Op::Unary(operator, _) => !matches!(operator, UnaryOp::Not | UnaryOp::Typeof),
         Op::ToNumeric(_) | Op::CallNative(..) => true,
-        Op::GetIndex(..) | Op::TypedIndex(..) | Op::IndexedGet(..) | Op::SetIndex(..) => index == 1,
+        Op::GetIndex(..)
+        | Op::TypedIndex(..)
+        | Op::IndexedGet(..)
+        | Op::ArrayIndex(..)
+        | Op::SetIndex(..) => index == 1,
         _ => false,
     }
 }
@@ -528,7 +500,8 @@ pub(super) fn reuse_loads(graph: &mut Graph, region: &HashSet<Block>, notes: &mu
                 }
                 Op::GetIndex(object, key)
                 | Op::TypedIndex(object, key, _)
-                | Op::IndexedGet(object, key) => {
+                | Op::IndexedGet(object, key)
+                | Op::ArrayIndex(object, key) => {
                     LoadKey::Index(resolve(&aliases, *object), resolve(&aliases, *key))
                 }
                 Op::ConstructorPrototype(callee) => {
@@ -690,7 +663,11 @@ fn probe_reads(
             if (input
                 || matches!(
                     data.op,
-                    Op::Get(..) | Op::GetIndex(..) | Op::IndexedGet(..) | Op::GlobalRead(_)
+                    Op::Get(..)
+                        | Op::GetIndex(..)
+                        | Op::IndexedGet(..)
+                        | Op::ArrayIndex(..)
+                        | Op::GlobalRead(_)
                 ))
                 && data.op.operands_iter().all(|value| {
                     !inside.contains(&graph.def_block(value)) || probed.contains(&value)
@@ -716,6 +693,7 @@ pub(super) fn views(graph: &mut Graph, notes: &mut Vec<String>) {
             let (Op::GetIndex(object, key)
             | Op::TypedIndex(object, key, _)
             | Op::IndexedGet(object, key)
+            | Op::ArrayIndex(object, key)
             | Op::SetIndex(object, key, _)) = graph.insts[inst].op
             else {
                 continue;
@@ -1084,7 +1062,7 @@ mod tests {
     #[test]
     fn numeric_and_typed_guards_share_one_loop_copy() {
         let allocator = Allocator::default();
-        let source = "function f(grid,width){let sum=0;for(let y=0;y<2;++y){for(let x=0;x<2;++x)sum+=grid[y*width+x];}return sum;}";
+        let source = "function f(width){const grid=new Float64Array(4);let sum=0;for(let y=0;y<2;++y){for(let x=0;x<2;++x)sum+=grid[y*width+x];}return sum;}";
         let parsed = Parser::new(&allocator, source, SourceType::script()).parse();
         let Statement::FunctionDeclaration(function) = &parsed.program.body[0] else {
             panic!()
@@ -1118,7 +1096,7 @@ mod tests {
             analysis
                 .notes
                 .iter()
-                .any(|note| note.contains("function: combined entry guards"))
+                .any(|note| note.contains("combined entry guards"))
         );
         graph.verify().unwrap();
     }

@@ -72,6 +72,7 @@ pub(super) fn result_facts(graph: &Graph) -> (HashSet<Value>, HashMap<Inst, Type
                     Op::Get(..)
                     | Op::GetIndex(..)
                     | Op::IndexedGet(..)
+                    | Op::ArrayIndex(..)
                     | Op::PackTake(..)
                     | Op::ProbeProperty(..)
                     | Op::ProbeIndex(..) => index == 0,
@@ -106,6 +107,7 @@ pub(super) fn result_facts(graph: &Graph) -> (HashSet<Value>, HashMap<Inst, Type
             let (array, key) = match graph.insts[inst].op {
                 Op::GetIndex(array, key)
                 | Op::IndexedGet(array, key)
+                | Op::ArrayIndex(array, key)
                 | Op::PackTake(array, key) => (array, key),
                 _ => continue,
             };

@@ -16,8 +16,8 @@ use crate::jit::clif::IndexedRead;
 use crate::jit::helpers::{
     self, CACHE_ADDITION_DESTINATION_OFFSET, CACHE_ADDITION_INDEX_OFFSET,
     CACHE_ADDITION_SOURCE_OFFSET, CACHE_BUILTIN_KIND_OFFSET, CACHE_BUILTIN_VALUE_OFFSET,
-    CACHE_HOLDER_OFFSET, CACHE_HOLDER_SHAPE_OFFSET, CACHE_INDEX_OFFSET, CACHE_SHAPE_OFFSET,
-    HELPERS, Helper, PropertyCache,
+    CACHE_HOLDER_OFFSET, CACHE_HOLDER_SHAPE_OFFSET, CACHE_INDEX_OFFSET, CACHE_INITIALIZED_OFFSET,
+    CACHE_SHAPE_OFFSET, HELPERS, Helper, PropertyCache,
 };
 use crate::jit::planner::{CallSite, Site};
 use crate::jit::semantic::DirectTarget;
@@ -333,6 +333,22 @@ impl FunctionCompiler<'_, '_> {
 
     pub(super) fn function_data<T>(&mut self, value: T) -> ClifValue {
         let offset = self.data.push(value);
+        self.b.ins().iadd_imm_s(self.data_base, offset)
+    }
+
+    pub(super) fn property_cache(
+        &mut self,
+        site: crate::jit::semantic::Inst,
+        name: &str,
+    ) -> ClifValue {
+        let offset = match self.property_caches.get(&site) {
+            Some(&offset) => offset,
+            None => {
+                let offset = self.data.push(PropertyCache::new(name));
+                self.property_caches.insert(site, offset);
+                offset
+            }
+        };
         self.b.ins().iadd_imm_s(self.data_base, offset)
     }
 
@@ -893,7 +909,7 @@ impl FunctionCompiler<'_, '_> {
         retain: bool,
     ) -> ClifValue {
         let view = self.view(object);
-        self.viewed_index_access(view, object, key, None, true, retain)
+        self.viewed_index_access(view, object, key, None, true, retain, true)
     }
 
     pub(super) fn typed_kind_is(&mut self, view: ClifValue, kind: TypedKind) -> ClifValue {
@@ -982,6 +998,7 @@ impl FunctionCompiler<'_, '_> {
         value: Option<Operand>,
         fallback: bool,
         retain: bool,
+        typed: bool,
     ) -> ClifValue {
         let flags = MemFlagsData::trusted();
         let length = self.b.ins().load(types::I64, flags, view, LENGTH_OFFSET);
@@ -1024,10 +1041,10 @@ impl FunctionCompiler<'_, '_> {
             let address = self.b.ins().iadd(data, offset);
             (packed, holey, address)
         });
-        let typed = value.is_none().then(|| self.b.create_block());
-        switch.emit(self.b, kind, typed.unwrap_or(slow));
-        if let Some(typed) = typed {
-            self.switch(typed);
+        let typed_block = (value.is_none() && typed).then(|| self.b.create_block());
+        switch.emit(self.b, kind, typed_block.unwrap_or(slow));
+        if let Some(typed_block) = typed_block {
+            self.switch(typed_block);
             let typed = self.has_kind(view, kind::TYPED);
             let read = self.b.create_block();
             self.brif(typed, read, &[], slow, &[]);
@@ -1352,6 +1369,132 @@ impl FunctionCompiler<'_, '_> {
         self.jump(done, &[BlockArg::Value(result)]);
         self.switch(done);
         self.b.block_params(done)[0]
+    }
+
+    pub(super) fn property_cache_hit(
+        &mut self,
+        object: ClifValue,
+        address: ClifValue,
+    ) -> ClifValue {
+        let flags = MemFlagsData::trusted();
+        let heap = self.is_heap(object);
+        let address_bits = self.b.ins().band_imm_s(object, ADDRESS_MASK);
+        let present = self.b.ins().icmp_imm_s(IntCC::NotEqual, address_bits, 0);
+        let valid = self.b.ins().band(heap, present);
+        let empty = self
+            .b
+            .ins()
+            .iconst(self.pointer, NO_ELEMENTS.as_ptr() as i64);
+        let view = self.b.ins().select(valid, address_bits, empty);
+        let kind = self.view_kind(view);
+        let expected_kind =
+            self.b
+                .ins()
+                .load(types::I32, flags, address, CACHE_BUILTIN_KIND_OFFSET);
+        let cached = self.b.ins().icmp_imm_s(IntCC::NotEqual, expected_kind, 0);
+        let matches = self.b.ins().icmp(IntCC::Equal, kind, expected_kind);
+        let builtin = self.b.ins().band(cached, matches);
+        let shape = self.b.ins().load(types::I32, flags, view, SHAPE_OFFSET);
+        let expected = self
+            .b
+            .ins()
+            .load(types::I32, flags, address, CACHE_SHAPE_OFFSET);
+        let holder = self
+            .b
+            .ins()
+            .load(self.pointer, flags, address, CACHE_HOLDER_OFFSET);
+        let own = self.b.ins().icmp_imm_s(IntCC::Equal, holder, 0);
+        let holder = self.b.ins().select(own, view, holder);
+        let holder_shape = self.b.ins().load(types::I32, flags, holder, SHAPE_OFFSET);
+        let expected_holder =
+            self.b
+                .ins()
+                .load(types::I32, flags, address, CACHE_HOLDER_SHAPE_OFFSET);
+        let receiver_hit = self.b.ins().icmp(IntCC::Equal, shape, expected);
+        let holder_hit = self
+            .b
+            .ins()
+            .icmp(IntCC::Equal, holder_shape, expected_holder);
+        let shaped = self.b.ins().band(receiver_hit, holder_hit);
+        let hit = self.b.ins().bor(builtin, shaped);
+        let initialized = self
+            .b
+            .ins()
+            .load(types::I32, flags, address, CACHE_INITIALIZED_OFFSET);
+        let initialized = self.b.ins().icmp_imm_s(IntCC::NotEqual, initialized, 0);
+        self.b.ins().band(initialized, hit)
+    }
+
+    pub(super) fn cached_property_load(
+        &mut self,
+        object: ClifValue,
+        address: ClifValue,
+        retain: bool,
+    ) -> ClifValue {
+        let flags = MemFlagsData::trusted();
+        let view = self.b.ins().band_imm_s(object, ADDRESS_MASK);
+        let kind = self.view_kind(view);
+        let expected_kind =
+            self.b
+                .ins()
+                .load(types::I32, flags, address, CACHE_BUILTIN_KIND_OFFSET);
+        let cached = self.b.ins().icmp_imm_s(IntCC::NotEqual, expected_kind, 0);
+        let matches = self.b.ins().icmp(IntCC::Equal, kind, expected_kind);
+        let builtin = self.b.ins().band(cached, matches);
+        let builtin_block = self.b.create_block();
+        let shaped_block = self.b.create_block();
+        let ready = self.b.create_block();
+        let done = self.b.create_block();
+        self.b.append_block_param(ready, types::I64);
+        self.b.append_block_param(done, types::I64);
+        self.brif(builtin, builtin_block, &[], shaped_block, &[]);
+        self.switch(builtin_block);
+        let bits = self
+            .b
+            .ins()
+            .load(types::I64, flags, address, CACHE_BUILTIN_VALUE_OFFSET);
+        self.jump(ready, &[BlockArg::Value(bits)]);
+        self.switch(shaped_block);
+        let holder = self
+            .b
+            .ins()
+            .load(self.pointer, flags, address, CACHE_HOLDER_OFFSET);
+        let own = self.b.ins().icmp_imm_s(IntCC::Equal, holder, 0);
+        let holder = self.b.ins().select(own, view, holder);
+        let index = self
+            .b
+            .ins()
+            .load(types::I32, flags, address, CACHE_INDEX_OFFSET);
+        let index = self.b.ins().uextend(types::I64, index);
+        let offset = self.b.ins().ishl_imm_s(index, 3);
+        let data = self.b.ins().load(self.pointer, flags, holder, DATA_OFFSET);
+        let slot = self.b.ins().iadd(data, offset);
+        let bits = self.b.ins().load(types::I64, flags, slot, 0);
+        self.jump(ready, &[BlockArg::Value(bits)]);
+        self.switch(ready);
+        let bits = self.b.block_params(ready)[0];
+        if retain {
+            let heap = self.is_heap(bits);
+            let retain = self.b.create_block();
+            self.brif(heap, retain, &[], done, &[BlockArg::Value(bits)]);
+            self.switch(retain);
+            let retained = self.retain_temporary(bits);
+            self.jump(done, &[BlockArg::Value(retained)]);
+        } else {
+            self.jump(done, &[BlockArg::Value(bits)]);
+        }
+        self.switch(done);
+        self.b.block_params(done)[0]
+    }
+
+    pub(super) fn fill_property_cache(
+        &mut self,
+        object: ClifValue,
+        address: ClifValue,
+    ) -> ClifValue {
+        let result = self.call_helper(Helper::PropertyGetCached, &[object, address]);
+        self.check_error();
+        result
     }
 
     fn cached_property_set(

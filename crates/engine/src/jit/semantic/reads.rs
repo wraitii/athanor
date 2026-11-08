@@ -82,18 +82,21 @@ pub(super) fn apply(
             _ => unreachable!(),
         };
         let (block, continuation, fallback) = super::inlining::split_call(graph, read.inst);
-        let fast = graph.blocks.push(BlockData::default());
-        let guard = if read.typed {
-            Op::IsTyped(object, read.element)
+        let fast = if read.typed {
+            let fast = graph.blocks.push(BlockData::default());
+            let check = graph
+                .append(block, data.span, Op::IsTyped(object, read.element), true)
+                .1
+                .unwrap();
+            graph.blocks[block].terminator = Some(Terminator {
+                source_name: data.source_name,
+                span: data.span,
+                kind: TerminatorKind::Branch(check, Target::new(fast), Target::new(fallback)),
+            });
+            fast
         } else {
-            Op::IsIndexed(object)
+            block
         };
-        let check = graph.append(block, data.span, guard, true).1.unwrap();
-        graph.blocks[block].terminator = Some(Terminator {
-            source_name: data.source_name,
-            span: data.span,
-            kind: TerminatorKind::Branch(check, Target::new(fast), Target::new(fallback)),
-        });
         let (fast, key) = if read.guard_number {
             let typed = graph.blocks.push(BlockData::default());
             let check = graph
@@ -113,6 +116,21 @@ pub(super) fn apply(
         } else {
             (fast, key)
         };
+        let fast = if read.typed {
+            fast
+        } else {
+            let bounded = graph.blocks.push(BlockData::default());
+            let check = graph
+                .append(fast, data.span, Op::IsArrayIndex(object, key), true)
+                .1
+                .unwrap();
+            graph.blocks[fast].terminator = Some(Terminator {
+                source_name: data.source_name,
+                span: data.span,
+                kind: TerminatorKind::Branch(check, Target::new(bounded), Target::new(fallback)),
+            });
+            bounded
+        };
         let (inst, value) = graph.append(
             fast,
             data.span,
@@ -126,7 +144,7 @@ pub(super) fn apply(
                     },
                 )
             } else {
-                Op::IndexedGet(object, key)
+                Op::ArrayIndex(object, key)
             },
             true,
         );
@@ -209,7 +227,7 @@ mod tests {
             graph
                 .insts
                 .values()
-                .filter(|data| matches!(data.op, Op::IndexedGet(..)))
+                .filter(|data| matches!(data.op, Op::ArrayIndex(..)))
                 .count(),
             1
         );
