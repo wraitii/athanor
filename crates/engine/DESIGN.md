@@ -39,6 +39,14 @@ aliasing, and cycles; document deliberate semantic restrictions.
   fallbacks. This is not yet a complete implementation of JS binding or coercion
   semantics. Array-to-primitive conversion is not implemented: numeric coercion
   reports a runtime error when object conversion would be required.
+- Numeric facts distinguish Int32, wider integers, and doubles. Integer increments,
+  decrements, addition, and subtraction widen to Int64 when Int32 bounds are not
+  established; loop merges preserve integer representation without matching a
+  specific induction pattern. Indexed lengths and converted array positions are
+  also Int64. Inferred integer arithmetic assumes results remain in the exact
+  integer range of JavaScript numbers. Stepwise double rounding beyond that range
+  and signed 64-bit overflow are unsupported; generated integer operations do not
+  guard these limits.
 - Bitwise and shift operators, including compound assignments, use guarded
   native operations for exact Int32 operands and runtime helpers for other
   conversions. Shift counts are masked to five bits; unsigned right shift
@@ -1220,6 +1228,30 @@ native and invalid callees close the cache without requesting inlining. This
 initial policy keeps one candidate per source site and does not adapt to later
 target changes. Code IDs are metadata and do not retain closure objects.
 
+Semantic planning inserts explicit `Observe` operations before region versioning.
+Each operation carries its value, observation kind, and original source site;
+versioning and cleanup preserve that intent when copying or replacing reads.
+The emitter only lowers these operations to one-shot latches. OSR consumes the
+same operations, including dominating observations of loop inputs, rather than
+rediscovering observation opportunities from reads and calls. Replanning removes
+old observers and emits only those still missing feedback. Observers update
+compiler metadata without retaining values or changing JavaScript heap state.
+
+Numeric entry guards also emit one-shot number observations after success.
+They distinguish safe integral numbers from other numbers, excluding negative
+zero. Replanning represents observed types with explicit `ReadHint` metadata;
+hints choose speculation but do not narrow facts. Region checks carry their
+required types into candidate analysis, guard generation, and refinements.
+An integer choice emits `IsInteger` and `AsInteger`, preserving native integer
+arithmetic while retaining the generic continuation when the guard fails.
+
+Inlining, read refinements, numeric observations, and conditional calls form one
+comparable `SpecializationPlan`. Recompilation compares that complete plan, so a
+numeric-only change can replace a body or produce an OSR fragment. Extracted
+loops carry both pending observations and known read hints for transferred inputs
+at their original sites. Array and numeric feedback therefore remain available
+when the producing read or guard is outside the extracted loop.
+
 Read observations run after successful lookup, including named-property IC hits.
 The first result closes the observation cache; array results record their storage
 category (ordinary array or typed array with element kind) and queue the owner.
@@ -1228,17 +1260,21 @@ whose element kind is still unknown. This retains feedback when load reuse
 eliminates the producing read or an existing loop version already establishes
 that the receiver is typed. Planning prefers a read's own receiver observation,
 then uses its producer's result observation. In `height[x][y]`, the first read
-can select `IndexedGet` and the second can select `TypedIndex` independently.
+can select guarded `ArrayLoad` operations and the second can select `TypedIndex` independently.
 
-An indexed-storage or typed-array guard and, where needed, a number guard select
-the existing generic indexed or typed read. Other receivers and keys use the
-original read. Key categories are not profiled yet: numeric speculation uses IR
-facts and explicit guards. Indexed reads retain bounds checks, hole handling and
-heap-result ownership. Typed element kinds select a matching kind guard and a
-direct element load, retaining index validity and bounds checks unless the
-region proves them redundant. Feedback does not prove a property
-immutable or retain the observed array. Read decisions join the inlining record
-when comparing plans. This initial policy does not propagate producer
+Where needed, a number guard selects numeric keys before read specialization.
+For ordinary arrays, `ArrayPosition` converts the numeric key to an integer.
+`IsArrayIndex` checks that this position exactly represents the original key,
+is in bounds, and matches the packed or holey layout. Its boolean result selects
+a matching `ArrayLoad`, which uses the shared integer position directly without
+repeating layout or bounds checks. Packed loads read the element directly; holey loads also map
+holes to undefined. These loads require the matching successful check with no
+intervening array mutation, and retain the existing heap-result ownership rules.
+Other receivers and keys use the original read. Numeric speculation combines
+IR facts with guarded integer observations. Typed element kinds
+select a matching kind guard and a direct element load, retaining index validity
+and bounds checks unless the region proves them redundant. Feedback does not prove a property
+immutable or retain the observed array. Read decisions join the shared specialization plan. This initial policy does not propagate producer
 observations through SSA merges or specialize writes.
 
 Observations request compilation independently of scheduling. At function return,
@@ -1398,10 +1434,12 @@ still joins running compilations before releasing their referenced resources.
 `EngineOptions::osr` (`JS_JIT_OSR=1`) enables experimental loop replacement.
 Natural-loop discovery runs independently of the region-plan tree after guard
 placement and optimization. Merging region plans therefore does not suppress an
-inner loop that still contains unresolved call or indexed-read observations.
+inner loop that still has explicit call or indexed-read observations.
 The descriptor retains that emission's graph and records the preheader, entry
-arguments, external SSA inputs, exit values, and backedges. Read-result
-opportunities are restricted to values feeding an unresolved indexed receiver.
+arguments, external SSA inputs, exit values, and backedges. An observation
+belongs to a loop when it executes inside the body, or dominates its header and
+observes one of its external inputs. Read-result opportunities are restricted to
+values feeding an unresolved indexed receiver.
 Loops without remaining observations do not receive counters.
 
 The initial eligibility policy chooses the first transferable loop with numeric

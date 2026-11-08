@@ -23,6 +23,9 @@ impl Graph {
                 .join(", ")
         };
         match op {
+            Op::Observe(value, kind, site) => {
+                format!("observe {kind:?} {value} site={site}")
+            }
             Op::OsrStart(_, index, values) => format!("osr_start {index} [{}]", list(values)),
             Op::OsrOutput(value, index) => format!("osr_output {value}, {index}"),
             Op::OsrStore(offset, values) => format!("osr_store {offset} [{}]", list(values)),
@@ -97,10 +100,17 @@ impl Graph {
             Op::IteratorNew(value) => format!("iterator_new {value}"),
             Op::IteratorNext(value) => format!("iterator_next {value}"),
             Op::IsIndexed(value) => format!("is_indexed {value}"),
-            Op::IsArrayIndex(object, key) => format!("is_array_index {object}[{key}]"),
+            Op::ArrayPosition(key) => format!("array_position {key}"),
+            Op::IsArrayIndex(object, key, position, holey) => format!(
+                "is_array_index {object}[{key}] position={position} {}",
+                if *holey { "holey" } else { "packed" }
+            ),
+            Op::ArrayLoad(object, key, holey) => format!(
+                "load_array {object}[{key}] {}",
+                if *holey { "holey" } else { "packed" }
+            ),
             Op::IndexedLength(value) => format!("indexed_length {value}"),
             Op::IndexedGet(object, key) => format!("get_indexed {object}[{key}]"),
-            Op::ArrayIndex(object, key) => format!("get_array {object}[{key}]"),
             Op::PackTake(object, key) => format!("pack_take {object}[{key}]"),
             Op::EnumerateNew(value) => format!("enumerate_new {value}"),
             Op::EnumerateNext(value) => format!("enumerate_next {value}"),
@@ -175,6 +185,11 @@ impl Graph {
                 let bounded = if read.bounded { " bounded" } else { "" };
                 format!("get_typed {object}[{key}]{element}{bounded}")
             }
+            Op::ReadHint(value, kind, observed, site) => {
+                format!("read_hint {kind:?} {value} {observed:?} site={site}")
+            }
+            Op::IsInteger(value) => format!("is_integer {value}"),
+            Op::AsInteger(value) => format!("as_integer {value}"),
             Op::IsNumber(value) => format!("is_number {value}"),
             Op::IsString(value) => format!("is_string {value}"),
             Op::IsStringSplit(value) => format!("is_string_split {value}"),
@@ -396,8 +411,8 @@ impl Analysis {
         for entry in feedback {
             writeln!(out, "{entry}").unwrap();
         }
-        writeln!(out, "inlines: {}", self.inlines.len()).unwrap();
-        for inline in &self.inlines {
+        writeln!(out, "inlines: {}", self.plan.inlines.len()).unwrap();
+        for inline in &self.plan.inlines {
             writeln!(
                 out,
                 "  {} -> {} ({}) guard_code={} arrow={}",
@@ -409,8 +424,12 @@ impl Analysis {
             )
             .unwrap();
         }
-        writeln!(out, "read refinements: {}", self.reads.len()).unwrap();
-        for read in &self.reads {
+        writeln!(out, "numeric observations: {}", self.plan.numbers.len()).unwrap();
+        for (site, observed) in &self.plan.numbers {
+            writeln!(out, "  {site}: {observed:?}").unwrap();
+        }
+        writeln!(out, "read refinements: {}", self.plan.reads.len()).unwrap();
+        for read in &self.plan.reads {
             writeln!(
                 out,
                 "  {} typed={} element={:?} guard_number={}",
@@ -418,8 +437,13 @@ impl Analysis {
             )
             .unwrap();
         }
-        writeln!(out, "conditional calls: {}", self.conditional.calls.len()).unwrap();
-        for call in &self.conditional.calls {
+        writeln!(
+            out,
+            "conditional calls: {}",
+            self.plan.conditional.calls.len()
+        )
+        .unwrap();
+        for call in &self.plan.conditional.calls {
             writeln!(
                 out,
                 "  {} {} callee={} effects=0x{:04x}",

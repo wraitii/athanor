@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::jit::planner::{ReadKind, Site};
+use crate::jit::planner::{Observation, Site};
 
 use super::{
     Block, BlockData, Cfg, Constant, Facts, Graph, Inst, Op, Target, Terminator, TerminatorKind,
@@ -43,90 +43,47 @@ pub(in crate::jit) struct Opportunity {
     pub(in crate::jit) kind: Observation,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::jit) enum Observation {
-    Call,
-    Read(ReadKind),
-}
-
 impl Plan {
-    pub(super) fn discover(
-        graph: &Graph,
-        repository: Option<&super::specialize::Repository>,
-        source: usize,
-    ) -> Option<Self> {
+    pub(super) fn discover(graph: &Graph, source: usize) -> Option<Self> {
         if graph.generator || graph.has_handlers {
             return None;
         }
         let cfg = Cfg::new(graph);
-        let facts = Facts::compute(graph);
-        let receivers: HashSet<_> = cfg
+        let opportunities: Vec<_> = cfg
             .rpo
             .iter()
             .filter(|block| !graph.cold.contains(block))
             .flat_map(|&block| graph.blocks[block].insts.iter())
-            .filter_map(|&inst| match graph.insts[inst].op {
-                Op::GetIndex(object, _)
-                | Op::TypedIndex(object, _, super::TypedRead { element: None, .. }) => Some(object),
-                _ => None,
+            .filter_map(|&inst| {
+                let Op::Observe(_, kind, mut site) = graph.insts[inst].op else {
+                    return None;
+                };
+                if site.source == 0 {
+                    site.source = source;
+                }
+                Some(Opportunity { inst, site, kind })
             })
             .collect();
-        let mut opportunities = Vec::new();
-        for &block in &cfg.rpo {
-            if graph.cold.contains(&block) {
-                continue;
-            }
-            for &inst in &graph.blocks[block].insts {
-                let data = &graph.insts[inst];
-                let site = Site {
-                    source: data.source_name.map_or(source, |name| name.0),
-                    start: data.span.start,
-                    end: data.span.end,
-                };
-                let mut record = |kind| opportunities.push(Opportunity { inst, site, kind });
-                match data.op {
-                    Op::GetIndex(object, _)
-                    | Op::TypedIndex(object, _, super::TypedRead { element: None, .. })
-                        if super::optimize::element_guess(graph, object).is_none()
-                            && repository.is_none_or(|repository| {
-                                !repository
-                                    .read_feedback
-                                    .contains_key(&(site, ReadKind::Receiver))
-                            }) =>
-                    {
-                        record(Observation::Read(ReadKind::Receiver));
-                    }
-                    Op::Call { target: None, .. } | Op::Construct { .. }
-                        if repository
-                            .is_none_or(|repository| !repository.feedback.contains_key(&site)) =>
-                    {
-                        record(Observation::Call);
-                    }
-                    _ => {}
-                }
-                if matches!(
-                    data.op,
-                    Op::Get(..) | Op::GetIndex(..) | Op::IndexedGet(..) | Op::ArrayIndex(..)
-                ) && data.result.is_some_and(|value| {
-                    receivers.contains(&value) && facts.of(value).intersects(Types::OBJECT)
-                }) && repository.is_none_or(|repository| {
-                    !repository
-                        .read_feedback
-                        .contains_key(&(site, ReadKind::Result))
-                }) {
-                    record(Observation::Read(ReadKind::Result));
-                }
-            }
-        }
         let loops: Vec<_> = super::optimize::natural_loops(graph, &cfg)
             .into_iter()
             .filter_map(|(header, body)| {
                 if graph.cold.contains(&header) {
                     return None;
                 }
+                let transfer = transfer(graph, &cfg, header, &body);
                 let opportunities: Vec<_> = opportunities
                     .iter()
-                    .filter(|opportunity| body.contains(&graph.insts[opportunity.inst].block))
+                    .filter(|opportunity| {
+                        let data = &graph.insts[opportunity.inst];
+                        let Op::Observe(value, ..) = data.op else {
+                            unreachable!()
+                        };
+                        body.contains(&data.block)
+                            || cfg.dominates(data.block, header)
+                                && transfer
+                                    .as_ref()
+                                    .is_ok_and(|transfer| transfer.inputs.contains(&value))
+                    })
                     .map(|opportunity| Opportunity {
                         inst: opportunity.inst,
                         site: opportunity.site,
@@ -136,7 +93,6 @@ impl Plan {
                 if opportunities.is_empty() {
                     return None;
                 }
-                let transfer = transfer(graph, &cfg, header, &body);
                 Some(Loop {
                     header,
                     body,
@@ -306,6 +262,32 @@ impl Plan {
                 (value, argument)
             })
             .collect();
+        for opportunity in &candidate.opportunities {
+            let Op::Observe(value, kind, site) = self.graph.insts[opportunity.inst].op else {
+                unreachable!()
+            };
+            if !candidate
+                .body
+                .contains(&self.graph.insts[opportunity.inst].block)
+                && let Some(&argument) = aliases.get(&value)
+            {
+                graph.append(entry, span, Op::Observe(argument, kind, site), false);
+            }
+        }
+        for (_, block) in self.graph.blocks.iter() {
+            for &inst in &block.insts {
+                if let Op::ReadHint(value, kind, observed, site) = self.graph.insts[inst].op
+                    && let Some(&argument) = aliases.get(&value)
+                {
+                    graph.append(
+                        entry,
+                        span,
+                        Op::ReadHint(argument, kind, observed, site),
+                        false,
+                    );
+                }
+            }
+        }
         graph.views.clear();
         for &block in &candidate.body {
             for &inst in &graph.blocks[block].insts {
@@ -553,7 +535,9 @@ mod tests {
             .semantic;
         let graph =
             super::super::build::lower(function, semantic.scoping(), &HashSet::new()).unwrap();
-        super::super::canonicalize(graph, true).unwrap().graph
+        let mut graph = super::super::canonicalize(graph, true).unwrap().graph;
+        super::super::observations::plan(&mut graph, None);
+        graph
     }
 
     #[test]
@@ -561,7 +545,7 @@ mod tests {
         let graph = graph(
             "function f(rows,n){let total=0;for(let y=0;y<n;++y){let sum=0;for(let x=0;x<n;++x)sum+=rows[y][x];total+=sum;}return total;}",
         );
-        let plan = Plan::discover(&graph, None, 0).unwrap();
+        let plan = Plan::discover(&graph, 0).unwrap();
         assert_eq!(plan.loops.len(), 2);
         let inner = &plan.loops[0];
         let transfer = inner.transfer.as_ref().unwrap();
@@ -584,7 +568,7 @@ mod tests {
     #[test]
     fn arithmetic_only_loops_have_no_opportunities() {
         let graph = graph("function f(n){let sum=0;for(let i=0;i<n;++i)sum+=i;return sum;}");
-        assert!(Plan::discover(&graph, None, 0).is_none());
+        assert!(Plan::discover(&graph, 0).is_none());
     }
 
     #[test]
@@ -592,14 +576,147 @@ mod tests {
         let graph = graph(
             "function f(xs,n){let sum=0;for(let i=0;i<n;++i){if(xs[i])return sum;sum+=xs[i];}return sum;}",
         );
-        let plan = Plan::discover(&graph, None, 0).unwrap();
+        let plan = Plan::discover(&graph, 0).unwrap();
         assert!(plan.loops[0].transfer.is_err());
+    }
+
+    #[test]
+    fn loop_inputs_keep_observations_before_the_loop() {
+        let graph = graph(
+            "function f(holder,n){const row=holder.row;let sum=0;for(let i=0;i<n;++i)sum+=row[i];return sum;}",
+        );
+        let plan = Plan::discover(&graph, 7).unwrap();
+        let candidate = &plan.loops[0];
+        let opportunity = candidate
+            .opportunities
+            .iter()
+            .find(|opportunity| {
+                opportunity.kind == Observation::Read(crate::jit::planner::ReadKind::Result)
+                    && !candidate
+                        .body
+                        .contains(&graph.insts[opportunity.inst].block)
+            })
+            .unwrap();
+        let Op::Observe(value, _, _) = graph.insts[opportunity.inst].op else {
+            panic!()
+        };
+        assert!(candidate.transfer.as_ref().unwrap().inputs.contains(&value));
+        assert_eq!(opportunity.site.source, 7);
+        plan.extract(0).unwrap().verify().unwrap();
+    }
+
+    #[test]
+    fn extracted_inputs_keep_known_storage_and_numeric_hints() {
+        use crate::jit::planner::{ReadKind, ReadType};
+        let mut graph = graph(
+            "function f(holder,x,n){const row=holder.row;let sum=0;for(let i=0;i<n;++i)sum+=row[i]*x;return sum;}",
+        );
+        let cfg = Cfg::new(&graph);
+        let (_, body) = super::super::optimize::natural_loops(&graph, &cfg).remove(0);
+        let row = graph
+            .blocks
+            .iter()
+            .filter(|(block, _)| !body.contains(block))
+            .flat_map(|(_, block)| &block.insts)
+            .find_map(|&inst| {
+                matches!(&graph.insts[inst].op, Op::Get(_, name) if name == "row")
+                    .then(|| graph.insts[inst].result.unwrap())
+            })
+            .unwrap();
+        let x = graph
+            .insts
+            .values()
+            .find_map(|data| matches!(data.op, Op::Argument(1)).then(|| data.result.unwrap()))
+            .unwrap();
+        let site = Site {
+            source: 7,
+            start: 1,
+            end: 2,
+        };
+        for (value, kind, observed) in [
+            (
+                row,
+                ReadKind::Result,
+                ReadType::Typed(crate::heap::TypedKind::Float32),
+            ),
+            (x, ReadKind::Number, ReadType::Integer),
+        ] {
+            let block = graph.def_block(value);
+            graph.append(
+                block,
+                graph.span,
+                Op::ReadHint(value, kind, observed, site),
+                false,
+            );
+        }
+        let plan = Plan::discover(&graph, 7).unwrap();
+        let mut extracted = plan.extract(0).unwrap();
+        let mut repository = super::super::specialize::Repository::default();
+        repository.read_feedback.insert(
+            (site, ReadKind::Result),
+            ReadType::Typed(crate::heap::TypedKind::Float32),
+        );
+        repository
+            .read_feedback
+            .insert((site, ReadKind::Number), ReadType::Integer);
+        super::super::observations::plan(&mut extracted, Some((&repository, 7)));
+        assert!(!super::super::observations::numeric_hints(&extracted).is_empty());
+        let reads = super::super::reads::plan(&extracted, &repository, 7);
+        assert!(
+            reads
+                .iter()
+                .any(|read| read.element == Some(crate::heap::TypedKind::Float32))
+        );
+        extracted.verify().unwrap();
+    }
+
+    #[test]
+    fn observations_survive_rejected_region_specialization() {
+        let mut graph = graph(
+            "function f(xs,n,callback){let sum=0;for(let i=0;i<n;++i)sum+=callback(xs[i]);return sum;}",
+        );
+        super::super::optimize::version(&mut graph, &Default::default(), None, &mut Vec::new())
+            .unwrap();
+        let plan = Plan::discover(&graph, 7).unwrap();
+        let opportunities = &plan.loops[0].opportunities;
+        assert!(
+            opportunities
+                .iter()
+                .any(|opportunity| opportunity.kind == Observation::Call)
+        );
+        assert!(opportunities.iter().any(|opportunity| opportunity.kind
+            == Observation::Read(crate::jit::planner::ReadKind::Receiver)));
+        graph.verify().unwrap();
+    }
+
+    #[test]
+    fn replanning_does_not_duplicate_observations() {
+        let mut graph =
+            graph("function f(xs,n){let sum=0;for(let i=0;i<n;++i)sum+=xs[i];return sum;}");
+        let before: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|(_, block)| &block.insts)
+            .filter(|&&inst| matches!(graph.insts[inst].op, Op::Observe(..)))
+            .map(|&inst| graph.op_text(&graph.insts[inst].op))
+            .collect();
+        super::super::observations::plan(&mut graph, None);
+        let after: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|(_, block)| &block.insts)
+            .filter(|&&inst| matches!(graph.insts[inst].op, Op::Observe(..)))
+            .map(|&inst| graph.op_text(&graph.insts[inst].op))
+            .collect();
+        assert!(!before.is_empty());
+        assert_eq!(before, after);
+        graph.verify().unwrap();
     }
 
     #[test]
     fn observed_reads_no_longer_request_discovery() {
         let graph = graph("function f(xs,n){let sum=0;for(let i=0;i<n;++i)sum+=xs[i];return sum;}");
-        let initial = Plan::discover(&graph, None, 7).unwrap();
+        let initial = Plan::discover(&graph, 7).unwrap();
         let mut repository = super::super::specialize::Repository::default();
         for opportunity in &initial.loops[0].opportunities {
             let Observation::Read(kind) = opportunity.kind else {
@@ -610,6 +727,8 @@ mod tests {
                 crate::jit::planner::ReadType::Array,
             );
         }
-        assert!(Plan::discover(&graph, Some(&repository), 7).is_none());
+        let mut graph = graph;
+        super::super::observations::plan(&mut graph, Some((&repository, 7)));
+        assert!(Plan::discover(&graph, 7).is_none());
     }
 }

@@ -14,7 +14,7 @@ pub(in crate::jit) fn receiver(op: &Op) -> Option<Value> {
         | Op::ProbeProperty(object, _)
         | Op::GetIndex(object, _)
         | Op::IndexedGet(object, _)
-        | Op::ArrayIndex(object, _) => Some(*object),
+        | Op::ArrayLoad(object, _, _) => Some(*object),
         _ => None,
     }
 }
@@ -98,7 +98,7 @@ pub(super) fn borrows(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>)
             if matches!(
                 data.op,
                 Op::IndexedGet(..)
-                    | Op::ArrayIndex(..)
+                    | Op::ArrayLoad(..)
                     | Op::ProbeProperty(..)
                     | Op::CachedProperty(..)
             ) {

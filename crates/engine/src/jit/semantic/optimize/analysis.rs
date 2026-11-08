@@ -2,11 +2,12 @@ use super::*;
 
 fn contained_use(op: &Op, index: usize) -> bool {
     match op {
+        Op::Observe(..) | Op::ReadHint(..) => true,
         Op::Get(..)
         | Op::GetIndex(..)
         | Op::TypedIndex(..)
         | Op::IndexedGet(..)
-        | Op::ArrayIndex(..)
+        | Op::ArrayLoad(..)
         | Op::Set(..)
         | Op::SetIndex(..)
         | Op::Define(..)
@@ -191,7 +192,7 @@ impl Access {
             Op::GetIndex(_, key)
             | Op::TypedIndex(_, key, _)
             | Op::IndexedGet(_, key)
-            | Op::ArrayIndex(_, key)
+            | Op::ArrayLoad(_, key, _)
             | Op::SetIndex(_, key, _)
                 if facts.of(*key).within(Types::NUMBER) =>
             {
@@ -293,7 +294,7 @@ impl Writes {
             | Op::GetIndex(object, _)
             | Op::TypedIndex(object, ..)
             | Op::IndexedGet(object, _)
-            | Op::ArrayIndex(object, _)
+            | Op::ArrayLoad(object, _, _)
             | Op::ConstructorPrototype(object) => {
                 !self.clobbers(*object, &Access::of(op, &self.facts))
             }

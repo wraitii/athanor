@@ -21,12 +21,22 @@ impl std::fmt::Display for Site {
 pub(crate) enum ReadKind {
     Result,
     Receiver,
+    Number,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReadType {
+    Unknown,
+    Integer,
+    Number,
     Array,
     Typed(TypedKind),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Observation {
+    Call,
+    Read(ReadKind),
 }
 
 #[repr(C)]

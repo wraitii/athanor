@@ -862,3 +862,30 @@ fn borrowed_phi_rows_keep_their_owners_alive() {
         assert_eq!(engine.call("main", &[]).unwrap().value(), Value::TRUE);
     }
 }
+
+#[test]
+fn integer_loop_values_widen_and_merge_with_fractions() {
+    let source = r#"
+        function count(limit) {
+            let k = 0;
+            while (k < limit) ++k;
+            return k;
+        }
+        function main() {
+            let up = 2147483647;
+            let down = -2147483648;
+            let mixed = 0;
+            for (let i = 0; i < 4; ++i) {
+                ++up;
+                --down;
+                mixed += i === 2 ? 0.5 : 1;
+            }
+            return up === 2147483651 && down === -2147483652 &&
+                mixed === 3.5 && (up | 0) === -2147483645 && count(4) === 4;
+        }
+    "#;
+    for mut engine in engines() {
+        engine.compile(source, "integer_loops.js").unwrap();
+        assert_eq!(engine.call("main", &[]).unwrap().value(), Value::TRUE);
+    }
+}

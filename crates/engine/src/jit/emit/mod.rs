@@ -37,16 +37,14 @@ pub(super) enum FunctionKind {
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct Feedback<'a> {
+pub(super) struct Feedback {
     pub(super) function_return: bool,
     pub(super) get_refinement: bool,
     pub(super) owner: u64,
-    pub(super) reads:
-        &'a HashMap<(super::planner::Site, super::planner::ReadKind), super::planner::ReadType>,
 }
 
 pub(super) struct FunctionCompiler<'a, 'f> {
-    feedback: Option<Feedback<'a>>,
+    feedback: Option<Feedback>,
     names: &'a mut Vec<Box<str>>,
     cells: &'a mut Vec<Box<u64>>,
     data: &'a mut FunctionData,
@@ -118,7 +116,7 @@ pub(super) fn build_function(
     _closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
     kind: FunctionKind,
     graph: &super::semantic::Graph,
-    feedback: Option<Feedback<'_>>,
+    feedback: Option<Feedback>,
 ) -> Result<(), Error> {
     build_callable(
         b,
@@ -182,7 +180,7 @@ fn build_callable(
     params: Span,
     kind: FunctionKind,
     body: CallableBody<'_>,
-    feedback: Option<Feedback<'_>>,
+    feedback: Option<Feedback>,
 ) -> Result<(), Error> {
     let entry = b.create_block();
     b.switch_to_block(entry);

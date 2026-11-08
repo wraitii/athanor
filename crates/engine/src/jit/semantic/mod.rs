@@ -7,6 +7,7 @@ mod construction;
 pub(in crate::jit) mod facts;
 mod inlining;
 mod listing;
+mod observations;
 mod optimize;
 pub(super) mod osr;
 mod promote;
@@ -207,6 +208,13 @@ pub(in crate::jit) struct DirectTarget {
 
 #[derive(Clone, Debug)]
 pub(super) enum Op {
+    Observe(Value, super::planner::Observation, super::planner::Site),
+    ReadHint(
+        Value,
+        super::planner::ReadKind,
+        super::planner::ReadType,
+        super::planner::Site,
+    ),
     OsrStart(std::sync::Arc<osr::Plan>, usize, Vec<Value>),
     OsrOutput(Value, usize),
     OsrStore(usize, Vec<Value>),
@@ -269,10 +277,13 @@ pub(super) enum Op {
     IteratorNew(Value),
     IteratorNext(Value),
     IsIndexed(Value),
-    IsArrayIndex(Value, Value),
+    // Saturating integer conversion; validity is established separately by IsArrayIndex.
+    ArrayPosition(Value),
+    IsArrayIndex(Value, Value, Value, bool),
+    // Requires a successful matching IsArrayIndex with no intervening array mutation.
+    ArrayLoad(Value, Value, bool),
     IndexedLength(Value),
     IndexedGet(Value, Value),
-    ArrayIndex(Value, Value),
     // Extracted values stay rooted independently of the pack across argument initialization.
     PackTake(Value, Value),
     EnumerateNew(Value),
@@ -324,6 +335,8 @@ pub(super) enum Op {
     IsTyped(Value, Option<TypedKind>),
     TypedIndex(Value, Value, TypedRead),
     IsNumber(Value),
+    IsInteger(Value),
+    AsInteger(Value),
     IsString(Value),
     IsStringSplit(Value),
     StringSplit(Value, Vec<Value>),
@@ -404,7 +417,9 @@ impl Op {
     pub(super) fn operands_iter(&self) -> impl Iterator<Item = Value> + '_ {
         let (fixed, rest): ([Option<Value>; 3], &[Value]) = match self {
             Op::OsrStart(_, _, values) | Op::OsrStore(_, values) => ([None, None, None], values),
-            Op::OsrOutput(value, _) => ([Some(*value), None, None], &[]),
+            Op::OsrOutput(value, _) | Op::Observe(value, ..) | Op::ReadHint(value, ..) => {
+                ([Some(*value), None, None], &[])
+            }
             Op::Argument(_)
             | Op::Arguments
             | Op::Rest(_)
@@ -452,6 +467,7 @@ impl Op {
             | Op::PropertyKey(value)
             | Op::ToNumeric(value)
             | Op::ToInt32(value)
+            | Op::ArrayPosition(value)
             | Op::Unary(_, value)
             | Op::IsUndefined(value)
             | Op::IsNullish(value)
@@ -463,6 +479,8 @@ impl Op {
             | Op::View(value)
             | Op::IsTyped(value, _)
             | Op::IsNumber(value)
+            | Op::IsInteger(value)
+            | Op::AsInteger(value)
             | Op::IsString(value)
             | Op::IsStringSplit(value)
             | Op::IsTypeof(value, _)
@@ -475,8 +493,7 @@ impl Op {
             | Op::GetIndex(object, key)
             | Op::TypedIndex(object, key, _)
             | Op::IndexedGet(object, key)
-            | Op::ArrayIndex(object, key)
-            | Op::IsArrayIndex(object, key)
+            | Op::ArrayLoad(object, key, _)
             | Op::PackTake(object, key)
             | Op::ProbeIndex(object, key)
             | Op::Binary(_, object, key)
@@ -484,6 +501,9 @@ impl Op {
             | Op::ArrayAppend(object, key, _)
             | Op::ConstructorResult(object, key)
             | Op::ConstructPack(object, key) => ([Some(*object), Some(*key), None], &[]),
+            Op::IsArrayIndex(object, key, position, _) => {
+                ([Some(*object), Some(*key), Some(*position)], &[])
+            }
             Op::CallPack(callee, receiver, args)
             | Op::ConstructorCallPack(callee, receiver, args)
             | Op::ConstructPackResolved(callee, receiver, args) => {
@@ -524,7 +544,9 @@ impl Op {
     pub(super) fn operands_mut(&mut self) -> impl Iterator<Item = &mut Value> + '_ {
         let (fixed, rest): ([Option<&mut Value>; 3], &mut [Value]) = match self {
             Op::OsrStart(_, _, values) | Op::OsrStore(_, values) => ([None, None, None], values),
-            Op::OsrOutput(value, _) => ([Some(value), None, None], &mut []),
+            Op::OsrOutput(value, _) | Op::Observe(value, ..) | Op::ReadHint(value, ..) => {
+                ([Some(value), None, None], &mut [])
+            }
             Op::Argument(_)
             | Op::Arguments
             | Op::Rest(_)
@@ -572,6 +594,7 @@ impl Op {
             | Op::PropertyKey(value)
             | Op::ToNumeric(value)
             | Op::ToInt32(value)
+            | Op::ArrayPosition(value)
             | Op::Unary(_, value)
             | Op::IsUndefined(value)
             | Op::IsNullish(value)
@@ -583,6 +606,8 @@ impl Op {
             | Op::View(value)
             | Op::IsTyped(value, _)
             | Op::IsNumber(value)
+            | Op::IsInteger(value)
+            | Op::AsInteger(value)
             | Op::IsString(value)
             | Op::IsStringSplit(value)
             | Op::IsTypeof(value, _)
@@ -595,8 +620,7 @@ impl Op {
             | Op::GetIndex(object, key)
             | Op::TypedIndex(object, key, _)
             | Op::IndexedGet(object, key)
-            | Op::ArrayIndex(object, key)
-            | Op::IsArrayIndex(object, key)
+            | Op::ArrayLoad(object, key, _)
             | Op::PackTake(object, key)
             | Op::ProbeIndex(object, key)
             | Op::Binary(_, object, key)
@@ -604,6 +628,9 @@ impl Op {
             | Op::ArrayAppend(object, key, _)
             | Op::ConstructorResult(object, key)
             | Op::ConstructPack(object, key) => ([Some(object), Some(key), None], &mut []),
+            Op::IsArrayIndex(object, key, position, _) => {
+                ([Some(object), Some(key), Some(position)], &mut [])
+            }
             Op::CallPack(callee, receiver, args)
             | Op::ConstructorCallPack(callee, receiver, args)
             | Op::ConstructPackResolved(callee, receiver, args) => {
@@ -1009,7 +1036,7 @@ impl Graph {
                 result: Unowned,
             },
             Op::OsrOutput(..) => closed(INTERNAL, &[], Unowned),
-            Op::OsrStore(..) => closed(INTERNAL, &[], None),
+            Op::OsrStore(..) | Op::Observe(..) | Op::ReadHint(..) => closed(INTERNAL, &[], None),
             Op::NewInstance(_) => closed(ALLOCATION | INTERNAL | ERROR, &[], Owned),
             Op::ConstructorResult(..) => closed(0, &[], Borrowed),
             Op::Rest(_) | Op::Arguments => closed(ALLOCATION | INTERNAL | ERROR, &[], Owned),
@@ -1162,13 +1189,16 @@ impl Graph {
             Op::View(_) => closed(HEAP_READ, &[Assumption::FixedTypedStorage], Unowned),
             Op::IsTyped(..) | Op::IsIndexed(_) => closed(0, &[], Unowned),
             Op::IsArrayIndex(..) => closed(HEAP_READ, &[], Unowned),
+            Op::ArrayPosition(_) => closed(INTERNAL, &[], Unowned),
             Op::IndexedLength(_) => closed(HEAP_READ, &[], Unowned),
-            Op::IndexedGet(..) | Op::ArrayIndex(..) => {
+            Op::IndexedGet(..) | Op::ArrayLoad(..) => {
                 closed(HEAP_READ | INTERNAL | ERROR, &[], Borrowed)
             }
             Op::PackTake(..) => closed(HEAP_READ | HEAP_WRITE | INTERNAL, &[], Owned),
             Op::TypedIndex(..) => closed(HEAP_READ, &[Assumption::FixedTypedStorage], Unowned),
-            Op::IsNumber(_) | Op::IsString(_) => closed(0, &[], Unowned),
+            Op::IsNumber(_) | Op::IsInteger(_) | Op::AsInteger(_) | Op::IsString(_) => {
+                closed(0, &[], Unowned)
+            }
             Op::IsTypeof(..) => closed(HEAP_READ, &[], Unowned),
             Op::AsNumber(_) => closed(INTERNAL, &[], Unowned),
             Op::EnterCaptures(..) => closed(HEAP_READ | INTERNAL | ERROR, &[], None),
@@ -1313,19 +1343,23 @@ fn unsupported<T>(what: &str, span: Span) -> Result<T> {
     ))
 }
 
+#[derive(Clone, Default, PartialEq, Eq)]
+pub(in crate::jit) struct SpecializationPlan {
+    pub(in crate::jit) inlines: Vec<specialize::Inline>,
+    pub(in crate::jit) reads: Vec<reads::Read>,
+    pub(in crate::jit) numbers: Vec<(super::planner::Site, super::planner::ReadType)>,
+    pub(in crate::jit) conditional: specialize::ConditionalPlan,
+}
+
 pub(super) struct Planned {
-    pub(super) inlines: Vec<specialize::Inline>,
-    pub(super) reads: Vec<reads::Read>,
+    pub(in crate::jit) plan: SpecializationPlan,
     pub(super) graph: Graph,
     notes: Vec<String>,
     optimize: bool,
-    pub(super) conditional: specialize::ConditionalPlan,
 }
 
 pub(super) struct Analysis {
-    pub(super) conditional: specialize::ConditionalPlan,
-    pub(super) inlines: Vec<specialize::Inline>,
-    pub(super) reads: Vec<reads::Read>,
+    pub(in crate::jit) plan: SpecializationPlan,
     pub(super) graph: Graph,
     pub(super) osr: Option<std::sync::Arc<osr::Plan>>,
     facts: Facts,
@@ -1334,7 +1368,7 @@ pub(super) struct Analysis {
 
 impl Analysis {
     pub(in crate::jit) fn prepare_osr(&mut self, source: usize) -> Result<()> {
-        self.osr = osr::Plan::discover(&self.graph, None, source).map(std::sync::Arc::new);
+        self.osr = osr::Plan::discover(&self.graph, source).map(std::sync::Arc::new);
         if let Some(plan) = &self.osr {
             plan.instrument(&mut self.graph)?;
             self.facts = Facts::compute(&self.graph);
@@ -1491,12 +1525,10 @@ pub(super) fn plan_canonical_with_budget(
     let optimize = ssa_opt && !graph.has_handlers && !graph.generator;
     if !optimize {
         return Ok(Planned {
-            inlines: Vec::new(),
-            reads: Vec::new(),
+            plan: SpecializationPlan::default(),
             graph,
             notes,
             optimize,
-            conditional: specialize::ConditionalPlan::default(),
         });
     }
     let mut inline_budget = specialize::Budget::new(inline_multiplier);
@@ -1532,6 +1564,7 @@ pub(super) fn plan_canonical_with_budget(
     if let Some((bodies, source)) = specialization {
         specialize::direct_calls(&mut graph, bodies, source);
     }
+    let numbers = observations::plan(&mut graph, specialization);
     let reads = specialization.map_or_else(Vec::new, |(bodies, source)| {
         reads::plan(&graph, bodies, source)
     });
@@ -1543,9 +1576,12 @@ pub(super) fn plan_canonical_with_budget(
         conditional.native_calls = arrays::push_calls(&mut graph, bodies, source, &mut notes)?;
     }
     Ok(Planned {
-        conditional,
-        inlines: inline_budget.inlines,
-        reads,
+        plan: SpecializationPlan {
+            conditional,
+            inlines: inline_budget.inlines,
+            reads,
+            numbers,
+        },
         graph,
         notes,
         optimize,
@@ -1558,19 +1594,15 @@ pub(super) fn optimize_planned(
     report_regions: bool,
 ) -> Result<Analysis> {
     let Planned {
-        inlines,
-        reads,
+        plan,
         mut graph,
         mut notes,
         optimize,
-        conditional,
     } = planned;
     if !optimize {
         let facts = Facts::compute(&graph);
         return Ok(Analysis {
-            conditional,
-            inlines,
-            reads,
+            plan,
             graph,
             facts,
             notes,
@@ -1578,7 +1610,7 @@ pub(super) fn optimize_planned(
         });
     }
     caches::apply(&mut graph)?;
-    reads::apply(&mut graph, &reads, &mut notes)?;
+    reads::apply(&mut graph, &plan.reads, &mut notes)?;
     comparisons::expose(&mut graph);
     optimize::sink_closures(&mut graph, &mut notes);
     if optimize::lazy_captures(&mut graph, &mut notes) {
@@ -1590,7 +1622,7 @@ pub(super) fn optimize_planned(
     graph.verify()?;
     let mut regions = optimize::version_with_report(
         &mut graph,
-        &conditional,
+        &plan.conditional,
         fallback,
         &mut notes,
         report_regions,
@@ -1631,9 +1663,7 @@ pub(super) fn optimize_planned(
     let facts = Facts::compute(&graph);
     borrow::borrows(&mut graph, &facts, &mut notes);
     Ok(Analysis {
-        conditional,
-        inlines,
-        reads,
+        plan,
         graph,
         facts,
         notes,

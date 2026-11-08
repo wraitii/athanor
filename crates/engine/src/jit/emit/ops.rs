@@ -213,6 +213,24 @@ impl FunctionCompiler<'_, '_> {
         self.b.ins().iconst(types::I64, value.bits() as i64)
     }
 
+    pub(super) fn is_integer(&mut self, value: ClifValue) -> ClifValue {
+        let numeric = self.is_number(value);
+        let float = self.b.ins().bitcast(types::F64, MemFlagsData::new(), value);
+        let integer = self.b.ins().fcvt_to_sint_sat(types::I64, float);
+        let exact = self.b.ins().fcvt_from_sint(types::F64, integer);
+        let integral = self.b.ins().fcmp(FloatCC::Equal, float, exact);
+        let magnitude = self.b.ins().fabs(float);
+        let limit = self.b.ins().f64const(9007199254740991.0);
+        let safe = self
+            .b
+            .ins()
+            .fcmp(FloatCC::LessThanOrEqual, magnitude, limit);
+        let positive_zero = self.b.ins().icmp_imm_s(IntCC::NotEqual, value, i64::MIN);
+        let valid = self.b.ins().band(numeric, integral);
+        let valid = self.b.ins().band(valid, safe);
+        self.b.ins().band(valid, positive_zero)
+    }
+
     pub(super) fn is_number(&mut self, value: ClifValue) -> ClifValue {
         let top = self.b.ins().ushr_imm_s(value, TAG_SHIFT as i64);
         let offset = self.b.ins().iadd_imm_s(top, -(TAG_FIRST as i64));
@@ -601,7 +619,7 @@ impl FunctionCompiler<'_, '_> {
             self.check_error();
             return result;
         }
-        let (helper, index) = if matches!(index.repr, Repr::Float | Repr::Int32) {
+        let (helper, index) = if matches!(index.repr, Repr::Float | Repr::Int32 | Repr::Int64) {
             (Helper::IndexGetNumeric, self.convert(index, Repr::Float))
         } else {
             (Helper::IndexGet, index.value)
@@ -929,8 +947,8 @@ impl FunctionCompiler<'_, '_> {
     ) -> Operand {
         let element = Element::from(kind);
         let flags = MemFlagsData::trusted();
-        let position = if key.repr == Repr::Int32 {
-            self.b.ins().sextend(types::I64, key.value)
+        let position = if matches!(key.repr, Repr::Int32 | Repr::Int64) {
+            self.convert(key, Repr::Int64)
         } else {
             let key = self.convert(key, Repr::Float);
             self.b.ins().fcvt_to_sint_sat(types::I64, key)
@@ -956,6 +974,68 @@ impl FunctionCompiler<'_, '_> {
         }
     }
 
+    pub(super) fn is_array_index(
+        &mut self,
+        object: ClifValue,
+        key: Operand,
+        position: Operand,
+        holey: bool,
+    ) -> ClifValue {
+        let view = self.view(object);
+        let kind = self.view_kind(view);
+        let expected = crate::heap::kind::ARRAY | if holey { crate::heap::kind::HOLEY } else { 0 };
+        let array = self.b.ins().icmp_imm_s(IntCC::Equal, kind, expected as i64);
+        let length = self.view_length_integer(view);
+        let position = self.convert(position, Repr::Int64);
+        let integral = if key.repr == Repr::Int32 || key.repr == Repr::Int64 {
+            self.b.ins().iconst(types::I8, 1)
+        } else {
+            let number = self.convert(key, Repr::Float);
+            let exact = self.b.ins().fcvt_from_sint(types::F64, position);
+            self.b.ins().fcmp(FloatCC::Equal, exact, number)
+        };
+        let inside = self.b.ins().icmp(IntCC::UnsignedLessThan, position, length);
+        let valid = self.b.ins().band(array, integral);
+        self.b.ins().band(valid, inside)
+    }
+
+    pub(super) fn array_load(
+        &mut self,
+        object: ClifValue,
+        position: Operand,
+        holey: bool,
+        retain: bool,
+    ) -> ClifValue {
+        let view = self.view(object);
+        let position = self.convert(position, Repr::Int64);
+        let flags = MemFlagsData::trusted();
+        let data = self.b.ins().load(self.pointer, flags, view, DATA_OFFSET);
+        let offset = self.b.ins().ishl_imm_s(position, 3);
+        let address = self.b.ins().iadd(data, offset);
+        let mut bits = self.b.ins().load(types::I64, flags, address, 0);
+        if holey {
+            let hole = self
+                .b
+                .ins()
+                .icmp_imm_s(IntCC::Equal, bits, HOLE.bits() as i64);
+            let undefined = self.constant(Value::UNDEFINED);
+            bits = self.b.ins().select(hole, undefined, bits);
+        }
+        if retain {
+            let heap = self.is_heap(bits);
+            let retained = self.b.create_block();
+            let done = self.b.create_block();
+            self.b.append_block_param(done, types::I64);
+            self.brif(heap, retained, &[], done, &[bits.into()]);
+            self.switch(retained);
+            let value = self.retain_temporary(bits);
+            self.jump(done, &[value.into()]);
+            self.switch(done);
+            bits = self.b.block_params(done)[0];
+        }
+        bits
+    }
+
     pub(super) fn checked_element_read(
         &mut self,
         view: ClifValue,
@@ -966,8 +1046,8 @@ impl FunctionCompiler<'_, '_> {
             .b
             .ins()
             .load(types::I64, MemFlagsData::trusted(), view, LENGTH_OFFSET);
-        let inside = if key.repr == Repr::Int32 {
-            let position = self.b.ins().sextend(types::I64, key.value);
+        let inside = if matches!(key.repr, Repr::Int32 | Repr::Int64) {
+            let position = self.convert(key, Repr::Int64);
             self.b.ins().icmp(IntCC::UnsignedLessThan, position, length)
         } else {
             let number = self.convert(key, Repr::Float);
@@ -1002,8 +1082,8 @@ impl FunctionCompiler<'_, '_> {
     ) -> ClifValue {
         let flags = MemFlagsData::trusted();
         let length = self.b.ins().load(types::I64, flags, view, LENGTH_OFFSET);
-        let (position, fast) = if key.repr == Repr::Int32 {
-            let position = self.b.ins().sextend(types::I64, key.value);
+        let (position, fast) = if matches!(key.repr, Repr::Int32 | Repr::Int64) {
+            let position = self.convert(key, Repr::Int64);
             let inside = self.b.ins().icmp(IntCC::UnsignedLessThan, position, length);
             (position, inside)
         } else {

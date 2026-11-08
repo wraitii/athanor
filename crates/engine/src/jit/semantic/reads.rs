@@ -19,6 +19,7 @@ pub(super) fn plan(
     source: usize,
 ) -> Vec<Read> {
     let facts = Facts::compute(graph);
+    let hints = super::observations::read_hints(graph);
     let mut reads = Vec::new();
     for block in Cfg::new(graph).rpo {
         for &inst in &graph.blocks[block].insts {
@@ -39,6 +40,7 @@ pub(super) fn plan(
                 .read_feedback
                 .get(&(site(inst), ReadKind::Receiver))
                 .copied()
+                .or_else(|| hints.get(&object).copied())
                 .or_else(|| {
                     let ValueDef::Result(producer) = graph.values[object] else {
                         return None;
@@ -61,6 +63,7 @@ pub(super) fn plan(
                 element: match observed {
                     ReadType::Typed(kind) => Some(kind),
                     ReadType::Array => None,
+                    ReadType::Unknown | ReadType::Integer | ReadType::Number => continue,
                 },
                 guard_number: !types.within(Types::NUMBER),
             });
@@ -116,36 +119,67 @@ pub(super) fn apply(
         } else {
             (fast, key)
         };
-        let fast = if read.typed {
-            fast
-        } else {
-            let bounded = graph.blocks.push(BlockData::default());
-            let check = graph
-                .append(fast, data.span, Op::IsArrayIndex(object, key), true)
+        if !read.typed {
+            let position = graph
+                .append(fast, data.span, Op::ArrayPosition(key), true)
                 .1
                 .unwrap();
-            graph.blocks[fast].terminator = Some(Terminator {
-                source_name: data.source_name,
-                span: data.span,
-                kind: TerminatorKind::Branch(check, Target::new(bounded), Target::new(fallback)),
-            });
-            bounded
-        };
+            let mut guard = fast;
+            for holey in [false, true] {
+                let load = graph.blocks.push(BlockData::default());
+                let otherwise = if holey {
+                    fallback
+                } else {
+                    graph.blocks.push(BlockData::default())
+                };
+                let valid = graph
+                    .append(
+                        guard,
+                        data.span,
+                        Op::IsArrayIndex(object, key, position, holey),
+                        true,
+                    )
+                    .1
+                    .unwrap();
+                graph.blocks[guard].terminator = Some(Terminator {
+                    source_name: data.source_name,
+                    span: data.span,
+                    kind: TerminatorKind::Branch(valid, Target::new(load), Target::new(otherwise)),
+                });
+                let (inst, value) = graph.append(
+                    load,
+                    data.span,
+                    Op::ArrayLoad(object, position, holey),
+                    true,
+                );
+                graph.insts[inst].source_name = data.source_name;
+                graph.blocks[load].terminator = Some(Terminator {
+                    source_name: data.source_name,
+                    span: data.span,
+                    kind: TerminatorKind::Jump(Target {
+                        block: continuation,
+                        args: vec![value.unwrap()],
+                    }),
+                });
+                guard = otherwise;
+            }
+            notes.push(format!(
+                "read at {}..{}: packed/holey indexed receiver checks",
+                data.span.start, data.span.end
+            ));
+            continue;
+        }
         let (inst, value) = graph.append(
             fast,
             data.span,
-            if read.typed {
-                Op::TypedIndex(
-                    object,
-                    key,
-                    TypedRead {
-                        element: read.element,
-                        bounded: false,
-                    },
-                )
-            } else {
-                Op::ArrayIndex(object, key)
-            },
+            Op::TypedIndex(
+                object,
+                key,
+                TypedRead {
+                    element: read.element,
+                    bounded: false,
+                },
+            ),
             true,
         );
         graph.insts[inst].source_name = data.source_name;
@@ -159,9 +193,7 @@ pub(super) fn apply(
         });
         notes.push(format!(
             "read at {}..{}: {} receiver check",
-            data.span.start,
-            data.span.end,
-            if read.typed { "typed" } else { "indexed" }
+            data.span.start, data.span.end, "typed"
         ));
     }
     graph.verify()
@@ -227,9 +259,9 @@ mod tests {
             graph
                 .insts
                 .values()
-                .filter(|data| matches!(data.op, Op::ArrayIndex(..)))
+                .filter(|data| matches!(data.op, Op::ArrayLoad(..)))
                 .count(),
-            1
+            2
         );
         assert_eq!(
             graph

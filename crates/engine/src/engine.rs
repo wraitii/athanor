@@ -453,7 +453,7 @@ impl Engine {
             self.planner
                 .borrow_mut()
                 .observe_get(cache.owner, cache.site, kind, observed);
-        if recorded {
+        if recorded && observed != jit::planner::ReadType::Unknown {
             self.log_recompilation(
                 cache.owner,
                 format_args!(
@@ -1474,6 +1474,33 @@ mod feedback_tests {
     }
 
     #[test]
+    fn property_integer_feedback_preserves_type_changes() {
+        let mut engine = new_engine().unwrap();
+        engine.compile(
+            "var point={x:2}; function sum(n){let total=0;for(let i=0;i<n;++i)total+=point.x+i;return total;} function replace(){point.x='3';}",
+            "property-numbers.js",
+        ).unwrap();
+        let code = code(&engine, "sum");
+        let original = entry(&engine, code);
+        for _ in 0..3 {
+            assert_eq!(
+                engine.call("sum", &[Value::number(3.0)]).unwrap().value(),
+                Value::number(9.0)
+            );
+        }
+        assert_ne!(entry(&engine, code), original);
+        engine.call("replace", &[]).unwrap();
+        let result = engine.call("sum", &[Value::number(3.0)]).unwrap();
+        let expected = engine.string("0303132").unwrap();
+        assert!(
+            engine
+                .global
+                .heap()
+                .strings_equal(result.value(), expected.value())
+        );
+    }
+
+    #[test]
     fn ineligible_feedback_keeps_the_existing_entry() {
         let mut engine = new_engine().unwrap();
         engine.compile(
@@ -1570,7 +1597,15 @@ mod feedback_tests {
                 Value::UNDEFINED
             );
         }
-        for index in [-1.0, 0.5, f64::NAN, f64::INFINITY] {
+        for index in [
+            -1.0,
+            0.5,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MAX,
+            f64::MIN,
+        ] {
             assert!(engine.call("read", &[Value::number(index)]).is_err());
         }
         let key = engine.string("2").unwrap();
@@ -1588,6 +1623,63 @@ mod feedback_tests {
         assert_eq!(
             engine.call("read", &[Value::number(0.0)]).unwrap().value(),
             Value::number(7.0)
+        );
+    }
+
+    #[test]
+    fn array_read_guards_follow_layout_length_and_storage_changes() {
+        let mut engine = new_engine().unwrap();
+        engine
+            .compile(
+                "var values=new Array(3);values[0]=5;values[2]=9;
+             function read(i){return values[i];}
+             function fill(){values[1]=7;}
+             function shrink(){values.length=1;}
+             function grow(){for(let i=1;i<100;++i)values.push(i);}
+             function replace(){values=new Array(3);values[2]=11;}",
+                "array_layout_feedback.js",
+            )
+            .unwrap();
+        let code = code(&engine, "read");
+        let original = entry(&engine, code);
+        for _ in 0..3 {
+            assert_eq!(
+                engine.call("read", &[Value::number(2.0)]).unwrap().value(),
+                Value::number(9.0)
+            );
+        }
+        assert_ne!(entry(&engine, code), original);
+        assert_eq!(
+            engine.call("read", &[Value::number(1.0)]).unwrap().value(),
+            Value::UNDEFINED
+        );
+        engine.call("fill", &[]).unwrap();
+        assert_eq!(
+            engine.call("read", &[Value::number(1.0)]).unwrap().value(),
+            Value::number(7.0)
+        );
+        assert_eq!(
+            engine.call("read", &[Value::number(-0.0)]).unwrap().value(),
+            Value::number(5.0)
+        );
+        engine.call("shrink", &[]).unwrap();
+        assert_eq!(
+            engine.call("read", &[Value::number(2.0)]).unwrap().value(),
+            Value::UNDEFINED
+        );
+        engine.call("grow", &[]).unwrap();
+        assert_eq!(
+            engine.call("read", &[Value::number(99.0)]).unwrap().value(),
+            Value::number(99.0)
+        );
+        engine.call("replace", &[]).unwrap();
+        assert_eq!(
+            engine.call("read", &[Value::number(0.0)]).unwrap().value(),
+            Value::UNDEFINED
+        );
+        assert_eq!(
+            engine.call("read", &[Value::number(2.0)]).unwrap().value(),
+            Value::number(11.0)
         );
     }
 
@@ -1718,6 +1810,62 @@ mod feedback_tests {
             ..Default::default()
         })
         .unwrap()
+    }
+
+    #[test]
+    fn numeric_feedback_recompiles_without_read_or_call_specialization() {
+        let mut engine = Engine::with_options(EngineOptions {
+            background_compile: false,
+            ..Default::default()
+        })
+        .unwrap();
+        engine
+            .compile(
+                "function sum(x){let result=1/x;for(let i=0;i<2;++i)result+=x;return result;}",
+                "integer-feedback.js",
+            )
+            .unwrap();
+        let code = code(&engine, "sum");
+        let original = entry(&engine, code);
+        for _ in 0..3 {
+            assert_eq!(
+                engine.call("sum", &[Value::number(2.0)]).unwrap().value(),
+                Value::number(4.5)
+            );
+        }
+        assert_ne!(entry(&engine, code), original);
+        for value in [
+            0.5,
+            -0.0,
+            0.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            9007199254740992.0,
+        ] {
+            let expected = (1.0 / value + value) + value;
+            assert_eq!(
+                engine.call("sum", &[Value::number(value)]).unwrap().value(),
+                Value::number(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn numeric_osr_feedback_preserves_fractional_guard_fallbacks() {
+        let source = "function main(){const holder={x:2};let result=0;for(let j=0;j<160;++j){if(j===100)holder.x=0.5;const x=holder.x;let sum=0;for(let i=0;i<3;++i)sum+=(x+i)*1;result+=sum;}return result;}";
+        let mut baseline = Engine::with_options(EngineOptions {
+            ssa_opt: false,
+            background_compile: false,
+            ..Default::default()
+        })
+        .unwrap();
+        baseline.compile(source, "numeric-osr.js").unwrap();
+        let expected = baseline.call("main", &[]).unwrap().value();
+        let mut engine = osr_engine(false);
+        engine.compile(source, "numeric-osr.js").unwrap();
+        assert_eq!(engine.call("main", &[]).unwrap().value(), expected);
+        assert!(engine.compiler.borrow().osr_transfers() > 0);
     }
 
     #[test]

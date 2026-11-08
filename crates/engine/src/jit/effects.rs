@@ -63,7 +63,9 @@ pub(super) fn effects(helper: Helper) -> Effects {
         | LocalGet | TempClear | TempRetain | TempOwn | ErrorOrigin | Catch | Throw => {
             (Reentry::Closed, INTERNAL | ERROR, &[])
         }
-        ObserveCall | ObserveGet | ObserveIndex => (Reentry::Closed, HEAP_READ | INTERNAL, &[]),
+        ObserveCall | ObserveGet | ObserveIndex | ObserveNumber => {
+            (Reentry::Closed, HEAP_READ | INTERNAL, &[])
+        }
         CompilePoll | CompileLeave | CallProfileFlush => (Reentry::Closed, INTERNAL, &[]),
         SemanticGlobalProbe => (Reentry::Closed, GLOBAL_READ, &[]),
         ConstructorPrototype
@@ -171,11 +173,12 @@ pub(super) fn temporary_effect(helper: Helper) -> TemporaryEffect {
         | ArrayMapNewOwned => None,
         FrameOverflow | FrameRelease | IndexUnroot | LocalSet | LocalReplace | Release
         | ErrorOrigin | Throw | MathDirect | ObserveCall | ObserveGet | ObserveIndex
-        | CompilePoll | CompileLeave | CallProfileFlush | ClosureThis | LexicalReceiver
-        | ArrayIterationGuard | IsStringSplit | IndexRoot | Truthy | BitwiseAnd | BitwiseOr
-        | BitwiseXor | ShiftLeft | ShiftRight | ShiftRightUnsigned | Sub | Mul | Div | Rem
-        | Pow | LooseEqual | LooseNotEqual | StrictEqual | StrictNotEqual | Less | LessEqual
-        | Greater | GreaterEqual | UnaryPlus | UnaryNegation | LogicalNot | BitwiseNot => None,
+        | ObserveNumber | CompilePoll | CompileLeave | CallProfileFlush | ClosureThis
+        | LexicalReceiver | ArrayIterationGuard | IsStringSplit | IndexRoot | Truthy
+        | BitwiseAnd | BitwiseOr | BitwiseXor | ShiftLeft | ShiftRight | ShiftRightUnsigned
+        | Sub | Mul | Div | Rem | Pow | LooseEqual | LooseNotEqual | StrictEqual
+        | StrictNotEqual | Less | LessEqual | Greater | GreaterEqual | UnaryPlus
+        | UnaryNegation | LogicalNot | BitwiseNot => None,
         _ => MayRegister,
     }
 }

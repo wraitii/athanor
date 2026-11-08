@@ -37,6 +37,21 @@ struct Body {
 }
 
 impl Repository {
+    pub(in crate::jit) fn observed(
+        &self,
+        site: crate::jit::planner::Site,
+        kind: crate::jit::planner::Observation,
+    ) -> bool {
+        match kind {
+            crate::jit::planner::Observation::Call => {
+                self.feedback.contains_key(&site) || self.native_feedback.contains_key(&site)
+            }
+            crate::jit::planner::Observation::Read(kind) => {
+                self.read_feedback.contains_key(&(site, kind))
+            }
+        }
+    }
+
     pub(in crate::jit) fn callees(&self, code: FuncId) -> Vec<FuncId> {
         let Some(body) = self.bodies.get(&code) else {
             return Vec::new();
@@ -213,7 +228,7 @@ impl Repository {
                     }
                     Op::GetIndex(..)
                     | Op::IndexedGet(..)
-                    | Op::ArrayIndex(..)
+                    | Op::ArrayLoad(..)
                     | Op::TypedIndex(..) => {
                         effects.properties_read.insert("*".into());
                     }
@@ -1202,10 +1217,10 @@ mod tests {
             let first =
                 super::super::plan_canonical(canonical.clone(), true, Some((&bodies, 0))).unwrap();
             let second = super::super::plan_canonical(canonical, true, Some((&bodies, 0))).unwrap();
-            assert_eq!(first.inlines.len(), count);
-            assert!(first.inlines == second.inlines);
+            assert_eq!(first.plan.inlines.len(), count);
+            assert!(first.plan.inlines == second.plan.inlines);
             let analysis = super::super::optimize_planned(first, None, false).unwrap();
-            assert!(analysis.inlines == second.inlines);
+            assert!(analysis.plan.inlines == second.plan.inlines);
             analysis.graph.verify().unwrap();
         }
     }
@@ -1404,8 +1419,8 @@ mod tests {
         let recompiled =
             super::super::plan_canonical_with_budget(canonical, true, Some((&bodies, 0)), 2)
                 .unwrap();
-        assert!(initial.inlines.is_empty());
-        assert!(!recompiled.inlines.is_empty());
+        assert!(initial.plan.inlines.is_empty());
+        assert!(!recompiled.plan.inlines.is_empty());
     }
 
     #[test]

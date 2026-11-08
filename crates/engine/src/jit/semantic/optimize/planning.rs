@@ -9,7 +9,7 @@ struct RegionPlan {
     calls: Vec<ConditionalCall>,
     identities: Vec<(String, cranelift_module::FuncId)>,
     reads: Vec<Inst>,
-    checks: Vec<Value>,
+    checks: Vec<(Value, Types)>,
     guards: Vec<Block>,
     exits: Vec<Block>,
     typed: Vec<(Value, Option<TypedKind>)>,
@@ -62,12 +62,16 @@ impl RegionPlan {
         for (name, code) in &self.identities {
             writeln!(out, "{indent}  identity {name}={code}").unwrap();
         }
-        for &value in &self.checks {
+        for &(value, types) in &self.checks {
             let origin = graph
                 .defining_op(value)
                 .map(|op| graph.op_text(op))
                 .unwrap_or_else(|| "block parameter".into());
-            writeln!(out, "{indent}  number assumption {value}: {origin}").unwrap();
+            writeln!(
+                out,
+                "{indent}  number assumption {value} as {types}: {origin}"
+            )
+            .unwrap();
         }
         for &inst in &self.reads {
             writeln!(
@@ -117,7 +121,7 @@ impl RegionPlan {
         child
             .checks
             .iter()
-            .all(|&value| facts.of(value).within(NUMERIC))
+            .all(|&(value, types)| facts.of(value).within(types))
             && child
                 .calls
                 .iter()
@@ -353,7 +357,7 @@ fn plan_region(
     let checks = entry_checks(&planning, &body, &blocks, &reads);
     let guards = invariant_guards(&planning, &body, &blocks, &reads);
     // Candidate facts must not narrow the original graph before its guards execute.
-    let assumptions = checks.iter().map(|&value| (value, Types::NUMBER)).collect();
+    let assumptions = checks.iter().copied().collect();
     let facts = Facts::assuming(&planning, &assumptions);
     let objects = typed_objects(&planning, &body, &available, &facts);
     let typed: Vec<_> = objects
@@ -523,6 +527,149 @@ mod tests {
             .graph;
         super::super::super::comparisons::expose(&mut graph);
         graph
+    }
+
+    #[test]
+    fn entry_numeric_observations_replace_copied_loop_observations() {
+        use crate::jit::planner::{Observation, ReadKind};
+
+        let mut graph = graph(
+            "function sum(point,n){let sum=0;for(let i=0;i<n;++i)sum+=point.x+i;return sum;}",
+        );
+        let repository = super::super::super::specialize::Repository::default();
+        super::super::super::observations::plan(&mut graph, Some((&repository, 7)));
+        version(&mut graph, &Default::default(), None, &mut Vec::new()).unwrap();
+        let cfg = Cfg::new(&graph);
+        let observations: Vec<_> = cfg
+            .rpo
+            .iter()
+            .flat_map(|&block| {
+                graph.blocks[block]
+                    .insts
+                    .iter()
+                    .filter_map(|&inst| match graph.insts[inst].op {
+                        Op::Observe(value, Observation::Read(ReadKind::Number), site) => {
+                            Some((block, value, site))
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(!observations.is_empty());
+        for &(block, value, site) in &observations {
+            assert!(!observations.iter().any(|&(other, candidate, origin)| {
+                other != block
+                    && candidate == value
+                    && origin == site
+                    && cfg.dominates(other, block)
+            }));
+        }
+        graph.verify().unwrap();
+    }
+
+    #[test]
+    fn observed_numeric_types_select_guarded_region_facts() {
+        use crate::jit::planner::{ReadKind, ReadType, Site};
+        for observed in [ReadType::Integer, ReadType::Number] {
+            let mut graph =
+                graph("function f(x,n){let sum=0;for(let i=0;i<n;++i)sum+=x+i;return sum;}");
+            let (inst, value) = graph
+                .insts
+                .iter()
+                .find_map(|(inst, data)| {
+                    matches!(data.op, Op::Argument(0)).then(|| (inst, data.result.unwrap()))
+                })
+                .unwrap();
+            let data = &graph.insts[inst];
+            let site = Site {
+                source: 7,
+                start: data.span.start,
+                end: data.span.end,
+            };
+            let mut repository = super::super::super::specialize::Repository::default();
+            repository
+                .read_feedback
+                .insert((site, ReadKind::Number), observed);
+            let decisions =
+                super::super::super::observations::plan(&mut graph, Some((&repository, 7)));
+            assert_eq!(decisions, vec![(site, observed)]);
+            assert!(!Facts::compute(&graph).of(value).within(Types::INTEGER));
+            version(&mut graph, &Default::default(), None, &mut Vec::new()).unwrap();
+            let facts = Facts::compute(&graph);
+            let integers: Vec<_> = Cfg::new(&graph)
+                .rpo
+                .iter()
+                .flat_map(|&block| &graph.blocks[block].insts)
+                .filter_map(|&inst| {
+                    matches!(graph.insts[inst].op, Op::AsInteger(_))
+                        .then(|| graph.insts[inst].result.unwrap())
+                })
+                .collect();
+            assert_eq!(!integers.is_empty(), observed == ReadType::Integer);
+            for value in integers {
+                assert!(facts.of(value).within(Types::INTEGER));
+            }
+            graph.verify().unwrap();
+        }
+    }
+
+    #[test]
+    fn observed_storage_and_numbers_combine_for_bounded_integer_reads() {
+        use crate::jit::planner::{ReadKind, ReadType, Site};
+        let graph = graph(
+            "function f(x,offsets){let sum=0;for(let k=0;k<offsets.length;++k)sum+=(x+offsets[k])*1;return sum;}",
+        );
+        let mut repository = super::super::super::specialize::Repository::default();
+        for data in graph.insts.values() {
+            let observed = match data.op {
+                Op::Argument(0) => Some((ReadKind::Number, ReadType::Integer)),
+                Op::GetIndex(..) => Some((ReadKind::Receiver, ReadType::Typed(TypedKind::Int32))),
+                _ => None,
+            };
+            if let Some((kind, observed)) = observed {
+                repository.read_feedback.insert(
+                    (
+                        Site {
+                            source: 7,
+                            start: data.span.start,
+                            end: data.span.end,
+                        },
+                        kind,
+                    ),
+                    observed,
+                );
+            }
+        }
+        let canonical = super::super::super::Canonical::from_graph(graph);
+        let analysis =
+            super::super::super::optimize_canonical(canonical, true, Some((&repository, 7)))
+                .unwrap();
+        let graph = &analysis.graph;
+        let facts = Facts::compute(graph);
+        let integer_add = Cfg::new(graph)
+            .rpo
+            .iter()
+            .flat_map(|&block| &graph.blocks[block].insts)
+            .any(|&inst| {
+                let data = &graph.insts[inst];
+                let Op::Binary(BinaryOperator::Addition, _, right) = data.op else {
+                    return false;
+                };
+                matches!(
+                    graph.defining_op(right),
+                    Some(Op::TypedIndex(
+                        _,
+                        _,
+                        TypedRead {
+                            element: Some(TypedKind::Int32),
+                            bounded: true
+                        }
+                    ))
+                ) && facts.of(data.result.unwrap()).within(Types::INTEGER)
+            });
+        assert!(integer_add);
+        graph.verify().unwrap();
     }
 
     #[test]
@@ -756,10 +903,10 @@ mod tests {
         assert!(root.entry.is_none());
         assert_eq!(root.children.len(), 1);
         let child = &root.children[0];
-        assert!(child.checks.iter().any(|&value| {
+        assert!(child.checks.iter().any(|&(value, _)| {
             matches!(graph.defining_op(value), Some(Op::Get(_, name)) if name == "width")
         }));
-        assert!(!root.checks.iter().any(|&value| {
+        assert!(!root.checks.iter().any(|&(value, _)| {
             matches!(graph.defining_op(value), Some(Op::Get(_, name)) if name == "width")
         }));
     }

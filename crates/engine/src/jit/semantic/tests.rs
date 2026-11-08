@@ -424,7 +424,7 @@ fn indexed_rows_borrow_from_owned_receivers_through_guards() {
             .insts
             .values()
             .filter(|data| {
-                matches!(data.op, Op::ArrayIndex(..))
+                matches!(data.op, Op::ArrayLoad(..))
                     && &source[data.span.start as usize..data.span.end as usize] == "height[i&1]"
             })
             .collect();
@@ -920,7 +920,7 @@ fn borrowed_rows_flow_through_phi_parameters() {
                         },
                     );
                 } else {
-                    data.op = Op::ArrayIndex(object, key);
+                    data.op = Op::IndexedGet(object, key);
                 }
             }
         }
@@ -930,4 +930,66 @@ fn borrowed_rows_flow_through_phi_parameters() {
         borrow::borrows(&mut graph, &facts, &mut Vec::new());
         assert_eq!(graph.borrowed.contains(&row), expected, "{source}");
     }
+}
+
+#[test]
+fn integer_facts_survive_loop_backedges_without_length_bounds() {
+    for step in ["++k", "k = k + 1", "--k", "k = k - 1"] {
+        let source = format!("function f(limit){{let k=0;while(k!==limit){{{step};}}return k;}}");
+        let graph = canonicalize(lower_source(&source).unwrap(), true)
+            .unwrap()
+            .graph;
+        let facts = Facts::compute(&graph);
+        let mut steps = 0;
+        for data in graph.insts.values() {
+            if matches!(
+                data.op,
+                Op::Unary(UnaryOp::Increment | UnaryOp::Decrement, _)
+                    | Op::Binary(BinaryOperator::Addition | BinaryOperator::Subtraction, ..)
+            ) {
+                assert!(facts.of(data.result.unwrap()).within(Types::INTEGER));
+                steps += 1;
+            }
+        }
+        assert!(steps > 0);
+        assert!(
+            graph
+                .blocks
+                .values()
+                .flat_map(|block| &block.params)
+                .any(|&value| facts.of(value).within(Types::INTEGER)
+                    && facts.of(value).intersects(Types::INT64))
+        );
+    }
+}
+
+#[test]
+fn unsupported_numeric_reads_are_not_observed_again() {
+    use crate::jit::planner::{Observation, ReadKind, ReadType, Site};
+
+    let mut graph = lower_source("function f(point){return point.x + 1;}").unwrap();
+    observations::plan(&mut graph, None);
+    let (value, site) = ops(&graph)
+        .into_iter()
+        .find_map(|op| match op {
+            Op::Observe(value, Observation::Read(ReadKind::Number), site) => Some((*value, *site)),
+            _ => None,
+        })
+        .unwrap();
+    let mut repository = specialize::Repository::default();
+    let site = Site { source: 7, ..site };
+    repository
+        .read_feedback
+        .insert((site, ReadKind::Number), ReadType::Unknown);
+    assert!(observations::plan(&mut graph, Some((&repository, 7))).is_empty());
+    assert!(
+        !ops(&graph)
+            .iter()
+            .any(|op| matches!(op, Op::Observe(_, Observation::Read(ReadKind::Number), _)))
+    );
+    assert_eq!(
+        observations::numeric_hints(&graph).get(&value),
+        Some(&ReadType::Unknown)
+    );
+    graph.verify().unwrap();
 }

@@ -10,7 +10,7 @@ use crate::heap::kind;
 use crate::jit::helpers::Helper;
 use crate::jit::semantic::{
     Constant, Facts, Graph, Op, ScopeKind, TerminatorKind, TypedRead, Types, UnaryOp,
-    Value as GraphValue, ValueDef,
+    Value as GraphValue,
 };
 use crate::value::{TAG_SHIFT, TAG_STRING, Value};
 
@@ -48,26 +48,28 @@ impl Context<'_> {
 }
 
 impl FunctionCompiler<'_, '_> {
-    fn observe(&mut self, value: ClifValue, span: oxc_span::Span, helper: Helper) {
+    fn observe(
+        &mut self,
+        value: ClifValue,
+        mut site: crate::jit::planner::Site,
+        kind: crate::jit::planner::Observation,
+    ) {
         let Some(feedback) = self.feedback else {
             return;
         };
-        if !feedback.get_refinement && matches!(helper, Helper::ObserveGet | Helper::ObserveIndex) {
+        use crate::jit::planner::Observation;
+        if !feedback.get_refinement && matches!(kind, Observation::Read(_)) {
             return;
         }
-        let site = crate::jit::planner::Site {
-            source: self.source_name.0,
-            start: span.start,
-            end: span.end,
-        };
-        let kind = match helper {
-            Helper::ObserveGet => Some(crate::jit::planner::ReadKind::Result),
-            Helper::ObserveIndex => Some(crate::jit::planner::ReadKind::Receiver),
-            _ => None,
-        };
-        if kind.is_some_and(|kind| feedback.reads.contains_key(&(site, kind))) {
-            return;
+        if site.source == 0 {
+            site.source = self.source_name.0;
         }
+        let helper = match kind {
+            Observation::Call => Helper::ObserveCall,
+            Observation::Read(crate::jit::planner::ReadKind::Result) => Helper::ObserveGet,
+            Observation::Read(crate::jit::planner::ReadKind::Receiver) => Helper::ObserveIndex,
+            Observation::Read(crate::jit::planner::ReadKind::Number) => Helper::ObserveNumber,
+        };
         let address = self.function_data(crate::jit::planner::ObservationCache {
             recorded: 0,
             owner: feedback.owner,
@@ -182,52 +184,6 @@ impl FunctionCompiler<'_, '_> {
                 reprs[value] = Repr::of(facts.of(value));
             }
         }
-        if !suspends {
-            for data in graph.insts.values() {
-                let Op::Binary(oxc_syntax::operator::BinaryOperator::LessThan, index, length) =
-                    data.op
-                else {
-                    continue;
-                };
-                if !matches!(graph.defining_op(length), Some(Op::IndexedLength(_))) {
-                    continue;
-                }
-                let ValueDef::Param(header, position) = graph.values[index] else {
-                    continue;
-                };
-                let incoming: Vec<_> = graph
-                    .blocks
-                    .values()
-                    .filter_map(|block| block.terminator.as_ref())
-                    .flat_map(|term| term.kind.targets())
-                    .filter(|target| target.block == header)
-                    .map(|target| target.args[position])
-                    .collect();
-                let unit_step = |value| match graph.defining_op(value) {
-                    Some(Op::Constant(Constant::Number(n))) => *n == 0.0,
-                    Some(Op::Binary(
-                        oxc_syntax::operator::BinaryOperator::Addition,
-                        left,
-                        right,
-                    )) => {
-                        *left == index
-                            && matches!(
-                                graph.defining_op(*right),
-                                Some(Op::Constant(Constant::Number(n))) if *n == 1.0
-                            )
-                    }
-                    _ => false,
-                };
-                if incoming.is_empty() || !incoming.iter().copied().all(unit_step) {
-                    continue;
-                }
-                reprs[index] = Repr::Int64;
-                reprs[length] = Repr::Int64;
-                for value in incoming {
-                    reprs[value] = Repr::Int64;
-                }
-            }
-        }
         let values: Vec<Variable> = graph
             .values
             .keys()
@@ -261,15 +217,6 @@ impl FunctionCompiler<'_, '_> {
         };
         let cfg = crate::jit::semantic::Cfg::new(graph);
         let reachable = cfg.rpo.clone();
-        let indexed_receivers: std::collections::HashSet<_> = reachable
-            .iter()
-            .flat_map(|&block| graph.blocks[block].insts.iter())
-            .filter_map(|&inst| match graph.insts[inst].op {
-                Op::GetIndex(object, _)
-                | Op::TypedIndex(object, _, TypedRead { element: None, .. }) => Some(object),
-                _ => None,
-            })
-            .collect();
         let mut pack_slots = SecondaryMap::new();
         let mut pack_cleanup = Vec::new();
         for &block in &reachable {
@@ -353,7 +300,7 @@ impl FunctionCompiler<'_, '_> {
                             Op::GetIndex(..)
                             | Op::TypedIndex(..)
                             | Op::IndexedGet(..)
-                            | Op::ArrayIndex(..)
+                            | Op::ArrayLoad(..)
                             | Op::PackTake(..)
                             | Op::Call {
                                 target: Some(_), ..
@@ -460,13 +407,6 @@ impl FunctionCompiler<'_, '_> {
                     let operand = this.operand(&cx, value);
                     this.convert(operand, Repr::Boxed)
                 };
-                if let Op::GetIndex(object, _)
-                | Op::ProbeIndex(object, _)
-                | Op::TypedIndex(object, _, TypedRead { element: None, .. }) = data.op
-                {
-                    let object = get(self, object);
-                    self.observe(object, data.span, Helper::ObserveIndex);
-                }
                 let typed = self.typed_op(&cx, graph, inst)?;
                 let mut owned = false;
                 let result = if let Some(typed) = typed {
@@ -540,6 +480,12 @@ impl FunctionCompiler<'_, '_> {
                             } else {
                                 Some(self.constant(Value::FALSE))
                             }
+                        }
+                        Op::ReadHint(..) => None,
+                        Op::Observe(value, kind, site) => {
+                            let value = get(self, *value);
+                            self.observe(value, *site, *kind);
+                            None
                         }
                         Op::OsrOutput(start, index) => {
                             let (address, inputs) = cx.osr_buffers.borrow()[start];
@@ -921,8 +867,7 @@ impl FunctionCompiler<'_, '_> {
                         }
                         Op::GetIndex(object, index)
                         | Op::TypedIndex(object, index, _)
-                        | Op::IndexedGet(object, index)
-                        | Op::ArrayIndex(object, index) => {
+                        | Op::IndexedGet(object, index) => {
                             let object = get(self, *object);
                             let index = get(self, *index);
                             let retain = data.result.is_none_or(|value| {
@@ -1021,10 +966,12 @@ impl FunctionCompiler<'_, '_> {
                             let no = self.constant(Value::FALSE);
                             Some(self.b.ins().select(condition, yes, no))
                         }
-                        Op::IsTyped(..)
-                        | Op::IsArrayIndex(..)
-                        | Op::IsPropertyCached(..)
-                        | Op::IsCode(..) => unreachable!(),
+                        Op::ArrayPosition(..) | Op::IsArrayIndex(..) | Op::ArrayLoad(..) => {
+                            unreachable!()
+                        }
+                        Op::IsTyped(..) | Op::IsPropertyCached(..) | Op::IsCode(..) => {
+                            unreachable!()
+                        }
                         Op::IsIndexed(value) => {
                             let value = get(self, *value);
                             let view = self.view(value);
@@ -1044,6 +991,7 @@ impl FunctionCompiler<'_, '_> {
                             )
                         }
                         Op::AsNumber(value) => Some(get(self, *value)),
+                        Op::IsInteger(_) | Op::AsInteger(_) => unreachable!(),
                         Op::ToInt32(_) => unreachable!(),
                         Op::ToNumeric(value) => {
                             let value = get(self, *value);
@@ -1124,7 +1072,6 @@ impl FunctionCompiler<'_, '_> {
                                 .map(|v| get(self, v))
                                 .unwrap_or_else(|| self.constant(Value::UNDEFINED));
                             let args: Vec<_> = args.iter().map(|&v| get(self, v)).collect();
-                            self.observe(callee, data.span, Helper::ObserveCall);
                             let value = match target {
                                 Some(target) => {
                                     let receiver = match closure {
@@ -1184,7 +1131,6 @@ impl FunctionCompiler<'_, '_> {
                             let callee = get(self, *callee);
                             let receiver = get(self, *receiver);
                             let args: Vec<_> = args.iter().map(|&v| get(self, v)).collect();
-                            self.observe(callee, data.span, Helper::ObserveCall);
                             let argv = self.stack_values(&args, data.span)?;
                             let argc = self.b.ins().iconst(types::I64, args.len() as i64);
                             let result = self.call_helper(
@@ -1428,15 +1374,6 @@ impl FunctionCompiler<'_, '_> {
                     result.map(|value| Operand::new(value, Repr::Boxed))
                 };
                 if let (Some(value), Some(result)) = (data.result, result) {
-                    if matches!(
-                        data.op,
-                        Op::Get(..) | Op::GetIndex(..) | Op::IndexedGet(..) | Op::ArrayIndex(..)
-                    ) && indexed_receivers.contains(&value)
-                        && facts.of(value).intersects(Types::OBJECT)
-                    {
-                        let boxed = self.convert(result, Repr::Boxed);
-                        self.observe(boxed, data.span, Helper::ObserveGet);
-                    }
                     let result = self.convert(result, reprs[value]);
                     let borrowed = (matches!(data.op, Op::This | Op::Argument(_))
                         || graph.borrowed.contains(&value))
@@ -1682,9 +1619,10 @@ impl FunctionCompiler<'_, '_> {
                 } else {
                     -1
                 };
-                Some(Some(if target == Some(Repr::Int32) {
-                    let integer = self.convert(operand, Repr::Int32);
-                    Operand::new(self.b.ins().iadd_imm_s(integer, delta), Repr::Int32)
+                Some(Some(if matches!(target, Some(Repr::Int32 | Repr::Int64)) {
+                    let repr = target.unwrap();
+                    let integer = self.convert(operand, repr);
+                    Operand::new(self.b.ins().iadd_imm_s(integer, delta), repr)
                 } else {
                     let float = self.convert(operand, Repr::Float);
                     let one = self.b.ins().f64const(delta as f64);
@@ -1695,6 +1633,18 @@ impl FunctionCompiler<'_, '_> {
                 let operand = self.operand(cx, *value);
                 let float = self.convert(operand, Repr::Float);
                 Some(Some(Operand::new(self.b.ins().fneg(float), Repr::Float)))
+            }
+            Op::IsInteger(value) => {
+                let operand = self.operand(cx, *value);
+                let boxed = self.convert(operand, Repr::Boxed);
+                boolean(self.is_integer(boxed))
+            }
+            Op::AsInteger(value) => {
+                let operand = self.operand(cx, *value);
+                Some(Some(Operand::new(
+                    self.convert(operand, Repr::Int64),
+                    Repr::Int64,
+                )))
             }
             Op::ToInt32(value) => {
                 debug_assert!(cx.numeric(*value));
@@ -1712,7 +1662,7 @@ impl FunctionCompiler<'_, '_> {
             {
                 let operand = self.operand(cx, *value);
                 Some(Some(match operand.repr {
-                    Repr::Int32 | Repr::Float => operand,
+                    Repr::Int32 | Repr::Int64 | Repr::Float => operand,
                     _ => Operand::new(self.convert(operand, Repr::Float), Repr::Float),
                 }))
             }
@@ -1785,29 +1735,31 @@ impl FunctionCompiler<'_, '_> {
                 let view = self.view(object);
                 boolean(self.has_kind(view, kind::ARRAY | kind::TYPED))
             }
-            Op::IsArrayIndex(object, key) => {
-                let operand = self.operand(cx, *object);
-                let object = self.convert(operand, Repr::Boxed);
-                let view = self.view(object);
-                let array = self.has_kind(view, kind::ARRAY);
-                let length = self.view_length_integer(view);
+            Op::ArrayPosition(key) => {
                 let key = self.operand(cx, *key);
-                let inside = if key.repr == Repr::Int32 {
-                    let position = self.b.ins().sextend(types::I64, key.value);
-                    self.b.ins().icmp(IntCC::UnsignedLessThan, position, length)
-                } else {
-                    let number = self.convert(key, Repr::Float);
-                    let position = self.b.ins().fcvt_to_sint_sat(types::I64, number);
-                    let exact = self.b.ins().fcvt_from_sint(types::F64, position);
-                    let integral = self.b.ins().fcmp(
-                        cranelift_codegen::ir::condcodes::FloatCC::Equal,
-                        exact,
-                        number,
-                    );
-                    let inside = self.b.ins().icmp(IntCC::UnsignedLessThan, position, length);
-                    self.b.ins().band(integral, inside)
-                };
-                boolean(self.b.ins().band(array, inside))
+                Some(Some(Operand::new(
+                    self.convert(key, Repr::Int64),
+                    Repr::Int64,
+                )))
+            }
+            Op::IsArrayIndex(object, key, position, holey) => {
+                let object = self.operand(cx, *object);
+                let object = self.convert(object, Repr::Boxed);
+                let key = self.operand(cx, *key);
+                let position = self.operand(cx, *position);
+                boolean(self.is_array_index(object, key, position, *holey))
+            }
+            Op::ArrayLoad(object, position, holey) => {
+                let object = self.operand(cx, *object);
+                let object = self.convert(object, Repr::Boxed);
+                let position = self.operand(cx, *position);
+                let retain = data.result.is_none_or(|value| {
+                    !graph.borrowed.contains(&value) && !self.slot_owned(graph, cx, value)
+                });
+                Some(Some(Operand::new(
+                    self.array_load(object, position, *holey, retain),
+                    Repr::Boxed,
+                )))
             }
             Op::IndexedLength(object) => {
                 let operand = self.operand(cx, *object);
@@ -1846,13 +1798,8 @@ impl FunctionCompiler<'_, '_> {
             }
             Op::GetIndex(object, key)
             | Op::TypedIndex(object, key, _)
-            | Op::IndexedGet(object, key)
-            | Op::ArrayIndex(object, key) => {
-                let fallback = !matches!(
-                    data.op,
-                    Op::TypedIndex(..) | Op::ArrayIndex(..) | Op::PackTake(..)
-                );
-                let typed = !matches!(data.op, Op::ArrayIndex(..));
+            | Op::IndexedGet(object, key) => {
+                let fallback = !matches!(data.op, Op::TypedIndex(..) | Op::PackTake(..));
                 let object = self.operand(cx, *object);
                 let object = self.convert(object, Repr::Boxed);
                 let view = match graph.views.get(&inst) {
@@ -1869,7 +1816,7 @@ impl FunctionCompiler<'_, '_> {
                     !graph.borrowed.contains(&value) && !self.slot_owned(graph, cx, value)
                 });
                 let result =
-                    self.viewed_index_access(view, object, key, None, fallback, retain, typed);
+                    self.viewed_index_access(view, object, key, None, fallback, retain, true);
                 Some(Some(Operand::new(result, Repr::Boxed)))
             }
             Op::SetIndex(object, key, value) => {

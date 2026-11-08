@@ -182,6 +182,7 @@ fn guard_fallback(graph: &Graph, block: Block) -> Option<Block> {
         Some(
             Op::IsCode(..)
                 | Op::IsNumber(_)
+                | Op::IsInteger(_)
                 | Op::IsTyped(..)
                 | Op::IsIndexed(_)
                 | Op::IsArrayIndex(..)
@@ -245,7 +246,19 @@ fn typed_objects(
 }
 
 pub(super) fn element_guess(graph: &Graph, object: Value) -> Option<TypedKind> {
-    element_guess_at(graph, object, 0)
+    graph
+        .blocks
+        .iter()
+        .flat_map(|(_, block)| block.insts.iter())
+        .find_map(|&inst| match graph.insts[inst].op {
+            Op::ReadHint(value, _, crate::jit::planner::ReadType::Typed(element), _)
+                if value == object =>
+            {
+                Some(element)
+            }
+            _ => None,
+        })
+        .or_else(|| element_guess_at(graph, object, 0))
 }
 
 fn element_guess_at(graph: &Graph, object: Value, depth: usize) -> Option<TypedKind> {
@@ -432,7 +445,7 @@ fn numeric_use(op: &Op, index: usize) -> bool {
         Op::GetIndex(..)
         | Op::TypedIndex(..)
         | Op::IndexedGet(..)
-        | Op::ArrayIndex(..)
+        | Op::ArrayLoad(..)
         | Op::SetIndex(..) => index == 1,
         _ => false,
     }
@@ -443,19 +456,27 @@ fn entry_checks(
     inside: &HashSet<Block>,
     scan: &[Block],
     probes: &[Inst],
-) -> Vec<Value> {
+) -> Vec<(Value, Types)> {
     let facts = Facts::compute(graph);
     let probed: HashSet<Value> = probes
         .iter()
         .filter_map(|inst| graph.insts[*inst].result)
         .collect();
+    let hints = super::observations::numeric_hints(graph);
     let mut checks = HashSet::new();
     for &block in scan {
         for &inst in &graph.blocks[block].insts {
             let op = &graph.insts[inst].op;
             for (index, value) in op.operands_iter().enumerate() {
-                if numeric_use(op, index)
-                    && !facts.of(value).within(NUMERIC)
+                let desired = if hints.get(&value) == Some(&crate::jit::planner::ReadType::Integer)
+                {
+                    Types::INTEGER
+                } else {
+                    NUMERIC
+                };
+                if hints.get(&value) != Some(&crate::jit::planner::ReadType::Unknown)
+                    && numeric_use(op, index)
+                    && !facts.of(value).within(desired)
                     && (!inside.contains(&graph.def_block(value)) || probed.contains(&value))
                     && !matches!(graph.defining_op(value), Some(Op::Constant(_)))
                 {
@@ -467,6 +488,16 @@ fn entry_checks(
     let mut checks: Vec<Value> = checks.into_iter().collect();
     checks.sort();
     checks
+        .into_iter()
+        .map(|value| {
+            let types = if hints.get(&value) == Some(&crate::jit::planner::ReadType::Integer) {
+                Types::INT64
+            } else {
+                Types::NUMBER
+            };
+            (value, types)
+        })
+        .collect()
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -501,7 +532,7 @@ pub(super) fn reuse_loads(graph: &mut Graph, region: &HashSet<Block>, notes: &mu
                 Op::GetIndex(object, key)
                 | Op::TypedIndex(object, key, _)
                 | Op::IndexedGet(object, key)
-                | Op::ArrayIndex(object, key) => {
+                | Op::ArrayLoad(object, key, _) => {
                     LoadKey::Index(resolve(&aliases, *object), resolve(&aliases, *key))
                 }
                 Op::ConstructorPrototype(callee) => {
@@ -611,6 +642,9 @@ pub(super) fn hoist(graph: &mut Graph, region: &HashSet<Block>, notes: &mut Vec<
         let mut moved = Vec::new();
         for inst in graph.blocks[header].insts.clone() {
             let data = &graph.insts[inst];
+            if matches!(data.op, Op::ReadHint(..)) {
+                continue;
+            }
             let pure = graph.contract(&data.op, &facts).is_pure();
             if data.result.is_some()
                 && invariant(graph, &data.op)
@@ -663,11 +697,7 @@ fn probe_reads(
             if (input
                 || matches!(
                     data.op,
-                    Op::Get(..)
-                        | Op::GetIndex(..)
-                        | Op::IndexedGet(..)
-                        | Op::ArrayIndex(..)
-                        | Op::GlobalRead(_)
+                    Op::Get(..) | Op::GetIndex(..) | Op::IndexedGet(..) | Op::GlobalRead(_)
                 ))
                 && data.op.operands_iter().all(|value| {
                     !inside.contains(&graph.def_block(value)) || probed.contains(&value)
@@ -693,7 +723,7 @@ pub(super) fn views(graph: &mut Graph, notes: &mut Vec<String>) {
             let (Op::GetIndex(object, key)
             | Op::TypedIndex(object, key, _)
             | Op::IndexedGet(object, key)
-            | Op::ArrayIndex(object, key)
+            | Op::ArrayLoad(object, key, _)
             | Op::SetIndex(object, key, _)) = graph.insts[inst].op
             else {
                 continue;

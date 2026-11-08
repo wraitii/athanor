@@ -107,6 +107,7 @@ define_helpers! {
     ObserveCall => Binary, js_observe_call;
     ObserveGet => Binary, js_observe_get;
     ObserveIndex => Binary, js_observe_index;
+    ObserveNumber => Binary, js_observe_number;
     SemanticGlobalProbe => GlobalGet, js_semantic_global_probe;
     SemanticPropertyProbeCached => Binary, js_semantic_property_probe_cached;
     SemanticIndexProbe => Binary, js_semantic_index_probe;
@@ -719,6 +720,10 @@ extern "C" fn js_observe_index(ctx: *mut JitCtx, value: Value, cache: u64) -> Va
     observe_read(ctx, value, cache, super::planner::ReadKind::Receiver)
 }
 
+extern "C" fn js_observe_number(ctx: *mut JitCtx, value: Value, cache: u64) -> Value {
+    observe_read(ctx, value, cache, super::planner::ReadKind::Number)
+}
+
 fn observe_read(
     ctx: *mut JitCtx,
     value: Value,
@@ -729,7 +734,18 @@ fn observe_read(
     let cache = unsafe { &mut *(cache as *mut super::planner::ObservationCache) };
     if cache.recorded == 0 {
         let heap = context.global.heap();
-        let observed = if heap.is_array(value) {
+        let observed = if kind == super::planner::ReadKind::Number {
+            value.as_number().map(|number| {
+                if number.abs() <= 9007199254740991.0
+                    && number.trunc() == number
+                    && !(number == 0.0 && number.is_sign_negative())
+                {
+                    super::planner::ReadType::Integer
+                } else {
+                    super::planner::ReadType::Number
+                }
+            })
+        } else if heap.is_array(value) {
             Some(super::planner::ReadType::Array)
         } else {
             heap.typed_kind(value).map(super::planner::ReadType::Typed)
@@ -737,7 +753,9 @@ fn observe_read(
         if let Some(observed) = observed {
             context.engine.observe_get(cache, observed, kind);
         } else {
-            cache.recorded = 1;
+            context
+                .engine
+                .observe_get(cache, super::planner::ReadType::Unknown, kind);
         }
     }
     Value::UNDEFINED

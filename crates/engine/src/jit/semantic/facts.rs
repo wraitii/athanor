@@ -13,6 +13,8 @@ pub(in crate::jit) struct Types(u16);
 impl Types {
     pub(in crate::jit) const INT32: Self = Self(1);
     pub(in crate::jit) const DOUBLE: Self = Self(2);
+    pub(in crate::jit) const INT64: Self = Self(2048);
+    pub(in crate::jit) const INTEGER: Self = Self(1 | 2048);
     pub(in crate::jit) const BOOLEAN: Self = Self(4);
     pub(in crate::jit) const UNDEFINED: Self = Self(8);
     pub(in crate::jit) const NULL: Self = Self(16);
@@ -22,10 +24,10 @@ impl Types {
     pub(in crate::jit) const UNINITIALIZED: Self = Self(256);
     pub(in crate::jit) const PACK: Self = Self(1024);
     pub(in crate::jit) const VIEW: Self = Self(512);
-    pub(in crate::jit) const NUMBER: Self = Self(1 | 2);
-    pub(in crate::jit) const PRIMITIVE: Self = Self(1 | 2 | 4 | 8 | 16 | 32);
-    pub(in crate::jit) const VALUE: Self = Self(511 & !256);
-    pub(in crate::jit) const ALL: Self = Self(511);
+    pub(in crate::jit) const NUMBER: Self = Self(1 | 2 | 2048);
+    pub(in crate::jit) const PRIMITIVE: Self = Self(1 | 2 | 4 | 8 | 16 | 32 | 2048);
+    pub(in crate::jit) const VALUE: Self = Self((511 & !256) | 2048);
+    pub(in crate::jit) const ALL: Self = Self(511 | 2048);
 
     pub(in crate::jit) const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
@@ -53,10 +55,16 @@ impl fmt::Display for Types {
         let mut names = Vec::new();
         if Self::NUMBER.within(*self) {
             names.push("number");
-        } else if self.intersects(Self::INT32) {
-            names.push("int32");
-        } else if self.intersects(Self::DOUBLE) {
-            names.push("double");
+        } else {
+            if self.intersects(Self::INT32) {
+                names.push("int32");
+            }
+            if self.intersects(Self::INT64) {
+                names.push("int64");
+            }
+            if self.intersects(Self::DOUBLE) {
+                names.push("double");
+            }
         }
         for (types, name) in [
             (Self::BOOLEAN, "bool"),
@@ -194,6 +202,7 @@ fn refined_edge(graph: &Graph, kind: &TerminatorKind) -> Option<(Block, Value, T
         Op::IsNullish(value) => (value, Types::UNDEFINED.union(Types::NULL)),
         Op::IsString(value) => (value, Types::STRING),
         Op::IsNumber(value) => (value, Types::NUMBER),
+        Op::IsInteger(value) => (value, Types::INTEGER),
         _ => return None,
     };
     Some((yes.block, value, mask))
@@ -380,7 +389,7 @@ fn result_types(op: &Op, facts: &Facts) -> Types {
     match op {
         Op::OsrStart(..) => Types::BOOLEAN,
         Op::OsrOutput(..) => Types::NUMBER,
-        Op::OsrStore(..) => Types::default(),
+        Op::OsrStore(..) | Op::Observe(..) | Op::ReadHint(..) => Types::default(),
         Op::Constant(constant) => match constant {
             Constant::Undefined => Types::UNDEFINED,
             Constant::Null => Types::NULL,
@@ -414,20 +423,28 @@ fn result_types(op: &Op, facts: &Facts) -> Types {
         },
         Op::TypedIndex(..) => Types::NUMBER.union(Types::UNDEFINED),
         Op::IsTyped(..) | Op::IsIndexed(_) | Op::IsArrayIndex(..) => Types::BOOLEAN,
-        Op::IndexedLength(_) => Types::NUMBER,
-        Op::IsNumber(_) | Op::IsString(_) | Op::IsStringSplit(_) | Op::IsTypeof(..) => {
-            Types::BOOLEAN
-        }
+        Op::IndexedLength(_) => Types::INT64,
+        Op::IsNumber(_)
+        | Op::IsInteger(_)
+        | Op::IsString(_)
+        | Op::IsStringSplit(_)
+        | Op::IsTypeof(..) => Types::BOOLEAN,
         Op::NewPack | Op::Spread(_) | Op::StringSplitParts(..) => Types::PACK,
         Op::StringSplit(..) => Types::OBJECT,
-        Op::AsNumber(_) => Types::NUMBER,
+        Op::ArrayPosition(_) => Types::INT64,
         Op::ToInt32(_) => Types::INT32,
-        Op::ToNumeric(value) | Op::Unary(UnaryOp::Plus, value)
+        Op::AsInteger(_) => Types::INT64,
+        Op::AsNumber(value) | Op::ToNumeric(value) | Op::Unary(UnaryOp::Plus, value)
             if facts.of(*value).within(Types::NUMBER) =>
         {
             facts.of(*value)
         }
-        Op::ToNumeric(_) => Types::NUMBER,
+        Op::AsNumber(_) | Op::ToNumeric(_) => Types::NUMBER,
+        Op::Unary(UnaryOp::Increment | UnaryOp::Decrement, value)
+            if facts.of(*value).within(Types::INTEGER) =>
+        {
+            Types::INT64
+        }
         Op::Unary(operator, _) => match operator {
             UnaryOp::Not => Types::BOOLEAN,
             UnaryOp::Typeof => Types::STRING,
@@ -435,6 +452,12 @@ fn result_types(op: &Op, facts: &Facts) -> Types {
             UnaryOp::BitwiseNot => Types::INT32,
             UnaryOp::Negate | UnaryOp::Increment | UnaryOp::Decrement => Types::NUMBER,
         },
+        Op::Binary(BinaryOperator::Addition | BinaryOperator::Subtraction, left, right)
+            if facts.of(*left).within(Types::INTEGER)
+                && facts.of(*right).within(Types::INTEGER) =>
+        {
+            Types::INT64
+        }
         Op::Binary(operator, left, right) => match operator {
             BinaryOperator::Addition => {
                 let (left, right) = (facts.of(*left), facts.of(*right));

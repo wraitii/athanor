@@ -51,9 +51,7 @@ pub(crate) struct CompiledFunction {
 struct Emission {
     tier: CompilationTier,
     callees: Vec<FuncId>,
-    conditional: super::semantic::specialize::ConditionalPlan,
-    inlines: Vec<super::semantic::specialize::Inline>,
-    reads: Vec<super::semantic::reads::Read>,
+    plan: super::semantic::SpecializationPlan,
     osr: Option<Arc<super::semantic::osr::Plan>>,
     source_name: (usize, usize),
     params: oxc_span::Span,
@@ -193,7 +191,7 @@ impl Compiler {
                     .opportunities
                     .iter()
                     .find_map(|opportunity| {
-                        let super::semantic::osr::Observation::Read(kind) = opportunity.kind else {
+                        let super::planner::Observation::Read(kind) = opportunity.kind else {
                             return None;
                         };
                         Some((site as *const _, opportunity.site, kind))
@@ -620,9 +618,7 @@ impl Compiler {
                         Emission {
                             tier: CompilationTier::Optimized,
                             callees: Vec::new(),
-                            conditional: Default::default(),
-                            inlines: Vec::new(),
-                            reads: Vec::new(),
+                            plan: Default::default(),
                             osr: None,
                             source_name: self.source_name,
                             params: function.params.span,
@@ -665,9 +661,7 @@ impl Compiler {
                         Emission {
                             tier: CompilationTier::Optimized,
                             callees: Vec::new(),
-                            conditional: Default::default(),
-                            inlines: Vec::new(),
-                            reads: Vec::new(),
+                            plan: Default::default(),
                             osr: None,
                             source_name: self.source_name,
                             params: params.span,
@@ -1109,14 +1103,7 @@ impl Compiler {
                     if location.source == 0 {
                         location.source = job.emission.source_name.0;
                     }
-                    match opportunity.kind {
-                        super::semantic::osr::Observation::Call => {
-                            self.canonical.feedback.contains_key(&location)
-                        }
-                        super::semantic::osr::Observation::Read(kind) => {
-                            self.canonical.read_feedback.contains_key(&(location, kind))
-                        }
-                    }
+                    self.canonical.observed(location, opportunity.kind)
                 });
         if !has_feedback {
             return None;
@@ -1208,31 +1195,22 @@ impl Compiler {
         )
         .map_err(Error::Unsupported)?;
         emission.callees = self.canonical.graph_callees(&planned.graph, source);
-        if region.is_some()
-            && planned.inlines.is_empty()
-            && planned.reads.is_empty()
-            && planned.conditional == Default::default()
-        {
+        if region.is_some() && planned.plan == Default::default() {
             return Ok(None);
         }
         if self.log.enabled() {
             self.log.event(format_args!(
-                "plan code={} function={label} inlines={}->{} reads={}->{} conditional_changed={} inline_multiplier={inline_multiplier}",
+                "plan code={} function={label} inlines={}->{} reads={}->{} numeric_changed={} conditional_changed={} inline_multiplier={inline_multiplier}",
                 code.as_u32(),
-                emission.inlines.len(),
-                planned.inlines.len(),
-                emission.reads.len(),
-                planned.reads.len(),
-                emission.conditional != planned.conditional,
+                emission.plan.inlines.len(),
+                planned.plan.inlines.len(),
+                emission.plan.reads.len(),
+                planned.plan.reads.len(),
+                emission.plan.numbers != planned.plan.numbers,
+                emission.plan.conditional != planned.plan.conditional,
             ));
         }
-        if !initial
-            && emission.tier == tier
-            && region.is_none()
-            && planned.inlines == emission.inlines
-            && planned.reads == emission.reads
-            && planned.conditional == emission.conditional
-        {
+        if !initial && emission.tier == tier && region.is_none() && planned.plan == emission.plan {
             return Ok(None);
         }
         emission.tier = tier;
@@ -1278,7 +1256,6 @@ impl Compiler {
                 self.ssa_opt.then_some(emit::Feedback {
                     function_return: region.is_none(),
                     get_refinement: self.get_refinement,
-                    reads: &self.canonical.read_feedback,
                     owner: code.as_u32() as u64,
                 }),
             )?;
@@ -1312,9 +1289,7 @@ impl Compiler {
         let (source, filename) = self.sources[&source].as_ref().clone();
         let lines = line_starts(&source);
         self.finish_functions(vec![(id, body)], &source, &filename, &lines)?;
-        emission.conditional = graph.conditional;
-        emission.inlines = graph.inlines;
-        emission.reads = graph.reads;
+        emission.plan = graph.plan;
         emission.osr = graph.osr;
         if self.log.enabled()
             && let Some(plan) = &emission.osr
@@ -1584,9 +1559,7 @@ impl Compiler {
                     callees: self
                         .canonical
                         .graph_callees(&graph.as_ref().unwrap().graph, self.source_name.0),
-                    conditional: graph.as_ref().unwrap().conditional.clone(),
-                    inlines: graph.as_ref().unwrap().inlines.clone(),
-                    reads: graph.as_ref().unwrap().reads.clone(),
+                    plan: graph.as_ref().unwrap().plan.clone(),
                     osr: graph.as_ref().unwrap().osr.clone(),
                     source_name: self.source_name,
                     params: params.span,
@@ -1626,7 +1599,6 @@ impl Compiler {
                     feedback.map(|owner| emit::Feedback {
                         function_return: true,
                         get_refinement: self.get_refinement,
-                        reads: &self.canonical.read_feedback,
                         owner: owner.as_u32() as u64,
                     }),
                 )?;

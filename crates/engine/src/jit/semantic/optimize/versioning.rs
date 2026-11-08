@@ -1,10 +1,15 @@
+use crate::jit::planner::{Observation, ReadKind};
+
 use super::*;
 
 fn retarget(graph: &mut Graph, blocks: &HashSet<Block>, from: Value, to: Value) {
     let aliases = HashMap::from([(from, to)]);
     for &block in blocks {
         for inst in graph.blocks[block].insts.clone() {
-            if !matches!(graph.insts[inst].op, Op::IsNumber(_) | Op::AsNumber(_)) {
+            if !matches!(
+                graph.insts[inst].op,
+                Op::IsNumber(_) | Op::AsNumber(_) | Op::IsInteger(_) | Op::AsInteger(_)
+            ) {
                 for value in graph.insts[inst].op.operands_mut() {
                     *value = resolve(&aliases, *value);
                 }
@@ -30,7 +35,7 @@ pub(super) struct Speculation<'a> {
     pub(super) typed: &'a [(Value, Option<TypedKind>)],
     pub(super) bounds: &'a [(Value, Value)],
     pub(super) typed_reads: &'a [(Inst, TypedRead)],
-    pub(super) checks: &'a [Value],
+    pub(super) checks: &'a [(Value, Types)],
     pub(super) code_guards: &'a [(String, cranelift_module::FuncId)],
     pub(super) closed_calls: &'a [super::super::specialize::ConditionalCall],
 }
@@ -39,6 +44,7 @@ pub(super) struct Speculation<'a> {
 enum EntryGuard {
     Code(Value, cranelift_module::FuncId),
     Number(Value),
+    Integer(Value),
     Typed(Value, Option<TypedKind>),
     Indexed(Value),
     Value(Value),
@@ -49,6 +55,7 @@ impl EntryGuard {
         match *op {
             Op::IsCode(value, code) => Some(Self::Code(value, code)),
             Op::IsNumber(value) => Some(Self::Number(value)),
+            Op::IsInteger(value) => Some(Self::Integer(value)),
             Op::IsTyped(value, element) => Some(Self::Typed(value, element)),
             Op::IsIndexed(value) => Some(Self::Indexed(value)),
             _ => None,
@@ -105,6 +112,7 @@ pub(super) fn apply_version(
         code_guards,
         closed_calls,
     } = *speculation;
+    let hints = super::super::observations::numeric_hints(graph);
     let head = entry.map_or(graph.entry, |(_, header)| header);
     let mut tested =
         EntryGuard::at_entry(graph, entry.map_or(graph.entry, |(preheader, _)| preheader));
@@ -373,9 +381,7 @@ pub(super) fn apply_version(
         let data = graph.insts[inst].clone();
         let mut op = match data.op {
             Op::Get(object, name) => Op::ProbeProperty(object, name),
-            Op::GetIndex(object, key)
-            | Op::IndexedGet(object, key)
-            | Op::ArrayIndex(object, key) => Op::ProbeIndex(object, key),
+            Op::GetIndex(object, key) | Op::IndexedGet(object, key) => Op::ProbeIndex(object, key),
             Op::GlobalRead(name) => Op::ProbeGlobal(name),
             Op::Argument(index) => Op::Argument(index),
             Op::This => Op::This,
@@ -473,13 +479,27 @@ pub(super) fn apply_version(
         });
         current = next;
     }
-    for &value in checks {
+    for &(value, types) in checks {
         let checked = values.get(&value).copied().unwrap_or(value);
-        if !tested.insert(EntryGuard::Number(checked)) {
+        let guard = if types == Types::INT64 {
+            EntryGuard::Integer(checked)
+        } else {
+            EntryGuard::Number(checked)
+        };
+        if !tested.insert(guard) {
             continue;
         }
         let check = graph
-            .append(current, span, Op::IsNumber(checked), true)
+            .append(
+                current,
+                span,
+                if types == Types::INT64 {
+                    Op::IsInteger(checked)
+                } else {
+                    Op::IsNumber(checked)
+                },
+                true,
+            )
             .1
             .unwrap();
         let next = graph.blocks.push(BlockData::default());
@@ -491,14 +511,40 @@ pub(super) fn apply_version(
         current = next;
     }
     let mut numbers = HashMap::new();
-    for &value in checks {
+    for &(value, types) in checks {
         let checked = values.get(&value).copied().unwrap_or(value);
         let number = *numbers.entry(checked).or_insert_with(|| {
             graph
-                .append(current, span, Op::AsNumber(checked), true)
+                .append(
+                    current,
+                    span,
+                    if types == Types::INT64 {
+                        Op::AsInteger(checked)
+                    } else {
+                        Op::AsNumber(checked)
+                    },
+                    true,
+                )
                 .1
                 .unwrap()
         });
+        if !hints.contains_key(&value)
+            && let Some(site) = super::super::observations::numeric_site(graph, value)
+        {
+            graph.append(
+                current,
+                span,
+                Op::Observe(number, Observation::Read(ReadKind::Number), site),
+                false,
+            );
+            for &block in &copies {
+                graph.blocks[block].insts.retain(|&inst| {
+                    !matches!(graph.insts[inst].op,
+                        Op::Observe(observed, Observation::Read(ReadKind::Number), origin)
+                            if observed == checked && origin == site)
+                });
+            }
+        }
         retarget(graph, &copies, checked, number);
         for arg in &mut args {
             if *arg == checked {
