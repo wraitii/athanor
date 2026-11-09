@@ -705,7 +705,12 @@ pub(super) fn apply_version(
             let stub = *stubs.entry(key).or_insert_with(|| {
                 let stub = graph.blocks.push(BlockData::default());
                 let result = graph
-                    .append(stub, span, Op::Continuation(piece.body.clone(), inputs), true)
+                    .append(
+                        stub,
+                        span,
+                        Op::Continuation(piece.body.clone(), inputs),
+                        true,
+                    )
                     .1
                     .unwrap();
                 graph.blocks[stub].terminator = Some(Terminator {

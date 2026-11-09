@@ -21,6 +21,7 @@ impl Body {
         super::optimize::bit_tests(&mut graph);
         super::optimize::views(&mut graph, &mut notes);
         super::optimize::simplify(&mut graph);
+        super::trim::trim(&mut graph);
         super::promote::remove_trivial_params(&mut graph);
         let facts = super::Facts::compute(&graph);
         super::borrow::borrows(&mut graph, &facts, &mut notes);
@@ -473,8 +474,7 @@ impl Pieces {
                         .enumerate()
                         .map(|(offset, &types)| {
                             let offset = exit.outputs.len() + offset;
-                            let output =
-                                append(result, case, Op::ContinuationOutput(call, offset));
+                            let output = append(result, case, Op::ContinuationOutput(call, offset));
                             unbox(result, case, output, types)
                         })
                         .collect();
@@ -525,8 +525,7 @@ impl Pieces {
 
     fn exits(&self, graph: &Graph, result: &mut Graph, header: Block, entry: Block) -> usize {
         let shape = &self.shapes.as_ref().unwrap()[&header];
-        let outside =
-            |block: Block| graph.blocks.is_valid(block) && !shape.body.contains(&block);
+        let outside = |block: Block| graph.blocks.is_valid(block) && !shape.body.contains(&block);
         let index = |constant: usize| Op::Constant(Constant::Number(constant as f64));
         for block in Cfg::from_entry(result, entry).rpo {
             if outside(block) {
@@ -663,8 +662,11 @@ mod tests {
         let mut pieces = Pieces::default();
         let driver = pieces.driver(&graph, header).unwrap();
         driver.body.graph.verify().unwrap();
-        assert!(uses(&driver.body, &|op| matches!(op, Op::Continuation(body, _)
-            if body.outputs > 0 && uses(body, &|op| matches!(op, Op::This)))));
+        assert!(uses(
+            &driver.body,
+            &|op| matches!(op, Op::Continuation(body, _)
+            if body.outputs > 0 && uses(body, &|op| matches!(op, Op::This)))
+        ));
         let resume = pieces.resume(&graph, &target).unwrap();
         resume.body.graph.verify().unwrap();
         assert!(!resume.inputs.is_empty());
@@ -674,7 +676,10 @@ mod tests {
                 .iter()
                 .all(|&value| cfg.dominates(graph.def_block(value), pred))
         );
-        assert!(uses(&resume.body, &|op| matches!(op, Op::Continuation(body, _)
-            if Arc::ptr_eq(body, &driver.body))));
+        assert!(uses(
+            &resume.body,
+            &|op| matches!(op, Op::Continuation(body, _)
+            if Arc::ptr_eq(body, &driver.body))
+        ));
     }
 }

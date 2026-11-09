@@ -15,6 +15,7 @@ mod promote;
 pub(super) mod reads;
 pub(super) mod specialize;
 mod string_split;
+mod trim;
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -427,9 +428,7 @@ impl Op {
             Op::OsrOutput(value, _)
             | Op::ContinuationOutput(value, _)
             | Op::Observe(value, ..)
-            | Op::ReadHint(value, ..) => {
-                ([Some(*value), None, None], &[])
-            }
+            | Op::ReadHint(value, ..) => ([Some(*value), None, None], &[]),
             Op::Argument(_)
             | Op::Arguments
             | Op::Rest(_)
@@ -560,9 +559,7 @@ impl Op {
             Op::OsrOutput(value, _)
             | Op::ContinuationOutput(value, _)
             | Op::Observe(value, ..)
-            | Op::ReadHint(value, ..) => {
-                ([Some(value), None, None], &mut [])
-            }
+            | Op::ReadHint(value, ..) => ([Some(value), None, None], &mut []),
             Op::Argument(_)
             | Op::Arguments
             | Op::Rest(_)
@@ -1687,6 +1684,7 @@ pub(super) fn optimize_planned(
     optimize::lazy_captures(&mut graph, &mut notes);
     graph.verify()?;
     string_split::forward_packs(&mut graph);
+    trim::trim(&mut graph);
     promote::remove_trivial_params(&mut graph);
     graph.verify()?;
     let facts = Facts::compute(&graph);
