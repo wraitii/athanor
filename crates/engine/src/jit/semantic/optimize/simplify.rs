@@ -1,4 +1,5 @@
 use super::*;
+use cranelift_codegen::entity::SecondaryMap;
 
 pub(in super::super) fn typeof_comparisons(graph: &mut Graph) {
     let uses = graph.use_counts();
@@ -385,8 +386,123 @@ pub(in super::super) fn simplify(graph: &mut Graph) {
             graph.blocks[block].terminator.as_mut().unwrap().kind = TerminatorKind::Jump(target);
             changed = true;
         }
+        changed |= thread_branches(graph);
         if !changed && dead.is_empty() {
             return;
         }
+    }
+}
+
+fn thread_branches(graph: &mut Graph) -> bool {
+    let cfg = Cfg::new(graph);
+    let uses = graph.use_counts();
+    let header = |block: Block| {
+        cfg.preds[block]
+            .iter()
+            .any(|&pred| cfg.dominates(block, pred))
+    };
+    let mut touched = HashSet::new();
+    for &block in &cfg.rpo {
+        let Some(Terminator {
+            kind: TerminatorKind::Branch(condition, yes, no),
+            ..
+        }) = &graph.blocks[block].terminator
+        else {
+            continue;
+        };
+        let Some(Op::Unary(UnaryOp::Not, operand)) = graph.defining_op(*condition) else {
+            continue;
+        };
+        let kind = TerminatorKind::Branch(*operand, no.clone(), yes.clone());
+        graph.blocks[block].terminator.as_mut().unwrap().kind = kind;
+        touched.insert(block);
+    }
+    if !touched.is_empty() {
+        return true;
+    }
+    for &join in &cfg.rpo {
+        if join == graph.entry || header(join) {
+            continue;
+        }
+        let Some((index, yes, no)) = trivial_branch(graph, join, &uses) else {
+            continue;
+        };
+        if header(yes.block) || header(no.block) {
+            continue;
+        }
+        let params = graph.blocks[join].params.clone();
+        for &pred in &cfg.preds[join] {
+            if pred == join || touched.contains(&join) {
+                continue;
+            }
+            let kind = &mut graph.blocks[pred].terminator.as_mut().unwrap().kind;
+            let threaded = match kind {
+                TerminatorKind::Jump(target) if target.block == join => {
+                    let condition = target.args[index];
+                    let yes = substitute(&yes, &params, &target.args);
+                    let no = substitute(&no, &params, &target.args);
+                    *kind = TerminatorKind::Branch(condition, yes, no);
+                    true
+                }
+                TerminatorKind::Branch(condition, then, otherwise) => {
+                    let mut threaded = false;
+                    for (target, taken) in [(then, true), (otherwise, false)] {
+                        if target.block != join || target.args[index] != *condition {
+                            continue;
+                        }
+                        let next = if taken { &yes } else { &no };
+                        *target = substitute(next, &params, &target.args);
+                        threaded = true;
+                    }
+                    threaded
+                }
+                _ => false,
+            };
+            if threaded {
+                touched.insert(pred);
+            }
+        }
+    }
+    !touched.is_empty()
+}
+
+fn trivial_branch(
+    graph: &Graph,
+    block: Block,
+    uses: &SecondaryMap<Value, u32>,
+) -> Option<(usize, Target, Target)> {
+    let data = &graph.blocks[block];
+    if !data.insts.is_empty() {
+        return None;
+    }
+    let Terminator {
+        kind: TerminatorKind::Branch(condition, yes, no),
+        ..
+    } = data.terminator.as_ref()?
+    else {
+        return None;
+    };
+    let index = data.params.iter().position(|param| param == condition)?;
+    let operands = data.terminator.as_ref()?.kind.operands();
+    let local = data.params.iter().all(|param| {
+        uses[*param] as usize == operands.iter().filter(|value| *value == param).count()
+    });
+    local.then(|| (index, yes.clone(), no.clone()))
+}
+
+fn substitute(target: &Target, params: &[Value], args: &[Value]) -> Target {
+    let args = target
+        .args
+        .iter()
+        .map(|value| {
+            params
+                .iter()
+                .position(|param| param == value)
+                .map_or(*value, |index| args[index])
+        })
+        .collect();
+    Target {
+        block: target.block,
+        args,
     }
 }
