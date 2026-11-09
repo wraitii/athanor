@@ -387,13 +387,10 @@ fn number(value: f64) -> Types {
 
 fn result_types(op: &Op, facts: &Facts) -> Types {
     match op {
-        Op::OsrStart(..) => Types::BOOLEAN,
+        Op::OsrStart(..) => Types::INT32,
         Op::Continuation(body, _) => body.result,
-        Op::OsrOutput(..) => Types::NUMBER,
         Op::ContinuationOutput(..) => Types::ALL,
-        Op::OsrStore(..) | Op::ContinuationStore(..) | Op::Observe(..) | Op::ReadHint(..) => {
-            Types::default()
-        }
+        Op::ContinuationStore(..) | Op::Observe(..) | Op::ReadHint(..) => Types::default(),
         Op::Constant(constant) => match constant {
             Constant::Undefined => Types::UNDEFINED,
             Constant::Null => Types::NULL,

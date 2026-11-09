@@ -162,14 +162,19 @@ and tile data, plus generator timing.
 Set `JS_JIT_GET_REFINEMENT=0` to disable get feedback and refinement while keeping
 other optimizations enabled (`EngineOptions::get_refinement`).
 
-Set `JS_JIT_OSR=1` to enable experimental loop replacement
-(`EngineOptions::osr`). Hot eligible loops request a specialized native fragment
-and can enter it on a later loop entry during the same function invocation.
-The initial implementation supports one loop per emission, numeric outputs,
-and transfer at the preheader; it does not transfer an iteration already in
-progress. `JS_JIT_RECOMPILE_LOG=1` reports requests, queue priorities, publication,
-and the first transfer. `JS_JIT_BACKGROUND=0` compiles fragments synchronously
-for deterministic comparisons.
+Loop replacement (`EngineOptions::osr`) is on by default; set `JS_JIT_OSR=0` to
+disable it. Every eligible loop polls at its header and, after 1024 iterations
+with applicable feedback, requests a specialized native fragment. The running
+invocation transfers into it at the next header arrival with its current
+loop-carried values, so nested loops move into native fragments inner loop
+first. `JS_JIT_RECOMPILE_LOG=1` reports requests, queue priorities, publication,
+the first transfer, and why ineligible loops were rejected. `JS_JIT_BACKGROUND=0`
+compiles fragments synchronously for deterministic comparisons.
+
+With background compilation, initial bodies are generic by default
+(`EngineOptions::generic_first`; set `JS_JIT_GENERIC_FIRST=0` to disable). They
+keep semantic optimization and observations but skip speculative versioning.
+Specialization comes only from feedback recompilation and OSR fragments.
 
 Compilation uses four regular workers by default plus a separate worker reserved
 for demanded lazy bodies. Scheduling priorities are demanded lazy compilation,
@@ -203,7 +208,8 @@ synchronously at the next dispatch instead (`EngineOptions::background_compile`)
 
 Scheduling priority and compilation tier are separate. Demanded lazy, prefetch,
 and unlazify jobs use the baseline tier: Cranelift `opt_level=none`, with semantic
-optimization and specialization still enabled. OSR and feedback jobs use the
+optimization still enabled and speculative versioning only when generic-first is
+disabled. OSR and feedback jobs use the
 optimized tier and `EngineOptions::opt_level` (default `speed`). Both tiers use
 the backtracking register allocator. Initial bodies retain the base inlining
 budget; OSR and feedback use the recompilation multiplier described above.

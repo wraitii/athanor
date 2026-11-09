@@ -13,6 +13,11 @@ pub(crate) struct Site {
     pub(crate) transfers: Cell<u64>,
 }
 
+#[cfg(not(test))]
+pub(crate) const TICK: u64 = 1024;
+#[cfg(test)]
+pub(crate) const TICK: u64 = 32;
+
 pub(in crate::jit) const ENTRIES_OFFSET: i32 = std::mem::offset_of!(Site, entries) as i32;
 pub(in crate::jit) const ENTRY_OFFSET: i32 = std::mem::offset_of!(Site, entry) as i32;
 

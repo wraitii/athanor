@@ -46,6 +46,7 @@ pub struct EngineOptions {
     pub compiler_threads: usize,
     pub recompile_inline_multiplier: usize,
     pub osr: bool,
+    pub generic_first: bool,
     pub recompile_log: bool,
     pub call_profile: bool,
     pub ssa_dump: bool,
@@ -71,7 +72,8 @@ impl Default for EngineOptions {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(jit::DEFAULT_RECOMPILE_INLINE_MULTIPLIER),
-            osr: std::env::var("JS_JIT_OSR").as_deref() == Ok("1"),
+            osr: std::env::var("JS_JIT_OSR").as_deref() != Ok("0"),
+            generic_first: std::env::var("JS_JIT_GENERIC_FIRST").as_deref() != Ok("0"),
             recompile_log: std::env::var("JS_JIT_RECOMPILE_LOG").as_deref() == Ok("1"),
             call_profile: std::env::var("JS_JIT_CALL_PROFILE").as_deref() == Ok("1"),
             ssa_dump: std::env::var("JS_JIT_SSA_DUMP").as_deref() == Ok("1"),
@@ -96,7 +98,7 @@ struct LazyWaitStats {
 }
 
 pub struct Engine {
-    // Join the worker before releasing resources referenced by its compilation snapshots.
+    // Stop the workers first; in-flight compiles finish detached on their own snapshots.
     worker: RefCell<Option<jit::recompile::Service>>,
     unlazify_seen: RefCell<HashSet<u64>>,
     compilation_errors: RefCell<HashMap<u64, Error>>,
@@ -771,7 +773,7 @@ impl Engine {
         if site.entry.get() != 0 {
             return site.entry.get();
         }
-        if site.entries.get() % 32 != 0 {
+        if site.entries.get() % jit::osr::TICK != 0 {
             return 0;
         }
         self.poll_compilation();
@@ -1985,7 +1987,7 @@ mod feedback_tests {
         };
         engine.observe_get(&mut cache, jit::planner::ReadType::Array, kind);
         assert!(!engine.direct.warmed(code));
-        site.entries.set(32);
+        site.entries.set(jit::osr::TICK);
         engine.osr_entry(site);
         assert!(engine.direct.warmed(code));
         {

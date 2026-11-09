@@ -343,15 +343,8 @@ impl Drop for Service {
             "shutdown outstanding={}",
             self.in_flight.len()
         ));
-        let started = self.log.enabled().then(Instant::now);
         self.shared.stop();
-        self.join();
-        if let Some(started) = started {
-            self.log.event(format_args!(
-                "shutdown complete join_ms={:.3}",
-                started.elapsed().as_secs_f64() * 1000.0,
-            ));
-        }
+        self.threads.clear();
     }
 }
 

@@ -218,8 +218,6 @@ pub(super) enum Op {
         super::planner::Site,
     ),
     OsrStart(std::sync::Arc<osr::Plan>, usize, Vec<Value>),
-    OsrOutput(Value, usize),
-    OsrStore(usize, Vec<Value>),
     Continuation(std::sync::Arc<continuation::Body>, Vec<Value>),
     ContinuationOutput(Value, usize),
     ContinuationStore(Vec<Value>),
@@ -422,13 +420,11 @@ impl Op {
     pub(super) fn operands_iter(&self) -> impl Iterator<Item = Value> + '_ {
         let (fixed, rest): ([Option<Value>; 3], &[Value]) = match self {
             Op::OsrStart(_, _, values)
-            | Op::OsrStore(_, values)
             | Op::Continuation(_, values)
             | Op::ContinuationStore(values) => ([None, None, None], values),
-            Op::OsrOutput(value, _)
-            | Op::ContinuationOutput(value, _)
-            | Op::Observe(value, ..)
-            | Op::ReadHint(value, ..) => ([Some(*value), None, None], &[]),
+            Op::ContinuationOutput(value, _) | Op::Observe(value, ..) | Op::ReadHint(value, ..) => {
+                ([Some(*value), None, None], &[])
+            }
             Op::Argument(_)
             | Op::Arguments
             | Op::Rest(_)
@@ -553,13 +549,11 @@ impl Op {
     pub(super) fn operands_mut(&mut self) -> impl Iterator<Item = &mut Value> + '_ {
         let (fixed, rest): ([Option<&mut Value>; 3], &mut [Value]) = match self {
             Op::OsrStart(_, _, values)
-            | Op::OsrStore(_, values)
             | Op::Continuation(_, values)
             | Op::ContinuationStore(values) => ([None, None, None], values),
-            Op::OsrOutput(value, _)
-            | Op::ContinuationOutput(value, _)
-            | Op::Observe(value, ..)
-            | Op::ReadHint(value, ..) => ([Some(value), None, None], &mut []),
+            Op::ContinuationOutput(value, _) | Op::Observe(value, ..) | Op::ReadHint(value, ..) => {
+                ([Some(value), None, None], &mut [])
+            }
             Op::Argument(_)
             | Op::Arguments
             | Op::Rest(_)
@@ -1058,9 +1052,8 @@ impl Graph {
                 assumptions: &[],
                 result: Owned,
             },
-            Op::OsrOutput(..) => closed(INTERNAL, &[], Unowned),
             Op::ContinuationOutput(..) => closed(INTERNAL, &[], Owned),
-            Op::OsrStore(..) | Op::ContinuationStore(..) | Op::Observe(..) | Op::ReadHint(..) => {
+            Op::ContinuationStore(..) | Op::Observe(..) | Op::ReadHint(..) => {
                 closed(INTERNAL, &[], None)
             }
             Op::NewInstance(_) => closed(ALLOCATION | INTERNAL | ERROR, &[], Owned),
@@ -1423,7 +1416,7 @@ pub(super) fn lower_global(
         arguments_references,
     )?;
     let planned = plan_canonical(canonicalize(graph, ssa_opt)?, ssa_opt, None)?;
-    optimize_planned(planned, None, report_regions)
+    optimize_planned(planned, Versioning::Speculate(None), report_regions)
 }
 
 pub(super) fn canonical_for_emission(
@@ -1505,7 +1498,7 @@ pub(super) fn optimize_canonical(
 ) -> Result<Analysis> {
     optimize_planned(
         plan_canonical(canonical, ssa_opt, specialization)?,
-        None,
+        Versioning::Speculate(None),
         false,
     )
 }
@@ -1614,9 +1607,15 @@ pub(super) fn plan_canonical_with_budget(
     })
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum Versioning {
+    Generic,
+    Speculate(Option<usize>),
+}
+
 pub(super) fn optimize_planned(
     planned: Planned,
-    fallback: Option<usize>,
+    versioning: Versioning,
     report_regions: bool,
 ) -> Result<Analysis> {
     let Planned {
@@ -1646,17 +1645,23 @@ pub(super) fn optimize_planned(
     graph.verify()?;
     optimize::forward_captured_parameters(&mut graph, &mut notes);
     graph.verify()?;
-    let mut regions = optimize::version_with_report(
-        &mut graph,
-        &plan.conditional,
-        fallback,
-        &mut notes,
-        report_regions,
-    )?;
-    graph.verify()?;
-    if regions.is_empty() {
-        regions.extend(optimize::version_string_leaves(&mut graph, &mut notes)?);
-    }
+    let regions = match versioning {
+        Versioning::Generic => Vec::new(),
+        Versioning::Speculate(fallback) => {
+            let mut regions = optimize::version_with_report(
+                &mut graph,
+                &plan.conditional,
+                fallback,
+                &mut notes,
+                report_regions,
+            )?;
+            graph.verify()?;
+            if regions.is_empty() {
+                regions.extend(optimize::version_string_leaves(&mut graph, &mut notes)?);
+            }
+            regions
+        }
+    };
     graph.verify()?;
     optimize::simplify(&mut graph);
     graph.verify()?;

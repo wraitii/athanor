@@ -1259,7 +1259,11 @@ Indexed reads also observe receiver categories, including generic typed reads
 whose element kind is still unknown. This retains feedback when load reuse
 eliminates the producing read or an existing loop version already establishes
 that the receiver is typed. Planning prefers a read's own receiver observation,
-then uses its producer's result observation. In `height[x][y]`, the first read
+then uses its producer's result observation, then the element kind statically
+known from the receiver's construction (`new Uint8Array(...)`,
+`Float32Array.from(...)`). Receivers with such a static kind emit no receiver
+observation, so read planning must consume the static kind itself; otherwise
+the read stays generic until other code observes it. In `height[x][y]`, the first read
 can select guarded `ArrayLoad` operations and the second can select `TypedIndex` independently.
 
 Where needed, a number guard selects numeric keys before read specialization.
@@ -1361,10 +1365,12 @@ Continuations own their results through the ordinary return path; only the
 original invocation reports function completion.
 
 Extraction currently requires promoted SSA state. Materialized scopes, other
-implicit frame reads, generators, handlers, heap views, and OSR transfer-buffer
-operations keep their existing in-function fallback paths, and so does any
+implicit frame reads, generators, handlers, heap views, and OSR polls keep their
+existing in-function fallback paths, and so does any
 guard whose path reaches a loop that cannot be split; planner notes explain
-rejected extractions. Continuations compile eagerly and have separate semantic
+rejected extractions. Graphs that already store exit outputs, such as OSR
+fragments, do not extract continuations: a piece would store into its own buffer
+rather than the fragment's caller buffer. Continuations compile eagerly and have separate semantic
 IR and assembly listings under the enclosing function's name.
 `JS_JIT_NO_CONTINUATIONS=1` disables extraction and keeps every bailout in the
 function's own generic copy.
@@ -1440,8 +1446,18 @@ Scheduling has four priorities: demanded lazy compilation, OSR/feedback,
 prefetch, and unlazify. Compilation tier is carried separately on each job.
 Demanded lazy, prefetch, and unlazify jobs use the baseline tier with Cranelift
 `opt_level=none`; OSR and feedback jobs use the optimized tier with the configured
-`opt_level`. Both currently retain semantic specialization and optimization and
-the backtracking allocator. Workers retain a compiler/module per tier so emitted
+`opt_level`. Both use the backtracking allocator; the single-pass allocator
+measured slower overall at the baseline tier.
+
+With background compilation, initial bodies are generic by default: they keep
+semantic optimization and observations but skip region versioning, so they carry
+no speculative guards or continuations. Specialization happens only through
+feedback recompilation (the first observation requests it, and it is submitted
+once the function has returned eight times) or through OSR fragments for loops
+still running. Nothing queues specialization merely because an initial body was
+installed. `EngineOptions::generic_first` (`JS_JIT_GENERIC_FIRST=0` disables it)
+restores speculative initial bodies. Recompilation of a generic body always
+proceeds, even when its specialization plan is unchanged. Workers retain a compiler/module per tier so emitted
 code outlives subsequent jobs. Promoting a queued lazy job to demanded priority
 retains its baseline tier and snapshot. Running jobs
 retain their original tier. Installed emissions record their tier, allowing
@@ -1469,42 +1485,58 @@ publishes completed results and releases their dependency tickets. Independent
 jobs continue compiling without publication. Initial compilation failures are
 retained and returned when the function is called. With background compilation
 disabled, initial bodies still compile synchronously. Lazy wait logging records
-per-call durations and aggregate count, total, and maximum duration; shutdown
-still joins running compilations before releasing their referenced resources.
+per-call durations and aggregate count, total, and maximum duration. Shutdown
+stops the pool without joining: running compilations finish detached on their
+owned snapshots and their results are discarded. Workers embed engine addresses
+in generated code but never dereference them.
 
-`EngineOptions::osr` (`JS_JIT_OSR=1`) enables experimental loop replacement.
+`EngineOptions::osr` enables loop replacement; it is on by default and
+`JS_JIT_OSR=0` disables it.
 Natural-loop discovery runs independently of the region-plan tree after guard
 placement and optimization. Merging region plans therefore does not suppress an
 inner loop that still has explicit call or indexed-read observations.
-The descriptor retains that emission's graph and records the preheader, entry
-arguments, external SSA inputs, exit values, and backedges. An observation
-belongs to a loop when it executes inside the body, or dominates its header and
-observes one of its external inputs. Read-result opportunities are restricted to
-values feeding an unresolved indexed receiver.
-Loops without remaining observations do not receive counters.
+The descriptor retains that emission's graph and records each loop's external
+SSA inputs, header parameters, and exit shape. An observation belongs to a loop
+when it executes inside the body, or dominates its header and observes one of
+its external inputs. Read-result opportunities are restricted to values feeding
+an unresolved indexed receiver. Loops without remaining observations do not
+receive counters.
 
-The initial eligibility policy chooses the first transferable loop with numeric
-outputs. It requires promoted state, one normal exit, inputs dominating entry,
-and outputs available at exit. Generators, handlers, materialized scopes,
-nonlocal exits, and implicit function-frame reads are excluded. An explicit
-`OsrStart` operation exposes inputs to ownership analysis. A native stack buffer
-passes boxed input words and numeric output words; `OsrOutput` operations feed
-the existing exit continuation. No JS container is allocated for the transfer.
-The parent frame remains suspended and roots inputs while a separately framed
-fragment executes. Errors unwind the fragment frame before propagating through
-the parent's existing failure path.
+Every eligible loop is instrumented. Eligibility requires promoted state, inputs
+dominating the header, outputs dominating their exits, and at least one exit.
+Generators, handlers, materialized scopes, closure creation, and implicit
+function-frame reads other than `this` are excluded; the planner report names
+the rejecting operation. Exits follow the loop-continuation convention: each
+edge leaving the body and each return gets an exit index, and the fragment
+stores that exit's live outputs and target arguments with `ContinuationStore`.
 
-Every 32 entries, a site with applicable feedback can request one compilation
-attempt. Installed sites transfer on every subsequent entry. The fragment starts
-at the loop preheader, preserving its original entry arguments and accumulation
-order; backedge transfer with partially accumulated state is not implemented.
-Its extracted graph inherits facts established at that particular entry.
-Constants are rematerialized, established numeric inputs become numeric SSA
-values, and typed operations retain the enclosing guards' guarantees. Address
-views are discarded and rebuilt during fragment optimization, so re-versioning
-cannot retain stale view definitions. New feedback introduces guards and local
-generic continuations inside the fragment. A failed guard never restarts the
-parent function or replays completed iterations.
+All edges into the header, from the preheader and every backedge, pass through
+a poll block whose parameters replace the header's. Its `OsrStart` operation
+exposes external inputs and the current header parameters to ownership
+analysis, and returns -1 when no transfer happened or the fragment's exit index.
+Dispatch then reads outputs with `ContinuationOutput`, unboxes them by their
+facts, and jumps to the original exit or returns; SSA repair merges these
+definitions with the loop's own. A native stack buffer passes boxed words in
+both directions, borrowed inputs acquire temporary ownership, and no JS
+container is allocated. The caller's receiver is forwarded, so `this` reads in
+the loop need no materialization. The parent frame remains suspended and roots
+its values while a separately framed fragment executes. Errors unwind the
+fragment frame before propagating through the parent's existing failure path.
+
+The poll counts header arrivals, so it measures iterations rather than loop
+entries. Every 1024 arrivals a site with applicable feedback can request one
+compilation attempt; installed sites transfer on the next arrival. Because
+transfer happens at the header with the current loop-carried values, a running
+invocation can leave generic code mid-loop. Nested loops cascade: the inner
+loop reaches the threshold first, and by the time the outer loop transfers, its
+fragment is compiled with the inner loop already observed. Fragments themselves
+are not instrumented. The extracted graph inherits facts established at the
+header. Constants are rematerialized, established numeric inputs become numeric
+SSA values, and typed operations retain the enclosing guards' guarantees.
+Address views are discarded and rebuilt during fragment optimization, so
+re-versioning cannot retain stale view definitions. New feedback introduces
+guards and local generic paths inside the fragment. A failed guard never
+restarts the parent function or replays completed iterations.
 
 Loop jobs use active priority. Ordinary function recompilation uses normal
 priority; after an OSR request, encompassing-function jobs use next-call priority

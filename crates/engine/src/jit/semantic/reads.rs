@@ -49,7 +49,8 @@ pub(super) fn plan(
                         .read_feedback
                         .get(&(site(producer), ReadKind::Result))
                         .copied()
-                });
+                })
+                .or_else(|| super::optimize::element_guess(graph, object).map(ReadType::Typed));
             let Some(observed) = observed else {
                 continue;
             };

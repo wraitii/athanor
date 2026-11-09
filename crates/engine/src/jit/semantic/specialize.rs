@@ -1219,7 +1219,12 @@ mod tests {
             let second = super::super::plan_canonical(canonical, true, Some((&bodies, 0))).unwrap();
             assert_eq!(first.plan.inlines.len(), count);
             assert!(first.plan.inlines == second.plan.inlines);
-            let analysis = super::super::optimize_planned(first, None, false).unwrap();
+            let analysis = super::super::optimize_planned(
+                first,
+                super::super::Versioning::Speculate(None),
+                false,
+            )
+            .unwrap();
             assert!(analysis.plan.inlines == second.plan.inlines);
             analysis.graph.verify().unwrap();
         }
@@ -1289,7 +1294,12 @@ mod tests {
         for fallback in [None, Some(0x1234)] {
             let planned =
                 super::super::plan_canonical(canonical.clone(), true, Some((&bodies, 0))).unwrap();
-            let analysis = super::super::optimize_planned(planned, fallback, false).unwrap();
+            let analysis = super::super::optimize_planned(
+                planned,
+                super::super::Versioning::Speculate(fallback),
+                false,
+            )
+            .unwrap();
             let graph = &analysis.graph;
             graph.verify().unwrap();
             let mut fallbacks = Vec::new();

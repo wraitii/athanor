@@ -482,7 +482,7 @@ impl FunctionCompiler<'_, '_> {
                         }
                         Op::OsrStart(plan, candidate, inputs) => {
                             let transfer = plan.loops[*candidate].transfer.as_ref().unwrap();
-                            let words = inputs.len() + transfer.outputs.len();
+                            let words = transfer.words();
                             let slot = self.b.create_sized_stack_slot(
                                 cranelift_codegen::ir::StackSlotData::new(
                                     cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
@@ -493,7 +493,7 @@ impl FunctionCompiler<'_, '_> {
                             let address = self.b.ins().stack_addr(self.pointer, slot, 0);
                             cx.osr_buffers
                                 .borrow_mut()
-                                .insert(data.result.unwrap(), (address, inputs.len()));
+                                .insert(data.result.unwrap(), (address, 0));
                             if let Some(feedback) = self.feedback {
                                 let site = self.data.pin(crate::jit::osr::Site::new(
                                     feedback.owner,
@@ -514,7 +514,10 @@ impl FunctionCompiler<'_, '_> {
                                     site,
                                     crate::jit::osr::ENTRIES_OFFSET,
                                 );
-                                let tick = self.b.ins().band_imm_s(count, 31);
+                                let tick = self
+                                    .b
+                                    .ins()
+                                    .band_imm_s(count, crate::jit::osr::TICK as i64 - 1);
                                 let tick = self.b.ins().icmp_imm_s(IntCC::Equal, tick, 0);
                                 let entry = self.b.ins().load(
                                     self.pointer,
@@ -527,11 +530,21 @@ impl FunctionCompiler<'_, '_> {
                                 let slow = self.b.create_block();
                                 let done = self.b.create_block();
                                 self.b.append_block_param(done, types::I64);
-                                let no = self.constant(Value::FALSE);
-                                self.brif(poll, slow, &[], done, &[no.into()]);
+                                let declined = self.constant(Value::number(-1.0));
+                                self.brif(poll, slow, &[], done, &[declined.into()]);
                                 self.switch(slow);
-                                for (index, &value) in inputs.iter().enumerate() {
-                                    let value = get(self, value);
+                                for (index, &input) in inputs.iter().enumerate() {
+                                    let value = get(self, input);
+                                    if graph.borrowed.contains(&input) {
+                                        let heap = self.is_heap(value);
+                                        let retain = self.b.create_block();
+                                        let stored = self.b.create_block();
+                                        self.brif(heap, retain, &[], stored, &[]);
+                                        self.switch(retain);
+                                        self.retain_temporary(value);
+                                        self.jump(stored, &[]);
+                                        self.switch(stored);
+                                    }
                                     self.b.ins().store(
                                         MemFlagsData::trusted(),
                                         value,
@@ -539,13 +552,14 @@ impl FunctionCompiler<'_, '_> {
                                         (index * 8) as i32,
                                     );
                                 }
-                                let result = self.call_helper(Helper::OsrPoll, &[site, address]);
+                                let result = self
+                                    .call_helper(Helper::OsrPoll, &[self.receiver, address, site]);
                                 self.check_error();
                                 self.jump(done, &[result.into()]);
                                 self.switch(done);
                                 Some(self.b.block_params(done)[0])
                             } else {
-                                Some(self.constant(Value::FALSE))
+                                Some(self.constant(Value::number(-1.0)))
                             }
                         }
                         Op::ReadHint(..) => None,
@@ -553,15 +567,6 @@ impl FunctionCompiler<'_, '_> {
                             let value = get(self, *value);
                             self.observe(value, *site, *kind);
                             None
-                        }
-                        Op::OsrOutput(start, index) => {
-                            let (address, inputs) = cx.osr_buffers.borrow()[start];
-                            Some(self.b.ins().load(
-                                types::I64,
-                                MemFlagsData::trusted(),
-                                address,
-                                ((inputs + index) * 8) as i32,
-                            ))
                         }
                         Op::ContinuationOutput(call, index) => {
                             let (address, _) = cx.osr_buffers.borrow()[call];
@@ -587,23 +592,6 @@ impl FunctionCompiler<'_, '_> {
                                     value,
                                     argv,
                                     (index * 8) as i32,
-                                );
-                            }
-                            None
-                        }
-                        Op::OsrStore(offset, values) => {
-                            let super::Arguments::Vector { argv, .. } = self.arguments else {
-                                return Err(Error::Compile(
-                                    "OSR fragment requires vector arguments".into(),
-                                ));
-                            };
-                            for (index, &value) in values.iter().enumerate() {
-                                let value = get(self, value);
-                                self.b.ins().store(
-                                    MemFlagsData::trusted(),
-                                    value,
-                                    argv,
-                                    ((offset + index) * 8) as i32,
                                 );
                             }
                             None

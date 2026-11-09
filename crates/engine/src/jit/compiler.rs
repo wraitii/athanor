@@ -50,6 +50,7 @@ pub(crate) struct CompiledFunction {
 #[derive(Clone)]
 struct Emission {
     tier: CompilationTier,
+    specialized: bool,
     callees: Vec<FuncId>,
     plan: super::semantic::SpecializationPlan,
     osr: Option<Arc<super::semantic::osr::Plan>>,
@@ -154,6 +155,7 @@ pub(crate) struct Compiler {
     ssa_opt: bool,
     recompile_inline_multiplier: usize,
     osr: bool,
+    generic_first: bool,
     get_refinement: bool,
     ssa_dump: bool,
     inspection: Option<Arc<super::inspect::CompileOptions>>,
@@ -211,10 +213,7 @@ impl Compiler {
         let flags = [
             ("opt_level", options.opt_level.as_flag()),
             ("regalloc_algorithm", "backtracking"),
-            (
-                "enable_verifier",
-                if options.osr { "true" } else { "false" },
-            ),
+            ("enable_verifier", "false"),
         ];
         let builder = JITBuilder::with_flags(&flags, default_libcall_names())
             .map_err(|error| Error::Compile(error.to_string()))?;
@@ -243,6 +242,7 @@ impl Compiler {
         Ok(Self {
             log,
             osr: options.osr,
+            generic_first: options.generic_first && options.background_compile,
             emissions: HashMap::new(),
             lazy: HashMap::new(),
             sources: Arc::default(),
@@ -620,6 +620,7 @@ impl Compiler {
                     (
                         Emission {
                             tier: CompilationTier::Optimized,
+                            specialized: false,
                             callees: Vec::new(),
                             plan: Default::default(),
                             osr: None,
@@ -663,6 +664,7 @@ impl Compiler {
                     (
                         Emission {
                             tier: CompilationTier::Optimized,
+                            specialized: false,
                             callees: Vec::new(),
                             plan: Default::default(),
                             osr: None,
@@ -1225,13 +1227,26 @@ impl Compiler {
                 emission.plan.conditional != planned.plan.conditional,
             ));
         }
-        if !initial && emission.tier == tier && region.is_none() && planned.plan == emission.plan {
+        if !initial
+            && emission.specialized
+            && emission.tier == tier
+            && region.is_none()
+            && planned.plan == emission.plan
+        {
             return Ok(None);
         }
+        let versioning = if initial && region.is_none() && self.generic_first {
+            super::semantic::Versioning::Generic
+        } else {
+            super::semantic::Versioning::Speculate(
+                (!initial && region.is_none()).then_some(previous.code),
+            )
+        };
         emission.tier = tier;
+        emission.specialized = matches!(versioning, super::semantic::Versioning::Speculate(_));
         let mut graph = super::semantic::optimize_planned(
             planned,
-            (!initial && region.is_none()).then_some(previous.code),
+            versioning,
             self.inspection
                 .as_ref()
                 .is_some_and(|options| options.planner),
@@ -1674,7 +1689,7 @@ impl Compiler {
                 )?;
                 super::semantic::optimize_planned(
                     planned,
-                    None,
+                    super::semantic::Versioning::Speculate(None),
                     self.inspection
                         .as_ref()
                         .is_some_and(|options| options.planner),
@@ -1699,6 +1714,7 @@ impl Compiler {
                 code,
                 Emission {
                     tier: CompilationTier::Optimized,
+                    specialized: true,
                     callees: self
                         .canonical
                         .graph_callees(&graph.as_ref().unwrap().graph, self.source_name.0),

@@ -1,11 +1,15 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use cranelift_codegen::entity::SecondaryMap;
+use oxc_syntax::operator::BinaryOperator;
+
 use crate::jit::planner::{Observation, Site};
 
+use super::continuation::{Shape, liveness, unbox};
 use super::{
     Block, BlockData, Cfg, Constant, Facts, Graph, Inst, Op, Target, Terminator, TerminatorKind,
-    Types, Value,
+    Value,
 };
 
 impl std::fmt::Debug for Plan {
@@ -29,12 +33,19 @@ pub(in crate::jit) struct Loop {
 }
 
 pub(in crate::jit) struct Transfer {
-    pub(in crate::jit) preheader: Block,
-    pub(in crate::jit) entry: Target,
     pub(in crate::jit) inputs: Vec<Value>,
-    pub(in crate::jit) exit: Block,
-    pub(in crate::jit) outputs: Vec<Value>,
-    pub(in crate::jit) backedges: Vec<Block>,
+    pub(in crate::jit) params: Vec<Value>,
+    pub(super) shape: Shape,
+}
+
+impl Transfer {
+    pub(in crate::jit) fn arguments(&self) -> usize {
+        self.inputs.len() + self.params.len()
+    }
+
+    pub(in crate::jit) fn words(&self) -> usize {
+        self.arguments().max(self.shape.words())
+    }
 }
 
 pub(in crate::jit) struct Opportunity {
@@ -64,13 +75,18 @@ impl Plan {
                 Some(Opportunity { inst, site, kind })
             })
             .collect();
+        if opportunities.is_empty() {
+            return None;
+        }
+        let facts = Facts::compute(graph);
+        let live = liveness(graph, &cfg.rpo);
         let loops: Vec<_> = super::optimize::natural_loops(graph, &cfg)
             .into_iter()
             .filter_map(|(header, body)| {
-                if graph.cold.contains(&header) {
+                if graph.cold.contains(&header) || header == graph.entry {
                     return None;
                 }
-                let transfer = transfer(graph, &cfg, header, &body);
+                let transfer = transfer(graph, &cfg, &facts, &live, header, &body);
                 let opportunities: Vec<_> = opportunities
                     .iter()
                     .filter(|opportunity| {
@@ -108,114 +124,62 @@ impl Plan {
     }
 
     pub(in crate::jit) fn instrument(self: &Arc<Self>, graph: &mut Graph) -> super::Result<()> {
-        let facts = Facts::compute(&self.graph);
+        let mut definitions = HashMap::new();
         for (index, candidate) in self.loops.iter().enumerate() {
             let Ok(transfer) = &candidate.transfer else {
                 continue;
             };
-            if transfer.outputs.is_empty()
-                || transfer
-                    .outputs
-                    .iter()
-                    .any(|&value| !facts.of(value).within(Types::NUMBER))
-                || self.extract(index).is_err()
-            {
-                continue;
-            }
-            let span = graph.blocks[candidate.header]
-                .terminator
-                .as_ref()
-                .unwrap()
-                .span;
-            let success = graph.blocks.push(BlockData::default());
-            let start = graph
-                .append(
-                    transfer.preheader,
-                    span,
-                    Op::OsrStart(self.clone(), index, transfer.inputs.clone()),
-                    true,
-                )
-                .1
-                .unwrap();
-            graph.blocks[transfer.preheader].terminator = Some(Terminator {
-                source_name: None,
-                span,
-                kind: TerminatorKind::Branch(start, Target::new(success), transfer.entry.clone()),
-            });
-            let results: HashMap<_, _> = transfer
-                .outputs
+            let header = candidate.header;
+            let span = graph.blocks[header].terminator.as_ref().unwrap().span;
+            let poll = graph.blocks.push(BlockData::default());
+            let params: Vec<_> = transfer
+                .params
                 .iter()
-                .enumerate()
-                .map(|(index, &value)| {
-                    let result = graph
-                        .append(success, span, Op::OsrOutput(start, index), true)
-                        .1
-                        .unwrap();
-                    (value, result)
-                })
+                .map(|_| graph.add_param(poll))
                 .collect();
-            let original_params = graph.blocks[transfer.exit].params.clone();
-            let mut args: Vec<_> = original_params.iter().map(|value| results[value]).collect();
-            let mut aliases = HashMap::new();
-            for &output in &transfer.outputs {
-                if original_params.contains(&output) {
+            for data in graph.blocks.values_mut() {
+                let Some(terminator) = &mut data.terminator else {
                     continue;
-                }
-                let param = graph.add_param(transfer.exit);
-                aliases.insert(output, param);
-                args.push(results[&output]);
-                for &block in &candidate.body {
-                    if graph.successors(block).contains(&transfer.exit) {
-                        graph.push_edge_arg(block, transfer.exit, output);
+                };
+                for target in terminator.kind.targets_mut() {
+                    if target.block == header {
+                        target.block = poll;
                     }
                 }
             }
-            for (block, data) in graph.blocks.iter_mut() {
-                if candidate.body.contains(&block) || block == success {
-                    continue;
-                }
-                for &inst in &data.insts {
-                    for value in graph.insts[inst].op.operands_mut() {
-                        if let Some(&replacement) = aliases.get(value) {
-                            *value = replacement;
-                        }
-                    }
-                }
-                if let Some(terminator) = &mut data.terminator {
-                    for value in terminator.kind.operands_mut() {
-                        if let Some(&replacement) = aliases.get(value) {
-                            *value = replacement;
-                        }
-                    }
-                }
-            }
-            graph.blocks[success].terminator = Some(Terminator {
+            let values = transfer.inputs.iter().chain(&params).copied().collect();
+            let append = |graph: &mut Graph, op| graph.append(poll, span, op, true).1.unwrap();
+            let start = append(graph, Op::OsrStart(self.clone(), index, values));
+            let declined = append(graph, Op::Constant(Constant::Number(-1.0)));
+            let declined = append(
+                graph,
+                Op::Binary(BinaryOperator::StrictEquality, start, declined),
+            );
+            let dispatch = graph.blocks.push(BlockData::default());
+            graph.blocks[poll].terminator = Some(Terminator {
                 source_name: None,
                 span,
-                kind: TerminatorKind::Jump(Target {
-                    block: transfer.exit,
-                    args,
-                }),
+                kind: TerminatorKind::Branch(
+                    declined,
+                    Target {
+                        block: header,
+                        args: params,
+                    },
+                    Target::new(dispatch),
+                ),
             });
-            graph.verify()?;
-            break;
+            transfer
+                .shape
+                .dispatch(graph, dispatch, start, &mut definitions);
         }
-        Ok(())
+        super::optimize::repair(graph, &definitions);
+        graph.verify()
     }
 
     pub(in crate::jit) fn extract(&self, index: usize) -> super::Result<Graph> {
         let candidate = &self.loops[index];
         let transfer = candidate.transfer.as_ref().map_err(Clone::clone)?;
         let mut graph = self.graph.clone();
-        for (block, data) in graph.blocks.iter_mut() {
-            if !candidate.body.contains(&block) {
-                data.insts.clear();
-                data.terminator = None;
-                if block != transfer.exit {
-                    data.params.clear();
-                }
-            }
-        }
         for &block in &candidate.body {
             graph.blocks[block].insts.retain(|&inst| {
                 !matches!(
@@ -228,39 +192,41 @@ impl Plan {
                 )
             });
         }
+        transfer
+            .shape
+            .store_exits(&self.graph, &mut graph, candidate.header);
         graph.name += ".osr";
         graph.arity = None;
         graph.borrowed.clear();
+        graph.views.clear();
         let entry = graph.blocks.push(BlockData::default());
         graph.entry = entry;
         let span = graph.span;
         let facts = Facts::compute(&self.graph);
+        let argument = |graph: &mut Graph, index: usize, value: Value| {
+            if let Some(Op::Constant(constant)) = self.graph.defining_op(value) {
+                return graph
+                    .append(entry, span, Op::Constant(constant.clone()), true)
+                    .1
+                    .unwrap();
+            }
+            let argument = graph
+                .append(entry, span, Op::Argument(index), true)
+                .1
+                .unwrap();
+            unbox(graph, entry, argument, facts.of(value))
+        };
         let aliases: HashMap<_, _> = transfer
             .inputs
             .iter()
             .enumerate()
-            .map(|(index, &value)| {
-                let argument = if let Some(Op::Constant(constant)) = self.graph.defining_op(value) {
-                    graph
-                        .append(entry, span, Op::Constant(constant.clone()), true)
-                        .1
-                        .unwrap()
-                } else {
-                    let argument = graph
-                        .append(entry, span, Op::Argument(index), true)
-                        .1
-                        .unwrap();
-                    if facts.of(value).within(Types::NUMBER) {
-                        graph
-                            .append(entry, span, Op::AsNumber(argument), true)
-                            .1
-                            .unwrap()
-                    } else {
-                        argument
-                    }
-                };
-                (value, argument)
-            })
+            .map(|(index, &value)| (value, argument(&mut graph, index, value)))
+            .collect();
+        let args = transfer
+            .params
+            .iter()
+            .enumerate()
+            .map(|(offset, &param)| argument(&mut graph, transfer.inputs.len() + offset, param))
             .collect();
         for opportunity in &candidate.opportunities {
             let Op::Observe(value, kind, site) = self.graph.insts[opportunity.inst].op else {
@@ -288,54 +254,42 @@ impl Plan {
                 }
             }
         }
-        graph.views.clear();
-        for &block in &candidate.body {
-            for &inst in &graph.blocks[block].insts {
+        graph.blocks[entry].terminator = Some(Terminator {
+            source_name: None,
+            span,
+            kind: TerminatorKind::Jump(Target {
+                block: candidate.header,
+                args,
+            }),
+        });
+        let reachable: HashSet<_> = Cfg::new(&graph).rpo.into_iter().collect();
+        for (block, data) in graph.blocks.iter_mut() {
+            if !reachable.contains(&block) {
+                data.insts.clear();
+                data.params.clear();
+                data.terminator = None;
+                continue;
+            }
+            if block == entry {
+                continue;
+            }
+            for &inst in &data.insts {
                 for value in graph.insts[inst].op.operands_mut() {
                     if let Some(&replacement) = aliases.get(value) {
                         *value = replacement;
                     }
                 }
             }
-            for value in graph.blocks[block]
-                .terminator
-                .as_mut()
-                .unwrap()
-                .kind
-                .operands_mut()
-            {
+            for value in data.terminator.as_mut().unwrap().kind.operands_mut() {
                 if let Some(&replacement) = aliases.get(value) {
                     *value = replacement;
                 }
             }
         }
-        graph.blocks[entry].terminator = Some(Terminator {
-            source_name: None,
-            span,
-            kind: TerminatorKind::Jump(Target {
-                block: transfer.entry.block,
-                args: transfer
-                    .entry
-                    .args
-                    .iter()
-                    .map(|value| aliases[value])
-                    .collect(),
-            }),
-        });
-        graph.append(
-            transfer.exit,
-            span,
-            Op::OsrStore(transfer.inputs.len(), transfer.outputs.clone()),
-            false,
-        );
-        let result = graph
-            .append(transfer.exit, span, Op::Constant(Constant::Undefined), true)
-            .1
-            .unwrap();
-        graph.blocks[transfer.exit].terminator = Some(Terminator {
-            source_name: None,
-            span,
-            kind: TerminatorKind::Return(result),
+        graph.cold.retain(|block| reachable.contains(block));
+        graph.closed_calls.retain(|inst, _| {
+            let block = graph.insts[*inst].block;
+            reachable.contains(&block) && graph.blocks[block].insts.contains(inst)
         });
         graph.verify()?;
         Ok(graph)
@@ -354,12 +308,15 @@ impl Plan {
             match &candidate.transfer {
                 Ok(transfer) => {
                     report += &format!(
-                        "entry={} args={:?} exit={} outputs={:?} backedges={:?}\n",
-                        transfer.preheader,
-                        transfer.entry.args,
-                        transfer.exit,
-                        transfer.outputs,
-                        transfer.backedges
+                        "params={:?} exits={:?} returns={}\n",
+                        transfer.params,
+                        transfer
+                            .shape
+                            .exits
+                            .iter()
+                            .map(|exit| (exit.block, exit.outputs.len() + exit.params.len()))
+                            .collect::<Vec<_>>(),
+                        transfer.shape.returns.is_some()
                     );
                     for &value in &transfer.inputs {
                         report += &format!("  input {value}: {}", facts.of(value));
@@ -389,31 +346,43 @@ impl Plan {
 fn transfer(
     graph: &Graph,
     cfg: &Cfg,
+    facts: &Facts,
+    live: &SecondaryMap<Block, HashSet<Value>>,
     header: Block,
     body: &HashSet<Block>,
 ) -> Result<Transfer, String> {
-    let preheader = super::optimize::preheader(graph, cfg, header, body)
-        .ok_or("no unique unconditional preheader")?;
-    let mut exits = HashSet::new();
     let mut inputs = HashSet::new();
-    let mut backedges = Vec::new();
     for &block in &cfg.rpo {
-        if !body.contains(&block) {
-            continue;
-        }
+        let inside = body.contains(&block);
         for &inst in &graph.blocks[block].insts {
+            if let Some(&view) = graph.views.get(&inst) {
+                let defined = body.contains(&graph.def_block(view));
+                if !inside && defined {
+                    return Err("heap view escapes the loop".into());
+                }
+                if inside
+                    && !defined
+                    && let Some(Op::View(object)) = graph.defining_op(view)
+                {
+                    inputs.insert(*object);
+                }
+            }
+            if !inside {
+                continue;
+            }
             match graph.insts[inst].op {
                 Op::Read(_)
                 | Op::Write(..)
                 | Op::Initialize(..)
                 | Op::Closure(..)
                 | Op::Argument(_)
-                | Op::This
-                | Op::ClosureThis(_)
                 | Op::EnterCaptures(..)
                 | Op::Arguments
                 | Op::Rest(_) => {
-                    return Err("requires non-SSA frame state".into());
+                    return Err(format!(
+                        "requires non-SSA frame state: {}",
+                        graph.op_text(&graph.insts[inst].op)
+                    ));
                 }
                 _ => {}
             }
@@ -431,87 +400,46 @@ fn transfer(
                     .operands_iter()
                     .filter(|&value| !body.contains(&graph.def_block(value))),
             );
-            if let Some(&view) = graph.views.get(&inst)
-                && !body.contains(&graph.def_block(view))
-                && let Some(Op::View(object)) = graph.defining_op(view)
-            {
-                inputs.insert(*object);
-            }
+        }
+        if !inside {
+            continue;
         }
         let terminator = &graph.blocks[block].terminator.as_ref().unwrap().kind;
         if !matches!(
             terminator,
-            TerminatorKind::Jump(_) | TerminatorKind::Branch(..)
+            TerminatorKind::Jump(_) | TerminatorKind::Branch(..) | TerminatorKind::Return(_)
         ) {
-            return Err("requires a nonlocal exit".into());
+            return Err("requires normal control flow".into());
         }
         inputs.extend(
             terminator
                 .operands_iter()
                 .filter(|&value| !body.contains(&graph.def_block(value))),
         );
-        for target in terminator.targets() {
-            if target.block == header {
-                backedges.push(block);
-            } else if !body.contains(&target.block) {
-                exits.insert(target.block);
-            }
-        }
     }
-    if exits.len() != 1 {
-        return Err(format!("requires one normal exit, found {}", exits.len()));
-    }
-    let exit = *exits.iter().next().unwrap();
-    let TerminatorKind::Jump(entry) = &graph.blocks[preheader].terminator.as_ref().unwrap().kind
-    else {
-        unreachable!()
-    };
-    inputs.extend(entry.args.iter().copied());
     if inputs
         .iter()
-        .any(|&value| !cfg.dominates(graph.def_block(value), preheader))
+        .any(|&value| !cfg.dominates(graph.def_block(value), header))
     {
-        return Err("input does not dominate entry".into());
+        return Err("input does not dominate the header".into());
     }
-    let mut outputs: HashSet<_> = graph.blocks[exit].params.iter().copied().collect();
-    for &block in &cfg.rpo {
-        if body.contains(&block) {
-            continue;
-        }
-        for &inst in &graph.blocks[block].insts {
-            outputs.extend(
-                graph.insts[inst]
-                    .op
-                    .operands_iter()
-                    .filter(|&value| body.contains(&graph.def_block(value))),
-            );
-        }
-        outputs.extend(
-            graph.blocks[block]
-                .terminator
-                .as_ref()
-                .unwrap()
-                .kind
-                .operands_iter()
-                .filter(|&value| body.contains(&graph.def_block(value))),
-        );
+    let shape = Shape::new(graph, facts, live, body.clone());
+    if shape.count() == 0 {
+        return Err("requires an exit".into());
     }
-    if outputs.iter().any(|&value| {
-        graph.def_block(value) != exit && !cfg.dominates(graph.def_block(value), exit)
+    if shape.exits.iter().any(|exit| {
+        exit.outputs
+            .iter()
+            .any(|&(value, _)| !cfg.dominates(graph.def_block(value), exit.block))
     }) {
-        return Err("output does not dominate exit".into());
+        return Err("output does not dominate its exit".into());
     }
     let mut inputs: Vec<_> = inputs.into_iter().collect();
-    let mut outputs: Vec<_> = outputs.into_iter().collect();
     inputs.sort();
-    outputs.sort();
     Ok(Transfer {
-        preheader,
-        entry: entry.clone(),
         inputs,
-        exit,
-        outputs,
-        backedges,
+        params: graph.blocks[header].params.clone(),
+        shape,
     })
 }
 
@@ -550,8 +478,8 @@ mod tests {
         let inner = &plan.loops[0];
         let transfer = inner.transfer.as_ref().unwrap();
         assert_eq!(plan.graph.blocks[inner.header].params.len(), 2);
-        assert!(transfer.outputs.len() >= 1);
-        assert_eq!(transfer.backedges.len(), 1);
+        assert_eq!(transfer.params.len(), 2);
+        assert_eq!(transfer.shape.exits.len(), 1);
         assert!(
             transfer
                 .inputs
@@ -572,12 +500,15 @@ mod tests {
     }
 
     #[test]
-    fn multiple_normal_exits_are_not_transferable() {
+    fn early_returns_are_transferable() {
         let graph = graph(
             "function f(xs,n){let sum=0;for(let i=0;i<n;++i){if(xs[i])return sum;sum+=xs[i];}return sum;}",
         );
-        let plan = Plan::discover(&graph, 0).unwrap();
-        assert!(plan.loops[0].transfer.is_err());
+        let plan = Arc::new(Plan::discover(&graph, 0).unwrap());
+        assert!(plan.loops[0].transfer.is_ok());
+        plan.extract(0).unwrap().verify().unwrap();
+        let mut instrumented = graph;
+        plan.instrument(&mut instrumented).unwrap();
     }
 
     #[test]

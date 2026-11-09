@@ -50,7 +50,7 @@ impl std::fmt::Debug for Body {
     }
 }
 
-fn liveness(graph: &Graph, rpo: &[Block]) -> SecondaryMap<Block, HashSet<Value>> {
+pub(super) fn liveness(graph: &Graph, rpo: &[Block]) -> SecondaryMap<Block, HashSet<Value>> {
     let mut live_in: SecondaryMap<_, HashSet<Value>> = SecondaryMap::new();
     loop {
         let mut changed = false;
@@ -96,7 +96,7 @@ fn terminate(graph: &mut Graph, block: Block, kind: TerminatorKind) {
     });
 }
 
-fn unbox(graph: &mut Graph, block: Block, value: Value, types: Types) -> Value {
+pub(super) fn unbox(graph: &mut Graph, block: Block, value: Value, types: Types) -> Value {
     if types.intersects(Types::INTEGER) && types.within(Types::INTEGER) {
         append(graph, block, Op::AsInteger(value))
     } else if types.intersects(Types::NUMBER) && types.within(Types::NUMBER) {
@@ -163,8 +163,6 @@ fn extract(graph: &Graph, target: Target, facts: &Facts) -> super::Result<(Graph
                 | Op::Arguments
                 | Op::Rest(_)
                 | Op::OsrStart(..)
-                | Op::OsrOutput(..)
-                | Op::OsrStore(..)
                     if block != entry =>
                 {
                     return Err("continuation requires SSA frame state".into());
@@ -227,10 +225,10 @@ pub(super) struct Piece {
     pub(super) inputs: Vec<Value>,
 }
 
-struct Exit {
-    block: Block,
-    outputs: Vec<(Value, Types)>,
-    params: Vec<Types>,
+pub(super) struct Exit {
+    pub(super) block: Block,
+    pub(super) outputs: Vec<(Value, Types)>,
+    pub(super) params: Vec<Types>,
 }
 
 impl Exit {
@@ -239,15 +237,187 @@ impl Exit {
     }
 }
 
-struct Shape {
-    body: HashSet<Block>,
-    exits: Vec<Exit>,
-    returns: Option<Types>,
+pub(super) struct Shape {
+    pub(super) body: HashSet<Block>,
+    pub(super) exits: Vec<Exit>,
+    pub(super) returns: Option<Types>,
 }
 
 impl Shape {
-    fn count(&self) -> usize {
+    pub(super) fn new(
+        graph: &Graph,
+        facts: &Facts,
+        live: &SecondaryMap<Block, HashSet<Value>>,
+        body: HashSet<Block>,
+    ) -> Self {
+        let mut targets = BTreeSet::new();
+        let mut returns: Option<Types> = None;
+        for &block in &body {
+            let kind = &graph.blocks[block].terminator.as_ref().unwrap().kind;
+            if let TerminatorKind::Return(value) = kind {
+                returns = Some(returns.unwrap_or_default().union(facts.of(*value)));
+            }
+            targets.extend(
+                kind.targets()
+                    .into_iter()
+                    .map(|target| target.block)
+                    .filter(|block| !body.contains(block)),
+            );
+        }
+        let exits = targets
+            .into_iter()
+            .map(|block| {
+                let mut outputs: Vec<_> = live[block]
+                    .iter()
+                    .copied()
+                    .filter(|&value| body.contains(&graph.def_block(value)))
+                    .collect();
+                outputs.sort();
+                Exit {
+                    block,
+                    outputs: outputs
+                        .into_iter()
+                        .map(|value| (value, facts.of(value)))
+                        .collect(),
+                    params: graph.blocks[block]
+                        .params
+                        .iter()
+                        .map(|&param| facts.of(param))
+                        .collect(),
+                }
+            })
+            .collect();
+        Self {
+            body,
+            exits,
+            returns,
+        }
+    }
+
+    pub(super) fn count(&self) -> usize {
         self.exits.len() + usize::from(self.returns.is_some())
+    }
+
+    pub(super) fn dispatch(
+        &self,
+        result: &mut Graph,
+        block: Block,
+        call: Value,
+        definitions: &mut HashMap<Value, Vec<Value>>,
+    ) {
+        let count = self.count();
+        let mut current = block;
+        for index in 0..count {
+            let case = result.blocks.push(BlockData::default());
+            let kind = match self.exits.get(index) {
+                Some(exit) => {
+                    for (offset, &(value, types)) in exit.outputs.iter().enumerate() {
+                        let output = append(result, case, Op::ContinuationOutput(call, offset));
+                        let output = unbox(result, case, output, types);
+                        definitions.entry(value).or_default().push(output);
+                    }
+                    let args = exit
+                        .params
+                        .iter()
+                        .enumerate()
+                        .map(|(offset, &types)| {
+                            let offset = exit.outputs.len() + offset;
+                            let output = append(result, case, Op::ContinuationOutput(call, offset));
+                            unbox(result, case, output, types)
+                        })
+                        .collect();
+                    TerminatorKind::Jump(Target {
+                        block: exit.block,
+                        args,
+                    })
+                }
+                None => {
+                    let output = append(result, case, Op::ContinuationOutput(call, 0));
+                    let output = unbox(result, case, output, self.returns.unwrap());
+                    TerminatorKind::Return(output)
+                }
+            };
+            terminate(result, case, kind);
+            if index + 1 == count {
+                terminate(result, current, TerminatorKind::Jump(Target::new(case)));
+                break;
+            }
+            let constant = append(
+                result,
+                current,
+                Op::Constant(Constant::Number(index as f64)),
+            );
+            let test = append(
+                result,
+                current,
+                Op::Binary(BinaryOperator::StrictEquality, call, constant),
+            );
+            let next = result.blocks.push(BlockData::default());
+            terminate(
+                result,
+                current,
+                TerminatorKind::Branch(test, Target::new(case), Target::new(next)),
+            );
+            current = next;
+        }
+    }
+
+    pub(super) fn store_exits(&self, graph: &Graph, result: &mut Graph, entry: Block) -> usize {
+        let outside = |block: Block| graph.blocks.is_valid(block) && !self.body.contains(&block);
+        let index = |constant: usize| Op::Constant(Constant::Number(constant as f64));
+        for block in Cfg::from_entry(result, entry).rpo {
+            if outside(block) {
+                continue;
+            }
+            let kind = &result.blocks[block].terminator.as_ref().unwrap().kind;
+            if let TerminatorKind::Return(value) = *kind {
+                result.append(block, graph.span, Op::ContinuationStore(vec![value]), false);
+                let exit = append(result, block, index(self.exits.len()));
+                terminate(result, block, TerminatorKind::Return(exit));
+                continue;
+            }
+            let edges: Vec<_> = kind
+                .targets()
+                .into_iter()
+                .enumerate()
+                .filter(|(_, target)| outside(target.block))
+                .map(|(edge, target)| (edge, target.clone()))
+                .collect();
+            for (edge, target) in edges {
+                let position = self
+                    .exits
+                    .iter()
+                    .position(|exit| exit.block == target.block)
+                    .unwrap();
+                let exit = &self.exits[position];
+                let values = exit
+                    .outputs
+                    .iter()
+                    .map(|&(value, _)| value)
+                    .chain(target.args)
+                    .collect();
+                let stub = result.blocks.push(BlockData::default());
+                result.append(stub, graph.span, Op::ContinuationStore(values), false);
+                let value = append(result, stub, index(position));
+                terminate(result, stub, TerminatorKind::Return(value));
+                *result.blocks[block]
+                    .terminator
+                    .as_mut()
+                    .unwrap()
+                    .kind
+                    .targets_mut()[edge] = Target::new(stub);
+            }
+        }
+        self.words()
+    }
+
+    pub(super) fn words(&self) -> usize {
+        self.exits
+            .iter()
+            .map(Exit::words)
+            .chain(self.returns.map(|_| 1))
+            .max()
+            .unwrap_or(0)
     }
 }
 
@@ -318,53 +488,7 @@ impl Pieces {
             let live = liveness(graph, &cfg.rpo);
             super::optimize::natural_loops(graph, &cfg)
                 .into_iter()
-                .map(|(header, body)| {
-                    let mut targets = BTreeSet::new();
-                    let mut returns: Option<Types> = None;
-                    for &block in &body {
-                        let kind = &graph.blocks[block].terminator.as_ref().unwrap().kind;
-                        if let TerminatorKind::Return(value) = kind {
-                            returns = Some(returns.unwrap_or_default().union(facts.of(*value)));
-                        }
-                        targets.extend(
-                            kind.targets()
-                                .into_iter()
-                                .map(|target| target.block)
-                                .filter(|block| !body.contains(block)),
-                        );
-                    }
-                    let exits = targets
-                        .into_iter()
-                        .map(|block| {
-                            let mut outputs: Vec<_> = live[block]
-                                .iter()
-                                .copied()
-                                .filter(|&value| body.contains(&graph.def_block(value)))
-                                .collect();
-                            outputs.sort();
-                            Exit {
-                                block,
-                                outputs: outputs
-                                    .into_iter()
-                                    .map(|value| (value, facts.of(value)))
-                                    .collect(),
-                                params: graph.blocks[block]
-                                    .params
-                                    .iter()
-                                    .map(|&param| facts.of(param))
-                                    .collect(),
-                            }
-                        })
-                        .collect();
-                    (
-                        header,
-                        Shape {
-                            body,
-                            exits,
-                            returns,
-                        },
-                    )
-                })
+                .map(|(header, body)| (header, Shape::new(graph, facts, &live, body)))
                 .collect()
         })
     }
@@ -379,6 +503,14 @@ impl Pieces {
     ) -> super::Result<Piece> {
         if graph.generator || graph.has_handlers {
             return Err("continuation requires a normal function without handlers".into());
+        }
+        if graph
+            .blocks
+            .values()
+            .flat_map(|block| &block.insts)
+            .any(|&inst| matches!(graph.insts[inst].op, Op::ContinuationStore(_)))
+        {
+            return Err("continuation requires its own exit buffer".into());
         }
         self.shapes(graph);
         let mut entry = entry;
@@ -453,65 +585,11 @@ impl Pieces {
             .map(|value| renamed.get(value).copied().unwrap_or(*value))
             .collect();
         let call = append(result, block, Op::Continuation(piece.body, inputs));
-        let count = shape.count();
-        if count == 0 {
+        if shape.count() == 0 {
             terminate(result, block, TerminatorKind::Return(call));
             return Ok((block, Vec::new()));
         }
-        let mut current = block;
-        for index in 0..count {
-            let case = result.blocks.push(BlockData::default());
-            let kind = match shape.exits.get(index) {
-                Some(exit) => {
-                    for (offset, &(value, types)) in exit.outputs.iter().enumerate() {
-                        let output = append(result, case, Op::ContinuationOutput(call, offset));
-                        let output = unbox(result, case, output, types);
-                        definitions.entry(value).or_default().push(output);
-                    }
-                    let args = exit
-                        .params
-                        .iter()
-                        .enumerate()
-                        .map(|(offset, &types)| {
-                            let offset = exit.outputs.len() + offset;
-                            let output = append(result, case, Op::ContinuationOutput(call, offset));
-                            unbox(result, case, output, types)
-                        })
-                        .collect();
-                    TerminatorKind::Jump(Target {
-                        block: exit.block,
-                        args,
-                    })
-                }
-                None => {
-                    let output = append(result, case, Op::ContinuationOutput(call, 0));
-                    let output = unbox(result, case, output, shape.returns.unwrap());
-                    TerminatorKind::Return(output)
-                }
-            };
-            terminate(result, case, kind);
-            if index + 1 == count {
-                terminate(result, current, TerminatorKind::Jump(Target::new(case)));
-                break;
-            }
-            let constant = append(
-                result,
-                current,
-                Op::Constant(Constant::Number(index as f64)),
-            );
-            let test = append(
-                result,
-                current,
-                Op::Binary(BinaryOperator::StrictEquality, call, constant),
-            );
-            let next = result.blocks.push(BlockData::default());
-            terminate(
-                result,
-                current,
-                TerminatorKind::Branch(test, Target::new(case), Target::new(next)),
-            );
-            current = next;
-        }
+        shape.dispatch(result, block, call, definitions);
         Ok((block, shape.exits.iter().map(|exit| exit.block).collect()))
     }
 
@@ -524,59 +602,7 @@ impl Pieces {
     }
 
     fn exits(&self, graph: &Graph, result: &mut Graph, header: Block, entry: Block) -> usize {
-        let shape = &self.shapes.as_ref().unwrap()[&header];
-        let outside = |block: Block| graph.blocks.is_valid(block) && !shape.body.contains(&block);
-        let index = |constant: usize| Op::Constant(Constant::Number(constant as f64));
-        for block in Cfg::from_entry(result, entry).rpo {
-            if outside(block) {
-                continue;
-            }
-            let kind = &result.blocks[block].terminator.as_ref().unwrap().kind;
-            if let TerminatorKind::Return(value) = *kind {
-                result.append(block, graph.span, Op::ContinuationStore(vec![value]), false);
-                let exit = append(result, block, index(shape.exits.len()));
-                terminate(result, block, TerminatorKind::Return(exit));
-                continue;
-            }
-            let edges: Vec<_> = kind
-                .targets()
-                .into_iter()
-                .enumerate()
-                .filter(|(_, target)| outside(target.block))
-                .map(|(edge, target)| (edge, target.clone()))
-                .collect();
-            for (edge, target) in edges {
-                let position = shape
-                    .exits
-                    .iter()
-                    .position(|exit| exit.block == target.block)
-                    .unwrap();
-                let exit = &shape.exits[position];
-                let values = exit
-                    .outputs
-                    .iter()
-                    .map(|&(value, _)| value)
-                    .chain(target.args)
-                    .collect();
-                let stub = result.blocks.push(BlockData::default());
-                result.append(stub, graph.span, Op::ContinuationStore(values), false);
-                let value = append(result, stub, index(position));
-                terminate(result, stub, TerminatorKind::Return(value));
-                *result.blocks[block]
-                    .terminator
-                    .as_mut()
-                    .unwrap()
-                    .kind
-                    .targets_mut()[edge] = Target::new(stub);
-            }
-        }
-        shape
-            .exits
-            .iter()
-            .map(Exit::words)
-            .chain(shape.returns.map(|_| 1))
-            .max()
-            .unwrap_or(0)
+        self.shapes.as_ref().unwrap()[&header].store_exits(graph, result, entry)
     }
 }
 

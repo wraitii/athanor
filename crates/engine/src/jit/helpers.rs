@@ -72,7 +72,7 @@ define_helpers! {
     PackTake => Binary, js_pack_take;
     PackTakeOwned => Binary, js_pack_take_owned;
     CompilePoll => Nullary, js_compile_poll;
-    OsrPoll => Binary, js_osr_poll;
+    OsrPoll => Callable, js_osr_poll;
     CompileLeave => Unary, js_compile_leave;
     Instanceof => Binary, js_instanceof;
     In => Binary, js_in;
@@ -200,13 +200,14 @@ extern "C" fn js_compile_poll(ctx: *mut JitCtx) -> Value {
 
 extern "C" fn js_osr_poll(
     ctx: *mut JitCtx,
-    site: *const super::osr::Site,
+    receiver: Value,
     buffer: *mut Value,
+    site: *const super::osr::Site,
 ) -> Value {
     let site = unsafe { &*site };
     let entry = unsafe { &*ctx }.engine.osr_entry(site);
     if entry == 0 {
-        return Value::FALSE;
+        return Value::number(-1.0);
     }
     unsafe { &*ctx }.engine.osr_entered(site);
     let transfer = site.plan.loops[site.candidate].transfer.as_ref().unwrap();
@@ -216,12 +217,11 @@ extern "C" fn js_osr_poll(
         function(
             ctx,
             Value::UNDEFINED,
-            Value::UNDEFINED,
+            receiver,
             buffer,
-            transfer.inputs.len() as u64,
+            transfer.arguments() as u64,
         )
-    };
-    Value::TRUE
+    }
 }
 
 extern "C" fn js_compile_leave(ctx: *mut JitCtx, code: u64) -> Value {
