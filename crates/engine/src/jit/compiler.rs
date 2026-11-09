@@ -235,6 +235,7 @@ impl Compiler {
             &signature,
             direct_entries,
             compilation_state,
+            options.call_profile,
             dump.as_mut(),
         )?;
         let context = module.make_context();

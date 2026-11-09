@@ -37,6 +37,7 @@ impl Stubs {
         generic: &Signature,
         direct_entries: *const usize,
         compilation_state: usize,
+        call_profile: bool,
         mut dump: Option<&mut Writer>,
     ) -> Result<Self, Error> {
         let mut misses = Vec::new();
@@ -47,6 +48,7 @@ impl Stubs {
                 generic,
                 direct_entries,
                 compilation_state,
+                call_profile,
                 arity,
             )?);
             adapters.push(build_adapter(module, generic, arity)?);
@@ -183,6 +185,7 @@ fn build_miss(
     generic: &Signature,
     direct_entries: *const usize,
     compilation_state: usize,
+    call_profile: bool,
     arity: u16,
 ) -> Result<Stub, Error> {
     let target = module.target_config();
@@ -210,7 +213,9 @@ fn build_miss(
         b.switch_to_block(inspect);
         let code = b.ins().load(types::I32, flags, address, CODE_OFFSET);
         let code = b.ins().uextend(pointer, code);
-        record_call(b, target.default_call_conv, pointer, ctx, code);
+        if call_profile {
+            record_call(b, target.default_call_conv, pointer, ctx, code);
+        }
         let index = b.ins().iadd_imm_s(code, -1);
         let valid = b
             .ins()
