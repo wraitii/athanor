@@ -4,6 +4,7 @@ mod build;
 mod caches;
 mod comparisons;
 mod construction;
+pub(in crate::jit) mod continuation;
 pub(in crate::jit) mod facts;
 mod inlining;
 mod listing;
@@ -218,6 +219,9 @@ pub(super) enum Op {
     OsrStart(std::sync::Arc<osr::Plan>, usize, Vec<Value>),
     OsrOutput(Value, usize),
     OsrStore(usize, Vec<Value>),
+    Continuation(std::sync::Arc<continuation::Body>, Vec<Value>),
+    ContinuationOutput(Value, usize),
+    ContinuationStore(Vec<Value>),
     Argument(usize),
     Arguments,
     Rest(usize),
@@ -416,8 +420,14 @@ impl Op {
 
     pub(super) fn operands_iter(&self) -> impl Iterator<Item = Value> + '_ {
         let (fixed, rest): ([Option<Value>; 3], &[Value]) = match self {
-            Op::OsrStart(_, _, values) | Op::OsrStore(_, values) => ([None, None, None], values),
-            Op::OsrOutput(value, _) | Op::Observe(value, ..) | Op::ReadHint(value, ..) => {
+            Op::OsrStart(_, _, values)
+            | Op::OsrStore(_, values)
+            | Op::Continuation(_, values)
+            | Op::ContinuationStore(values) => ([None, None, None], values),
+            Op::OsrOutput(value, _)
+            | Op::ContinuationOutput(value, _)
+            | Op::Observe(value, ..)
+            | Op::ReadHint(value, ..) => {
                 ([Some(*value), None, None], &[])
             }
             Op::Argument(_)
@@ -543,8 +553,14 @@ impl Op {
 
     pub(super) fn operands_mut(&mut self) -> impl Iterator<Item = &mut Value> + '_ {
         let (fixed, rest): ([Option<&mut Value>; 3], &mut [Value]) = match self {
-            Op::OsrStart(_, _, values) | Op::OsrStore(_, values) => ([None, None, None], values),
-            Op::OsrOutput(value, _) | Op::Observe(value, ..) | Op::ReadHint(value, ..) => {
+            Op::OsrStart(_, _, values)
+            | Op::OsrStore(_, values)
+            | Op::Continuation(_, values)
+            | Op::ContinuationStore(values) => ([None, None, None], values),
+            Op::OsrOutput(value, _)
+            | Op::ContinuationOutput(value, _)
+            | Op::Observe(value, ..)
+            | Op::ReadHint(value, ..) => {
                 ([Some(value), None, None], &mut [])
             }
             Op::Argument(_)
@@ -769,9 +785,13 @@ pub(super) struct Cfg {
 
 impl Cfg {
     pub(super) fn new(graph: &Graph) -> Self {
-        let mut visited = HashSet::from([graph.entry]);
+        Self::from_entry(graph, graph.entry)
+    }
+
+    pub(super) fn from_entry(graph: &Graph, entry: Block) -> Self {
+        let mut visited = HashSet::from([entry]);
         let mut postorder = Vec::new();
-        let mut stack = vec![(graph.entry, 0)];
+        let mut stack = vec![(entry, 0)];
         while let Some((block, index)) = stack.pop() {
             let successors = graph.successors(block);
             if let Some(&next) = successors.get(index) {
@@ -795,7 +815,7 @@ impl Cfg {
             ranks[block] = index;
         }
         let mut dominators = SecondaryMap::<Block, Option<Block>>::new();
-        dominators[graph.entry] = Some(graph.entry);
+        dominators[entry] = Some(entry);
         let mut changed = true;
         while changed {
             changed = false;
@@ -1035,8 +1055,17 @@ impl Graph {
                 assumptions: &[],
                 result: Unowned,
             },
+            Op::Continuation(..) => Contract {
+                reentry: Reentry::Unknown,
+                flags: UNKNOWN,
+                assumptions: &[],
+                result: Owned,
+            },
             Op::OsrOutput(..) => closed(INTERNAL, &[], Unowned),
-            Op::OsrStore(..) | Op::Observe(..) | Op::ReadHint(..) => closed(INTERNAL, &[], None),
+            Op::ContinuationOutput(..) => closed(INTERNAL, &[], Owned),
+            Op::OsrStore(..) | Op::ContinuationStore(..) | Op::Observe(..) | Op::ReadHint(..) => {
+                closed(INTERNAL, &[], None)
+            }
             Op::NewInstance(_) => closed(ALLOCATION | INTERNAL | ERROR, &[], Owned),
             Op::ConstructorResult(..) => closed(0, &[], Borrowed),
             Op::Rest(_) | Op::Arguments => closed(ALLOCATION | INTERNAL | ERROR, &[], Owned),

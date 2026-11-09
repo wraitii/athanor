@@ -27,7 +27,14 @@ impl Graph {
                 format!("observe {kind:?} {value} site={site}")
             }
             Op::OsrStart(_, index, values) => format!("osr_start {index} [{}]", list(values)),
+            Op::Continuation(body, values) => {
+                format!("continuation {} [{}]", body.graph.name, list(values))
+            }
             Op::OsrOutput(value, index) => format!("osr_output {value}, {index}"),
+            Op::ContinuationOutput(value, index) => {
+                format!("continuation_output {value}, {index}")
+            }
+            Op::ContinuationStore(values) => format!("continuation_store [{}]", list(values)),
             Op::OsrStore(offset, values) => format!("osr_store {offset} [{}]", list(values)),
             Op::Argument(index) => format!("argument {index}"),
             Op::Arguments => "arguments".into(),

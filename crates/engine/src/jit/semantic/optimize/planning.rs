@@ -1,5 +1,5 @@
 use super::super::specialize::{ConditionalCall, ConditionalPlan};
-use super::versioning::Version;
+use super::versioning::{Canonical, Version};
 use super::*;
 
 struct RegionPlan {
@@ -177,6 +177,7 @@ impl RegionPlan {
         regions: &mut Vec<HashSet<Block>>,
         notes: &mut Vec<String>,
         report_regions: bool,
+        canonical: &Canonical<'_>,
     ) -> Result<()> {
         let cfg = Cfg::new(graph);
         let live: HashSet<_> = cfg.rpo.iter().copied().collect();
@@ -198,6 +199,7 @@ impl RegionPlan {
             || "function".to_owned(),
             |(_, header)| format!("loop at {header}"),
         );
+        let mut child_canonical = None;
         if self.speculative() {
             let blocks: Vec<_> = Cfg::new(graph)
                 .rpo
@@ -219,7 +221,8 @@ impl RegionPlan {
                 closed_calls: &self.calls,
                 ..Default::default()
             };
-            let version = apply_version(graph, &blocks, self.entry, &speculation);
+            let version = apply_version(graph, &blocks, self.entry, &speculation, Some(canonical));
+            notes.extend(version.notes.iter().cloned());
             graph.verify()?;
             if let Some(previous) = fallback {
                 notes.push(format!(
@@ -247,13 +250,21 @@ impl RegionPlan {
             for child in &mut self.children {
                 child.remap(&version);
             }
+            child_canonical = Some(canonical.copied(&version));
             self.body = version.body;
         } else {
             notes.push(format!("{label}: closed without guards"));
         }
         for child in self.children {
             let first = regions.len();
-            child.emit(graph, None, regions, notes, report_regions)?;
+            child.emit(
+                graph,
+                None,
+                regions,
+                notes,
+                report_regions,
+                child_canonical.as_ref().unwrap_or(canonical),
+            )?;
             for region in &regions[first..] {
                 self.body.extend(region.iter().copied());
             }
@@ -487,6 +498,8 @@ pub(in crate::jit::semantic) fn version_with_report(
     report_regions: bool,
 ) -> Result<Vec<HashSet<Block>>> {
     let plans = plan(graph, conditional, notes);
+    let original = graph.clone();
+    let canonical = Canonical::identity(&original);
     if report_regions {
         let mut report = String::from("region plan before versioning:\n");
         for plan in &plans {
@@ -496,7 +509,14 @@ pub(in crate::jit::semantic) fn version_with_report(
     }
     let mut regions = Vec::new();
     for plan in plans {
-        plan.emit(graph, fallback, &mut regions, notes, report_regions)?;
+        plan.emit(
+            graph,
+            fallback,
+            &mut regions,
+            notes,
+            report_regions,
+            &canonical,
+        )?;
     }
     Ok(regions)
 }
@@ -850,6 +870,63 @@ mod tests {
             .count();
         assert_eq!(checks, 1);
         graph.verify().unwrap();
+    }
+
+    #[test]
+    fn nested_loop_continuations_survive_parent_pruning() {
+        use crate::jit::planner::{ReadKind, ReadType, Site};
+
+        let graph = graph(
+            "function f(rows,offsets,weights,points){unknown();let total=0;for(let y=0;y<points.length;++y){let base=points[y].x;for(let i=0;i<weights.length;++i){let x=base+offsets[i];if(x<0||x>=rows.length)continue;total+=rows[x][y]/weights[i];}}return total;}",
+        );
+        let mut repository = super::super::super::specialize::Repository::default();
+        for data in graph.insts.values() {
+            if let Op::GetIndex(object, _) = data.op {
+                let element = match graph.defining_op(object) {
+                    Some(Op::GetIndex(..)) => TypedKind::Float64,
+                    Some(Op::Argument(1)) => TypedKind::Int32,
+                    Some(Op::Argument(2)) => TypedKind::Float64,
+                    _ => continue,
+                };
+                repository.read_feedback.insert(
+                    (
+                        Site {
+                            source: 7,
+                            start: data.span.start,
+                            end: data.span.end,
+                        },
+                        ReadKind::Receiver,
+                    ),
+                    ReadType::Typed(element),
+                );
+            }
+            if matches!(data.op, Op::Binary(BinaryOperator::Addition, ..)) {
+                repository.read_feedback.insert(
+                    (
+                        Site {
+                            source: 7,
+                            start: data.span.start,
+                            end: data.span.end,
+                        },
+                        ReadKind::Number,
+                    ),
+                    ReadType::Integer,
+                );
+            }
+        }
+        let canonical = super::super::super::Canonical::from_graph(graph);
+        let analysis =
+            super::super::super::optimize_canonical(canonical, true, Some((&repository, 7)))
+                .unwrap();
+        let cfg = Cfg::new(&analysis.graph);
+        assert_eq!(natural_loops(&analysis.graph, &cfg).len(), 2);
+        assert!(cfg.rpo.iter().any(|&block| {
+            analysis.graph.blocks[block]
+                .insts
+                .iter()
+                .any(|&inst| matches!(analysis.graph.insts[inst].op, Op::Continuation(..)))
+        }));
+        analysis.graph.verify().unwrap();
     }
 
     #[test]

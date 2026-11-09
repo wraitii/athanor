@@ -1324,13 +1324,54 @@ Feedback recompilation retains the native entry of the previously emitted
 version. A function specialization sends entry guard failure directly to that
 previous version, passing the original closure, receiver and arguments. When
 all fallback guards move to entry, it reuses the planned fast body in place.
-Varying guards retain local generic continuations carrying the current SSA
-values; only entry failures restart the previous function. Side-exit SSA repair
-runs before redirecting entry failures, preserving merges between copied loop
-values and values updated by the generic continuation. Fixed entries use a
-native tail call; generic entries call and return after releasing the speculative
-frame. The fallback bypasses mutable dispatch tables. Initial compilation still
-includes its generic body because no earlier native version exists.
+Generic code that a specialized region bails out to is split into native
+continuation pieces built lazily from the canonical graph, at most once per
+compilation:
+
+- `loop.H` runs loop `H` from its header with the loop-carried values. Nested
+  loops are called as their own `loop` pieces rather than copied. Every exit
+  stores its live outputs into the caller's argument buffer and returns an exit
+  index. Exits are keyed by target block, plus one shared exit for `return`, so
+  a `break` to an outer label simply becomes an exit of each enclosing loop.
+- `next.H` calls `loop.H`, dispatches on the exit index and runs the generic
+  code after the loop up to the next loop header, which hands over to that
+  header's `next` piece.
+- `resume.T` starts at a failed guard's target with the live SSA values,
+  finishes the interrupted iteration and hands over to `next` at the first loop
+  header it reaches.
+
+A guard stub stores its live values and makes one call. Loop headers of the
+in-function generic copy are replaced by a call to their `next` piece. Pieces
+only call outward along loop exits, so the native stack depth of a bailout is
+bounded by the number of loops on its path, independent of iteration counts.
+Stubs share one cold block when they resume at the same target with the same
+values.
+
+Continuations use the canonical graph's facts to type their inputs and outputs:
+a piece's own control flow omits the paths around it and would infer unsound
+loop-carried types. Nested versions compose block and value mappings back to
+that graph, so a bailout does not inherit an enclosing specialization's
+assumptions. Each continuation uses the existing vector calling convention, with
+boxed live values in a caller-owned native stack buffer; a loop call that
+returns outputs gets its own buffer. The original receiver is forwarded through
+each continuation, so ordinary `this` reads need no extra materialization.
+Borrowed inputs acquire temporary ownership at the transfer boundary. Exit
+outputs are retained by the callee and owned by the caller's temporaries.
+Continuations own their results through the ordinary return path; only the
+original invocation reports function completion.
+
+Extraction currently requires promoted SSA state. Materialized scopes, other
+implicit frame reads, generators, handlers, heap views, and OSR transfer-buffer
+operations keep their existing in-function fallback paths, and so does any
+guard whose path reaches a loop that cannot be split; planner notes explain
+rejected extractions. Continuations compile eagerly and have separate semantic
+IR and assembly listings under the enclosing function's name.
+`JS_JIT_NO_CONTINUATIONS=1` disables extraction and keeps every bailout in the
+function's own generic copy.
+
+Only function-entry failures restart the previous native version. Fixed entries
+use a native tail call; generic entries call and return after releasing the
+speculative frame. That fallback bypasses mutable dispatch tables.
 
 Load reuse, hoisting and borrowing consume instruction-specific proofs, while
 generic calls retain their reentry and ownership barriers. Conditional decisions

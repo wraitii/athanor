@@ -69,6 +69,26 @@ impl Inspection {
         }
     }
 
+    pub(super) fn from_graph(options: Option<&CompileOptions>, graph: &semantic::Graph) -> Self {
+        let Some(options) = options else {
+            return Self::default();
+        };
+        Self {
+            semantic: options.semantic_ir.then(|| {
+                let mut text = String::new();
+                for (id, _, line) in graph.listing(&semantic::Facts::compute(graph)).lines() {
+                    if id == 0 {
+                        writeln!(text, "{line}").unwrap();
+                    } else {
+                        writeln!(text, "{line}  @{id:04x}").unwrap();
+                    }
+                }
+                text
+            }),
+            ..Self::default()
+        }
+    }
+
     pub(super) fn with_ast(mut self, other: Self) -> Self {
         self.ast = other.ast;
         self

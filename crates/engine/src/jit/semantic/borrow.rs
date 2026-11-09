@@ -297,7 +297,9 @@ fn scan(
                     }
                 }
             }
-            if reenters || (writes && !stores(&graph.insts[inst].op)) {
+            if (reenters || (writes && !stores(&graph.insts[inst].op)))
+                && !matches!(graph.insts[inst].op, Op::Continuation(..))
+            {
                 for value in borrows.uses(inst) {
                     borrows.rejected.insert(value);
                 }

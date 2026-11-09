@@ -319,19 +319,10 @@ fn loop_versioning_reuses_exposed_comparison_checks() {
         "function f(limit){let sum=0;for(let i=0;i<2;++i){if(i<limit)sum+=i;}return sum;}",
     );
     let graph = &analysis.graph;
-    let limit = graph
-        .insts
-        .values()
-        .find_map(|data| {
-            matches!(data.op, Op::Argument(0))
-                .then_some(data.result)
-                .flatten()
-        })
-        .unwrap();
     assert_eq!(
         ops(graph)
             .into_iter()
-            .filter(|op| matches!(op, Op::IsNumber(value) if *value == limit))
+            .filter(|op| matches!(op, Op::IsNumber(value) if matches!(graph.defining_op(*value), Some(Op::Argument(0)))))
             .count(),
         1
     );
@@ -370,12 +361,9 @@ fn indexed_reads_are_reused_probed_and_get_hoisted_views() {
             .any(|&inst| matches!(viewed.insts[inst].op, Op::IndexedGet(..)))
     );
     let analysis = optimize_canonical(canonical, true, None).unwrap();
-    assert!(
-        analysis
-            .notes
-            .iter()
-            .any(|note| note.contains("get_indexed") && note.contains("reuses"))
-    );
+    assert!(ops(&analysis.graph).iter().any(|op| matches!(
+        op, Op::Binary(oxc_syntax::operator::BinaryOperator::Addition, left, right) if left == right
+    )));
     assert!(
         analysis
             .notes
@@ -837,7 +825,13 @@ fn versions_on_native_calls_only_when_closed() {
     let analysis = analyze_source(source);
     let versioned = ops(&analysis.graph);
     assert!(versioned.iter().any(|op| matches!(op, Op::CallNative(..))));
-    assert!(versioned.iter().any(|op| matches!(op, Op::Call { .. })));
+    assert!(
+        super::continuation::bodies(&analysis.graph)
+            .iter()
+            .any(|body| ops(&body.graph)
+                .iter()
+                .any(|op| matches!(op, Op::Call { .. })))
+    );
     let unknown = analyze_source(
         "function f(m) { let s = 0; for (let x = 0; x < m.length; ++x) s = Math.min(s, g(x)); return s; }",
     );

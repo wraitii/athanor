@@ -87,9 +87,55 @@ impl EntryGuard {
 
 pub(super) struct Version {
     pub(super) body: HashSet<Block>,
+    pub(super) notes: Vec<String>,
     pub(super) blocks: HashMap<Block, Block>,
     pub(super) insts: HashMap<Inst, Inst>,
     pub(super) values: HashMap<Value, Value>,
+}
+
+pub(super) struct Canonical<'a> {
+    pub(super) graph: &'a Graph,
+    pub(super) blocks: HashMap<Block, Block>,
+    pub(super) values: HashMap<Value, Value>,
+    pieces: std::rc::Rc<std::cell::RefCell<super::super::continuation::Pieces>>,
+}
+
+impl<'a> Canonical<'a> {
+    pub(super) fn identity(graph: &'a Graph) -> Self {
+        Self {
+            graph,
+            blocks: graph.blocks.keys().map(|block| (block, block)).collect(),
+            values: graph.values.keys().map(|value| (value, value)).collect(),
+            pieces: Default::default(),
+        }
+    }
+
+    pub(super) fn copied(&self, version: &Version) -> Self {
+        Self {
+            graph: self.graph,
+            pieces: self.pieces.clone(),
+            blocks: self
+                .blocks
+                .iter()
+                .map(|(&original, &current)| {
+                    (
+                        original,
+                        version.blocks.get(&current).copied().unwrap_or(current),
+                    )
+                })
+                .collect(),
+            values: self
+                .values
+                .iter()
+                .map(|(&original, &current)| {
+                    (
+                        original,
+                        version.values.get(&current).copied().unwrap_or(current),
+                    )
+                })
+                .collect(),
+        }
+    }
 }
 
 pub(super) fn apply_version(
@@ -97,6 +143,7 @@ pub(super) fn apply_version(
     region: &[Block],
     entry: Option<(Block, Block)>,
     speculation: &Speculation<'_>,
+    canonical: Option<&Canonical<'_>>,
 ) -> Version {
     let Speculation {
         fallback,
@@ -112,6 +159,11 @@ pub(super) fn apply_version(
         code_guards,
         closed_calls,
     } = *speculation;
+    let local_generic = canonical.is_none().then(|| graph.clone());
+    let local_canonical = local_generic.as_ref().map(Canonical::identity);
+    let canonical = canonical.or(local_canonical.as_ref()).unwrap();
+    let generic = canonical.graph;
+    let mut notes = Vec::new();
     let hints = super::super::observations::numeric_hints(graph);
     let head = entry.map_or(graph.entry, |(_, header)| header);
     let mut tested =
@@ -600,6 +652,130 @@ pub(super) fn apply_version(
         None => graph.entry = start,
     }
 
+    if !reuse && std::env::var_os("JS_JIT_NO_CONTINUATIONS").is_none() {
+        let region: HashSet<_> = region.iter().copied().collect();
+        let reverse: HashMap<_, _> = canonical
+            .blocks
+            .iter()
+            .map(|(&old, &current)| (current, old))
+            .collect();
+        let exits: Vec<_> = exits
+            .iter()
+            .filter(|block| !guards.contains(block))
+            .map(|&block| (block, false))
+            .chain(exits_true.iter().map(|&block| (block, true)))
+            .collect();
+        let mut pieces = canonical.pieces.borrow_mut();
+        let cfg = Cfg::new(graph);
+        let mut stubs: HashMap<(usize, Vec<Value>), Block> = HashMap::new();
+        for &(block, taken) in &exits {
+            let Some(&original) = reverse.get(&block) else {
+                notes.push(format!("guard at {block}: canonical block unavailable"));
+                continue;
+            };
+            let TerminatorKind::Branch(_, yes, no) =
+                &generic.blocks[original].terminator.as_ref().unwrap().kind
+            else {
+                notes.push(format!("guard at {block}: canonical branch unavailable"));
+                continue;
+            };
+            let piece = match pieces.resume(generic, if taken { yes } else { no }) {
+                Ok(piece) => piece,
+                Err(reason) => {
+                    notes.push(format!(
+                        "guard at {block}: continuation unavailable: {reason}"
+                    ));
+                    continue;
+                }
+            };
+            let inputs: Option<Vec<_>> = piece
+                .inputs
+                .iter()
+                .map(|value| {
+                    let current = *canonical.values.get(value)?;
+                    let mapped = values.get(&current).copied().unwrap_or(current);
+                    value_available(graph, &cfg, mapped, blocks[&block]).then_some(mapped)
+                })
+                .collect();
+            let Some(inputs) = inputs else {
+                notes.push(format!("guard at {block}: canonical inputs unavailable"));
+                continue;
+            };
+            let key = (std::sync::Arc::as_ptr(&piece.body) as usize, inputs.clone());
+            let stub = *stubs.entry(key).or_insert_with(|| {
+                let stub = graph.blocks.push(BlockData::default());
+                let result = graph
+                    .append(stub, span, Op::Continuation(piece.body.clone(), inputs), true)
+                    .1
+                    .unwrap();
+                graph.blocks[stub].terminator = Some(Terminator {
+                    source_name: None,
+                    span,
+                    kind: TerminatorKind::Return(result),
+                });
+                graph.cold.insert(stub);
+                stub
+            });
+            let TerminatorKind::Branch(_, yes, no) = &mut graph.blocks[blocks[&block]]
+                .terminator
+                .as_mut()
+                .unwrap()
+                .kind
+            else {
+                continue;
+            };
+            *if taken { yes } else { no } = Target::new(stub);
+            notes.push(format!(
+                "guard at {block}: resumes in {}",
+                piece.body.graph.name
+            ));
+        }
+        for header in pieces.headers(generic) {
+            let cfg = Cfg::new(graph);
+            let Some(&current) = canonical
+                .blocks
+                .get(&header)
+                .filter(|current| region.contains(current) && cfg.rpo.contains(current))
+            else {
+                continue;
+            };
+            let piece = match pieces.driver(generic, header) {
+                Ok(piece) => piece,
+                Err(reason) => {
+                    notes.push(format!(
+                        "loop at {current}: continuation unavailable: {reason}"
+                    ));
+                    continue;
+                }
+            };
+            let inputs: Option<Vec<_>> = piece
+                .inputs
+                .iter()
+                .map(|value| {
+                    let current_value = *canonical.values.get(value)?;
+                    value_available(graph, &cfg, current_value, current).then_some(current_value)
+                })
+                .collect();
+            let Some(inputs) = inputs else {
+                notes.push(format!(
+                    "loop at {current}: generic entry inputs unavailable"
+                ));
+                continue;
+            };
+            graph.blocks[current].insts.clear();
+            let result = graph
+                .append(current, span, Op::Continuation(piece.body, inputs), true)
+                .1
+                .unwrap();
+            graph.blocks[current].terminator = Some(Terminator {
+                source_name: None,
+                span,
+                kind: TerminatorKind::Return(result),
+            });
+            notes.push(format!("loop at {current}: separate generic function"));
+        }
+    }
+
     let mut callees = Vec::new();
     for requirement in requirements {
         let copy = insts[&requirement.call];
@@ -677,6 +853,7 @@ pub(super) fn apply_version(
         .filter(|block| copies.contains(block))
         .collect();
     Version {
+        notes,
         body: reachable,
         blocks,
         insts,
@@ -684,7 +861,15 @@ pub(super) fn apply_version(
     }
 }
 
-fn repair(graph: &mut Graph, values: &HashMap<Value, Vec<Value>>) {
+fn value_available(graph: &Graph, cfg: &Cfg, value: Value, block: Block) -> bool {
+    let defined = match graph.values[value] {
+        ValueDef::Result(inst) => graph.blocks[graph.insts[inst].block].insts.contains(&inst),
+        ValueDef::Param(block, _) => graph.blocks[block].params.contains(&value),
+    };
+    defined && cfg.dominates(graph.def_block(value), block)
+}
+
+pub(in crate::jit::semantic) fn repair(graph: &mut Graph, values: &HashMap<Value, Vec<Value>>) {
     let cfg = Cfg::new(graph);
     let mut repair = Repair {
         cfg: &cfg,

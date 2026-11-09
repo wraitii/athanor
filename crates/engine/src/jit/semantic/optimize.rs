@@ -23,6 +23,7 @@ use analysis::{Access, Guarded, Requirement, Writes, closure_failure, requiremen
 pub(super) use planning::version;
 pub(super) use planning::version_with_report;
 pub(super) use simplify::{bit_tests, coercions, simplify, typeof_comparisons};
+pub(super) use versioning::repair;
 use versioning::{Speculation, apply_version};
 
 pub(super) fn version_string_leaves(
@@ -146,7 +147,9 @@ pub(super) fn version_string_leaves(
             &blocks,
             Some((preheader, header)),
             &speculation,
+            None,
         );
+        notes.extend(version.notes.iter().cloned());
         let copy = version.body;
         simplify(&mut candidate);
         candidate.verify()?;
@@ -1112,7 +1115,12 @@ mod tests {
                     .any(|(other, body)| other != header && body.contains(header))
             })
             .count();
-        assert_eq!(outer, 2);
+        assert_eq!(outer, 1);
+        assert!(
+            super::super::continuation::bodies(graph)
+                .iter()
+                .any(|body| !natural_loops(&body.graph, &Cfg::new(&body.graph)).is_empty())
+        );
         assert_eq!(
             Cfg::new(graph)
                 .rpo

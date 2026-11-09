@@ -1303,8 +1303,17 @@ mod tests {
                     fallbacks.push(otherwise.block);
                 }
             }
-            assert!(fallbacks.len() >= 2);
-            assert!(fallbacks.iter().all(|block| *block == fallbacks[0]));
+            assert_eq!(fallbacks.len(), 1);
+            assert!(
+                graph.blocks[fallbacks[0]]
+                    .insts
+                    .iter()
+                    .any(|&inst| matches!(graph.insts[inst].op, Op::Continuation(..)))
+            );
+            assert!(matches!(
+                graph.blocks[fallbacks[0]].terminator.as_ref().unwrap().kind,
+                TerminatorKind::Return(_)
+            ));
             assert!(
                 operations(graph)
                     .iter()

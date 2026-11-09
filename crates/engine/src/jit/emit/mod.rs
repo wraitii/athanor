@@ -116,6 +116,7 @@ pub(super) fn build_function(
     _closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
     kind: FunctionKind,
     graph: &super::semantic::Graph,
+    continuations: &HashMap<usize, FuncId>,
     feedback: Option<Feedback>,
 ) -> Result<(), Error> {
     build_callable(
@@ -130,6 +131,7 @@ pub(super) fn build_function(
         params,
         kind,
         CallableBody::Graph(graph),
+        continuations,
         feedback,
     )
 }
@@ -159,6 +161,7 @@ pub(super) fn build_factory(
         params,
         FunctionKind::Factory(resume),
         CallableBody::Factory(resume),
+        &HashMap::new(),
         None,
     )
 }
@@ -180,6 +183,7 @@ fn build_callable(
     params: Span,
     kind: FunctionKind,
     body: CallableBody<'_>,
+    continuations: &HashMap<usize, FuncId>,
     feedback: Option<Feedback>,
 ) -> Result<(), Error> {
     let entry = b.create_block();
@@ -278,7 +282,7 @@ fn build_callable(
         } else {
             closure
         };
-        compiler.emit_semantic_graph(graph, graph_closure)?;
+        compiler.emit_semantic_graph(graph, graph_closure, continuations)?;
         compiler.patch_frame_size();
         if let Some(dispatch) = dispatch {
             compiler.switch(dispatch);
@@ -310,6 +314,7 @@ pub(super) fn build_global(
     source_name: (usize, usize),
     _closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
     graph: &super::semantic::Graph,
+    continuations: &HashMap<usize, FuncId>,
 ) -> Result<(), Error> {
     let entry = b.create_block();
     b.switch_to_block(entry);
@@ -356,7 +361,7 @@ pub(super) fn build_global(
         slot_count: 0,
     };
     compiler.enter_frame();
-    compiler.emit_semantic_graph(graph, closure)?;
+    compiler.emit_semantic_graph(graph, closure, continuations)?;
     compiler.patch_frame_size();
     Ok(())
 }

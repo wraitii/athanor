@@ -4,6 +4,7 @@ use cranelift_codegen::entity::{EntityRef, SecondaryMap};
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{BlockArg, InstBuilder, MemFlagsData, Value as ClifValue, types};
 use cranelift_frontend::Variable;
+use cranelift_module::{FuncId, Module};
 
 use crate::error::Error;
 use crate::heap::kind;
@@ -169,6 +170,7 @@ impl FunctionCompiler<'_, '_> {
         &mut self,
         graph: &Graph,
         closure: ClifValue,
+        continuations: &std::collections::HashMap<usize, FuncId>,
     ) -> Result<(), Error> {
         let source_name = self.source_name;
         let blocks: Vec<_> = graph
@@ -247,6 +249,25 @@ impl FunctionCompiler<'_, '_> {
                 pack_slots[inst] = Some(address);
             }
         }
+
+        let continuation_words = reachable
+            .iter()
+            .flat_map(|&block| &graph.blocks[block].insts)
+            .filter_map(|&inst| match &graph.insts[inst].op {
+                Op::Continuation(_, inputs) => Some(inputs.len()),
+                _ => None,
+            })
+            .max();
+        let continuation_buffer = continuation_words.map(|words| {
+            let slot = self
+                .b
+                .create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                    cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                    (words.max(1) * 8) as u32,
+                    3,
+                ));
+            self.b.ins().stack_addr(self.pointer, slot, 0)
+        });
 
         let cyclic = cyclic_blocks(graph, &cfg);
         let repeated = |block: crate::jit::semantic::Block| {
@@ -413,6 +434,52 @@ impl FunctionCompiler<'_, '_> {
                     typed
                 } else {
                     let result = match &data.op {
+                        Op::Continuation(target, inputs) => {
+                            let id = continuations[&(std::sync::Arc::as_ptr(target) as usize)];
+                            let function = self.module.declare_func_in_func(id, self.b.func);
+                            let argv = if target.outputs == 0 {
+                                continuation_buffer.unwrap()
+                            } else {
+                                let words = inputs.len().max(target.outputs);
+                                let slot = self.b.create_sized_stack_slot(
+                                    cranelift_codegen::ir::StackSlotData::new(
+                                        cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                                        (words * 8) as u32,
+                                        3,
+                                    ),
+                                );
+                                let address = self.b.ins().stack_addr(self.pointer, slot, 0);
+                                cx.osr_buffers
+                                    .borrow_mut()
+                                    .insert(data.result.unwrap(), (address, 0));
+                                address
+                            };
+                            for (index, &input) in inputs.iter().enumerate() {
+                                let value = get(self, input);
+                                if graph.borrowed.contains(&input) {
+                                    let heap = self.is_heap(value);
+                                    let retain = self.b.create_block();
+                                    let stored = self.b.create_block();
+                                    self.brif(heap, retain, &[], stored, &[]);
+                                    self.switch(retain);
+                                    self.retain_temporary(value);
+                                    self.jump(stored, &[]);
+                                    self.switch(stored);
+                                }
+                                self.b.ins().store(
+                                    MemFlagsData::trusted(),
+                                    value,
+                                    argv,
+                                    (index * 8) as i32,
+                                );
+                            }
+                            let argc = self.b.ins().iconst(types::I64, inputs.len() as i64);
+                            let args = [self.ctx, closure, self.receiver, argv, argc];
+                            let call = self.b.ins().call(function, &args);
+                            let value = self.b.inst_results(call)[0];
+                            self.check_error();
+                            Some(self.own_temporary(value))
+                        }
                         Op::OsrStart(plan, candidate, inputs) => {
                             let transfer = plan.loops[*candidate].transfer.as_ref().unwrap();
                             let words = inputs.len() + transfer.outputs.len();
@@ -495,6 +562,34 @@ impl FunctionCompiler<'_, '_> {
                                 address,
                                 ((inputs + index) * 8) as i32,
                             ))
+                        }
+                        Op::ContinuationOutput(call, index) => {
+                            let (address, _) = cx.osr_buffers.borrow()[call];
+                            let value = self.b.ins().load(
+                                types::I64,
+                                MemFlagsData::trusted(),
+                                address,
+                                (index * 8) as i32,
+                            );
+                            Some(self.own_temporary(value))
+                        }
+                        Op::ContinuationStore(values) => {
+                            let super::Arguments::Vector { argv, .. } = self.arguments else {
+                                return Err(Error::Compile(
+                                    "continuation exit requires vector arguments".into(),
+                                ));
+                            };
+                            for (index, &value) in values.iter().enumerate() {
+                                let value = get(self, value);
+                                self.increment(value);
+                                self.b.ins().store(
+                                    MemFlagsData::trusted(),
+                                    value,
+                                    argv,
+                                    (index * 8) as i32,
+                                );
+                            }
+                            None
                         }
                         Op::OsrStore(offset, values) => {
                             let super::Arguments::Vector { argv, .. } = self.arguments else {

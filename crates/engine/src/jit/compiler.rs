@@ -131,6 +131,7 @@ impl Drop for Compiler {
 }
 
 pub(crate) struct Compiler {
+    continuations: Vec<(FuncId, FunctionBody)>,
     log: super::recompile::Log,
     emissions: HashMap<FuncId, Emission>,
     lazy: HashMap<FuncId, (Emission, Arc<super::semantic::specialize::Repository>)>,
@@ -248,6 +249,7 @@ impl Compiler {
             names: Vec::new(),
             cells: Vec::new(),
             data: Vec::new(),
+            continuations: Vec::new(),
             source_name: (0, 0),
             canonical: Arc::default(),
             module,
@@ -354,6 +356,7 @@ impl Compiler {
             .insert(self.source_name.0, self.source_name.1);
         let result = self.compile_program_inner(program, scoping, nodes, source, source_path);
         if result.is_err() {
+            self.continuations.clear();
             self.context.clear();
             self.builder_context = FunctionBuilderContext::new();
         }
@@ -709,8 +712,6 @@ impl Compiler {
                 .unwrap_or("module");
             let label = format!("{module}.module");
             let id = self.declare_js(&label, line)?;
-            self.context.clear();
-            self.context.func.signature = self.signature.clone();
             let mut annotations = Annotations {
                 semantic_locations: self.dump_ir || self.inspection.is_some(),
                 ..Annotations::default()
@@ -728,6 +729,16 @@ impl Compiler {
                     .is_some_and(|options| options.planner),
             )
             .map_err(Error::Unsupported)?;
+            let continuations = self.compile_continuations(
+                &graph.graph,
+                self.source_name,
+                program.span,
+                &closures,
+                (&label, line),
+                None,
+            )?;
+            self.context.clear();
+            self.context.func.signature = self.signature.clone();
             {
                 let mut data = FunctionData::new();
                 let mut builder = cranelift_frontend::FunctionBuilder::new(
@@ -745,6 +756,7 @@ impl Compiler {
                     self.source_name,
                     &closures,
                     &graph.graph,
+                    &continuations,
                 )?;
                 builder.seal_all_blocks();
                 builder.finalize(self.module.target_config());
@@ -817,13 +829,15 @@ impl Compiler {
 
     fn finish_functions(
         &mut self,
-        pending: Vec<(FuncId, FunctionBody)>,
+        mut pending: Vec<(FuncId, FunctionBody)>,
         source: &str,
         source_path: &str,
         lines: &[u32],
     ) -> Result<(), Error> {
+        let mut continuations = std::mem::take(&mut self.continuations);
+        continuations.append(&mut pending);
         let mut dumped = Vec::new();
-        for (id, mut code) in pending {
+        for (id, mut code) in continuations {
             let mut listing = None;
             self.context.clear();
             self.context.func = code.function;
@@ -1141,6 +1155,7 @@ impl Compiler {
             ));
         }
         if result.is_err() {
+            self.continuations.clear();
             self.context.clear();
             self.builder_context = FunctionBuilderContext::new();
         }
@@ -1225,6 +1240,19 @@ impl Compiler {
         if self.osr && region.is_none() {
             graph.prepare_osr(source).map_err(Error::Unsupported)?;
         }
+        let feedback = self.ssa_opt.then_some(emit::Feedback {
+            function_return: false,
+            get_refinement: self.get_refinement,
+            owner: code.as_u32() as u64,
+        });
+        let continuations = self.compile_continuations(
+            &graph.graph,
+            emission.source_name,
+            emission.params,
+            &emission.closures,
+            (&label, 1),
+            feedback,
+        )?;
         let mut annotations = Annotations {
             semantic_locations: self.dump_ir || self.inspection.is_some(),
             ..Annotations::default()
@@ -1253,6 +1281,7 @@ impl Compiler {
                 &emission.closures,
                 emit::FunctionKind::Ordinary,
                 &graph.graph,
+                &continuations,
                 self.ssa_opt.then_some(emit::Feedback {
                     function_return: region.is_none(),
                     get_refinement: self.get_refinement,
@@ -1380,6 +1409,7 @@ impl Compiler {
         }
         self.canonical = current;
         if result.is_err() {
+            self.continuations.clear();
             self.context.clear();
             self.builder_context = FunctionBuilderContext::new();
         }
@@ -1420,6 +1450,115 @@ impl Compiler {
         Some(self.install(compiled.replacement))
     }
 
+    fn compile_continuations(
+        &mut self,
+        graph: &super::semantic::Graph,
+        source_name: (usize, usize),
+        params: oxc_span::Span,
+        closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
+        name: (&str, u32),
+        feedback: Option<emit::Feedback>,
+    ) -> Result<HashMap<usize, FuncId>, Error> {
+        let mut ids = HashMap::new();
+        self.compile_continuations_inner(
+            graph,
+            source_name,
+            params,
+            closures,
+            name,
+            feedback,
+            &mut ids,
+        )?;
+        Ok(ids)
+    }
+
+    fn compile_continuations_inner(
+        &mut self,
+        graph: &super::semantic::Graph,
+        source_name: (usize, usize),
+        params: oxc_span::Span,
+        closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
+        name: (&str, u32),
+        feedback: Option<emit::Feedback>,
+        ids: &mut HashMap<usize, FuncId>,
+    ) -> Result<(), Error> {
+        let cfg = super::semantic::Cfg::new(graph);
+        for &inst in cfg.rpo.iter().flat_map(|&block| &graph.blocks[block].insts) {
+            let super::semantic::Op::Continuation(target, _) = &graph.insts[inst].op else {
+                continue;
+            };
+            let key = Arc::as_ptr(target) as usize;
+            if ids.contains_key(&key) {
+                continue;
+            }
+            let id = self.declare_js(&format!("{}.continuation", name.0), name.1)?;
+            ids.insert(key, id);
+            self.compile_continuations_inner(
+                &target.graph,
+                source_name,
+                params,
+                closures,
+                name,
+                feedback,
+                ids,
+            )?;
+            self.context.clear();
+            self.context.func.signature = self.signature.clone();
+            let mut annotations = Annotations {
+                semantic_locations: self.dump_ir || self.inspection.is_some(),
+                ..Annotations::default()
+            };
+            let mut data = FunctionData::new();
+            let mut builder = cranelift_frontend::FunctionBuilder::new(
+                &mut self.context.func,
+                &mut self.builder_context,
+            );
+            emit::build_function(
+                &mut builder,
+                &mut self.module,
+                self.stubs,
+                &mut annotations,
+                &mut self.names,
+                &mut self.cells,
+                &mut data,
+                source_name,
+                params,
+                closures,
+                emit::FunctionKind::Ordinary,
+                &target.graph,
+                ids,
+                feedback,
+            )?;
+            builder.seal_all_blocks();
+            builder.finalize(self.module.target_config());
+            data.seal();
+            self.data.push(data);
+            self.continuations.push((
+                id,
+                FunctionBody {
+                    function: std::mem::replace(
+                        &mut self.context.func,
+                        cranelift_codegen::ir::Function::new(),
+                    ),
+                    annotations,
+                    inspection: super::inspect::Inspection::from_graph(
+                        self.inspection.as_deref(),
+                        &target.graph,
+                    )
+                    .named(&format!("continuation of {}", name.0)),
+                    listing: (self.dump_ir || (self.dump.is_some() && self.inspection.is_some()))
+                        .then(|| {
+                            target
+                                .graph
+                                .listing(&super::semantic::Facts::compute(&target.graph))
+                                .lines()
+                        }),
+                },
+            ));
+        }
+        Ok(())
+    }
+
     fn compile_callable(
         &mut self,
         params: &FormalParameters<'_>,
@@ -1448,6 +1587,7 @@ impl Compiler {
                 closures,
                 scoping,
                 emit::FunctionKind::Ordinary,
+                (label, line),
                 semantic_function,
             )?;
             body.inspection = body.inspection.named(label).ast(
@@ -1472,6 +1612,7 @@ impl Compiler {
             closures,
             scoping,
             emit::FunctionKind::Generator(plan),
+            (&internal, line),
             semantic_function,
         )?;
         resume.inspection = resume.inspection.named(&internal).with_ast(inspection);
@@ -1486,6 +1627,7 @@ impl Compiler {
             closures,
             scoping,
             emit::FunctionKind::Factory(id),
+            (label, line),
             None,
         )?;
         Ok((factory, Some((id, resume))))
@@ -1503,6 +1645,7 @@ impl Compiler {
         closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
         scoping: &Scoping,
         kind: emit::FunctionKind,
+        name: (&str, u32),
         semantic_function: Option<oxc_span::Span>,
     ) -> Result<FunctionBody, Error> {
         let mut graph = semantic_function
@@ -1567,6 +1710,23 @@ impl Compiler {
                 },
             );
         }
+        let continuation_feedback = feedback.map(|owner| emit::Feedback {
+            function_return: false,
+            get_refinement: self.get_refinement,
+            owner: owner.as_u32() as u64,
+        });
+        let continuations = if let Some(graph) = &graph {
+            self.compile_continuations(
+                &graph.graph,
+                self.source_name,
+                params.span,
+                closures,
+                name,
+                continuation_feedback,
+            )?
+        } else {
+            HashMap::new()
+        };
         let mut annotations = Annotations {
             semantic_locations: self.dump_ir || self.inspection.is_some(),
             ..Annotations::default()
@@ -1596,6 +1756,7 @@ impl Compiler {
                     closures,
                     kind,
                     &graph.graph,
+                    &continuations,
                     feedback.map(|owner| emit::Feedback {
                         function_return: true,
                         get_refinement: self.get_refinement,
