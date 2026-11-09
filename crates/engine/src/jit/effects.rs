@@ -70,6 +70,7 @@ pub(super) fn effects(helper: Helper) -> Effects {
         SemanticGlobalProbe => (Reentry::Closed, GLOBAL_READ, &[]),
         ConstructorPrototype
         | SemanticPropertyProbeCached
+        | PropertyCachePrime
         | SemanticMathNative
         | ClosureThis
         | LexicalReceiver
@@ -157,6 +158,7 @@ pub(super) fn temporary_effect(helper: Helper) -> TemporaryEffect {
         TempClear => Clear,
         TempRetain | TempOwn | Add => MayRegister,
         SemanticPropertyProbeCached
+        | PropertyCachePrime
         | TypedIndexGet
         | GlobalGetBorrowed
         | GlobalGetOptionalBorrowed

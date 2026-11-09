@@ -520,6 +520,21 @@ pub(super) fn apply_version(
         if key.is_some_and(|key| !tested.insert(key)) {
             continue;
         }
+        let otherwise = match &test {
+            Some(Op::IsPropertyCached(object, site, name)) if fallback.is_some() => {
+                let prime = graph.blocks.push(BlockData::default());
+                graph.cold.insert(prime);
+                let op = Op::PrimePropertyCache(*object, *site, name.clone());
+                graph.append(prime, span, op, false);
+                graph.blocks[prime].terminator = Some(Terminator {
+                    source_name,
+                    span,
+                    kind: TerminatorKind::Jump(original.clone()),
+                });
+                Target::new(prime)
+            }
+            _ => original.clone(),
+        };
         let condition = test.map_or(condition, |op| {
             graph.append(current, span, op, true).1.unwrap()
         });
@@ -527,7 +542,7 @@ pub(super) fn apply_version(
         graph.blocks[current].terminator = Some(Terminator {
             source_name,
             span,
-            kind: TerminatorKind::Branch(condition, Target::new(next), original.clone()),
+            kind: TerminatorKind::Branch(condition, Target::new(next), otherwise),
         });
         current = next;
     }

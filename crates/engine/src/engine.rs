@@ -1303,7 +1303,8 @@ mod feedback_tests {
         let optimized = entry(&engine, code);
         assert_ne!(original, optimized);
         engine.call("replace", &[]).unwrap();
-        for _ in 0..3 {
+        let mut entries = Vec::new();
+        for _ in 0..6 {
             assert_eq!(
                 engine
                     .call("distance", &[Value::number(3.0), Value::number(4.0)])
@@ -1311,8 +1312,9 @@ mod feedback_tests {
                     .value(),
                 Value::number(27.0)
             );
-            assert_eq!(entry(&engine, code), optimized);
+            entries.push(entry(&engine, code));
         }
+        assert!(entries[3..].iter().all(|&settled| settled == entries[2]));
     }
 
     #[test]

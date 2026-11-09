@@ -1244,6 +1244,20 @@ impl FunctionCompiler<'_, '_> {
         optional: bool,
         retain: bool,
     ) -> ClifValue {
+        let helper = match (optional, retain) {
+            (false, true) => Helper::GlobalGet,
+            (true, true) => Helper::GlobalGetOptional,
+            (false, false) => Helper::GlobalGetBorrowed,
+            (true, false) => Helper::GlobalGetOptionalBorrowed,
+        };
+        self.cached_global(name, helper, retain)
+    }
+
+    pub(super) fn cached_global_probe(&mut self, name: &str) -> ClifValue {
+        self.cached_global(name, Helper::SemanticGlobalProbe, false)
+    }
+
+    fn cached_global(&mut self, name: &str, helper: Helper, retain: bool) -> ClifValue {
         use crate::jit::helpers::GlobalCache;
         use crate::jit::session::{GLOBAL_IDENTITY_OFFSET, GLOBAL_REVISION_OFFSET};
 
@@ -1308,14 +1322,10 @@ impl FunctionCompiler<'_, '_> {
             self.jump(done, &[BlockArg::Value(value)]);
         }
         self.switch(slow);
-        let helper = match (optional, retain) {
-            (false, true) => Helper::GlobalGet,
-            (true, true) => Helper::GlobalGetOptional,
-            (false, false) => Helper::GlobalGetBorrowed,
-            (true, false) => Helper::GlobalGetOptionalBorrowed,
-        };
         let value = self.call_helper(helper, &[address]);
-        self.check_error();
+        if helper != Helper::SemanticGlobalProbe {
+            self.check_error();
+        }
         self.jump(done, &[BlockArg::Value(value)]);
         self.switch(done);
         self.b.block_params(done)[0]

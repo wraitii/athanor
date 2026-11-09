@@ -940,6 +940,12 @@ impl FunctionCompiler<'_, '_> {
                             let address = self.property_cache(*site, name);
                             Some(self.fill_property_cache(object, address))
                         }
+                        Op::PrimePropertyCache(object, site, name) => {
+                            let object = get(self, *object);
+                            let address = self.property_cache(*site, name);
+                            self.call_helper(Helper::PropertyCachePrime, &[object, address]);
+                            None
+                        }
                         Op::Get(object, name) => {
                             let object = get(self, *object);
                             let retain = data.result.is_none_or(|value| {
@@ -1275,13 +1281,7 @@ impl FunctionCompiler<'_, '_> {
                             self.check_error();
                             Some(value)
                         }
-                        Op::ProbeGlobal(name) => {
-                            let name: Box<str> = name.as_str().into();
-                            let ptr = self.b.ins().iconst(self.pointer, name.as_ptr() as i64);
-                            let len = self.b.ins().iconst(types::I64, name.len() as i64);
-                            self.names.push(name);
-                            Some(self.call_helper(Helper::SemanticGlobalProbe, &[ptr, len]))
-                        }
+                        Op::ProbeGlobal(name) => Some(self.cached_global_probe(name)),
                         Op::ProbeProperty(object, name) => {
                             let object = get(self, *object);
                             Some(self.cached_property_probe(object, name))

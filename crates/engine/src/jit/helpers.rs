@@ -26,7 +26,6 @@ pub(crate) enum HelperShape {
     NumericIndex,
     Unary,
     Pointer,
-    GlobalGet,
     GlobalSet,
     PropertyGet,
     PropertySet,
@@ -108,7 +107,7 @@ define_helpers! {
     ObserveGet => Binary, js_observe_get;
     ObserveIndex => Binary, js_observe_index;
     ObserveNumber => Binary, js_observe_number;
-    SemanticGlobalProbe => GlobalGet, js_semantic_global_probe;
+    SemanticGlobalProbe => Pointer, js_semantic_global_probe;
     SemanticPropertyProbeCached => Binary, js_semantic_property_probe_cached;
     SemanticIndexProbe => Binary, js_semantic_index_probe;
     SemanticMathNative => Binary, js_semantic_math_native;
@@ -155,6 +154,7 @@ define_helpers! {
     IndexSet => IndexSet, js_index_set;
     PropertyGet => PropertyGet, js_property_get;
     PropertyGetCached => Binary, js_property_get_cached;
+    PropertyCachePrime => Binary, js_property_cache_prime;
     PropertySetCached => PropertySetCached, js_property_set_cached;
     PropertyDefineHidden => PropertySet, js_property_define_hidden;
     GlobalGet => Pointer, js_global_get;
@@ -363,8 +363,7 @@ pub(crate) fn signature(shape: HelperShape, call_conv: CallConv, pointer: Type) 
             }
         }
         HelperShape::Pointer => signature.params.push(AbiParam::new(pointer)),
-        HelperShape::GlobalGet
-        | HelperShape::GlobalSet
+        HelperShape::GlobalSet
         | HelperShape::PropertyGet
         | HelperShape::PropertySet => {
             if matches!(shape, HelperShape::PropertyGet | HelperShape::PropertySet) {

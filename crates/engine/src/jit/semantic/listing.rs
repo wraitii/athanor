@@ -134,6 +134,9 @@ impl Graph {
             Op::FillPropertyCache(object, _, name) => {
                 format!("fill_property_cache {object}.{name}")
             }
+            Op::PrimePropertyCache(object, _, name) => {
+                format!("prime_property_cache {object}.{name}")
+            }
             Op::GetIndex(object, key) => format!("get {object}[{key}]"),
             Op::Set(object, name, value) => format!("set {object}.{name}, {value}"),
             Op::SetIndex(object, key, value) => format!("set {object}[{key}], {value}"),

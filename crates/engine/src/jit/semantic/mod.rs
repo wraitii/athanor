@@ -300,6 +300,7 @@ pub(super) enum Op {
     IsPropertyCached(Value, Inst, String),
     CachedProperty(Value, Inst),
     FillPropertyCache(Value, Inst, String),
+    PrimePropertyCache(Value, Inst, String),
     GetIndex(Value, Value),
     Set(Value, String, Value),
     SetIndex(Value, Value, Value),
@@ -467,6 +468,7 @@ impl Op {
             | Op::IsPropertyCached(value, _, _)
             | Op::CachedProperty(value, _)
             | Op::FillPropertyCache(value, _, _)
+            | Op::PrimePropertyCache(value, _, _)
             | Op::MarkClass(value)
             | Op::DisableConstructor(value)
             | Op::PropertyKey(value)
@@ -596,6 +598,7 @@ impl Op {
             | Op::IsPropertyCached(value, _, _)
             | Op::CachedProperty(value, _)
             | Op::FillPropertyCache(value, _, _)
+            | Op::PrimePropertyCache(value, _, _)
             | Op::MarkClass(value)
             | Op::DisableConstructor(value)
             | Op::PropertyKey(value)
@@ -1134,6 +1137,7 @@ impl Graph {
                 Borrowed,
             ),
             Op::IsPropertyCached(..) => closed(HEAP_READ, &[], Unowned),
+            Op::PrimePropertyCache(..) => closed(HEAP_READ | INTERNAL, &[], None),
             Op::CachedProperty(..) => closed(HEAP_READ | INTERNAL | ERROR, &[], Borrowed),
             Op::Set(..) | Op::SetIndex(..) => closed(
                 HEAP_READ | HEAP_WRITE | ALLOCATION | INTERNAL | ERROR,

@@ -20,6 +20,14 @@ impl GlobalCache {
             owner: None,
         }
     }
+
+    fn resolve(&mut self, global: &crate::environment::Environment) -> Option<Value> {
+        self.owner = Some(global.clone());
+        self.identity = global.identity();
+        self.revision = global.revision();
+        self.slot = global.binding_slot(&self.name).unwrap_or(std::ptr::null());
+        (!self.slot.is_null()).then(|| unsafe { *self.slot })
+    }
 }
 
 pub(super) extern "C" fn js_global_get(ctx: *mut JitCtx, cache: *mut GlobalCache) -> Value {
@@ -55,19 +63,7 @@ pub(super) fn global_get(
 ) -> Value {
     let ctx = unsafe { &mut *ctx };
     let cache = unsafe { &mut *cache };
-    cache.owner = Some(ctx.global.clone());
-    cache.identity = ctx.global.identity();
-    cache.revision = ctx.global.revision();
-    cache.slot = ctx
-        .global
-        .binding_slot(&cache.name)
-        .unwrap_or(std::ptr::null());
-    let value = if cache.slot.is_null() {
-        None
-    } else {
-        Some(unsafe { *cache.slot })
-    };
-    match value {
+    match cache.resolve(&ctx.global) {
         Some(Value::UNINITIALIZED) => {
             ctx.error = Some(Box::new(crate::Error::Runtime(format!(
                 "binding `{}` accessed before initialization",
@@ -222,6 +218,21 @@ impl PropertyCache {
         self.builtin_value = value.bits();
         Some(value)
     }
+
+    fn fill(&mut self, heap: &crate::heap::Heap, receiver: Value) -> Option<Value> {
+        if let Some(value) = self.builtin(heap, receiver) {
+            self.initialized = 1;
+            return Some(value);
+        }
+        if let Some(found) = heap.cached_property(receiver, &self.name) {
+            self.initialized = 1;
+            self.shape = found.shape;
+            self.index = found.index;
+            self.holder = found.holder;
+            self.holder_shape = found.holder_shape;
+        }
+        None
+    }
 }
 
 pub(super) extern "C" fn js_property_get_cached(
@@ -231,18 +242,20 @@ pub(super) extern "C" fn js_property_get_cached(
 ) -> Value {
     let cache = unsafe { &mut *cache };
     let heap = unsafe { &*ctx }.global.heap();
-    if let Some(value) = cache.builtin(heap, object) {
-        cache.initialized = 1;
+    if let Some(value) = cache.fill(heap, object) {
         return unsafe { &mut *ctx }.retain_temp(value);
     }
-    if let Some(found) = heap.cached_property(object, &cache.name) {
-        cache.initialized = 1;
-        cache.shape = found.shape;
-        cache.index = found.index;
-        cache.holder = found.holder;
-        cache.holder_shape = found.holder_shape;
-    }
     js_property_get(ctx, object, cache.name.as_ptr(), cache.name.len() as u64)
+}
+
+pub(super) extern "C" fn js_property_cache_prime(
+    ctx: *mut JitCtx,
+    object: Value,
+    cache: *mut PropertyCache,
+) -> Value {
+    let heap = unsafe { &*ctx }.global.heap();
+    unsafe { &mut *cache }.fill(heap, object);
+    Value::UNDEFINED
 }
 
 pub(super) extern "C" fn js_property_set(
@@ -500,15 +513,12 @@ pub(super) extern "C" fn js_index_set(
 
 pub(super) extern "C" fn js_semantic_global_probe(
     ctx: *mut JitCtx,
-    ptr: *const u8,
-    len: u64,
+    cache: *mut GlobalCache,
 ) -> Value {
-    let name =
-        unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len as usize)) };
-    match unsafe { &*ctx }.global.get_raw(name) {
-        Some(value) => value,
-        None => Value::UNINITIALIZED,
-    }
+    let global = &unsafe { &*ctx }.global;
+    unsafe { &mut *cache }
+        .resolve(global)
+        .unwrap_or(Value::UNINITIALIZED)
 }
 
 pub(super) extern "C" fn js_semantic_property_probe(
