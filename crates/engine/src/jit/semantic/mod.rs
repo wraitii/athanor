@@ -319,7 +319,10 @@ pub(super) enum Op {
     // Compare integer position and length as unsigned values.
     IsInBounds(Value, Value),
     IsArrayIndex(Value, Value, Value, bool),
-    // Requires a successful matching IsArrayIndex with no intervening array mutation.
+    IsArray(Value, bool),
+    // Non-short-circuit conjunction of boolean operands.
+    BooleanAnd(Value, Value),
+    // Requires matching layout, exact position and bounds checks with no intervening array mutation.
     ArrayLoad(Value, Value, bool),
     IndexedLength(Value),
     IndexedGet(Value, Value),
@@ -517,6 +520,7 @@ impl Op {
             | Op::ConstructorPrototype(value)
             | Op::IsCode(value, _)
             | Op::View(value)
+            | Op::IsArray(value, _)
             | Op::IsTyped(value, _)
             | Op::IsNumber(value)
             | Op::IsInteger(value)
@@ -540,6 +544,7 @@ impl Op {
             | Op::ProbeIndex(object, key)
             | Op::IsExactPosition(object, key)
             | Op::IsInBounds(object, key)
+            | Op::BooleanAnd(object, key)
             | Op::Binary(_, object, key)
             | Op::PackAppend(object, key, _)
             | Op::ArrayAppend(object, key, _)
@@ -656,6 +661,7 @@ impl Op {
             | Op::ConstructorPrototype(value)
             | Op::IsCode(value, _)
             | Op::View(value)
+            | Op::IsArray(value, _)
             | Op::IsTyped(value, _)
             | Op::IsNumber(value)
             | Op::IsInteger(value)
@@ -679,6 +685,7 @@ impl Op {
             | Op::ProbeIndex(object, key)
             | Op::IsExactPosition(object, key)
             | Op::IsInBounds(object, key)
+            | Op::BooleanAnd(object, key)
             | Op::Binary(_, object, key)
             | Op::PackAppend(object, key, _)
             | Op::ArrayAppend(object, key, _)
@@ -1003,6 +1010,28 @@ impl Graph {
         self.insert(block, position, span, op, has_result)
     }
 
+    pub(super) fn insert_value(
+        &mut self,
+        block: Block,
+        position: usize,
+        span: Span,
+        op: Op,
+    ) -> Value {
+        self.insert(block, position, span, op, true).1.unwrap()
+    }
+
+    pub(super) fn append_value(&mut self, block: Block, span: Span, op: Op) -> Value {
+        self.append(block, span, op, true).1.unwrap()
+    }
+
+    pub(super) fn terminate(&mut self, block: Block, span: Span, kind: TerminatorKind) {
+        self.blocks[block].terminator = Some(Terminator {
+            source_name: None,
+            span,
+            kind,
+        });
+    }
+
     pub(super) fn remove_inst(&mut self, inst: Inst) {
         self.detach_inst(inst);
         let Some(result) = self.insts[inst].result.filter(|_| self.has_assumes) else {
@@ -1316,9 +1345,9 @@ impl Graph {
             Op::GuardCommit(_) => closed(INTERNAL, None),
             Op::View(_) => closed(HEAP_READ, Unowned),
             Op::IsTyped(..) | Op::IsIndexed(_) => closed(0, Unowned),
-            Op::IsArrayIndex(..) => closed(HEAP_READ, Unowned),
+            Op::IsArrayIndex(..) | Op::IsArray(..) => closed(HEAP_READ, Unowned),
             Op::ArrayPosition(_) => closed(INTERNAL, Unowned),
-            Op::IsExactPosition(..) | Op::IsInBounds(..) => closed(0, Unowned),
+            Op::IsExactPosition(..) | Op::IsInBounds(..) | Op::BooleanAnd(..) => closed(0, Unowned),
             Op::IndexedLength(_) => closed(HEAP_READ, Unowned),
             Op::IndexedGet(..) | Op::ArrayLoad(..) => {
                 closed(HEAP_READ | INTERNAL | ERROR, Borrowed)
@@ -1520,6 +1549,7 @@ pub(super) fn lower_global(
     closures: &std::collections::HashMap<u32, (cranelift_module::FuncId, Vec<SymbolId>, bool)>,
     arguments_references: &std::collections::HashMap<u32, SymbolId>,
     ssa_opt: bool,
+    continuations: bool,
     report_regions: bool,
 ) -> Result<Analysis> {
     let graph = build::lower_global(
@@ -1531,7 +1561,11 @@ pub(super) fn lower_global(
         arguments_references,
     )?;
     let planned = plan_canonical(canonicalize(graph, ssa_opt)?, ssa_opt, None)?;
-    optimize_planned(planned, Versioning::Speculate(None), report_regions)
+    let versioning = Versioning::Speculate {
+        fallback: None,
+        continuations,
+    };
+    optimize_planned(planned, versioning, report_regions)
 }
 
 pub(super) fn canonical_for_emission(
@@ -1613,7 +1647,10 @@ pub(super) fn optimize_canonical(
 ) -> Result<Analysis> {
     optimize_planned(
         plan_canonical(canonical, ssa_opt, specialization)?,
-        Versioning::Speculate(None),
+        Versioning::Speculate {
+            fallback: None,
+            continuations: true,
+        },
         false,
     )
 }
@@ -1729,7 +1766,10 @@ pub(super) fn plan_canonical_with_budget(
 #[derive(Clone, Copy)]
 pub(super) enum Versioning {
     Generic,
-    Speculate(Option<usize>),
+    Speculate {
+        fallback: Option<usize>,
+        continuations: bool,
+    },
 }
 
 pub(super) fn optimize_planned(
@@ -1766,17 +1806,21 @@ pub(super) fn optimize_planned(
     graph.verify()?;
     let regions = match versioning {
         Versioning::Generic => Vec::new(),
-        Versioning::Speculate(fallback) => {
+        Versioning::Speculate {
+            fallback,
+            continuations,
+        } => {
             let mut regions = optimize::version_with_report(
                 &mut graph,
                 &plan.conditional,
                 fallback,
+                continuations,
                 &mut notes,
                 report_regions,
             )?;
             graph.verify()?;
             if regions.is_empty() {
-                regions.extend(optimize::version_string_leaves(&mut graph, &mut notes)?);
+                regions.extend(optimize::version_string_leaves(&mut graph, continuations, &mut notes)?);
             }
             regions
         }

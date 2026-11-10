@@ -46,6 +46,7 @@ impl Field {
             {
                 Self::Elements
             }
+            Op::IndexedLength(_) => Self::Length,
             Op::ArrayAppend(..) | Op::MapElement(..) => Self::Elements,
             Op::PackAppend(..) | Op::PackRelease(_) => Self::Packs,
             Op::IteratorNext(_) | Op::EnumerateNext(_) => Self::Iteration,
@@ -88,6 +89,8 @@ impl Access {
             | Op::TypedIndex(object, ..)
             | Op::IndexedGet(object, _)
             | Op::ArrayLoad(object, _, _)
+            | Op::IndexedLength(object)
+            | Op::IsArray(object, _)
             | Op::ConstructorPrototype(object) => (Locations::HEAP, Some(*object)),
             Op::IsShape(object, _) | Op::IsPropertyCached(object, ..) => {
                 (Locations::CODE, Some(*object))

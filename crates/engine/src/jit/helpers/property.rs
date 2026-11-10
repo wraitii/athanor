@@ -274,7 +274,7 @@ impl PropertyCache {
             return;
         }
         self.reported = Some(access);
-        engine.observe_shape(owner, site, property, access);
+        engine.tiering.observe_shape(owner, site, property, access);
     }
 }
 

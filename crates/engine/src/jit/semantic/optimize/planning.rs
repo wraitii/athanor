@@ -247,6 +247,7 @@ impl RegionPlan {
         mut self,
         graph: &mut Graph,
         fallback: Option<usize>,
+        continuations: bool,
         regions: &mut Vec<RegionId>,
         notes: &mut Vec<String>,
         report_regions: bool,
@@ -294,6 +295,7 @@ impl RegionPlan {
             let fallback = fallback.filter(|_| self.entry.is_none());
             let speculation = Speculation {
                 fallback,
+                continuations,
                 reads: &self.reads,
                 assumes: &self.checks,
                 guards: &self.guards,
@@ -355,6 +357,7 @@ impl RegionPlan {
             child.emit(
                 graph,
                 None,
+                continuations,
                 regions,
                 notes,
                 report_regions,
@@ -739,13 +742,14 @@ pub(in crate::jit::semantic) fn version(
     fallback: Option<usize>,
     notes: &mut Vec<String>,
 ) -> Result<Vec<RegionId>> {
-    version_with_report(graph, conditional, fallback, notes, false)
+    version_with_report(graph, conditional, fallback, true, notes, false)
 }
 
 pub(in crate::jit::semantic) fn version_with_report(
     graph: &mut Graph,
     conditional: &ConditionalPlan,
     fallback: Option<usize>,
+    continuations: bool,
     notes: &mut Vec<String>,
     report_regions: bool,
 ) -> Result<Vec<RegionId>> {
@@ -765,6 +769,7 @@ pub(in crate::jit::semantic) fn version_with_report(
         plan.emit(
             graph,
             fallback,
+            continuations,
             &mut regions,
             notes,
             report_regions,

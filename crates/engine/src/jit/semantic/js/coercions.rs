@@ -44,10 +44,7 @@ pub(in crate::jit::semantic) fn coercions(graph: &mut Graph) {
                 if facts.of(*operand).within(Types::INT32) {
                     continue;
                 }
-                *operand = graph
-                    .insert(block, position, span, Op::ToInt32(*operand), true)
-                    .1
-                    .unwrap();
+                *operand = graph.insert_value(block, position, span, Op::ToInt32(*operand));
                 position += 1;
             }
             graph.insts[inst].op = op;

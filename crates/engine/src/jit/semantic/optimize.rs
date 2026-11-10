@@ -32,6 +32,7 @@ use versioning::{Speculation, apply_version};
 
 pub(super) fn version_string_leaves(
     graph: &mut Graph,
+    continuations: bool,
     notes: &mut Vec<String>,
 ) -> Result<Vec<RegionId>> {
     let initial = Cfg::new(graph);
@@ -143,6 +144,7 @@ pub(super) fn version_string_leaves(
         }
         let mut candidate = graph.clone();
         let speculation = Speculation {
+            continuations,
             exits: &exits,
             exits_true: &exits_true,
             ..Default::default()
@@ -679,10 +681,7 @@ pub(super) fn views(graph: &mut Graph, notes: &mut Vec<String>) {
                 Some(&view) => view,
                 None => {
                     let span = graph.insts[inst].span;
-                    let view = graph
-                        .append(preheader, span, Op::View(object), true)
-                        .1
-                        .unwrap();
+                    let view = graph.append_value(preheader, span, Op::View(object));
                     notes.push(format!("{view} = view {object} in {preheader}"));
                     placed.insert((preheader, object), view);
                     view
@@ -912,8 +911,8 @@ mod tests {
             let mut graph = empty_graph();
             let block = graph.entry;
             let span = graph.span;
-            let array = graph.append(block, span, Op::Argument(0), true).1.unwrap();
-            let value = graph.append(block, span, Op::Argument(1), true).1.unwrap();
+            let array = graph.append_value(block, span, Op::Argument(0));
+            let value = graph.append_value(block, span, Op::Argument(1));
             graph.append(block, span, Op::ArrayAppend(array, value, spread), false);
             let scope = Cfg::new(&graph).rpo.into_iter().collect();
             let writes = Writes::collect(&graph, &scope);
@@ -929,18 +928,14 @@ mod tests {
         let mut graph = empty_graph();
         let block = graph.entry;
         let span = graph.span;
-        let object = graph.append(block, span, Op::Argument(0), true).1.unwrap();
-        let value = graph.append(block, span, Op::Argument(1), true).1.unwrap();
+        let object = graph.append_value(block, span, Op::Argument(0));
+        let value = graph.append_value(block, span, Op::Argument(1));
         let first = graph.append(block, span, Op::IsShape(object, 1), true).1;
         graph.append(block, span, Op::ShapedSet(object, "x".into(), 0, value), false);
         let (second, _) = graph.append(block, span, Op::IsShape(object, 1), true);
         graph.append(block, span, Op::Set(object, "y".into(), value), false);
         let (third, _) = graph.append(block, span, Op::IsShape(object, 1), true);
-        graph.blocks[block].terminator = Some(Terminator {
-            source_name: None,
-            span,
-            kind: TerminatorKind::Return(first.unwrap()),
-        });
+        graph.terminate(block, span, TerminatorKind::Return(first.unwrap()));
         graph.verify().unwrap();
         let facts = Facts::compute(&graph);
         let cfg = Cfg::new(&graph);
@@ -956,8 +951,8 @@ mod tests {
         let mut graph = empty_graph();
         let block = graph.entry;
         let span = graph.span;
-        let pack = graph.append(block, span, Op::NewPack, true).1.unwrap();
-        let value = graph.append(block, span, Op::Argument(0), true).1.unwrap();
+        let pack = graph.append_value(block, span, Op::NewPack);
+        let value = graph.append_value(block, span, Op::Argument(0));
         graph.append(block, span, Op::PackAppend(pack, value, false), false);
         graph.append(block, span, Op::PackRelease(pack), false);
         let scope = Cfg::new(&graph).rpo.into_iter().collect();
@@ -974,41 +969,34 @@ mod tests {
             let mut graph = empty_graph();
             let entry = graph.entry;
             let span = graph.span;
-            let object = graph.append(entry, span, Op::NewObject, true).1.unwrap();
-            let other = graph.append(entry, span, Op::NewObject, true).1.unwrap();
-            let argument = graph.append(entry, span, Op::Argument(0), true).1.unwrap();
-            let check = graph
-                .append(entry, span, Op::IsUndefined(argument), true)
-                .1
-                .unwrap();
+            let object = graph.append_value(entry, span, Op::NewObject);
+            let other = graph.append_value(entry, span, Op::NewObject);
+            let argument = graph.append_value(entry, span, Op::Argument(0));
+            let check = graph.append_value(entry, span, Op::IsUndefined(argument));
             let left = graph.blocks.push(BlockData::default());
             let right = graph.blocks.push(BlockData::default());
             let merge = graph.blocks.push(BlockData::default());
             let receiver = graph.add_param(merge);
-            graph.blocks[entry].terminator = Some(Terminator {
-                source_name: None,
+            graph.terminate(
+                entry,
                 span,
-                kind: TerminatorKind::Branch(check, Target::new(left), Target::new(right)),
-            });
+                TerminatorKind::Branch(check, Target::new(left), Target::new(right)),
+            );
             for (block, value) in [
                 (left, object),
                 (right, if external { argument } else { object }),
             ] {
-                graph.blocks[block].terminator = Some(Terminator {
-                    source_name: None,
+                graph.terminate(
+                    block,
                     span,
-                    kind: TerminatorKind::Jump(Target {
+                    TerminatorKind::Jump(Target {
                         block: merge,
                         args: vec![value],
                     }),
-                });
+                );
             }
             graph.append(merge, span, Op::Set(receiver, "x".into(), argument), false);
-            graph.blocks[merge].terminator = Some(Terminator {
-                source_name: None,
-                span,
-                kind: TerminatorKind::Return(receiver),
-            });
+            graph.terminate(merge, span, TerminatorKind::Return(receiver));
             graph.verify().unwrap();
             let scope = Cfg::new(&graph).rpo.into_iter().collect();
             let writes = Writes::collect(&graph, &scope);
@@ -1039,42 +1027,28 @@ mod tests {
             let mut graph = empty_graph();
             let entry = graph.entry;
             let span = graph.span;
-            let argument = graph.append(entry, span, Op::Argument(0), true).1.unwrap();
-            let check = graph
-                .append(entry, span, Op::IsUndefined(argument), true)
-                .1
-                .unwrap();
+            let argument = graph.append_value(entry, span, Op::Argument(0));
+            let check = graph.append_value(entry, span, Op::IsUndefined(argument));
             let [yes, no, inner_yes, inner_no] =
                 std::array::from_fn(|_| graph.blocks.push(BlockData::default()));
-            graph.blocks[entry].terminator = Some(Terminator {
-                source_name: None,
+            graph.terminate(
+                entry,
                 span,
-                kind: TerminatorKind::Branch(check, Target::new(yes), Target::new(no)),
-            });
+                TerminatorKind::Branch(check, Target::new(yes), Target::new(no)),
+            );
             let repeated = if inverted {
-                graph.append(yes, span, Op::Unary(UnaryOp::Not, check), true).1.unwrap()
+                graph.append_value(yes, span, Op::Unary(UnaryOp::Not, check))
             } else {
                 check
             };
-            graph.blocks[yes].terminator = Some(Terminator {
-                source_name: None,
+            graph.terminate(
+                yes,
                 span,
-                kind: TerminatorKind::Branch(
-                    repeated,
-                    Target::new(inner_yes),
-                    Target::new(inner_no),
-                ),
-            });
+                TerminatorKind::Branch(repeated, Target::new(inner_yes), Target::new(inner_no)),
+            );
             for block in [no, inner_yes, inner_no] {
-                let zero = graph
-                    .append(block, span, Op::Constant(Constant::Number(0.0)), true)
-                    .1
-                    .unwrap();
-                graph.blocks[block].terminator = Some(Terminator {
-                    source_name: None,
-                    span,
-                    kind: TerminatorKind::Return(zero),
-                });
+                let zero = graph.append_value(block, span, Op::Constant(Constant::Number(0.0)));
+                graph.terminate(block, span, TerminatorKind::Return(zero));
             }
             graph.verify().unwrap();
             super::super::js::simplify(&mut graph);
@@ -1100,25 +1074,16 @@ mod tests {
             )]));
             let entry = graph.entry;
             let span = graph.span;
-            let probe = graph
-                .append(entry, span, Op::ProbeGlobal("f".into()), true)
-                .1
-                .unwrap();
-            let check = graph
-                .append(entry, span, Op::IsCode(probe, code), true)
-                .1
-                .unwrap();
+            let probe = graph.append_value(entry, span, Op::ProbeGlobal("f".into()));
+            let check = graph.append_value(entry, span, Op::IsCode(probe, code));
             let body = graph.blocks.push(BlockData::default());
             let exit = graph.blocks.push(BlockData::default());
-            graph.blocks[entry].terminator = Some(Terminator {
-                source_name: None,
+            graph.terminate(
+                entry,
                 span,
-                kind: TerminatorKind::Branch(check, Target::new(body), Target::new(exit)),
-            });
-            let value = graph
-                .append(body, span, Op::Constant(Constant::Number(1.0)), true)
-                .1
-                .unwrap();
+                TerminatorKind::Branch(check, Target::new(body), Target::new(exit)),
+            );
+            let value = graph.append_value(body, span, Op::Constant(Constant::Number(1.0)));
             if written {
                 graph.append(body, span, Op::GlobalWrite("f".into(), value), false);
             }
@@ -1133,20 +1098,9 @@ mod tests {
                 },
                 true,
             );
-            graph.blocks[body].terminator = Some(Terminator {
-                source_name: None,
-                span,
-                kind: TerminatorKind::Return(result.unwrap()),
-            });
-            let zero = graph
-                .append(exit, span, Op::Constant(Constant::Number(0.0)), true)
-                .1
-                .unwrap();
-            graph.blocks[exit].terminator = Some(Terminator {
-                source_name: None,
-                span,
-                kind: TerminatorKind::Return(zero),
-            });
+            graph.terminate(body, span, TerminatorKind::Return(result.unwrap()));
+            let zero = graph.append_value(exit, span, Op::Constant(Constant::Number(0.0)));
+            graph.terminate(exit, span, TerminatorKind::Return(zero));
             graph.verify().unwrap();
             let facts = Facts::compute(&graph);
             assert_eq!(facts.memory(call).is_empty(), !written);
@@ -1158,30 +1112,27 @@ mod tests {
         let mut graph = empty_graph();
         let entry = graph.entry;
         let span = graph.span;
-        let object = graph.append(entry, span, Op::NewObject, true).1.unwrap();
+        let object = graph.append_value(entry, span, Op::NewObject);
         let header = graph.blocks.push(BlockData::default());
         let receiver = graph.add_param(header);
-        graph.blocks[entry].terminator = Some(Terminator {
-            source_name: None,
+        graph.terminate(
+            entry,
             span,
-            kind: TerminatorKind::Jump(Target {
+            TerminatorKind::Jump(Target {
                 block: header,
                 args: vec![object],
             }),
-        });
-        graph.blocks[header].terminator = Some(Terminator {
-            source_name: None,
+        );
+        graph.terminate(
+            header,
             span,
-            kind: TerminatorKind::Jump(Target {
+            TerminatorKind::Jump(Target {
                 block: header,
                 args: vec![receiver],
             }),
-        });
-        let other = graph.append(entry, span, Op::NewObject, true).1.unwrap();
-        let one = graph
-            .append(header, span, Op::Constant(Constant::Number(1.0)), true)
-            .1
-            .unwrap();
+        );
+        let other = graph.append_value(entry, span, Op::NewObject);
+        let one = graph.append_value(header, span, Op::Constant(Constant::Number(1.0)));
         graph.append(header, span, Op::Set(receiver, "x".into(), one), false);
         graph.verify().unwrap();
         let scope = HashSet::from([entry, header]);
@@ -1261,32 +1212,13 @@ mod tests {
             super::super::build::lower(function, semantic.scoping(), &HashSet::new()).unwrap();
         let block = graph.entry;
         let span = graph.span;
-        let prototype = graph
-            .append(block, span, Op::Constant(Constant::Null), true)
-            .1
-            .unwrap();
-        let object = graph
-            .append(block, span, Op::NewInstance(prototype), true)
-            .1
-            .unwrap();
-        let undefined = graph
-            .append(block, span, Op::Constant(Constant::Undefined), true)
-            .1
-            .unwrap();
-        let result = graph
-            .append(block, span, Op::ConstructorResult(undefined, object), true)
-            .1
-            .unwrap();
-        graph.blocks[block].terminator = Some(Terminator {
-            source_name: None,
-            span,
-            kind: TerminatorKind::Return(result),
-        });
-        let other = graph.append(block, span, Op::NewObject, true).1.unwrap();
-        let one = graph
-            .append(block, span, Op::Constant(Constant::Number(1.0)), true)
-            .1
-            .unwrap();
+        let prototype = graph.append_value(block, span, Op::Constant(Constant::Null));
+        let object = graph.append_value(block, span, Op::NewInstance(prototype));
+        let undefined = graph.append_value(block, span, Op::Constant(Constant::Undefined));
+        let result = graph.append_value(block, span, Op::ConstructorResult(undefined, object));
+        graph.terminate(block, span, TerminatorKind::Return(result));
+        let other = graph.append_value(block, span, Op::NewObject);
+        let one = graph.append_value(block, span, Op::Constant(Constant::Number(1.0)));
         graph.append(block, span, Op::Set(object, "x".into(), one), false);
         let scope = HashSet::from([block]);
         let writes = Writes::collect(&graph, &scope);

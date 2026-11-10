@@ -88,10 +88,7 @@ pub(super) fn apply(
         let (block, continuation, fallback) = super::inlining::split_call(graph, read.inst);
         let fast = if read.typed {
             let fast = graph.blocks.push(BlockData::default());
-            let check = graph
-                .append(block, data.span, Op::IsTyped(object, read.element), true)
-                .1
-                .unwrap();
+            let check = graph.append_value(block, data.span, Op::IsTyped(object, read.element));
             graph.blocks[block].terminator = Some(Terminator {
                 source_name: data.source_name,
                 span: data.span,
@@ -103,28 +100,19 @@ pub(super) fn apply(
         };
         let (fast, key) = if read.guard_number {
             let typed = graph.blocks.push(BlockData::default());
-            let check = graph
-                .append(fast, data.span, Op::IsNumber(key), true)
-                .1
-                .unwrap();
+            let check = graph.append_value(fast, data.span, Op::IsNumber(key));
             graph.blocks[fast].terminator = Some(Terminator {
                 source_name: data.source_name,
                 span: data.span,
                 kind: TerminatorKind::Branch(check, Target::new(typed), Target::new(fallback)),
             });
-            let key = graph
-                .append(typed, data.span, Op::AsNumber(key), true)
-                .1
-                .unwrap();
+            let key = graph.append_value(typed, data.span, Op::AsNumber(key));
             (typed, key)
         } else {
             (fast, key)
         };
         if !read.typed {
-            let position = graph
-                .append(fast, data.span, Op::ArrayPosition(key), true)
-                .1
-                .unwrap();
+            let position = graph.append_value(fast, data.span, Op::ArrayPosition(key));
             let mut guard = fast;
             for holey in [false, true] {
                 let load = graph.blocks.push(BlockData::default());
@@ -133,15 +121,11 @@ pub(super) fn apply(
                 } else {
                     graph.blocks.push(BlockData::default())
                 };
-                let valid = graph
-                    .append(
-                        guard,
-                        data.span,
-                        Op::IsArrayIndex(object, key, position, holey),
-                        true,
-                    )
-                    .1
-                    .unwrap();
+                let valid = graph.append_value(
+                    guard,
+                    data.span,
+                    Op::IsArrayIndex(object, key, position, holey),
+                );
                 graph.blocks[guard].terminator = Some(Terminator {
                     source_name: data.source_name,
                     span: data.span,

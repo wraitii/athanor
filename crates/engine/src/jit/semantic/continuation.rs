@@ -1,6 +1,5 @@
 use super::{
-    Block, BlockData, Cfg, Constant, Facts, Graph, Op, Target, Terminator, TerminatorKind, Types,
-    Value,
+    Block, BlockData, Cfg, Constant, Facts, Graph, Op, Target, TerminatorKind, Types, Value,
 };
 use cranelift_codegen::entity::SecondaryMap;
 use oxc_syntax::operator::BinaryOperator;
@@ -19,6 +18,10 @@ impl Body {
         super::js::simplify(&mut graph);
         super::js::coercions(&mut graph);
         super::js::bit_tests(&mut graph);
+        if super::typed_lowering::lower_arrays(&mut graph) {
+            super::js::simplify(&mut graph);
+            super::optimize::reuse_loads(&mut graph, &mut notes);
+        }
         super::optimize::views(&mut graph, &mut notes);
         super::js::simplify(&mut graph);
         super::transforms::trim(&mut graph);
@@ -85,15 +88,11 @@ pub(super) fn liveness(graph: &Graph, rpo: &[Block]) -> SecondaryMap<Block, Hash
 
 fn append(graph: &mut Graph, block: Block, op: Op) -> Value {
     let span = graph.span;
-    graph.append(block, span, op, true).1.unwrap()
+    graph.append_value(block, span, op)
 }
 
 fn terminate(graph: &mut Graph, block: Block, kind: TerminatorKind) {
-    graph.blocks[block].terminator = Some(Terminator {
-        source_name: None,
-        span: graph.span,
-        kind,
-    });
+    graph.terminate(block, graph.span, kind);
 }
 
 pub(super) fn unbox(graph: &mut Graph, block: Block, value: Value, types: Types) -> Value {

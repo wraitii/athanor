@@ -8,8 +8,7 @@ use crate::jit::profile::{Observation, Site};
 
 use super::continuation::{Shape, liveness, unbox};
 use super::{
-    Block, BlockData, Cfg, Constant, Facts, Graph, Inst, Op, Target, Terminator, TerminatorKind,
-    Value,
+    Block, BlockData, Cfg, Constant, Facts, Graph, Inst, Op, Target, TerminatorKind, Value,
 };
 
 impl std::fmt::Debug for Plan {
@@ -148,7 +147,7 @@ impl Plan {
                 }
             }
             let values = transfer.inputs.iter().chain(&params).copied().collect();
-            let append = |graph: &mut Graph, op| graph.append(poll, span, op, true).1.unwrap();
+            let append = |graph: &mut Graph, op| graph.append_value(poll, span, op);
             let start = append(graph, Op::OsrStart(self.clone(), index, values));
             let declined = append(graph, Op::Constant(Constant::Number(-1.0)));
             let declined = append(
@@ -156,10 +155,10 @@ impl Plan {
                 Op::Binary(BinaryOperator::StrictEquality, start, declined),
             );
             let dispatch = graph.blocks.push(BlockData::default());
-            graph.blocks[poll].terminator = Some(Terminator {
-                source_name: None,
+            graph.terminate(
+                poll,
                 span,
-                kind: TerminatorKind::Branch(
+                TerminatorKind::Branch(
                     declined,
                     Target {
                         block: header,
@@ -167,7 +166,7 @@ impl Plan {
                     },
                     Target::new(dispatch),
                 ),
-            });
+            );
             transfer
                 .shape
                 .dispatch(graph, dispatch, start, &mut definitions);
@@ -205,15 +204,9 @@ impl Plan {
         let facts = Facts::compute(&self.graph);
         let argument = |graph: &mut Graph, index: usize, value: Value| {
             if let Some(Op::Constant(constant)) = self.graph.defining_op(value) {
-                return graph
-                    .append(entry, span, Op::Constant(constant.clone()), true)
-                    .1
-                    .unwrap();
+                return graph.append_value(entry, span, Op::Constant(constant.clone()));
             }
-            let argument = graph
-                .append(entry, span, Op::Argument(index), true)
-                .1
-                .unwrap();
+            let argument = graph.append_value(entry, span, Op::Argument(index));
             unbox(graph, entry, argument, facts.of(value))
         };
         let aliases: HashMap<_, _> = transfer
@@ -259,14 +252,14 @@ impl Plan {
                 }
             }
         }
-        graph.blocks[entry].terminator = Some(Terminator {
-            source_name: None,
+        graph.terminate(
+            entry,
             span,
-            kind: TerminatorKind::Jump(Target {
+            TerminatorKind::Jump(Target {
                 block: candidate.header,
                 args,
             }),
-        });
+        );
         let reachable: HashSet<_> = Cfg::new(&graph).rpo.into_iter().collect();
         for (block, data) in graph.blocks.iter_mut() {
             if !reachable.contains(&block) {

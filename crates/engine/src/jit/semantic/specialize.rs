@@ -1352,7 +1352,10 @@ mod tests {
             assert!(first.plan.inlines == second.plan.inlines);
             let analysis = super::super::optimize_planned(
                 first,
-                super::super::Versioning::Speculate(None),
+                super::super::Versioning::Speculate {
+                    fallback: None,
+                    continuations: true,
+                },
                 false,
             )
             .unwrap();
@@ -1427,7 +1430,10 @@ mod tests {
                 super::super::plan_canonical(canonical.clone(), true, Some((&bodies, 0))).unwrap();
             let analysis = super::super::optimize_planned(
                 planned,
-                super::super::Versioning::Speculate(fallback),
+                super::super::Versioning::Speculate {
+                    fallback,
+                    continuations: true,
+                },
                 false,
             )
             .unwrap();

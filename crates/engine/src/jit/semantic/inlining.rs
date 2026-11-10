@@ -148,22 +148,16 @@ pub(super) fn apply(graph: &mut Graph, body: &Graph, plan: &Inline) {
         source_name: call.source_name,
         span: call.span,
         kind: if plan.guard_code {
-            let check = graph
-                .append(block, call.span, Op::IsCode(*callee, plan.target), true)
-                .1
-                .unwrap();
+            let check = graph.append_value(block, call.span, Op::IsCode(*callee, plan.target));
             TerminatorKind::Branch(check, Target::new(current), Target::new(fallback))
         } else {
             TerminatorKind::Jump(Target::new(current))
         },
     });
-    let undefined = graph
-        .append(current, call.span, Op::Constant(Constant::Undefined), true)
-        .1
-        .unwrap();
+    let undefined = graph.append_value(current, call.span, Op::Constant(Constant::Undefined));
     let receiver = if plan.arrow && uses_this(body) {
         let op = Op::ClosureThis(*callee);
-        graph.append(current, call.span, op, true).1.unwrap()
+        graph.append_value(current, call.span, op)
     } else {
         receiver.unwrap_or(undefined)
     };
@@ -221,19 +215,12 @@ pub(super) fn apply(graph: &mut Graph, body: &Graph, plan: &Inline) {
             if let Op::Argument(index) = data.op {
                 let value = if let Some(array) = spread {
                     *spread_args.entry(index).or_insert_with(|| {
-                        let key = graph
-                            .append(
-                                current,
-                                call.span,
-                                Op::Constant(Constant::Number(index as f64)),
-                                true,
-                            )
-                            .1
-                            .unwrap();
-                        graph
-                            .append(current, call.span, Op::PackTake(array, key), true)
-                            .1
-                            .unwrap()
+                        let key = graph.append_value(
+                            current,
+                            call.span,
+                            Op::Constant(Constant::Number(index as f64)),
+                        );
+                        graph.append_value(current, call.span, Op::PackTake(array, key))
                     })
                 } else {
                     args.get(index).copied().unwrap_or(undefined)

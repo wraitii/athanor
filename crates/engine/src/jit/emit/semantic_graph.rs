@@ -1109,6 +1109,8 @@ impl FunctionCompiler<'_, '_> {
                         | Op::IsExactPosition(..)
                         | Op::IsInBounds(..)
                         | Op::IsArrayIndex(..)
+                        | Op::IsArray(..)
+                        | Op::BooleanAnd(..)
                         | Op::ArrayLoad(..) => {
                             unreachable!()
                         }
@@ -1902,12 +1904,21 @@ impl FunctionCompiler<'_, '_> {
                     Repr::Int64,
                 )))
             }
-            Op::IsArrayIndex(object, key, position, holey) => {
+            Op::BooleanAnd(left, right) => {
+                let left = self.operand(cx, *left);
+                let right = self.operand(cx, *right);
+                let left = self.convert(left, Repr::Bool);
+                let right = self.convert(right, Repr::Bool);
+                boolean(self.b.ins().band(left, right))
+            }
+            Op::IsArrayIndex(..) => unreachable!(),
+            Op::IsArray(object, holey) => {
                 let object = self.operand(cx, *object);
                 let object = self.convert(object, Repr::Boxed);
-                let key = self.operand(cx, *key);
-                let position = self.operand(cx, *position);
-                boolean(self.is_array_index(object, key, position, *holey))
+                let view = self.view(object);
+                let kind = self.view_kind(view);
+                let expected = kind::ARRAY | if *holey { kind::HOLEY } else { 0 };
+                boolean(self.b.ins().icmp_imm_s(IntCC::Equal, kind, expected as i64))
             }
             Op::ArrayLoad(object, position, holey) => {
                 let object = self.operand(cx, *object);

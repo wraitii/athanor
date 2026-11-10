@@ -974,31 +974,6 @@ impl FunctionCompiler<'_, '_> {
         }
     }
 
-    pub(super) fn is_array_index(
-        &mut self,
-        object: ClifValue,
-        key: Operand,
-        position: Operand,
-        holey: bool,
-    ) -> ClifValue {
-        let view = self.view(object);
-        let kind = self.view_kind(view);
-        let expected = crate::heap::kind::ARRAY | if holey { crate::heap::kind::HOLEY } else { 0 };
-        let array = self.b.ins().icmp_imm_s(IntCC::Equal, kind, expected as i64);
-        let length = self.view_length_integer(view);
-        let position = self.convert(position, Repr::Int64);
-        let integral = if key.repr == Repr::Int32 || key.repr == Repr::Int64 {
-            self.b.ins().iconst(types::I8, 1)
-        } else {
-            let number = self.convert(key, Repr::Float);
-            let exact = self.b.ins().fcvt_from_sint(types::F64, position);
-            self.b.ins().fcmp(FloatCC::Equal, exact, number)
-        };
-        let inside = self.b.ins().icmp(IntCC::UnsignedLessThan, position, length);
-        let valid = self.b.ins().band(array, integral);
-        self.b.ins().band(valid, inside)
-    }
-
     pub(super) fn array_load(
         &mut self,
         object: ClifValue,

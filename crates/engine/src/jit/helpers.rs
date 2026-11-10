@@ -195,7 +195,7 @@ define_helpers! {
 }
 
 extern "C" fn js_compile_poll(ctx: *mut JitCtx) -> Value {
-    unsafe { &*ctx }.engine.poll_compilation();
+    unsafe { &*ctx }.engine.tiering.poll_compilation();
     Value::UNDEFINED
 }
 
@@ -206,11 +206,11 @@ extern "C" fn js_osr_poll(
     site: *const super::osr::Site,
 ) -> Value {
     let site = unsafe { &*site };
-    let entry = unsafe { &*ctx }.engine.osr_entry(site);
+    let entry = unsafe { &*ctx }.engine.tiering.osr_entry(site);
     if entry == 0 {
         return Value::number(-1.0);
     }
-    unsafe { &*ctx }.engine.osr_entered(site);
+    unsafe { &*ctx }.engine.tiering.osr_entered(site);
     let transfer = site.plan.loops[site.candidate].transfer.as_ref().unwrap();
     let function: unsafe extern "C" fn(*mut JitCtx, Value, Value, *const Value, u64) -> Value =
         unsafe { std::mem::transmute(entry) };
@@ -226,7 +226,7 @@ extern "C" fn js_osr_poll(
 }
 
 extern "C" fn js_compile_leave(ctx: *mut JitCtx, code: u64) -> Value {
-    unsafe { &*ctx }.engine.leave_function(code);
+    unsafe { &*ctx }.engine.tiering.leave_function(code);
     Value::UNDEFINED
 }
 
@@ -755,11 +755,11 @@ fn observe_read(
             heap.typed_kind(value).map(super::profile::ReadType::Typed)
         };
         if let Some(observed) = observed {
-            context.engine.observe_get(cache, observed, kind);
+            context.engine.tiering.observe_get(cache, observed, kind);
         } else {
             context
                 .engine
-                .observe_get(cache, super::profile::ReadType::Unknown, kind);
+                .tiering.observe_get(cache, super::profile::ReadType::Unknown, kind);
         }
     }
     Value::UNDEFINED
@@ -770,9 +770,9 @@ extern "C" fn js_observe_call(ctx: *mut JitCtx, callee: Value, cache: u64) -> Va
     let cache = unsafe { &mut *(cache as *mut super::profile::ObservationCache) };
     if cache.recorded == 0 {
         if let Some(code) = context.global.heap().closure_code(callee) {
-            context.engine.observe_call(cache, code.0);
+            context.engine.tiering.observe_call(cache, code.0);
         } else if let Some(native) = context.global.heap().native(callee) {
-            context.engine.observe_native(cache, native);
+            context.engine.tiering.observe_native(cache, native);
         } else {
             cache.recorded = 1;
         }

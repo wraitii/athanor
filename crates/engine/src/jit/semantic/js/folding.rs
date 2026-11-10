@@ -34,6 +34,26 @@ impl Folder for Rules {
             {
                 Some(Fold::Op(Op::Binary(operator, left, right)))
             }
+            Op::IsExactPosition(key, position)
+                if facts.of(key).within(Types::INTEGER)
+                    && matches!(graph.defining_op(position), Some(Op::ArrayPosition(value)) if *value == key) =>
+            {
+                boolean(true)
+            }
+            Op::BooleanAnd(left, right) => {
+                for (constant, other) in [(left, right), (right, left)] {
+                    if let Some(Op::Constant(Constant::Boolean(value))) =
+                        graph.defining_op(constant)
+                    {
+                        return if *value {
+                            Some(Fold::Alias(other))
+                        } else {
+                            boolean(false)
+                        };
+                    }
+                }
+                None
+            }
             Op::IsIndexed(value) if facts.indexed(value) => boolean(true),
             Op::IsString(value) => boolean(known(facts.of(value), Types::STRING)?),
             Op::IsUndefined(value) => boolean(known(facts.of(value), Types::UNDEFINED)?),

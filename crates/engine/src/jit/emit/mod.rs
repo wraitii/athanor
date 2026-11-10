@@ -19,7 +19,6 @@ use cranelift_frontend::{FunctionBuilder, Switch, Variable};
 use cranelift_jit::JITModule;
 use cranelift_module::{FuncId, Module};
 use oxc_span::Span;
-use oxc_syntax::symbol::SymbolId;
 
 use crate::error::Error;
 use crate::jit::clif::Annotations;
@@ -103,31 +102,27 @@ fn data_base(b: &mut FunctionBuilder<'_>, pointer: Type, data: &FunctionData) ->
     )
 }
 
+pub(super) struct Output<'a, 'f> {
+    pub(super) b: &'a mut FunctionBuilder<'f>,
+    pub(super) module: &'a mut JITModule,
+    pub(super) stubs: Stubs,
+    pub(super) annotations: &'a mut Annotations,
+    pub(super) names: &'a mut Vec<Box<str>>,
+    pub(super) cells: &'a mut Vec<Box<u64>>,
+    pub(super) data: &'a mut FunctionData,
+    pub(super) source_name: (usize, usize),
+}
+
 pub(super) fn build_function(
-    b: &mut FunctionBuilder<'_>,
-    module: &mut JITModule,
-    stubs: Stubs,
-    annotations: &mut Annotations,
-    names: &mut Vec<Box<str>>,
-    cells: &mut Vec<Box<u64>>,
-    data: &mut FunctionData,
-    source_name: (usize, usize),
+    out: Output<'_, '_>,
     params: Span,
-    _closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
     kind: FunctionKind,
     graph: &super::semantic::Graph,
     continuations: &HashMap<usize, FuncId>,
     feedback: Option<Feedback>,
 ) -> Result<(), Error> {
     build_callable(
-        b,
-        module,
-        stubs,
-        annotations,
-        names,
-        cells,
-        data,
-        source_name,
+        out,
         params,
         kind,
         CallableBody::Graph(graph),
@@ -137,31 +132,32 @@ pub(super) fn build_function(
 }
 
 pub(super) fn build_factory(
-    b: &mut FunctionBuilder<'_>,
-    module: &mut JITModule,
-    stubs: Stubs,
-    annotations: &mut Annotations,
-    names: &mut Vec<Box<str>>,
-    cells: &mut Vec<Box<u64>>,
-    data: &mut FunctionData,
-    source_name: (usize, usize),
+    out: Output<'_, '_>,
     params: Span,
-    _closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
     resume: FuncId,
 ) -> Result<(), Error> {
     build_callable(
-        b,
-        module,
-        stubs,
-        annotations,
-        names,
-        cells,
-        data,
-        source_name,
+        out,
         params,
         FunctionKind::Factory(resume),
         CallableBody::Factory(resume),
         &HashMap::new(),
+        None,
+    )
+}
+
+pub(super) fn build_global(
+    out: Output<'_, '_>,
+    graph: &super::semantic::Graph,
+    continuations: &HashMap<usize, FuncId>,
+) -> Result<(), Error> {
+    debug_assert!(graph.arity.is_none());
+    build_callable(
+        out,
+        Span::new(0, 0),
+        FunctionKind::Ordinary,
+        CallableBody::Graph(graph),
+        continuations,
         None,
     )
 }
@@ -172,20 +168,23 @@ enum CallableBody<'g> {
 }
 
 fn build_callable(
-    b: &mut FunctionBuilder<'_>,
-    module: &mut JITModule,
-    stubs: Stubs,
-    annotations: &mut Annotations,
-    names: &mut Vec<Box<str>>,
-    cells: &mut Vec<Box<u64>>,
-    data: &mut FunctionData,
-    source_name: (usize, usize),
+    out: Output<'_, '_>,
     params: Span,
     kind: FunctionKind,
     body: CallableBody<'_>,
     continuations: &HashMap<usize, FuncId>,
     feedback: Option<Feedback>,
 ) -> Result<(), Error> {
+    let Output {
+        b,
+        module,
+        stubs,
+        annotations,
+        names,
+        cells,
+        data,
+        source_name,
+    } = out;
     let entry = b.create_block();
     b.switch_to_block(entry);
     b.append_block_params_for_function_params(entry);
@@ -300,69 +299,6 @@ fn build_callable(
         }
         return Ok(());
     }
-    Ok(())
-}
-
-pub(super) fn build_global(
-    b: &mut FunctionBuilder<'_>,
-    module: &mut JITModule,
-    stubs: Stubs,
-    annotations: &mut Annotations,
-    names: &mut Vec<Box<str>>,
-    cells: &mut Vec<Box<u64>>,
-    data: &mut FunctionData,
-    source_name: (usize, usize),
-    _closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
-    graph: &super::semantic::Graph,
-    continuations: &HashMap<usize, FuncId>,
-) -> Result<(), Error> {
-    let entry = b.create_block();
-    b.switch_to_block(entry);
-    b.append_block_params_for_function_params(entry);
-    let [ctx, closure, receiver, argv, argc] = b.block_params(entry).try_into().unwrap();
-    let arguments = Arguments::Vector { argv, argc };
-    let return_block = b.create_block();
-    b.append_block_param(return_block, types::I64);
-    let pointer = module.target_config().pointer_type();
-    let data_base = data_base(b, pointer, data);
-    let mut compiler = FunctionCompiler {
-        feedback: None,
-        names,
-        cells,
-        data,
-        data_base,
-        source_name,
-        source_span: Span::new(0, 0),
-        b,
-        module,
-        helper_signatures: HashMap::new(),
-        source_names: HashMap::new(),
-        stubs,
-        annotations,
-        pointer,
-        ctx,
-        receiver,
-        arguments,
-        return_block,
-        failed_exit: None,
-        error_origin: None,
-        handlers: Vec::new(),
-        generator: None,
-        resume_blocks: Vec::new(),
-        suspensions: HashMap::new(),
-        terminated: false,
-        frame_size: None,
-        frame_roots: None,
-        frame: None,
-        frame_code: false,
-        fixed_signatures: HashMap::new(),
-        property_caches: HashMap::new(),
-        slots: HashMap::new(),
-        slot_count: 0,
-    };
-    compiler.enter_frame();
-    compiler.emit_semantic_graph(graph, closure, continuations)?;
-    compiler.patch_frame_size();
     Ok(())
 }
 

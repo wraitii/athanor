@@ -40,6 +40,20 @@ impl CompilationTier {
     }
 }
 
+struct Callable<'a> {
+    id: FuncId,
+    declaration: Option<String>,
+    span: oxc_span::Span,
+    params: &'a FormalParameters<'a>,
+    statements: &'a [Statement<'a>],
+    expression: Option<&'a Expression<'a>>,
+    generator: bool,
+    arrow: bool,
+    label: String,
+    line: u32,
+    captures: Vec<SymbolId>,
+}
+
 pub(crate) struct CompiledFunction {
     pub(crate) name: String,
     pub(crate) arity: usize,
@@ -56,7 +70,6 @@ struct Emission {
     osr: Option<Arc<super::semantic::osr::Plan>>,
     source_name: (usize, usize),
     params: oxc_span::Span,
-    closures: HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
 }
 
 pub(crate) struct RecompileJob {
@@ -155,6 +168,7 @@ pub(crate) struct Compiler {
     ssa_opt: bool,
     recompile_inline_multiplier: usize,
     osr: bool,
+    speculative_continuations: bool,
     generic_first: bool,
     get_refinement: bool,
     ssa_dump: bool,
@@ -243,6 +257,7 @@ impl Compiler {
         Ok(Self {
             log,
             osr: options.osr,
+            speculative_continuations: options.continuations,
             generic_first: options.generic_first && options.background_compile,
             emissions: HashMap::new(),
             lazy: HashMap::new(),
@@ -276,6 +291,69 @@ impl Compiler {
 
     fn fixed_signature(&self, arity: u16) -> Signature {
         emit::stubs::fixed_signature(self.module.target_config().pointer_type(), arity)
+    }
+
+    fn graph_signature(&self, graph: Option<&super::semantic::Graph>) -> Signature {
+        match graph.and_then(|graph| graph.arity) {
+            Some(arity) => self.fixed_signature(arity),
+            None => self.signature.clone(),
+        }
+    }
+
+    fn listing(&self) -> bool {
+        self.dump_ir || (self.dump.is_some() && self.inspection.is_some())
+    }
+
+    fn report_regions(&self) -> bool {
+        self.inspection
+            .as_ref()
+            .is_some_and(|options| options.planner)
+    }
+
+    fn feedback(&self, owner: FuncId, function_return: bool) -> emit::Feedback {
+        emit::Feedback {
+            function_return,
+            get_refinement: self.get_refinement,
+            owner: owner.as_u32() as u64,
+        }
+    }
+
+    fn emit_body(
+        &mut self,
+        signature: Signature,
+        source_name: (usize, usize),
+        build: impl FnOnce(emit::Output<'_, '_>) -> Result<(), Error>,
+    ) -> Result<(cranelift_codegen::ir::Function, Annotations), Error> {
+        let mut annotations = Annotations {
+            semantic_locations: self.dump_ir || self.inspection.is_some(),
+            ..Annotations::default()
+        };
+        self.context.clear();
+        self.context.func.signature = signature;
+        let mut data = FunctionData::new();
+        let mut builder = cranelift_frontend::FunctionBuilder::new(
+            &mut self.context.func,
+            &mut self.builder_context,
+        );
+        build(emit::Output {
+            b: &mut builder,
+            module: &mut self.module,
+            stubs: self.stubs,
+            annotations: &mut annotations,
+            names: &mut self.names,
+            cells: &mut self.cells,
+            data: &mut data,
+            source_name,
+        })?;
+        builder.seal_all_blocks();
+        builder.finalize(self.module.target_config());
+        data.seal();
+        self.data.push(data);
+        let function = std::mem::replace(
+            &mut self.context.func,
+            cranelift_codegen::ir::Function::new(),
+        );
+        Ok((function, annotations))
     }
 
     fn entry(&mut self, id: FuncId) -> Result<Entry, Error> {
@@ -446,7 +524,7 @@ impl Compiler {
         }
 
         let mut ids = self.functions.clone();
-        let mut ordered = Vec::new();
+        let mut callables = Vec::new();
         for (name, function) in declarations {
             if ids.contains_key(&name) {
                 return Err(compile_at(
@@ -457,15 +535,27 @@ impl Compiler {
             let line = line_at(&lines, function.span.start);
             let id = self.declare_js(&name, line)?;
             ids.insert(name.clone(), id);
-            ordered.push((name, function));
+            callables.push(Callable {
+                id,
+                span: function.span,
+                params: &function.params,
+                statements: &function.body.as_ref().unwrap().statements,
+                expression: None,
+                generator: function.generator,
+                arrow: false,
+                label: name.clone(),
+                line,
+                captures: Vec::new(),
+                declaration: Some(name),
+            });
         }
+        let declared = callables.len();
 
         let analysis = CaptureAnalysis::analyze(program, scoping);
         if let Some(span) = analysis.class_name_write {
             return Err(unsupported_at(span, "assignment to inner class name"));
         }
         let mut closures = HashMap::new();
-        let mut nested = Vec::new();
         for node in nodes.iter() {
             let (span, params, statements, expression, generator) = match node.kind() {
                 AstKind::ArrowFunctionExpression(function) => {
@@ -487,7 +577,9 @@ impl Compiler {
                     )
                 }
                 AstKind::Function(function)
-                    if !ordered.iter().any(|(_, top)| top.span == function.span) =>
+                    if !callables[..declared]
+                        .iter()
+                        .any(|top| top.span == function.span) =>
                 {
                     if (function.id.is_some()
                         && function.r#type != oxc_ast::ast::FunctionType::FunctionDeclaration)
@@ -517,19 +609,23 @@ impl Compiler {
             let label = function_label(nodes, node.id(), self_name);
             let line = line_at(&lines, span.start);
             let id = self.declare_js(&label, line)?;
-            let captures = analysis
-                .functions
-                .get(&span.start)
-                .map(|f| f.captures.clone())
-                .unwrap_or_default();
-            let lexical_this = analysis
-                .functions
-                .get(&span.start)
-                .is_some_and(|function| function.lexical_this);
-            closures.insert(span.start, (id, captures, lexical_this));
-            nested.push((
-                id, span, params, statements, expression, generator, label, line,
-            ));
+            let function = analysis.functions.get(&span.start);
+            let captures = function.map(|f| f.captures.clone()).unwrap_or_default();
+            let lexical_this = function.is_some_and(|function| function.lexical_this);
+            closures.insert(span.start, (id, captures.clone(), lexical_this));
+            callables.push(Callable {
+                id,
+                span,
+                params,
+                statements,
+                expression,
+                generator,
+                arrow: matches!(node.kind(), AstKind::ArrowFunctionExpression(_)),
+                label,
+                line,
+                captures,
+                declaration: None,
+            });
         }
         let mut pending = Vec::new();
         for node in nodes.iter() {
@@ -574,75 +670,41 @@ impl Compiler {
             }
         }
 
-        for (name, function) in &ordered {
-            if function.generator {
+        for callable in &callables {
+            if callable.generator {
                 continue;
             }
             let canonical = super::semantic::canonical_for_emission(
-                &function.params,
-                &function.body.as_ref().unwrap().statements,
-                None,
-                function.span,
+                callable.params,
+                callable.statements,
+                callable.expression,
+                callable.span,
                 scoping,
                 &analysis.captured,
-                &[],
+                &callable.captures,
                 &closures,
-                analysis
-                    .arguments_bindings
-                    .get(&function.span.start)
-                    .copied(),
+                analysis.arguments_bindings.get(&callable.span.start).copied(),
                 &analysis.arguments_references,
                 false,
                 self.ssa_opt,
             )
             .map_err(Error::Unsupported)?;
-            Arc::make_mut(&mut self.canonical).insert(
-                self.source_name.0,
-                name,
-                ids[name],
-                canonical,
-            );
-        }
-
-        let arrows: HashSet<u32> = nodes
-            .iter()
-            .filter_map(|node| match node.kind() {
-                AstKind::ArrowFunctionExpression(function) => Some(function.span.start),
-                _ => None,
-            })
-            .collect();
-        for (id, span, params, statements, expression, generator, _, _) in &nested {
-            if *generator {
-                continue;
+            let repository = Arc::make_mut(&mut self.canonical);
+            match &callable.declaration {
+                Some(name) => repository.insert(self.source_name.0, name, callable.id, canonical),
+                None => repository.insert_closure(
+                    self.source_name.0,
+                    callable.id,
+                    canonical,
+                    callable.arrow,
+                ),
             }
-            let canonical = super::semantic::canonical_for_emission(
-                params,
-                statements,
-                *expression,
-                *span,
-                scoping,
-                &analysis.captured,
-                &closures[&span.start].1,
-                &closures,
-                analysis.arguments_bindings.get(&span.start).copied(),
-                &analysis.arguments_references,
-                false,
-                self.ssa_opt,
-            )
-            .map_err(Error::Unsupported)?;
-            Arc::make_mut(&mut self.canonical).insert_closure(
-                self.source_name.0,
-                *id,
-                canonical,
-                arrows.contains(&span.start),
-            );
         }
 
-        for (name, function) in &ordered {
-            let line = line_at(&lines, function.span.start);
-            if !function.generator && self.inspection.is_none() {
+        for callable in &callables {
+            if !callable.generator && self.inspection.is_none() {
                 self.lazy.insert(
-                    ids[name],
+                    callable.id,
                     (
                         Emission {
                             tier: CompilationTier::Optimized,
@@ -651,8 +713,7 @@ impl Compiler {
                             plan: Default::default(),
                             osr: None,
                             source_name: self.source_name,
-                            params: function.params.span,
-                            closures: closures.clone(),
+                            params: callable.params.span,
                         },
                         self.canonical.clone(),
                     ),
@@ -660,68 +721,24 @@ impl Compiler {
                 continue;
             }
             let (code, resume) = self.compile_callable(
-                &function.params,
-                &function.body.as_ref().unwrap().statements,
-                None,
-                analysis
-                    .arguments_bindings
-                    .get(&function.span.start)
-                    .copied(),
+                callable.params,
+                callable.statements,
+                callable.expression,
+                analysis.arguments_bindings.get(&callable.span.start).copied(),
                 &analysis.arguments_references,
-                &[],
+                &callable.captures,
                 &analysis.captured,
                 &closures,
                 scoping,
-                function.generator,
-                name,
-                line,
-                Some(function.span),
+                callable.generator,
+                &callable.label,
+                callable.line,
+                Some(callable.span),
             )?;
             if let Some(resume) = resume {
                 pending.push(resume);
             }
-            pending.push((ids[name], code));
-        }
-        for (id, span, params, statements, expression, generator, label, line) in nested {
-            let captures = &closures[&span.start].1;
-            if !generator && self.inspection.is_none() {
-                self.lazy.insert(
-                    id,
-                    (
-                        Emission {
-                            tier: CompilationTier::Optimized,
-                            specialized: false,
-                            callees: Vec::new(),
-                            plan: Default::default(),
-                            osr: None,
-                            source_name: self.source_name,
-                            params: params.span,
-                            closures: closures.clone(),
-                        },
-                        self.canonical.clone(),
-                    ),
-                );
-                continue;
-            }
-            let (code, resume) = self.compile_callable(
-                params,
-                statements,
-                expression,
-                analysis.arguments_bindings.get(&span.start).copied(),
-                &analysis.arguments_references,
-                captures,
-                &analysis.captured,
-                &closures,
-                scoping,
-                generator,
-                &label,
-                line,
-                Some(span),
-            )?;
-            if let Some(resume) = resume {
-                pending.push(resume);
-            }
-            pending.push((id, code));
+            pending.push((callable.id, code));
         }
         let initializer = if program.body.iter().all(|s| {
             matches!(
@@ -738,10 +755,6 @@ impl Compiler {
                 .unwrap_or("module");
             let label = format!("{module}.module");
             let id = self.declare_js(&label, line)?;
-            let mut annotations = Annotations {
-                semantic_locations: self.dump_ir || self.inspection.is_some(),
-                ..Annotations::default()
-            };
             let graph = super::semantic::lower_global(
                 &program.body,
                 program.span,
@@ -750,52 +763,25 @@ impl Compiler {
                 &closures,
                 &analysis.arguments_references,
                 self.ssa_opt,
-                self.inspection
-                    .as_ref()
-                    .is_some_and(|options| options.planner),
+                self.speculative_continuations,
+                self.report_regions(),
             )
             .map_err(Error::Unsupported)?;
             let continuations = self.compile_continuations(
                 &graph.graph,
                 self.source_name,
                 program.span,
-                &closures,
                 (&label, line),
                 None,
             )?;
-            self.context.clear();
-            self.context.func.signature = self.signature.clone();
-            {
-                let mut data = FunctionData::new();
-                let mut builder = cranelift_frontend::FunctionBuilder::new(
-                    &mut self.context.func,
-                    &mut self.builder_context,
-                );
-                emit::build_global(
-                    &mut builder,
-                    &mut self.module,
-                    self.stubs,
-                    &mut annotations,
-                    &mut self.names,
-                    &mut self.cells,
-                    &mut data,
-                    self.source_name,
-                    &closures,
-                    &graph.graph,
-                    &continuations,
-                )?;
-                builder.seal_all_blocks();
-                builder.finalize(self.module.target_config());
-                data.seal();
-                self.data.push(data);
-            }
+            let (function, annotations) =
+                self.emit_body(self.signature.clone(), self.source_name, |out| {
+                    emit::build_global(out, &graph.graph, &continuations)
+                })?;
             pending.push((
                 id,
                 FunctionBody {
-                    function: std::mem::replace(
-                        &mut self.context.func,
-                        cranelift_codegen::ir::Function::new(),
-                    ),
+                    function,
                     annotations,
                     inspection: super::inspect::Inspection::new(
                         self.inspection.as_deref(),
@@ -805,8 +791,7 @@ impl Compiler {
                         1,
                     )
                     .ast(self.inspection.as_deref(), &program),
-                    listing: (self.dump_ir || (self.dump.is_some() && self.inspection.is_some()))
-                        .then(|| graph.listing_lines()),
+                    listing: self.listing().then(|| graph.listing_lines()),
                 },
             ));
             Some(id)
@@ -832,15 +817,17 @@ impl Compiler {
         }
         self.finish_functions(pending, source, source_path, &lines)?;
 
-        let mut functions = Vec::with_capacity(ordered.len());
-        for (name, function) in ordered {
-            functions.push(CompiledFunction {
-                name: name.clone(),
-                arity: function.params.items.len(),
-                code: ids[&name].as_u32() as u64,
-                generator: function.generator,
-            });
-        }
+        let functions = callables
+            .iter()
+            .filter_map(|callable| {
+                Some(CompiledFunction {
+                    name: callable.declaration.clone()?,
+                    arity: callable.params.items.len(),
+                    code: callable.id.as_u32() as u64,
+                    generator: callable.generator,
+                })
+            })
+            .collect();
         self.functions = ids;
         Ok((
             functions,
@@ -1268,84 +1255,42 @@ impl Compiler {
         let versioning = if initial && region.is_none() && self.generic_first {
             super::semantic::Versioning::Generic
         } else {
-            super::semantic::Versioning::Speculate(
-                (!initial && region.is_none()).then_some(previous.code),
-            )
+            super::semantic::Versioning::Speculate {
+                fallback: (!initial && region.is_none()).then_some(previous.code),
+                continuations: self.speculative_continuations,
+            }
         };
         emission.tier = tier;
-        emission.specialized = matches!(versioning, super::semantic::Versioning::Speculate(_));
-        let mut graph = super::semantic::optimize_planned(
-            planned,
-            versioning,
-            self.inspection
-                .as_ref()
-                .is_some_and(|options| options.planner),
-        )
-        .map_err(Error::Unsupported)?;
+        emission.specialized = matches!(versioning, super::semantic::Versioning::Speculate { .. });
+        let mut graph =
+            super::semantic::optimize_planned(planned, versioning, self.report_regions())
+                .map_err(Error::Unsupported)?;
         if self.osr && region.is_none() {
             graph.prepare_osr(source).map_err(Error::Unsupported)?;
         }
-        let feedback = self.ssa_opt.then_some(emit::Feedback {
-            function_return: false,
-            get_refinement: self.get_refinement,
-            owner: code.as_u32() as u64,
-        });
         let continuations = self.compile_continuations(
             &graph.graph,
             emission.source_name,
             emission.params,
-            &emission.closures,
             (&label, 1),
-            feedback,
+            self.ssa_opt.then(|| self.feedback(code, false)),
         )?;
-        let mut annotations = Annotations {
-            semantic_locations: self.dump_ir || self.inspection.is_some(),
-            ..Annotations::default()
-        };
-        self.context.clear();
-        self.context.func.signature = match graph.graph.arity {
-            Some(arity) => self.fixed_signature(arity),
-            None => self.signature.clone(),
-        };
-        {
-            let mut data = FunctionData::new();
-            let mut builder = cranelift_frontend::FunctionBuilder::new(
-                &mut self.context.func,
-                &mut self.builder_context,
-            );
+        let signature = self.graph_signature(Some(&graph.graph));
+        let feedback = self.ssa_opt.then(|| self.feedback(code, region.is_none()));
+        let (function, annotations) = self.emit_body(signature, emission.source_name, |out| {
             emit::build_function(
-                &mut builder,
-                &mut self.module,
-                self.stubs,
-                &mut annotations,
-                &mut self.names,
-                &mut self.cells,
-                &mut data,
-                emission.source_name,
+                out,
                 emission.params,
-                &emission.closures,
                 emit::FunctionKind::Ordinary,
                 &graph.graph,
                 &continuations,
-                self.ssa_opt.then_some(emit::Feedback {
-                    function_return: region.is_none(),
-                    get_refinement: self.get_refinement,
-                    owner: code.as_u32() as u64,
-                }),
-            )?;
-            builder.seal_all_blocks();
-            builder.finalize(self.module.target_config());
-            data.seal();
-            self.data.push(data);
-        }
+                feedback,
+            )
+        })?;
         let body = FunctionBody {
-            function: std::mem::replace(
-                &mut self.context.func,
-                cranelift_codegen::ir::Function::new(),
-            ),
+            function,
             annotations,
-            listing: (self.dump_ir || (self.dump.is_some() && self.inspection.is_some()))
-                .then(|| graph.listing_lines()),
+            listing: self.listing().then(|| graph.listing_lines()),
             inspection: super::inspect::Inspection::new(
                 self.inspection.as_deref(),
                 &graph,
@@ -1500,20 +1445,11 @@ impl Compiler {
         graph: &super::semantic::Graph,
         source_name: (usize, usize),
         params: oxc_span::Span,
-        closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
         name: (&str, u32),
         feedback: Option<emit::Feedback>,
     ) -> Result<HashMap<usize, FuncId>, Error> {
         let mut ids = HashMap::new();
-        self.compile_continuations_inner(
-            graph,
-            source_name,
-            params,
-            closures,
-            name,
-            feedback,
-            &mut ids,
-        )?;
+        self.compile_continuations_inner(graph, source_name, params, name, feedback, &mut ids)?;
         Ok(ids)
     }
 
@@ -1522,7 +1458,6 @@ impl Compiler {
         graph: &super::semantic::Graph,
         source_name: (usize, usize),
         params: oxc_span::Span,
-        closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
         name: (&str, u32),
         feedback: Option<emit::Feedback>,
         ids: &mut HashMap<usize, FuncId>,
@@ -1542,62 +1477,38 @@ impl Compiler {
                 &target.graph,
                 source_name,
                 params,
-                closures,
                 name,
                 feedback,
                 ids,
             )?;
-            self.context.clear();
-            self.context.func.signature = self.signature.clone();
-            let mut annotations = Annotations {
-                semantic_locations: self.dump_ir || self.inspection.is_some(),
-                ..Annotations::default()
-            };
-            let mut data = FunctionData::new();
-            let mut builder = cranelift_frontend::FunctionBuilder::new(
-                &mut self.context.func,
-                &mut self.builder_context,
-            );
-            emit::build_function(
-                &mut builder,
-                &mut self.module,
-                self.stubs,
-                &mut annotations,
-                &mut self.names,
-                &mut self.cells,
-                &mut data,
-                source_name,
-                params,
-                closures,
-                emit::FunctionKind::Ordinary,
-                &target.graph,
-                ids,
-                feedback,
-            )?;
-            builder.seal_all_blocks();
-            builder.finalize(self.module.target_config());
-            data.seal();
-            self.data.push(data);
+            let (function, annotations) =
+                self.emit_body(self.signature.clone(), source_name, |out| {
+                    emit::build_function(
+                        out,
+                        params,
+                        emit::FunctionKind::Ordinary,
+                        &target.graph,
+                        ids,
+                        feedback,
+                    )
+                })?;
+            let listing = self.listing().then(|| {
+                target
+                    .graph
+                    .listing(&super::semantic::Facts::compute(&target.graph))
+                    .lines()
+            });
             self.continuations.push((
                 id,
                 FunctionBody {
-                    function: std::mem::replace(
-                        &mut self.context.func,
-                        cranelift_codegen::ir::Function::new(),
-                    ),
+                    function,
                     annotations,
                     inspection: super::inspect::Inspection::from_graph(
                         self.inspection.as_deref(),
                         &target.graph,
                     )
                     .named(&format!("continuation of {}", name.0)),
-                    listing: (self.dump_ir || (self.dump.is_some() && self.inspection.is_some()))
-                        .then(|| {
-                            target
-                                .graph
-                                .listing(&super::semantic::Facts::compute(&target.graph))
-                                .lines()
-                        }),
+                    listing,
                 },
             ));
         }
@@ -1719,10 +1630,11 @@ impl Compiler {
                 )?;
                 super::semantic::optimize_planned(
                     planned,
-                    super::semantic::Versioning::Speculate(None),
-                    self.inspection
-                        .as_ref()
-                        .is_some_and(|options| options.planner),
+                    super::semantic::Versioning::Speculate {
+                        fallback: None,
+                        continuations: self.speculative_continuations,
+                    },
+                    self.report_regions(),
                 )
             })
             .transpose()
@@ -1740,6 +1652,7 @@ impl Compiler {
             None
         };
         if let Some(code) = feedback {
+            let graph = graph.as_ref().unwrap();
             self.emissions.insert(
                 code,
                 Emission {
@@ -1747,93 +1660,45 @@ impl Compiler {
                     specialized: true,
                     callees: self
                         .canonical
-                        .graph_callees(&graph.as_ref().unwrap().graph, self.source_name.0),
-                    plan: graph.as_ref().unwrap().plan.clone(),
-                    osr: graph.as_ref().unwrap().osr.clone(),
+                        .graph_callees(&graph.graph, self.source_name.0),
+                    plan: graph.plan.clone(),
+                    osr: graph.osr.clone(),
                     source_name: self.source_name,
                     params: params.span,
-                    closures: closures.clone(),
                 },
             );
         }
-        let continuation_feedback = feedback.map(|owner| emit::Feedback {
-            function_return: false,
-            get_refinement: self.get_refinement,
-            owner: owner.as_u32() as u64,
-        });
-        let continuations = if let Some(graph) = &graph {
-            self.compile_continuations(
+        let continuations = match &graph {
+            Some(graph) => self.compile_continuations(
                 &graph.graph,
                 self.source_name,
                 params.span,
-                closures,
                 name,
-                continuation_feedback,
-            )?
-        } else {
-            HashMap::new()
+                feedback.map(|owner| self.feedback(owner, false)),
+            )?,
+            None => HashMap::new(),
         };
-        let mut annotations = Annotations {
-            semantic_locations: self.dump_ir || self.inspection.is_some(),
-            ..Annotations::default()
-        };
-        self.context.clear();
-        self.context.func.signature = match graph.as_ref().and_then(|graph| graph.graph.arity) {
-            Some(arity) => self.fixed_signature(arity),
-            None => self.signature.clone(),
-        };
-        {
-            let mut data = FunctionData::new();
-            let mut builder = cranelift_frontend::FunctionBuilder::new(
-                &mut self.context.func,
-                &mut self.builder_context,
-            );
-            if let Some(graph) = &graph {
-                emit::build_function(
-                    &mut builder,
-                    &mut self.module,
-                    self.stubs,
-                    &mut annotations,
-                    &mut self.names,
-                    &mut self.cells,
-                    &mut data,
-                    self.source_name,
+        let signature = self.graph_signature(graph.as_ref().map(|graph| &graph.graph));
+        let feedback = feedback.map(|owner| self.feedback(owner, true));
+        let (function, annotations) =
+            self.emit_body(signature, self.source_name, |out| match &graph {
+                Some(graph) => emit::build_function(
+                    out,
                     params.span,
-                    closures,
                     kind,
                     &graph.graph,
                     &continuations,
-                    feedback.map(|owner| emit::Feedback {
-                        function_return: true,
-                        get_refinement: self.get_refinement,
-                        owner: owner.as_u32() as u64,
-                    }),
-                )?;
-            } else if let emit::FunctionKind::Factory(resume) = kind {
-                emit::build_factory(
-                    &mut builder,
-                    &mut self.module,
-                    self.stubs,
-                    &mut annotations,
-                    &mut self.names,
-                    &mut self.cells,
-                    &mut data,
-                    self.source_name,
-                    params.span,
-                    closures,
-                    resume,
-                )?;
-            }
-            builder.seal_all_blocks();
-            builder.finalize(self.module.target_config());
-            data.seal();
-            self.data.push(data);
-        }
+                    feedback,
+                ),
+                None => match kind {
+                    emit::FunctionKind::Factory(resume) => {
+                        emit::build_factory(out, params.span, resume)
+                    }
+                    _ => Ok(()),
+                },
+            })?;
         Ok(FunctionBody {
-            function: std::mem::replace(
-                &mut self.context.func,
-                cranelift_codegen::ir::Function::new(),
-            ),
+            function,
             annotations,
             inspection: graph.as_ref().map_or_else(Default::default, |graph| {
                 super::inspect::Inspection::new(
@@ -1844,11 +1709,10 @@ impl Compiler {
                     1,
                 )
             }),
-            listing: if self.dump_ir || (self.dump.is_some() && self.inspection.is_some()) {
-                graph.as_ref().map(|graph| graph.listing_lines())
-            } else {
-                None
-            },
+            listing: self
+                .listing()
+                .then(|| graph.as_ref().map(|graph| graph.listing_lines()))
+                .flatten(),
         })
     }
 }

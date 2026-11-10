@@ -617,3 +617,71 @@ fn string_split_specialization_preserves_replacements_and_errors() {
         assert_eq!(run(source, true), run(source, false), "{source}");
     }
 }
+
+#[test]
+fn array_read_feedback_preserves_layouts_bounds_and_fallbacks() {
+    for enabled in [false, true] {
+        let mut engine = Engine::with_options(EngineOptions {
+            ssa_opt: enabled,
+            background_compile: false,
+            ..Default::default()
+        })
+        .unwrap();
+        engine
+            .compile(
+                r#"
+            function read(a, k) { return a[k]; }
+            const runner = {call: read};
+            function warm() {
+                const values = [10, 20, 30];
+                for (let i = 0; i < 32; ++i)
+                    runner.call(values, i % 3);
+            }
+            function main() {
+                const array = [10, 20, 30];
+                const holey = [10, 20, 30].map((value, index, source) => {
+                    if (index === 0) source.length = 1;
+                    return value;
+                });
+                const object = {"0": 7, "0.5": 9};
+                const owned = {value: 42};
+                const references = [owned];
+                if (runner.call(array, -0) !== 10 || runner.call(array, 2) !== 30 ||
+                    runner.call(array, 3) !== undefined || runner.call(array, "1") !== 20 ||
+                    runner.call(holey, 0) !== 10 || runner.call(holey, 1) !== undefined ||
+                    runner.call(object, 0) !== 7 || runner.call(object, 0.5) !== 9 ||
+                    runner.call(Uint8Array.from([4, 5]), 1) !== 5 ||
+                    runner.call("abc", 1) !== "b" || runner.call(references, 0) !== owned)
+                    return false;
+                array.length = 1;
+                if (runner.call(array, 2) !== undefined) return false;
+                array.push(40);
+                return runner.call(array, 1) === 40;
+            }
+            function fractional() { return runner.call([10], 0.5); }
+            function negative() { return runner.call([10], -1); }
+            function nan() { return runner.call([10], NaN); }
+            function infinite() { return runner.call([10], Infinity); }
+            function huge() { return runner.call([10], 1e30); }
+            function nullReceiver() { return runner.call(null, 0); }
+        "#,
+                "array-read-feedback.js",
+            )
+            .unwrap();
+        engine.call("warm", &[]).unwrap();
+        assert_eq!(engine.call("main", &[]).unwrap().value(), Value::TRUE);
+        for name in [
+            "fractional",
+            "negative",
+            "nan",
+            "infinite",
+            "huge",
+            "nullReceiver",
+        ] {
+            assert!(
+                engine.call(name, &[]).is_err(),
+                "{name}, optimized={enabled}"
+            );
+        }
+    }
+}

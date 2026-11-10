@@ -1292,9 +1292,12 @@ can select guarded `ArrayLoad` operations and the second can select `TypedIndex`
 Where needed, a number guard selects numeric keys before read specialization.
 For ordinary arrays, `ArrayPosition` converts the numeric key to an integer.
 `IsArrayIndex` checks that this position exactly represents the original key,
-is in bounds, and matches the packed or holey layout. Its boolean result selects
-a matching `ArrayLoad`, which uses the shared integer position directly without
-repeating layout or bounds checks. Packed loads read the element directly; holey loads also map
+is in bounds, and matches the packed or holey layout. After versioning, lowering
+exposes `IsExactPosition`, `IndexedLength`, `IsInBounds` and `IsArray`, joined by
+`BooleanAnd` predicates. Load reuse shares exactness and bounds between the packed
+and holey alternatives; length and layout reuse are invalidated by conflicting
+mutations. The resulting predicate selects a matching `ArrayLoad`, which uses
+the shared integer position directly without repeating layout or bounds checks. Packed loads read the element directly; holey loads also map
 holes to undefined. These loads require the matching successful check with no
 intervening array mutation, and retain the existing heap-result ownership rules.
 Other receivers and keys use the original read. Numeric speculation combines

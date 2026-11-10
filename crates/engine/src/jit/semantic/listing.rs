@@ -122,12 +122,17 @@ impl Graph {
             Op::ConstructPack(callee, args) => format!("construct_pack {callee}, {args}"),
             Op::IteratorNew(value) => format!("iterator_new {value}"),
             Op::IteratorNext(value) => format!("iterator_next {value}"),
+            Op::BooleanAnd(left, right) => format!("boolean_and {left}, {right}"),
             Op::IsIndexed(value) => format!("is_indexed {value}"),
             Op::IsExactPosition(key, position) => format!("is_exact_position {key}, {position}"),
             Op::IsInBounds(position, length) => format!("is_in_bounds {position}, {length}"),
             Op::ArrayPosition(key) => format!("array_position {key}"),
             Op::IsArrayIndex(object, key, position, holey) => format!(
                 "is_array_index {object}[{key}] position={position} {}",
+                if *holey { "holey" } else { "packed" }
+            ),
+            Op::IsArray(object, holey) => format!(
+                "is_array {object} {}",
                 if *holey { "holey" } else { "packed" }
             ),
             Op::ArrayLoad(object, key, holey) => format!(

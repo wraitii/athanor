@@ -73,10 +73,7 @@ pub(super) fn expand(graph: &mut Graph, expanded: &mut HashSet<Inst>) {
             span: data.span,
             kind: TerminatorKind::Branch(unresolved, Target::new(fallback), Target::new(fast)),
         });
-        let instance = graph
-            .append(fast, data.span, Op::NewInstance(prototype), true)
-            .1
-            .unwrap();
+        let instance = graph.append_value(fast, data.span, Op::NewInstance(prototype));
         let call = match data.op {
             Op::ConstructResolved { args, .. } => Op::ConstructorCall {
                 callee,
@@ -88,16 +85,8 @@ pub(super) fn expand(graph: &mut Graph, expanded: &mut HashSet<Inst>) {
             }
             _ => unreachable!(),
         };
-        let result = graph.append(fast, data.span, call, true).1.unwrap();
-        let result = graph
-            .append(
-                fast,
-                data.span,
-                Op::ConstructorResult(result, instance),
-                true,
-            )
-            .1
-            .unwrap();
+        let result = graph.append_value(fast, data.span, call);
+        let result = graph.append_value(fast, data.span, Op::ConstructorResult(result, instance));
         for &inst in &graph.blocks[fast].insts {
             graph.insts[inst].source_name = data.source_name;
         }

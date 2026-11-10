@@ -18,8 +18,7 @@ use oxc_syntax::{reference::ReferenceId, symbol::SymbolId};
 
 use super::{
     Binding, BindingData, BindingKind, Block, BlockData, Constant, Graph, InstData, Op, Result,
-    Scope, ScopeData, ScopeKind, Target, Terminator, TerminatorKind, UnaryOp, Value, ValueDef,
-    unsupported,
+    Scope, ScopeData, ScopeKind, Target, TerminatorKind, UnaryOp, Value, ValueDef, unsupported,
 };
 
 enum Reference {
@@ -223,11 +222,7 @@ impl<'a> Builder<'a> {
             .current
             .take()
             .expect("termination of unreachable code");
-        self.graph.blocks[block].terminator = Some(Terminator {
-            source_name: None,
-            span,
-            kind,
-        });
+        self.graph.terminate(block, span, kind);
     }
 
     fn jump(&mut self, span: Span, block: Block, args: Vec<Value>) {

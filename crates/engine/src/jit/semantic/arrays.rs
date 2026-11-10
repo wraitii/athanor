@@ -115,24 +115,13 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
     let advance = graph.blocks.push(BlockData::default());
     let exit = graph.blocks.push(BlockData::default());
     let span = call.span;
-    let check = graph
-        .append(
-            block,
-            span,
-            Op::IsArrayIteration(callee, receiver, method),
-            true,
-        )
-        .1
-        .unwrap();
+    let check = graph.append_value(block, span, Op::IsArrayIteration(callee, receiver, method));
     graph.blocks[block].terminator = Some(Terminator {
         source_name: call.source_name,
         span,
         kind: TerminatorKind::Branch(check, Target::new(start), Target::new(fallback)),
     });
-    let length = graph
-        .append(start, span, Op::IndexedLength(receiver), true)
-        .1
-        .unwrap();
+    let length = graph.append_value(start, span, Op::IndexedLength(receiver));
     let result_op = match method {
         ArrayMethod::Map => Op::NewHoleyArray(length),
         ArrayMethod::Filter => Op::NewArray(Vec::new()),
@@ -142,15 +131,9 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
         ArrayMethod::ForEach | ArrayMethod::Find => Op::Constant(Constant::Undefined),
         ArrayMethod::Push => unreachable!(),
     };
-    let result = graph.append(start, span, result_op, true).1.unwrap();
-    let zero = graph
-        .append(start, span, Op::Constant(Constant::Number(0.0)), true)
-        .1
-        .unwrap();
-    let undefined = graph
-        .append(start, span, Op::Constant(Constant::Undefined), true)
-        .1
-        .unwrap();
+    let result = graph.append_value(start, span, result_op);
+    let zero = graph.append_value(start, span, Op::Constant(Constant::Number(0.0)));
+    let undefined = graph.append_value(start, span, Op::Constant(Constant::Undefined));
     let index = graph.add_param(header);
     graph.blocks[start].terminator = Some(Terminator {
         source_name: call.source_name,
@@ -160,28 +143,18 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
             args: vec![zero],
         }),
     });
-    let more = graph
-        .append(
-            header,
-            span,
-            Op::Binary(BinaryOperator::LessThan, index, length),
-            true,
-        )
-        .1
-        .unwrap();
+    let more = graph.append_value(
+        header,
+        span,
+        Op::Binary(BinaryOperator::LessThan, index, length),
+    );
     graph.blocks[header].terminator = Some(Terminator {
         source_name: call.source_name,
         span,
         kind: TerminatorKind::Branch(more, Target::new(read), Target::new(exit)),
     });
-    let element = graph
-        .append(read, span, Op::MapElement(receiver, index), true)
-        .1
-        .unwrap();
-    let absent = graph
-        .append(read, span, Op::IsUninitialized(element), true)
-        .1
-        .unwrap();
+    let element = graph.append_value(read, span, Op::MapElement(receiver, index));
+    let absent = graph.append_value(read, span, Op::IsUninitialized(element));
     let value = graph.add_param(invoke);
     let hole = match method {
         ArrayMethod::Find => Target {
@@ -199,20 +172,16 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
         span,
         kind: TerminatorKind::Branch(absent, hole, present),
     });
-    let mapped = graph
-        .append(
-            invoke,
-            span,
-            Op::Call {
-                callee: callback,
-                receiver: Some(undefined),
-                args: vec![value, index, receiver],
-                target: None,
-            },
-            true,
-        )
-        .1
-        .unwrap();
+    let mapped = graph.append_value(
+        invoke,
+        span,
+        Op::Call {
+            callee: callback,
+            receiver: Some(undefined),
+            args: vec![value, index, receiver],
+            target: None,
+        },
+    );
     match method {
         ArrayMethod::Push => unreachable!(),
         ArrayMethod::ForEach => {
@@ -272,15 +241,11 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
                 span,
                 kind: TerminatorKind::Branch(mapped, targets.0, targets.1),
             });
-            let found = graph
-                .append(
-                    stop,
-                    span,
-                    Op::Constant(Constant::Boolean(method == ArrayMethod::Some)),
-                    true,
-                )
-                .1
-                .unwrap();
+            let found = graph.append_value(
+                stop,
+                span,
+                Op::Constant(Constant::Boolean(method == ArrayMethod::Some)),
+            );
             graph.blocks[stop].terminator = Some(Terminator {
                 source_name: call.source_name,
                 span,
@@ -291,19 +256,8 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
             });
         }
     }
-    let one = graph
-        .append(advance, span, Op::Constant(Constant::Number(1.0)), true)
-        .1
-        .unwrap();
-    let next = graph
-        .append(
-            advance,
-            span,
-            Op::Binary(BinaryOperator::Addition, index, one),
-            true,
-        )
-        .1
-        .unwrap();
+    let one = graph.append_value(advance, span, Op::Constant(Constant::Number(1.0)));
+    let next = graph.append_value(advance, span, Op::Binary(BinaryOperator::Addition, index, one));
     graph.blocks[advance].terminator = Some(Terminator {
         source_name: call.source_name,
         span,
@@ -378,15 +332,11 @@ pub(super) fn push_calls(
         let kind = if known_array {
             TerminatorKind::Jump(Target::new(fast))
         } else {
-            let check = graph
-                .append(
-                    block,
-                    call.span,
-                    Op::IsArrayIteration(callee, receiver, ArrayMethod::Push),
-                    true,
-                )
-                .1
-                .unwrap();
+            let check = graph.append_value(
+                block,
+                call.span,
+                Op::IsArrayIteration(callee, receiver, ArrayMethod::Push),
+            );
             TerminatorKind::Branch(check, Target::new(fast), Target::new(fallback))
         };
         graph.blocks[block].terminator = Some(Terminator {
@@ -402,10 +352,7 @@ pub(super) fn push_calls(
                 false,
             );
         }
-        let length = graph
-            .append(fast, call.span, Op::IndexedLength(receiver), true)
-            .1
-            .unwrap();
+        let length = graph.append_value(fast, call.span, Op::IndexedLength(receiver));
         graph.blocks[fast].terminator = Some(Terminator {
             source_name: call.source_name,
             span: call.span,

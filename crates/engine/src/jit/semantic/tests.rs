@@ -56,19 +56,12 @@ fn constructor_result_facts_and_folding_preserve_object_returns() {
         let mut graph = lower_source("function f(){return 0;}").unwrap();
         let block = graph.entry;
         let span = graph.span;
-        let instance = graph.append(block, span, Op::NewObject, true).1.unwrap();
+        let instance = graph.append_value(block, span, Op::NewObject);
         let object_return = matches!(returned, Op::NewObject);
         let unknown_return = matches!(returned, Op::Argument(_));
-        let returned = graph.append(block, span, returned, true).1.unwrap();
-        let result = graph
-            .append(block, span, Op::ConstructorResult(returned, instance), true)
-            .1
-            .unwrap();
-        graph.blocks[block].terminator = Some(Terminator {
-            source_name: None,
-            span,
-            kind: TerminatorKind::Return(result),
-        });
+        let returned = graph.append_value(block, span, returned);
+        let result = graph.append_value(block, span, Op::ConstructorResult(returned, instance));
+        graph.terminate(block, span, TerminatorKind::Return(result));
         assert_eq!(Facts::compute(&graph).of(result), Types::OBJECT);
         js::simplify(&mut graph);
         graph.verify().unwrap();
@@ -95,7 +88,7 @@ fn block_arguments_retain_type_test_facts_without_narrowing_unrelated_edges() {
         let mut graph = lower_source("function f(){return 0;}").unwrap();
         let entry = graph.entry;
         let span = graph.span;
-        let value = graph.append(entry, span, Op::Argument(0), true).1.unwrap();
+        let value = graph.append_value(entry, span, Op::Argument(0));
         let (op, mask) = match kind {
             0 => (Op::IsUndefined(value), Types::UNDEFINED),
             1 => (Op::IsNullish(value), Types::UNDEFINED.union(Types::NULL)),
@@ -103,17 +96,17 @@ fn block_arguments_retain_type_test_facts_without_narrowing_unrelated_edges() {
             3 => (Op::IsNumber(value), Types::NUMBER),
             _ => (Op::IsUninitialized(value), Types::UNINITIALIZED),
         };
-        let condition = graph.append(entry, span, op, true).1.unwrap();
+        let condition = graph.append_value(entry, span, op);
         let yes = graph.blocks.push(BlockData::default());
         let no = graph.blocks.push(BlockData::default());
         let join = graph.blocks.push(BlockData::default());
         let positive = graph.add_param(yes);
         let negative = graph.add_param(no);
         let merged = graph.add_param(join);
-        graph.blocks[entry].terminator = Some(Terminator {
-            source_name: None,
+        graph.terminate(
+            entry,
             span,
-            kind: TerminatorKind::Branch(
+            TerminatorKind::Branch(
                 condition,
                 Target {
                     block: yes,
@@ -124,22 +117,18 @@ fn block_arguments_retain_type_test_facts_without_narrowing_unrelated_edges() {
                     args: vec![value],
                 },
             ),
-        });
+        );
         for (block, arg) in [(yes, positive), (no, negative)] {
-            graph.blocks[block].terminator = Some(Terminator {
-                source_name: None,
+            graph.terminate(
+                block,
                 span,
-                kind: TerminatorKind::Jump(Target {
+                TerminatorKind::Jump(Target {
                     block: join,
                     args: vec![arg],
                 }),
-            });
+            );
         }
-        graph.blocks[join].terminator = Some(Terminator {
-            source_name: None,
-            span,
-            kind: TerminatorKind::Return(merged),
-        });
+        graph.terminate(join, span, TerminatorKind::Return(merged));
         graph.verify().unwrap();
         let facts = Facts::compute(&graph);
         let original = facts.of(value);
@@ -1223,11 +1212,8 @@ fn forwarded_undefined_facts_stop_at_joins_and_alternate_predecessors() {
     let mut graph = lower_source("function f(){return 0;}").unwrap();
     let entry = graph.entry;
     let span = graph.span;
-    let value = graph.append(entry, span, Op::Argument(0), true).1.unwrap();
-    let condition = graph
-        .append(entry, span, Op::IsUndefined(value), true)
-        .1
-        .unwrap();
+    let value = graph.append_value(entry, span, Op::Argument(0));
+    let condition = graph.append_value(entry, span, Op::IsUndefined(value));
     let yes = graph.blocks.push(BlockData::default());
     let no = graph.blocks.push(BlockData::default());
     let forward = graph.blocks.push(BlockData::default());
@@ -1235,45 +1221,37 @@ fn forwarded_undefined_facts_stop_at_joins_and_alternate_predecessors() {
     let passing = graph.blocks.push(BlockData::default());
     let narrowed = graph.add_param(passing);
     let parameter = graph.add_param(join);
-    graph.blocks[entry].terminator = Some(Terminator {
-        source_name: None,
+    graph.terminate(
+        entry,
         span,
-        kind: TerminatorKind::Branch(condition, Target::new(yes), Target::new(no)),
-    });
-    graph.blocks[yes].terminator = Some(Terminator {
-        source_name: None,
+        TerminatorKind::Branch(condition, Target::new(yes), Target::new(no)),
+    );
+    graph.terminate(
+        yes,
         span,
-        kind: TerminatorKind::Jump(Target {
+        TerminatorKind::Jump(Target {
             block: join,
             args: vec![value],
         }),
-    });
-    graph.blocks[no].terminator = Some(Terminator {
-        source_name: None,
+    );
+    graph.terminate(no, span, TerminatorKind::Jump(Target::new(forward)));
+    graph.terminate(
+        forward,
         span,
-        kind: TerminatorKind::Jump(Target::new(forward)),
-    });
-    graph.blocks[forward].terminator = Some(Terminator {
-        source_name: None,
-        span,
-        kind: TerminatorKind::Jump(Target {
+        TerminatorKind::Jump(Target {
             block: passing,
             args: vec![value],
         }),
-    });
-    graph.blocks[passing].terminator = Some(Terminator {
-        source_name: None,
+    );
+    graph.terminate(
+        passing,
         span,
-        kind: TerminatorKind::Jump(Target {
+        TerminatorKind::Jump(Target {
             block: join,
             args: vec![narrowed],
         }),
-    });
-    graph.blocks[join].terminator = Some(Terminator {
-        source_name: None,
-        span,
-        kind: TerminatorKind::Return(parameter),
-    });
+    );
+    graph.terminate(join, span, TerminatorKind::Return(parameter));
     graph.verify().unwrap();
     let facts = Facts::compute(&graph);
     assert_eq!(
@@ -1281,18 +1259,14 @@ fn forwarded_undefined_facts_stop_at_joins_and_alternate_predecessors() {
         facts.of(value).without(Types::UNDEFINED)
     );
     assert_eq!(facts.of(parameter), facts.of(value));
-    graph.blocks[yes].terminator = Some(Terminator {
-        source_name: None,
-        span,
-        kind: TerminatorKind::Jump(Target::new(no)),
-    });
+    graph.terminate(yes, span, TerminatorKind::Jump(Target::new(no)));
     let facts = Facts::compute(&graph);
     assert_eq!(facts.of(narrowed), facts.of(value));
     assert_eq!(facts.of(parameter), facts.of(value));
-    graph.blocks[join].terminator = Some(Terminator {
-        source_name: None,
+    graph.terminate(
+        join,
         span,
-        kind: TerminatorKind::Branch(
+        TerminatorKind::Branch(
             condition,
             Target::new(no),
             Target {
@@ -1300,7 +1274,7 @@ fn forwarded_undefined_facts_stop_at_joins_and_alternate_predecessors() {
                 args: vec![parameter],
             },
         ),
-    });
+    );
     graph.verify().unwrap();
     let facts = Facts::compute(&graph);
     assert_eq!(facts.of(parameter), facts.of(value));

@@ -317,10 +317,7 @@ fn guard_segment(
         } else {
             graph.blocks.push(BlockData::default())
         };
-        let check = graph
-            .append(check_block, first.span, Op::IsShape(object, shape), true)
-            .1
-            .unwrap();
+        let check = graph.append_value(check_block, first.span, Op::IsShape(object, shape));
         graph.blocks[check_block].terminator = Some(Terminator {
             source_name: first.source_name,
             span: first.span,

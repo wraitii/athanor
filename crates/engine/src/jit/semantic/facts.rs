@@ -691,8 +691,10 @@ fn result_types(op: &Op, facts: &Facts) -> Types {
         Op::IsTyped(..)
         | Op::IsIndexed(_)
         | Op::IsArrayIndex(..)
+        | Op::IsArray(..)
         | Op::IsExactPosition(..)
-        | Op::IsInBounds(..) => Types::BOOLEAN,
+        | Op::IsInBounds(..)
+        | Op::BooleanAnd(..) => Types::BOOLEAN,
         Op::IndexedLength(_) => Types::INT64,
         Op::IsNumber(_)
         | Op::IsInteger(_)

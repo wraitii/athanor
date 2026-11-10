@@ -4,6 +4,7 @@ use super::{
 };
 
 pub(super) fn lower(graph: &mut Graph) -> super::Result<bool> {
+    let arrays_changed = lower_arrays(graph);
     let facts = Facts::compute(graph);
     let reads: Vec<_> = Cfg::new(graph)
         .rpo
@@ -66,7 +67,43 @@ pub(super) fn lower(graph: &mut Graph) -> super::Result<bool> {
         });
     }
     graph.verify()?;
-    Ok(changed)
+    Ok(changed || arrays_changed)
+}
+
+pub(super) fn lower_arrays(graph: &mut Graph) -> bool {
+    let facts = Facts::compute(graph);
+    let mut changed = false;
+    for block in Cfg::new(graph).rpo {
+        for inst in graph.blocks[block].insts.clone() {
+            let data = graph.insts[inst].clone();
+            let Op::IsArrayIndex(object, key, position, holey) = data.op else {
+                continue;
+            };
+            let mut at = graph.blocks[block]
+                .insts
+                .iter()
+                .position(|&i| i == inst)
+                .unwrap();
+            let mut insert = |op| {
+                let (lowered, value) = graph.insert(block, at, data.span, op, true);
+                graph.insts[lowered].source_name = data.source_name;
+                at += 1;
+                value.unwrap()
+            };
+            let layout = insert(Op::IsArray(object, holey));
+            let exact = insert(if facts.of(key).within(Types::INTEGER) {
+                Op::Constant(Constant::Boolean(true))
+            } else {
+                Op::IsExactPosition(key, position)
+            });
+            let length = insert(Op::IndexedLength(object));
+            let inside = insert(Op::IsInBounds(position, length));
+            let valid = insert(Op::BooleanAnd(exact, inside));
+            graph.insts[inst].op = Op::BooleanAnd(layout, valid);
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn append(
@@ -78,4 +115,91 @@ fn append(
     let (inst, value) = graph.append(block, source.span, op, true);
     graph.insts[inst].source_name = source.source_name;
     value.unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxc_allocator::Allocator;
+    use oxc_ast::ast::Statement;
+    use oxc_parser::Parser;
+    use oxc_span::SourceType;
+    use std::collections::HashSet;
+
+    #[test]
+    fn array_checks_share_validity_until_a_mutation() {
+        for mutate in [false, true] {
+            let allocator = Allocator::default();
+            let parsed = Parser::new(
+                &allocator,
+                "function check(a, k) { return a[k * 1]; }",
+                SourceType::script(),
+            )
+            .parse();
+            let Statement::FunctionDeclaration(function) = &parsed.program.body[0] else {
+                panic!()
+            };
+            let semantic = oxc_semantic::SemanticBuilder::new_compiler()
+                .build(&parsed.program)
+                .semantic;
+            let graph =
+                super::super::build::lower(function, semantic.scoping(), &HashSet::new()).unwrap();
+            let mut graph = super::super::canonicalize(graph, true).unwrap().graph;
+            let inst = graph
+                .insts
+                .iter()
+                .find_map(|(inst, data)| matches!(data.op, Op::GetIndex(..)).then_some(inst))
+                .unwrap();
+            let Op::GetIndex(object, key) = graph.insts[inst].op else {
+                unreachable!()
+            };
+            let data = graph.insts[inst].clone();
+            let block = graph.def_block(data.result.unwrap());
+            let at = graph.blocks[block]
+                .insts
+                .iter()
+                .position(|&i| i == inst)
+                .unwrap();
+            let position = graph.insert_value(block, at, data.span, Op::ArrayPosition(key));
+            graph.insts[inst].op = Op::IsArrayIndex(object, key, position, false);
+            if mutate {
+                graph.append(block, data.span, Op::ArrayAppend(object, key, false), false);
+            }
+            let second = append(
+                &mut graph,
+                &data,
+                block,
+                Op::IsArrayIndex(object, key, position, true),
+            );
+            let result = append(
+                &mut graph,
+                &data,
+                block,
+                Op::NewArray(vec![data.result.unwrap(), second]),
+            );
+            graph.blocks[block].terminator.as_mut().unwrap().kind = TerminatorKind::Return(result);
+            lower(&mut graph).unwrap();
+            super::super::optimize::reuse_loads(&mut graph, &mut Vec::new());
+            super::super::js::simplify(&mut graph);
+            graph.verify().unwrap();
+            let count = |predicate: fn(&Op) -> bool| {
+                Cfg::new(&graph)
+                    .rpo
+                    .iter()
+                    .flat_map(|&block| &graph.blocks[block].insts)
+                    .filter(|&&inst| predicate(&graph.insts[inst].op))
+                    .count()
+            };
+            assert_eq!(count(|op| matches!(op, Op::IsExactPosition(..))), 1);
+            assert_eq!(
+                count(|op| matches!(op, Op::IndexedLength(..))),
+                if mutate { 2 } else { 1 }
+            );
+            assert_eq!(
+                count(|op| matches!(op, Op::IsInBounds(..))),
+                if mutate { 2 } else { 1 }
+            );
+            assert_eq!(count(|op| matches!(op, Op::IsArrayIndex(..))), 0);
+        }
+    }
 }

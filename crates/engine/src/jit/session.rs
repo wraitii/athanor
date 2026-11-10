@@ -291,18 +291,18 @@ impl<'a> JitCtx<'a> {
             .iter()
             .filter(|sample| !sample.site.is_null())
             .map(|sample| (unsafe { &*sample.site }, sample.code));
-        self.engine.record_calls(samples);
+        self.engine.tiering.record_calls(samples);
     }
 
     pub(crate) fn has_code(&self, code: u64) -> bool {
-        self.engine.has_code(code)
+        self.engine.tiering.has_code(code)
     }
 
     pub(crate) fn entry(
         &self,
         code: u64,
     ) -> Result<Option<crate::jit::entries::Entry>, crate::Error> {
-        self.engine.entry(code)
+        self.engine.tiering.entry(code)
     }
 
     pub(crate) fn resume(&mut self, locals: Vec<Value>, state: usize) -> Result<(), Vec<Value>> {

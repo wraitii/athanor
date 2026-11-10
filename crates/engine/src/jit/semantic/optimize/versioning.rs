@@ -33,6 +33,7 @@ fn retarget(graph: &mut Graph, blocks: &HashSet<Block>, from: Value, to: Value) 
 #[derive(Default)]
 pub(super) struct Speculation<'a> {
     pub(super) fallback: Option<usize>,
+    pub(super) continuations: bool,
     pub(super) reads: &'a [Inst],
     pub(super) guards: &'a [Block],
     pub(super) exits: &'a [Block],
@@ -150,6 +151,7 @@ pub(super) fn apply_version(
 ) -> Version {
     let Speculation {
         fallback,
+        continuations,
         guards,
         exits,
         exits_true,
@@ -208,7 +210,7 @@ pub(super) fn apply_version(
         tested,
         &mut copy,
     );
-    if !reuse && std::env::var_os("JS_JIT_NO_CONTINUATIONS").is_none() {
+    if !reuse && continuations {
         wire_failures(graph, region, speculation, canonical, &copy, &mut notes);
     }
     let Copy {
@@ -497,22 +499,10 @@ fn entry_checks(
     let mut current = start;
     let mut guarded_probes = HashMap::new();
     for (name, code) in code_guards {
-        let global = graph
-            .append(current, span, Op::ProbeGlobal(name.clone()), true)
-            .1
-            .unwrap();
+        let global = graph.append_value(current, span, Op::ProbeGlobal(name.clone()));
         guarded_probes.insert(name.clone(), global);
-        let check = graph
-            .append(current, span, Op::IsCode(global, *code), true)
-            .1
-            .unwrap();
-        let next = graph.blocks.push(BlockData::default());
-        graph.blocks[current].terminator = Some(Terminator {
-            source_name: None,
-            span,
-            kind: TerminatorKind::Branch(check, Target::new(next), original.clone()),
-        });
-        current = next;
+        let check = graph.append_value(current, span, Op::IsCode(global, *code));
+        current = continue_if(graph, current, check, &original);
     }
     if requirements
         .iter()
@@ -524,15 +514,12 @@ fn entry_checks(
         let commit = graph.blocks.push(BlockData::default());
         graph.cold.extend([probes, commit]);
         let validated = graph.blocks.push(BlockData::default());
-        let valid = graph
-            .append(current, span, Op::GuardValid(guard), true)
-            .1
-            .unwrap();
-        graph.blocks[current].terminator = Some(Terminator {
-            source_name: None,
+        let valid = graph.append_value(current, span, Op::GuardValid(guard));
+        graph.terminate(
+            current,
             span,
-            kind: TerminatorKind::Branch(valid, Target::new(validated), Target::new(probes)),
-        });
+            TerminatorKind::Branch(valid, Target::new(validated), Target::new(probes)),
+        );
         let mut globals: HashMap<String, Value> = HashMap::new();
         let mut methods = HashSet::new();
         let mut probed = Vec::new();
@@ -544,7 +531,7 @@ fn entry_checks(
                 Some(&value) => value,
                 None => {
                     let op = Op::ProbeGlobal(requirement.global.clone());
-                    let value = graph.append(probes, span, op, true).1.unwrap();
+                    let value = graph.append_value(probes, span, op);
                     globals.insert(requirement.global.clone(), value);
                     value
                 }
@@ -553,9 +540,9 @@ fn entry_checks(
                 continue;
             }
             let op = Op::ProbeProperty(global, requirement.property.clone());
-            let method = graph.append(probes, span, op, true).1.unwrap();
+            let method = graph.append_value(probes, span, op);
             let op = Op::IsNative(method, requirement.native);
-            probed.push(graph.append(probes, span, op, true).1.unwrap());
+            probed.push(graph.append_value(probes, span, op));
         }
         let mut chain = probes;
         for (index, &check) in probed.iter().enumerate() {
@@ -566,19 +553,15 @@ fn entry_checks(
                 graph.cold.insert(next);
                 next
             };
-            graph.blocks[chain].terminator = Some(Terminator {
-                source_name: None,
+            graph.terminate(
+                chain,
                 span,
-                kind: TerminatorKind::Branch(check, Target::new(next), original.clone()),
-            });
+                TerminatorKind::Branch(check, Target::new(next), original.clone()),
+            );
             chain = next;
         }
         graph.append(commit, span, Op::GuardCommit(guard), false);
-        graph.blocks[commit].terminator = Some(Terminator {
-            source_name: None,
-            span,
-            kind: TerminatorKind::Jump(Target::new(validated)),
-        });
+        graph.terminate(commit, span, TerminatorKind::Jump(Target::new(validated)));
         current = validated;
     }
     for requirement in requirements
@@ -587,32 +570,14 @@ fn entry_checks(
     {
         let method = match requirement.captured {
             Some(value) => value,
-            None => graph
-                .append(
-                    current,
-                    span,
-                    Op::ProbeProperty(requirement.object.unwrap(), requirement.property.clone()),
-                    true,
-                )
-                .1
-                .unwrap(),
-        };
-        let check = graph
-            .append(
+            None => graph.append_value(
                 current,
                 span,
-                Op::IsNative(method, requirement.native),
-                true,
-            )
-            .1
-            .unwrap();
-        let next = graph.blocks.push(BlockData::default());
-        graph.blocks[current].terminator = Some(Terminator {
-            source_name: None,
-            span,
-            kind: TerminatorKind::Branch(check, Target::new(next), original.clone()),
-        });
-        current = next;
+                Op::ProbeProperty(requirement.object.unwrap(), requirement.property.clone()),
+            ),
+        };
+        let check = graph.append_value(current, span, Op::IsNative(method, requirement.native));
+        current = continue_if(graph, current, check, &original);
     }
     let mut probes = HashMap::new();
     let mut replacements = HashMap::new();
@@ -649,12 +614,9 @@ fn entry_checks(
             Some(&value) => value,
             None => {
                 let input = matches!(op, Op::Argument(_) | Op::This);
-                let value = graph.append(current, data.span, op, true).1.unwrap();
+                let value = graph.append_value(current, data.span, op);
                 if !input {
-                    let failed = graph
-                        .append(current, data.span, Op::IsUninitialized(value), true)
-                        .1
-                        .unwrap();
+                    let failed = graph.append_value(current, data.span, Op::IsUninitialized(value));
                     let next = graph.blocks.push(BlockData::default());
                     graph.blocks[current].terminator = Some(Terminator {
                         source_name: data.source_name,
@@ -742,7 +704,7 @@ fn entry_checks(
             _ => None,
         };
         let condition = test.map_or(condition, |op| {
-            graph.append(current, span, op, true).1.unwrap()
+            graph.append_value(current, span, op)
         });
         let next = graph.blocks.push(BlockData::default());
         graph.blocks[current].terminator = Some(Terminator {
@@ -754,10 +716,7 @@ fn entry_checks(
         if let Some(object) = shaped
             && !objects.contains_key(&object)
         {
-            let alias = graph
-                .append(current, span, Op::AsObject(object), true)
-                .1
-                .unwrap();
+            let alias = graph.append_value(current, span, Op::AsObject(object));
             objects.insert(object, alias);
             retarget(graph, &copies, object, alias);
             for arg in &mut args {
@@ -780,45 +739,28 @@ fn entry_checks(
             continue;
         }
         tested.insert(guard);
-        let check = graph
-            .append(
-                current,
-                span,
-                if fact == Fact::Type(Types::INTEGER) {
-                    Op::IsInteger(checked)
-                } else {
-                    Op::IsNumber(checked)
-                },
-                true,
-            )
-            .1
-            .unwrap();
-        let next = graph.blocks.push(BlockData::default());
-        graph.blocks[current].terminator = Some(Terminator {
-            source_name: None,
-            span,
-            kind: TerminatorKind::Branch(check, Target::new(next), original.clone()),
-        });
-        current = next;
+        let check = if fact == Fact::Type(Types::INTEGER) {
+            Op::IsInteger(checked)
+        } else {
+            Op::IsNumber(checked)
+        };
+        let check = graph.append_value(current, span, check);
+        current = continue_if(graph, current, check, &original);
     }
     let mut numbers = HashMap::new();
     let mut aliases = HashMap::new();
     for (value, fact) in numeric() {
         let checked = values.get(&value).copied().unwrap_or(value);
         let number = *numbers.entry(checked).or_insert_with(|| {
-            graph
-                .append(
-                    current,
-                    span,
-                    if fact == Fact::Type(Types::INTEGER) {
-                        Op::AsInteger(checked)
-                    } else {
-                        Op::AsNumber(checked)
-                    },
-                    true,
-                )
-                .1
-                .unwrap()
+            graph.append_value(
+                current,
+                span,
+                if fact == Fact::Type(Types::INTEGER) {
+                    Op::AsInteger(checked)
+                } else {
+                    Op::AsNumber(checked)
+                },
+            )
         });
         if !hints.contains_key(&value)
             && let Some(site) = super::super::observations::numeric_site(graph, value)
@@ -876,21 +818,17 @@ fn entry_checks(
     bounds.sort();
     bounds.dedup();
     current = typed_guards(graph, current, &original, &mapped_typed, &bounds);
-    graph.blocks[current].terminator = Some(Terminator {
-        source_name: None,
+    graph.terminate(
+        current,
         span,
-        kind: TerminatorKind::Jump(Target {
+        TerminatorKind::Jump(Target {
             block: blocks[&head],
             args,
         }),
-    });
+    );
     match entry {
         Some((preheader, _)) => {
-            graph.blocks[preheader].terminator = Some(Terminator {
-                source_name: None,
-                span,
-                kind: TerminatorKind::Jump(Target::new(start)),
-            });
+            graph.terminate(preheader, span, TerminatorKind::Jump(Target::new(start)));
         }
         None => graph.entry = start,
     }
@@ -1024,20 +962,12 @@ fn wire_failures(
                     false,
                 );
             }
-            let result = graph
-                .append(
-                    stub,
-                    guard_span,
-                    Op::Continuation(piece.body.clone(), inputs),
-                    true,
-                )
-                .1
-                .unwrap();
-            graph.blocks[stub].terminator = Some(Terminator {
-                source_name: None,
-                span,
-                kind: TerminatorKind::Return(result),
-            });
+            let result = graph.append_value(
+                stub,
+                guard_span,
+                Op::Continuation(piece.body.clone(), inputs),
+            );
+            graph.terminate(stub, span, TerminatorKind::Return(result));
             graph.cold.insert(stub);
             stub
         });
@@ -1089,15 +1019,8 @@ fn wire_failures(
             continue;
         };
         graph.blocks[current].insts.clear();
-        let result = graph
-            .append(current, span, Op::Continuation(piece.body, inputs), true)
-            .1
-            .unwrap();
-        graph.blocks[current].terminator = Some(Terminator {
-            source_name: None,
-            span,
-            kind: TerminatorKind::Return(result),
-        });
+        let result = graph.append_value(current, span, Op::Continuation(piece.body, inputs));
+        graph.terminate(current, span, TerminatorKind::Return(result));
         notes.push(format!("loop at {current}: separate generic function"));
     }
     }
@@ -1249,6 +1172,13 @@ impl Repair<'_> {
     }
 }
 
+fn continue_if(graph: &mut Graph, block: Block, check: Value, otherwise: &Target) -> Block {
+    let next = graph.blocks.push(BlockData::default());
+    let kind = TerminatorKind::Branch(check, Target::new(next), otherwise.clone());
+    graph.terminate(block, graph.span, kind);
+    next
+}
+
 fn typed_guards(
     graph: &mut Graph,
     mut current: Block,
@@ -1258,32 +1188,14 @@ fn typed_guards(
 ) -> Block {
     let span = graph.span;
     for &(object, element) in typed {
-        let check = graph
-            .append(current, span, Op::IsTyped(object, element), true)
-            .1
-            .unwrap();
-        let next = graph.blocks.push(BlockData::default());
-        graph.blocks[current].terminator = Some(Terminator {
-            source_name: None,
-            span,
-            kind: TerminatorKind::Branch(check, Target::new(next), fallback.clone()),
-        });
-        current = next;
+        let check = graph.append_value(current, span, Op::IsTyped(object, element));
+        current = continue_if(graph, current, check, fallback);
     }
     for &(object, bound) in bounds {
-        let length = graph
-            .append(current, span, Op::IndexedLength(object), true)
-            .1
-            .unwrap();
+        let length = graph.append_value(current, span, Op::IndexedLength(object));
         let fits = Op::Binary(BinaryOperator::LessEqualThan, bound, length);
-        let fits = graph.append(current, span, fits, true).1.unwrap();
-        let next = graph.blocks.push(BlockData::default());
-        graph.blocks[current].terminator = Some(Terminator {
-            source_name: None,
-            span,
-            kind: TerminatorKind::Branch(fits, Target::new(next), fallback.clone()),
-        });
-        current = next;
+        let fits = graph.append_value(current, span, fits);
+        current = continue_if(graph, current, fits, fallback);
     }
     current
 }
@@ -1331,15 +1243,11 @@ mod tests {
                 )
             })
             .unwrap();
-        let condition = graph
-            .append(
-                branch,
-                graph.span,
-                Op::IsTyped(xs, Some(TypedKind::Float32)),
-                true,
-            )
-            .1
-            .unwrap();
+        let condition = graph.append_value(
+            branch,
+            graph.span,
+            Op::IsTyped(xs, Some(TypedKind::Float32)),
+        );
         let TerminatorKind::Branch(test, yes, no) =
             &mut graph.blocks[branch].terminator.as_mut().unwrap().kind
         else {
