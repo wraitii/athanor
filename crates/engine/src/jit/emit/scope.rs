@@ -311,18 +311,18 @@ pub(in crate::jit) fn collect_var_symbols(
                 }
             }
             Statement::ForInStatement(statement) => {
-                if let ForStatementLeft::VariableDeclaration(declaration) = &statement.left {
-                    if declaration.kind == VariableDeclarationKind::Var {
-                        collect_declaration_symbols(declaration, symbols);
-                    }
+                if let ForStatementLeft::VariableDeclaration(declaration) = &statement.left
+                    && declaration.kind == VariableDeclarationKind::Var
+                {
+                    collect_declaration_symbols(declaration, symbols);
                 }
                 collect_var_symbols(std::slice::from_ref(&statement.body), symbols);
             }
             Statement::ForOfStatement(statement) => {
-                if let ForStatementLeft::VariableDeclaration(declaration) = &statement.left {
-                    if declaration.kind == VariableDeclarationKind::Var {
-                        collect_declaration_symbols(declaration, symbols);
-                    }
+                if let ForStatementLeft::VariableDeclaration(declaration) = &statement.left
+                    && declaration.kind == VariableDeclarationKind::Var
+                {
+                    collect_declaration_symbols(declaration, symbols);
                 }
                 collect_var_symbols(std::slice::from_ref(&statement.body), symbols);
             }

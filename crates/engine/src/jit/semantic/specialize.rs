@@ -346,9 +346,8 @@ impl Repository {
                 {
                     let target = match graph.defining_op(*callee) {
                         Some(Op::GlobalRead(name)) => {
-                            self.globals.get(name).copied().map(|target| {
+                            self.globals.get(name).copied().inspect(|&target| {
                                 requires.identities.insert((name.clone(), target));
-                                target
                             })
                         }
                         Some(Op::Closure(_, target, _, false, _, _, _)) => Some(*target),
@@ -1088,7 +1087,10 @@ mod tests {
         let plan = conditional_plan(&canonical.graph, &bodies, &mut notes);
         assert!(plan.calls.is_empty());
         let summaries = bodies.effect_summaries([FuncId::from_u32(0)]);
-        assert_eq!(summaries[&FuncId::from_u32(0)].requires.string_splits.len(), 1);
+        assert_eq!(
+            summaries[&FuncId::from_u32(0)].requires.string_splits.len(),
+            1
+        );
         assert!(
             notes.iter().any(|note| note.contains("createTerrain")
                 && note.contains("method .map")
@@ -1114,11 +1116,7 @@ mod tests {
         );
         assert_eq!(graph.entry, original_entry);
         assert_eq!(graph.blocks.len(), original_blocks);
-        assert!(
-            notes
-                .iter()
-                .any(|note| note.contains("reenters"))
-        );
+        assert!(notes.iter().any(|note| note.contains("reenters")));
     }
 
     fn closed_calls(graph: &Graph) -> Vec<Inst> {
@@ -1148,11 +1146,11 @@ mod tests {
         let region = &regions[0];
         let closed = closed_calls(&graph);
         assert_eq!(closed.len(), 1);
-        assert!(
-            closed
-                .iter()
-                .all(|inst| graph.regions[*region].blocks.contains(&graph.insts[*inst].block))
-        );
+        assert!(closed.iter().all(|inst| {
+            graph.regions[*region]
+                .blocks
+                .contains(&graph.insts[*inst].block)
+        }));
         assert_eq!(
             operations(&graph)
                 .iter()

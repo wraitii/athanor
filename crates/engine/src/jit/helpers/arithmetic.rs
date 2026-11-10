@@ -277,6 +277,6 @@ pub(super) extern "C" fn js_shift_right_unsigned(
     right: Value,
 ) -> Value {
     bitwise_binary(ctx, left, right, |left, right| {
-        (((left as u32) >> ((right as u32) & 31)) as i64) as i64
+        ((left as u32) >> ((right as u32) & 31)) as i64
     })
 }

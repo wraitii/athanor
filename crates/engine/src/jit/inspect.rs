@@ -233,8 +233,8 @@ impl CompileOptions {
                 out.push('\n');
                 decoded = end as usize;
             }
-            for offset in decoded..end {
-                writeln!(out, "  +{offset:06x}  .byte 0x{:02x}", code[offset]).unwrap();
+            for (offset, byte) in code.iter().enumerate().take(end).skip(decoded) {
+                writeln!(out, "  +{offset:06x}  .byte 0x{byte:02x}").unwrap();
             }
         }
         print!("{out}");

@@ -534,7 +534,10 @@ impl<'a> Builder<'a> {
                 Op::Unary(operator, value)
             }
             Expression::BinaryExpression(x) => {
-                if matches!(x.operator, BinaryOperator::Equality | BinaryOperator::Inequality) {
+                if matches!(
+                    x.operator,
+                    BinaryOperator::Equality | BinaryOperator::Inequality
+                ) {
                     let other = if self.nullish_literal(&x.right)? {
                         Some(&x.left)
                     } else if self.nullish_literal(&x.left)? {

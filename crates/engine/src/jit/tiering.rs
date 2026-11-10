@@ -533,7 +533,7 @@ impl Tiering {
         if site.entry.get() != 0 {
             return site.entry.get();
         }
-        if site.entries.get() % jit::osr::TICK != 0 {
+        if !site.entries.get().is_multiple_of(jit::osr::TICK) {
             return 0;
         }
         self.poll_compilation();

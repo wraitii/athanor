@@ -83,8 +83,7 @@ fn planned(graph: &Graph, plan: &Plan) -> HashMap<Inst, (Value, u32, u32)> {
             let (Op::Get(object, _) | Op::Set(object, ..)) = data.op else {
                 unreachable!();
             };
-            if data.result.is_some_and(|value| callees.contains(&value))
-                || invariant(block, object)
+            if data.result.is_some_and(|value| callees.contains(&value)) || invariant(block, object)
             {
                 continue;
             }
@@ -191,11 +190,7 @@ fn segments(graph: &Graph, planned: &HashMap<Inst, (Value, u32, u32)>) -> Vec<Se
     segments
 }
 
-pub(super) fn apply(
-    graph: &mut Graph,
-    plan: &Plan,
-    notes: &mut Vec<String>,
-) -> super::Result<()> {
+pub(super) fn apply(graph: &mut Graph, plan: &Plan, notes: &mut Vec<String>) -> super::Result<()> {
     if plan.accesses.is_empty() {
         return Ok(());
     }
@@ -280,9 +275,7 @@ fn guard_segment(
         .insts
         .iter()
         .filter_map(|&inst| graph.insts[inst].result)
-        .filter(|value| {
-            counts[*value] > inner.get(value).copied().unwrap_or(0)
-        })
+        .filter(|value| counts[*value] > inner.get(value).copied().unwrap_or(0))
         .collect();
     let params: HashMap<Value, Value> = outputs
         .iter()
@@ -305,9 +298,8 @@ fn guard_segment(
         }),
     };
     graph.blocks[fast].terminator = Some(jump(outputs.clone()));
-    graph.blocks[fallback].terminator = Some(jump(
-        outputs.iter().map(|value| clones[value]).collect(),
-    ));
+    graph.blocks[fallback].terminator =
+        Some(jump(outputs.iter().map(|value| clones[value]).collect()));
 
     let mut check_block = block;
     for (position, &(object, shape)) in segment.guards.iter().enumerate() {

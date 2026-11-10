@@ -136,23 +136,23 @@ impl<'a> Visit<'a> for Analyzer<'_> {
             .get()
             .map(|id| self.scoping.get_reference(id));
         let resolved = reference.and_then(|reference| reference.symbol_id());
-        if identifier.name == "arguments" {
-            if let Some(owner_index) = self.active.iter().rposition(|function| !function.arrow) {
-                let owner = &self.active[owner_index];
-                let is_local = resolved.is_some_and(|symbol| {
-                    let scope = self.scoping.symbol_scope_id(symbol);
-                    scope == owner.scope || self.scoping.scope_is_descendant_of(scope, owner.scope)
-                });
-                if !is_local {
-                    let symbol = self.result.arguments_bindings[&owner.start];
-                    self.result
-                        .arguments_references
-                        .insert(identifier.span.start, symbol);
-                    for function in &self.active[owner_index + 1..] {
-                        self.result.add_capture(function.start, symbol);
-                    }
-                    return;
+        if identifier.name == "arguments"
+            && let Some(owner_index) = self.active.iter().rposition(|function| !function.arrow)
+        {
+            let owner = &self.active[owner_index];
+            let is_local = resolved.is_some_and(|symbol| {
+                let scope = self.scoping.symbol_scope_id(symbol);
+                scope == owner.scope || self.scoping.scope_is_descendant_of(scope, owner.scope)
+            });
+            if !is_local {
+                let symbol = self.result.arguments_bindings[&owner.start];
+                self.result
+                    .arguments_references
+                    .insert(identifier.span.start, symbol);
+                for function in &self.active[owner_index + 1..] {
+                    self.result.add_capture(function.start, symbol);
                 }
+                return;
             }
         }
         let Some(symbol) = resolved else {

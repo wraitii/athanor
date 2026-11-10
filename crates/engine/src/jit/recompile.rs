@@ -294,7 +294,7 @@ fn spawn_worker(
                         queued.elapsed().as_secs_f64() * 1000.0
                     ));
                 }
-                if !compilers.contains_key(&job.tier) {
+                if let std::collections::hash_map::Entry::Vacant(e) = compilers.entry(job.tier) {
                     match Compiler::new(
                         options.clone(),
                         job.tier,
@@ -303,7 +303,7 @@ fn spawn_worker(
                         log,
                     ) {
                         Ok(created) => {
-                            compilers.insert(job.tier, created);
+                            e.insert(created);
                         }
                         Err(error) => {
                             let _ = results.send(Completion {

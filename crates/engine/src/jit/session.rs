@@ -415,15 +415,13 @@ impl<'a> JitCtx<'a> {
             return false;
         }
         let values = [receiver, key, result];
-        let mut retained = 0;
-        for value in values {
+        for (retained, value) in values.into_iter().enumerate() {
             if !heap.retain(value) {
                 for value in values.into_iter().take(retained) {
                     heap.release(value);
                 }
                 return false;
             }
-            retained += 1;
         }
         let old = std::mem::replace(&mut self.index_root, values);
         heap.release_all(&old);

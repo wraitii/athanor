@@ -353,10 +353,12 @@ fn property_integer_feedback_preserves_type_changes() {
 #[test]
 fn ineligible_feedback_keeps_the_existing_entry() {
     let mut engine = new_engine().unwrap();
-    engine.compile(
-        "function run(x){return arguments[0];}function invoke(x){return run(x);}",
-        "ineligible.js",
-    ).unwrap();
+    engine
+        .compile(
+            "function run(x){return arguments[0];}function invoke(x){return run(x);}",
+            "ineligible.js",
+        )
+        .unwrap();
     let code = code(&engine, "invoke");
     let original = entry(&engine, code);
     for _ in 0..3 {
@@ -395,10 +397,12 @@ fn ineligible_method_feedback_keeps_the_existing_entry() {
 #[test]
 fn shape_feedback_respecializes_property_reads() {
     let mut engine = new_engine().unwrap();
-    engine.compile(
-        "var object={a:3,b:4};function read(){return object.a*object.b;}",
-        "shape_feedback.js",
-    ).unwrap();
+    engine
+        .compile(
+            "var object={a:3,b:4};function read(){return object.a*object.b;}",
+            "shape_feedback.js",
+        )
+        .unwrap();
     let code = code(&engine, "read");
     let original = entry(&engine, code);
     let mut entries = Vec::new();
@@ -868,14 +872,21 @@ fn osr_request_queues_the_enclosing_function_before_return() {
         .unwrap();
     let code = code(&engine, "hot");
     entry(&engine, code);
-    let (site, location, kind) = engine.tiering.compiler.borrow().osr_read_site(code).unwrap();
+    let (site, location, kind) = engine
+        .tiering
+        .compiler
+        .borrow()
+        .osr_read_site(code)
+        .unwrap();
     let site = unsafe { &*site };
     let mut cache = jit::profile::ObservationCache {
         recorded: 0,
         owner: code,
         site: location,
     };
-    engine.tiering.observe_get(&mut cache, jit::profile::ReadType::Array, kind);
+    engine
+        .tiering
+        .observe_get(&mut cache, jit::profile::ReadType::Array, kind);
     assert!(!engine.tiering.direct.warmed(code));
     site.entries.set(jit::osr::TICK);
     engine.tiering.osr_entry(site);
@@ -994,7 +1005,12 @@ fn baseline_bodies_upgrade_without_specialization_changes() {
         .compile("function f(a){return a+1;}", "tier-upgrade.js")
         .unwrap();
     let code = code(&engine, "f");
-    let mut job = engine.tiering.compiler.borrow().lazy_compilation(code).unwrap();
+    let mut job = engine
+        .tiering
+        .compiler
+        .borrow()
+        .lazy_compilation(code)
+        .unwrap();
     job.tier = jit::CompilationTier::Baseline;
     let mut baseline = Compiler::new(
         engine.tiering.options.clone(),
@@ -1012,7 +1028,11 @@ fn baseline_bodies_upgrade_without_specialization_changes() {
         .borrow_mut()
         .install_unpublished(unpublished)
         .unwrap();
-    engine.tiering.code.borrow_mut().resize(code as usize + 1, None);
+    engine
+        .tiering
+        .code
+        .borrow_mut()
+        .resize(code as usize + 1, None);
     engine.tiering.code.borrow_mut()[code as usize] = Some(original);
     assert_eq!(
         engine.call("f", &[Value::number(2.0)]).unwrap().value(),
@@ -1143,7 +1163,12 @@ fn synchronous_compilation_supersedes_an_unpublished_initial_entry() {
         .compile("function f(a){return a.items[0];}", "takeover.js")
         .unwrap();
     let code = code(&engine, "f");
-    let job = engine.tiering.compiler.borrow().lazy_compilation(code).unwrap();
+    let job = engine
+        .tiering
+        .compiler
+        .borrow()
+        .lazy_compilation(code)
+        .unwrap();
     let mut worker = Compiler::new(
         engine.tiering.options.clone(),
         jit::CompilationTier::Optimized,
@@ -1178,7 +1203,11 @@ fn prefetched_closures_preserve_captures_and_lexical_this() {
     engine.tiering.entry(caller).unwrap().unwrap();
     finish_compilation(&engine);
     assert!(!engine.tiering.compiler.borrow().has_lazy(closure));
-    assert!(engine.tiering.code.borrow()[closure as usize].unwrap().lexical_this);
+    assert!(
+        engine.tiering.code.borrow()[closure as usize]
+            .unwrap()
+            .lexical_this
+    );
     assert_eq!(
         engine.call("run", &[]).unwrap().value(),
         Value::number(172.0)
@@ -1332,7 +1361,17 @@ fn requests_during_background_compilation_are_coalesced_and_retained() {
         engine.tiering.request_compilation(code);
         engine.tiering.submit_compilation(code);
     }
-    assert_eq!(engine.tiering.worker.borrow().as_ref().unwrap().in_flight.len(), 1);
+    assert_eq!(
+        engine
+            .tiering
+            .worker
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .in_flight
+            .len(),
+        1
+    );
     assert!(engine.tiering.recompiles.borrow().has_pending());
     finish_compilation(&engine);
     assert!(!engine.tiering.recompiles.borrow().has_pending());

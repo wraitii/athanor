@@ -1114,7 +1114,10 @@ impl FunctionCompiler<'_, '_> {
                         | Op::ArrayLoad(..) => {
                             unreachable!()
                         }
-                        Op::IsTyped(..) | Op::IsPropertyCached(..) | Op::IsShape(..) | Op::IsCode(..) => {
+                        Op::IsTyped(..)
+                        | Op::IsPropertyCached(..)
+                        | Op::IsShape(..)
+                        | Op::IsCode(..) => {
                             unreachable!()
                         }
                         Op::IsIndexed(value) => {
@@ -1514,8 +1517,7 @@ impl FunctionCompiler<'_, '_> {
                 };
                 if let (Some(value), Some(result)) = (data.result, result) {
                     let result = self.convert(result, reprs[value]);
-                    let borrowed = (graph.caller_rooted(value)
-                        || graph.borrowed.contains(&value))
+                    let borrowed = (graph.caller_rooted(value) || graph.borrowed.contains(&value))
                         && !suspends;
                     if owned {
                         let repeated = repeated(block) || cx.slots.shared(value);

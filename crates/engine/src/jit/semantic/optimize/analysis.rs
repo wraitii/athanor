@@ -1,5 +1,5 @@
-use super::*;
 use super::super::fresh::Fresh;
+use super::*;
 
 pub(super) struct Writes {
     writes: Vec<(Inst, Access)>,

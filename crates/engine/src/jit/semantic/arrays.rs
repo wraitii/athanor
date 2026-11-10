@@ -257,7 +257,11 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
         }
     }
     let one = graph.append_value(advance, span, Op::Constant(Constant::Number(1.0)));
-    let next = graph.append_value(advance, span, Op::Binary(BinaryOperator::Addition, index, one));
+    let next = graph.append_value(
+        advance,
+        span,
+        Op::Binary(BinaryOperator::Addition, index, one),
+    );
     graph.blocks[advance].terminator = Some(Terminator {
         source_name: call.source_name,
         span,

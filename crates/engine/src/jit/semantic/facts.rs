@@ -201,7 +201,10 @@ impl Facts {
                 if self.rejected.contains(&inst) || self.assumes(callee) {
                     continue;
                 }
-                if graph.call_summary(inst, callee, self).is_some_and(|summary| !summary.requires.is_empty()) {
+                if graph
+                    .call_summary(inst, callee, self)
+                    .is_some_and(|summary| !summary.requires.is_empty())
+                {
                     pending.push(inst);
                 }
             }
@@ -228,9 +231,11 @@ impl Facts {
                         probed == name
                             && guarded == code
                             && self.cfg.dominates(*entry, block)
-                            && state.get(&available::LoadKey::Probe(name.clone())).is_some_and(
-                                |available| available.value == solved.canonical(*probe),
-                            )
+                            && state
+                                .get(&available::LoadKey::Probe(name.clone()))
+                                .is_some_and(|available| {
+                                    available.value == solved.canonical(*probe)
+                                })
                     })
                 })
             })
@@ -253,10 +258,7 @@ impl Facts {
         Self::assuming(graph, &[])
     }
 
-    pub(super) fn assuming(
-        graph: &Graph,
-        candidates: &[(Value, guards::Fact)],
-    ) -> Self {
+    pub(super) fn assuming(graph: &Graph, candidates: &[(Value, guards::Fact)]) -> Self {
         let assumptions: HashMap<Value, Types> = candidates
             .iter()
             .filter_map(|&(value, fact)| Some((value, fact.mask()?)))

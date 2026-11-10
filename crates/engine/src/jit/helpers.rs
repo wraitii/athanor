@@ -364,9 +364,7 @@ pub(crate) fn signature(shape: HelperShape, call_conv: CallConv, pointer: Type) 
             }
         }
         HelperShape::Pointer => signature.params.push(AbiParam::new(pointer)),
-        HelperShape::GlobalSet
-        | HelperShape::PropertyGet
-        | HelperShape::PropertySet => {
+        HelperShape::GlobalSet | HelperShape::PropertyGet | HelperShape::PropertySet => {
             if matches!(shape, HelperShape::PropertyGet | HelperShape::PropertySet) {
                 signature.params.push(AbiParam::new(types::I64));
             }
@@ -759,7 +757,8 @@ fn observe_read(
         } else {
             context
                 .engine
-                .tiering.observe_get(cache, super::profile::ReadType::Unknown, kind);
+                .tiering
+                .observe_get(cache, super::profile::ReadType::Unknown, kind);
         }
     }
     Value::UNDEFINED

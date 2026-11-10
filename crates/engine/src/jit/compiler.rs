@@ -683,7 +683,10 @@ impl Compiler {
                 &analysis.captured,
                 &callable.captures,
                 &closures,
-                analysis.arguments_bindings.get(&callable.span.start).copied(),
+                analysis
+                    .arguments_bindings
+                    .get(&callable.span.start)
+                    .copied(),
                 &analysis.arguments_references,
                 false,
                 self.ssa_opt,
@@ -724,7 +727,10 @@ impl Compiler {
                 callable.params,
                 callable.statements,
                 callable.expression,
-                analysis.arguments_bindings.get(&callable.span.start).copied(),
+                analysis
+                    .arguments_bindings
+                    .get(&callable.span.start)
+                    .copied(),
                 &analysis.arguments_references,
                 &callable.captures,
                 &analysis.captured,
@@ -863,7 +869,7 @@ impl Compiler {
                 super::read_scope::specialize(
                     &mut self.context,
                     &mut code.annotations,
-                    &mut self.module,
+                    &self.module,
                 );
                 let removed =
                     temporaries::remove_empty_clears(&mut self.context.func, &code.annotations);
@@ -874,7 +880,7 @@ impl Compiler {
             if self.dump_ir
                 && let Some(semantic) = &code.listing
             {
-                let ir = ir_lines(semantic, source, source_path, &lines, &self.sources);
+                let ir = ir_lines(semantic, source, source_path, lines, &self.sources);
                 if let Some(dump) = self.dump.as_mut() {
                     match dump.listing(&name, &ir) {
                         Ok(written) => listing = Some(written),
@@ -970,7 +976,7 @@ impl Compiler {
                         } else {
                             offset
                         };
-                        let line = line_at(&lines, offset);
+                        let line = line_at(lines, offset);
                         default_line.get_or_insert(line);
                         locations.insert(location.start, line);
                     }
@@ -1021,8 +1027,7 @@ impl Compiler {
             && (!self.get_refinement
                 || profile.reads().all(|(site, observed)| {
                     self.canonical.read_feedback.get(&site) == Some(&observed)
-                })
-                && profile.shapes().all(|(site, access)| {
+                }) && profile.shapes().all(|(site, access)| {
                     self.canonical.shape_feedback.get(&site) == Some(&access)
                 }))
         {

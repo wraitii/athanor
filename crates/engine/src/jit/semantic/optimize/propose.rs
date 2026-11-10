@@ -29,7 +29,11 @@ pub(super) fn numbers(graph: &mut Graph) -> Vec<(Value, Fact)> {
                 {
                     continue;
                 }
-                let fact = Fact::Type(if integer { Types::INTEGER } else { Types::NUMBER });
+                let fact = Fact::Type(if integer {
+                    Types::INTEGER
+                } else {
+                    Types::NUMBER
+                });
                 if !seen.insert((block, value, fact)) {
                     continue;
                 }
@@ -61,8 +65,7 @@ pub(super) fn typed(graph: &mut Graph, numbers: &[(Value, Fact)]) {
     let mut objects = HashSet::new();
     for &block in &cfg.rpo {
         for &inst in &graph.blocks[block].insts {
-            if let Op::GetIndex(object, key) | Op::TypedIndex(object, key, _) =
-                graph.insts[inst].op
+            if let Op::GetIndex(object, key) | Op::TypedIndex(object, key, _) = graph.insts[inst].op
                 && under.of(key).within(NUMERIC)
                 && let Some(element) = element_guess(graph, object)
             {
@@ -119,7 +122,12 @@ pub(super) fn natives(graph: &mut Graph) {
             kind: Kind::Native,
             gain: 1,
         };
-        graph.append(block, span, Op::Assume(callee, Fact::Native(native), origin), false);
+        graph.append(
+            block,
+            span,
+            Op::Assume(callee, Fact::Native(native), origin),
+            false,
+        );
     }
 }
 
@@ -146,7 +154,12 @@ pub(super) fn identities(graph: &mut Graph, conditional: &ConditionalPlan) -> Ve
             kind: Kind::Identity,
             gain: 1,
         };
-        graph.append(block, span, Op::Assume(probe.unwrap(), Fact::Code(code), origin), false);
+        graph.append(
+            block,
+            span,
+            Op::Assume(probe.unwrap(), Fact::Code(code), origin),
+            false,
+        );
         added.push(probe_inst);
     }
     added

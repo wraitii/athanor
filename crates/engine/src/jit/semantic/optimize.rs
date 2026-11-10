@@ -9,8 +9,8 @@ use super::guards;
 use super::js::NUMERIC;
 use super::{
     Block, BlockData, Cfg, Constant, Facts, Graph, Inst, Native, Op, Region, RegionFallback,
-    RegionId, Result, Target, Terminator, TerminatorKind, TypedRead, Types, UnaryOp, Value, ValueDef,
-    resolve,
+    RegionId, Result, Target, Terminator, TerminatorKind, TypedRead, Types, UnaryOp, Value,
+    ValueDef, resolve,
 };
 use crate::heap::TypedKind;
 
@@ -194,7 +194,10 @@ fn cold_exit(graph: &Graph, block: Block) -> Option<Block> {
     else {
         return None;
     };
-    graph.cold.contains(&otherwise.block).then_some(otherwise.block)
+    graph
+        .cold
+        .contains(&otherwise.block)
+        .then_some(otherwise.block)
 }
 
 fn invariant_guards(
@@ -222,7 +225,6 @@ fn invariant_guards(
         })
         .collect()
 }
-
 
 fn typed_entry(
     graph: &Graph,
@@ -931,7 +933,12 @@ mod tests {
         let object = graph.append_value(block, span, Op::Argument(0));
         let value = graph.append_value(block, span, Op::Argument(1));
         let first = graph.append(block, span, Op::IsShape(object, 1), true).1;
-        graph.append(block, span, Op::ShapedSet(object, "x".into(), 0, value), false);
+        graph.append(
+            block,
+            span,
+            Op::ShapedSet(object, "x".into(), 0, value),
+            false,
+        );
         let (second, _) = graph.append(block, span, Op::IsShape(object, 1), true);
         graph.append(block, span, Op::Set(object, "y".into(), value), false);
         let (third, _) = graph.append(block, span, Op::IsShape(object, 1), true);
@@ -939,8 +946,8 @@ mod tests {
         graph.verify().unwrap();
         let facts = Facts::compute(&graph);
         let cfg = Cfg::new(&graph);
-        let solved = super::super::available::solve(&graph, &facts, &cfg, HashSet::new(), false)
-            .unwrap();
+        let solved =
+            super::super::available::solve(&graph, &facts, &cfg, HashSet::new(), false).unwrap();
         let reused: Vec<Inst> = solved.reused.iter().map(|&(inst, _)| inst).collect();
         assert!(reused.contains(&second));
         assert!(!reused.contains(&third));

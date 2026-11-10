@@ -63,7 +63,7 @@ pub(in crate::jit) fn call(ctx: &mut JitCtx, function: MathFunction, args: &[Val
         Round => {
             if !x.is_finite() || x == 0.0 {
                 x
-            } else if x >= -0.5 && x < 0.0 {
+            } else if (-0.5..0.0).contains(&x) {
                 -0.0
             } else {
                 let floor = x.floor();

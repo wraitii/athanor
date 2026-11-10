@@ -199,10 +199,10 @@ pub(crate) const CACHE_ADDITION_INDEX_OFFSET: i32 =
 
 const CACHE_OVERWRITE_OFFSET: i32 = std::mem::offset_of!(PropertyCache, write) as i32
     + std::mem::offset_of!(crate::heap::PropertyWriteCache, overwrite) as i32;
-pub(crate) const CACHE_OVERWRITE_SHAPE_OFFSET: i32 =
-    CACHE_OVERWRITE_OFFSET + std::mem::offset_of!(crate::heap::PropertyOverwriteCache, shape) as i32;
-pub(crate) const CACHE_OVERWRITE_INDEX_OFFSET: i32 =
-    CACHE_OVERWRITE_OFFSET + std::mem::offset_of!(crate::heap::PropertyOverwriteCache, index) as i32;
+pub(crate) const CACHE_OVERWRITE_SHAPE_OFFSET: i32 = CACHE_OVERWRITE_OFFSET
+    + std::mem::offset_of!(crate::heap::PropertyOverwriteCache, shape) as i32;
+pub(crate) const CACHE_OVERWRITE_INDEX_OFFSET: i32 = CACHE_OVERWRITE_OFFSET
+    + std::mem::offset_of!(crate::heap::PropertyOverwriteCache, index) as i32;
 
 impl PropertyCache {
     pub(crate) fn new(name: &str, observer: Option<(u64, crate::jit::profile::Site)>) -> Self {
@@ -547,15 +547,15 @@ pub(super) extern "C" fn js_index_set(
     } else {
         index
     };
-    if ctx.global.heap().is_array(array) {
-        if let Some(index) = array_index(index) {
-            if !ctx.global.heap().set(array, index, value) {
-                ctx.error = Some(Box::new(crate::Error::Runtime(
-                    "unsupported array index or receiver".into(),
-                )));
-            }
-            return value;
+    if ctx.global.heap().is_array(array)
+        && let Some(index) = array_index(index)
+    {
+        if !ctx.global.heap().set(array, index, value) {
+            ctx.error = Some(Box::new(crate::Error::Runtime(
+                "unsupported array index or receiver".into(),
+            )));
         }
+        return value;
     }
     let Some(name) = property_key(ctx, index) else {
         return Value::UNDEFINED;
@@ -630,13 +630,14 @@ pub(super) extern "C" fn js_semantic_index_probe(
                 .unwrap_or(Value::UNDEFINED);
         }
     }
-    if key.is_string() && (heap.is_array(object) || object.is_string()) {
-        if let Some(index) = heap.text(key).as_deref().and_then(named_array_index) {
-            return match heap.read_numeric_index(object, index as f64) {
-                Some(IndexRead::Primitive(value) | IndexRead::Borrowed(value)) => value,
-                _ => Value::UNINITIALIZED,
-            };
-        }
+    if key.is_string()
+        && (heap.is_array(object) || object.is_string())
+        && let Some(index) = heap.text(key).as_deref().and_then(named_array_index)
+    {
+        return match heap.read_numeric_index(object, index as f64) {
+            Some(IndexRead::Primitive(value) | IndexRead::Borrowed(value)) => value,
+            _ => Value::UNINITIALIZED,
+        };
     }
     if key.is_object() || key == Value::UNINITIALIZED {
         return Value::UNINITIALIZED;

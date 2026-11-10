@@ -91,13 +91,13 @@ impl FunctionCompiler<'_, '_> {
                 let unordered = self.b.ins().fcmp(FloatCC::Unordered, value, value);
                 let bits = self.b.ins().bitcast(types::I64, MemFlagsData::new(), value);
                 let nan = self.constant(Value::number(f64::NAN));
-                let boxed = self.b.ins().select(unordered, nan, bits);
-                boxed
+
+                self.b.ins().select(unordered, nan, bits)
             }
             (Repr::Int64, Repr::Boxed) | (Repr::Int32, Repr::Boxed) => {
                 let float = self.b.ins().fcvt_from_sint(types::F64, value);
-                let boxed = self.b.ins().bitcast(types::I64, MemFlagsData::new(), float);
-                boxed
+
+                self.b.ins().bitcast(types::I64, MemFlagsData::new(), float)
             }
             (Repr::Bool, Repr::Boxed) => {
                 let yes = self.constant(Value::TRUE);

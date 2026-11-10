@@ -42,12 +42,7 @@ pub(super) struct Solved {
     probes: bool,
 }
 
-fn load_key(
-    op: &Op,
-    pure: bool,
-    probes: bool,
-    aliases: &HashMap<Value, Value>,
-) -> Option<LoadKey> {
+fn load_key(op: &Op, pure: bool, probes: bool, aliases: &HashMap<Value, Value>) -> Option<LoadKey> {
     let at = |value: &Value| resolve(aliases, *value);
     Some(match op {
         Op::Get(object, name) | Op::ShapedGet(object, name, _) => {
@@ -77,10 +72,9 @@ fn load_key(
             ..
         } if pure => LoadKey::Binary(*operator, at(left), at(right)),
         _ => match implies(op)? {
-            (
-                value,
-                fact @ (Fact::Type(_) | Fact::Code(_) | Fact::Typed(_) | Fact::Shape(_)),
-            ) => LoadKey::Check(at(&value), fact),
+            (value, fact @ (Fact::Type(_) | Fact::Code(_) | Fact::Typed(_) | Fact::Shape(_))) => {
+                LoadKey::Check(at(&value), fact)
+            }
             _ => return None,
         },
     })
@@ -177,8 +171,7 @@ pub(super) fn solve(
             let mut state = entering(graph, cfg, &exits, block);
             let is_cold = cold.contains(&block);
             for &inst in &graph.blocks[block].insts {
-                if let Some(value) =
-                    step(graph, facts, inst, is_cold, probes, &aliases, &mut state)
+                if let Some(value) = step(graph, facts, inst, is_cold, probes, &aliases, &mut state)
                 {
                     aliases.insert(graph.insts[inst].result.unwrap(), value);
                     reused.push((inst, value));
@@ -218,7 +211,15 @@ impl Solved {
             if earlier == inst {
                 break;
             }
-            step(graph, facts, earlier, cold, self.probes, &self.aliases, &mut state);
+            step(
+                graph,
+                facts,
+                earlier,
+                cold,
+                self.probes,
+                &self.aliases,
+                &mut state,
+            );
         }
         state
     }

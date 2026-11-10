@@ -119,7 +119,7 @@ impl Arena {
 
     pub(super) fn owns(&self, address: u64) -> bool {
         let address = address as usize;
-        address % SLOT_SIZE == 0 && self.chunks.iter().any(|chunk| chunk.contains(address))
+        address.is_multiple_of(SLOT_SIZE) && self.chunks.iter().any(|chunk| chunk.contains(address))
     }
 
     #[cfg(test)]

@@ -336,15 +336,14 @@ impl Heap {
         } else if data
             .closure(id)
             .is_some_and(|closure| closure.constructable)
+            && let Some(index) = keys.iter().position(|name| name == "prototype")
         {
-            if let Some(index) = keys.iter().position(|name| name == "prototype") {
-                let name = keys.remove(index);
-                let first_string = keys
-                    .iter()
-                    .take_while(|name| array_index_name(name).is_some())
-                    .count();
-                keys.insert(first_string, name);
-            }
+            let name = keys.remove(index);
+            let first_string = keys
+                .iter()
+                .take_while(|name| array_index_name(name).is_some())
+                .count();
+            keys.insert(first_string, name);
         }
         Some(keys)
     }
@@ -502,10 +501,10 @@ impl Heap {
             let keys = next
                 .and_then(|value| data.enumeration_keys(value))
                 .unwrap_or_default();
-            if let Some(next) = next {
-                if !data.retain(next) {
-                    return None;
-                }
+            if let Some(next) = next
+                && !data.retain(next)
+            {
+                return None;
             }
             let state = data.enumerator_mut(id).unwrap();
             state.current = next;

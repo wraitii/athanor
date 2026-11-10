@@ -12,12 +12,9 @@ pub(in crate::jit::semantic) fn trim(graph: &mut Graph) {
         if graph.blocks[block].terminator.is_none() {
             continue;
         }
-        loop {
-            let TerminatorKind::Jump(target) =
-                &graph.blocks[block].terminator.as_ref().unwrap().kind
-            else {
-                break;
-            };
+        while let TerminatorKind::Jump(target) =
+            &graph.blocks[block].terminator.as_ref().unwrap().kind
+        {
             let next = target.block;
             if next == block || next == graph.entry || preds[next][..] != [block] {
                 break;

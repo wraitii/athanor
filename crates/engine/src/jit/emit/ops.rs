@@ -17,7 +17,8 @@ use crate::jit::helpers::{
     self, CACHE_ADDITION_DESTINATION_OFFSET, CACHE_ADDITION_INDEX_OFFSET,
     CACHE_ADDITION_SOURCE_OFFSET, CACHE_BUILTIN_KIND_OFFSET, CACHE_BUILTIN_VALUE_OFFSET,
     CACHE_HOLDER_OFFSET, CACHE_HOLDER_SHAPE_OFFSET, CACHE_INDEX_OFFSET, CACHE_INITIALIZED_OFFSET,
-    CACHE_OVERWRITE_INDEX_OFFSET, CACHE_OVERWRITE_SHAPE_OFFSET, CACHE_SHAPE_OFFSET, HELPERS, Helper, PropertyCache,
+    CACHE_OVERWRITE_INDEX_OFFSET, CACHE_OVERWRITE_SHAPE_OFFSET, CACHE_SHAPE_OFFSET, HELPERS,
+    Helper, PropertyCache,
 };
 use crate::jit::profile::{CallSite, Site};
 use crate::jit::semantic::DirectTarget;
@@ -234,11 +235,10 @@ impl FunctionCompiler<'_, '_> {
     pub(super) fn is_number(&mut self, value: ClifValue) -> ClifValue {
         let top = self.b.ins().ushr_imm_s(value, TAG_SHIFT as i64);
         let offset = self.b.ins().iadd_imm_s(top, -(TAG_FIRST as i64));
-        let condition =
-            self.b
-                .ins()
-                .icmp_imm_s(IntCC::UnsignedGreaterThan, offset, TAG_SPAN as i64);
-        condition
+
+        self.b
+            .ins()
+            .icmp_imm_s(IntCC::UnsignedGreaterThan, offset, TAG_SPAN as i64)
     }
 
     pub(super) fn truthy(&mut self, value: ClifValue) -> ClifValue {
@@ -540,8 +540,8 @@ impl FunctionCompiler<'_, '_> {
                     .ins()
                     .bitcast(types::I64, MemFlagsData::new(), result);
                 let nan = compiler.constant(Value::number(f64::NAN));
-                let boxed = compiler.b.ins().select(unordered, nan, bits);
-                boxed
+
+                compiler.b.ins().select(unordered, nan, bits)
             },
             |compiler| compiler.binary_helper(op, left, right),
         )

@@ -1,5 +1,5 @@
-use super::super::specialize::{ConditionalCall, ConditionalPlan};
 use super::super::guards::{Fact, Origin};
+use super::super::specialize::{ConditionalCall, ConditionalPlan};
 use super::cost::{Candidate, Verdict, worth};
 use super::placement::Reach;
 use super::versioning::{Canonical, Version};
@@ -265,13 +265,7 @@ impl RegionPlan {
             codes: std::mem::take(&mut self.identities),
             ..Default::default()
         };
-        let (mut current, _) = plan_region(
-            graph,
-            self.body,
-            self.entry,
-            &self.calls,
-            &candidates,
-        )?;
+        let (mut current, _) = plan_region(graph, self.body, self.entry, &self.calls, &candidates)?;
         current.children = self.children;
         self = current;
         if report_regions {
@@ -467,10 +461,7 @@ fn plan_region(
             .iter()
             .map(|requirement| {
                 requirement.captured.is_some()
-                    || !found.invalidates(&guarded_accesses(
-                        std::slice::from_ref(requirement),
-                        &[],
-                    ))
+                    || !found.invalidates(&guarded_accesses(std::slice::from_ref(requirement), &[]))
             })
             .collect();
         let live_calls: Vec<bool> = calls
@@ -564,8 +555,16 @@ fn plan_region(
     bounds.sort();
     bounds.dedup();
     let mut checks = numbers;
-    checks.extend(typed.iter().map(|&(object, element)| (object, Fact::Typed(element))));
-    checks.extend(bounds.iter().map(|&(object, bound)| (object, Fact::Bound(bound))));
+    checks.extend(
+        typed
+            .iter()
+            .map(|&(object, element)| (object, Fact::Typed(element))),
+    );
+    checks.extend(
+        bounds
+            .iter()
+            .map(|&(object, bound)| (object, Fact::Bound(bound))),
+    );
     checks.extend(requirements.iter().map(native_of));
     let mut typed_reads = Vec::new();
     for &block in &blocks {
@@ -598,8 +597,9 @@ fn plan_region(
         && guards.is_empty()
         && closure_failure(&planning, &body, &guarded, &assumed).is_some()
     {
-        return Err(reentry
-            .unwrap_or_else(|| "no invariant entry guards for reentrant fallbacks".into()));
+        return Err(
+            reentry.unwrap_or_else(|| "no invariant entry guards for reentrant fallbacks".into())
+        );
     }
     let mut survivors: Vec<(Fact, Origin)> = candidates
         .origins
@@ -673,7 +673,9 @@ fn plan(
             match (reach.fact, &reach.global) {
                 (Fact::Code(code), Some(name)) => {
                     proposals.codes.push((name.clone(), code));
-                    proposals.code_origins.push((name.clone(), code, reach.origin));
+                    proposals
+                        .code_origins
+                        .push((name.clone(), code, reach.origin));
                 }
                 (Fact::Code(_), None) => {}
                 (fact, _) => {
@@ -682,23 +684,18 @@ fn plan(
                 }
             }
         }
-        let (mut parent, facts) = match plan_region(
-            graph,
-            body,
-            entry,
-            &conditional.calls,
-            &proposals,
-        ) {
-            Ok(plan) => plan,
-            Err(reason) => {
-                let label = entry.map_or_else(
-                    || "function".to_owned(),
-                    |(_, header)| format!("loop at {header}"),
-                );
-                notes.push(format!("{label}: not versioned: {reason}"));
-                continue;
-            }
-        };
+        let (mut parent, facts) =
+            match plan_region(graph, body, entry, &conditional.calls, &proposals) {
+                Ok(plan) => plan,
+                Err(reason) => {
+                    let label = entry.map_or_else(
+                        || "function".to_owned(),
+                        |(_, header)| format!("loop at {header}"),
+                    );
+                    notes.push(format!("{label}: not versioned: {reason}"));
+                    continue;
+                }
+            };
         let label = entry.map_or_else(
             || "function".to_owned(),
             |(_, header)| format!("loop at {header}"),
@@ -880,10 +877,8 @@ mod tests {
                 .rpo
                 .iter()
                 .flat_map(|&block| &graph.blocks[block].insts)
-                .filter_map(|&inst| {
-                    matches!(graph.insts[inst].op, Op::AsInteger(_))
-                        .then(|| graph.insts[inst].result.unwrap())
-                })
+                .filter(|&&inst| matches!(graph.insts[inst].op, Op::AsInteger(_)))
+                .map(|&inst| graph.insts[inst].result.unwrap())
                 .collect();
             assert_eq!(!integers.is_empty(), observed == ReadType::Integer);
             for value in integers {
@@ -1285,7 +1280,11 @@ mod tests {
         let mut notes = Vec::new();
         let regions = version(&mut graph, &ConditionalPlan::default(), None, &mut notes).unwrap();
         assert!(regions.is_empty());
-        assert!(notes.iter().any(|note| note.starts_with("function: not versioned: reenters")));
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.starts_with("function: not versioned: reenters"))
+        );
         graph.verify().unwrap();
     }
 

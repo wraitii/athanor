@@ -187,8 +187,7 @@ pub(super) fn apply_version(
     let mut notes = Vec::new();
     let hints = super::super::observations::numeric_hints(graph);
     let head = entry.map_or(graph.entry, |(_, header)| header);
-    let tested =
-        EntryGuard::at_entry(graph, entry.map_or(graph.entry, |(preheader, _)| preheader));
+    let tested = EntryGuard::at_entry(graph, entry.map_or(graph.entry, |(preheader, _)| preheader));
     assert!(fallback.is_none() || entry.is_none());
     let reuse = fallback.is_some()
         && exits.iter().all(|block| guards.contains(block))
@@ -703,9 +702,7 @@ fn entry_checks(
             Some(Op::IsShape(object, _)) if graph.caller_rooted(*object) => Some(*object),
             _ => None,
         };
-        let condition = test.map_or(condition, |op| {
-            graph.append_value(current, span, op)
-        });
+        let condition = test.map_or(condition, |op| graph.append_value(current, span, op));
         let next = graph.blocks.push(BlockData::default());
         graph.blocks[current].terminator = Some(Terminator {
             source_name,
@@ -718,7 +715,7 @@ fn entry_checks(
         {
             let alias = graph.append_value(current, span, Op::AsObject(object));
             objects.insert(object, alias);
-            retarget(graph, &copies, object, alias);
+            retarget(graph, copies, object, alias);
             for arg in &mut args {
                 if *arg == object {
                     *arg = alias;
@@ -779,7 +776,7 @@ fn entry_checks(
                 });
             }
         }
-        retarget(graph, &copies, checked, number);
+        retarget(graph, copies, checked, number);
         aliases.insert(checked, number);
         for arg in &mut args {
             if *arg == checked {
@@ -928,21 +925,31 @@ fn wire_failures(
             notes.push(format!("guard at {block}: canonical inputs unavailable"));
             continue;
         };
-        let prime = match &graph.blocks[blocks[&block]].terminator.as_ref().unwrap().kind {
-            TerminatorKind::Branch(condition, ..) => {
-                match graph.defining_op(*condition) {
-                    Some(Op::IsPropertyCached(object, site, name)) => {
-                        Some((*object, *site, name.clone()))
-                    }
-                    _ => None,
+        let prime = match &graph.blocks[blocks[&block]]
+            .terminator
+            .as_ref()
+            .unwrap()
+            .kind
+        {
+            TerminatorKind::Branch(condition, ..) => match graph.defining_op(*condition) {
+                Some(Op::IsPropertyCached(object, site, name)) => {
+                    Some((*object, *site, name.clone()))
                 }
-            }
+                _ => None,
+            },
             _ => None,
         };
-        let guard_span = graph.blocks[blocks[&block]].terminator.as_ref().unwrap().span;
+        let guard_span = graph.blocks[blocks[&block]]
+            .terminator
+            .as_ref()
+            .unwrap()
+            .span;
         if crate::jit::bailouts::enabled()
-            && let TerminatorKind::Branch(condition, ..) =
-                &graph.blocks[blocks[&block]].terminator.as_ref().unwrap().kind
+            && let TerminatorKind::Branch(condition, ..) = &graph.blocks[blocks[&block]]
+                .terminator
+                .as_ref()
+                .unwrap()
+                .kind
             && let Some(op) = graph.defining_op(*condition)
         {
             crate::jit::bailouts::note_guard(guard_span, graph.op_text(op));
@@ -1023,7 +1030,7 @@ fn wire_failures(
         graph.terminate(current, span, TerminatorKind::Return(result));
         notes.push(format!("loop at {current}: separate generic function"));
     }
-    }
+}
 
 fn consume_assumes(
     graph: &mut Graph,
@@ -1031,7 +1038,10 @@ fn consume_assumes(
     entry: Option<(Block, Block)>,
     checks: &[(Value, Fact)],
 ) {
-    let scope = blocks.iter().copied().chain(entry.map(|(before, _)| before));
+    let scope = blocks
+        .iter()
+        .copied()
+        .chain(entry.map(|(before, _)| before));
     for block in scope.collect::<Vec<_>>() {
         let consumed: Vec<Inst> = graph.blocks[block]
             .insts

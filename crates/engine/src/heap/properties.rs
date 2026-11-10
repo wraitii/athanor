@@ -310,7 +310,7 @@ impl HeapData {
                     atom,
                     enumerable: enumerable.unwrap_or(true),
                 };
-                slot.shape = match cache.as_deref_mut() {
+                slot.shape = match cache {
                     Some(cache) => cache.transition(slot.shape, &mut self.shapes, key),
                     None => self.shapes.transition(slot.shape, key),
                 };

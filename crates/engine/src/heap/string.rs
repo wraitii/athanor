@@ -66,9 +66,7 @@ impl Heap {
         let mut data = self.0.borrow_mut();
         values.reserve(ranges.len());
         for range in ranges {
-            let Some(piece_id) = data.reserve() else {
-                return None;
-            };
+            let piece_id = data.reserve()?;
             let piece = data.string(id).unwrap()[range].to_owned();
             data.store(piece_id, Payload::String(piece));
             values.push(Value::from_bits(TAG_STRING | piece_id));

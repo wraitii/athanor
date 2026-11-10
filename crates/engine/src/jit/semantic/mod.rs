@@ -4,7 +4,6 @@ mod available;
 mod borrow;
 mod build;
 mod caches;
-mod shapes;
 mod comparisons;
 mod construction;
 pub(in crate::jit) mod continuation;
@@ -12,16 +11,17 @@ pub(in crate::jit) mod facts;
 mod fresh;
 mod guards;
 mod inlining;
+mod js;
 mod listing;
-mod typed_lowering;
 mod observations;
 mod optimize;
 pub(super) mod osr;
-mod js;
 pub(super) mod reads;
+mod shapes;
 pub(super) mod specialize;
 mod string_split;
 mod transforms;
+mod typed_lowering;
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -457,9 +457,7 @@ impl Op {
             Op::ContinuationOutput(value, _)
             | Op::Observe(value, ..)
             | Op::ReadHint(value, ..)
-            | Op::Assume(value, ..) => {
-                ([Some(*value), None, None], &[])
-            }
+            | Op::Assume(value, ..) => ([Some(*value), None, None], &[]),
             Op::Argument(_)
             | Op::Arguments
             | Op::Rest(_)
@@ -598,9 +596,7 @@ impl Op {
             Op::ContinuationOutput(value, _)
             | Op::Observe(value, ..)
             | Op::ReadHint(value, ..)
-            | Op::Assume(value, ..) => {
-                ([Some(value), None, None], &mut [])
-            }
+            | Op::Assume(value, ..) => ([Some(value), None, None], &mut []),
             Op::Argument(_)
             | Op::Arguments
             | Op::Rest(_)
@@ -1261,13 +1257,11 @@ impl Graph {
             Op::IsUninitialized(_) => closed(0, Unowned),
             // Defines only target the literal being built, which nothing has read yet, so the
             // HEAP write is left out to keep borrows and loads alive across object construction.
-            Op::Define(..) => closed(
-                HEAP_READ | CODE_WRITE | ALLOCATION | INTERNAL | ERROR,
+            Op::Define(..) => closed(HEAP_READ | CODE_WRITE | ALLOCATION | INTERNAL | ERROR, None),
+            Op::DefineHidden(..) | Op::MarkClass(_) | Op::DisableConstructor(_) => closed(
+                HEAP_WRITE | CODE_WRITE | ALLOCATION | INTERNAL | ERROR,
                 None,
             ),
-            Op::DefineHidden(..) | Op::MarkClass(_) | Op::DisableConstructor(_) => {
-                closed(HEAP_WRITE | CODE_WRITE | ALLOCATION | INTERNAL | ERROR, None)
-            }
             Op::PackAppend(..) | Op::ArrayAppend(..) => {
                 closed(HEAP_READ | HEAP_WRITE | ALLOCATION | INTERNAL | ERROR, None)
             }
@@ -1400,10 +1394,10 @@ impl Graph {
                             return Err(format!("{inst} leaves {scope} out of order"));
                         }
                     }
-                    Op::NextIteration(scope) | Op::FreshIteration(scope) => {
-                        if stack.last() != Some(&scope) {
-                            return Err(format!("{inst} steps {scope} while it is not innermost"));
-                        }
+                    Op::NextIteration(scope) | Op::FreshIteration(scope)
+                        if stack.last() != Some(&scope) =>
+                    {
+                        return Err(format!("{inst} steps {scope} while it is not innermost"));
                     }
                     _ => {}
                 }
@@ -1820,7 +1814,11 @@ pub(super) fn optimize_planned(
             )?;
             graph.verify()?;
             if regions.is_empty() {
-                regions.extend(optimize::version_string_leaves(&mut graph, continuations, &mut notes)?);
+                regions.extend(optimize::version_string_leaves(
+                    &mut graph,
+                    continuations,
+                    &mut notes,
+                )?);
             }
             regions
         }
@@ -1829,7 +1827,11 @@ pub(super) fn optimize_planned(
         for (id, region) in &graph.regions {
             let mut blocks: Vec<_> = region.blocks.iter().copied().collect();
             blocks.sort();
-            let blocks = blocks.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
+            let blocks = blocks
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
             let fallback = match region.fallback {
                 Some(RegionFallback::Region(id)) => id.to_string(),
                 Some(RegionFallback::CompiledEntry(address)) => {

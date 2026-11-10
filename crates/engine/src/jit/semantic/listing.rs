@@ -22,10 +22,10 @@ impl Graph {
                 TerminatorKind::Branch(condition, then, otherwise)
                     if then.block == block || otherwise.block == block =>
                 {
-                    Some(self.defining_op(*condition).map_or_else(
-                        || format!("branch {condition}"),
-                        |op| self.op_text(op),
-                    ))
+                    Some(
+                        self.defining_op(*condition)
+                            .map_or_else(|| format!("branch {condition}"), |op| self.op_text(op)),
+                    )
                 }
                 _ => None,
             })
@@ -226,7 +226,9 @@ impl Graph {
                 format!("get_typed {object}[{key}]{element}{bounded}")
             }
             Op::Assume(value, fact, origin) => {
-                let site = origin.site.map_or(String::new(), |site| format!(" site={site}"));
+                let site = origin
+                    .site
+                    .map_or(String::new(), |site| format!(" site={site}"));
                 format!(
                     "assume {value} {fact:?} {:?} gain={}{site}",
                     origin.kind, origin.gain

@@ -103,7 +103,7 @@ impl TypedStorage {
             Self::Int16(values) => values.get(index).map(|value| *value as f64),
             Self::Int32(values) => values.get(index).map(|value| *value as f64),
             Self::Float32(values) => values.get(index).map(|value| *value as f64),
-            Self::Float64(values) => values.get(index).map(|value| *value as f64),
+            Self::Float64(values) => values.get(index).copied(),
         }
     }
     pub(super) fn integer(number: f64) -> u32 {
@@ -127,7 +127,7 @@ impl TypedStorage {
             }
             Self::Uint32(values) => {
                 if let Some(value) = values.get_mut(index) {
-                    *value = Self::integer(number) as u32;
+                    *value = Self::integer(number);
                 }
             }
             Self::Int8(values) => {
@@ -152,7 +152,7 @@ impl TypedStorage {
             }
             Self::Float64(values) => {
                 if let Some(value) = values.get_mut(index) {
-                    *value = number as f64;
+                    *value = number;
                 }
             }
         }
@@ -164,12 +164,12 @@ impl TypedStorage {
         match self {
             Self::Uint8(values) => values[start..end].fill(Self::integer(number) as u8),
             Self::Uint16(values) => values[start..end].fill(Self::integer(number) as u16),
-            Self::Uint32(values) => values[start..end].fill(Self::integer(number) as u32),
+            Self::Uint32(values) => values[start..end].fill(Self::integer(number)),
             Self::Int8(values) => values[start..end].fill(Self::integer(number) as i8),
             Self::Int16(values) => values[start..end].fill(Self::integer(number) as i16),
             Self::Int32(values) => values[start..end].fill(Self::integer(number) as i32),
             Self::Float32(values) => values[start..end].fill(number as f32),
-            Self::Float64(values) => values[start..end].fill(number as f64),
+            Self::Float64(values) => values[start..end].fill(number),
         }
     }
 }

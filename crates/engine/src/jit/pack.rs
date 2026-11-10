@@ -69,12 +69,11 @@ pub(super) unsafe fn take_element(heap: &Heap, pack: Value, index: usize) -> Val
     if pack.is_object() {
         return heap.take_array_element(pack, index);
     }
-    unsafe {
-        (&mut (*(pack.bits() as *mut StackPack)).values)
-            .get_mut(index)
-            .map(|value| std::mem::replace(value, Value::UNDEFINED))
-            .unwrap_or(Value::UNDEFINED)
-    }
+    let pack = unsafe { &mut *(pack.bits() as *mut StackPack) };
+    pack.values
+        .get_mut(index)
+        .map(|value| std::mem::replace(value, Value::UNDEFINED))
+        .unwrap_or(Value::UNDEFINED)
 }
 
 pub(super) unsafe fn append(heap: &Heap, pack: Value, values: &mut Vec<Value>) {

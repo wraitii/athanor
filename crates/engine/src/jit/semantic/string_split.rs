@@ -240,6 +240,75 @@ pub(super) fn expand(graph: &mut Graph, expanded: &mut HashSet<Inst>) {
     }
 }
 
+pub(super) fn forward_packs(graph: &mut Graph) {
+    let cfg = Cfg::new(graph);
+    let mut uses = HashMap::<Value, usize>::new();
+    for &block in &cfg.rpo {
+        for &inst in &graph.blocks[block].insts {
+            for value in graph.insts[inst].op.operands() {
+                *uses.entry(value).or_default() += 1;
+            }
+        }
+        if let Some(term) = &graph.blocks[block].terminator {
+            for value in term.kind.operands() {
+                *uses.entry(value).or_default() += 1;
+            }
+        }
+    }
+    let mut aliases = HashMap::new();
+    for &block in &cfg.rpo {
+        for inst in graph.blocks[block].insts.clone() {
+            let Op::Spread(array) = graph.insts[inst].op else {
+                continue;
+            };
+            if uses.get(&array) != Some(&1) {
+                continue;
+            }
+            let mut source = array;
+            let mut seen = HashSet::new();
+            let producer = loop {
+                if !seen.insert(source) || uses.get(&source) != Some(&1) {
+                    break None;
+                }
+                match graph.values[source] {
+                    super::ValueDef::Result(inst) => break Some(inst),
+                    super::ValueDef::Param(block, index) => {
+                        let mut incoming = cfg.preds[block]
+                            .iter()
+                            .flat_map(|&pred| {
+                                graph.blocks[pred]
+                                    .terminator
+                                    .as_ref()
+                                    .unwrap()
+                                    .kind
+                                    .targets()
+                            })
+                            .filter(|target| target.block == block)
+                            .map(|target| target.args[index]);
+                        let Some(value) = incoming.next() else {
+                            break None;
+                        };
+                        if incoming.next().is_some() {
+                            break None;
+                        }
+                        source = value;
+                    }
+                }
+            };
+            let Some(producer) = producer else {
+                continue;
+            };
+            let Op::StringSplit(receiver, args) = graph.insts[producer].op.clone() else {
+                continue;
+            };
+            graph.insts[producer].op = Op::StringSplitParts(receiver, args);
+            aliases.insert(graph.insts[inst].result.unwrap(), array);
+            graph.remove_inst(inst);
+        }
+    }
+    graph.replace_uses(&aliases);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,73 +418,4 @@ mod tests {
         let (_, reads) = result_facts(&graph);
         assert!(reads.is_empty());
     }
-}
-
-pub(super) fn forward_packs(graph: &mut Graph) {
-    let cfg = Cfg::new(graph);
-    let mut uses = HashMap::<Value, usize>::new();
-    for &block in &cfg.rpo {
-        for &inst in &graph.blocks[block].insts {
-            for value in graph.insts[inst].op.operands() {
-                *uses.entry(value).or_default() += 1;
-            }
-        }
-        if let Some(term) = &graph.blocks[block].terminator {
-            for value in term.kind.operands() {
-                *uses.entry(value).or_default() += 1;
-            }
-        }
-    }
-    let mut aliases = HashMap::new();
-    for &block in &cfg.rpo {
-        for inst in graph.blocks[block].insts.clone() {
-            let Op::Spread(array) = graph.insts[inst].op else {
-                continue;
-            };
-            if uses.get(&array) != Some(&1) {
-                continue;
-            }
-            let mut source = array;
-            let mut seen = HashSet::new();
-            let producer = loop {
-                if !seen.insert(source) || uses.get(&source) != Some(&1) {
-                    break None;
-                }
-                match graph.values[source] {
-                    super::ValueDef::Result(inst) => break Some(inst),
-                    super::ValueDef::Param(block, index) => {
-                        let mut incoming = cfg.preds[block]
-                            .iter()
-                            .flat_map(|&pred| {
-                                graph.blocks[pred]
-                                    .terminator
-                                    .as_ref()
-                                    .unwrap()
-                                    .kind
-                                    .targets()
-                            })
-                            .filter(|target| target.block == block)
-                            .map(|target| target.args[index]);
-                        let Some(value) = incoming.next() else {
-                            break None;
-                        };
-                        if incoming.next().is_some() {
-                            break None;
-                        }
-                        source = value;
-                    }
-                }
-            };
-            let Some(producer) = producer else {
-                continue;
-            };
-            let Op::StringSplit(receiver, args) = graph.insts[producer].op.clone() else {
-                continue;
-            };
-            graph.insts[producer].op = Op::StringSplitParts(receiver, args);
-            aliases.insert(graph.insts[inst].result.unwrap(), array);
-            graph.remove_inst(inst);
-        }
-    }
-    graph.replace_uses(&aliases);
 }

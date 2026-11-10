@@ -73,7 +73,9 @@ impl Hoister<'_> {
             return if self.cfg.dominates(definer, target.block) {
                 Ok(())
             } else {
-                Err(format!("{value} is defined where the point is not dominated"))
+                Err(format!(
+                    "{value} is defined where the point is not dominated"
+                ))
             };
         }
         let ValueDef::Result(inst) = self.graph.values[value] else {
@@ -82,7 +84,10 @@ impl Hoister<'_> {
         let op = self.graph.insts[inst].op.clone();
         let input = matches!(op, Op::Argument(_) | Op::This);
         if !input && !is_load(&op) {
-            return Err(format!("{value} is not a load ({})", self.graph.op_text(&op)));
+            return Err(format!(
+                "{value} is not a load ({})",
+                self.graph.op_text(&op)
+            ));
         }
         for operand in op.operands_iter() {
             self.hoistable(points, point, operand)?;
@@ -153,10 +158,9 @@ fn merge(graph: &mut Graph, point: &mut Point) {
             Fact::Bound(bound) => Fact::Bound(representative(graph, &mut reps, bound, 0)),
             fact => fact,
         };
-        if let Some(existing) = kept
-            .iter_mut()
-            .find(|(other, known, _)| *other == value && (known.implies(fact) || fact.implies(*known)))
-        {
+        if let Some(existing) = kept.iter_mut().find(|(other, known, _)| {
+            *other == value && (known.implies(fact) || fact.implies(*known))
+        }) {
             let gain = existing.2.origin.gain.saturating_add(placed.origin.gain);
             if fact.implies(existing.1) && fact != existing.1 {
                 graph.detach_inst(existing.2.inst);
@@ -316,7 +320,9 @@ mod tests {
         let graph =
             super::super::super::build::lower(function, semantic.scoping(), &HashSet::new())
                 .unwrap();
-        super::super::super::canonicalize(graph, true).unwrap().graph
+        super::super::super::canonicalize(graph, true)
+            .unwrap()
+            .graph
     }
 
     fn origin() -> Origin {
@@ -329,7 +335,9 @@ mod tests {
 
     fn assume(graph: &mut Graph, value: Value, fact: Fact) -> Inst {
         let block = graph.def_block(value);
-        graph.append(block, graph.span, Op::Assume(value, fact, origin()), false).0
+        graph
+            .append(block, graph.span, Op::Assume(value, fact, origin()), false)
+            .0
     }
 
     fn find(graph: &Graph, predicate: impl Fn(&Op) -> bool) -> Value {
@@ -383,16 +391,14 @@ mod tests {
 
     #[test]
     fn conflicting_writes_stop_hoisting() {
-        let mut graph = graph(
-            "function f(o,n){let s=0;for(let i=0;i<n;++i){o.x=i;s+=o.x;}return s;}",
-        );
+        let mut graph =
+            graph("function f(o,n){let s=0;for(let i=0;i<n;++i){o.x=i;s+=o.x;}return s;}");
         let load = find(&graph, |op| matches!(op, Op::Get(_, name) if name == "x"));
         assume(&mut graph, load, number());
         assert!(place_assumes(&mut graph, &HashMap::new()).is_empty());
 
-        let mut graph = self::graph(
-            "function f(o,n){let s=0;for(let i=0;i<n;++i){o.z=i;s+=o.x;}return s;}",
-        );
+        let mut graph =
+            self::graph("function f(o,n){let s=0;for(let i=0;i<n;++i){o.z=i;s+=o.x;}return s;}");
         let load = find(&graph, |op| matches!(op, Op::Get(_, name) if name == "x"));
         assume(&mut graph, load, number());
         assert_eq!(place_assumes(&mut graph, &HashMap::new()).len(), 1);
@@ -426,6 +432,11 @@ mod tests {
             panic!()
         };
         graph.remove_inst(def);
-        assert!(!graph.blocks.values().any(|block| block.insts.contains(&inst)));
+        assert!(
+            !graph
+                .blocks
+                .values()
+                .any(|block| block.insts.contains(&inst))
+        );
     }
 }

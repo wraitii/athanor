@@ -250,7 +250,11 @@ impl Fresh {
     pub(super) fn at(&self, value: Value, inst: Inst) -> Option<Value> {
         let class = self.class(value)?;
         let &(block, index) = self.positions.get(&inst)?;
-        if self.entering.get(&block).is_some_and(|set| set.contains(&class)) {
+        if self
+            .entering
+            .get(&block)
+            .is_some_and(|set| set.contains(&class))
+        {
             return None;
         }
         match self.first.get(&block).and_then(|events| events.get(&class)) {

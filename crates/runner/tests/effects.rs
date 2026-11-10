@@ -554,8 +554,8 @@ fn recursively_inlined_bodies_expand_arrays_and_constructors_once() {
         .unwrap();
     let maps = caller.matches(" = is_array_map ").count();
     let constructors = caller.matches(" = construct_pack_resolved ").count();
-    assert!(maps >= 2 && maps <= 4, "{maps}");
-    assert!(constructors >= 2 && constructors <= 4, "{constructors}");
+    assert!((2..=4).contains(&maps), "{maps}");
+    assert!((2..=4).contains(&constructors), "{constructors}");
     assert!(!caller.contains(" = construct_pack "));
     let start = source.find("new SimpleTerrain").unwrap();
     assert!(caller.lines().any(|line| {
