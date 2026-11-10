@@ -592,7 +592,7 @@ impl FunctionCompiler<'_, '_> {
                                 Some(self.constant(Value::number(-1.0)))
                             }
                         }
-                        Op::ReadHint(..) => None,
+                        Op::ReadHint(..) | Op::Assume(..) => None,
                         Op::Observe(value, kind, site) => {
                             let value = get(self, *value);
                             self.observe(value, *site, *kind);

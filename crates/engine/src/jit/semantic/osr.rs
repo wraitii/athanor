@@ -252,6 +252,11 @@ impl Plan {
                         false,
                     );
                 }
+                if let Op::Assume(value, fact, origin) = self.graph.insts[inst].op
+                    && let Some(&argument) = aliases.get(&value)
+                {
+                    graph.append(entry, span, Op::Assume(argument, fact, origin), false);
+                }
             }
         }
         graph.blocks[entry].terminator = Some(Terminator {

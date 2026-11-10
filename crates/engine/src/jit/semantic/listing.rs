@@ -220,6 +220,13 @@ impl Graph {
                 let bounded = if read.bounded { " bounded" } else { "" };
                 format!("get_typed {object}[{key}]{element}{bounded}")
             }
+            Op::Assume(value, fact, origin) => {
+                let site = origin.site.map_or(String::new(), |site| format!(" site={site}"));
+                format!(
+                    "assume {value} {fact:?} {:?} gain={}{site}",
+                    origin.kind, origin.gain
+                )
+            }
             Op::ReadHint(value, kind, observed, site) => {
                 format!("read_hint {kind:?} {value} {observed:?} site={site}")
             }

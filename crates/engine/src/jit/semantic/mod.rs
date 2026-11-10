@@ -96,6 +96,7 @@ pub(super) struct Graph {
     pub(in crate::jit) cold: HashSet<Block>,
     pub(super) lazy_captures: HashSet<Binding>,
     pub(super) generator: bool,
+    pub(super) has_assumes: bool,
     /// Parameter count of a function whose entry takes its arguments in registers; `None` when
     /// it reads `arguments` or a rest parameter, or is a generator.
     pub(in crate::jit) arity: Option<u16>,
@@ -247,6 +248,7 @@ pub(super) enum Op {
         super::profile::ReadType,
         super::profile::Site,
     ),
+    Assume(Value, guards::Fact, guards::Origin),
     OsrStart(std::sync::Arc<osr::Plan>, usize, Vec<Value>),
     Continuation(std::sync::Arc<continuation::Body>, Vec<Value>),
     ContinuationOutput(Value, usize),
@@ -449,7 +451,10 @@ impl Op {
             Op::OsrStart(_, _, values)
             | Op::Continuation(_, values)
             | Op::ContinuationStore(values) => ([None, None, None], values),
-            Op::ContinuationOutput(value, _) | Op::Observe(value, ..) | Op::ReadHint(value, ..) => {
+            Op::ContinuationOutput(value, _)
+            | Op::Observe(value, ..)
+            | Op::ReadHint(value, ..)
+            | Op::Assume(value, ..) => {
                 ([Some(*value), None, None], &[])
             }
             Op::Argument(_)
@@ -585,7 +590,10 @@ impl Op {
             Op::OsrStart(_, _, values)
             | Op::Continuation(_, values)
             | Op::ContinuationStore(values) => ([None, None, None], values),
-            Op::ContinuationOutput(value, _) | Op::Observe(value, ..) | Op::ReadHint(value, ..) => {
+            Op::ContinuationOutput(value, _)
+            | Op::Observe(value, ..)
+            | Op::ReadHint(value, ..)
+            | Op::Assume(value, ..) => {
                 ([Some(value), None, None], &mut [])
             }
             Op::Argument(_)
@@ -972,6 +980,7 @@ impl Graph {
             .insts
             .get(position)
             .and_then(|&next| self.insts[next].source_name);
+        self.has_assumes |= matches!(op, Op::Assume(..));
         self.insts.push(InstData {
             source_name,
             span,
@@ -995,6 +1004,36 @@ impl Graph {
     }
 
     pub(super) fn remove_inst(&mut self, inst: Inst) {
+        self.detach_inst(inst);
+        let Some(result) = self.insts[inst].result.filter(|_| self.has_assumes) else {
+            return;
+        };
+        for block in self.blocks.keys().collect::<Vec<_>>() {
+            let insts = std::mem::take(&mut self.blocks[block].insts);
+            self.blocks[block].insts = insts
+                .into_iter()
+                .filter(|&other| {
+                    !matches!(self.insts[other].op, Op::Assume(value, ..) if value == result)
+                })
+                .collect();
+        }
+    }
+
+    pub(super) fn strip_assumes(&mut self) {
+        if !self.has_assumes {
+            return;
+        }
+        for block in self.blocks.keys().collect::<Vec<_>>() {
+            let insts = std::mem::take(&mut self.blocks[block].insts);
+            self.blocks[block].insts = insts
+                .into_iter()
+                .filter(|&inst| !matches!(self.insts[inst].op, Op::Assume(..)))
+                .collect();
+        }
+        self.has_assumes = false;
+    }
+
+    pub(super) fn detach_inst(&mut self, inst: Inst) {
         let block = self.insts[inst].block;
         self.blocks[block].insts.retain(|&i| i != inst);
         self.views.remove(&inst);
@@ -1002,7 +1041,7 @@ impl Graph {
 
     pub(super) fn move_inst(&mut self, inst: Inst, block: Block) {
         let view = self.views.get(&inst).copied();
-        self.remove_inst(inst);
+        self.detach_inst(inst);
         if let Some(view) = view {
             self.views.insert(inst, view);
         }
@@ -1035,6 +1074,9 @@ impl Graph {
         let mut counts = SecondaryMap::new();
         for data in self.blocks.values() {
             for &inst in &data.insts {
+                if matches!(self.insts[inst].op, Op::Assume(..)) {
+                    continue;
+                }
                 for value in self.insts[inst].op.operands_iter() {
                     counts[value] += 1;
                 }
@@ -1130,6 +1172,7 @@ impl Graph {
             Op::ContinuationStore(..) | Op::Observe(..) | Op::ReadHint(..) => {
                 closed(INTERNAL, None)
             }
+            Op::Assume(..) => closed(0, None),
             Op::NewInstance(_) => closed(ALLOCATION | INTERNAL | ERROR, Owned),
             Op::ConstructorResult(..) => closed(0, Borrowed),
             Op::Rest(_) | Op::Arguments => closed(ALLOCATION | INTERNAL | ERROR, Owned),

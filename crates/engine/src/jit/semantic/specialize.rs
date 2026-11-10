@@ -1117,7 +1117,7 @@ mod tests {
         assert!(
             notes
                 .iter()
-                .any(|note| note.contains("writes guarded state"))
+                .any(|note| note.contains("reenters"))
         );
     }
 
@@ -1214,7 +1214,7 @@ mod tests {
         assert_eq!(plan.calls.len(), 2);
         let mut notes = Vec::new();
         let regions = super::super::optimize::version(&mut graph, &plan, None, &mut notes).unwrap();
-        assert_eq!(regions.len(), 1);
+        assert_eq!(regions.len(), 2);
         assert_eq!(closed_calls(&graph).len(), 1);
         let probes: Vec<_> = operations(&graph)
             .into_iter()

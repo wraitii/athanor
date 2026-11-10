@@ -1,16 +1,48 @@
 use cranelift_module::FuncId;
 
 use super::facts::Types;
-use super::{Block, Graph, Op, TerminatorKind, UnaryOp, Value};
+use super::{Block, Graph, Native, Op, TerminatorKind, UnaryOp, Value};
 use crate::heap::TypedKind;
+use crate::jit::profile::Site;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(super) enum Fact {
+pub(in crate::jit) enum Fact {
     Type(Types),
     Code(FuncId),
     Shape(u32),
     Typed(Option<TypedKind>),
     Indexed,
+    Native(Native),
+    Bound(Value),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(in crate::jit) enum Kind {
+    Number,
+    Receiver,
+    Bound,
+    Identity,
+    Native,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(in crate::jit) struct Origin {
+    pub(in crate::jit) site: Option<Site>,
+    pub(in crate::jit) kind: Kind,
+    pub(in crate::jit) gain: u16,
+}
+
+pub(super) fn assumed(
+    types: &std::collections::HashMap<Value, Types>,
+    code: &std::collections::HashMap<Value, FuncId>,
+) -> Vec<(Value, Fact)> {
+    let mut facts: Vec<_> = types
+        .iter()
+        .map(|(&value, &types)| (value, Fact::Type(types)))
+        .chain(code.iter().map(|(&value, &code)| (value, Fact::Code(code))))
+        .collect();
+    facts.sort_by_key(|&(value, _)| value);
+    facts
 }
 
 impl Fact {

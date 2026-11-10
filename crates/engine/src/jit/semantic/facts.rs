@@ -248,14 +248,23 @@ impl Facts {
     }
 
     pub(in crate::jit) fn compute(graph: &Graph) -> Self {
-        Self::assuming(graph, &HashMap::new(), &HashMap::new())
+        Self::assuming(graph, &[])
     }
 
     pub(super) fn assuming(
         graph: &Graph,
-        assumptions: &HashMap<Value, Types>,
-        identities: &HashMap<Value, FuncId>,
+        candidates: &[(Value, guards::Fact)],
     ) -> Self {
+        let assumptions: HashMap<Value, Types> = candidates
+            .iter()
+            .filter_map(|&(value, fact)| Some((value, fact.mask()?)))
+            .collect();
+        let identities: HashMap<Value, FuncId> = candidates
+            .iter()
+            .filter_map(|&(value, fact)| Some((value, fact.code()?)))
+            .collect();
+        let assumptions = &assumptions;
+        let identities = &identities;
         let cfg = Cfg::new(graph);
         let steps = steps(graph, &cfg);
         let mut refinements: HashMap<Value, Vec<Refinement>> = HashMap::new();
@@ -641,7 +650,9 @@ fn result_types(op: &Op, facts: &Facts) -> Types {
         Op::OsrStart(..) => Types::INT32,
         Op::Continuation(body, _) => body.result,
         Op::ContinuationOutput(..) => Types::ALL,
-        Op::ContinuationStore(..) | Op::Observe(..) | Op::ReadHint(..) => Types::default(),
+        Op::ContinuationStore(..) | Op::Observe(..) | Op::ReadHint(..) | Op::Assume(..) => {
+            Types::default()
+        }
         Op::Constant(constant) => match constant {
             Constant::Undefined => Types::UNDEFINED,
             Constant::Null => Types::NULL,

@@ -5,6 +5,7 @@ use oxc_syntax::operator::BinaryOperator;
 use super::super::effects::Locations;
 use super::access::{Access, Field};
 use super::available;
+use super::guards;
 use super::js::NUMERIC;
 use super::{
     Block, BlockData, Cfg, Constant, Facts, Graph, Inst, Native, Op, Region, RegionFallback,
@@ -16,10 +17,12 @@ use crate::heap::TypedKind;
 const SPECIALIZATION_REGION_LIMIT: usize = 512;
 
 mod analysis;
+mod placement;
 mod planning;
+mod propose;
 mod versioning;
 
-use analysis::{Requirement, Writes, closure_failure, guarded_accesses, requirements};
+use analysis::{Requirement, Writes, closure_failure, conflicts, guarded_accesses, requirements};
 #[cfg(test)]
 pub(super) use planning::version;
 pub(super) use planning::version_with_report;
@@ -218,27 +221,31 @@ fn invariant_guards(
 }
 
 
-fn typed_objects(
+fn typed_entry(
     graph: &Graph,
     body: &HashSet<Block>,
     available: &HashSet<Value>,
     facts: &Facts,
-) -> Vec<Value> {
-    let mut objects = HashSet::new();
+    candidates: &[(Value, guards::Fact)],
+) -> Vec<(Value, Option<TypedKind>)> {
+    let mut typed = HashMap::new();
     for &block in body {
         for &inst in &graph.blocks[block].insts {
             if let Op::GetIndex(object, key) | Op::TypedIndex(object, key, _) = graph.insts[inst].op
                 && (!body.contains(&graph.def_block(object)) || available.contains(&object))
                 && facts.of(key).within(NUMERIC)
-                && element_guess(graph, object).is_some()
+                && let Some(element) = candidates.iter().find_map(|&(value, fact)| match fact {
+                    guards::Fact::Typed(element) if value == object => Some(element),
+                    _ => None,
+                })
             {
-                objects.insert(object);
+                typed.insert(object, element);
             }
         }
     }
-    let mut objects: Vec<_> = objects.into_iter().collect();
-    objects.sort();
-    objects
+    let mut typed: Vec<_> = typed.into_iter().collect();
+    typed.sort_by_key(|&(object, _)| object);
+    typed
 }
 
 pub(super) fn element_guess(graph: &Graph, object: Value) -> Option<TypedKind> {
@@ -447,54 +454,37 @@ fn numeric_use(op: &Op, index: usize) -> bool {
     }
 }
 
-fn entry_checks(
+fn entry_assumes(
     graph: &Graph,
     inside: &HashSet<Block>,
-    scan: &[Block],
     probes: &[Inst],
     assumed: &HashMap<Value, cranelift_module::FuncId>,
-) -> Vec<(Value, Types)> {
-    let facts = Facts::assuming(graph, &HashMap::new(), assumed);
+    candidates: &[(Value, guards::Fact)],
+) -> Vec<(Value, guards::Fact)> {
+    let facts = Facts::assuming(graph, &guards::assumed(&HashMap::new(), assumed));
     let probed: HashSet<Value> = probes
         .iter()
         .filter_map(|inst| graph.insts[*inst].result)
         .collect();
-    let hints = super::observations::numeric_hints(graph);
-    let mut checks = HashSet::new();
-    for &block in scan {
-        for &inst in &graph.blocks[block].insts {
-            let op = &graph.insts[inst].op;
-            for (index, value) in op.operands_iter().enumerate() {
-                let desired = if hints.get(&value) == Some(&crate::jit::profile::ReadType::Integer)
-                {
-                    Types::INTEGER
-                } else {
-                    NUMERIC
-                };
-                if hints.get(&value) != Some(&crate::jit::profile::ReadType::Unknown)
-                    && numeric_use(op, index)
-                    && !facts.of(value).within(desired)
-                    && (!inside.contains(&graph.def_block(value)) || probed.contains(&value))
-                    && !matches!(graph.defining_op(value), Some(Op::Constant(_)))
-                {
-                    checks.insert(value);
-                }
+    let mut checks: Vec<_> = candidates
+        .iter()
+        .copied()
+        .filter(|&(value, fact)| {
+            if !matches!(fact, guards::Fact::Type(_)) {
+                return false;
             }
-        }
-    }
-    let mut checks: Vec<Value> = checks.into_iter().collect();
-    checks.sort();
-    checks
-        .into_iter()
-        .map(|value| {
-            let types = if hints.get(&value) == Some(&crate::jit::profile::ReadType::Integer) {
-                Types::INT64
+            let desired = if fact == guards::Fact::Type(Types::INTEGER) {
+                Types::INTEGER
             } else {
-                Types::NUMBER
+                NUMERIC
             };
-            (value, types)
+            !facts.of(value).within(desired)
+                && (!inside.contains(&graph.def_block(value)) || probed.contains(&value))
         })
-        .collect()
+        .collect();
+    checks.sort_by_key(|&(value, _)| value);
+    checks.dedup_by_key(|&mut (value, _)| value);
+    checks
 }
 
 pub(super) fn reuse_loads(graph: &mut Graph, notes: &mut Vec<String>) {

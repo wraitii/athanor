@@ -191,9 +191,11 @@ fn extract(graph: &Graph, target: Target, facts: &Facts) -> super::Result<(Graph
                     | Op::LeaveScope(_)
                     | Op::NextIteration(_)
                     | Op::FreshIteration(_)
+                    | Op::Assume(..)
             )
         });
     }
+    result.has_assumes = false;
     result.views.clear();
     let definitions = aliases
         .into_iter()

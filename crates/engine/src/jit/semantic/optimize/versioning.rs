@@ -33,16 +33,22 @@ fn retarget(graph: &mut Graph, blocks: &HashSet<Block>, from: Value, to: Value) 
 #[derive(Default)]
 pub(super) struct Speculation<'a> {
     pub(super) fallback: Option<usize>,
-    pub(super) requirements: &'a [Requirement],
     pub(super) reads: &'a [Inst],
     pub(super) guards: &'a [Block],
     pub(super) exits: &'a [Block],
     pub(super) exits_true: &'a [Block],
-    pub(super) typed: &'a [(Value, Option<TypedKind>)],
-    pub(super) bounds: &'a [(Value, Value)],
     pub(super) typed_reads: &'a [(Inst, TypedRead)],
-    pub(super) checks: &'a [(Value, Types)],
+    pub(super) assumes: &'a [(Value, Fact)],
     pub(super) code_guards: &'a [(String, cranelift_module::FuncId)],
+}
+
+struct NativeCheck {
+    callee: Value,
+    global: String,
+    property: String,
+    native: Native,
+    captured: Option<Value>,
+    object: Option<Value>,
 }
 
 #[derive(PartialEq, Eq, Hash)]
@@ -87,6 +93,7 @@ pub(super) struct Version {
     pub(super) blocks: HashMap<Block, Block>,
     pub(super) insts: HashMap<Inst, Inst>,
     pub(super) values: HashMap<Value, Value>,
+    pub(super) aliases: HashMap<Value, Value>,
 }
 
 pub(super) struct Canonical<'a> {
@@ -143,17 +150,37 @@ pub(super) fn apply_version(
 ) -> Version {
     let Speculation {
         fallback,
-        requirements,
         reads,
         guards,
         exits,
         exits_true,
-        typed,
-        bounds,
         typed_reads,
-        checks,
+        assumes,
         code_guards,
     } = *speculation;
+    let region_blocks: HashSet<Block> = region.iter().copied().collect();
+    let requirements: Vec<NativeCheck> = assumes
+        .iter()
+        .filter_map(|&(callee, fact)| {
+            let Fact::Native(native) = fact else {
+                return None;
+            };
+            let Some(Op::Get(object, property)) = graph.defining_op(callee) else {
+                unreachable!()
+            };
+            let Some(Op::GlobalRead(global)) = graph.defining_op(*object) else {
+                unreachable!()
+            };
+            Some(NativeCheck {
+                callee,
+                global: global.clone(),
+                property: property.clone(),
+                native,
+                captured: (!region_blocks.contains(&graph.def_block(callee))).then_some(callee),
+                object: (!region_blocks.contains(&graph.def_block(*object))).then_some(*object),
+            })
+        })
+        .collect();
     let local_generic = canonical.is_none().then(|| graph.clone());
     let local_canonical = local_generic.as_ref().map(Canonical::identity);
     let canonical = canonical.or(local_canonical.as_ref()).unwrap();
@@ -464,7 +491,7 @@ pub(super) fn apply_version(
         };
         let result = data.result.unwrap();
         replacements.insert(values[&result], value);
-        graph.remove_inst(insts[&inst]);
+        graph.detach_inst(insts[&inst]);
         values.insert(result, value);
         probes.insert(result, value);
     }
@@ -562,16 +589,15 @@ pub(super) fn apply_version(
             }
         }
     }
-    for &(value, types) in checks {
+    let numeric = || {
+        assumes
+            .iter()
+            .copied()
+            .filter(|(_, fact)| matches!(fact, Fact::Type(_)))
+    };
+    for (value, fact) in numeric() {
         let checked = values.get(&value).copied().unwrap_or(value);
-        let guard = EntryGuard::Fact(
-            checked,
-            Fact::Type(if types == Types::INT64 {
-                Types::INTEGER
-            } else {
-                Types::NUMBER
-            }),
-        );
+        let guard = EntryGuard::Fact(checked, fact);
         if guard.tested_by(&tested) {
             continue;
         }
@@ -580,7 +606,7 @@ pub(super) fn apply_version(
             .append(
                 current,
                 span,
-                if types == Types::INT64 {
+                if fact == Fact::Type(Types::INTEGER) {
                     Op::IsInteger(checked)
                 } else {
                     Op::IsNumber(checked)
@@ -598,14 +624,15 @@ pub(super) fn apply_version(
         current = next;
     }
     let mut numbers = HashMap::new();
-    for &(value, types) in checks {
+    let mut aliases = HashMap::new();
+    for (value, fact) in numeric() {
         let checked = values.get(&value).copied().unwrap_or(value);
         let number = *numbers.entry(checked).or_insert_with(|| {
             graph
                 .append(
                     current,
                     span,
-                    if types == Types::INT64 {
+                    if fact == Fact::Type(Types::INTEGER) {
                         Op::AsInteger(checked)
                     } else {
                         Op::AsNumber(checked)
@@ -633,6 +660,7 @@ pub(super) fn apply_version(
             }
         }
         retarget(graph, &copies, checked, number);
+        aliases.insert(checked, number);
         for arg in &mut args {
             if *arg == checked {
                 *arg = number;
@@ -643,7 +671,10 @@ pub(super) fn apply_version(
         }
     }
     let mut mapped_typed = Vec::new();
-    for &(object, element) in typed {
+    for &(object, fact) in assumes {
+        let Fact::Typed(element) = fact else {
+            continue;
+        };
         let guard = (values.get(&object).copied().unwrap_or(object), element);
         let key = EntryGuard::Fact(guard.0, Fact::Typed(element));
         if key.tested_by(&tested) {
@@ -652,13 +683,16 @@ pub(super) fn apply_version(
         tested.insert(key);
         mapped_typed.push(guard);
     }
-    let mut bounds: Vec<_> = bounds
+    let mut bounds: Vec<_> = assumes
         .iter()
-        .map(|&(object, bound)| {
-            (
+        .filter_map(|&(object, fact)| {
+            let Fact::Bound(bound) = fact else {
+                return None;
+            };
+            Some((
                 values.get(&object).copied().unwrap_or(object),
                 values.get(&bound).copied().unwrap_or(bound),
-            )
+            ))
         })
         .collect();
     bounds.sort();
@@ -868,11 +902,19 @@ pub(super) fn apply_version(
     }
 
     let mut callees = Vec::new();
-    for requirement in requirements {
-        let copy = insts[&requirement.call];
-        if let Op::Call { callee, args, .. } = &graph.insts[copy].op {
-            callees.push(*callee);
-            graph.insts[copy].op = Op::CallNative(requirement.native, args.clone());
+    for &block in region {
+        for &inst in &graph.blocks[block].insts.clone() {
+            let Op::Call { callee, .. } = graph.insts[inst].op else {
+                continue;
+            };
+            let Some(requirement) = requirements.iter().find(|r| r.callee == callee) else {
+                continue;
+            };
+            let copy = insts[&inst];
+            if let Op::Call { callee, args, .. } = &graph.insts[copy].op {
+                callees.push(*callee);
+                graph.insts[copy].op = Op::CallNative(requirement.native, args.clone());
+            }
         }
     }
     let inside: HashSet<Block> = region.iter().chain(&copies).copied().collect();
@@ -949,6 +991,7 @@ pub(super) fn apply_version(
         blocks,
         insts,
         values,
+        aliases,
     }
 }
 

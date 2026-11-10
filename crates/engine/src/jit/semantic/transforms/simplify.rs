@@ -43,6 +43,12 @@ pub(in crate::jit::semantic) fn simplify(graph: &mut Graph, folder: &mut impl Fo
                     }
                     None => {}
                 }
+                if let Op::Assume(value, ..) = graph.insts[inst].op {
+                    if uses[value] == 0 {
+                        dead.push(inst);
+                    }
+                    continue;
+                }
                 if facts.removable(inst)
                     && graph.insts[inst]
                         .result

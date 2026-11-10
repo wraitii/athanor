@@ -14,7 +14,7 @@ pub(super) struct Fresh {
 
 fn contained_use(op: &Op, index: usize) -> bool {
     match op {
-        Op::Observe(..) | Op::ReadHint(..) => true,
+        Op::Observe(..) | Op::ReadHint(..) | Op::Assume(..) => true,
         Op::Get(..)
         | Op::ShapedGet(..)
         | Op::ShapedSet(..)

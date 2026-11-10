@@ -166,10 +166,13 @@ pub(super) fn borrows(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>)
         }
     }
     // The environment owns these values until a write or reentry invalidates the borrow.
-    for (_, data) in &graph.insts {
-        if let (Op::ProbeGlobal(_), Some(value)) = (&data.op, data.result) {
-            chains.insert(value, Vec::new());
-            objects.insert(value);
+    for block in graph.blocks.values() {
+        for &inst in &block.insts {
+            let data = &graph.insts[inst];
+            if let (Op::ProbeGlobal(_), Some(value)) = (&data.op, data.result) {
+                chains.insert(value, Vec::new());
+                objects.insert(value);
+            }
         }
     }
     if chains.is_empty() {

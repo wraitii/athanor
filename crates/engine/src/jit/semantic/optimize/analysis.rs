@@ -17,7 +17,7 @@ impl Writes {
         blocks: &HashSet<Block>,
         assumed: &HashMap<Value, cranelift_module::FuncId>,
     ) -> Self {
-        let facts = Facts::assuming(graph, &HashMap::new(), assumed);
+        let facts = Facts::assuming(graph, &guards::assumed(&HashMap::new(), assumed));
         let mut writes = Vec::new();
         let fresh = facts.fresh(graph);
         for &block in blocks {
@@ -40,6 +40,13 @@ impl Writes {
 
     pub(super) fn kills(&self, inst: Inst, write: &Access, read: &Access) -> bool {
         self.fresh.may_alias(inst, write, read) && write.field.conflicts(&read.field)
+    }
+
+    pub(super) fn killer(&self, read: &Access) -> Option<Inst> {
+        self.writes
+            .iter()
+            .find(|(inst, write)| self.kills(*inst, write, read))
+            .map(|(inst, _)| *inst)
     }
 
     pub(super) fn clobbers(&self, read: &Access) -> bool {
@@ -114,6 +121,45 @@ pub(super) fn closure_failure(
         }
     }
     None
+}
+
+pub(super) struct Conflicts {
+    pub(super) reentry: Option<String>,
+    writes: Writes,
+}
+
+impl Conflicts {
+    pub(super) fn invalidates(&self, guards: &[Access]) -> bool {
+        self.reentry.is_some()
+            || self.writes.writes.iter().any(|(inst, write)| {
+                guards.iter().any(|guard| {
+                    (write.field == Field::Any || write.location.intersects(guard.location))
+                        && self.writes.kills(*inst, write, guard)
+                })
+            })
+    }
+}
+
+pub(super) fn conflicts(
+    graph: &Graph,
+    blocks: &HashSet<Block>,
+    assumed: &HashMap<Value, cranelift_module::FuncId>,
+) -> Conflicts {
+    let writes = Writes::collect_assuming(graph, blocks, assumed);
+    let cfg = Cfg::new(graph);
+    let reentry = cfg
+        .rpo
+        .iter()
+        .filter(|block| blocks.contains(block))
+        .flat_map(|&block| graph.blocks[block].insts.iter())
+        .find(|&&inst| writes.facts.memory(inst).reenters())
+        .map(|&inst| {
+            format!(
+                "reenters at {inst} ({})",
+                graph.op_text(&graph.insts[inst].op)
+            )
+        });
+    Conflicts { reentry, writes }
 }
 
 pub(super) struct Requirement {
