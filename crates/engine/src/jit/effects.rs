@@ -50,6 +50,8 @@ pub(super) const GLOBAL_WRITE: u16 = 8;
 pub(super) const INTERNAL: u16 = 16;
 pub(super) const ALLOCATION: u16 = 32;
 pub(super) const ERROR: u16 = 64;
+pub(super) const CODE_READ: u16 = 128;
+pub(super) const CODE_WRITE: u16 = 256;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(super) struct Locations(u8);
@@ -95,16 +97,18 @@ impl std::fmt::Display for Locations {
 pub(super) struct Memory {
     pub(super) reads: Locations,
     pub(super) writes: Locations,
+    pub(super) unbounded: bool,
 }
 
 impl Memory {
     pub(super) const UNKNOWN: Self = Self {
         reads: Locations::ALL,
         writes: Locations::ALL,
+        unbounded: true,
     };
 
     pub(super) fn of(flags: u16) -> Self {
-        let locations = |heap, global| {
+        let locations = |heap, global, code| {
             let mut locations = Locations::default();
             if flags & heap != 0 {
                 locations = locations.union(Locations::HEAP);
@@ -112,11 +116,15 @@ impl Memory {
             if flags & global != 0 {
                 locations = locations.union(Locations::GLOBAL);
             }
+            if flags & code != 0 {
+                locations = locations.union(Locations::CODE);
+            }
             locations
         };
         Self {
-            reads: locations(HEAP_READ, GLOBAL_READ),
-            writes: locations(HEAP_WRITE, GLOBAL_WRITE),
+            reads: locations(HEAP_READ, GLOBAL_READ, CODE_READ),
+            writes: locations(HEAP_WRITE, GLOBAL_WRITE, CODE_WRITE),
+            unbounded: false,
         }
     }
 
@@ -124,16 +132,21 @@ impl Memory {
         Self {
             reads: self.reads.union(other.reads),
             writes: self.writes.union(other.writes),
+            unbounded: self.unbounded || other.unbounded,
         }
     }
 
     pub(super) fn reenters(self) -> bool {
-        self.writes.intersects(Locations::CODE)
+        self.unbounded
     }
 
     pub(super) fn writes_data(self) -> bool {
         self.writes
             .intersects(Locations::HEAP.union(Locations::GLOBAL))
+    }
+
+    pub(super) fn writes_state(self) -> bool {
+        !self.writes.is_empty()
     }
 
     pub(super) fn is_empty(self) -> bool {

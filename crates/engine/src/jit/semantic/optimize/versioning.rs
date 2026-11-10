@@ -150,13 +150,11 @@ pub(super) fn apply_version(
 ) -> Version {
     let Speculation {
         fallback,
-        reads,
         guards,
         exits,
         exits_true,
-        typed_reads,
         assumes,
-        code_guards,
+        ..
     } = *speculation;
     let region_blocks: HashSet<Block> = region.iter().copied().collect();
     let requirements: Vec<NativeCheck> = assumes
@@ -184,16 +182,163 @@ pub(super) fn apply_version(
     let local_generic = canonical.is_none().then(|| graph.clone());
     let local_canonical = local_generic.as_ref().map(Canonical::identity);
     let canonical = canonical.or(local_canonical.as_ref()).unwrap();
-    let generic = canonical.graph;
     let mut notes = Vec::new();
     let hints = super::super::observations::numeric_hints(graph);
     let head = entry.map_or(graph.entry, |(_, header)| header);
-    let mut tested =
+    let tested =
         EntryGuard::at_entry(graph, entry.map_or(graph.entry, |(preheader, _)| preheader));
     assert!(fallback.is_none() || entry.is_none());
     let reuse = fallback.is_some()
         && exits.iter().all(|block| guards.contains(block))
         && exits_true.is_empty();
+    let mut copy = duplicate(graph, region, reuse, speculation);
+    let Entry {
+        start,
+        previous,
+        aliases,
+    } = entry_checks(
+        graph,
+        region,
+        entry,
+        speculation,
+        &requirements,
+        &hints,
+        head,
+        reuse,
+        tested,
+        &mut copy,
+    );
+    if !reuse && std::env::var_os("JS_JIT_NO_CONTINUATIONS").is_none() {
+        wire_failures(graph, region, speculation, canonical, &copy, &mut notes);
+    }
+    let Copy {
+        blocks,
+        values,
+        insts,
+        copies,
+    } = copy;
+
+    let mut callees = Vec::new();
+    for &block in region {
+        for &inst in &graph.blocks[block].insts.clone() {
+            let Op::Call { callee, .. } = graph.insts[inst].op else {
+                continue;
+            };
+            let Some(requirement) = requirements.iter().find(|r| r.callee == callee) else {
+                continue;
+            };
+            let copy = insts[&inst];
+            if let Op::Call { callee, args, .. } = &graph.insts[copy].op {
+                callees.push(*callee);
+                graph.insts[copy].op = Op::CallNative(requirement.native, args.clone());
+            }
+        }
+    }
+    let inside: HashSet<Block> = region.iter().chain(&copies).copied().collect();
+    let mut outside = HashSet::new();
+    for (block, data) in graph.blocks.iter() {
+        if inside.contains(&block) {
+            continue;
+        }
+        for &inst in &data.insts {
+            outside.extend(graph.insts[inst].op.operands_iter());
+        }
+        if let Some(terminator) = &data.terminator {
+            outside.extend(terminator.kind.operands_iter());
+        }
+    }
+    let pinned: HashSet<Value> = values
+        .iter()
+        .filter(|(original, _)| outside.contains(*original))
+        .map(|(_, &copy)| copy)
+        .collect();
+    let mut uses = graph.use_counts();
+    while let Some(value) = callees.pop() {
+        if uses[value] != 0 || pinned.contains(&value) {
+            continue;
+        }
+        let ValueDef::Result(inst) = graph.values[value] else {
+            continue;
+        };
+        match graph.insts[inst].op {
+            Op::Get(object, _) => {
+                uses[object] -= 1;
+                callees.push(object);
+            }
+            Op::GlobalRead(_) => {}
+            _ => continue,
+        }
+        uses[value] = u32::MAX;
+        graph.remove_inst(inst);
+    }
+    if !reuse {
+        let definitions: HashMap<Value, Vec<Value>> = values
+            .iter()
+            .map(|(&original, &copy)| {
+                let live = uses[copy] != u32::MAX;
+                (original, if live { vec![copy] } else { Vec::new() })
+            })
+            .collect();
+        repair(graph, &definitions);
+    }
+    // Preserve the original entry during repair so generic loop updates merge with side exits.
+    if !reuse && let Some(previous) = previous {
+        for (block, data) in graph.blocks.iter_mut() {
+            if block < start {
+                continue;
+            }
+            if let Some(terminator) = &mut data.terminator {
+                for target in terminator.kind.targets_mut() {
+                    if target.block == head {
+                        *target = previous.clone();
+                    }
+                }
+            }
+        }
+    }
+    consume_assumes(graph, region, entry, assumes);
+    // Disconnected fallbacks must not contribute writes to the closed copy.
+    let reachable = Cfg::new(graph)
+        .rpo
+        .into_iter()
+        .filter(|block| copies.contains(block))
+        .collect();
+    Version {
+        notes,
+        body: reachable,
+        blocks,
+        insts,
+        values,
+        aliases,
+    }
+}
+
+struct Copy {
+    blocks: HashMap<Block, Block>,
+    values: HashMap<Value, Value>,
+    insts: HashMap<Inst, Inst>,
+    copies: HashSet<Block>,
+}
+
+struct Entry {
+    start: Block,
+    previous: Option<Target>,
+    aliases: HashMap<Value, Value>,
+}
+
+fn duplicate(
+    graph: &mut Graph,
+    region: &[Block],
+    reuse: bool,
+    speculation: &Speculation<'_>,
+) -> Copy {
+    let Speculation {
+        guards,
+        exits,
+        exits_true,
+        typed_reads,
+        ..
+    } = *speculation;
     let mut blocks = HashMap::new();
     let mut values = HashMap::new();
     let mut insts = HashMap::new();
@@ -283,7 +428,40 @@ pub(super) fn apply_version(
     if !reuse {
         graph.cold.extend(region.iter().copied());
     }
+    Copy {
+        blocks,
+        values,
+        insts,
+        copies,
+    }
+}
 
+fn entry_checks(
+    graph: &mut Graph,
+    region: &[Block],
+    entry: Option<(Block, Block)>,
+    speculation: &Speculation<'_>,
+    requirements: &[NativeCheck],
+    hints: &HashMap<Value, crate::jit::profile::ReadType>,
+    head: Block,
+    reuse: bool,
+    mut tested: HashSet<EntryGuard>,
+    copy: &mut Copy,
+) -> Entry {
+    let Speculation {
+        fallback,
+        reads,
+        guards,
+        assumes,
+        code_guards,
+        ..
+    } = *speculation;
+    let Copy {
+        blocks,
+        values,
+        insts,
+        copies,
+    } = copy;
     let span = graph.span;
     let mut args = match entry {
         Some((preheader, _)) => match &graph.blocks[preheader].terminator {
@@ -651,7 +829,7 @@ pub(super) fn apply_version(
                 Op::Observe(number, Observation::Read(ReadKind::Number), site),
                 false,
             );
-            for &block in &copies {
+            for &block in copies.iter() {
                 graph.blocks[block].insts.retain(|&inst| {
                     !matches!(graph.insts[inst].op,
                         Op::Observe(observed, Observation::Read(ReadKind::Number), origin)
@@ -717,129 +895,56 @@ pub(super) fn apply_version(
         None => graph.entry = start,
     }
 
-    if !reuse && std::env::var_os("JS_JIT_NO_CONTINUATIONS").is_none() {
-        let region: HashSet<_> = region.iter().copied().collect();
-        let reverse: HashMap<_, _> = canonical
-            .blocks
-            .iter()
-            .map(|(&old, &current)| (current, old))
-            .collect();
-        let cfg = Cfg::new(graph);
-        let facts = Facts::compute(graph);
-        let order: HashMap<Block, usize> = cfg
-            .rpo
-            .iter()
-            .enumerate()
-            .map(|(index, &block)| (block, index))
-            .collect();
-        let mut exits: Vec<_> = exits
-            .iter()
-            .filter(|block| !guards.contains(block))
-            .map(|&block| (block, false))
-            .chain(exits_true.iter().map(|&block| (block, true)))
-            .collect();
-        exits.sort_by_key(|(block, _)| order.get(&blocks[block]).copied().unwrap_or(usize::MAX));
-        let mut pieces = canonical.pieces.borrow_mut();
-        let mut stubs: HashMap<(usize, Vec<Value>, Option<Inst>), Block> = HashMap::new();
-        let mut resumed: HashMap<Block, Block> = HashMap::new();
-        for &(block, taken) in &exits {
-            if let Some(stub) = shared_resume(graph, &cfg, &facts, blocks[&block], &resumed) {
-                let TerminatorKind::Branch(_, yes, no) = &mut graph.blocks[blocks[&block]]
-                    .terminator
-                    .as_mut()
-                    .unwrap()
-                    .kind
-                else {
-                    continue;
-                };
-                *if taken { yes } else { no } = Target::new(stub);
-                resumed.insert(blocks[&block], stub);
-                notes.push(format!("guard at {block}: shares an earlier resume"));
-                continue;
-            }
-            let Some(&original) = reverse.get(&block) else {
-                notes.push(format!("guard at {block}: canonical block unavailable"));
-                continue;
-            };
-            let TerminatorKind::Branch(_, yes, no) =
-                &generic.blocks[original].terminator.as_ref().unwrap().kind
-            else {
-                notes.push(format!("guard at {block}: canonical branch unavailable"));
-                continue;
-            };
-            let piece = match pieces.resume(generic, if taken { yes } else { no }) {
-                Ok(piece) => piece,
-                Err(reason) => {
-                    notes.push(format!(
-                        "guard at {block}: continuation unavailable: {reason}"
-                    ));
-                    continue;
-                }
-            };
-            let inputs: Option<Vec<_>> = piece
-                .inputs
-                .iter()
-                .map(|value| {
-                    let current = *canonical.values.get(value)?;
-                    let mapped = values.get(&current).copied().unwrap_or(current);
-                    value_available(graph, &cfg, mapped, blocks[&block]).then_some(mapped)
-                })
-                .collect();
-            let Some(inputs) = inputs else {
-                notes.push(format!("guard at {block}: canonical inputs unavailable"));
-                continue;
-            };
-            let prime = match &graph.blocks[blocks[&block]].terminator.as_ref().unwrap().kind {
-                TerminatorKind::Branch(condition, ..) => {
-                    match graph.defining_op(*condition) {
-                        Some(Op::IsPropertyCached(object, site, name)) => {
-                            Some((*object, *site, name.clone()))
-                        }
-                        _ => None,
-                    }
-                }
-                _ => None,
-            };
-            let guard_span = graph.blocks[blocks[&block]].terminator.as_ref().unwrap().span;
-            if crate::jit::bailouts::enabled()
-                && let TerminatorKind::Branch(condition, ..) =
-                    &graph.blocks[blocks[&block]].terminator.as_ref().unwrap().kind
-                && let Some(op) = graph.defining_op(*condition)
-            {
-                crate::jit::bailouts::note_guard(guard_span, graph.op_text(op));
-            }
-            let key = (
-                std::sync::Arc::as_ptr(&piece.body) as usize,
-                inputs.clone(),
-                prime.as_ref().map(|(_, site, _)| *site),
-            );
-            let stub = *stubs.entry(key).or_insert_with(|| {
-                let stub = graph.blocks.push(BlockData::default());
-                if let Some((object, site, name)) = prime {
-                    graph.append(
-                        stub,
-                        guard_span,
-                        Op::PrimePropertyCache(object, site, name),
-                        false,
-                    );
-                }
-                let result = graph
-                    .append(
-                        stub,
-                        guard_span,
-                        Op::Continuation(piece.body.clone(), inputs),
-                        true,
-                    )
-                    .1
-                    .unwrap();
-                graph.blocks[stub].terminator = Some(Terminator {
-                    source_name: None,
-                    span,
-                    kind: TerminatorKind::Return(result),
-                });
-                graph.cold.insert(stub);
-                stub
-            });
+    Entry {
+        start,
+        previous,
+        aliases,
+    }
+}
+
+fn wire_failures(
+    graph: &mut Graph,
+    region: &[Block],
+    speculation: &Speculation<'_>,
+    canonical: &Canonical<'_>,
+    copy: &Copy,
+    notes: &mut Vec<String>,
+) {
+    let Speculation {
+        guards,
+        exits,
+        exits_true,
+        ..
+    } = *speculation;
+    let generic = canonical.graph;
+    let span = graph.span;
+    let Copy { blocks, values, .. } = copy;
+    let region: HashSet<_> = region.iter().copied().collect();
+    let reverse: HashMap<_, _> = canonical
+        .blocks
+        .iter()
+        .map(|(&old, &current)| (current, old))
+        .collect();
+    let cfg = Cfg::new(graph);
+    let facts = Facts::compute(graph);
+    let order: HashMap<Block, usize> = cfg
+        .rpo
+        .iter()
+        .enumerate()
+        .map(|(index, &block)| (block, index))
+        .collect();
+    let mut exits: Vec<_> = exits
+        .iter()
+        .filter(|block| !guards.contains(block))
+        .map(|&block| (block, false))
+        .chain(exits_true.iter().map(|&block| (block, true)))
+        .collect();
+    exits.sort_by_key(|(block, _)| order.get(&blocks[block]).copied().unwrap_or(usize::MAX));
+    let mut pieces = canonical.pieces.borrow_mut();
+    let mut stubs: HashMap<(usize, Vec<Value>, Option<Inst>), Block> = HashMap::new();
+    let mut resumed: HashMap<Block, Block> = HashMap::new();
+    for &(block, taken) in &exits {
+        if let Some(stub) = shared_resume(graph, &cfg, &facts, blocks[&block], &resumed) {
             let TerminatorKind::Branch(_, yes, no) = &mut graph.blocks[blocks[&block]]
                 .terminator
                 .as_mut()
@@ -850,148 +955,173 @@ pub(super) fn apply_version(
             };
             *if taken { yes } else { no } = Target::new(stub);
             resumed.insert(blocks[&block], stub);
-            notes.push(format!(
-                "guard at {block}: resumes in {}",
-                piece.body.graph.name
-            ));
+            notes.push(format!("guard at {block}: shares an earlier resume"));
+            continue;
         }
-        for header in pieces.headers(generic) {
-            let cfg = Cfg::new(graph);
-            let Some(&current) = canonical
-                .blocks
-                .get(&header)
-                .filter(|current| region.contains(current) && cfg.rpo.contains(current))
-            else {
-                continue;
-            };
-            let piece = match pieces.driver(generic, header) {
-                Ok(piece) => piece,
-                Err(reason) => {
-                    notes.push(format!(
-                        "loop at {current}: continuation unavailable: {reason}"
-                    ));
-                    continue;
-                }
-            };
-            let inputs: Option<Vec<_>> = piece
-                .inputs
-                .iter()
-                .map(|value| {
-                    let current_value = *canonical.values.get(value)?;
-                    value_available(graph, &cfg, current_value, current).then_some(current_value)
-                })
-                .collect();
-            let Some(inputs) = inputs else {
+        let Some(&original) = reverse.get(&block) else {
+            notes.push(format!("guard at {block}: canonical block unavailable"));
+            continue;
+        };
+        let TerminatorKind::Branch(_, yes, no) =
+            &generic.blocks[original].terminator.as_ref().unwrap().kind
+        else {
+            notes.push(format!("guard at {block}: canonical branch unavailable"));
+            continue;
+        };
+        let piece = match pieces.resume(generic, if taken { yes } else { no }) {
+            Ok(piece) => piece,
+            Err(reason) => {
                 notes.push(format!(
-                    "loop at {current}: generic entry inputs unavailable"
+                    "guard at {block}: continuation unavailable: {reason}"
                 ));
                 continue;
-            };
-            graph.blocks[current].insts.clear();
+            }
+        };
+        let inputs: Option<Vec<_>> = piece
+            .inputs
+            .iter()
+            .map(|value| {
+                let current = *canonical.values.get(value)?;
+                let mapped = values.get(&current).copied().unwrap_or(current);
+                value_available(graph, &cfg, mapped, blocks[&block]).then_some(mapped)
+            })
+            .collect();
+        let Some(inputs) = inputs else {
+            notes.push(format!("guard at {block}: canonical inputs unavailable"));
+            continue;
+        };
+        let prime = match &graph.blocks[blocks[&block]].terminator.as_ref().unwrap().kind {
+            TerminatorKind::Branch(condition, ..) => {
+                match graph.defining_op(*condition) {
+                    Some(Op::IsPropertyCached(object, site, name)) => {
+                        Some((*object, *site, name.clone()))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let guard_span = graph.blocks[blocks[&block]].terminator.as_ref().unwrap().span;
+        if crate::jit::bailouts::enabled()
+            && let TerminatorKind::Branch(condition, ..) =
+                &graph.blocks[blocks[&block]].terminator.as_ref().unwrap().kind
+            && let Some(op) = graph.defining_op(*condition)
+        {
+            crate::jit::bailouts::note_guard(guard_span, graph.op_text(op));
+        }
+        let key = (
+            std::sync::Arc::as_ptr(&piece.body) as usize,
+            inputs.clone(),
+            prime.as_ref().map(|(_, site, _)| *site),
+        );
+        let stub = *stubs.entry(key).or_insert_with(|| {
+            let stub = graph.blocks.push(BlockData::default());
+            if let Some((object, site, name)) = prime {
+                graph.append(
+                    stub,
+                    guard_span,
+                    Op::PrimePropertyCache(object, site, name),
+                    false,
+                );
+            }
             let result = graph
-                .append(current, span, Op::Continuation(piece.body, inputs), true)
+                .append(
+                    stub,
+                    guard_span,
+                    Op::Continuation(piece.body.clone(), inputs),
+                    true,
+                )
                 .1
                 .unwrap();
-            graph.blocks[current].terminator = Some(Terminator {
+            graph.blocks[stub].terminator = Some(Terminator {
                 source_name: None,
                 span,
                 kind: TerminatorKind::Return(result),
             });
-            notes.push(format!("loop at {current}: separate generic function"));
-        }
-    }
-
-    let mut callees = Vec::new();
-    for &block in region {
-        for &inst in &graph.blocks[block].insts.clone() {
-            let Op::Call { callee, .. } = graph.insts[inst].op else {
-                continue;
-            };
-            let Some(requirement) = requirements.iter().find(|r| r.callee == callee) else {
-                continue;
-            };
-            let copy = insts[&inst];
-            if let Op::Call { callee, args, .. } = &graph.insts[copy].op {
-                callees.push(*callee);
-                graph.insts[copy].op = Op::CallNative(requirement.native, args.clone());
-            }
-        }
-    }
-    let inside: HashSet<Block> = region.iter().chain(&copies).copied().collect();
-    let mut outside = HashSet::new();
-    for (block, data) in graph.blocks.iter() {
-        if inside.contains(&block) {
-            continue;
-        }
-        for &inst in &data.insts {
-            outside.extend(graph.insts[inst].op.operands_iter());
-        }
-        if let Some(terminator) = &data.terminator {
-            outside.extend(terminator.kind.operands_iter());
-        }
-    }
-    let pinned: HashSet<Value> = values
-        .iter()
-        .filter(|(original, _)| outside.contains(*original))
-        .map(|(_, &copy)| copy)
-        .collect();
-    let mut uses = graph.use_counts();
-    while let Some(value) = callees.pop() {
-        if uses[value] != 0 || pinned.contains(&value) {
-            continue;
-        }
-        let ValueDef::Result(inst) = graph.values[value] else {
+            graph.cold.insert(stub);
+            stub
+        });
+        let TerminatorKind::Branch(_, yes, no) = &mut graph.blocks[blocks[&block]]
+            .terminator
+            .as_mut()
+            .unwrap()
+            .kind
+        else {
             continue;
         };
-        match graph.insts[inst].op {
-            Op::Get(object, _) => {
-                uses[object] -= 1;
-                callees.push(object);
-            }
-            Op::GlobalRead(_) => {}
-            _ => continue,
-        }
-        uses[value] = u32::MAX;
-        graph.remove_inst(inst);
+        *if taken { yes } else { no } = Target::new(stub);
+        resumed.insert(blocks[&block], stub);
+        notes.push(format!(
+            "guard at {block}: resumes in {}",
+            piece.body.graph.name
+        ));
     }
-    if !reuse {
-        let definitions: HashMap<Value, Vec<Value>> = values
-            .iter()
-            .map(|(&original, &copy)| {
-                let live = uses[copy] != u32::MAX;
-                (original, if live { vec![copy] } else { Vec::new() })
-            })
-            .collect();
-        repair(graph, &definitions);
-    }
-    // Preserve the original entry during repair so generic loop updates merge with side exits.
-    if !reuse && let Some(previous) = previous {
-        for (block, data) in graph.blocks.iter_mut() {
-            if block < start {
+    for header in pieces.headers(generic) {
+        let cfg = Cfg::new(graph);
+        let Some(&current) = canonical
+            .blocks
+            .get(&header)
+            .filter(|current| region.contains(current) && cfg.rpo.contains(current))
+        else {
+            continue;
+        };
+        let piece = match pieces.driver(generic, header) {
+            Ok(piece) => piece,
+            Err(reason) => {
+                notes.push(format!(
+                    "loop at {current}: continuation unavailable: {reason}"
+                ));
                 continue;
             }
-            if let Some(terminator) = &mut data.terminator {
-                for target in terminator.kind.targets_mut() {
-                    if target.block == head {
-                        *target = previous.clone();
-                    }
-                }
-            }
-        }
+        };
+        let inputs: Option<Vec<_>> = piece
+            .inputs
+            .iter()
+            .map(|value| {
+                let current_value = *canonical.values.get(value)?;
+                value_available(graph, &cfg, current_value, current).then_some(current_value)
+            })
+            .collect();
+        let Some(inputs) = inputs else {
+            notes.push(format!(
+                "loop at {current}: generic entry inputs unavailable"
+            ));
+            continue;
+        };
+        graph.blocks[current].insts.clear();
+        let result = graph
+            .append(current, span, Op::Continuation(piece.body, inputs), true)
+            .1
+            .unwrap();
+        graph.blocks[current].terminator = Some(Terminator {
+            source_name: None,
+            span,
+            kind: TerminatorKind::Return(result),
+        });
+        notes.push(format!("loop at {current}: separate generic function"));
     }
-    // Disconnected fallbacks must not contribute writes to the closed copy.
-    let reachable = Cfg::new(graph)
-        .rpo
-        .into_iter()
-        .filter(|block| copies.contains(block))
-        .collect();
-    Version {
-        notes,
-        body: reachable,
-        blocks,
-        insts,
-        values,
-        aliases,
+    }
+
+fn consume_assumes(
+    graph: &mut Graph,
+    blocks: &[Block],
+    entry: Option<(Block, Block)>,
+    checks: &[(Value, Fact)],
+) {
+    let scope = blocks.iter().copied().chain(entry.map(|(before, _)| before));
+    for block in scope.collect::<Vec<_>>() {
+        let consumed: Vec<Inst> = graph.blocks[block]
+            .insts
+            .iter()
+            .copied()
+            .filter(|&inst| {
+                matches!(graph.insts[inst].op, Op::Assume(value, fact, _)
+                    if checks.iter().any(|&(checked, known)| checked == value && known.implies(fact)))
+            })
+            .collect();
+        for inst in consumed {
+            graph.detach_inst(inst);
+        }
     }
 }
 

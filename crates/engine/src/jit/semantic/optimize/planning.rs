@@ -1,5 +1,6 @@
 use super::super::specialize::{ConditionalCall, ConditionalPlan};
-use super::super::guards::Fact;
+use super::super::guards::{Fact, Origin};
+use super::cost::{Candidate, Verdict, worth};
 use super::placement::Reach;
 use super::versioning::{Canonical, Version};
 use super::*;
@@ -25,33 +26,12 @@ fn pure_guard(graph: &Graph, block: Block) -> bool {
     }
 }
 
-fn consume_assumes(
-    graph: &mut Graph,
-    blocks: &[Block],
-    entry: Option<(Block, Block)>,
-    checks: &[(Value, Fact)],
-) {
-    let scope = blocks.iter().copied().chain(entry.map(|(before, _)| before));
-    for block in scope.collect::<Vec<_>>() {
-        let consumed: Vec<Inst> = graph.blocks[block]
-            .insts
-            .iter()
-            .copied()
-            .filter(|&inst| {
-                matches!(graph.insts[inst].op, Op::Assume(value, fact, _)
-                    if checks.iter().any(|&(checked, known)| checked == value && known.implies(fact)))
-            })
-            .collect();
-        for inst in consumed {
-            graph.detach_inst(inst);
-        }
-    }
-}
-
 #[derive(Default)]
 pub(super) struct Candidates {
     facts: Vec<(Value, Fact)>,
     codes: Vec<(String, cranelift_module::FuncId)>,
+    origins: Vec<(Value, Fact, Origin)>,
+    code_origins: Vec<(String, cranelift_module::FuncId, Origin)>,
 }
 
 struct RegionPlan {
@@ -66,6 +46,8 @@ struct RegionPlan {
     guards: Vec<Block>,
     exits: Vec<Block>,
     typed_reads: Vec<(Inst, TypedRead)>,
+    survivors: Vec<(Fact, Origin)>,
+    reentry: Option<String>,
     children: Vec<RegionPlan>,
 }
 
@@ -280,6 +262,7 @@ impl RegionPlan {
         let candidates = Candidates {
             facts: std::mem::take(&mut self.assumes),
             codes: std::mem::take(&mut self.identities),
+            ..Default::default()
         };
         let (mut current, _) = plan_region(
             graph,
@@ -320,7 +303,6 @@ impl RegionPlan {
                 ..Default::default()
             };
             let version = apply_version(graph, &blocks, self.entry, &speculation, Some(canonical));
-            consume_assumes(graph, &blocks, self.entry, &self.checks);
             region_fallback = Some(if let Some(address) = fallback {
                 RegionFallback::CompiledEntry(address)
             } else {
@@ -616,6 +598,23 @@ fn plan_region(
         return Err(reentry
             .unwrap_or_else(|| "no invariant entry guards for reentrant fallbacks".into()));
     }
+    let mut survivors: Vec<(Fact, Origin)> = candidates
+        .origins
+        .iter()
+        .filter(|&&(value, fact, _)| {
+            checks
+                .iter()
+                .any(|&(checked, known)| checked == value && known.implies(fact))
+        })
+        .map(|&(_, fact, origin)| (fact, origin))
+        .collect();
+    survivors.extend(
+        candidates
+            .code_origins
+            .iter()
+            .filter(|(name, code, _)| identities.contains(&(name.clone(), *code)))
+            .map(|&(_, code, origin)| (Fact::Code(code), origin)),
+    );
     Ok((
         RegionPlan {
             body,
@@ -629,6 +628,8 @@ fn plan_region(
             guards,
             exits,
             typed_reads,
+            survivors,
+            reentry,
             children: Vec::new(),
         },
         facts,
@@ -667,9 +668,15 @@ fn plan(
                     .is_some_and(|outer| outer.is_superset(&body))
         }) {
             match (reach.fact, &reach.global) {
-                (Fact::Code(code), Some(name)) => proposals.codes.push((name.clone(), code)),
+                (Fact::Code(code), Some(name)) => {
+                    proposals.codes.push((name.clone(), code));
+                    proposals.code_origins.push((name.clone(), code, reach.origin));
+                }
                 (Fact::Code(_), None) => {}
-                (fact, _) => proposals.facts.push((reach.value, fact)),
+                (fact, _) => {
+                    proposals.facts.push((reach.value, fact));
+                    proposals.origins.push((reach.value, fact, reach.origin));
+                }
             }
         }
         let (mut parent, facts) = match plan_region(
@@ -689,6 +696,28 @@ fn plan(
                 continue;
             }
         };
+        let label = entry.map_or_else(
+            || "function".to_owned(),
+            |(_, header)| format!("loop at {header}"),
+        );
+        let candidate = Candidate {
+            size: parent
+                .body
+                .iter()
+                .filter(|block| !graph.cold.contains(block))
+                .map(|&block| graph.blocks[block].insts.len())
+                .sum(),
+            checks: parent.checks.len() + parent.identities.len(),
+            reentry: parent.reentry.as_deref(),
+            survivors: &parent.survivors,
+        };
+        match worth(&candidate) {
+            Verdict::Open => notes.push(format!("{label}: gate open: {}", candidate.summary())),
+            Verdict::Skip(reason) => {
+                notes.push(format!("{label}: not versioned: {reason}"));
+                continue;
+            }
+        }
         let mut remaining = Vec::new();
         for child in plans {
             if child.body.is_subset(&parent.body) {
@@ -1243,5 +1272,25 @@ mod tests {
         assert!(!root.checks.iter().any(|&(value, _)| {
             matches!(graph.defining_op(value), Some(Op::Get(_, name)) if name == "width")
         }));
+    }
+
+    #[test]
+    fn reentrant_functions_are_not_versioned() {
+        let mut graph = graph("function f(g,n){g();return n*2+1;}");
+        let mut notes = Vec::new();
+        let regions = version(&mut graph, &ConditionalPlan::default(), None, &mut notes).unwrap();
+        assert!(regions.is_empty());
+        assert!(notes.iter().any(|note| note.starts_with("function: not versioned: reenters")));
+        graph.verify().unwrap();
+    }
+
+    #[test]
+    fn closed_loops_are_versioned() {
+        let mut graph = graph("function f(n){let sum=0;for(let i=0;i<n;++i)sum+=i*2;return sum;}");
+        let mut notes = Vec::new();
+        let regions = version(&mut graph, &ConditionalPlan::default(), None, &mut notes).unwrap();
+        assert!(!regions.is_empty());
+        assert!(notes.iter().any(|note| note.contains("gate open")));
+        graph.verify().unwrap();
     }
 }

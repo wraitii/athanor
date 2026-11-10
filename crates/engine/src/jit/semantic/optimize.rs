@@ -17,6 +17,7 @@ use crate::heap::TypedKind;
 const SPECIALIZATION_REGION_LIMIT: usize = 512;
 
 mod analysis;
+mod cost;
 mod placement;
 mod planning;
 mod propose;
@@ -534,6 +535,23 @@ pub(super) fn natural_loops(graph: &Graph, cfg: &Cfg) -> Vec<(Block, HashSet<Blo
     loops
 }
 
+pub(super) fn normalise_regions(
+    graph: &mut Graph,
+    regions: &[RegionId],
+    notes: &mut Vec<String>,
+) -> Result<()> {
+    graph.verify()?;
+    super::js::simplify(graph);
+    graph.verify()?;
+    reuse_loads(graph, notes);
+    graph.verify()?;
+    for region in regions {
+        hoist(graph, *region, notes);
+        graph.verify()?;
+    }
+    Ok(())
+}
+
 pub(super) fn hoist(graph: &mut Graph, region: RegionId, notes: &mut Vec<String>) {
     let region = graph.regions[region].blocks.clone();
     let region = &region;
@@ -904,6 +922,33 @@ mod tests {
             assert!(!writes.clobbers(&heap(array, Field::Named("allows".into()))));
             assert!(!writes.clobbers(&global("g_Map")));
         }
+    }
+
+    #[test]
+    fn shape_checks_survive_slot_stores_but_not_shape_writes_on_the_object() {
+        let mut graph = empty_graph();
+        let block = graph.entry;
+        let span = graph.span;
+        let object = graph.append(block, span, Op::Argument(0), true).1.unwrap();
+        let value = graph.append(block, span, Op::Argument(1), true).1.unwrap();
+        let first = graph.append(block, span, Op::IsShape(object, 1), true).1;
+        graph.append(block, span, Op::ShapedSet(object, "x".into(), 0, value), false);
+        let (second, _) = graph.append(block, span, Op::IsShape(object, 1), true);
+        graph.append(block, span, Op::Set(object, "y".into(), value), false);
+        let (third, _) = graph.append(block, span, Op::IsShape(object, 1), true);
+        graph.blocks[block].terminator = Some(Terminator {
+            source_name: None,
+            span,
+            kind: TerminatorKind::Return(first.unwrap()),
+        });
+        graph.verify().unwrap();
+        let facts = Facts::compute(&graph);
+        let cfg = Cfg::new(&graph);
+        let solved = super::super::available::solve(&graph, &facts, &cfg, HashSet::new(), false)
+            .unwrap();
+        let reused: Vec<Inst> = solved.reused.iter().map(|&(inst, _)| inst).collect();
+        assert!(reused.contains(&second));
+        assert!(!reused.contains(&third));
     }
 
     #[test]

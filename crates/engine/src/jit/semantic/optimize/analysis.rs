@@ -23,7 +23,7 @@ impl Writes {
         for &block in blocks {
             for &inst in &graph.blocks[block].insts {
                 let memory = facts.memory(inst);
-                if memory.writes_data() {
+                if memory.writes_state() {
                     writes.push((
                         inst,
                         Access::written(&graph.insts[inst].op, &facts, memory.writes),
@@ -39,7 +39,9 @@ impl Writes {
     }
 
     pub(super) fn kills(&self, inst: Inst, write: &Access, read: &Access) -> bool {
-        self.fresh.may_alias(inst, write, read) && write.field.conflicts(&read.field)
+        write.overlaps(read)
+            && self.fresh.may_alias(inst, write, read)
+            && write.field.conflicts(&read.field)
     }
 
     pub(super) fn killer(&self, read: &Access) -> Option<Inst> {
@@ -105,7 +107,7 @@ pub(super) fn closure_failure(
             if memory.reenters() {
                 return Some(format!("reenters at {inst} ({})", graph.op_text(op)));
             }
-            if !memory.writes_data() || guards.is_empty() {
+            if !memory.writes_state() || guards.is_empty() {
                 continue;
             }
             let write = Access::written(op, facts, memory.writes);

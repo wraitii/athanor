@@ -73,6 +73,13 @@ pub(super) struct Access {
 }
 
 impl Access {
+    pub(super) fn overlaps(&self, read: &Self) -> bool {
+        let data = Locations::HEAP.union(Locations::GLOBAL);
+        let code = Locations::CODE;
+        (self.location.intersects(data) && read.location.intersects(data))
+            || (self.location.intersects(code) && read.location.intersects(code))
+    }
+
     pub(super) fn read(op: &Op, facts: &Facts) -> Option<Self> {
         let (location, base) = match op {
             Op::Get(object, _)
@@ -82,6 +89,9 @@ impl Access {
             | Op::IndexedGet(object, _)
             | Op::ArrayLoad(object, _, _)
             | Op::ConstructorPrototype(object) => (Locations::HEAP, Some(*object)),
+            Op::IsShape(object, _) | Op::IsPropertyCached(object, ..) => {
+                (Locations::CODE, Some(*object))
+            }
             Op::GlobalRead(_) => (Locations::GLOBAL, None),
             _ => return None,
         };

@@ -1,3 +1,4 @@
+use crate::jit::effects::Locations;
 use crate::jit::profile::{PropertyAccess, ShapeAccess, Site};
 
 use std::collections::{HashMap, HashSet};
@@ -119,7 +120,12 @@ fn shape_preserving(graph: &Graph, facts: &Facts, op: &Op) -> bool {
     ) {
         return false;
     }
-    graph.contract(op, facts).effects.memory.writes.is_empty()
+    !graph
+        .contract(op, facts)
+        .effects
+        .memory
+        .writes
+        .intersects(Locations::CODE)
 }
 
 fn segments(graph: &Graph, planned: &HashMap<Inst, (Value, u32, u32)>) -> Vec<Segment> {

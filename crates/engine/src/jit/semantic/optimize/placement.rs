@@ -22,6 +22,7 @@ pub(super) struct Reach {
     pub(super) use_block: Block,
     pub(super) header: Option<Block>,
     pub(super) global: Option<String>,
+    pub(super) origin: Origin,
 }
 
 fn is_load(op: &Op) -> bool {
@@ -271,6 +272,7 @@ pub(super) fn place_assumes(
                 use_block: block,
                 header: points[index].header,
                 global,
+                origin,
             });
             placed[index].push(Placed {
                 inst,

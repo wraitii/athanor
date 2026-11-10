@@ -119,9 +119,17 @@ keyed by `Inst`).
 
 Done:
 - `Effects { memory: Memory, control: Control }`; `Memory` reads/writes `Locations` (heap, global,
-  code); reentry is "writes code".
+  code). `CODE` is state compiled code bakes in: object shapes and prototypes. `IsShape` and
+  `IsPropertyCached` read `CODE` on their object; `Set`, `SetIndex`, `Define`, `DefineHidden`,
+  `MarkClass`, `DisableConstructor` and global writes may transition shapes and write `CODE` (on
+  their object, `base: None` for globals); `ShapedSet` overwrites an existing slot and writes only
+  `HEAP`. Reentry is the unknown case: `Memory::UNKNOWN` writes every location on an unknown object
+  and sets `unbounded`, which is what `reenters()` reports (a union of known `HEAP|GLOBAL|CODE`
+  writes is not reentry).
 - `Access { location, base, field }` refines a `Locations` class for one object and one field;
-  `Writes::clobbers`, `closure_failure` and the available-loads dataflow use it.
+  `Writes::clobbers`, `closure_failure` and the available-loads dataflow use it. A write kills a read
+  only if their locations overlap (`HEAP` and `GLOBAL` count as one data class, `CODE` is separate),
+  so an `IsShape(o)` stays available across slot stores and `CODE` writes on distinct fresh objects.
 - `Facts::removable(inst)` drives DCE; `graph.views` entries are real uses.
 
 ### Guard table (planner-owned)
@@ -237,6 +245,18 @@ identity rule is gone because entry probes reuse the `IsCode`-checked probe. `gu
 longer trusts region legality: the available-loads dataflow (`semantic/available.rs`, shared with
 `reuse_loads`) must still hold the guarded probe at the call, with summarised calls decided
 optimistically and re-checked until stable.
+Step 7 is done: planner proposals are real `Assume` ops, placed and merged by `place_assumes`, and
+versioning consumes the ones that reach a region.
+Step 8 is done in its small form: `apply_version` is `duplicate`, `entry_checks` and `wire_failures`
+(continuations, cache priming and the previous-entry fallback, isolated for step 9) plus SSA repair, and
+it detaches the `Assume`s its checks imply. `Reach` and `Candidates` carry each `Assume`'s `Origin`,
+and `optimize/cost.rs` holds the open-or-skip hook (`worth`), fed with the surviving `Assume`s, size,
+check count and reentry. Its default only opens a region whose specialised body has no reentry left,
+which restores the pre-step-7(e) behaviour; gain values are still 1 and unused. The
+post-versioning normalisation (`simplify`, `reuse_loads`, `hoist`) is `normalise_regions`, still run
+once over the whole graph after all regions: it must stay after the last child emit because the
+`Version` maps and `Canonical` mapping are not valid across it. Per-copy normalisation and the
+iteration it enables are not done.
 
 1. **Rename `jit/planner.rs` to `jit/profile.rs`.** Split `Profile` from the recompile queue.
    Mechanical.
@@ -275,11 +295,24 @@ optimistically and re-checked until stable.
    to today's.
 8. **Versioning as a transform.** `apply_version` reduces to "duplicate from an `Assume` collection
    point, turn those `Assume`s into entry checks, repair SSA", then reruns normalisation on the
-   copy. The gain-versus-cost decision is a hook that is ready for a cost model but not
-   implemented: it keeps today's choices.
-9. **Failure mode per check.** Continuation wiring, cache priming and previous-entry fallback move
-   out of `apply_version` into a pass after optimisation. Continuations stay the only mode for
-   now; inline recovery (an IC-sized region) is added with the cost model.
+   copy. The gain-versus-cost decision is a hook that is ready for a cost model, with a small
+   default: specialise only at loop and function collection points, and only when the specialised
+   body has no reentry left once its native and identity `Assume`s hold (step 7's per-`Assume`
+   viability opened reentrant regions and cost about +32% on the map, partly from a specialised
+   copy that keeps leaving through continuations).
+9. **Failure mode per check.** Wiring continuations late is not useful on its own: guards already
+   exist before normalisation (so the guarded code is optimised under their facts), and a
+   continuation exit never rejoins, so nothing downstream depends on how it is lowered. The real
+   choice is for speculating lowerings (`reads::apply`, `shapes::apply`, typed-array number
+   checks): on failure, run the generic helper inline and rejoin, or bail through a continuation.
+   That needs those lowerings to stay `Assume`s until the decision, so their guards are
+   materialised later than today. As `Assume`s they also go through placement: a guard on a
+   loop-invariant receiver hoists to the region entry and becomes an entry check (generic copy on
+   failure, no continuation, checked once), and only guards on values defined in the loop stay
+   inline, where IC-or-bail applies. Shapes need their own observation for this: a site-keyed shape
+   feedback (the property cache is the observing IC) and a proposer emitting
+   `Assume(o, Fact::Shape(s))`, mirroring `Observe`/`ReadHint` for types. Done with the cost model in
+   step 10.
 10. **Cost model and failure feedback.** Guard failure counts in the profile; loop-weighted
     evaluation; specialise-or-drop and continuation-or-inline decided by cost. This doubles as
     tiering: with fresh feedback every `Assume` is an in-place IC (cheap, cannot deopt); once its
@@ -305,8 +338,6 @@ need before/after comparisons of notes and timings, not just hashes.
   optimised bodies.
 - **Cost model units.** Loop weight, guard cost, failure rate and the size of what a guard unlocks
   need a common scale. Start crude (loop depth, counts) and make it visible in `--planner` notes.
-- **Shape identities.** Shapes are runtime objects; whether a shape fact is a value fact on the
-  object (permanent until a write changes the shape) or needs location treatment.
 - **Observation placement.** `Observe`/`ReadHint` are injected by `observations::plan` after
   inlining; the first (unoptimised) compile still needs observation points.
 - **Planning under assumptions.** Evaluating candidates with `Facts::assuming(already chosen

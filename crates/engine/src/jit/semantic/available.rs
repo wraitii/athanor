@@ -69,9 +69,10 @@ fn load_key(
             ..
         } if pure => LoadKey::Binary(*operator, at(left), at(right)),
         _ => match implies(op)? {
-            (value, fact @ (Fact::Type(_) | Fact::Code(_) | Fact::Typed(_))) => {
-                LoadKey::Check(at(&value), fact)
-            }
+            (
+                value,
+                fact @ (Fact::Type(_) | Fact::Code(_) | Fact::Typed(_) | Fact::Shape(_)),
+            ) => LoadKey::Check(at(&value), fact),
             _ => return None,
         },
     })
@@ -99,7 +100,7 @@ fn step(
         state.clear();
         return None;
     }
-    if memory.writes_data() {
+    if memory.writes_state() {
         let write = Access::written(&data.op, facts, memory.writes);
         state.retain(|_, entry| {
             entry

@@ -34,8 +34,8 @@ use oxc_syntax::operator::BinaryOperator;
 use oxc_syntax::symbol::SymbolId;
 
 use super::effects::{
-    ALLOCATION, Control, ERROR, Effects, GLOBAL_READ, GLOBAL_WRITE, HEAP_READ, HEAP_WRITE,
-    INTERNAL, Memory,
+    ALLOCATION, CODE_READ, CODE_WRITE, Control, ERROR, Effects, GLOBAL_READ, GLOBAL_WRITE,
+    HEAP_READ, HEAP_WRITE, INTERNAL, Memory,
 };
 use super::math::METHODS;
 use crate::heap::TypedKind;
@@ -1230,9 +1230,14 @@ impl Graph {
                 MaybeOwned,
             ),
             Op::IsUninitialized(_) => closed(0, Unowned),
-            Op::Define(..) => closed(HEAP_READ | ALLOCATION | INTERNAL | ERROR, None),
+            // Defines only target the literal being built, which nothing has read yet, so the
+            // HEAP write is left out to keep borrows and loads alive across object construction.
+            Op::Define(..) => closed(
+                HEAP_READ | CODE_WRITE | ALLOCATION | INTERNAL | ERROR,
+                None,
+            ),
             Op::DefineHidden(..) | Op::MarkClass(_) | Op::DisableConstructor(_) => {
-                closed(HEAP_WRITE | ALLOCATION | INTERNAL | ERROR, None)
+                closed(HEAP_WRITE | CODE_WRITE | ALLOCATION | INTERNAL | ERROR, None)
             }
             Op::PackAppend(..) | Op::ArrayAppend(..) => {
                 closed(HEAP_READ | HEAP_WRITE | ALLOCATION | INTERNAL | ERROR, None)
@@ -1241,17 +1246,17 @@ impl Graph {
                 HEAP_READ | GLOBAL_READ | ALLOCATION | INTERNAL | ERROR,
                 Borrowed,
             ),
-            Op::IsPropertyCached(..) => closed(HEAP_READ, Unowned),
-            Op::IsShape(..) => closed(HEAP_READ, Unowned),
+            Op::IsPropertyCached(..) | Op::IsShape(..) => closed(CODE_READ, Unowned),
             Op::ShapedGet(..) => closed(HEAP_READ | INTERNAL | ERROR, Borrowed),
             Op::ShapedSet(..) => {
                 closed(HEAP_READ | HEAP_WRITE | ALLOCATION | INTERNAL | ERROR, None)
             }
-            Op::PrimePropertyCache(..) => closed(HEAP_READ | INTERNAL, None),
+            Op::PrimePropertyCache(..) => closed(HEAP_READ | CODE_READ | INTERNAL, None),
             Op::CachedProperty(..) => closed(HEAP_READ | INTERNAL | ERROR, Borrowed),
-            Op::Set(..) | Op::SetIndex(..) => {
-                closed(HEAP_READ | HEAP_WRITE | ALLOCATION | INTERNAL | ERROR, None)
-            }
+            Op::Set(..) | Op::SetIndex(..) => closed(
+                HEAP_READ | HEAP_WRITE | CODE_WRITE | ALLOCATION | INTERNAL | ERROR,
+                None,
+            ),
             Op::Unary(UnaryOp::Not, _) => closed(HEAP_READ, Unowned),
             Op::Unary(UnaryOp::Typeof, _) => closed(HEAP_READ | ALLOCATION | ERROR, MaybeOwned),
             Op::Unary(UnaryOp::Increment | UnaryOp::Decrement, _) => {
@@ -1791,15 +1796,7 @@ pub(super) fn optimize_planned(
             notes.push(format!("{id}: blocks [{blocks}], fallback {fallback}"));
         }
     }
-    graph.verify()?;
-    js::simplify(&mut graph);
-    graph.verify()?;
-    optimize::reuse_loads(&mut graph, &mut notes);
-    graph.verify()?;
-    for region in &regions {
-        optimize::hoist(&mut graph, *region, &mut notes);
-        graph.verify()?;
-    }
+    optimize::normalise_regions(&mut graph, &regions, &mut notes)?;
     js::coercions(&mut graph);
     js::bit_tests(&mut graph);
     graph.verify()?;
