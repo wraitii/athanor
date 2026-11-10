@@ -362,7 +362,7 @@ impl FunctionCompiler<'_, '_> {
         let offset = match self.property_caches.get(&site) {
             Some(&offset) => offset,
             None => {
-                let offset = self.data.push(PropertyCache::new(name));
+                let offset = self.data.push(PropertyCache::new(name, None));
                 self.property_caches.insert(site, offset);
                 offset
             }
@@ -914,7 +914,7 @@ impl FunctionCompiler<'_, '_> {
             .bitcast(types::I64, MemFlagsData::new(), length);
         self.jump(done, &[BlockArg::Value(bits)]);
         self.switch(slow);
-        let result = self.property_access(object, "length", None);
+        let result = self.property_access(object, "length", None, None);
         self.jump(done, &[BlockArg::Value(result)]);
         self.switch(done);
         self.b.block_params(done)[0]
@@ -1345,12 +1345,13 @@ impl FunctionCompiler<'_, '_> {
         object: ClifValue,
         name: &str,
         retain: bool,
+        observer: Option<(u64, crate::jit::planner::Site)>,
     ) -> ClifValue {
-        self.cached_property_read(object, name, retain, false)
+        self.cached_property_read(object, name, retain, false, observer)
     }
 
     pub(super) fn cached_property_probe(&mut self, object: ClifValue, name: &str) -> ClifValue {
-        self.cached_property_read(object, name, false, true)
+        self.cached_property_read(object, name, false, true, None)
     }
 
     fn cached_property_read(
@@ -1359,8 +1360,9 @@ impl FunctionCompiler<'_, '_> {
         name: &str,
         retain: bool,
         probe: bool,
+        observer: Option<(u64, crate::jit::planner::Site)>,
     ) -> ClifValue {
-        let address = self.function_data(PropertyCache::new(name));
+        let address = self.function_data(PropertyCache::new(name, observer));
         let flags = MemFlagsData::trusted();
         let heap = self.is_heap(object);
         let address_bits = self.b.ins().band_imm_s(object, ADDRESS_MASK);
@@ -1624,13 +1626,120 @@ impl FunctionCompiler<'_, '_> {
         result
     }
 
+    fn overwrite_slot(
+        &mut self,
+        view: ClifValue,
+        overwrite_index: ClifValue,
+        value: ClifValue,
+        slow: cranelift_codegen::ir::Block,
+        done: cranelift_codegen::ir::Block,
+    ) {
+        let flags = MemFlagsData::trusted();
+        let overwrite_data = self.b.ins().load(self.pointer, flags, view, DATA_OFFSET);
+        let overwrite_offset = self.b.ins().ishl_imm_s(overwrite_index, 3);
+        let overwrite_slot = self.b.ins().iadd(overwrite_data, overwrite_offset);
+        let old = self.b.ins().load(types::I64, flags, overwrite_slot, 0);
+        let old_address = super::scope::heap_address(self.b, old);
+        let old_native = self.b.create_block();
+        let overwrite_retain = self.b.create_block();
+        let overwrite_store = self.b.create_block();
+        let overwrite_release = self.b.create_block();
+        let overwrite_done = self.b.create_block();
+        self.brif(old_address, old_native, &[], overwrite_retain, &[]);
+        self.switch(old_native);
+        let old_view_kind = self.view_kind(old_address);
+        let native_bits = self.b.ins().band_imm_s(old_view_kind, kind::NATIVE as i64);
+        let is_native = self.b.ins().icmp_imm_s(IntCC::NotEqual, native_bits, 0);
+        self.brif(is_native, slow, &[], overwrite_retain, &[]);
+        self.switch(overwrite_retain);
+        let overwrite_incoming = super::scope::heap_address(self.b, value);
+        let overwrite_increment = self.b.create_block();
+        self.brif(
+            overwrite_incoming,
+            overwrite_increment,
+            &[],
+            overwrite_store,
+            &[],
+        );
+        self.switch(overwrite_increment);
+        super::scope::increment_references(self.b, overwrite_incoming);
+        self.jump(overwrite_store, &[]);
+        self.switch(overwrite_store);
+        self.b.ins().store(flags, value, overwrite_slot, 0);
+        self.brif(old_address, overwrite_release, &[], overwrite_done, &[]);
+        self.switch(overwrite_release);
+        self.release_inline(old, overwrite_done, false);
+        self.switch(overwrite_done);
+        self.jump(done, &[BlockArg::Value(value)]);
+    }
+
+    pub(super) fn shape_hit(&mut self, object: ClifValue, shape: u32) -> ClifValue {
+        let view = self.view(object);
+        let actual = self
+            .b
+            .ins()
+            .load(types::I32, MemFlagsData::trusted(), view, SHAPE_OFFSET);
+        self.b.ins().icmp_imm_s(IntCC::Equal, actual, shape as i64)
+    }
+
+    pub(super) fn shaped_property_get(
+        &mut self,
+        object: ClifValue,
+        index: u32,
+        retain: bool,
+    ) -> ClifValue {
+        let flags = MemFlagsData::trusted();
+        let view = self.b.ins().band_imm_s(object, ADDRESS_MASK);
+        let data = self.b.ins().load(self.pointer, flags, view, DATA_OFFSET);
+        let bits = self
+            .b
+            .ins()
+            .load(types::I64, flags, data, (index as i32) * 8);
+        if !retain {
+            return bits;
+        }
+        let heap = self.is_heap(bits);
+        let retain = self.b.create_block();
+        let done = self.b.create_block();
+        self.b.append_block_param(done, types::I64);
+        self.brif(heap, retain, &[], done, &[BlockArg::Value(bits)]);
+        self.switch(retain);
+        let retained = self.retain_temporary(bits);
+        self.jump(done, &[BlockArg::Value(retained)]);
+        self.switch(done);
+        self.b.block_params(done)[0]
+    }
+
+    pub(super) fn shaped_property_set(
+        &mut self,
+        object: ClifValue,
+        name: &str,
+        index: u32,
+        value: ClifValue,
+    ) {
+        let view = self.b.ins().band_imm_s(object, ADDRESS_MASK);
+        let index = self.b.ins().iconst(types::I64, index as i64);
+        let slow = self.b.create_block();
+        let done = self.b.create_block();
+        self.b.append_block_param(done, types::I64);
+        self.b.set_cold_block(slow);
+        self.overwrite_slot(view, index, value, slow, done);
+        self.switch(slow);
+        let address = self.function_data(PropertyCache::new(name, None));
+        self.call_helper(Helper::PropertySetCached, &[object, address, value]);
+        self.check_error();
+        self.jump(done, &[BlockArg::Value(value)]);
+        self.switch(done);
+    }
+
     fn cached_property_set(
         &mut self,
         object: ClifValue,
         name: &str,
         value: ClifValue,
+        observer: Option<(u64, crate::jit::planner::Site)>,
     ) -> ClifValue {
-        let address = self.function_data(PropertyCache::new(name));
+        let address = self.function_data(PropertyCache::new(name, observer));
         let flags = MemFlagsData::trusted();
         let view = self.view(object);
         let slow = self.b.create_block();
@@ -1671,42 +1780,7 @@ impl FunctionCompiler<'_, '_> {
                 .ins()
                 .load(types::I32, flags, address, CACHE_OVERWRITE_INDEX_OFFSET);
         let overwrite_index = self.b.ins().uextend(types::I64, overwrite_index);
-        let overwrite_data = self.b.ins().load(self.pointer, flags, view, DATA_OFFSET);
-        let overwrite_offset = self.b.ins().ishl_imm_s(overwrite_index, 3);
-        let overwrite_slot = self.b.ins().iadd(overwrite_data, overwrite_offset);
-        let old = self.b.ins().load(types::I64, flags, overwrite_slot, 0);
-        let old_address = super::scope::heap_address(self.b, old);
-        let old_native = self.b.create_block();
-        let overwrite_retain = self.b.create_block();
-        let overwrite_store = self.b.create_block();
-        let overwrite_release = self.b.create_block();
-        let overwrite_done = self.b.create_block();
-        self.brif(old_address, old_native, &[], overwrite_retain, &[]);
-        self.switch(old_native);
-        let old_view_kind = self.view_kind(old_address);
-        let native_bits = self.b.ins().band_imm_s(old_view_kind, kind::NATIVE as i64);
-        let is_native = self.b.ins().icmp_imm_s(IntCC::NotEqual, native_bits, 0);
-        self.brif(is_native, slow, &[], overwrite_retain, &[]);
-        self.switch(overwrite_retain);
-        let overwrite_incoming = super::scope::heap_address(self.b, value);
-        let overwrite_increment = self.b.create_block();
-        self.brif(
-            overwrite_incoming,
-            overwrite_increment,
-            &[],
-            overwrite_store,
-            &[],
-        );
-        self.switch(overwrite_increment);
-        super::scope::increment_references(self.b, overwrite_incoming);
-        self.jump(overwrite_store, &[]);
-        self.switch(overwrite_store);
-        self.b.ins().store(flags, value, overwrite_slot, 0);
-        self.brif(old_address, overwrite_release, &[], overwrite_done, &[]);
-        self.switch(overwrite_release);
-        self.release_inline(old, overwrite_done, false);
-        self.switch(overwrite_done);
-        self.jump(done, &[BlockArg::Value(value)]);
+        self.overwrite_slot(view, overwrite_index, value, slow, done);
         self.switch(inline);
         let incoming = super::scope::heap_address(self.b, value);
         self.brif(incoming, retain, &[], store, &[]);
@@ -1750,9 +1824,10 @@ impl FunctionCompiler<'_, '_> {
         object: ClifValue,
         name: &str,
         value: Option<ClifValue>,
+        observer: Option<(u64, crate::jit::planner::Site)>,
     ) -> ClifValue {
         if let Some(value) = value {
-            return self.cached_property_set(object, name, value);
+            return self.cached_property_set(object, name, value, observer);
         }
         let name: Box<str> = name.into();
         let ptr = self.b.ins().iconst(self.pointer, name.as_ptr() as i64);

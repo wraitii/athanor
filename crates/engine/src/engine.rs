@@ -469,6 +469,22 @@ impl Engine {
         cache.recorded = 1;
     }
 
+    pub(crate) fn observe_shape(
+        &self,
+        owner: u64,
+        site: jit::planner::Site,
+        access: jit::planner::ShapeAccess,
+    ) {
+        if !self.planner.borrow_mut().observe_shape(site, access) {
+            return;
+        }
+        self.log_recompilation(
+            owner,
+            format_args!("shape feedback site={site} access={access:?}"),
+        );
+        self.request_compilation(owner);
+    }
+
     fn request_compilation(&self, code: u64) {
         if self.planner.borrow_mut().request(code) && self.recompile_log.enabled() {
             let compiling = self.worker.borrow().as_ref().is_some_and(|worker| {
@@ -1509,7 +1525,7 @@ mod feedback_tests {
     fn ineligible_feedback_keeps_the_existing_entry() {
         let mut engine = new_engine().unwrap();
         engine.compile(
-            "var object={run:function(x){return arguments[0];}};function invoke(x){return object.run(x);}",
+            "function run(x){return arguments[0];}function invoke(x){return run(x);}",
             "ineligible.js",
         ).unwrap();
         let code = code(&engine, "invoke");

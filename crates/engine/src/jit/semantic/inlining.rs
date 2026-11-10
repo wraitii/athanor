@@ -15,9 +15,10 @@ pub(super) fn split_call(graph: &mut Graph, inst: Inst) -> (Block, Block, Block)
         .position(|&current| current == inst)
         .unwrap();
     let continuation = graph.blocks.push(BlockData::default());
-    let result = graph.add_param(continuation);
-    let original = call.result.unwrap();
-    graph.replace_uses(&HashMap::from([(original, result)]));
+    if let Some(original) = call.result {
+        let result = graph.add_param(continuation);
+        graph.replace_uses(&HashMap::from([(original, result)]));
+    }
     let tail = graph.blocks[block].insts.split_off(position + 1);
     graph.blocks[continuation].insts = tail;
     for &inst in &graph.blocks[continuation].insts {
@@ -31,7 +32,7 @@ pub(super) fn split_call(graph: &mut Graph, inst: Inst) -> (Block, Block, Block)
         span: call.span,
         kind: TerminatorKind::Jump(Target {
             block: continuation,
-            args: vec![original],
+            args: call.result.into_iter().collect(),
         }),
     });
     graph.cold.insert(fallback);

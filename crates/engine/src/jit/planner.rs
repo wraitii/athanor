@@ -33,6 +33,19 @@ pub(crate) enum ReadType {
     Typed(TypedKind),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ShapeAccess {
+    Read { shape: u32, index: u32 },
+    Overwrite { shape: u32, index: u32 },
+    Varying,
+}
+
+impl ShapeAccess {
+    fn merge(self, other: Self) -> Self {
+        if self == other { self } else { Self::Varying }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Observation {
     Call,
@@ -104,6 +117,7 @@ pub(crate) struct Planner {
     observed: HashSet<(u64, Site)>,
     reads: HashMap<(Site, ReadKind), ReadType>,
     observed_reads: HashSet<(u64, Site, ReadKind)>,
+    shapes: HashMap<Site, ShapeAccess>,
     pending: Vec<bool>,
     pending_count: usize,
 }
@@ -146,6 +160,18 @@ impl Planner {
         }
         self.reads.entry((site, kind)).or_insert(observed);
         true
+    }
+
+    pub(crate) fn observe_shape(&mut self, site: Site, access: ShapeAccess) -> bool {
+        let merged = match self.shapes.get(&site) {
+            Some(&known) => known.merge(access),
+            None => access,
+        };
+        self.shapes.insert(site, merged) != Some(merged)
+    }
+
+    pub(super) fn shapes(&self) -> impl Iterator<Item = (Site, ShapeAccess)> + '_ {
+        self.shapes.iter().map(|(&site, &access)| (site, access))
     }
 
     pub(super) fn reads(&self) -> impl Iterator<Item = ((Site, ReadKind), ReadType)> + '_ {

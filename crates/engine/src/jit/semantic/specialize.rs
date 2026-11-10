@@ -23,6 +23,8 @@ pub(in crate::jit) struct Repository {
         (crate::jit::planner::Site, crate::jit::planner::ReadKind),
         crate::jit::planner::ReadType,
     >,
+    pub(in crate::jit) shape_feedback:
+        HashMap<crate::jit::planner::Site, crate::jit::planner::ShapeAccess>,
     locations: HashMap<(usize, u32), FuncId>,
     globals: HashMap<String, FuncId>,
     pub(in crate::jit) sources: HashMap<usize, usize>,

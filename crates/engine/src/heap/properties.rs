@@ -13,6 +13,18 @@ pub(crate) struct PropertyWriteCache {
     atom: Option<Atom>,
     slot: Option<(ShapeId, Option<usize>)>,
     transition: Option<(ShapeId, Key, ShapeId)>,
+    pub(crate) last: PropertyWrite,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) enum PropertyWrite {
+    #[default]
+    None,
+    Overwrite {
+        shape: u32,
+        index: u32,
+    },
+    Addition,
 }
 
 /// Published only for an inline addition: the source shape fixes the slot count,
@@ -35,6 +47,10 @@ pub(crate) struct PropertyOverwriteCache {
 impl PropertyWriteCache {
     fn publish_overwrite(&mut self, shape: ShapeId, index: usize) {
         self.overwrite = PropertyOverwriteCache {
+            shape,
+            index: index as u32,
+        };
+        self.last = PropertyWrite::Overwrite {
             shape,
             index: index as u32,
         };
@@ -249,6 +265,7 @@ impl HeapData {
                         destination: slot.shape,
                         index: object.len as u32,
                     };
+                    cache.last = PropertyWrite::Addition;
                 }
                 object.values[object.len as usize] = value;
                 object.len += 1;

@@ -1,4 +1,5 @@
 use super::*;
+use crate::jit::planner::ShapeAccess;
 
 #[repr(C)]
 pub(crate) struct GlobalCache {
@@ -171,6 +172,8 @@ pub(crate) struct PropertyCache {
     pub(crate) builtin_value: u64,
     pub(crate) name: Box<str>,
     write: crate::heap::PropertyWriteCache,
+    observer: Option<(u64, crate::jit::planner::Site)>,
+    reported: Option<ShapeAccess>,
 }
 
 pub(crate) const CACHE_INITIALIZED_OFFSET: i32 =
@@ -202,7 +205,7 @@ pub(crate) const CACHE_OVERWRITE_INDEX_OFFSET: i32 =
     CACHE_OVERWRITE_OFFSET + std::mem::offset_of!(crate::heap::PropertyOverwriteCache, index) as i32;
 
 impl PropertyCache {
-    pub(crate) fn new(name: &str) -> Self {
+    pub(crate) fn new(name: &str, observer: Option<(u64, crate::jit::planner::Site)>) -> Self {
         Self {
             initialized: 0,
             shape: crate::heap::DICTIONARY,
@@ -213,6 +216,8 @@ impl PropertyCache {
             builtin_value: Value::UNDEFINED.bits(),
             write: Default::default(),
             name: name.into(),
+            observer,
+            reported: None,
         }
     }
 
@@ -226,9 +231,15 @@ impl PropertyCache {
         Some(value)
     }
 
-    fn fill(&mut self, heap: &crate::heap::Heap, receiver: Value) -> Option<Value> {
+    fn fill(
+        &mut self,
+        engine: &crate::Engine,
+        heap: &crate::heap::Heap,
+        receiver: Value,
+    ) -> Option<Value> {
         if let Some(value) = self.builtin(heap, receiver) {
             self.initialized = 1;
+            self.observe(engine, ShapeAccess::Varying);
             return Some(value);
         }
         if let Some(found) = heap.cached_property(receiver, &self.name) {
@@ -237,8 +248,32 @@ impl PropertyCache {
             self.index = found.index;
             self.holder = found.holder;
             self.holder_shape = found.holder_shape;
+            self.observe(
+                engine,
+                if found.holder == 0 {
+                    ShapeAccess::Read {
+                        shape: found.shape,
+                        index: found.index,
+                    }
+                } else {
+                    ShapeAccess::Varying
+                },
+            );
+        } else {
+            self.observe(engine, ShapeAccess::Varying);
         }
         None
+    }
+
+    fn observe(&mut self, engine: &crate::Engine, access: ShapeAccess) {
+        let Some((owner, site)) = self.observer else {
+            return;
+        };
+        if self.reported == Some(ShapeAccess::Varying) || self.reported == Some(access) {
+            return;
+        }
+        self.reported = Some(access);
+        engine.observe_shape(owner, site, access);
     }
 }
 
@@ -248,8 +283,8 @@ pub(super) extern "C" fn js_property_get_cached(
     cache: *mut PropertyCache,
 ) -> Value {
     let cache = unsafe { &mut *cache };
-    let heap = unsafe { &*ctx }.global.heap();
-    if let Some(value) = cache.fill(heap, object) {
+    let context = unsafe { &*ctx };
+    if let Some(value) = cache.fill(context.engine, context.global.heap(), object) {
         return unsafe { &mut *ctx }.retain_temp(value);
     }
     js_property_get(ctx, object, cache.name.as_ptr(), cache.name.len() as u64)
@@ -260,8 +295,8 @@ pub(super) extern "C" fn js_property_cache_prime(
     object: Value,
     cache: *mut PropertyCache,
 ) -> Value {
-    let heap = unsafe { &*ctx }.global.heap();
-    unsafe { &mut *cache }.fill(heap, object);
+    let context = unsafe { &*ctx };
+    unsafe { &mut *cache }.fill(context.engine, context.global.heap(), object);
     Value::UNDEFINED
 }
 
@@ -286,7 +321,16 @@ pub(super) extern "C" fn js_property_set_cached(
 ) -> Value {
     let ctx = unsafe { &mut *ctx };
     let cache = unsafe { &mut *cache };
-    property_set(ctx, object, &cache.name, value, Some(&mut cache.write))
+    cache.write.last = crate::heap::PropertyWrite::None;
+    let result = property_set(ctx, object, &cache.name, value, Some(&mut cache.write));
+    let access = match cache.write.last {
+        crate::heap::PropertyWrite::Overwrite { shape, index } => {
+            ShapeAccess::Overwrite { shape, index }
+        }
+        _ => ShapeAccess::Varying,
+    };
+    cache.observe(ctx.engine, access);
+    result
 }
 
 pub(super) fn property_set(

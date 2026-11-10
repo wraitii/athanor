@@ -11,6 +11,7 @@ pub(in crate::jit) fn receiver(op: &Op) -> Option<Value> {
     match op {
         Op::Get(object, _)
         | Op::CachedProperty(object, _)
+        | Op::ShapedGet(object, ..)
         | Op::ProbeProperty(object, _)
         | Op::GetIndex(object, _)
         | Op::IndexedGet(object, _)
@@ -23,6 +24,7 @@ fn stores(op: &Op) -> bool {
     matches!(
         op,
         Op::Set(..)
+            | Op::ShapedSet(..)
             | Op::SetIndex(..)
             | Op::Define(..)
             | Op::ArrayAppend(..)
@@ -101,6 +103,7 @@ pub(super) fn borrows(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>)
                     | Op::ArrayLoad(..)
                     | Op::ProbeProperty(..)
                     | Op::CachedProperty(..)
+                    | Op::ShapedGet(..)
             ) {
                 held.insert(result);
             }

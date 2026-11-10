@@ -2,6 +2,7 @@ mod arrays;
 mod borrow;
 mod build;
 mod caches;
+mod shapes;
 mod comparisons;
 mod construction;
 pub(in crate::jit) mod continuation;
@@ -299,6 +300,9 @@ pub(super) enum Op {
     Get(Value, String),
     IsPropertyCached(Value, Inst, String),
     CachedProperty(Value, Inst),
+    IsShape(Value, u32),
+    ShapedGet(Value, String, u32),
+    ShapedSet(Value, String, u32, Value),
     FillPropertyCache(Value, Inst, String),
     PrimePropertyCache(Value, Inst, String),
     GetIndex(Value, Value),
@@ -468,6 +472,8 @@ impl Op {
             | Op::Get(value, _)
             | Op::IsPropertyCached(value, _, _)
             | Op::CachedProperty(value, _)
+            | Op::IsShape(value, _)
+            | Op::ShapedGet(value, _, _)
             | Op::FillPropertyCache(value, _, _)
             | Op::PrimePropertyCache(value, _, _)
             | Op::MarkClass(value)
@@ -496,6 +502,7 @@ impl Op {
             | Op::AsNumber(value) => ([Some(*value), None, None], &[]),
             Op::Define(object, _, value)
             | Op::DefineHidden(object, _, value)
+            | Op::ShapedSet(object, _, _, value)
             | Op::Set(object, _, value) => ([Some(*object), Some(*value), None], &[]),
             Op::MapElement(object, key)
             | Op::IsArrayIteration(object, key, _)
@@ -599,6 +606,8 @@ impl Op {
             | Op::Get(value, _)
             | Op::IsPropertyCached(value, _, _)
             | Op::CachedProperty(value, _)
+            | Op::IsShape(value, _)
+            | Op::ShapedGet(value, _, _)
             | Op::FillPropertyCache(value, _, _)
             | Op::PrimePropertyCache(value, _, _)
             | Op::MarkClass(value)
@@ -627,6 +636,7 @@ impl Op {
             | Op::AsNumber(value) => ([Some(value), None, None], &mut []),
             Op::Define(object, _, value)
             | Op::DefineHidden(object, _, value)
+            | Op::ShapedSet(object, _, _, value)
             | Op::Set(object, _, value) => ([Some(object), Some(value), None], &mut []),
             Op::MapElement(object, key)
             | Op::IsArrayIteration(object, key, _)
@@ -685,6 +695,7 @@ impl Op {
         match self {
             Op::Define(object, ..)
             | Op::Set(object, ..)
+            | Op::ShapedSet(object, ..)
             | Op::SetIndex(object, ..)
             | Op::ArrayAppend(object, ..)
             | Op::IteratorNext(object)
@@ -1148,6 +1159,13 @@ impl Graph {
                 Borrowed,
             ),
             Op::IsPropertyCached(..) => closed(HEAP_READ, &[], Unowned),
+            Op::IsShape(..) => closed(HEAP_READ, &[], Unowned),
+            Op::ShapedGet(..) => closed(HEAP_READ | INTERNAL | ERROR, &[], Borrowed),
+            Op::ShapedSet(..) => closed(
+                HEAP_READ | HEAP_WRITE | ALLOCATION | INTERNAL | ERROR,
+                &[],
+                None,
+            ),
             Op::PrimePropertyCache(..) => closed(HEAP_READ | INTERNAL, &[], None),
             Op::CachedProperty(..) => closed(HEAP_READ | INTERNAL | ERROR, &[], Borrowed),
             Op::Set(..) | Op::SetIndex(..) => closed(
@@ -1382,6 +1400,7 @@ fn unsupported<T>(what: &str, span: Span) -> Result<T> {
 pub(in crate::jit) struct SpecializationPlan {
     pub(in crate::jit) inlines: Vec<specialize::Inline>,
     pub(in crate::jit) reads: Vec<reads::Read>,
+    pub(in crate::jit) shapes: Vec<shapes::Shape>,
     pub(in crate::jit) numbers: Vec<(super::planner::Site, super::planner::ReadType)>,
     pub(in crate::jit) conditional: specialize::ConditionalPlan,
 }
@@ -1603,6 +1622,9 @@ pub(super) fn plan_canonical_with_budget(
     let reads = specialization.map_or_else(Vec::new, |(bodies, source)| {
         reads::plan(&graph, bodies, source)
     });
+    let shapes = specialization.map_or_else(Vec::new, |(bodies, source)| {
+        shapes::plan(&graph, bodies, source)
+    });
     let mut conditional = specialization
         .map_or_else(specialize::ConditionalPlan::default, |(bodies, _)| {
             specialize::conditional_plan(&graph, bodies, &mut notes)
@@ -1615,6 +1637,7 @@ pub(super) fn plan_canonical_with_budget(
             conditional,
             inlines: inline_budget.inlines,
             reads,
+            shapes,
             numbers,
         },
         graph,
@@ -1652,6 +1675,7 @@ pub(super) fn optimize_planned(
     }
     caches::apply(&mut graph)?;
     reads::apply(&mut graph, &plan.reads, &mut notes)?;
+    shapes::apply(&mut graph, &plan.shapes, &mut notes)?;
     comparisons::expose(&mut graph);
     optimize::sink_closures(&mut graph, &mut notes);
     if optimize::lazy_captures(&mut graph, &mut notes) {

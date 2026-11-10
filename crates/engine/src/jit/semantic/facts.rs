@@ -409,11 +409,12 @@ fn result_types(op: &Op, facts: &Facts) -> Types {
         Op::MapElement(..) => Types::ALL,
         Op::IsArrayIteration(..) => Types::BOOLEAN,
         Op::IteratorNext(_) | Op::EnumerateNext(_) => Types::ALL,
-        Op::IsUninitialized(_) | Op::IsPropertyCached(..) => Types::BOOLEAN,
+        Op::IsUninitialized(_) | Op::IsPropertyCached(..) | Op::IsShape(..) => Types::BOOLEAN,
         Op::ProbeProperty(..)
         | Op::ProbeIndex(..)
         | Op::ConstructorPrototype(_)
         | Op::CachedProperty(..)
+        | Op::ShapedGet(..)
         | Op::FillPropertyCache(..) => Types::ALL,
         Op::View(_) => Types::VIEW,
         Op::TypedIndex(.., read) if read.bounded => match read.element {

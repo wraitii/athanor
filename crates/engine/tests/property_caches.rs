@@ -316,3 +316,59 @@ fn addition_site_handles_layouts_prototypes_and_replacements() {
         5350.0,
     );
 }
+
+fn check_specialized(source: &str, expected: f64) {
+    let mut engine = Engine::with_options(EngineOptions {
+        background_compile: false,
+        ..Default::default()
+    })
+    .unwrap();
+    engine.compile(source, "property_caches.js").unwrap();
+    for _ in 0..3 {
+        assert_eq!(
+            engine.call("main", &[]).unwrap().value(),
+            Value::number(expected)
+        );
+    }
+}
+
+#[test]
+fn shape_guards_fall_back_when_the_layout_changes() {
+    check_specialized(
+        "function bump(o) { o.n = o.n + 1; return o.n + o.m; }
+        function main() {
+            let sum = 0;
+            for (let i = 0; i < 200; ++i)
+                sum += bump({n: i, m: 1});
+            sum += bump({m: 5, n: 10});
+            sum += bump({n: 1, m: 2, k: 3});
+            const base = {m: 100};
+            function Child() { this.n = 7; }
+            Child.prototype = base;
+            sum += bump(new Child());
+            return sum;
+        }",
+        20428.0,
+    );
+}
+
+#[test]
+fn shaped_overwrites_release_replaced_values() {
+    check_specialized(
+        "function store(o, v) { o.v = v; }
+        function main() {
+            const o = {v: null};
+            let sum = 0;
+            for (let i = 0; i < 300; ++i) {
+                store(o, {n: i});
+                sum += o.v.n;
+            }
+            store(o, Math.abs);
+            store(o, {n: 1000});
+            sum += o.v.n;
+            store(o, 5);
+            return sum + o.v;
+        }",
+        45855.0,
+    );
+}

@@ -89,6 +89,21 @@ impl FunctionCompiler<'_, '_> {
         self.b.switch_to_block(next);
     }
 
+    fn property_observer(
+        &self,
+        data: &crate::jit::semantic::InstData,
+    ) -> Option<(u64, crate::jit::planner::Site)> {
+        let feedback = self.feedback.filter(|feedback| feedback.get_refinement)?;
+        Some((
+            feedback.owner,
+            crate::jit::planner::Site {
+                source: data.source_name.map_or(self.source_name.0, |name| name.0),
+                start: data.span.start,
+                end: data.span.end,
+            },
+        ))
+    }
+
     fn epoch(&mut self) -> ClifValue {
         let address = self.b.ins().load(
             self.pointer,
@@ -930,7 +945,8 @@ impl FunctionCompiler<'_, '_> {
                         Op::Define(object, name, value) | Op::Set(object, name, value) => {
                             let object = get(self, *object);
                             let value = get(self, *value);
-                            self.property_access(object, name, Some(value));
+                            let observer = self.property_observer(data);
+                            self.property_access(object, name, Some(value), observer);
                             None
                         }
                         Op::Get(object, name) if name == "length" => {
@@ -946,6 +962,20 @@ impl FunctionCompiler<'_, '_> {
                                     && !self.slot_owned(graph, &cx, value)
                             });
                             Some(self.cached_property_load(object, address, retain))
+                        }
+                        Op::ShapedGet(object, _, index) => {
+                            let object = get(self, *object);
+                            let retain = data.result.is_none_or(|value| {
+                                !graph.borrowed.contains(&value)
+                                    && !self.slot_owned(graph, &cx, value)
+                            });
+                            Some(self.shaped_property_get(object, *index, retain))
+                        }
+                        Op::ShapedSet(object, name, index, value) => {
+                            let object = get(self, *object);
+                            let value = get(self, *value);
+                            self.shaped_property_set(object, name, *index, value);
+                            None
                         }
                         Op::FillPropertyCache(object, site, name) => {
                             let object = get(self, *object);
@@ -964,7 +994,8 @@ impl FunctionCompiler<'_, '_> {
                                 !graph.borrowed.contains(&value)
                                     && !self.slot_owned(graph, &cx, value)
                             });
-                            Some(self.cached_property_get(object, name, retain))
+                            let observer = self.property_observer(data);
+                            Some(self.cached_property_get(object, name, retain, observer))
                         }
                         Op::GetIndex(object, index)
                         | Op::TypedIndex(object, index, _)
@@ -1070,7 +1101,7 @@ impl FunctionCompiler<'_, '_> {
                         Op::ArrayPosition(..) | Op::IsArrayIndex(..) | Op::ArrayLoad(..) => {
                             unreachable!()
                         }
-                        Op::IsTyped(..) | Op::IsPropertyCached(..) | Op::IsCode(..) => {
+                        Op::IsTyped(..) | Op::IsPropertyCached(..) | Op::IsShape(..) | Op::IsCode(..) => {
                             unreachable!()
                         }
                         Op::IsIndexed(value) => {
@@ -1773,6 +1804,11 @@ impl FunctionCompiler<'_, '_> {
                 let operand = self.operand(cx, *value);
                 let value = self.convert(operand, Repr::Boxed);
                 boolean(self.is_code(value, *code))
+            }
+            Op::IsShape(object, shape) => {
+                let operand = self.operand(cx, *object);
+                let object = self.convert(operand, Repr::Boxed);
+                boolean(self.shape_hit(object, *shape))
             }
             Op::IsPropertyCached(object, site, name) => {
                 let operand = self.operand(cx, *object);

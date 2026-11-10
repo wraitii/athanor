@@ -51,6 +51,7 @@ enum EntryGuard {
     Integer(Value),
     Typed(Value, Option<TypedKind>),
     Indexed(Value),
+    Shape(Value, u32),
     Value(Value),
 }
 
@@ -62,6 +63,7 @@ impl EntryGuard {
             Op::IsInteger(value) => Some(Self::Integer(value)),
             Op::IsTyped(value, element) => Some(Self::Typed(value, element)),
             Op::IsIndexed(value) => Some(Self::Indexed(value)),
+            Op::IsShape(value, shape) => Some(Self::Shape(value, shape)),
             _ => None,
         }
     }
@@ -436,7 +438,9 @@ pub(super) fn apply_version(
     for &inst in reads {
         let data = graph.insts[inst].clone();
         let mut op = match data.op {
-            Op::Get(object, name) => Op::ProbeProperty(object, name),
+            Op::Get(object, name) | Op::ShapedGet(object, name, _) => {
+                Op::ProbeProperty(object, name)
+            }
             Op::GetIndex(object, key) | Op::IndexedGet(object, key) => Op::ProbeIndex(object, key),
             Op::GlobalRead(name) => Op::ProbeGlobal(name),
             Op::Argument(index) => Op::Argument(index),
@@ -546,6 +550,7 @@ pub(super) fn apply_version(
             {
                 Some(*object)
             }
+            Some(Op::IsShape(object, _)) if graph.caller_rooted(*object) => Some(*object),
             _ => None,
         };
         let condition = test.map_or(condition, |op| {

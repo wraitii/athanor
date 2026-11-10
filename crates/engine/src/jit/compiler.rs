@@ -1034,6 +1034,9 @@ impl Compiler {
             && (!self.get_refinement
                 || planner.reads().all(|(site, observed)| {
                     self.canonical.read_feedback.get(&site) == Some(&observed)
+                })
+                && planner.shapes().all(|(site, access)| {
+                    self.canonical.shape_feedback.get(&site) == Some(&access)
                 }))
         {
             return;
@@ -1050,6 +1053,9 @@ impl Compiler {
         if self.get_refinement {
             for (site, element) in planner.reads() {
                 canonical.read_feedback.insert(site, element);
+            }
+            for (site, access) in planner.shapes() {
+                canonical.shape_feedback.insert(site, access);
             }
         }
     }

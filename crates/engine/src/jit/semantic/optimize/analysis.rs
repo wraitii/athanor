@@ -4,6 +4,8 @@ fn contained_use(op: &Op, index: usize) -> bool {
     match op {
         Op::Observe(..) | Op::ReadHint(..) => true,
         Op::Get(..)
+        | Op::ShapedGet(..)
+        | Op::ShapedSet(..)
         | Op::GetIndex(..)
         | Op::TypedIndex(..)
         | Op::IndexedGet(..)
@@ -188,7 +190,11 @@ impl Access {
     pub(super) fn of(op: &Op, facts: &Facts) -> Self {
         match op {
             Op::Read(_) | Op::Initialize(..) | Op::Write(..) => Self::Cells,
-            Op::Get(_, name) | Op::Set(_, name, _) | Op::Define(_, name, _) => Self::named(name),
+            Op::Get(_, name)
+            | Op::Set(_, name, _)
+            | Op::Define(_, name, _)
+            | Op::ShapedGet(_, name, _)
+            | Op::ShapedSet(_, name, _, _) => Self::named(name),
             Op::GetIndex(_, key)
             | Op::TypedIndex(_, key, _)
             | Op::IndexedGet(_, key)
@@ -291,6 +297,7 @@ impl Writes {
     pub(super) fn preserves(&self, op: &Op) -> bool {
         match op {
             Op::Get(object, _)
+            | Op::ShapedGet(object, ..)
             | Op::GetIndex(object, _)
             | Op::TypedIndex(object, ..)
             | Op::IndexedGet(object, _)

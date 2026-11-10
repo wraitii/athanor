@@ -190,6 +190,7 @@ fn guard_fallback(graph: &Graph, block: Block) -> Option<Block> {
                 | Op::IsIndexed(_)
                 | Op::IsArrayIndex(..)
                 | Op::IsPropertyCached(..)
+                | Op::IsShape(..)
                 | Op::IsArrayIteration(..)
                 | Op::IsStringSplit(_)
         )
@@ -529,7 +530,7 @@ pub(super) fn reuse_loads(graph: &mut Graph, region: &HashSet<Block>, notes: &mu
                 continue;
             };
             let key = match &data.op {
-                Op::Get(object, name) => {
+                Op::Get(object, name) | Op::ShapedGet(object, name, _) => {
                     LoadKey::Property(resolve(&aliases, *object), name.clone())
                 }
                 Op::GetIndex(object, key)
@@ -700,7 +701,11 @@ fn probe_reads(
             if (input
                 || matches!(
                     data.op,
-                    Op::Get(..) | Op::GetIndex(..) | Op::IndexedGet(..) | Op::GlobalRead(_)
+                    Op::Get(..)
+                        | Op::ShapedGet(..)
+                        | Op::GetIndex(..)
+                        | Op::IndexedGet(..)
+                        | Op::GlobalRead(_)
                 ))
                 && data.op.operands_iter().all(|value| {
                     !inside.contains(&graph.def_block(value)) || probed.contains(&value)
