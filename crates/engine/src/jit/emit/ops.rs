@@ -17,7 +17,7 @@ use crate::jit::helpers::{
     self, CACHE_ADDITION_DESTINATION_OFFSET, CACHE_ADDITION_INDEX_OFFSET,
     CACHE_ADDITION_SOURCE_OFFSET, CACHE_BUILTIN_KIND_OFFSET, CACHE_BUILTIN_VALUE_OFFSET,
     CACHE_HOLDER_OFFSET, CACHE_HOLDER_SHAPE_OFFSET, CACHE_INDEX_OFFSET, CACHE_INITIALIZED_OFFSET,
-    CACHE_SHAPE_OFFSET, HELPERS, Helper, PropertyCache,
+    CACHE_OVERWRITE_INDEX_OFFSET, CACHE_OVERWRITE_SHAPE_OFFSET, CACHE_SHAPE_OFFSET, HELPERS, Helper, PropertyCache,
 };
 use crate::jit::planner::{CallSite, Site};
 use crate::jit::semantic::DirectTarget;
@@ -1615,7 +1615,61 @@ impl FunctionCompiler<'_, '_> {
             .load(types::I32, flags, address, CACHE_ADDITION_SOURCE_OFFSET);
         let matches = self.b.ins().icmp(IntCC::Equal, shape, expected);
         let hit = self.b.ins().band(inline_object, matches);
-        self.brif(hit, inline, &[], slow, &[]);
+        let overwrite_check = self.b.create_block();
+        self.brif(hit, inline, &[], overwrite_check, &[]);
+        self.switch(overwrite_check);
+        let object_bits = self.b.ins().band_imm_s(kind, kind::OBJECT as i64);
+        let is_object = self.b.ins().icmp_imm_s(IntCC::NotEqual, object_bits, 0);
+        let overwrite_expected =
+            self.b
+                .ins()
+                .load(types::I32, flags, address, CACHE_OVERWRITE_SHAPE_OFFSET);
+        let overwrite_matches = self.b.ins().icmp(IntCC::Equal, shape, overwrite_expected);
+        let overwrite_hit = self.b.ins().band(is_object, overwrite_matches);
+        let overwrite = self.b.create_block();
+        self.brif(overwrite_hit, overwrite, &[], slow, &[]);
+        self.switch(overwrite);
+        let overwrite_index =
+            self.b
+                .ins()
+                .load(types::I32, flags, address, CACHE_OVERWRITE_INDEX_OFFSET);
+        let overwrite_index = self.b.ins().uextend(types::I64, overwrite_index);
+        let overwrite_data = self.b.ins().load(self.pointer, flags, view, DATA_OFFSET);
+        let overwrite_offset = self.b.ins().ishl_imm_s(overwrite_index, 3);
+        let overwrite_slot = self.b.ins().iadd(overwrite_data, overwrite_offset);
+        let old = self.b.ins().load(types::I64, flags, overwrite_slot, 0);
+        let old_address = super::scope::heap_address(self.b, old);
+        let old_native = self.b.create_block();
+        let overwrite_retain = self.b.create_block();
+        let overwrite_store = self.b.create_block();
+        let overwrite_release = self.b.create_block();
+        let overwrite_done = self.b.create_block();
+        self.brif(old_address, old_native, &[], overwrite_retain, &[]);
+        self.switch(old_native);
+        let old_view_kind = self.view_kind(old_address);
+        let native_bits = self.b.ins().band_imm_s(old_view_kind, kind::NATIVE as i64);
+        let is_native = self.b.ins().icmp_imm_s(IntCC::NotEqual, native_bits, 0);
+        self.brif(is_native, slow, &[], overwrite_retain, &[]);
+        self.switch(overwrite_retain);
+        let overwrite_incoming = super::scope::heap_address(self.b, value);
+        let overwrite_increment = self.b.create_block();
+        self.brif(
+            overwrite_incoming,
+            overwrite_increment,
+            &[],
+            overwrite_store,
+            &[],
+        );
+        self.switch(overwrite_increment);
+        super::scope::increment_references(self.b, overwrite_incoming);
+        self.jump(overwrite_store, &[]);
+        self.switch(overwrite_store);
+        self.b.ins().store(flags, value, overwrite_slot, 0);
+        self.brif(old_address, overwrite_release, &[], overwrite_done, &[]);
+        self.switch(overwrite_release);
+        self.release_inline(old, overwrite_done, false);
+        self.switch(overwrite_done);
+        self.jump(done, &[BlockArg::Value(value)]);
         self.switch(inline);
         let incoming = super::scope::heap_address(self.b, value);
         self.brif(incoming, retain, &[], store, &[]);

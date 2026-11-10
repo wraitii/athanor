@@ -194,6 +194,13 @@ pub(crate) const CACHE_ADDITION_DESTINATION_OFFSET: i32 = CACHE_ADDITION_OFFSET
 pub(crate) const CACHE_ADDITION_INDEX_OFFSET: i32 =
     CACHE_ADDITION_OFFSET + std::mem::offset_of!(crate::heap::PropertyAdditionCache, index) as i32;
 
+const CACHE_OVERWRITE_OFFSET: i32 = std::mem::offset_of!(PropertyCache, write) as i32
+    + std::mem::offset_of!(crate::heap::PropertyWriteCache, overwrite) as i32;
+pub(crate) const CACHE_OVERWRITE_SHAPE_OFFSET: i32 =
+    CACHE_OVERWRITE_OFFSET + std::mem::offset_of!(crate::heap::PropertyOverwriteCache, shape) as i32;
+pub(crate) const CACHE_OVERWRITE_INDEX_OFFSET: i32 =
+    CACHE_OVERWRITE_OFFSET + std::mem::offset_of!(crate::heap::PropertyOverwriteCache, index) as i32;
+
 impl PropertyCache {
     pub(crate) fn new(name: &str) -> Self {
         Self {

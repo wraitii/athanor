@@ -123,6 +123,7 @@ pub struct Engine {
 impl Drop for Engine {
     fn drop(&mut self) {
         self.log_prefetch_uses();
+        crate::jit::bailouts::report();
         if self.recompile_log.enabled() {
             let stats = self.prefetch_stats.borrow();
             self.recompile_log.event(format_args!(

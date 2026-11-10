@@ -411,11 +411,36 @@ impl Compiler {
                         }
                     }
                 }
-                other => {
+                Statement::ImportDeclaration(_)
+                | Statement::ExportAllDeclaration(_)
+                | Statement::ExportDefaultDeclaration(_)
+                | Statement::ExportNamedDeclaration(_) => {
                     return Err(unsupported_at(
-                        other.span(),
-                        format!("{} statement at top level", emit::statement_kind(other)),
+                        statement.span(),
+                        format!("{} statement at top level", emit::statement_kind(statement)),
                     ));
+                }
+                _ => {}
+            }
+        }
+        for node in nodes.iter() {
+            let AstKind::VariableDeclaration(declaration) = node.kind() else {
+                continue;
+            };
+            if declaration.kind != VariableDeclarationKind::Var {
+                continue;
+            }
+            for declarator in &declaration.declarations {
+                let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
+                    continue;
+                };
+                let Some(symbol) = identifier.symbol_id.get() else {
+                    continue;
+                };
+                if scoping.symbol_scope_id(symbol) == scoping.root_scope_id()
+                    && !globals.iter().any(|name| name == identifier.name.as_str())
+                {
+                    globals.push(identifier.name.to_string());
                 }
             }
         }
@@ -698,12 +723,10 @@ impl Compiler {
             }
             pending.push((id, code));
         }
-        let initializer = if !program.body.iter().any(|s| {
+        let initializer = if program.body.iter().all(|s| {
             matches!(
                 s,
-                Statement::VariableDeclaration(_)
-                    | Statement::ExpressionStatement(_)
-                    | Statement::ClassDeclaration(_)
+                Statement::FunctionDeclaration(_) | Statement::EmptyStatement(_)
             )
         }) {
             None

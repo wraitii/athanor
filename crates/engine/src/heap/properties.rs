@@ -8,6 +8,7 @@ const SHAPED_LIMIT: usize = 64;
 #[repr(C)]
 pub(crate) struct PropertyWriteCache {
     pub(crate) addition: PropertyAdditionCache,
+    pub(crate) overwrite: PropertyOverwriteCache,
     heap: std::rc::Weak<RefCell<HeapData>>,
     atom: Option<Atom>,
     slot: Option<(ShapeId, Option<usize>)>,
@@ -24,11 +25,26 @@ pub(crate) struct PropertyAdditionCache {
     pub(crate) index: u32,
 }
 
+#[derive(Default)]
+#[repr(C)]
+pub(crate) struct PropertyOverwriteCache {
+    pub(crate) shape: u32,
+    pub(crate) index: u32,
+}
+
 impl PropertyWriteCache {
+    fn publish_overwrite(&mut self, shape: ShapeId, index: usize) {
+        self.overwrite = PropertyOverwriteCache {
+            shape,
+            index: index as u32,
+        };
+    }
+
     pub(super) fn atom(&mut self, heap: &Heap, data: &mut HeapData, name: &str) -> Atom {
         if self.heap.as_ptr() != Rc::as_ptr(&heap.0) {
             self.heap = Rc::downgrade(&heap.0);
             self.addition = PropertyAdditionCache::default();
+            self.overwrite = PropertyOverwriteCache::default();
             self.atom = None;
             self.slot = None;
             self.transition = None;
@@ -212,6 +228,8 @@ impl HeapData {
                     && shape.keys()[index].enumerable != enumerable
                 {
                     slot.shape = self.shapes.transition(slot.shape, Key { atom, enumerable });
+                } else if let Some(cache) = cache {
+                    cache.publish_overwrite(slot.shape, index);
                 }
                 return Some(std::mem::replace(&mut object.values[index], value));
             }
@@ -245,6 +263,7 @@ impl HeapData {
                 prototype: object.prototype,
             });
         }
+        let is_closure = matches!(slot.payload, Payload::Closure(_));
         let properties = match &mut slot.payload {
             Payload::Object(object) => &mut object.properties,
             Payload::Closure(closure) => &mut closure.properties,
@@ -262,6 +281,10 @@ impl HeapData {
                     && shape.keys()[index].enumerable != enumerable
                 {
                     slot.shape = self.shapes.transition(slot.shape, Key { atom, enumerable });
+                } else if let Some(cache) = cache
+                    && !is_closure
+                {
+                    cache.publish_overwrite(slot.shape, index);
                 }
                 return Some(std::mem::replace(&mut values[index], value));
             }

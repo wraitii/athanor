@@ -129,6 +129,7 @@ define_helpers! {
     LocalSet => Binary, js_local_set;
     LocalReplace => IndexSet, js_local_replace;
     Release => Unary, js_release;
+    Bailout => Unary, js_bailout;
     TempClear => Unary, js_temp_clear;
     TempRetain => Unary, js_temp_retain;
     TempOwn => Unary, js_temp_own;
@@ -417,6 +418,10 @@ extern "C" fn js_index_unroot(ctx: *mut JitCtx) -> Value {
 }
 extern "C" fn js_local_set(ctx: *mut JitCtx, slot: u64, value: Value) -> Value {
     unsafe { &mut *ctx }.local_set(slot as usize, value)
+}
+extern "C" fn js_bailout(_: *mut JitCtx, site: Value) -> Value {
+    crate::jit::bailouts::hit(site.bits());
+    Value::UNDEFINED
 }
 extern "C" fn js_release(ctx: *mut JitCtx, value: Value) -> Value {
     unsafe { &*ctx }.global.heap().release(value);

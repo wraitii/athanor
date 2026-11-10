@@ -42,7 +42,7 @@ pub(crate) use arena::{
 pub(crate) use array::HOLE;
 pub(crate) use natives::{MathFunction, NativeFunction};
 pub use owned::OwnedValue;
-pub(crate) use properties::{PropertyAdditionCache, PropertyWriteCache};
+pub(crate) use properties::{PropertyAdditionCache, PropertyOverwriteCache, PropertyWriteCache};
 pub(crate) use regexp::regexp_flags;
 pub(crate) use shape::{DICTIONARY, NO_SHAPE};
 pub(crate) use typed::TypedKind;

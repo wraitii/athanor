@@ -682,7 +682,7 @@ pub(super) fn apply_version(
             .collect();
         let mut pieces = canonical.pieces.borrow_mut();
         let cfg = Cfg::new(graph);
-        let mut stubs: HashMap<(usize, Vec<Value>), Block> = HashMap::new();
+        let mut stubs: HashMap<(usize, Vec<Value>, Option<Inst>), Block> = HashMap::new();
         for &(block, taken) in &exits {
             let Some(&original) = reverse.get(&block) else {
                 notes.push(format!("guard at {block}: canonical block unavailable"));
@@ -716,13 +716,44 @@ pub(super) fn apply_version(
                 notes.push(format!("guard at {block}: canonical inputs unavailable"));
                 continue;
             };
-            let key = (std::sync::Arc::as_ptr(&piece.body) as usize, inputs.clone());
+            let prime = match &graph.blocks[blocks[&block]].terminator.as_ref().unwrap().kind {
+                TerminatorKind::Branch(condition, ..) => {
+                    match graph.defining_op(*condition) {
+                        Some(Op::IsPropertyCached(object, site, name)) => {
+                            Some((*object, *site, name.clone()))
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            let guard_span = graph.blocks[blocks[&block]].terminator.as_ref().unwrap().span;
+            if crate::jit::bailouts::enabled()
+                && let TerminatorKind::Branch(condition, ..) =
+                    &graph.blocks[blocks[&block]].terminator.as_ref().unwrap().kind
+                && let Some(op) = graph.defining_op(*condition)
+            {
+                crate::jit::bailouts::note_guard(guard_span, graph.op_text(op));
+            }
+            let key = (
+                std::sync::Arc::as_ptr(&piece.body) as usize,
+                inputs.clone(),
+                prime.as_ref().map(|(_, site, _)| *site),
+            );
             let stub = *stubs.entry(key).or_insert_with(|| {
                 let stub = graph.blocks.push(BlockData::default());
+                if let Some((object, site, name)) = prime {
+                    graph.append(
+                        stub,
+                        guard_span,
+                        Op::PrimePropertyCache(object, site, name),
+                        false,
+                    );
+                }
                 let result = graph
                     .append(
                         stub,
-                        span,
+                        guard_span,
                         Op::Continuation(piece.body.clone(), inputs),
                         true,
                     )

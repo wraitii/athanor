@@ -1,4 +1,5 @@
 mod analysis;
+pub(crate) mod bailouts;
 mod builtins;
 mod clif;
 mod compiler;

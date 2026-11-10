@@ -435,6 +435,18 @@ impl FunctionCompiler<'_, '_> {
                 } else {
                     let result = match &data.op {
                         Op::Continuation(target, inputs) => {
+                            if crate::jit::bailouts::enabled() {
+                                let site = crate::jit::bailouts::register(format!(
+                                    "{} => {} (source {}..{}) guard: {}",
+                                    graph.name,
+                                    target.graph.name,
+                                    data.span.start,
+                                    data.span.end,
+                                    crate::jit::bailouts::guard_text(data.span)
+                                ));
+                                let site = self.b.ins().iconst(types::I64, site as i64);
+                                self.call_helper(Helper::Bailout, &[site]);
+                            }
                             let id = continuations[&(std::sync::Arc::as_ptr(target) as usize)];
                             let function = self.module.declare_func_in_func(id, self.b.func);
                             let argv = if target.outputs == 0 {

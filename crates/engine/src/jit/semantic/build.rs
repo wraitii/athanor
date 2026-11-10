@@ -320,6 +320,17 @@ impl<'a> Builder<'a> {
         unsupported("binding", span)
     }
 
+    fn nullish_literal(&mut self, expression: &Expression<'_>) -> Result<bool> {
+        Ok(match expression.without_parentheses() {
+            Expression::NullLiteral(_) => true,
+            Expression::Identifier(id) => matches!(
+                self.resolve(&id.name, id.reference_id.get(), id.span)?,
+                Reference::Constant(Constant::Undefined)
+            ),
+            _ => false,
+        })
+    }
+
     fn place(&mut self, target: &SimpleAssignmentTarget<'_>) -> Result<Place> {
         match target {
             SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
@@ -528,6 +539,23 @@ impl<'a> Builder<'a> {
                 Op::Unary(operator, value)
             }
             Expression::BinaryExpression(x) => {
+                if matches!(x.operator, BinaryOperator::Equality | BinaryOperator::Inequality) {
+                    let other = if self.nullish_literal(&x.right)? {
+                        Some(&x.left)
+                    } else if self.nullish_literal(&x.left)? {
+                        Some(&x.right)
+                    } else {
+                        None
+                    };
+                    if let Some(other) = other {
+                        let value = self.expression(other)?;
+                        let nullish = self.emit(span, Op::IsNullish(value));
+                        if x.operator == BinaryOperator::Equality {
+                            return Ok(nullish);
+                        }
+                        return Ok(self.emit(span, Op::Unary(UnaryOp::Not, nullish)));
+                    }
+                }
                 let left = self.expression(&x.left)?;
                 let right = self.expression(&x.right)?;
                 Op::Binary(x.operator, left, right)
@@ -854,7 +882,10 @@ impl<'a> Builder<'a> {
     fn bind_pattern(&mut self, pattern: &BindingPattern<'_>, value: Value) -> Result<()> {
         match pattern {
             BindingPattern::BindingIdentifier(id) => {
-                let binding = self.symbols[&id.symbol_id.get().unwrap()];
+                let Some(&binding) = self.symbols.get(&id.symbol_id.get().unwrap()) else {
+                    self.effect(id.span, Op::GlobalWrite(id.name.to_string(), value));
+                    return Ok(());
+                };
                 self.effect(id.span, Op::Initialize(binding, value));
             }
             BindingPattern::ArrayPattern(pattern) => {
@@ -1661,7 +1692,8 @@ pub(super) fn lower_global(
                     builder.effect(declarator.span, op);
                 }
             }
-            _ => {}
+            Statement::FunctionDeclaration(_) | Statement::EmptyStatement(_) => {}
+            other => builder.statement(other)?,
         }
     }
     let value = builder.constant(span, Constant::Undefined);
