@@ -677,6 +677,7 @@ fn result_types(op: &Op, facts: &Facts) -> Types {
         Op::IteratorNext(_) | Op::EnumerateNext(_) => Types::ALL,
         Op::IsUninitialized(_) | Op::IsPropertyCached(..) | Op::IsShape(..) => Types::BOOLEAN,
         Op::ProbeProperty(..)
+        | Op::ProbeShapeProperty(..)
         | Op::ProbeIndex(..)
         | Op::ConstructorPrototype(_)
         | Op::CachedProperty(..)

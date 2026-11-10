@@ -372,6 +372,7 @@ pub(super) enum Op {
     IsNullish(Value),
     ProbeGlobal(String),
     ProbeProperty(Value, String),
+    ProbeShapeProperty(Value, String, u32, u32),
     ProbeIndex(Value, Value),
     IsNative(Value, Native),
     IsCode(Value, cranelift_module::FuncId),
@@ -513,6 +514,7 @@ impl Op {
             | Op::IsUndefined(value)
             | Op::IsNullish(value)
             | Op::ProbeProperty(value, _)
+            | Op::ProbeShapeProperty(value, _, _, _)
             | Op::IsNative(value, _)
             | Op::NewInstance(value)
             | Op::ConstructorPrototype(value)
@@ -652,6 +654,7 @@ impl Op {
             | Op::IsUndefined(value)
             | Op::IsNullish(value)
             | Op::ProbeProperty(value, _)
+            | Op::ProbeShapeProperty(value, _, _, _)
             | Op::IsNative(value, _)
             | Op::NewInstance(value)
             | Op::ConstructorPrototype(value)
@@ -1335,6 +1338,7 @@ impl Graph {
             Op::IsCode(..) => closed(HEAP_READ, Unowned),
             Op::ProbeGlobal(_) => closed(GLOBAL_READ, Borrowed),
             Op::ProbeProperty(..) | Op::ProbeIndex(..) => closed(HEAP_READ, Borrowed),
+            Op::ProbeShapeProperty(..) => closed(HEAP_READ | CODE_READ, Borrowed),
             Op::GuardValid(_) => closed(GLOBAL_READ, Unowned),
             Op::GuardCommit(_) => closed(INTERNAL, None),
             Op::View(_) => closed(HEAP_READ, Unowned),
@@ -1811,6 +1815,7 @@ pub(super) fn optimize_planned(
                 continuations,
                 &mut notes,
                 report_regions,
+                &plan.shapes,
             )?;
             graph.verify()?;
             if regions.is_empty() {

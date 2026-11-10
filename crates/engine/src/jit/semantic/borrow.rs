@@ -12,6 +12,7 @@ pub(in crate::jit) fn receiver(op: &Op) -> Option<Value> {
         | Op::CachedProperty(object, _)
         | Op::ShapedGet(object, ..)
         | Op::ProbeProperty(object, _)
+        | Op::ProbeShapeProperty(object, ..)
         | Op::GetIndex(object, _)
         | Op::IndexedGet(object, _)
         | Op::ArrayLoad(object, _, _) => Some(*object),
@@ -98,6 +99,7 @@ pub(super) fn borrows(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>)
                 Op::IndexedGet(..)
                     | Op::ArrayLoad(..)
                     | Op::ProbeProperty(..)
+                    | Op::ProbeShapeProperty(..)
                     | Op::CachedProperty(..)
                     | Op::ShapedGet(..)
             ) {

@@ -210,6 +210,9 @@ impl Graph {
             Op::IsNullish(value) => format!("is_nullish {value}"),
             Op::ProbeGlobal(name) => format!("probe_global {name}"),
             Op::ProbeProperty(object, name) => format!("probe {object}.{name}"),
+            Op::ProbeShapeProperty(object, name, shape, index) => {
+                format!("probe_shape_property {object}.{name} shape={shape} @{index}")
+            }
             Op::ProbeIndex(object, key) => format!("probe {object}[{key}]"),
             Op::IsNative(value, native) => format!("is_native {value}, {native}"),
             Op::IsCode(value, code) => format!("is_code {value}, {code}"),

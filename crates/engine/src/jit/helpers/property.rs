@@ -596,15 +596,9 @@ pub(super) extern "C" fn js_semantic_property_probe_cached(
     cache: *mut PropertyCache,
 ) -> Value {
     let cache = unsafe { &mut *cache };
-    let heap = unsafe { &*ctx }.global.heap();
-    if let Some(value) = cache.builtin(heap, object) {
+    let context = unsafe { &*ctx };
+    if let Some(value) = cache.fill(context.engine, context.global.heap(), object) {
         return value;
-    }
-    if let Some(found) = heap.cached_property(object, &cache.name) {
-        cache.shape = found.shape;
-        cache.index = found.index;
-        cache.holder = found.holder;
-        cache.holder_shape = found.holder_shape;
     }
     js_semantic_property_probe(ctx, object, cache.name.as_ptr(), cache.name.len() as u64)
 }

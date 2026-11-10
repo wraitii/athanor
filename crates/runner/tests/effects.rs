@@ -1,6 +1,41 @@
 use std::process::Command;
 
 #[test]
+fn property_probes_report_shapes_and_specialize_region_entry() {
+    let source = "function f(){return this.x*this.y;}";
+    let execute = "let o={x:3,y:4,f:f};
+        for(let i=0;i<6;i++) if(o.f()!==12) throw 'initial shape';
+        let changed={y:5,x:6,f:f};
+        if(changed.f()!==30) throw 'changed shape';
+        function Child(){this.f=f;}
+        Child.prototype={x:7,y:8};
+        if(new Child().f()!==56) throw 'prototype fallback';
+        o.x=2.5;
+        if(o.f()!==10) throw 'changed value';";
+    let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
+        .args([
+            "--compile",
+            "--filter",
+            "f",
+            "--execute",
+            execute,
+            "--eval",
+            source,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let dump = String::from_utf8(output.stdout).unwrap();
+    let (initial, feedback) = dump.split_once(".feedback").unwrap();
+    assert!(initial.contains("= probe "));
+    assert!(feedback.contains("probe_shape_property"));
+}
+
+#[test]
 fn semantic_graph_versions_math_calls_and_preserves_fallbacks() {
     let source = "function f(a,n){ let x=0; for(let i=0;i<n;i++) x+=Math.floor(a[i]); return x; } function main(){ let a=f([1.2,2.8],2); Math.floor=x=>x+1; return a*10+f([1,2],2); }";
     let dump = Command::new(env!("CARGO_BIN_EXE_js-runner"))

@@ -13,9 +13,22 @@ pub(in crate::jit) struct Plan {
     accesses: Vec<(Site, PropertyAccess, u32, u32)>,
 }
 
+impl Plan {
+    pub(super) fn read(&self, graph: &Graph, inst: Inst) -> Option<(u32, u32)> {
+        let site = site(graph, inst, self.source);
+        self.accesses
+            .iter()
+            .find_map(|&(origin, access, shape, index)| {
+                (origin == site && access == PropertyAccess::Get).then_some((shape, index))
+            })
+    }
+}
+
 fn property_access(op: &Op) -> Option<PropertyAccess> {
     match op {
-        Op::Get(_, name) if name != "length" => Some(PropertyAccess::Get),
+        Op::Get(_, name) | Op::ProbeProperty(_, name) if name != "length" => {
+            Some(PropertyAccess::Get)
+        }
         Op::Set(..) => Some(PropertyAccess::Set),
         _ => None,
     }
@@ -81,7 +94,7 @@ fn planned(graph: &Graph, plan: &Plan) -> HashMap<Inst, (Value, u32, u32)> {
                 continue;
             };
             let (Op::Get(object, _) | Op::Set(object, ..)) = data.op else {
-                unreachable!();
+                continue;
             };
             if data.result.is_some_and(|value| callees.contains(&value)) || invariant(block, object)
             {
@@ -179,14 +192,6 @@ fn segments(graph: &Graph, planned: &HashMap<Inst, (Value, u32, u32)>) -> Vec<Se
         }
         segments.extend(current);
     }
-    segments.retain(|segment| {
-        let accesses = segment
-            .insts
-            .iter()
-            .filter(|inst| planned.contains_key(inst))
-            .count();
-        accesses > segment.guards.len()
-    });
     segments
 }
 

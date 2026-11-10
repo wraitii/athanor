@@ -35,6 +35,7 @@ pub(super) struct Speculation<'a> {
     pub(super) fallback: Option<usize>,
     pub(super) continuations: bool,
     pub(super) reads: &'a [Inst],
+    pub(super) shaped_reads: &'a [(Inst, u32, u32)],
     pub(super) guards: &'a [Block],
     pub(super) exits: &'a [Block],
     pub(super) exits_true: &'a [Block],
@@ -587,9 +588,19 @@ fn entry_checks(
     for &inst in reads {
         let data = graph.insts[inst].clone();
         let mut op = match data.op {
-            Op::Get(object, name) | Op::ShapedGet(object, name, _) => {
-                Op::ProbeProperty(object, name)
+            Op::Get(object, name)
+            | Op::ShapedGet(object, name, _)
+            | Op::ProbeProperty(object, name) => {
+                match speculation
+                    .shaped_reads
+                    .iter()
+                    .find(|&&(read, _, _)| read == inst)
+                {
+                    Some(&(_, shape, index)) => Op::ProbeShapeProperty(object, name, shape, index),
+                    None => Op::ProbeProperty(object, name),
+                }
             }
+            Op::ProbeShapeProperty(..) => data.op,
             Op::GetIndex(object, key) | Op::IndexedGet(object, key) => Op::ProbeIndex(object, key),
             Op::GlobalRead(name) => Op::ProbeGlobal(name),
             Op::Argument(index) => Op::Argument(index),
@@ -603,7 +614,9 @@ fn entry_checks(
         }
         let key = match &op {
             Op::ProbeGlobal(name) => LoadKey::Global(name.clone()),
-            Op::ProbeProperty(object, name) => LoadKey::Property(*object, name.clone()),
+            Op::ProbeProperty(object, name) | Op::ProbeShapeProperty(object, name, ..) => {
+                LoadKey::Property(*object, name.clone())
+            }
             Op::ProbeIndex(object, key) => LoadKey::Index(*object, *key),
             Op::Argument(index) => LoadKey::Argument(*index),
             Op::This => LoadKey::This,

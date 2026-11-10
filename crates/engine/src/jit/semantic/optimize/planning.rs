@@ -252,6 +252,7 @@ impl RegionPlan {
         notes: &mut Vec<String>,
         report_regions: bool,
         canonical: &Canonical<'_>,
+        shapes: &super::super::shapes::Plan,
     ) -> Result<()> {
         let cfg = Cfg::new(graph);
         let live: HashSet<_> = cfg.rpo.iter().copied().collect();
@@ -287,10 +288,20 @@ impl RegionPlan {
                 .filter(|block| self.body.contains(block))
                 .collect();
             let fallback = fallback.filter(|_| self.entry.is_none());
+            let shaped_reads: Vec<_> = self
+                .reads
+                .iter()
+                .filter_map(|&inst| {
+                    shapes
+                        .read(graph, inst)
+                        .map(|(shape, index)| (inst, shape, index))
+                })
+                .collect();
             let speculation = Speculation {
                 fallback,
                 continuations,
                 reads: &self.reads,
+                shaped_reads: &shaped_reads,
                 assumes: &self.checks,
                 guards: &self.guards,
                 exits: &self.exits,
@@ -356,6 +367,7 @@ impl RegionPlan {
                 notes,
                 report_regions,
                 child_canonical.as_ref().unwrap_or(canonical),
+                shapes,
             )?;
             for region in &regions[first..] {
                 self.body
@@ -739,7 +751,15 @@ pub(in crate::jit::semantic) fn version(
     fallback: Option<usize>,
     notes: &mut Vec<String>,
 ) -> Result<Vec<RegionId>> {
-    version_with_report(graph, conditional, fallback, true, notes, false)
+    version_with_report(
+        graph,
+        conditional,
+        fallback,
+        true,
+        notes,
+        false,
+        &Default::default(),
+    )
 }
 
 pub(in crate::jit::semantic) fn version_with_report(
@@ -749,6 +769,7 @@ pub(in crate::jit::semantic) fn version_with_report(
     continuations: bool,
     notes: &mut Vec<String>,
     report_regions: bool,
+    shapes: &super::super::shapes::Plan,
 ) -> Result<Vec<RegionId>> {
     let reached = super::propose::assume(graph, conditional);
     let plans = plan(graph, conditional, &reached, notes);
@@ -771,6 +792,7 @@ pub(in crate::jit::semantic) fn version_with_report(
             notes,
             report_regions,
             &canonical,
+            shapes,
         )?;
     }
     graph.strip_assumes();

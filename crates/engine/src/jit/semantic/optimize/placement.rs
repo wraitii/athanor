@@ -35,6 +35,7 @@ fn is_load(op: &Op) -> bool {
             | Op::GlobalRead(_)
             | Op::ProbeGlobal(_)
             | Op::ProbeProperty(..)
+            | Op::ProbeShapeProperty(..)
             | Op::ProbeIndex(..)
     )
 }
@@ -43,6 +44,7 @@ fn as_read(op: &Op) -> Op {
     match op {
         Op::ProbeGlobal(name) => Op::GlobalRead(name.clone()),
         Op::ProbeProperty(object, name) => Op::Get(*object, name.clone()),
+        Op::ProbeShapeProperty(object, name, ..) => Op::Get(*object, name.clone()),
         Op::ProbeIndex(object, key) => Op::GetIndex(*object, *key),
         op => op.clone(),
     }

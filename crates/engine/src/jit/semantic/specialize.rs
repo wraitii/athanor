@@ -230,6 +230,7 @@ fn assumptions(op: &Op, facts: &Facts) -> &'static [Assumption] {
         Op::ConstructorPrototype(_)
         | Op::ProbeGlobal(_)
         | Op::ProbeProperty(..)
+        | Op::ProbeShapeProperty(..)
         | Op::ProbeIndex(..) => &[Assumption::NoAccessors],
         Op::View(_) | Op::TypedIndex(..) => &[Assumption::FixedTypedStorage],
         Op::GuardedCompare {

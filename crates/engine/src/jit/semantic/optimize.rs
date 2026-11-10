@@ -634,6 +634,8 @@ fn probe_reads(
                     data.op,
                     Op::Get(..)
                         | Op::ShapedGet(..)
+                        | Op::ProbeProperty(..)
+                        | Op::ProbeShapeProperty(..)
                         | Op::GetIndex(..)
                         | Op::IndexedGet(..)
                         | Op::GlobalRead(_)

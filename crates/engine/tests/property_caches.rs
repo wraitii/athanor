@@ -333,6 +333,50 @@ fn check_specialized(source: &str, expected: f64) {
 }
 
 #[test]
+fn shaped_probes_preserve_nested_reads_and_receiver_fallbacks() {
+    check_specialized(
+        "function read(o) { return o.x.v + o.y.v; }
+        function main() {
+            let sum = 0;
+            const o = {x: {v: 3}, y: {v: 4}};
+            for (let i = 0; i < 20; ++i)
+                sum += read(o);
+            sum += read({y: {v: 5}, x: {v: 6}});
+            o.x = {other: 1, v: 8};
+            sum += read(o);
+            return sum;
+        }",
+        163.0,
+    );
+    let mut engine = Engine::with_options(EngineOptions {
+        background_compile: false,
+        ..Default::default()
+    })
+    .unwrap();
+    engine
+        .compile(
+            "function read(o) { return o.x * o.y; }
+        function main() {
+            for (let i = 0; i < 20; ++i)
+                read({x: 3, y: 4});
+            return 12;
+        }",
+            "shaped_probe_error.js",
+        )
+        .unwrap();
+    assert_eq!(
+        engine.call("main", &[]).unwrap().value(),
+        Value::number(12.0)
+    );
+    let error = engine
+        .call("read", &[Value::number(42.0)])
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("cannot read property \"x\" of number"));
+}
+
+#[test]
 fn shape_guards_fall_back_when_the_layout_changes() {
     check_specialized(
         "function bump(o) { o.n = o.n + 1; return o.n + o.m; }

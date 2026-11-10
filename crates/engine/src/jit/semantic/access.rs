@@ -33,6 +33,7 @@ impl Field {
             | Op::Set(_, name, _)
             | Op::Define(_, name, _)
             | Op::ShapedGet(_, name, _)
+            | Op::ProbeProperty(_, name)
             | Op::ShapedSet(_, name, _, _)
             | Op::GlobalRead(name)
             | Op::GlobalWrite(name, _)
@@ -84,6 +85,7 @@ impl Access {
     pub(super) fn read(op: &Op, facts: &Facts) -> Option<Self> {
         let (location, base) = match op {
             Op::Get(object, _)
+            | Op::ProbeProperty(object, _)
             | Op::ShapedGet(object, ..)
             | Op::GetIndex(object, _)
             | Op::TypedIndex(object, ..)
@@ -92,6 +94,9 @@ impl Access {
             | Op::IndexedLength(object)
             | Op::IsArray(object, _)
             | Op::ConstructorPrototype(object) => (Locations::HEAP, Some(*object)),
+            Op::ProbeShapeProperty(object, ..) => {
+                (Locations::HEAP.union(Locations::CODE), Some(*object))
+            }
             Op::IsShape(object, _) | Op::IsPropertyCached(object, ..) => {
                 (Locations::CODE, Some(*object))
             }

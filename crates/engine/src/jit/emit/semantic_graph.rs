@@ -1343,7 +1343,12 @@ impl FunctionCompiler<'_, '_> {
                         Op::ProbeGlobal(name) => Some(self.cached_global_probe(name)),
                         Op::ProbeProperty(object, name) => {
                             let object = get(self, *object);
-                            Some(self.cached_property_probe(object, name))
+                            let observer = self.property_observer(data);
+                            Some(self.cached_property_probe(object, name, observer))
+                        }
+                        Op::ProbeShapeProperty(object, _, shape, index) => {
+                            let object = get(self, *object);
+                            Some(self.shaped_property_probe(object, *shape, *index))
                         }
                         Op::ProbeIndex(object, key) => {
                             let object = get(self, *object);

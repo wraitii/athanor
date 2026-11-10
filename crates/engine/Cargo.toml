@@ -5,10 +5,13 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-cranelift-codegen = { version = "=0.137.1", features = ["disas"] }
-cranelift-frontend = "=0.137.1"
-cranelift-jit = "=0.137.1"
-cranelift-module = "=0.137.1"
+# Cranelift is pinned to a wasmtime main commit (newer than the 0.137.1 release)
+# for an upstream fix to machine-code source locations, which jitdump profiling
+# relies on. Switch back to a crates.io release once one includes it.
+cranelift-codegen = { git = "https://github.com/bytecodealliance/wasmtime", rev = "24d029ab2487bc2dc7eff27ed8a9d51a0385fb75", features = ["disas"] }
+cranelift-frontend = { git = "https://github.com/bytecodealliance/wasmtime", rev = "24d029ab2487bc2dc7eff27ed8a9d51a0385fb75" }
+cranelift-jit = { git = "https://github.com/bytecodealliance/wasmtime", rev = "24d029ab2487bc2dc7eff27ed8a9d51a0385fb75" }
+cranelift-module = { git = "https://github.com/bytecodealliance/wasmtime", rev = "24d029ab2487bc2dc7eff27ed8a9d51a0385fb75" }
 oxc_allocator = "=0.157.0"
 oxc_ast = "=0.157.0"
 oxc_ast_visit = "=0.157.0"

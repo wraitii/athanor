@@ -1325,8 +1325,13 @@ impl FunctionCompiler<'_, '_> {
         self.cached_property_read(object, name, retain, false, observer)
     }
 
-    pub(super) fn cached_property_probe(&mut self, object: ClifValue, name: &str) -> ClifValue {
-        self.cached_property_read(object, name, false, true, None)
+    pub(super) fn cached_property_probe(
+        &mut self,
+        object: ClifValue,
+        name: &str,
+        observer: Option<(u64, crate::jit::profile::Site)>,
+    ) -> ClifValue {
+        self.cached_property_read(object, name, false, true, observer)
     }
 
     fn cached_property_read(
@@ -1655,6 +1660,28 @@ impl FunctionCompiler<'_, '_> {
             .ins()
             .load(types::I32, MemFlagsData::trusted(), view, SHAPE_OFFSET);
         self.b.ins().icmp_imm_s(IntCC::Equal, actual, shape as i64)
+    }
+
+    pub(super) fn shaped_property_probe(
+        &mut self,
+        object: ClifValue,
+        shape: u32,
+        index: u32,
+    ) -> ClifValue {
+        let hit = self.shape_hit(object, shape);
+        let fast = self.b.create_block();
+        let miss = self.b.create_block();
+        let done = self.b.create_block();
+        self.b.append_block_param(done, types::I64);
+        self.brif(hit, fast, &[], miss, &[]);
+        self.switch(fast);
+        let value = self.shaped_property_get(object, index, false);
+        self.jump(done, &[BlockArg::Value(value)]);
+        self.switch(miss);
+        let missing = self.constant(Value::UNINITIALIZED);
+        self.jump(done, &[BlockArg::Value(missing)]);
+        self.switch(done);
+        self.b.block_params(done)[0]
     }
 
     pub(super) fn shaped_property_get(
