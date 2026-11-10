@@ -1,0 +1,56 @@
+use oxc_syntax::operator::BinaryOperator;
+
+use super::super::{Cfg, Facts, Graph, Op, Types, UnaryOp};
+use super::NUMERIC;
+
+pub(in crate::jit::semantic) fn coercions(graph: &mut Graph) {
+    let facts = Facts::compute(graph);
+    for block in Cfg::new(graph).rpo {
+        for inst in graph.blocks[block].insts.clone() {
+            let op = &graph.insts[inst].op;
+            let bitwise = matches!(
+                op,
+                Op::Unary(UnaryOp::BitwiseNot, _)
+                    | Op::Binary(
+                        BinaryOperator::BitwiseAnd
+                            | BinaryOperator::BitwiseOR
+                            | BinaryOperator::BitwiseXOR
+                            | BinaryOperator::ShiftLeft
+                            | BinaryOperator::ShiftRight
+                            | BinaryOperator::ShiftRightZeroFill,
+                        ..
+                    )
+            );
+            if !bitwise {
+                continue;
+            }
+            if !op
+                .operands_iter()
+                .all(|value| facts.of(value).within(NUMERIC))
+                || op
+                    .operands_iter()
+                    .all(|value| facts.of(value).within(Types::INT32))
+            {
+                continue;
+            }
+            let mut op = op.clone();
+            let mut position = graph.blocks[block]
+                .insts
+                .iter()
+                .position(|&candidate| candidate == inst)
+                .unwrap();
+            let span = graph.insts[inst].span;
+            for operand in op.operands_mut() {
+                if facts.of(*operand).within(Types::INT32) {
+                    continue;
+                }
+                *operand = graph
+                    .insert(block, position, span, Op::ToInt32(*operand), true)
+                    .1
+                    .unwrap();
+                position += 1;
+            }
+            graph.insts[inst].op = op;
+        }
+    }
+}

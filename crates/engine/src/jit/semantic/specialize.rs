@@ -3,10 +3,14 @@ use std::sync::Arc;
 
 use cranelift_module::FuncId;
 
-use super::super::effects::{
-    Assumption, ERROR, GLOBAL_WRITE, HEAP_WRITE, INTERNAL, Reentry, UNKNOWN,
+use oxc_syntax::operator::BinaryOperator;
+
+use super::super::effects::{Assumption, Control, Effects, Locations, Memory};
+use super::super::math::METHODS;
+use super::{
+    Canonical, Cfg, DirectTarget, Facts, Graph, Inst, Native, Op, Result, TerminatorKind, Types,
+    UnaryOp,
 };
-use super::{Canonical, Cfg, DirectTarget, Facts, Graph, Inst, Native, Op, Result, TerminatorKind};
 
 pub(super) const SPECIALIZATION_BUDGET: usize = 128;
 pub(super) const SPECIALIZATION_BODY_INSTS: usize = 64;
@@ -164,23 +168,21 @@ impl Repository {
 }
 
 #[derive(Clone, Default, PartialEq, Eq)]
-struct ConditionalEffects {
-    flags: u16,
+struct SummaryEffects {
+    memory: Memory,
+    control: Control,
     globals_read: HashSet<String>,
     globals_written: HashSet<String>,
     properties_read: HashSet<String>,
     properties_written: HashSet<String>,
-    assumptions: HashSet<Assumption>,
-    identities: HashSet<(String, FuncId)>,
-    natives: HashSet<Native>,
-    string_splits: HashSet<(FuncId, Inst)>,
     unresolved: HashSet<(FuncId, Inst)>,
     unsupported: bool,
 }
 
-impl ConditionalEffects {
+impl SummaryEffects {
     fn merge(&mut self, other: &Self) {
-        self.flags |= other.flags;
+        self.memory = self.memory.union(other.memory);
+        self.control = self.control.union(other.control);
         self.unsupported |= other.unsupported;
         self.globals_read.extend(other.globals_read.iter().cloned());
         self.globals_written
@@ -189,17 +191,106 @@ impl ConditionalEffects {
             .extend(other.properties_read.iter().cloned());
         self.properties_written
             .extend(other.properties_written.iter().cloned());
+        self.unresolved.extend(other.unresolved.iter().copied());
+    }
+
+    fn absorb(&mut self, effects: Effects) {
+        self.memory = self.memory.union(effects.memory);
+        self.control = self.control.union(effects.control);
+    }
+
+    fn writes(&self) -> bool {
+        !self.memory.writes.is_empty() || !self.properties_written.is_empty()
+    }
+}
+
+fn assumptions(op: &Op, facts: &Facts) -> &'static [Assumption] {
+    const PROPERTY: &[Assumption] = &[Assumption::NoAccessors, Assumption::NoCoercionCallbacks];
+    const COERCION: &[Assumption] = &[Assumption::NoCoercionCallbacks];
+    let coercing = || {
+        let operands = op.operands_iter().fold(Types::default(), |types, value| {
+            types.union(facts.of(value))
+        });
+        if operands.within(Types::PRIMITIVE) {
+            &[]
+        } else {
+            COERCION
+        }
+    };
+    match op {
+        Op::Get(..)
+        | Op::GetIndex(..)
+        | Op::FillPropertyCache(..)
+        | Op::Set(..)
+        | Op::SetIndex(..)
+        | Op::Define(..) => PROPERTY,
+        Op::Spread(_) | Op::IteratorNext(_) | Op::EnumerateNext(_) => {
+            &[Assumption::DirectIteration]
+        }
+        Op::ConstructorPrototype(_)
+        | Op::ProbeGlobal(_)
+        | Op::ProbeProperty(..)
+        | Op::ProbeIndex(..) => &[Assumption::NoAccessors],
+        Op::View(_) | Op::TypedIndex(..) => &[Assumption::FixedTypedStorage],
+        Op::GuardedCompare {
+            operator,
+            left,
+            right,
+            ..
+        } => assumptions(&Op::Binary(*operator, *left, *right), facts),
+        Op::Binary(
+            BinaryOperator::StrictEquality
+            | BinaryOperator::StrictInequality
+            | BinaryOperator::In
+            | BinaryOperator::Instanceof,
+            ..,
+        ) => &[],
+        Op::Unary(UnaryOp::Not | UnaryOp::Typeof | UnaryOp::Increment | UnaryOp::Decrement, _) => {
+            &[]
+        }
+        Op::CallNative(native, _)
+            if METHODS[native.index()].1 == crate::heap::MathFunction::Random =>
+        {
+            &[]
+        }
+        Op::Binary(..) | Op::ToNumeric(_) | Op::Unary(..) | Op::CallNative(..) => coercing(),
+        _ => &[],
+    }
+}
+
+#[derive(Clone, Default, PartialEq, Eq)]
+struct Requirements {
+    assumptions: HashSet<Assumption>,
+    identities: HashSet<(String, FuncId)>,
+    natives: HashSet<Native>,
+    string_splits: HashSet<(FuncId, Inst)>,
+}
+
+impl Requirements {
+    fn merge(&mut self, other: &Self) {
         self.assumptions.extend(other.assumptions.iter().copied());
         self.identities.extend(other.identities.iter().cloned());
         self.natives.extend(other.natives.iter().copied());
         self.string_splits
             .extend(other.string_splits.iter().copied());
-        self.unresolved.extend(other.unresolved.iter().copied());
+    }
+}
+
+#[derive(Clone, Default, PartialEq, Eq)]
+struct Summary {
+    effects: SummaryEffects,
+    requires: Requirements,
+}
+
+impl Summary {
+    fn merge(&mut self, other: &Self) {
+        self.effects.merge(&other.effects);
+        self.requires.merge(&other.requires);
     }
 }
 
 struct LocalEffects {
-    effects: ConditionalEffects,
+    summary: Summary,
     calls: Vec<(Inst, FuncId)>,
 }
 
@@ -207,9 +298,10 @@ impl Repository {
     fn local_effects(&self, code: FuncId) -> Option<LocalEffects> {
         let graph = self.body(code)?;
         let facts = Facts::compute(graph);
-        let mut effects = ConditionalEffects::default();
+        let mut effects = SummaryEffects::default();
+        let mut requires = Requirements::default();
         if graph.generator || graph.has_handlers {
-            effects.flags |= UNKNOWN;
+            effects.absorb(Effects::UNKNOWN);
             effects.unsupported = true;
         }
         let mut calls = Vec::new();
@@ -231,7 +323,7 @@ impl Repository {
                     }
                     Op::Set(_, name, _) | Op::Define(_, name, _) | Op::DefineHidden(_, name, _) => {
                         effects.properties_written.insert(name.clone());
-                        effects.flags |= HEAP_WRITE;
+                        effects.memory.writes = effects.memory.writes.union(Locations::HEAP);
                     }
                     Op::GetIndex(..)
                     | Op::IndexedGet(..)
@@ -241,7 +333,7 @@ impl Repository {
                     }
                     Op::SetIndex(..) | Op::ArrayAppend(..) => {
                         effects.properties_written.insert("*".into());
-                        effects.flags |= HEAP_WRITE;
+                        effects.memory.writes = effects.memory.writes.union(Locations::HEAP);
                     }
                     _ => {}
                 }
@@ -255,7 +347,7 @@ impl Repository {
                     let target = match graph.defining_op(*callee) {
                         Some(Op::GlobalRead(name)) => {
                             self.globals.get(name).copied().map(|target| {
-                                effects.identities.insert((name.clone(), target));
+                                requires.identities.insert((name.clone(), target));
                                 target
                             })
                         }
@@ -263,7 +355,7 @@ impl Repository {
                         _ => None,
                     };
                     if let Some(target) = target.filter(|target| self.body(*target).is_some()) {
-                        effects.flags |= INTERNAL | ERROR;
+                        effects.control = Control::UNKNOWN;
                         calls.push((inst, target));
                         continue;
                     }
@@ -271,47 +363,47 @@ impl Repository {
                         && property == "split"
                         && *receiver == Some(*object)
                     {
-                        effects.string_splits.insert((code, inst));
-                        let contract =
-                            graph.contract(&Op::StringSplit(*object, args.clone()), &facts);
-                        effects.flags |= contract.flags;
-                        effects
+                        requires.string_splits.insert((code, inst));
+                        let lowered = Op::StringSplit(*object, args.clone());
+                        effects.absorb(graph.contract(&lowered, &facts).effects);
+                        requires
                             .assumptions
-                            .extend(contract.assumptions.iter().copied());
+                            .extend(assumptions(&lowered, &facts).iter().copied());
                         continue;
                     }
                     if let Some(Op::Get(object, property)) = graph.defining_op(*callee)
                         && let Some(Op::GlobalRead(global)) = graph.defining_op(*object)
                         && let Some(native) = Native::lookup(global, property)
                     {
-                        effects.natives.insert(native);
-                        let contract =
-                            graph.contract(&Op::CallNative(native, args.clone()), &facts);
-                        effects.flags |= contract.flags;
-                        for assumption in contract.assumptions {
-                            effects.assumptions.insert(*assumption);
-                        }
+                        requires.natives.insert(native);
+                        let lowered = Op::CallNative(native, args.clone());
+                        effects.absorb(graph.contract(&lowered, &facts).effects);
+                        requires
+                            .assumptions
+                            .extend(assumptions(&lowered, &facts).iter().copied());
                         continue;
                     }
                 }
-                let contract = graph.contract(op, &facts);
-                effects.flags |= contract.flags;
-                for assumption in contract.assumptions {
-                    effects.assumptions.insert(*assumption);
-                }
-                if contract.reentry != Reentry::Closed {
+                let contract = graph.contract(op, &facts).effects;
+                effects.absorb(contract);
+                requires
+                    .assumptions
+                    .extend(assumptions(op, &facts).iter().copied());
+                if contract.memory.reenters() {
                     effects.unresolved.insert((code, inst));
-                    effects.flags |= UNKNOWN;
                 }
             }
         }
-        Some(LocalEffects { effects, calls })
+        Some(LocalEffects {
+            summary: Summary { effects, requires },
+            calls,
+        })
     }
 
     fn effect_summaries(
         &self,
         roots: impl IntoIterator<Item = FuncId>,
-    ) -> HashMap<FuncId, ConditionalEffects> {
+    ) -> HashMap<FuncId, Summary> {
         let mut local = HashMap::new();
         let mut pending: Vec<_> = roots.into_iter().collect();
         while let Some(code) = pending.pop() {
@@ -326,12 +418,12 @@ impl Repository {
         }
         let mut summaries: HashMap<_, _> = local
             .iter()
-            .map(|(&code, body)| (code, body.effects.clone()))
+            .map(|(&code, body)| (code, body.summary.clone()))
             .collect();
         loop {
             let mut changed = false;
             for (&code, body) in &local {
-                let mut summary = body.effects.clone();
+                let mut summary = body.summary.clone();
                 for (_, target) in &body.calls {
                     if let Some(callee) = summaries.get(target) {
                         summary.merge(callee);
@@ -364,7 +456,7 @@ impl Repository {
             let Some(local) = self.local_effects(code) else {
                 continue;
             };
-            let effects = &local.effects;
+            let Summary { effects, requires } = &local.summary;
             if effects.unsupported {
                 return format!("{path}: generator or exception handler");
             }
@@ -376,21 +468,20 @@ impl Repository {
                 );
             }
             if identities_block
-                && let Some((name, target)) = effects.identities.iter().min_by_key(|(name, _)| name)
+                && let Some((name, target)) =
+                    requires.identities.iter().min_by_key(|(name, _)| name)
             {
                 return format!("{path}: requires global {name} to remain {target}");
             }
-            if let Some((_, inst)) = effects.string_splits.iter().min_by_key(|(_, inst)| *inst) {
+            if let Some((_, inst)) = requires.string_splits.iter().min_by_key(|(_, inst)| *inst) {
                 return format!(
                     "{path} -> {inst}: method .split requires native String.split identity and its original receiver"
                 );
             }
-            if let Some(native) = effects.natives.iter().min_by_key(|native| native.index()) {
+            if let Some(native) = requires.natives.iter().min_by_key(|native| native.index()) {
                 return format!("{path}: requires native {native} identity");
             }
-            if effects.flags & (GLOBAL_WRITE | HEAP_WRITE) != 0
-                || !effects.properties_written.is_empty()
-            {
+            if effects.writes() {
                 return format!("{path}: writes state");
             }
             for (inst, target) in local.calls.into_iter().rev() {
@@ -464,13 +555,13 @@ pub(super) fn prove_closed_calls(graph: &mut Graph, bodies: &Repository, notes: 
         let Some(summary) = summaries.get(&target) else {
             continue;
         };
-        if summary.unsupported
-            || !summary.unresolved.is_empty()
-            || !summary.identities.is_empty()
-            || !summary.natives.is_empty()
-            || !summary.string_splits.is_empty()
-            || summary.flags & (GLOBAL_WRITE | HEAP_WRITE) != 0
-            || !summary.properties_written.is_empty()
+        let Summary { effects, requires } = summary;
+        if effects.unsupported
+            || !effects.unresolved.is_empty()
+            || effects.writes()
+            || !requires.identities.is_empty()
+            || !requires.natives.is_empty()
+            || !requires.string_splits.is_empty()
         {
             notes.push(format!(
                 "call {inst}: closed-call proof rejected: {}",
@@ -478,7 +569,9 @@ pub(super) fn prove_closed_calls(graph: &mut Graph, bodies: &Repository, notes: 
             ));
             continue;
         }
-        graph.closed_calls.insert(inst, (callee, summary.flags));
+        graph
+            .closed_calls
+            .insert(inst, (callee, effects.memory, effects.control));
         notes.push(format!("call {inst}: {target} proved closed and read-only"));
     }
 }
@@ -494,7 +587,8 @@ pub(super) struct ConditionalCall {
     pub(super) inst: Inst,
     pub(super) callee: super::Value,
     pub(super) name: String,
-    pub(super) flags: u16,
+    pub(super) memory: Memory,
+    pub(super) control: Control,
     pub(super) identities: Vec<(String, FuncId)>,
 }
 
@@ -524,12 +618,12 @@ pub(super) fn conditional_plan(
         let Some(summary) = summaries.get(&target) else {
             continue;
         };
-        if summary.unsupported
-            || !summary.unresolved.is_empty()
-            || !summary.natives.is_empty()
-            || !summary.string_splits.is_empty()
-            || summary.flags & (GLOBAL_WRITE | HEAP_WRITE) != 0
-            || !summary.properties_written.is_empty()
+        let Summary { effects, requires } = summary;
+        if effects.unsupported
+            || !effects.unresolved.is_empty()
+            || effects.writes()
+            || !requires.natives.is_empty()
+            || !requires.string_splits.is_empty()
         {
             notes.push(format!(
                 "call {inst}: conditional proof rejected: {}",
@@ -537,11 +631,11 @@ pub(super) fn conditional_plan(
             ));
             continue;
         }
-        let mut required = summary.identities.clone();
+        let mut required = requires.identities.clone();
         required.insert((name.clone(), target));
         let mut identities: Vec<_> = required.into_iter().collect();
         identities.sort_by(|a, b| a.0.cmp(&b.0));
-        let mut assumptions: Vec<_> = summary
+        let mut assumptions: Vec<_> = requires
             .assumptions
             .iter()
             .map(ToString::to_string)
@@ -557,7 +651,8 @@ pub(super) fn conditional_plan(
             inst,
             callee,
             name,
-            flags: summary.flags,
+            memory: effects.memory,
+            control: effects.control,
             identities,
         });
     }
@@ -865,12 +960,12 @@ mod tests {
         let summaries = bodies.effect_summaries([FuncId::from_u32(0)]);
         for code in [FuncId::from_u32(0), FuncId::from_u32(1)] {
             let summary = &summaries[&code];
-            assert!(summary.unresolved.is_empty());
-            assert!(summary.globals_read.contains("state"));
-            assert!(summary.properties_read.contains("value"));
-            assert!(summary.properties_written.contains("value"));
-            assert_eq!(summary.identities.len(), 2);
-            assert_eq!(summary.natives.len(), 1);
+            assert!(summary.effects.unresolved.is_empty());
+            assert!(summary.effects.globals_read.contains("state"));
+            assert!(summary.effects.properties_read.contains("value"));
+            assert!(summary.effects.properties_written.contains("value"));
+            assert_eq!(summary.requires.identities.len(), 2);
+            assert_eq!(summary.requires.natives.len(), 1);
         }
     }
 
@@ -940,10 +1035,10 @@ mod tests {
             fixture("function leaf(t){return t.split('|');} function main(t){return leaf(t);}");
         let summaries = bodies.effect_summaries([FuncId::from_u32(0)]);
         let summary = &summaries[&FuncId::from_u32(0)];
-        assert!(summary.unresolved.is_empty());
-        assert_eq!(summary.string_splits.len(), 1);
-        assert!(summary.flags & super::super::ALLOCATION != 0);
-        assert!(summary.flags & super::super::ERROR != 0);
+        assert!(summary.effects.unresolved.is_empty());
+        assert_eq!(summary.requires.string_splits.len(), 1);
+        assert!(summary.effects.control.ordered);
+        assert!(summary.effects.control.throws);
         let mut notes = Vec::new();
         assert!(
             conditional_plan(&canonical.graph, &bodies, &mut notes)
@@ -970,7 +1065,7 @@ mod tests {
         let plan = conditional_plan(&canonical.graph, &bodies, &mut notes);
         assert!(plan.calls.is_empty());
         let summaries = bodies.effect_summaries([FuncId::from_u32(0)]);
-        assert_eq!(summaries[&FuncId::from_u32(0)].string_splits.len(), 1);
+        assert_eq!(summaries[&FuncId::from_u32(0)].requires.string_splits.len(), 1);
         assert!(
             notes.iter().any(|note| note.contains("createTerrain")
                 && note.contains("method .map")
@@ -1021,7 +1116,7 @@ mod tests {
             graph
                 .closed_calls
                 .keys()
-                .all(|inst| region.contains(&graph.insts[*inst].block))
+                .all(|inst| graph.regions[*region].blocks.contains(&graph.insts[*inst].block))
         );
         assert_eq!(
             operations(&graph)
@@ -1113,7 +1208,7 @@ mod tests {
         assert!(!graph.closed_calls.is_empty());
         let facts = Facts::compute(&graph);
         for &inst in graph.closed_calls.keys() {
-            assert_eq!(graph.inst_contract(inst, &facts).reentry, Reentry::Closed);
+            assert!(!graph.inst_contract(inst, &facts).effects.memory.reenters());
         }
         graph.verify().unwrap();
     }
@@ -1200,11 +1295,12 @@ mod tests {
         );
         prove_closed_calls(&mut graph, &bodies, &mut Vec::new());
         assert!(graph.closed_calls.contains_key(&request.call));
-        assert_eq!(
-            graph
+        assert!(
+            !graph
                 .inst_contract(request.call, &Facts::compute(&graph))
-                .reentry,
-            Reentry::Closed
+                .effects
+                .memory
+                .reenters()
         );
     }
 

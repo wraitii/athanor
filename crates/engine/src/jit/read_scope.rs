@@ -7,7 +7,7 @@ use cranelift_jit::JITModule;
 use cranelift_module::Module;
 
 use super::clif::{Annotations, IndexedRead};
-use super::effects::{self, GLOBAL_WRITE, HEAP_WRITE, Reentry};
+use super::effects;
 use super::helpers::{self, HELPERS, Helper};
 use crate::value::Value;
 
@@ -28,10 +28,7 @@ fn admitted(context: &Context, annotations: &Annotations) -> bool {
                 ) {
                     return false;
                 }
-                let effect = effects::effects(helper);
-                if effect.reentry != Reentry::Closed
-                    || effect.flags & (HEAP_WRITE | GLOBAL_WRITE) != 0
-                {
+                if !effects::effects(helper).memory.writes.is_empty() {
                     return false;
                 }
             } else if function.dfg.insts[inst].opcode().is_call() {

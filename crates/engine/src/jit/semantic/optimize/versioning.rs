@@ -173,7 +173,8 @@ pub(super) fn apply_version(
     let hints = super::super::observations::numeric_hints(graph);
     let head = entry.map_or(graph.entry, |(_, header)| header);
     let mut tested =
-        EntryGuard::at_entry(graph, entry.map_or(graph.entry, |(preheader, _)| preheader));    assert!(fallback.is_none() || entry.is_none());
+        EntryGuard::at_entry(graph, entry.map_or(graph.entry, |(preheader, _)| preheader));
+    assert!(fallback.is_none() || entry.is_none());
     let reuse = fallback.is_some()
         && exits.iter().all(|block| guards.contains(block))
         && exits_true.is_empty();
@@ -214,19 +215,19 @@ pub(super) fn apply_version(
             if let (Some(old), Some(new)) = (data.result, result) {
                 values.insert(old, new);
             }
-            let flags = closed_calls
+            let effects = closed_calls
                 .iter()
                 .find(|call| call.inst == inst)
-                .map(|call| call.flags)
+                .map(|call| (call.memory, call.control))
                 .or_else(|| {
                     graph.closed_calls.get(&inst)
-                        .filter(|(expected, _)| matches!(graph.insts[inst].op, Op::Call { callee, .. } if callee == *expected))
-                        .map(|(_, flags)| *flags)
+                        .filter(|(expected, ..)| matches!(graph.insts[inst].op, Op::Call { callee, .. } if callee == *expected))
+                        .map(|(_, memory, control)| (*memory, *control))
                 });
-            if let Some(flags) = flags
+            if let Some((memory, control)) = effects
                 && let Op::Call { callee, .. } = graph.insts[copy].op
             {
-                graph.closed_calls.insert(copy, (callee, flags));
+                graph.closed_calls.insert(copy, (callee, memory, control));
             }
             insts.insert(inst, copy);
         }
@@ -980,7 +981,7 @@ fn shared_resume(
         let pure = graph.blocks[current]
             .insts
             .iter()
-            .all(|&inst| graph.contract(&graph.insts[inst].op, facts).is_pure());
+            .all(|&inst| facts.is_pure(inst));
         if !pure {
             return None;
         }
@@ -1026,7 +1027,7 @@ pub(in crate::jit::semantic) fn repair(graph: &mut Graph, values: &HashMap<Value
                     *value = repair.entering(graph, block, *value);
                 }
             }
-            if let Some((expected, _)) = graph.closed_calls.get_mut(&inst)
+            if let Some((expected, ..)) = graph.closed_calls.get_mut(&inst)
                 && matches!(graph.insts[inst].op, Op::Call { callee, .. } if callee == *expected)
                 && let Op::Call { callee, .. } = &op
             {

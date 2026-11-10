@@ -162,77 +162,8 @@ pub(super) fn unescaped(graph: &Graph, scope: &HashSet<Block>, cfg: &Cfg) -> Has
     private
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub(super) enum Access {
-    Named(String),
-    // Cells can alias other captures, but cannot alias JavaScript properties.
-    Cells,
-    Packs,
-    Length,
-    Elements,
-    Iteration,
-    Any,
-}
-
-impl Access {
-    fn named(name: &str) -> Self {
-        match name {
-            "length" => Self::Length,
-            _ if name.starts_with(|c: char| c.is_ascii_digit() || c == '-')
-                || matches!(name, "NaN" | "Infinity") =>
-            {
-                Self::Any
-            }
-            _ => Self::Named(name.to_owned()),
-        }
-    }
-
-    pub(super) fn of(op: &Op, facts: &Facts) -> Self {
-        match op {
-            Op::Read(_) | Op::Initialize(..) | Op::Write(..) => Self::Cells,
-            Op::Get(_, name)
-            | Op::Set(_, name, _)
-            | Op::Define(_, name, _)
-            | Op::ShapedGet(_, name, _)
-            | Op::ShapedSet(_, name, _, _) => Self::named(name),
-            Op::GetIndex(_, key)
-            | Op::TypedIndex(_, key, _)
-            | Op::IndexedGet(_, key)
-            | Op::ArrayLoad(_, key, _)
-            | Op::SetIndex(_, key, _)
-                if facts.of(*key).within(Types::NUMBER) =>
-            {
-                Self::Elements
-            }
-            Op::ArrayAppend(..) | Op::MapElement(..) => Self::Elements,
-            Op::PackAppend(..) | Op::PackRelease(_) => Self::Packs,
-            Op::IteratorNext(_) | Op::EnumerateNext(_) => Self::Iteration,
-            _ => Self::Any,
-        }
-    }
-
-    fn written(op: &Op, facts: &Facts) -> Self {
-        match Self::of(op, facts) {
-            Self::Length => Self::Any,
-            access => access,
-        }
-    }
-
-    fn conflicts(&self, read: &Self) -> bool {
-        match (self, read) {
-            (Self::Iteration, _) | (_, Self::Iteration) => false,
-            (Self::Any, _) | (_, Self::Any) => true,
-            (Self::Cells, Self::Cells) | (Self::Packs, Self::Packs) => true,
-            (Self::Named(write), Self::Named(read)) => write == read,
-            (Self::Elements, Self::Elements | Self::Length) => true,
-            _ => false,
-        }
-    }
-}
-
 pub(super) struct Writes {
-    targets: Vec<(Option<Value>, Access)>,
-    globals: Vec<Access>,
+    writes: Vec<Access>,
     fresh: HashMap<Value, Value>,
     pub(super) facts: Facts,
 }
@@ -240,74 +171,44 @@ pub(super) struct Writes {
 impl Writes {
     pub(super) fn collect(graph: &Graph, blocks: &HashSet<Block>) -> Self {
         let facts = Facts::compute(graph);
-        let mut targets = Vec::new();
-        let mut globals = Vec::new();
+        let mut writes = Vec::new();
         let fresh = unescaped(graph, blocks, &Cfg::new(graph));
         for &block in blocks {
             for &inst in &graph.blocks[block].insts {
-                let op = &graph.insts[inst].op;
-                let contract = graph.inst_contract(inst, &facts);
-                if contract.flags & HEAP_WRITE != 0 {
-                    targets.push((op.write_target(), Access::written(op, &facts)));
-                }
-                if contract.flags & GLOBAL_WRITE != 0 {
-                    let access = match op {
-                        Op::GlobalWrite(name, _) | Op::GlobalInitialize(name, _) => {
-                            Access::named(name)
-                        }
-                        _ => Access::Any,
-                    };
-                    targets.push((None, access.clone()));
-                    globals.push(access);
-                } else if contract.flags & HEAP_WRITE != 0
-                    && !op
-                        .write_target()
-                        .is_some_and(|target| fresh.contains_key(&target))
-                {
-                    globals.push(Access::written(op, &facts));
+                let memory = facts.memory(inst);
+                if memory.writes_data() {
+                    writes.push(Access::written(
+                        &graph.insts[inst].op,
+                        &facts,
+                        memory.writes,
+                    ));
                 }
             }
         }
         Self {
-            targets,
-            globals,
+            writes,
             fresh,
             facts,
         }
     }
 
-    pub(super) fn clobbers(&self, receiver: Value, read: &Access) -> bool {
-        self.targets.iter().any(|(target, write)| {
-            let aliases = match target {
-                Some(target) if self.fresh.contains_key(target) => {
-                    self.fresh.get(target) == self.fresh.get(&receiver)
-                }
-                _ => true,
-            };
-            aliases && write.conflicts(read)
-        })
+    fn aliases(&self, write: &Access, read: &Access) -> bool {
+        match write.base {
+            Some(target) if self.fresh.contains_key(&target) => {
+                self.fresh.get(&target) == read.base.and_then(|base| self.fresh.get(&base))
+            }
+            _ => true,
+        }
     }
 
-    pub(super) fn clobbers_global(&self, name: &str) -> bool {
-        self.globals
+    pub(super) fn clobbers(&self, read: &Access) -> bool {
+        self.writes
             .iter()
-            .any(|write| write.conflicts(&Access::named(name)))
+            .any(|write| self.aliases(write, read) && write.field.conflicts(&read.field))
     }
 
     pub(super) fn preserves(&self, op: &Op) -> bool {
-        match op {
-            Op::Get(object, _)
-            | Op::ShapedGet(object, ..)
-            | Op::GetIndex(object, _)
-            | Op::TypedIndex(object, ..)
-            | Op::IndexedGet(object, _)
-            | Op::ArrayLoad(object, _, _)
-            | Op::ConstructorPrototype(object) => {
-                !self.clobbers(*object, &Access::of(op, &self.facts))
-            }
-            Op::GlobalRead(name) => !self.clobbers_global(name),
-            _ => false,
-        }
+        Access::read(op, &self.facts).is_some_and(|read| !self.clobbers(&read))
     }
 }
 
@@ -343,16 +244,14 @@ impl Guarded {
         self.globals.is_empty() && self.properties.is_empty()
     }
 
-    fn breaks(&self, op: &Op, facts: &Facts) -> bool {
-        match (op, Access::written(op, facts)) {
-            (Op::GlobalWrite(name, _) | Op::GlobalInitialize(name, _), _) => {
+    fn breaks(&self, write: &Access) -> bool {
+        match &write.field {
+            Field::Named(name) => {
                 self.globals.contains(name)
+                    || write.location.intersects(Locations::HEAP) && self.properties.contains(name)
             }
-            (_, Access::Named(name)) => {
-                self.properties.contains(&name) || self.globals.contains(&name)
-            }
-            (_, Access::Cells | Access::Packs | Access::Elements | Access::Iteration) => false,
-            _ => !self.is_empty(),
+            Field::Cells | Field::Packs | Field::Elements | Field::Iteration => false,
+            Field::Length | Field::Any => !self.is_empty(),
         }
     }
 }
@@ -368,15 +267,17 @@ pub(super) fn closure_failure(
     for &block in cfg.rpo.iter().filter(|block| blocks.contains(block)) {
         for &inst in &graph.blocks[block].insts {
             let op = &graph.insts[inst].op;
-            let contract = graph.inst_contract(inst, &facts);
-            if contract.reentry != Reentry::Closed {
+            let memory = facts.memory(inst);
+            if memory.reenters() {
                 return Some(format!("reenters at {inst} ({})", graph.op_text(op)));
             }
             let private = op
                 .write_target()
                 .is_some_and(|target| fresh.contains_key(&target));
-            let writes = contract.flags & (GLOBAL_WRITE | HEAP_WRITE) != 0;
-            if writes && !private && guarded.breaks(op, &facts) {
+            if memory.writes_data()
+                && !private
+                && guarded.breaks(&Access::written(op, &facts, memory.writes))
+            {
                 return Some(format!(
                     "writes guarded state at {inst} ({})",
                     graph.op_text(op)

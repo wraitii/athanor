@@ -2,10 +2,13 @@ use std::collections::{HashMap, HashSet};
 
 use oxc_syntax::operator::BinaryOperator;
 
-use super::super::effects::{GLOBAL_WRITE, HEAP_WRITE, Reentry};
+use super::super::effects::Locations;
+use super::access::{Access, Field};
+use super::js::NUMERIC;
 use super::{
-    Block, BlockData, Cfg, Constant, Facts, Graph, Inst, Native, Op, Result, Target, Terminator,
-    TerminatorKind, TypedRead, Types, UnaryOp, Value, ValueDef, resolve,
+    Block, BlockData, Cfg, Constant, Facts, Graph, Inst, Native, Op, Region, RegionFallback,
+    RegionId, Result, Target, Terminator, TerminatorKind, TypedRead, Types, UnaryOp, Value, ValueDef,
+    resolve,
 };
 use crate::heap::TypedKind;
 
@@ -13,23 +16,21 @@ const SPECIALIZATION_REGION_LIMIT: usize = 512;
 
 mod analysis;
 mod planning;
-mod simplify;
 mod versioning;
 
 #[cfg(test)]
 use analysis::unescaped;
-use analysis::{Access, Guarded, Requirement, Writes, closure_failure, requirements};
+use analysis::{Guarded, Requirement, Writes, closure_failure, requirements};
 #[cfg(test)]
 pub(super) use planning::version;
 pub(super) use planning::version_with_report;
-pub(super) use simplify::{bit_tests, coercions, simplify, typeof_comparisons};
 pub(super) use versioning::repair;
 use versioning::{Speculation, apply_version};
 
 pub(super) fn version_string_leaves(
     graph: &mut Graph,
     notes: &mut Vec<String>,
-) -> Result<Vec<HashSet<Block>>> {
+) -> Result<Vec<RegionId>> {
     let initial = Cfg::new(graph);
     let mut sites = Vec::new();
     for &block in &initial.rpo {
@@ -121,6 +122,7 @@ pub(super) fn version_string_leaves(
                 }
                 match graph.defining_op(*condition) {
                     Some(Op::IsUninitialized(_)) => graph.cold.contains(&yes.block),
+                    Some(Op::IsUndefined(_)) => true,
                     Some(Op::Binary(BinaryOperator::StrictEquality, left, right)) => {
                         [left, right].into_iter().any(|&value| {
                             matches!(
@@ -151,7 +153,7 @@ pub(super) fn version_string_leaves(
         );
         notes.extend(version.notes.iter().cloned());
         let copy = version.body;
-        simplify(&mut candidate);
+        super::js::simplify(&mut candidate);
         candidate.verify()?;
         let reachable: HashSet<_> = Cfg::new(&candidate).rpo.into_iter().collect();
         let copy: HashSet<_> = copy.intersection(&reachable).copied().collect();
@@ -165,8 +167,15 @@ pub(super) fn version_string_leaves(
             "string split continuation versioned after native identity check; {} guarded exits",
             exits.len() + exits_true.len()
         ));
+        let source = candidate.regions.push(Region {
+            blocks: blocks.iter().copied().collect(),
+            fallback: None,
+        });
         *graph = candidate;
-        regions.push(copy);
+        regions.push(graph.regions.push(Region {
+            blocks: copy,
+            fallback: Some(RegionFallback::Region(source)),
+        }));
         break;
     }
     Ok(regions)
@@ -224,7 +233,6 @@ fn invariant_guards(
         .collect()
 }
 
-const NUMERIC: Types = Types::NUMBER.union(Types::UNDEFINED);
 
 fn typed_objects(
     graph: &Graph,
@@ -507,6 +515,8 @@ fn entry_checks(
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum LoadKey {
     ToInt32(Value),
+    Position(Value),
+    ExactPosition(Value, Value),
     Constructor(Value),
     Property(Value, String),
     Index(Value, Value),
@@ -516,7 +526,9 @@ enum LoadKey {
     Binary(BinaryOperator, Value, Value),
 }
 
-pub(super) fn reuse_loads(graph: &mut Graph, region: &HashSet<Block>, notes: &mut Vec<String>) {
+pub(super) fn reuse_loads(graph: &mut Graph, region: RegionId, notes: &mut Vec<String>) {
+    let region = graph.regions[region].blocks.clone();
+    let region = &region;
     let cfg = Cfg::new(graph);
     let writes = Writes::collect(graph, region);
     let facts = &writes.facts;
@@ -544,6 +556,10 @@ pub(super) fn reuse_loads(graph: &mut Graph, region: &HashSet<Block>, notes: &mu
                 }
                 Op::GlobalRead(name) => LoadKey::Global(name.clone()),
                 Op::ToInt32(value) => LoadKey::ToInt32(resolve(&aliases, *value)),
+                Op::ArrayPosition(value) => LoadKey::Position(resolve(&aliases, *value)),
+                Op::IsExactPosition(key, position) => {
+                    LoadKey::ExactPosition(resolve(&aliases, *key), resolve(&aliases, *position))
+                }
                 Op::This => LoadKey::This,
                 Op::Argument(index) => LoadKey::Argument(*index),
                 Op::Binary(operator, left, right)
@@ -552,25 +568,17 @@ pub(super) fn reuse_loads(graph: &mut Graph, region: &HashSet<Block>, notes: &mu
                     left,
                     right,
                     ..
-                } if graph.contract(&data.op, facts).is_pure() => LoadKey::Binary(
+                } if facts.is_pure(inst) => LoadKey::Binary(
                     *operator,
                     resolve(&aliases, *left),
                     resolve(&aliases, *right),
                 ),
                 _ => continue,
             };
-            let preserved = match &key {
-                LoadKey::Property(object, _)
-                | LoadKey::Index(object, _)
-                | LoadKey::Constructor(object) => {
-                    !writes.clobbers(*object, &Access::of(&data.op, facts))
-                }
-                LoadKey::Global(name) => !writes.clobbers_global(name),
-                LoadKey::This
-                | LoadKey::Argument(_)
-                | LoadKey::Binary(..)
-                | LoadKey::ToInt32(_) => true,
-            };
+            let preserved = Access::read(&data.op, facts).is_none_or(|mut read| {
+                read.base = read.base.map(|base| resolve(&aliases, base));
+                !writes.clobbers(&read)
+            });
             if !preserved {
                 continue;
             }
@@ -628,7 +636,9 @@ pub(super) fn natural_loops(graph: &Graph, cfg: &Cfg) -> Vec<(Block, HashSet<Blo
     loops
 }
 
-pub(super) fn hoist(graph: &mut Graph, region: &HashSet<Block>, notes: &mut Vec<String>) {
+pub(super) fn hoist(graph: &mut Graph, region: RegionId, notes: &mut Vec<String>) {
+    let region = graph.regions[region].blocks.clone();
+    let region = &region;
     let cfg = Cfg::new(graph);
     let facts = Facts::compute(graph);
     for (header, body) in natural_loops(graph, &cfg) {
@@ -649,7 +659,7 @@ pub(super) fn hoist(graph: &mut Graph, region: &HashSet<Block>, notes: &mut Vec<
             if matches!(data.op, Op::ReadHint(..)) {
                 continue;
             }
-            let pure = graph.contract(&data.op, &facts).is_pure();
+            let pure = facts.is_pure(inst);
             if data.result.is_some()
                 && invariant(graph, &data.op)
                 && (pure || writes.preserves(&data.op))
@@ -665,7 +675,7 @@ pub(super) fn hoist(graph: &mut Graph, region: &HashSet<Block>, notes: &mut Vec<
                 let data = &graph.insts[inst];
                 if data.result.is_some()
                     && !matches!(data.op, Op::Constant(_))
-                    && graph.contract(&data.op, &facts).is_pure()
+                    && facts.is_pure(inst)
                     && invariant(graph, &data.op)
                 {
                     moved.push(inst);
@@ -963,6 +973,22 @@ mod tests {
         super::super::build::lower(function, semantic.scoping(), &HashSet::new()).unwrap()
     }
 
+    fn heap(base: Value, field: Field) -> Access {
+        Access {
+            location: Locations::HEAP,
+            base: Some(base),
+            field,
+        }
+    }
+
+    fn global(name: &str) -> Access {
+        Access {
+            location: Locations::GLOBAL,
+            base: None,
+            field: Field::Named(name.into()),
+        }
+    }
+
     #[test]
     fn append_writes_preserve_properties_but_invalidate_elements_and_length() {
         for spread in [false, true] {
@@ -974,10 +1000,10 @@ mod tests {
             graph.append(block, span, Op::ArrayAppend(array, value, spread), false);
             let scope = Cfg::new(&graph).rpo.into_iter().collect();
             let writes = Writes::collect(&graph, &scope);
-            assert!(writes.clobbers(array, &Access::Elements));
-            assert!(writes.clobbers(array, &Access::Length));
-            assert!(!writes.clobbers(array, &Access::Named("allows".into())));
-            assert!(!writes.clobbers_global("g_Map"));
+            assert!(writes.clobbers(&heap(array, Field::Elements)));
+            assert!(writes.clobbers(&heap(array, Field::Length)));
+            assert!(!writes.clobbers(&heap(array, Field::Named("allows".into()))));
+            assert!(!writes.clobbers(&global("g_Map")));
         }
     }
 
@@ -992,10 +1018,10 @@ mod tests {
         graph.append(block, span, Op::PackRelease(pack), false);
         let scope = Cfg::new(&graph).rpo.into_iter().collect();
         let writes = Writes::collect(&graph, &scope);
-        assert!(writes.clobbers(pack, &Access::Packs));
-        assert!(!writes.clobbers(value, &Access::Length));
-        assert!(!writes.clobbers(value, &Access::Named("allows".into())));
-        assert!(!writes.clobbers_global("g_Map"));
+        assert!(writes.clobbers(&heap(pack, Field::Packs)));
+        assert!(!writes.clobbers(&heap(value, Field::Length)));
+        assert!(!writes.clobbers(&heap(value, Field::Named("allows".into()))));
+        assert!(!writes.clobbers(&global("g_Map")));
     }
 
     #[test]
@@ -1045,8 +1071,11 @@ mod tests {
             assert_eq!(fresh.contains_key(&object), !external);
             assert_eq!(fresh.contains_key(&receiver), !external);
             let writes = Writes::collect(&graph, &scope);
-            assert!(writes.clobbers(object, &Access::Named("x".into())));
-            assert_eq!(writes.clobbers(other, &Access::Named("x".into())), external);
+            assert!(writes.clobbers(&heap(object, Field::Named("x".into()))));
+            assert_eq!(
+                writes.clobbers(&heap(other, Field::Named("x".into()))),
+                external
+            );
             for value in [object, receiver] {
                 let mut escaped = graph.clone();
                 escaped.append(merge, span, Op::GlobalWrite("leak".into(), value), false);

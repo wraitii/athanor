@@ -1,3 +1,4 @@
+mod access;
 mod arrays;
 mod borrow;
 mod build;
@@ -9,14 +10,15 @@ pub(in crate::jit) mod continuation;
 pub(in crate::jit) mod facts;
 mod inlining;
 mod listing;
+mod typed_lowering;
 mod observations;
 mod optimize;
 pub(super) mod osr;
-mod promote;
+mod js;
 pub(super) mod reads;
 pub(super) mod specialize;
 mod string_split;
-mod trim;
+mod transforms;
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -29,15 +31,15 @@ use oxc_syntax::operator::BinaryOperator;
 use oxc_syntax::symbol::SymbolId;
 
 use super::effects::{
-    ALLOCATION, Assumption, ERROR, GLOBAL_READ, GLOBAL_WRITE, HEAP_READ, HEAP_WRITE, INTERNAL,
-    Reentry, UNKNOWN,
+    ALLOCATION, Control, ERROR, Effects, GLOBAL_READ, GLOBAL_WRITE, HEAP_READ, HEAP_WRITE,
+    INTERNAL, Memory,
 };
 use super::math::METHODS;
 use crate::heap::TypedKind;
 
 pub(super) use borrow::receiver as borrowed_receiver;
 pub(super) use facts::{Facts, Types};
-pub(super) use ids::{Binding, Block, Inst, Scope, Value};
+pub(super) use ids::{Binding, Block, Inst, RegionId, Scope, Value};
 pub(in crate::jit) use listing::ListingLine;
 #[cfg(test)]
 pub(in crate::jit) use listing::SourceLocation;
@@ -53,6 +55,10 @@ mod ids {
     #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
     pub(in crate::jit) struct Block(u32);
     entity_impl!(Block, "block");
+
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+    pub(in crate::jit) struct RegionId(u32);
+    entity_impl!(RegionId, "region");
 
     #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
     pub(in crate::jit) struct Inst(u32);
@@ -76,18 +82,31 @@ pub(super) struct Graph {
     pub(in crate::jit) guards: usize,
     pub(in crate::jit) views: HashMap<Inst, Value>,
     pub(in crate::jit) borrowed: HashSet<Value>,
-    closed_calls: HashMap<Inst, (Value, u16)>,
+    closed_calls: HashMap<Inst, (Value, Memory, Control)>,
     pub(in crate::jit) cold: HashSet<Block>,
     pub(super) lazy_captures: HashSet<Binding>,
     pub(super) generator: bool,
     /// Parameter count of a function whose entry takes its arguments in registers; `None` when
     /// it reads `arguments` or a rest parameter, or is a generator.
     pub(in crate::jit) arity: Option<u16>,
+    pub(super) regions: PrimaryMap<RegionId, Region>,
     pub(super) blocks: PrimaryMap<Block, BlockData>,
     pub(super) insts: PrimaryMap<Inst, InstData>,
     pub(super) values: PrimaryMap<Value, ValueDef>,
     pub(super) bindings: PrimaryMap<Binding, BindingData>,
     pub(super) scopes: PrimaryMap<Scope, ScopeData>,
+}
+
+#[derive(Clone)]
+pub(super) struct Region {
+    pub(super) blocks: HashSet<Block>,
+    pub(super) fallback: Option<RegionFallback>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum RegionFallback {
+    Region(RegionId),
+    CompiledEntry(usize),
 }
 
 #[derive(Clone, Default)]
@@ -281,8 +300,12 @@ pub(super) enum Op {
     IteratorNew(Value),
     IteratorNext(Value),
     IsIndexed(Value),
-    // Saturating integer conversion; validity is established separately by IsArrayIndex.
+    // Saturating numeric conversion; validity is checked separately by IsArrayIndex or IsExactPosition.
     ArrayPosition(Value),
+    // Compare a numeric key with its integer position converted back to a number.
+    IsExactPosition(Value, Value),
+    // Compare integer position and length as unsigned values.
+    IsInBounds(Value, Value),
     IsArrayIndex(Value, Value, Value, bool),
     // Requires a successful matching IsArrayIndex with no intervening array mutation.
     ArrayLoad(Value, Value, bool),
@@ -393,20 +416,8 @@ pub(super) enum Ownership {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Contract {
-    pub(super) reentry: Reentry,
-    pub(super) flags: u16,
-    pub(super) assumptions: &'static [Assumption],
+    pub(super) effects: Effects,
     pub(super) result: Ownership,
-}
-
-impl Contract {
-    pub(super) fn may_throw(&self) -> bool {
-        self.flags & ERROR != 0
-    }
-
-    pub(super) fn is_pure(&self) -> bool {
-        self.reentry == Reentry::Closed && self.flags == 0
-    }
 }
 
 impl Target {
@@ -512,6 +523,8 @@ impl Op {
             | Op::ArrayLoad(object, key, _)
             | Op::PackTake(object, key)
             | Op::ProbeIndex(object, key)
+            | Op::IsExactPosition(object, key)
+            | Op::IsInBounds(object, key)
             | Op::Binary(_, object, key)
             | Op::PackAppend(object, key, _)
             | Op::ArrayAppend(object, key, _)
@@ -646,6 +659,8 @@ impl Op {
             | Op::ArrayLoad(object, key, _)
             | Op::PackTake(object, key)
             | Op::ProbeIndex(object, key)
+            | Op::IsExactPosition(object, key)
+            | Op::IsInBounds(object, key)
             | Op::Binary(_, object, key)
             | Op::PackAppend(object, key, _)
             | Op::ArrayAppend(object, key, _)
@@ -984,7 +999,7 @@ impl Graph {
         if aliases.is_empty() {
             return;
         }
-        for (callee, _) in self.closed_calls.values_mut() {
+        for (callee, ..) in self.closed_calls.values_mut() {
             *callee = resolve(aliases, *callee);
         }
         for data in self.insts.values_mut() {
@@ -1041,77 +1056,67 @@ impl Graph {
     fn inst_contract(&self, inst: Inst, facts: &Facts) -> Contract {
         let op = &self.insts[inst].op;
         let mut contract = self.contract(op, facts);
-        if let (Op::Call { callee, .. }, Some((expected, flags))) =
+        if let (Op::Call { callee, .. }, Some((expected, memory, control))) =
             (op, self.closed_calls.get(&inst))
             && callee == expected
         {
-            contract.reentry = Reentry::Closed;
-            contract.flags = *flags;
+            contract.effects.memory = *memory;
+            contract.effects.control = *control;
         }
         contract
     }
 
     pub(super) fn contract(&self, op: &Op, facts: &Facts) -> Contract {
         use Ownership::*;
-        let closed = |flags, assumptions, result| Contract {
-            reentry: Reentry::Closed,
-            flags,
-            assumptions,
+        let closed = |flags, result| Contract {
+            effects: Effects::of(flags),
             result,
         };
-        const PROPERTY: &[Assumption] = &[Assumption::NoAccessors, Assumption::NoCoercionCallbacks];
-        const COERCION: &[Assumption] = &[Assumption::NoCoercionCallbacks];
         const COERCING: u16 = HEAP_READ | ALLOCATION | INTERNAL | ERROR;
         let operands = op.operands_iter().fold(Types::default(), |types, value| {
             types.union(facts.of(value))
         });
         let coercing = |result| {
             if operands.within(Types::NUMBER) {
-                closed(0, &[], Unowned)
-            } else if operands.within(Types::PRIMITIVE) {
-                closed(COERCING, &[], result)
+                closed(0, Unowned)
             } else {
-                closed(COERCING, COERCION, result)
+                closed(COERCING, result)
             }
         };
         match op {
             Op::OsrStart(..) => Contract {
-                reentry: Reentry::Unknown,
-                flags: UNKNOWN,
-                assumptions: &[],
+                effects: Effects::UNKNOWN,
                 result: Unowned,
             },
             Op::Continuation(..) => Contract {
-                reentry: Reentry::Unknown,
-                flags: UNKNOWN,
-                assumptions: &[],
+                effects: Effects::UNKNOWN,
                 result: Owned,
             },
-            Op::ContinuationOutput(..) => closed(INTERNAL, &[], Owned),
+            Op::ContinuationOutput(..) => closed(INTERNAL, Owned),
             Op::ContinuationStore(..) | Op::Observe(..) | Op::ReadHint(..) => {
-                closed(INTERNAL, &[], None)
+                closed(INTERNAL, None)
             }
-            Op::NewInstance(_) => closed(ALLOCATION | INTERNAL | ERROR, &[], Owned),
-            Op::ConstructorResult(..) => closed(0, &[], Borrowed),
-            Op::Rest(_) | Op::Arguments => closed(ALLOCATION | INTERNAL | ERROR, &[], Owned),
-            Op::Throw(_) => closed(INTERNAL | ERROR, &[], None),
-            Op::Catch => closed(INTERNAL, &[], Owned),
-            Op::Argument(_) | Op::This => closed(0, &[], Borrowed),
-            Op::ClosureThis(_) => closed(HEAP_READ, &[], Borrowed),
-            Op::NewHoleyArray(_) => closed(ALLOCATION | INTERNAL | ERROR, &[], Owned),
-            Op::MapElement(..) => closed(HEAP_READ | INTERNAL, &[], Borrowed),
-            Op::IsArrayIteration(..) | Op::IsStringSplit(_) => closed(HEAP_READ, &[], Unowned),
+            Op::NewInstance(_) => closed(ALLOCATION | INTERNAL | ERROR, Owned),
+            Op::ConstructorResult(..) => closed(0, Borrowed),
+            Op::Rest(_) | Op::Arguments => closed(ALLOCATION | INTERNAL | ERROR, Owned),
+            Op::Throw(_) => closed(INTERNAL | ERROR, None),
+            Op::Catch => closed(INTERNAL, Owned),
+            Op::Argument(_) | Op::This => closed(0, Borrowed),
+            Op::ClosureThis(_) => closed(HEAP_READ, Borrowed),
+            Op::NewHoleyArray(_) => closed(ALLOCATION | INTERNAL | ERROR, Owned),
+            Op::MapElement(..) => closed(HEAP_READ | INTERNAL, Borrowed),
+            Op::IsArrayIteration(..) | Op::IsStringSplit(_) => closed(HEAP_READ, Unowned),
             Op::StringSplit(..) | Op::StringSplitParts(..) => {
-                closed(HEAP_READ | ALLOCATION | INTERNAL | ERROR, &[], Owned)
+                closed(HEAP_READ | ALLOCATION | INTERNAL | ERROR, Owned)
             }
-            Op::Constant(_) => closed(0, &[], Unowned),
+            Op::Constant(_) => closed(0, Unowned),
             Op::GlobalRead(_) | Op::GlobalReadOptional(_) => {
-                closed(GLOBAL_READ | INTERNAL | ERROR, &[], Borrowed)
+                closed(GLOBAL_READ | INTERNAL | ERROR, Borrowed)
             }
-            Op::RegExp(..) => closed(ALLOCATION | INTERNAL | ERROR, &[], Owned),
-            Op::PropertyKey(_) => closed(HEAP_READ | ALLOCATION | INTERNAL | ERROR, &[], Owned),
+            Op::RegExp(..) => closed(ALLOCATION | INTERNAL | ERROR, Owned),
+            Op::PropertyKey(_) => closed(HEAP_READ | ALLOCATION | INTERNAL | ERROR, Owned),
             Op::GlobalWrite(..) | Op::GlobalInitialize(..) => {
-                closed(GLOBAL_WRITE | INTERNAL | ERROR, &[], None)
+                closed(GLOBAL_WRITE | INTERNAL | ERROR, None)
             }
             Op::Read(binding) => closed(
                 if self.bindings[*binding].captured {
@@ -1119,21 +1124,20 @@ impl Graph {
                 } else {
                     ERROR
                 },
-                &[],
                 Borrowed,
             ),
             Op::Initialize(binding, _) | Op::Write(binding, _)
                 if self.bindings[*binding].captured =>
             {
-                closed(HEAP_WRITE | INTERNAL | ERROR, &[], None)
+                closed(HEAP_WRITE | INTERNAL | ERROR, None)
             }
-            Op::Initialize(..) => closed(INTERNAL, &[], None),
-            Op::Write(..) => closed(INTERNAL | ERROR, &[], None),
+            Op::Initialize(..) => closed(INTERNAL, None),
+            Op::Write(..) => closed(INTERNAL | ERROR, None),
             Op::CheckInitialized(_) => {
                 if operands.intersects(Types::UNINITIALIZED) {
-                    closed(ERROR, &[], None)
+                    closed(ERROR, None)
                 } else {
-                    closed(0, &[], None)
+                    closed(0, None)
                 }
             }
             Op::Closure(..)
@@ -1141,60 +1145,46 @@ impl Graph {
             | Op::NewObject
             | Op::NewArray(_)
             | Op::IteratorNew(_)
-            | Op::EnumerateNew(_) => closed(ALLOCATION | INTERNAL | ERROR, &[], Owned),
-            Op::PackRelease(_) => closed(HEAP_WRITE | INTERNAL, &[], None),
-            Op::Spread(_) => closed(
-                HEAP_READ | ALLOCATION | INTERNAL | ERROR,
-                &[Assumption::DirectIteration],
-                Owned,
-            ),
+            | Op::EnumerateNew(_) => closed(ALLOCATION | INTERNAL | ERROR, Owned),
+            Op::PackRelease(_) => closed(HEAP_WRITE | INTERNAL, None),
+            Op::Spread(_) => closed(HEAP_READ | ALLOCATION | INTERNAL | ERROR, Owned),
             Op::IteratorNext(_) | Op::EnumerateNext(_) => closed(
                 HEAP_READ | HEAP_WRITE | ALLOCATION | INTERNAL | ERROR,
-                &[Assumption::DirectIteration],
                 MaybeOwned,
             ),
-            Op::IsUninitialized(_) => closed(0, &[], Unowned),
-            Op::Define(..) => closed(HEAP_READ | ALLOCATION | INTERNAL | ERROR, PROPERTY, None),
+            Op::IsUninitialized(_) => closed(0, Unowned),
+            Op::Define(..) => closed(HEAP_READ | ALLOCATION | INTERNAL | ERROR, None),
             Op::DefineHidden(..) | Op::MarkClass(_) | Op::DisableConstructor(_) => {
-                closed(HEAP_WRITE | ALLOCATION | INTERNAL | ERROR, &[], None)
+                closed(HEAP_WRITE | ALLOCATION | INTERNAL | ERROR, None)
             }
-            Op::PackAppend(..) | Op::ArrayAppend(..) => closed(
-                HEAP_READ | HEAP_WRITE | ALLOCATION | INTERNAL | ERROR,
-                &[],
-                None,
-            ),
+            Op::PackAppend(..) | Op::ArrayAppend(..) => {
+                closed(HEAP_READ | HEAP_WRITE | ALLOCATION | INTERNAL | ERROR, None)
+            }
             Op::Get(..) | Op::GetIndex(..) | Op::FillPropertyCache(..) => closed(
                 HEAP_READ | GLOBAL_READ | ALLOCATION | INTERNAL | ERROR,
-                PROPERTY,
                 Borrowed,
             ),
-            Op::IsPropertyCached(..) => closed(HEAP_READ, &[], Unowned),
-            Op::IsShape(..) => closed(HEAP_READ, &[], Unowned),
-            Op::ShapedGet(..) => closed(HEAP_READ | INTERNAL | ERROR, &[], Borrowed),
-            Op::ShapedSet(..) => closed(
-                HEAP_READ | HEAP_WRITE | ALLOCATION | INTERNAL | ERROR,
-                &[],
-                None,
-            ),
-            Op::PrimePropertyCache(..) => closed(HEAP_READ | INTERNAL, &[], None),
-            Op::CachedProperty(..) => closed(HEAP_READ | INTERNAL | ERROR, &[], Borrowed),
-            Op::Set(..) | Op::SetIndex(..) => closed(
-                HEAP_READ | HEAP_WRITE | ALLOCATION | INTERNAL | ERROR,
-                PROPERTY,
-                None,
-            ),
-            Op::Unary(UnaryOp::Not, _) => closed(HEAP_READ, &[], Unowned),
-            Op::Unary(UnaryOp::Typeof, _) => {
-                closed(HEAP_READ | ALLOCATION | ERROR, &[], MaybeOwned)
+            Op::IsPropertyCached(..) => closed(HEAP_READ, Unowned),
+            Op::IsShape(..) => closed(HEAP_READ, Unowned),
+            Op::ShapedGet(..) => closed(HEAP_READ | INTERNAL | ERROR, Borrowed),
+            Op::ShapedSet(..) => {
+                closed(HEAP_READ | HEAP_WRITE | ALLOCATION | INTERNAL | ERROR, None)
             }
+            Op::PrimePropertyCache(..) => closed(HEAP_READ | INTERNAL, None),
+            Op::CachedProperty(..) => closed(HEAP_READ | INTERNAL | ERROR, Borrowed),
+            Op::Set(..) | Op::SetIndex(..) => {
+                closed(HEAP_READ | HEAP_WRITE | ALLOCATION | INTERNAL | ERROR, None)
+            }
+            Op::Unary(UnaryOp::Not, _) => closed(HEAP_READ, Unowned),
+            Op::Unary(UnaryOp::Typeof, _) => closed(HEAP_READ | ALLOCATION | ERROR, MaybeOwned),
             Op::Unary(UnaryOp::Increment | UnaryOp::Decrement, _) => {
                 if operands.within(Types::NUMBER) {
-                    closed(0, &[], Unowned)
+                    closed(0, Unowned)
                 } else {
-                    closed(ALLOCATION | INTERNAL | ERROR, &[], MaybeOwned)
+                    closed(ALLOCATION | INTERNAL | ERROR, MaybeOwned)
                 }
             }
-            Op::ToInt32(_) => closed(0, &[], Unowned),
+            Op::ToInt32(_) => closed(0, Unowned),
             Op::ToNumeric(_) | Op::Unary(..) => coercing(MaybeOwned),
             Op::GuardedCompare {
                 operator,
@@ -1204,7 +1194,7 @@ impl Graph {
             } => self.contract(&Op::Binary(*operator, *left, *right), facts),
             Op::Binary(operator, ..) => match operator {
                 BinaryOperator::StrictEquality | BinaryOperator::StrictInequality => {
-                    closed(HEAP_READ, &[], Unowned)
+                    closed(HEAP_READ, Unowned)
                 }
                 BinaryOperator::Equality
                 | BinaryOperator::Inequality
@@ -1213,9 +1203,7 @@ impl Graph {
                 | BinaryOperator::GreaterThan
                 | BinaryOperator::GreaterEqualThan => coercing(Unowned),
                 BinaryOperator::In | BinaryOperator::Instanceof => Contract {
-                    reentry: Reentry::Unknown,
-                    flags: UNKNOWN,
-                    assumptions: &[],
+                    effects: Effects::UNKNOWN,
                     result: Unowned,
                 },
                 _ => coercing(MaybeOwned),
@@ -1228,55 +1216,52 @@ impl Graph {
             | Op::ConstructorCallPack(..)
             | Op::ConstructResolved { .. }
             | Op::ConstructPackResolved(..) => Contract {
-                reentry: Reentry::Arbitrary,
-                flags: UNKNOWN,
-                assumptions: &[],
+                effects: Effects::UNKNOWN,
                 result: Owned,
             },
             Op::CallNative(native, _)
                 if METHODS[native.index()].1 == crate::heap::MathFunction::Random =>
             {
-                closed(INTERNAL, &[], Unowned)
+                closed(INTERNAL, Unowned)
             }
             Op::CallNative(..) => coercing(Unowned),
-            Op::IsUndefined(_) | Op::IsNullish(_) | Op::IsNative(..) => closed(0, &[], Unowned),
-            Op::ConstructorPrototype(_) => closed(HEAP_READ, &[Assumption::NoAccessors], Borrowed),
-            Op::IsCode(..) => closed(HEAP_READ, &[], Unowned),
-            Op::ProbeGlobal(_) => closed(GLOBAL_READ, &[Assumption::NoAccessors], Borrowed),
-            Op::ProbeProperty(..) | Op::ProbeIndex(..) => {
-                closed(HEAP_READ, &[Assumption::NoAccessors], Borrowed)
-            }
-            Op::GuardValid(_) => closed(GLOBAL_READ, &[], Unowned),
-            Op::GuardCommit(_) => closed(INTERNAL, &[], None),
-            Op::View(_) => closed(HEAP_READ, &[Assumption::FixedTypedStorage], Unowned),
-            Op::IsTyped(..) | Op::IsIndexed(_) => closed(0, &[], Unowned),
-            Op::IsArrayIndex(..) => closed(HEAP_READ, &[], Unowned),
-            Op::ArrayPosition(_) => closed(INTERNAL, &[], Unowned),
-            Op::IndexedLength(_) => closed(HEAP_READ, &[], Unowned),
+            Op::IsUndefined(_) | Op::IsNullish(_) | Op::IsNative(..) => closed(0, Unowned),
+            Op::ConstructorPrototype(_) => closed(HEAP_READ, Borrowed),
+            Op::IsCode(..) => closed(HEAP_READ, Unowned),
+            Op::ProbeGlobal(_) => closed(GLOBAL_READ, Borrowed),
+            Op::ProbeProperty(..) | Op::ProbeIndex(..) => closed(HEAP_READ, Borrowed),
+            Op::GuardValid(_) => closed(GLOBAL_READ, Unowned),
+            Op::GuardCommit(_) => closed(INTERNAL, None),
+            Op::View(_) => closed(HEAP_READ, Unowned),
+            Op::IsTyped(..) | Op::IsIndexed(_) => closed(0, Unowned),
+            Op::IsArrayIndex(..) => closed(HEAP_READ, Unowned),
+            Op::ArrayPosition(_) => closed(INTERNAL, Unowned),
+            Op::IsExactPosition(..) | Op::IsInBounds(..) => closed(0, Unowned),
+            Op::IndexedLength(_) => closed(HEAP_READ, Unowned),
             Op::IndexedGet(..) | Op::ArrayLoad(..) => {
-                closed(HEAP_READ | INTERNAL | ERROR, &[], Borrowed)
+                closed(HEAP_READ | INTERNAL | ERROR, Borrowed)
             }
-            Op::PackTake(..) => closed(HEAP_READ | HEAP_WRITE | INTERNAL, &[], Owned),
-            Op::TypedIndex(..) => closed(HEAP_READ, &[Assumption::FixedTypedStorage], Unowned),
+            Op::PackTake(..) => closed(HEAP_READ | HEAP_WRITE | INTERNAL, Owned),
+            Op::TypedIndex(..) => closed(HEAP_READ, Unowned),
             Op::IsNumber(_) | Op::IsInteger(_) | Op::AsInteger(_) | Op::IsString(_) => {
-                closed(0, &[], Unowned)
+                closed(0, Unowned)
             }
-            Op::IsTypeof(..) => closed(HEAP_READ, &[], Unowned),
-            Op::AsNumber(_) => closed(INTERNAL, &[], Unowned),
-            Op::AsObject(_) => closed(0, &[], Unowned),
-            Op::EnterCaptures(..) => closed(HEAP_READ | INTERNAL | ERROR, &[], None),
+            Op::IsTypeof(..) => closed(HEAP_READ, Unowned),
+            Op::AsNumber(_) => closed(INTERNAL, Unowned),
+            Op::AsObject(_) => closed(0, Unowned),
+            Op::EnterCaptures(..) => closed(HEAP_READ | INTERNAL | ERROR, None),
             Op::EnterScope(scope) | Op::NextIteration(scope) | Op::FreshIteration(scope) => {
                 if self.materialized(*scope) {
-                    closed(ALLOCATION | INTERNAL | ERROR, &[], None)
+                    closed(ALLOCATION | INTERNAL | ERROR, None)
                 } else {
-                    closed(0, &[], None)
+                    closed(0, None)
                 }
             }
             Op::LeaveScope(scope) => {
                 if self.materialized(*scope) {
-                    closed(INTERNAL, &[], None)
+                    closed(INTERNAL, None)
                 } else {
-                    closed(0, &[], None)
+                    closed(0, None)
                 }
             }
         }
@@ -1521,10 +1506,10 @@ impl Canonical {
 fn canonicalize(mut graph: Graph, ssa_opt: bool) -> Result<Canonical> {
     let mut notes = Vec::new();
     if ssa_opt && !graph.has_handlers && !graph.generator {
-        promote::promote(&mut graph, &mut notes);
+        transforms::promote(&mut graph, &mut notes);
         graph.verify()?;
-        optimize::typeof_comparisons(&mut graph);
-        optimize::simplify(&mut graph);
+        js::typeof_comparisons(&mut graph);
+        js::simplify(&mut graph);
         graph.verify()?;
     }
     Ok(Canonical { graph, notes })
@@ -1602,7 +1587,7 @@ pub(super) fn plan_canonical_with_budget(
         let requests = specialize::requests(&graph, bodies, source, &inline_budget);
         let plan = specialize::plan_round(&graph, bodies, source, &requests, &mut inline_budget);
         specialize::apply(&mut graph, bodies, source, plan, &mut notes)?;
-        optimize::simplify(&mut graph);
+        js::simplify(&mut graph);
         expansions.calls(&mut graph, source, &mut notes)?;
         graph.verify()?;
     }
@@ -1616,7 +1601,7 @@ pub(super) fn plan_canonical_with_budget(
                 break;
             }
             specialize::apply(&mut graph, bodies, source, plan, &mut notes)?;
-            optimize::simplify(&mut graph);
+            js::simplify(&mut graph);
             expansions.calls(&mut graph, source, &mut notes)?;
             expansions.constructors(&mut graph);
             graph.verify()?;
@@ -1688,8 +1673,8 @@ pub(super) fn optimize_planned(
     comparisons::expose(&mut graph);
     optimize::sink_closures(&mut graph, &mut notes);
     if optimize::lazy_captures(&mut graph, &mut notes) {
-        promote::promote(&mut graph, &mut notes);
-        optimize::simplify(&mut graph);
+        transforms::promote(&mut graph, &mut notes);
+        js::simplify(&mut graph);
     }
     graph.verify()?;
     optimize::forward_captured_parameters(&mut graph, &mut notes);
@@ -1711,36 +1696,57 @@ pub(super) fn optimize_planned(
             regions
         }
     };
+    if report_regions {
+        for (id, region) in &graph.regions {
+            let mut blocks: Vec<_> = region.blocks.iter().copied().collect();
+            blocks.sort();
+            let blocks = blocks.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
+            let fallback = match region.fallback {
+                Some(RegionFallback::Region(id)) => id.to_string(),
+                Some(RegionFallback::CompiledEntry(address)) => {
+                    format!("compiled entry {address:#x}")
+                }
+                None => "none".into(),
+            };
+            notes.push(format!("{id}: blocks [{blocks}], fallback {fallback}"));
+        }
+    }
     graph.verify()?;
-    optimize::simplify(&mut graph);
+    js::simplify(&mut graph);
     graph.verify()?;
     for region in &regions {
-        optimize::reuse_loads(&mut graph, region, &mut notes);
+        optimize::reuse_loads(&mut graph, *region, &mut notes);
         graph.verify()?;
-        optimize::hoist(&mut graph, region, &mut notes);
+        optimize::hoist(&mut graph, *region, &mut notes);
         graph.verify()?;
     }
-    optimize::coercions(&mut graph);
-    optimize::bit_tests(&mut graph);
+    js::coercions(&mut graph);
+    js::bit_tests(&mut graph);
     graph.verify()?;
     for region in &regions {
-        optimize::reuse_loads(&mut graph, region, &mut notes);
+        optimize::reuse_loads(&mut graph, *region, &mut notes);
         graph.verify()?;
-        optimize::hoist(&mut graph, region, &mut notes);
+        optimize::hoist(&mut graph, *region, &mut notes);
         graph.verify()?;
+    }
+    if typed_lowering::lower(&mut graph)? {
+        js::simplify(&mut graph);
+        for region in &regions {
+            optimize::reuse_loads(&mut graph, *region, &mut notes);
+        }
     }
     shapes::apply(&mut graph, &plan.shapes, &mut notes)?;
     optimize::views(&mut graph, &mut notes);
     comparisons::expose(&mut graph);
     graph.verify()?;
-    optimize::simplify(&mut graph);
+    js::simplify(&mut graph);
     graph.verify()?;
     optimize::sink_closures(&mut graph, &mut notes);
     optimize::lazy_captures(&mut graph, &mut notes);
     graph.verify()?;
     string_split::forward_packs(&mut graph);
-    trim::trim(&mut graph);
-    promote::remove_trivial_params(&mut graph);
+    transforms::trim(&mut graph);
+    transforms::remove_trivial_params(&mut graph);
     graph.verify()?;
     let facts = Facts::compute(&graph);
     borrow::borrows(&mut graph, &facts, &mut notes);

@@ -54,8 +54,8 @@ impl RegionPlan {
         for call in &self.calls {
             writeln!(
                 out,
-                "{indent}  closed call {}: {} effects=0x{:04x}",
-                call.inst, call.name, call.flags
+                "{indent}  closed call {}: {} {} {}",
+                call.inst, call.name, call.memory, call.control
             )
             .unwrap();
         }
@@ -174,7 +174,7 @@ impl RegionPlan {
         mut self,
         graph: &mut Graph,
         fallback: Option<usize>,
-        regions: &mut Vec<HashSet<Block>>,
+        regions: &mut Vec<RegionId>,
         notes: &mut Vec<String>,
         report_regions: bool,
         canonical: &Canonical<'_>,
@@ -200,6 +200,7 @@ impl RegionPlan {
             |(_, header)| format!("loop at {header}"),
         );
         let mut child_canonical = None;
+        let mut region_fallback = None;
         if self.speculative() {
             let blocks: Vec<_> = Cfg::new(graph)
                 .rpo
@@ -222,6 +223,15 @@ impl RegionPlan {
                 ..Default::default()
             };
             let version = apply_version(graph, &blocks, self.entry, &speculation, Some(canonical));
+            region_fallback = Some(if let Some(address) = fallback {
+                RegionFallback::CompiledEntry(address)
+            } else {
+                let source = graph.regions.push(Region {
+                    blocks: self.body.clone(),
+                    fallback: None,
+                });
+                RegionFallback::Region(source)
+            });
             notes.extend(version.notes.iter().cloned());
             graph.verify()?;
             if let Some(previous) = fallback {
@@ -266,10 +276,14 @@ impl RegionPlan {
                 child_canonical.as_ref().unwrap_or(canonical),
             )?;
             for region in &regions[first..] {
-                self.body.extend(region.iter().copied());
+                self.body
+                    .extend(graph.regions[*region].blocks.iter().copied());
             }
         }
-        regions.push(self.body);
+        regions.push(graph.regions.push(Region {
+            blocks: self.body,
+            fallback: region_fallback,
+        }));
         Ok(())
     }
 }
@@ -324,7 +338,7 @@ fn plan_region(
     for call in &calls {
         planning
             .closed_calls
-            .insert(call.inst, (call.callee, call.flags));
+            .insert(call.inst, (call.callee, call.memory, call.control));
     }
     for requirement in &requirements {
         let Op::Call { args, .. } = &planning.insts[requirement.call].op else {
@@ -486,7 +500,7 @@ pub(in crate::jit::semantic) fn version(
     conditional: &ConditionalPlan,
     fallback: Option<usize>,
     notes: &mut Vec<String>,
-) -> Result<Vec<HashSet<Block>>> {
+) -> Result<Vec<RegionId>> {
     version_with_report(graph, conditional, fallback, notes, false)
 }
 
@@ -496,7 +510,7 @@ pub(in crate::jit::semantic) fn version_with_report(
     fallback: Option<usize>,
     notes: &mut Vec<String>,
     report_regions: bool,
-) -> Result<Vec<HashSet<Block>>> {
+) -> Result<Vec<RegionId>> {
     let plans = plan(graph, conditional, notes);
     let original = graph.clone();
     let canonical = Canonical::identity(&original);
@@ -765,7 +779,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(regions.len(), 1);
-        assert!(regions[0].contains(&original));
+        assert!(matches!(
+            graph.regions[regions[0]].fallback,
+            Some(RegionFallback::CompiledEntry(0x1234))
+        ));
+        assert!(graph.regions[regions[0]].blocks.contains(&original));
         let cfg = Cfg::new(&graph);
         assert_eq!(natural_loops(&graph, &cfg).len(), loops);
         assert_eq!(
@@ -802,6 +820,10 @@ mod tests {
         )
         .unwrap();
         assert!(!regions.is_empty());
+        assert!(regions.iter().any(|&id| match graph.regions[id].fallback {
+            Some(RegionFallback::Region(source)) => !graph.regions[source].blocks.is_empty(),
+            _ => false,
+        }));
         assert!(Cfg::new(&graph).rpo.iter().all(|&block| {
             !matches!(
                 graph.blocks[block].terminator.as_ref().unwrap().kind,

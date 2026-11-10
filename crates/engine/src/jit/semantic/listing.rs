@@ -123,6 +123,8 @@ impl Graph {
             Op::IteratorNew(value) => format!("iterator_new {value}"),
             Op::IteratorNext(value) => format!("iterator_next {value}"),
             Op::IsIndexed(value) => format!("is_indexed {value}"),
+            Op::IsExactPosition(key, position) => format!("is_exact_position {key}, {position}"),
+            Op::IsInBounds(position, length) => format!("is_in_bounds {position}, {length}"),
             Op::ArrayPosition(key) => format!("array_position {key}"),
             Op::IsArrayIndex(object, key, position, holey) => format!(
                 "is_array_index {object}[{key}] position={position} {}",
@@ -320,11 +322,11 @@ impl Listing<'_> {
                 if let Some(result) = inst_data.result {
                     text = format!("{} = {text}", self.value(result));
                 }
-                let contract = graph.contract(&inst_data.op, self.facts);
-                let note = match (contract.reentry, contract.may_throw()) {
-                    (Reentry::Closed, true) => " throws",
-                    (Reentry::Closed, false) => "",
-                    (_, _) => " reenters, throws",
+                let effects = graph.contract(&inst_data.op, self.facts).effects;
+                let note = match (effects.memory.reenters(), effects.control.throws) {
+                    (false, true) => " throws",
+                    (false, false) => "",
+                    (true, _) => " reenters, throws",
                 };
                 let span = inst_data.span;
                 lines.push((
@@ -480,8 +482,8 @@ impl Analysis {
         for call in &self.plan.conditional.calls {
             writeln!(
                 out,
-                "  {} {} callee={} effects=0x{:04x}",
-                call.inst, call.name, call.callee, call.flags
+                "  {} {} callee={} {} {}",
+                call.inst, call.name, call.callee, call.memory, call.control
             )
             .unwrap();
             for (name, target) in &call.identities {

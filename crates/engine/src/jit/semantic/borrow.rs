@@ -2,7 +2,6 @@ use std::collections::{HashMap, HashSet};
 
 use cranelift_codegen::entity::SecondaryMap;
 
-use super::super::effects::{GLOBAL_WRITE, HEAP_WRITE, Reentry};
 use super::{Block, Cfg, Facts, Graph, Inst, Op, Types, Value};
 
 const HEAP: Types = Types::STRING.union(Types::OBJECT).union(Types::OTHER);
@@ -42,11 +41,8 @@ struct Borrows<'g> {
 
 impl Borrows<'_> {
     fn effects(&self, inst: Inst) -> (bool, bool) {
-        let contract = self.graph.inst_contract(inst, self.facts);
-        (
-            contract.reentry != Reentry::Closed,
-            contract.flags & (GLOBAL_WRITE | HEAP_WRITE) != 0,
-        )
+        let memory = self.facts.memory(inst);
+        (memory.reenters(), memory.writes_data())
     }
 
     fn redefined(&mut self, live: &HashSet<Value>, defined: Value) {

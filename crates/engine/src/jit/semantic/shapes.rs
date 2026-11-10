@@ -3,8 +3,7 @@ use crate::jit::planner::{PropertyAccess, ShapeAccess, Site};
 use std::collections::{HashMap, HashSet};
 
 use super::{
-    Block, BlockData, Cfg, Facts, GLOBAL_WRITE, Graph, HEAP_WRITE, Inst, Op, Reentry,
-    Target, Terminator, TerminatorKind, Value,
+    Block, BlockData, Cfg, Facts, Graph, Inst, Op, Target, Terminator, TerminatorKind, Value,
 };
 
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -120,9 +119,7 @@ fn shape_preserving(graph: &Graph, facts: &Facts, op: &Op) -> bool {
     ) {
         return false;
     }
-    let contract = graph.contract(op, facts);
-    contract.reentry == Reentry::Closed
-        && contract.flags & (HEAP_WRITE | GLOBAL_WRITE) == 0
+    graph.contract(op, facts).effects.memory.writes.is_empty()
 }
 
 fn segments(graph: &Graph, planned: &HashMap<Inst, (Value, u32, u32)>) -> Vec<Segment> {
@@ -282,7 +279,7 @@ fn guard_segment(
                 || graph
                     .closed_calls
                     .values()
-                    .any(|(callee, _)| callee == value)
+                    .any(|(callee, ..)| callee == value)
         })
         .collect();
     let params: HashMap<Value, Value> = outputs

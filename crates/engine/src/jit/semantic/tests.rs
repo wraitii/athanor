@@ -70,7 +70,7 @@ fn constructor_result_facts_and_folding_preserve_object_returns() {
             kind: TerminatorKind::Return(result),
         });
         assert_eq!(Facts::compute(&graph).of(result), Types::OBJECT);
-        optimize::simplify(&mut graph);
+        js::simplify(&mut graph);
         graph.verify().unwrap();
         let TerminatorKind::Return(value) = graph.blocks[block].terminator.as_ref().unwrap().kind
         else {
@@ -271,7 +271,7 @@ fn late_number_facts_remove_refinement_guards_and_assertions() {
             data.op = Op::Constant(Constant::Number(2.0));
         }
     }
-    optimize::simplify(&mut graph);
+    js::simplify(&mut graph);
     graph.verify().unwrap();
     assert!(
         !ops(&graph)
@@ -305,7 +305,7 @@ fn folding_guard_edges_recomputes_number_facts_at_joins() {
             data.op = Op::Constant(Constant::Boolean(true));
         }
     }
-    optimize::simplify(&mut graph);
+    js::simplify(&mut graph);
     graph.verify().unwrap();
     assert!(!ops(&graph).iter().any(|op| matches!(
         op,
@@ -986,4 +986,322 @@ fn unsupported_numeric_reads_are_not_observed_again() {
         Some(&ReadType::Unknown)
     );
     graph.verify().unwrap();
+}
+
+#[test]
+fn checked_typed_reads_expose_shared_numeric_checks() {
+    let mut graph = canonicalize(
+        lower_source("function f(a,b,k){k=+k;return a[k]+b[k];}").unwrap(),
+        true,
+    )
+    .unwrap()
+    .graph;
+    let reads: Vec<_> = graph
+        .insts
+        .iter()
+        .filter_map(|(inst, data)| matches!(data.op, Op::GetIndex(..)).then_some(inst))
+        .collect();
+    assert_eq!(reads.len(), 2);
+    let Op::GetIndex(_, key) = graph.insts[reads[0]].op else {
+        unreachable!()
+    };
+    for &inst in &reads {
+        let Op::GetIndex(object, _) = graph.insts[inst].op else {
+            unreachable!()
+        };
+        graph.insts[inst].op = Op::TypedIndex(
+            object,
+            key,
+            TypedRead {
+                element: Some(crate::heap::TypedKind::Float64),
+                bounded: false,
+            },
+        );
+    }
+    let region = graph.regions.push(Region {
+        blocks: graph.blocks.keys().collect(),
+        fallback: None,
+    });
+    for &inst in &reads {
+        graph.insts[inst].source_name = Some((17, 3));
+    }
+    let previous_insts = graph.insts.len();
+    assert!(typed_lowering::lower(&mut graph).unwrap());
+    let cfg = Cfg::new(&graph);
+    assert!(
+        cfg.rpo
+            .iter()
+            .all(|block| graph.regions[region].blocks.contains(block))
+    );
+    assert!(
+        graph
+            .insts
+            .iter()
+            .skip(previous_insts)
+            .all(|(_, data)| data.source_name == Some((17, 3)))
+    );
+    for &inst in &reads {
+        let load = graph.insts[inst].block;
+        assert_eq!(cfg.preds[load].len(), 1);
+        let bounds = cfg.preds[load][0];
+        let TerminatorKind::Branch(condition, yes, no) =
+            &graph.blocks[bounds].terminator.as_ref().unwrap().kind
+        else {
+            panic!()
+        };
+        assert_eq!(yes.block, load);
+        assert_ne!(no.block, load);
+        assert!(matches!(
+            graph.defining_op(*condition),
+            Some(Op::IsInBounds(..))
+        ));
+        assert_eq!(cfg.preds[bounds].len(), 1);
+        let check = cfg.preds[bounds][0];
+        let TerminatorKind::Branch(condition, yes, no) =
+            &graph.blocks[check].terminator.as_ref().unwrap().kind
+        else {
+            panic!()
+        };
+        assert_eq!(yes.block, bounds);
+        assert_ne!(no.block, bounds);
+        assert!(matches!(
+            graph.defining_op(*condition),
+            Some(Op::IsExactPosition(..))
+        ));
+    }
+    optimize::reuse_loads(&mut graph, region, &mut Vec::new());
+    graph.verify().unwrap();
+    let ops: Vec<_> = Cfg::new(&graph)
+        .rpo
+        .into_iter()
+        .flat_map(|block| {
+            graph.blocks[block]
+                .insts
+                .iter()
+                .map(|&inst| &graph.insts[inst].op)
+        })
+        .collect();
+    assert_eq!(
+        ops.iter()
+            .filter(|op| matches!(op, Op::ArrayPosition(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        ops.iter()
+            .filter(|op| matches!(op, Op::IsExactPosition(..)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        ops.iter()
+            .filter(|op| matches!(op, Op::IsInBounds(..)))
+            .count(),
+        2
+    );
+    assert_eq!(
+        ops.iter()
+            .filter(|op| matches!(op, Op::TypedIndex(_, _, TypedRead { bounded: true, .. })))
+            .count(),
+        2
+    );
+    let facts = Facts::compute(&graph);
+    for &inst in &reads {
+        assert!(
+            facts
+                .of(graph.insts[inst].result.unwrap())
+                .within(Types::NUMBER)
+        );
+    }
+}
+
+#[test]
+fn integer_typed_read_skips_exactness_roundtrip() {
+    let mut graph = canonicalize(
+        lower_source("function f(a,k){k=k|0;return a[k];}").unwrap(),
+        true,
+    )
+    .unwrap()
+    .graph;
+    let inst = graph
+        .insts
+        .iter()
+        .find_map(|(inst, data)| matches!(data.op, Op::GetIndex(..)).then_some(inst))
+        .unwrap();
+    let Op::GetIndex(object, key) = graph.insts[inst].op else {
+        unreachable!()
+    };
+    graph.insts[inst].op = Op::TypedIndex(
+        object,
+        key,
+        TypedRead {
+            element: Some(crate::heap::TypedKind::Int32),
+            bounded: false,
+        },
+    );
+    assert!(typed_lowering::lower(&mut graph).unwrap());
+    assert!(matches!(
+        graph.insts[inst].op,
+        Op::TypedIndex(_, _, TypedRead { bounded: true, .. })
+    ));
+    assert!(!Cfg::new(&graph).rpo.iter().any(|&block| {
+        graph.blocks[block]
+            .insts
+            .iter()
+            .any(|&inst| matches!(graph.insts[inst].op, Op::IsExactPosition(..)))
+    }));
+}
+
+#[test]
+fn undefined_comparisons_refine_typed_read_results() {
+    for (operator, comparison) in [("===", "x===undefined"), ("!==", "undefined!==x")] {
+        let source = format!(
+            "function f(a,k){{const x=a[k];return {comparison}?{}:{};}}",
+            if operator == "===" { "0" } else { "x" },
+            if operator == "===" { "x" } else { "0" }
+        );
+        let mut graph = canonicalize(lower_source(&source).unwrap(), true)
+            .unwrap()
+            .graph;
+        let inst = graph
+            .insts
+            .iter()
+            .find_map(|(inst, data)| matches!(data.op, Op::GetIndex(..)).then_some(inst))
+            .unwrap();
+        let Op::GetIndex(object, key) = graph.insts[inst].op else {
+            unreachable!()
+        };
+        graph.insts[inst].op = Op::TypedIndex(
+            object,
+            key,
+            TypedRead {
+                element: Some(crate::heap::TypedKind::Float64),
+                bounded: false,
+            },
+        );
+        comparisons::expose(&mut graph);
+        graph.verify().unwrap();
+        assert!(
+            ops(&graph)
+                .iter()
+                .any(|op| matches!(op, Op::IsUndefined(_)))
+        );
+        let result = graph
+            .blocks
+            .values()
+            .find_map(|block| match block.terminator.as_ref()?.kind {
+                TerminatorKind::Return(value) => Some(value),
+                _ => None,
+            })
+            .unwrap();
+        let types = Facts::compute(&graph).of(result);
+        assert!(
+            types.intersects(Types::NUMBER) && types.within(Types::NUMBER),
+            "{source}: {types}"
+        );
+    }
+    for source in [
+        "function f(x){return x==undefined;}",
+        "function f(x){return x!=undefined;}",
+        "function f(x,undefined){return x===undefined;}",
+    ] {
+        let mut graph = canonicalize(lower_source(source).unwrap(), true)
+            .unwrap()
+            .graph;
+        comparisons::expose(&mut graph);
+        assert!(
+            !ops(&graph)
+                .iter()
+                .any(|op| matches!(op, Op::IsUndefined(_))),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn forwarded_undefined_facts_stop_at_joins_and_alternate_predecessors() {
+    let mut graph = lower_source("function f(){return 0;}").unwrap();
+    let entry = graph.entry;
+    let span = graph.span;
+    let value = graph.append(entry, span, Op::Argument(0), true).1.unwrap();
+    let condition = graph
+        .append(entry, span, Op::IsUndefined(value), true)
+        .1
+        .unwrap();
+    let yes = graph.blocks.push(BlockData::default());
+    let no = graph.blocks.push(BlockData::default());
+    let forward = graph.blocks.push(BlockData::default());
+    let join = graph.blocks.push(BlockData::default());
+    let passing = graph.blocks.push(BlockData::default());
+    let narrowed = graph.add_param(passing);
+    let parameter = graph.add_param(join);
+    graph.blocks[entry].terminator = Some(Terminator {
+        source_name: None,
+        span,
+        kind: TerminatorKind::Branch(condition, Target::new(yes), Target::new(no)),
+    });
+    graph.blocks[yes].terminator = Some(Terminator {
+        source_name: None,
+        span,
+        kind: TerminatorKind::Jump(Target {
+            block: join,
+            args: vec![value],
+        }),
+    });
+    graph.blocks[no].terminator = Some(Terminator {
+        source_name: None,
+        span,
+        kind: TerminatorKind::Jump(Target::new(forward)),
+    });
+    graph.blocks[forward].terminator = Some(Terminator {
+        source_name: None,
+        span,
+        kind: TerminatorKind::Jump(Target {
+            block: passing,
+            args: vec![value],
+        }),
+    });
+    graph.blocks[passing].terminator = Some(Terminator {
+        source_name: None,
+        span,
+        kind: TerminatorKind::Jump(Target {
+            block: join,
+            args: vec![narrowed],
+        }),
+    });
+    graph.blocks[join].terminator = Some(Terminator {
+        source_name: None,
+        span,
+        kind: TerminatorKind::Return(parameter),
+    });
+    graph.verify().unwrap();
+    let facts = Facts::compute(&graph);
+    assert_eq!(
+        facts.of(narrowed),
+        facts.of(value).without(Types::UNDEFINED)
+    );
+    assert_eq!(facts.of(parameter), facts.of(value));
+    graph.blocks[yes].terminator = Some(Terminator {
+        source_name: None,
+        span,
+        kind: TerminatorKind::Jump(Target::new(no)),
+    });
+    let facts = Facts::compute(&graph);
+    assert_eq!(facts.of(narrowed), facts.of(value));
+    assert_eq!(facts.of(parameter), facts.of(value));
+    graph.blocks[join].terminator = Some(Terminator {
+        source_name: None,
+        span,
+        kind: TerminatorKind::Branch(
+            condition,
+            Target::new(no),
+            Target {
+                block: join,
+                args: vec![parameter],
+            },
+        ),
+    });
+    graph.verify().unwrap();
+    let facts = Facts::compute(&graph);
+    assert_eq!(facts.of(parameter), facts.of(value));
 }

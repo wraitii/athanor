@@ -1064,6 +1064,17 @@ and engine-error checks remain in place. Unknown index kinds keep IndexGet.
 Numeric element indices are checked against the receiver's limit and round-trip
 through `usize` to reject fractions; negative zero is accepted as index zero.
 
+After semantic hoisting, known-kind typed reads with numeric keys expose their
+checks in the graph: `ArrayPosition` computes a saturating integer position,
+`IsExactPosition` checks its numeric round trip when needed, and `IsInBounds`
+compares position and length as unsigned integers. Failure produces undefined;
+success executes a bounded `TypedIndex` using the position. Region block sets
+include the generated branches. Load reuse shares position and exactness work
+for identical SSA keys within optimized regions, while bounds remain specific
+to each receiver. View placement and simplification run afterward. The bounded
+load's storage access, element conversion and result boxing still use the
+existing emitter; other typed reads retain their emission-time checks.
+
 The numeric getter keeps primitive and borrowed reads in its main body. Character
 allocation and the general property fallback are cold, non-inlined functions so
 those paths do not inflate the common getter's register saves and stack frame.
@@ -1144,7 +1155,19 @@ uninitialized-binding sentinel and internal typed-array views. They are computed
 values to a fixed point; block parameters join their incoming arguments. Arguments
 forwarded by a branch on their own type test retain the corresponding type
 restriction on each edge, including undefined, nullish, string, number and
-uninitialized tests. For-of elements reached through the initialized iterator
+uninitialized tests. Strict equality and inequality against a value proven to
+be undefined lower to `IsUndefined` and, for inequality, boolean negation.
+This uses value facts rather than the spelling of an identifier; loose equality
+retains its coercion semantics.
+
+Type-test restrictions also follow the tested SSA value through intervening
+blocks when the corresponding branch successor has a single predecessor and
+dominates the forwarding edge. These restrictions are derived from the current
+CFG during fact computation, not stored as persistent region guarantees. They
+narrow incoming block arguments without changing the original value's facts;
+joins still combine all incoming possibilities. Thus the result of
+`x === undefined ? 0 : x` is numeric when `x` is number-or-undefined, even when
+each arm has its own block. For-of elements reached through the initialized iterator
 path therefore need no initialization checks. The
 engine has no BigInt, so numeric operators always produce numbers. Facts
 refine contracts: a coercing operation on numbers is pure, one on other
@@ -1574,6 +1597,16 @@ one generic sibling, which is not versioned
 further, so the result is a tree of loop versions that join again at loop exits.
 Values defined inside the version and used after it reach those exits through
 block parameters, placed by dominance-based SSA reconstruction.
+
+Versioning stores these block sets in graph-owned `Region` records, indexed by
+`RegionId`. Each record can identify its generic fallback as another region or an
+existing compiled entry. The link does not enumerate individual side exits.
+Load reuse and hoisting receive region IDs and use the same block sets as before;
+their existing analyses establish safety.
+These records describe versioning results, not maintained structural ownership
+or proofs. Later CFG transformations do not automatically extend membership or
+repair fallback relationships. Planner output reports the records at versioning
+time.
 
 A call whose callee is a property read of a global, such as `Math.min`, reenters
 unless the callee is the expected native function. Versioning collects these

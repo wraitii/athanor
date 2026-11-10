@@ -2,9 +2,22 @@ use super::helpers::Helper;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Effects {
-    pub(super) reentry: Reentry,
-    pub(super) flags: u16,
-    pub(super) assumptions: &'static [Assumption],
+    pub(super) memory: Memory,
+    pub(super) control: Control,
+}
+
+impl Effects {
+    pub(super) const UNKNOWN: Self = Self {
+        memory: Memory::UNKNOWN,
+        control: Control::UNKNOWN,
+    };
+
+    pub(super) fn of(flags: u16) -> Self {
+        Self {
+            memory: Memory::of(flags),
+            control: Control::of(flags),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -30,13 +43,6 @@ impl std::fmt::Display for Assumption {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Reentry {
-    Closed,
-    Arbitrary,
-    Unknown,
-}
-
 pub(super) const HEAP_READ: u16 = 1;
 pub(super) const HEAP_WRITE: u16 = 2;
 pub(super) const GLOBAL_READ: u16 = 4;
@@ -44,12 +50,144 @@ pub(super) const GLOBAL_WRITE: u16 = 8;
 pub(super) const INTERNAL: u16 = 16;
 pub(super) const ALLOCATION: u16 = 32;
 pub(super) const ERROR: u16 = 64;
-pub(super) const UNKNOWN: u16 =
-    HEAP_READ | HEAP_WRITE | GLOBAL_READ | GLOBAL_WRITE | INTERNAL | ALLOCATION | ERROR;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub(super) struct Locations(u8);
+
+impl Locations {
+    pub(super) const HEAP: Self = Self(1);
+    pub(super) const GLOBAL: Self = Self(2);
+    pub(super) const CODE: Self = Self(4);
+    pub(super) const ALL: Self = Self::HEAP.union(Self::GLOBAL).union(Self::CODE);
+
+    pub(super) const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    pub(super) fn intersects(self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
+
+    pub(super) fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl std::fmt::Display for Locations {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names = [
+            (Self::HEAP, "heap"),
+            (Self::GLOBAL, "global"),
+            (Self::CODE, "code"),
+        ]
+        .into_iter()
+        .filter(|(location, _)| self.intersects(*location))
+        .map(|(_, name)| name)
+        .collect::<Vec<_>>();
+        if names.is_empty() {
+            return f.write_str("-");
+        }
+        f.write_str(&names.join("|"))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Memory {
+    pub(super) reads: Locations,
+    pub(super) writes: Locations,
+}
+
+impl Memory {
+    pub(super) const UNKNOWN: Self = Self {
+        reads: Locations::ALL,
+        writes: Locations::ALL,
+    };
+
+    pub(super) fn of(flags: u16) -> Self {
+        let locations = |heap, global| {
+            let mut locations = Locations::default();
+            if flags & heap != 0 {
+                locations = locations.union(Locations::HEAP);
+            }
+            if flags & global != 0 {
+                locations = locations.union(Locations::GLOBAL);
+            }
+            locations
+        };
+        Self {
+            reads: locations(HEAP_READ, GLOBAL_READ),
+            writes: locations(HEAP_WRITE, GLOBAL_WRITE),
+        }
+    }
+
+    pub(super) fn union(self, other: Self) -> Self {
+        Self {
+            reads: self.reads.union(other.reads),
+            writes: self.writes.union(other.writes),
+        }
+    }
+
+    pub(super) fn reenters(self) -> bool {
+        self.writes.intersects(Locations::CODE)
+    }
+
+    pub(super) fn writes_data(self) -> bool {
+        self.writes
+            .intersects(Locations::HEAP.union(Locations::GLOBAL))
+    }
+
+    pub(super) fn is_empty(self) -> bool {
+        self.reads.is_empty() && self.writes.is_empty()
+    }
+}
+
+impl std::fmt::Display for Memory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "reads={} writes={}", self.reads, self.writes)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Control {
+    pub(super) throws: bool,
+    pub(super) ordered: bool,
+}
+
+impl Control {
+    pub(super) const UNKNOWN: Self = Self {
+        throws: true,
+        ordered: true,
+    };
+
+    pub(super) fn of(flags: u16) -> Self {
+        Self {
+            throws: flags & ERROR != 0,
+            ordered: flags & (INTERNAL | ALLOCATION) != 0,
+        }
+    }
+
+    pub(super) fn union(self, other: Self) -> Self {
+        Self {
+            throws: self.throws || other.throws,
+            ordered: self.ordered || other.ordered,
+        }
+    }
+
+    pub(super) fn is_empty(self) -> bool {
+        !self.throws && !self.ordered
+    }
+}
+
+impl std::fmt::Display for Control {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "throws={} ordered={}", self.throws, self.ordered)
+    }
+}
 
 pub(super) fn effects(helper: Helper) -> Effects {
     use Helper::*;
-    let (reentry, flags, assumptions): (_, _, &'static [Assumption]) = match helper {
+    let closed = Effects::of;
+    match helper {
         Call
         | CallOwned
         | CallPack
@@ -58,16 +196,14 @@ pub(super) fn effects(helper: Helper) -> Effects {
         | ConstructResolved
         | ConstructorCall
         | ConstructorCallPack
-        | ConstructPackResolved => (Reentry::Arbitrary, UNKNOWN, &[]),
+        | ConstructPackResolved => Effects::UNKNOWN,
         FrameOverflow | FrameRelease | IndexUnroot | LocalSet | LocalReplace | Release
         | LocalGet | TempClear | TempRetain | TempOwn | ErrorOrigin | Catch | Throw => {
-            (Reentry::Closed, INTERNAL | ERROR, &[])
+            closed(INTERNAL | ERROR)
         }
-        ObserveCall | ObserveGet | ObserveIndex | ObserveNumber => {
-            (Reentry::Closed, HEAP_READ | INTERNAL, &[])
-        }
-        CompilePoll | CompileLeave | CallProfileFlush => (Reentry::Closed, INTERNAL, &[]),
-        SemanticGlobalProbe => (Reentry::Closed, GLOBAL_READ, &[]),
+        ObserveCall | ObserveGet | ObserveIndex | ObserveNumber => closed(HEAP_READ | INTERNAL),
+        CompilePoll | CompileLeave | CallProfileFlush => closed(INTERNAL),
+        SemanticGlobalProbe => closed(GLOBAL_READ),
         ConstructorPrototype
         | SemanticPropertyProbeCached
         | PropertyCachePrime
@@ -75,72 +211,64 @@ pub(super) fn effects(helper: Helper) -> Effects {
         | ClosureThis
         | LexicalReceiver
         | ArrayIterationGuard
-        | IsStringSplit => (Reentry::Closed, HEAP_READ, &[]),
+        | IsStringSplit => closed(HEAP_READ),
         StringSplit
         | StringSplitOwned
         | StringSplitParts
         | StringSplitPartsOwned
         | Spread
-        | NewPack => (
-            Reentry::Closed,
-            HEAP_READ | ALLOCATION | INTERNAL | ERROR,
-            &[],
-        ),
-        PackInit | PackRelease => (Reentry::Closed, HEAP_WRITE | INTERNAL, &[]),
-        PackTake | PackTakeOwned => (Reentry::Closed, HEAP_READ | HEAP_WRITE | INTERNAL, &[]),
-        PackAppend | PackExtend => (
-            Reentry::Closed,
-            HEAP_READ | HEAP_WRITE | ALLOCATION | INTERNAL,
-            &[],
-        ),
-        IndexRoot => (
-            Reentry::Closed,
-            HEAP_READ | INTERNAL,
-            &[Assumption::StableIndexStorage],
-        ),
-        MathDirect => (
-            Reentry::Closed,
-            ALLOCATION | INTERNAL | ERROR,
-            &[
-                Assumption::GuardedMathIdentity,
-                Assumption::NoCoercionCallbacks,
-            ],
-        ),
-        Truthy => (Reentry::Closed, HEAP_READ, &[]),
-        TypedIndexGet => (Reentry::Closed, HEAP_READ, &[Assumption::FixedTypedStorage]),
-        ArrayMapElement => (Reentry::Closed, HEAP_READ | INTERNAL, &[]),
+        | NewPack => closed(HEAP_READ | ALLOCATION | INTERNAL | ERROR),
+        PackInit | PackRelease => closed(HEAP_WRITE | INTERNAL),
+        PackTake | PackTakeOwned => closed(HEAP_READ | HEAP_WRITE | INTERNAL),
+        PackAppend | PackExtend => closed(HEAP_READ | HEAP_WRITE | ALLOCATION | INTERNAL),
+        IndexRoot => closed(HEAP_READ | INTERNAL),
+        MathDirect => closed(ALLOCATION | INTERNAL | ERROR),
+        Truthy => closed(HEAP_READ),
+        TypedIndexGet => closed(HEAP_READ),
+        ArrayMapElement => closed(HEAP_READ | INTERNAL),
         ArrayNew | ArrayNewOwned | Rest | ObjectNew | ObjectNewOwned | NewInstance
         | NewInstanceOwned | StringNew | ArrayMapNew | ArrayMapNewOwned => {
-            (Reentry::Closed, ALLOCATION | INTERNAL | ERROR, &[])
+            closed(ALLOCATION | INTERNAL | ERROR)
         }
         GlobalGet | GlobalGetOptional | GlobalGetBorrowed | GlobalGetOptionalBorrowed => {
-            (Reentry::Closed, GLOBAL_READ | INTERNAL | ERROR, &[])
+            closed(GLOBAL_READ | INTERNAL | ERROR)
         }
-        GlobalSet | GlobalInitialize => (Reentry::Closed, GLOBAL_WRITE | INTERNAL | ERROR, &[]),
-        PropertyGet | PropertyGetCached | IndexGet | IndexGetNumeric => (
-            Reentry::Closed,
-            HEAP_READ | GLOBAL_READ | ALLOCATION | INTERNAL | ERROR,
-            &[Assumption::NoAccessors, Assumption::NoCoercionCallbacks],
-        ),
-        IterateNew | IterateNext | EnumerateNew | EnumerateNext => (
-            Reentry::Closed,
-            HEAP_READ | INTERNAL | ALLOCATION | ERROR,
-            &[Assumption::DirectIteration],
-        ),
+        GlobalSet | GlobalInitialize => closed(GLOBAL_WRITE | INTERNAL | ERROR),
+        PropertyGet | PropertyGetCached | IndexGet | IndexGetNumeric => {
+            closed(HEAP_READ | GLOBAL_READ | ALLOCATION | INTERNAL | ERROR)
+        }
+        IterateNew | IterateNext | EnumerateNew | EnumerateNext => {
+            closed(HEAP_READ | INTERNAL | ALLOCATION | ERROR)
+        }
         BitwiseAnd | BitwiseOr | BitwiseXor | ShiftLeft | ShiftRight | ShiftRightUnsigned | Add
         | Sub | Mul | Div | Rem | Pow | LooseEqual | LooseNotEqual | StrictEqual
         | StrictNotEqual | Less | LessEqual | Greater | GreaterEqual | UnaryPlus
-        | UnaryNegation | LogicalNot | BitwiseNot => (
-            Reentry::Closed,
-            HEAP_READ | ALLOCATION | INTERNAL | ERROR,
-            &[Assumption::NoCoercionCallbacks],
-        ),
-        _ => (Reentry::Unknown, UNKNOWN, &[]),
-    };
-    Effects {
-        reentry,
-        flags,
-        assumptions,
+        | UnaryNegation | LogicalNot | BitwiseNot => {
+            closed(HEAP_READ | ALLOCATION | INTERNAL | ERROR)
+        }
+        _ => Effects::UNKNOWN,
+    }
+}
+
+#[expect(dead_code)]
+pub(super) fn assumptions(helper: Helper) -> &'static [Assumption] {
+    use Helper::*;
+    match helper {
+        IndexRoot => &[Assumption::StableIndexStorage],
+        MathDirect => &[
+            Assumption::GuardedMathIdentity,
+            Assumption::NoCoercionCallbacks,
+        ],
+        TypedIndexGet => &[Assumption::FixedTypedStorage],
+        PropertyGet | PropertyGetCached | IndexGet | IndexGetNumeric => {
+            &[Assumption::NoAccessors, Assumption::NoCoercionCallbacks]
+        }
+        IterateNew | IterateNext | EnumerateNew | EnumerateNext => &[Assumption::DirectIteration],
+        BitwiseAnd | BitwiseOr | BitwiseXor | ShiftLeft | ShiftRight | ShiftRightUnsigned | Add
+        | Sub | Mul | Div | Rem | Pow | LooseEqual | LooseNotEqual | StrictEqual
+        | StrictNotEqual | Less | LessEqual | Greater | GreaterEqual | UnaryPlus
+        | UnaryNegation | LogicalNot | BitwiseNot => &[Assumption::NoCoercionCallbacks],
+        _ => &[],
     }
 }
 

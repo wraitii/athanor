@@ -56,6 +56,18 @@ This is an opportunity for e-graph-like alternatives under explicit assumptions:
 
 **Progressive migration**
 
+The broad structural implementation of steps 1–3 was explored and set aside:
+it introduced ownership and analysis machinery before a concrete optimization
+needed it. The retained refactor gives existing regions identities, block sets
+and fallback links. It does not establish a region hierarchy or persistent
+proofs, and does not complete the stages below.
+
+Treat these stages as architectural options, not a prerequisite checklist.
+Experiments should start with a concrete optimization interaction, identify
+which proof or effect information is lost, and introduce only the representation
+needed to improve that example. Shape specialization and hoisting remain one
+such target; checked typed-array reads provide a smaller first lowering slice.
+
 I’d migrate by making the existing architecture explicit, then extending it downward. Each stage should leave a working compiler and provide an immediate benefit.
 
 **1. Establish the structural model**
@@ -154,6 +166,24 @@ Add multiple-result support when introducing operations that benefit from it. Se
 
 **5. Move one lowering path into the graph**
 
+The first slice now expands known-kind, unbounded `TypedIndex` operations with
+proven numeric keys into position conversion, exactness and bounds checks,
+a bounded read, and an undefined result on failure. Existing region membership
+is extended to the generated blocks. Load reuse can share position conversion
+and exactness checks for the same SSA key; each receiver keeps its own bounds
+check. This runs after hoisting and before view placement. Bounded reads remain
+runtime operations, and boxing, storage addressing and scalar loads remain in
+the emitter. This does not establish persistent guard proofs or complete this
+stage.
+
+The next small interaction exposes strict undefined comparisons as the existing
+`IsUndefined` predicate. Fact analysis carries its edge restrictions through
+dominated forwarding blocks, allowing a typed read's number-or-undefined result
+to become numeric after an undefined default. This keeps the semantic rule in
+comparison lowering and the propagation mechanism in fact analysis. It adds no
+operation family or persistent proof storage; the restrictions are recomputed
+from the CFG.
+
 Choose a narrow hot path—typed-array numeric loops are a reasonable candidate.
 
 Replace emission-time decisions with graph transformations:
@@ -199,4 +229,4 @@ Likewise, compiled rule dispatch, e-graph alternatives and fine-grained incremen
 
 Preserve behavioral tests and map-output checks. Add structural verification for region boundaries, guarantee validity and SSA after transformations. For migrated hot paths, compare compilation time, lowered graphs, assembly, spills and execution time against the existing path.
 
-**The first milestone I’d choose is steps 1–3, narrowly scoped to persistent regions and reliable invalidation.** That gives immediate value to the existing optimizer and establishes the foundation for moving emitter logic into the graph—without simultaneously redesigning operations, scheduling and code generation.
+**The next milestone is a concrete optimization that benefits from preserving reasoning across transformations.** Extend the checked typed-read slice only where an example benefits; use the shape-specialization and hoisting example to expose its actual obstruction before introducing more structural or analysis infrastructure.

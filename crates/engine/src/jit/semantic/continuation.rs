@@ -16,13 +16,13 @@ pub(in crate::jit) struct Body {
 impl Body {
     fn new(mut graph: Graph, outputs: usize) -> Self {
         let mut notes = Vec::new();
-        super::optimize::simplify(&mut graph);
-        super::optimize::coercions(&mut graph);
-        super::optimize::bit_tests(&mut graph);
+        super::js::simplify(&mut graph);
+        super::js::coercions(&mut graph);
+        super::js::bit_tests(&mut graph);
         super::optimize::views(&mut graph, &mut notes);
-        super::optimize::simplify(&mut graph);
-        super::trim::trim(&mut graph);
-        super::promote::remove_trivial_params(&mut graph);
+        super::js::simplify(&mut graph);
+        super::transforms::trim(&mut graph);
+        super::transforms::remove_trivial_params(&mut graph);
         let facts = super::Facts::compute(&graph);
         super::borrow::borrows(&mut graph, &facts, &mut notes);
         let result = Cfg::new(&graph)

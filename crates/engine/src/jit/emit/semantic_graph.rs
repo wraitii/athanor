@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 
 use cranelift_codegen::entity::{EntityRef, SecondaryMap};
-use cranelift_codegen::ir::condcodes::IntCC;
+use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{BlockArg, InstBuilder, MemFlagsData, Value as ClifValue, types};
 use cranelift_frontend::Variable;
 use cranelift_module::{FuncId, Module};
@@ -1105,7 +1105,11 @@ impl FunctionCompiler<'_, '_> {
                             let no = self.constant(Value::FALSE);
                             Some(self.b.ins().select(condition, yes, no))
                         }
-                        Op::ArrayPosition(..) | Op::IsArrayIndex(..) | Op::ArrayLoad(..) => {
+                        Op::ArrayPosition(..)
+                        | Op::IsExactPosition(..)
+                        | Op::IsInBounds(..)
+                        | Op::IsArrayIndex(..)
+                        | Op::ArrayLoad(..) => {
                             unreachable!()
                         }
                         Op::IsTyped(..) | Op::IsPropertyCached(..) | Op::IsShape(..) | Op::IsCode(..) => {
@@ -1876,6 +1880,20 @@ impl FunctionCompiler<'_, '_> {
                 let object = self.convert(operand, Repr::Boxed);
                 let view = self.view(object);
                 boolean(self.has_kind(view, kind::ARRAY | kind::TYPED))
+            }
+            Op::IsExactPosition(key, position) => {
+                let key = self.operand(cx, *key);
+                let position = self.operand(cx, *position);
+                let key = self.convert(key, Repr::Float);
+                let position = self.convert(position, Repr::Float);
+                boolean(self.b.ins().fcmp(FloatCC::Equal, key, position))
+            }
+            Op::IsInBounds(position, length) => {
+                let position = self.operand(cx, *position);
+                let length = self.operand(cx, *length);
+                let position = self.convert(position, Repr::Int64);
+                let length = self.convert(length, Repr::Int64);
+                boolean(self.b.ins().icmp(IntCC::UnsignedLessThan, position, length))
             }
             Op::ArrayPosition(key) => {
                 let key = self.operand(cx, *key);

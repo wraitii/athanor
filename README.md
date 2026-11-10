@@ -49,8 +49,10 @@ error. Compilation options cannot be combined with `--load`, `--function`,
   replanned regions immediately before their emission: block membership, native
   requirements, numeric assumptions, read probes, hoisted guards, fallback exits,
   typed receivers/reads, and length checks. Rejected regions remain in the notes.
-  Region IDs refer to their respective planning stage, before subsequent copying
-  and simplification. Detailed region reports are collected only with this flag.
+  After versioning, it lists graph-local region IDs, their block sets and
+  generic fallback links. These records describe the versioning result,
+  before subsequent simplification; they do not describe every side exit.
+  Detailed region reports are collected only with this flag.
   Feedback is empty until code has executed.
 - `--ast` prints each function's analyzed Oxc parameters/body and generator resume
   plan, or the module AST for its initializer.

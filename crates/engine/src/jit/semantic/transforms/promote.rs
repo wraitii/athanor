@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use cranelift_codegen::entity::SecondaryMap;
 
-use super::{Binding, Block, Cfg, Constant, Graph, Op, Value};
+use super::super::{Binding, Block, Cfg, Constant, Graph, Op, Value, ValueDef, resolve};
 
 struct Promoter<'g> {
     graph: &'g mut Graph,
@@ -77,7 +77,7 @@ enum Access {
     Initialize(Value),
 }
 
-pub(super) fn promote(graph: &mut Graph, notes: &mut Vec<String>) {
+pub(in crate::jit::semantic) fn promote(graph: &mut Graph, notes: &mut Vec<String>) {
     let promoted: HashSet<Binding> = graph
         .bindings
         .iter()
@@ -171,7 +171,7 @@ pub(super) fn promote(graph: &mut Graph, notes: &mut Vec<String>) {
     ));
 }
 
-pub(super) fn remove_trivial_params(graph: &mut Graph) {
+pub(in crate::jit::semantic) fn remove_trivial_params(graph: &mut Graph) {
     let blocks = Cfg::new(graph).rpo;
     loop {
         let mut incoming: HashMap<Value, Vec<Value>> = HashMap::new();
@@ -191,7 +191,7 @@ pub(super) fn remove_trivial_params(graph: &mut Graph) {
             let mut unique = None;
             let mut trivial = true;
             for value in args {
-                let value = super::resolve(&aliases, value);
+                let value = resolve(&aliases, value);
                 if value == param || unique == Some(value) {
                     continue;
                 }
@@ -236,7 +236,7 @@ pub(super) fn remove_trivial_params(graph: &mut Graph) {
         for (block, data) in graph.blocks.iter_mut() {
             data.params.retain(|param| !aliases.contains_key(param));
             for (index, &param) in data.params.iter().enumerate() {
-                graph.values[param] = super::ValueDef::Param(block, index);
+                graph.values[param] = ValueDef::Param(block, index);
             }
         }
     }

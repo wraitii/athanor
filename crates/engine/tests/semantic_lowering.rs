@@ -1146,3 +1146,71 @@ fn cross_source_inlining_preserves_writes_and_global_rebinding() {
         );
     }
 }
+
+#[test]
+fn checked_typed_reads_cover_numeric_boundaries_and_distinct_lengths() {
+    let source = r#"
+        function read(k) {
+            const a = Int32Array.from([11, 22]);
+            const b = Float64Array.from([3.5]);
+            let result = 0;
+            for (let i = 0; i < 4; ++i) {
+                const x = a[k], y = b[k];
+                result += (x === undefined ? 100 : x) + (y === undefined ? 1000 : y);
+            }
+            return result;
+        }
+        function main() {
+            for (let i = 0; i < 3; ++i) {
+                if (read(0) !== 58 || read(-0) !== 58 || read(1) !== 4088 ||
+                    read(2) !== 4400 || read(-1) !== 4400 || read(0.5) !== 4400 ||
+                    read(NaN) !== 4400 || read(Infinity) !== 4400 ||
+                    read(-Infinity) !== 4400 || read(9223372036854775808) !== 4400)
+                    return false;
+            }
+            return true;
+        }
+    "#;
+    for ssa_opt in [false, true] {
+        assert_eq!(run(source, ssa_opt), Ok(Value::TRUE));
+    }
+}
+
+#[test]
+fn strict_undefined_checks_preserve_values_and_evaluation() {
+    let source = r#"
+        function read(k) {
+            k = +k;
+            const a = Float64Array.from([2.5, 4]);
+            let sum = 0;
+            for (let i = 0; i < 4; ++i) {
+                const x = a[k];
+                sum += x === undefined ? 0 : x;
+                sum += undefined !== x ? x : 0;
+            }
+            return sum;
+        }
+        function shadow(x, undefined) {
+            return x === undefined && !(x !== undefined);
+        }
+        function main() {
+            let calls = 0;
+            const value = 7;
+            return read(0) === 20 && read(1) === 32 && read(3) === 0 &&
+                read(NaN) === 0 && read(0.5) === 0 && shadow(2, 2) && !shadow(2, 3) &&
+                null == undefined && !(null === undefined) && null != 7 &&
+                value !== (calls++, undefined) && calls === 1;
+        }
+    "#;
+    for ssa_opt in [false, true] {
+        assert_eq!(run(source, ssa_opt), Ok(Value::TRUE));
+        assert!(run("function main(){return x === undefined; let x;}", ssa_opt).is_err());
+        assert!(
+            run(
+                "function main(){return 1 === undefined; let undefined;}",
+                ssa_opt
+            )
+            .is_err()
+        );
+    }
+}

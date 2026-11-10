@@ -4,6 +4,7 @@ use std::fmt;
 use cranelift_codegen::entity::SecondaryMap;
 use oxc_syntax::operator::BinaryOperator;
 
+use super::super::effects::{Control, Memory};
 use super::{Block, Cfg, Constant, Graph, Inst, Op, TerminatorKind, UnaryOp, Value};
 use crate::heap::TypedKind;
 
@@ -92,6 +93,8 @@ pub(in crate::jit) struct Facts {
     types: SecondaryMap<Value, Types>,
     indexed: HashSet<Value>,
     known: bool,
+    memory: SecondaryMap<Inst, Memory>,
+    control: SecondaryMap<Inst, Control>,
 }
 
 impl Facts {
@@ -107,6 +110,14 @@ impl Facts {
         }
     }
 
+    pub(super) fn is_pure(&self, inst: Inst) -> bool {
+        self.memory[inst].is_empty() && self.control[inst].is_empty()
+    }
+
+    pub(super) fn memory(&self, inst: Inst) -> Memory {
+        self.memory[inst]
+    }
+
     pub(in crate::jit) fn compute(graph: &Graph) -> Self {
         Self::assuming(graph, &HashMap::new())
     }
@@ -114,11 +125,54 @@ impl Facts {
     pub(super) fn assuming(graph: &Graph, assumptions: &HashMap<Value, Types>) -> Self {
         let cfg = Cfg::new(graph);
         let steps = steps(graph, &cfg);
+        let mut refinements: HashMap<Value, Vec<(Block, Types, bool)>> = HashMap::new();
+        for &block in &cfg.rpo {
+            let Some(terminator) = &graph.blocks[block].terminator else {
+                continue;
+            };
+            let Some((yes, value, mask)) = refined_edge(graph, &terminator.kind) else {
+                continue;
+            };
+            for target in terminator.kind.targets() {
+                // Dominance carries this edge's restriction only when the successor has no
+                // other entry path. The function entry also has an implicit incoming path.
+                if target.block != graph.entry && cfg.preds[target.block].len() == 1 {
+                    refinements.entry(value).or_default().push((
+                        target.block,
+                        mask,
+                        target.block == yes,
+                    ));
+                }
+            }
+        }
+        let mut edge_facts: HashMap<(Block, Value), Vec<(Types, bool)>> = HashMap::new();
+        for &block in &cfg.rpo {
+            let Some(terminator) = &graph.blocks[block].terminator else {
+                continue;
+            };
+            for arg in terminator
+                .kind
+                .targets()
+                .into_iter()
+                .flat_map(|target| &target.args)
+            {
+                for &(entry, mask, positive) in refinements.get(arg).into_iter().flatten() {
+                    if cfg.dominates(entry, block) {
+                        edge_facts
+                            .entry((block, *arg))
+                            .or_default()
+                            .push((mask, positive));
+                    }
+                }
+            }
+        }
         let (indexed, reads) = super::string_split::result_facts(graph);
         let mut facts = Self {
             types: SecondaryMap::new(),
             indexed,
             known: true,
+            memory: SecondaryMap::with_default(Memory::UNKNOWN),
+            control: SecondaryMap::with_default(Control::UNKNOWN),
         };
         for (&value, &types) in assumptions {
             facts.types[value] = types;
@@ -164,9 +218,24 @@ impl Facts {
                                 types.without(mask)
                             };
                         }
+                        for &(mask, positive) in edge_facts.get(&(block, arg)).into_iter().flatten()
+                        {
+                            types = if positive {
+                                Types(types.0 & mask.0)
+                            } else {
+                                types.without(mask)
+                            };
+                        }
                         changed |= facts.widen(param, types);
                     }
                 }
+            }
+        }
+        for &block in &cfg.rpo {
+            for &inst in &graph.blocks[block].insts {
+                let effects = graph.inst_contract(inst, &facts).effects;
+                facts.memory[inst] = effects.memory;
+                facts.control[inst] = effects.control;
             }
         }
         facts
@@ -196,7 +265,11 @@ fn refined_edge(graph: &Graph, kind: &TerminatorKind) -> Option<(Block, Value, T
     if yes.block == no.block {
         return None;
     }
-    let (value, mask) = match *graph.defining_op(*condition)? {
+    let (condition, yes) = match graph.defining_op(*condition)? {
+        Op::Unary(UnaryOp::Not, value) => (*value, no.block),
+        _ => (*condition, yes.block),
+    };
+    let (value, mask) = match *graph.defining_op(condition)? {
         Op::IsUninitialized(value) => (value, Types::UNINITIALIZED),
         Op::IsUndefined(value) => (value, Types::UNDEFINED),
         Op::IsNullish(value) => (value, Types::UNDEFINED.union(Types::NULL)),
@@ -205,7 +278,7 @@ fn refined_edge(graph: &Graph, kind: &TerminatorKind) -> Option<(Block, Value, T
         Op::IsInteger(value) => (value, Types::INTEGER),
         _ => return None,
     };
-    Some((yes.block, value, mask))
+    Some((yes, value, mask))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -424,7 +497,11 @@ fn result_types(op: &Op, facts: &Facts) -> Types {
             Some(_) => Types::INT32,
         },
         Op::TypedIndex(..) => Types::NUMBER.union(Types::UNDEFINED),
-        Op::IsTyped(..) | Op::IsIndexed(_) | Op::IsArrayIndex(..) => Types::BOOLEAN,
+        Op::IsTyped(..)
+        | Op::IsIndexed(_)
+        | Op::IsArrayIndex(..)
+        | Op::IsExactPosition(..)
+        | Op::IsInBounds(..) => Types::BOOLEAN,
         Op::IndexedLength(_) => Types::INT64,
         Op::IsNumber(_)
         | Op::IsInteger(_)

@@ -1,7 +1,7 @@
-use super::{Cfg, Graph, TerminatorKind, Value};
+use super::super::{Cfg, Graph, TerminatorKind, Value};
 use std::collections::HashMap;
 
-pub(super) fn trim(graph: &mut Graph) {
+pub(in crate::jit::semantic) fn trim(graph: &mut Graph) {
     if graph.generator || graph.has_handlers {
         return;
     }

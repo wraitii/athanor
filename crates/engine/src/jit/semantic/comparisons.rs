@@ -33,6 +33,38 @@ pub(super) fn expose(graph: &mut Graph) {
             let Op::Binary(operator, left, right) = data.op else {
                 continue;
             };
+            if matches!(
+                operator,
+                BinaryOperator::StrictEquality | BinaryOperator::StrictInequality
+            ) {
+                let undefined = |value| {
+                    let types = facts.of(value);
+                    types.intersects(Types::UNDEFINED) && types.within(Types::UNDEFINED)
+                };
+                let value = if undefined(left) {
+                    Some(right)
+                } else if undefined(right) {
+                    Some(left)
+                } else {
+                    None
+                };
+                if let Some(value) = value {
+                    if operator == BinaryOperator::StrictEquality {
+                        graph.insts[inst].op = Op::IsUndefined(value);
+                    } else {
+                        let position = graph.blocks[block]
+                            .insts
+                            .iter()
+                            .position(|&current| current == inst)
+                            .unwrap();
+                        let (check, result) =
+                            graph.insert(block, position, data.span, Op::IsUndefined(value), true);
+                        graph.insts[check].source_name = data.source_name;
+                        graph.insts[inst].op = Op::Unary(super::UnaryOp::Not, result.unwrap());
+                    }
+                    continue;
+                }
+            }
             if !matches!(
                 operator,
                 BinaryOperator::LessThan
