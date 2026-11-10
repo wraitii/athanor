@@ -514,7 +514,7 @@ impl HeapData {
     #[inline(always)]
     fn release_owned(&mut self, id: u64, value: Value) {
         let slot = self.slot_mut(id);
-        if slot.references > 1 {
+        if slot.references > 1 && !matches!(slot.payload, Payload::Vacant | Payload::Reserved) {
             slot.references -= 1;
             return;
         }

@@ -1,5 +1,5 @@
 use super::*;
-use crate::jit::planner::ShapeAccess;
+use crate::jit::planner::{PropertyAccess, ShapeAccess};
 
 #[repr(C)]
 pub(crate) struct GlobalCache {
@@ -239,7 +239,7 @@ impl PropertyCache {
     ) -> Option<Value> {
         if let Some(value) = self.builtin(heap, receiver) {
             self.initialized = 1;
-            self.observe(engine, ShapeAccess::Varying);
+            self.observe(engine, PropertyAccess::Get, ShapeAccess::Varying);
             return Some(value);
         }
         if let Some(found) = heap.cached_property(receiver, &self.name) {
@@ -250,6 +250,7 @@ impl PropertyCache {
             self.holder_shape = found.holder_shape;
             self.observe(
                 engine,
+                PropertyAccess::Get,
                 if found.holder == 0 {
                     ShapeAccess::Read {
                         shape: found.shape,
@@ -260,12 +261,12 @@ impl PropertyCache {
                 },
             );
         } else {
-            self.observe(engine, ShapeAccess::Varying);
+            self.observe(engine, PropertyAccess::Get, ShapeAccess::Varying);
         }
         None
     }
 
-    fn observe(&mut self, engine: &crate::Engine, access: ShapeAccess) {
+    fn observe(&mut self, engine: &crate::Engine, property: PropertyAccess, access: ShapeAccess) {
         let Some((owner, site)) = self.observer else {
             return;
         };
@@ -273,7 +274,7 @@ impl PropertyCache {
             return;
         }
         self.reported = Some(access);
-        engine.observe_shape(owner, site, access);
+        engine.observe_shape(owner, site, property, access);
     }
 }
 
@@ -329,7 +330,7 @@ pub(super) extern "C" fn js_property_set_cached(
         }
         _ => ShapeAccess::Varying,
     };
-    cache.observe(ctx.engine, access);
+    cache.observe(ctx.engine, PropertyAccess::Set, access);
     result
 }
 

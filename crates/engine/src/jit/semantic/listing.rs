@@ -14,6 +14,24 @@ impl Graph {
         format!("{}#{}", self.bindings[binding].name, binding.index())
     }
 
+    pub(in crate::jit) fn entering_guard(&self, inst: Inst) -> String {
+        let block = self.insts[inst].block;
+        self.blocks
+            .values()
+            .find_map(|data| match &data.terminator.as_ref()?.kind {
+                TerminatorKind::Branch(condition, then, otherwise)
+                    if then.block == block || otherwise.block == block =>
+                {
+                    Some(self.defining_op(*condition).map_or_else(
+                        || format!("branch {condition}"),
+                        |op| self.op_text(op),
+                    ))
+                }
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
     pub(in crate::jit) fn op_text(&self, op: &Op) -> String {
         let list = |values: &[Value]| {
             values

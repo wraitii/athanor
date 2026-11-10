@@ -21,40 +21,82 @@ pub(super) struct ObjectInfo {
 pub(super) const INLINE_PROPERTIES: usize = 8;
 
 pub(crate) fn builtin_method(name: &str) -> bool {
-    matches!(
-        name,
-        "fill"
-            | "test"
-            | "exec"
-            | "filter"
-            | "map"
-            | "every"
-            | "some"
-            | "find"
-            | "forEach"
-            | "at"
-            | "sort"
-            | "join"
-            | "pop"
-            | "indexOf"
-            | "concat"
-            | "push"
-            | "includes"
-            | "reverse"
-            | "slice"
-            | "flat"
-            | "flatMap"
-            | "match"
-            | "split"
-            | "startsWith"
-            | "replace"
-            | "padStart"
-            | "add"
-            | "has"
-            | "delete"
-            | "clear"
-            | "next"
-    )
+    [
+        array_method,
+        typed_method,
+        regexp_method,
+        string_method,
+        set_method,
+        generator_method,
+    ]
+    .iter()
+    .any(|method| method(name).is_some())
+}
+
+fn array_method(name: &str) -> Option<NativeFunction> {
+    use NativeFunction::*;
+    Some(match name {
+        "filter" => ArrayFilter,
+        "map" => ArrayMap,
+        "every" => ArrayEvery,
+        "some" => ArraySome,
+        "find" => ArrayFind,
+        "forEach" => ArrayForEach,
+        "at" => ArrayAt,
+        "sort" => ArraySort,
+        "join" => ArrayJoin,
+        "pop" => ArrayPop,
+        "indexOf" => ArrayIndexOf,
+        "concat" => ArrayConcat,
+        "push" => ArrayPush,
+        "includes" => ArrayIncludes,
+        "reverse" => ArrayReverse,
+        "slice" => ArraySlice,
+        "flat" => ArrayFlat,
+        "flatMap" => ArrayFlatMap,
+        "fill" => ArrayFill,
+        _ => return None,
+    })
+}
+
+fn typed_method(name: &str) -> Option<NativeFunction> {
+    (name == "fill").then_some(NativeFunction::TypedFill)
+}
+
+fn regexp_method(name: &str) -> Option<NativeFunction> {
+    Some(match name {
+        "test" => NativeFunction::RegExpTest,
+        "exec" => NativeFunction::RegExpExec,
+        _ => return None,
+    })
+}
+
+fn string_method(name: &str) -> Option<NativeFunction> {
+    use NativeFunction::*;
+    Some(match name {
+        "match" => StringMatch,
+        "slice" => StringSlice,
+        "split" => StringSplit,
+        "startsWith" => StringStartsWith,
+        "replace" => StringReplace,
+        "padStart" => StringPadStart,
+        _ => return None,
+    })
+}
+
+fn set_method(name: &str) -> Option<NativeFunction> {
+    use NativeFunction::*;
+    Some(match name {
+        "add" => SetAdd,
+        "has" => SetHas,
+        "delete" => SetDelete,
+        "clear" => SetClear,
+        _ => return None,
+    })
+}
+
+fn generator_method(name: &str) -> Option<NativeFunction> {
+    (name == "next").then_some(NativeFunction::GeneratorNext)
 }
 
 #[repr(C)]
@@ -202,14 +244,11 @@ impl Heap {
                         array.storage.len() as f64
                     )));
                 }
-                "fill" => TypedFill,
-                _ => return None,
+                _ => typed_method(name)?,
             },
             Payload::RegExp(regexp) => match name {
                 "lastIndex" => return Some(PropertyRead::Value(Value::number(regexp.last_index))),
-                "test" => RegExpTest,
-                "exec" => RegExpExec,
-                _ => return None,
+                _ => regexp_method(name)?,
             },
             Payload::Array(array) => match name {
                 "length" => {
@@ -217,26 +256,7 @@ impl Heap {
                         array.elements.len() as f64
                     )));
                 }
-                "filter" => ArrayFilter,
-                "map" => ArrayMap,
-                "every" => ArrayEvery,
-                "some" => ArraySome,
-                "find" => ArrayFind,
-                "forEach" => ArrayForEach,
-                "at" => ArrayAt,
-                "sort" => ArraySort,
-                "join" => ArrayJoin,
-                "pop" => ArrayPop,
-                "indexOf" => ArrayIndexOf,
-                "concat" => ArrayConcat,
-                "push" => ArrayPush,
-                "includes" => ArrayIncludes,
-                "reverse" => ArrayReverse,
-                "slice" => ArraySlice,
-                "flat" => ArrayFlat,
-                "flatMap" => ArrayFlatMap,
-                "fill" => ArrayFill,
-                _ => return None,
+                _ => array_method(name)?,
             },
             Payload::String(text) => match name {
                 "length" => {
@@ -244,27 +264,20 @@ impl Heap {
                         text.chars().count() as f64
                     )));
                 }
-                "match" => StringMatch,
-                "slice" => StringSlice,
-                "split" => StringSplit,
-                "startsWith" => StringStartsWith,
-                "replace" => StringReplace,
-                "padStart" => StringPadStart,
-                _ => return None,
+                _ => string_method(name)?,
             },
             Payload::Set(set) => match name {
                 "size" => {
                     return Some(PropertyRead::Value(Value::number(set.entries.len() as f64)));
                 }
-                "add" => SetAdd,
-                "has" => SetHas,
-                "delete" => SetDelete,
-                "clear" => SetClear,
-                _ => return Some(PropertyRead::Value(Value::UNDEFINED)),
+                _ => match set_method(name) {
+                    Some(function) => function,
+                    None => return Some(PropertyRead::Value(Value::UNDEFINED)),
+                },
             },
-            Payload::Generator(_) => match name {
-                "next" => GeneratorNext,
-                _ => return Some(PropertyRead::Value(Value::UNDEFINED)),
+            Payload::Generator(_) => match generator_method(name) {
+                Some(function) => function,
+                None => return Some(PropertyRead::Value(Value::UNDEFINED)),
             },
             _ => return None,
         };

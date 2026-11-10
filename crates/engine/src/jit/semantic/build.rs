@@ -882,7 +882,11 @@ impl<'a> Builder<'a> {
     fn bind_pattern(&mut self, pattern: &BindingPattern<'_>, value: Value) -> Result<()> {
         match pattern {
             BindingPattern::BindingIdentifier(id) => {
-                let Some(&binding) = self.symbols.get(&id.symbol_id.get().unwrap()) else {
+                let symbol = id.symbol_id.get().unwrap();
+                let Some(&binding) = self.symbols.get(&symbol) else {
+                    if self.scoping.symbol_scope_id(symbol) != self.scoping.root_scope_id() {
+                        return unsupported("binding", id.span);
+                    }
                     self.effect(id.span, Op::GlobalWrite(id.name.to_string(), value));
                     return Ok(());
                 };

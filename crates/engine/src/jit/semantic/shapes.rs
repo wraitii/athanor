@@ -1,106 +1,332 @@
-use crate::jit::planner::{ShapeAccess, Site};
+use crate::jit::planner::{PropertyAccess, ShapeAccess, Site};
 
-use super::{BlockData, Cfg, Graph, Inst, Op, Target, Terminator, TerminatorKind};
+use std::collections::{HashMap, HashSet};
 
-#[derive(Clone, PartialEq, Eq)]
-pub(in crate::jit) struct Shape {
-    pub(super) inst: Inst,
-    pub(super) shape: u32,
-    pub(super) index: u32,
+use super::{
+    Block, BlockData, Cfg, Facts, GLOBAL_WRITE, Graph, HEAP_WRITE, Inst, Op, Reentry,
+    Target, Terminator, TerminatorKind, Value,
+};
+
+#[derive(Clone, Default, PartialEq, Eq)]
+pub(in crate::jit) struct Plan {
+    source: usize,
+    accesses: Vec<(Site, PropertyAccess, u32, u32)>,
 }
 
-pub(super) fn plan(
-    graph: &Graph,
-    bodies: &super::specialize::Repository,
-    source: usize,
-) -> Vec<Shape> {
-    let mut shapes = Vec::new();
+fn property_access(op: &Op) -> Option<PropertyAccess> {
+    match op {
+        Op::Get(_, name) if name != "length" => Some(PropertyAccess::Get),
+        Op::Set(..) => Some(PropertyAccess::Set),
+        _ => None,
+    }
+}
+
+fn site(graph: &Graph, inst: Inst, source: usize) -> Site {
+    let data = &graph.insts[inst];
+    Site {
+        source: data.source_name.map_or(source, |name| name.0),
+        start: data.span.start,
+        end: data.span.end,
+    }
+}
+
+pub(super) fn plan(graph: &Graph, bodies: &super::specialize::Repository, source: usize) -> Plan {
+    let callees = graph.callees();
+    let mut accesses = Vec::new();
     for block in Cfg::new(graph).rpo {
         if graph.cold.contains(&block) {
             continue;
         }
         for &inst in &graph.blocks[block].insts {
             let data = &graph.insts[inst];
-            let site = Site {
-                source: data.source_name.map_or(source, |name| name.0),
-                start: data.span.start,
-                end: data.span.end,
+            let Some(property) = property_access(&data.op) else {
+                continue;
             };
-            let access = match data.op {
-                Op::Get(_, ref name) if name != "length" => {
-                    bodies.shape_feedback.get(&site).and_then(|access| match *access {
-                        ShapeAccess::Read { shape, index } => Some((shape, index)),
-                        _ => None,
-                    })
+            if data.result.is_some_and(|value| callees.contains(&value)) {
+                continue;
+            }
+            let site = site(graph, inst, source);
+            let access = match (property, bodies.shape_feedback.get(&(site, property))) {
+                (PropertyAccess::Get, Some(&ShapeAccess::Read { shape, index }))
+                | (PropertyAccess::Set, Some(&ShapeAccess::Overwrite { shape, index })) => {
+                    (site, property, shape, index)
                 }
-                Op::Set(..) => bodies.shape_feedback.get(&site).and_then(|access| match *access {
-                    ShapeAccess::Overwrite { shape, index } => Some((shape, index)),
-                    _ => None,
-                }),
-                _ => None,
+                _ => continue,
             };
-            if let Some((shape, index)) = access {
-                shapes.push(Shape { inst, shape, index });
+            if !accesses.contains(&access) {
+                accesses.push(access);
             }
         }
     }
-    shapes
+    Plan { source, accesses }
+}
+
+fn planned(graph: &Graph, plan: &Plan) -> HashMap<Inst, (Value, u32, u32)> {
+    let callees = graph.callees();
+    let cfg = Cfg::new(graph);
+    let loops = super::optimize::natural_loops(graph, &cfg);
+    let invariant = |block: Block, object: Value| {
+        loops
+            .iter()
+            .any(|(_, body)| body.contains(&block) && !body.contains(&graph.def_block(object)))
+    };
+    let mut planned = HashMap::new();
+    for &block in &cfg.rpo {
+        if graph.cold.contains(&block) {
+            continue;
+        }
+        for &inst in &graph.blocks[block].insts {
+            let data = &graph.insts[inst];
+            let Some(property) = property_access(&data.op) else {
+                continue;
+            };
+            let (Op::Get(object, _) | Op::Set(object, ..)) = data.op else {
+                unreachable!();
+            };
+            if data.result.is_some_and(|value| callees.contains(&value))
+                || invariant(block, object)
+            {
+                continue;
+            }
+            let site = site(graph, inst, plan.source);
+            if let Some(&(.., shape, index)) = plan
+                .accesses
+                .iter()
+                .find(|access| access.0 == site && access.1 == property)
+            {
+                planned.insert(inst, (object, shape, index));
+            }
+        }
+    }
+    planned
+}
+
+const SEGMENT_LIMIT: usize = 64;
+
+struct Segment {
+    insts: Vec<Inst>,
+    guards: Vec<(Value, u32)>,
+}
+
+fn shape_preserving(graph: &Graph, facts: &Facts, op: &Op) -> bool {
+    if matches!(
+        op,
+        Op::EnterScope(_)
+            | Op::EnterCaptures(..)
+            | Op::LeaveScope(_)
+            | Op::NextIteration(_)
+            | Op::FreshIteration(_)
+            | Op::Continuation(..)
+    ) {
+        return false;
+    }
+    let contract = graph.contract(op, facts);
+    contract.reentry == Reentry::Closed
+        && contract.flags & (HEAP_WRITE | GLOBAL_WRITE) == 0
+}
+
+fn segments(graph: &Graph, planned: &HashMap<Inst, (Value, u32, u32)>) -> Vec<Segment> {
+    let facts = Facts::compute(graph);
+    let blocks: HashSet<Block> = planned
+        .keys()
+        .map(|&inst| graph.insts[inst].block)
+        .collect();
+    let mut segments = Vec::new();
+    for block in blocks {
+        let mut current: Option<Segment> = None;
+        let mut pending = Vec::new();
+        let mut defined = HashSet::new();
+        for &inst in &graph.blocks[block].insts {
+            let data = &graph.insts[inst];
+            if let Some(&(object, shape, _)) = planned.get(&inst) {
+                let joins = current.as_ref().is_some_and(|segment| {
+                    !defined.contains(&object)
+                        && segment.insts.len() + pending.len() < SEGMENT_LIMIT
+                        && segment
+                            .guards
+                            .iter()
+                            .all(|&(guarded, expected)| guarded != object || expected == shape)
+                });
+                if joins {
+                    let segment = current.as_mut().unwrap();
+                    segment.insts.append(&mut pending);
+                    segment.insts.push(inst);
+                    if !segment.guards.iter().any(|&(guarded, _)| guarded == object) {
+                        segment.guards.push((object, shape));
+                    }
+                } else {
+                    segments.extend(current.take());
+                    pending.clear();
+                    defined.clear();
+                    current = Some(Segment {
+                        insts: vec![inst],
+                        guards: vec![(object, shape)],
+                    });
+                }
+                defined.extend(data.result);
+                continue;
+            }
+            if current.is_some() && shape_preserving(graph, &facts, &data.op) {
+                pending.push(inst);
+                defined.extend(data.result);
+                continue;
+            }
+            segments.extend(current.take());
+            pending.clear();
+            defined.clear();
+        }
+        segments.extend(current);
+    }
+    segments.retain(|segment| {
+        let accesses = segment
+            .insts
+            .iter()
+            .filter(|inst| planned.contains_key(inst))
+            .count();
+        accesses > segment.guards.len()
+    });
+    segments
 }
 
 pub(super) fn apply(
     graph: &mut Graph,
-    shapes: &[Shape],
+    plan: &Plan,
     notes: &mut Vec<String>,
 ) -> super::Result<()> {
-    let mut applied = 0;
-    for &Shape { inst, shape, index } in shapes {
-        let data = graph.insts[inst].clone();
-        let (object, name, value) = match data.op {
-            Op::Get(object, ref name) => (object, name.clone(), None),
-            Op::Set(object, ref name, value) => (object, name.clone(), Some(value)),
-            _ => continue,
-        };
-        let (block, continuation, fallback) = super::inlining::split_call(graph, inst);
-        let fast = graph.blocks.push(BlockData::default());
-        let check = graph
-            .append(block, data.span, Op::IsShape(object, shape), true)
-            .1
-            .unwrap();
-        graph.blocks[block].terminator = Some(Terminator {
-            source_name: data.source_name,
-            span: data.span,
-            kind: TerminatorKind::Branch(check, Target::new(fast), Target::new(fallback)),
-        });
-        let args = match value {
-            Some(value) => {
-                let (access, _) = graph.append(
-                    fast,
-                    data.span,
-                    Op::ShapedSet(object, name, index, value),
-                    false,
-                );
-                graph.insts[access].source_name = data.source_name;
-                Vec::new()
-            }
-            None => {
-                let (access, result) =
-                    graph.append(fast, data.span, Op::ShapedGet(object, name, index), true);
-                graph.insts[access].source_name = data.source_name;
-                vec![result.unwrap()]
-            }
-        };
-        graph.blocks[fast].terminator = Some(Terminator {
-            source_name: data.source_name,
-            span: data.span,
-            kind: TerminatorKind::Jump(Target {
-                block: continuation,
-                args,
-            }),
-        });
-        applied += 1;
+    if plan.accesses.is_empty() {
+        return Ok(());
     }
-    if applied != 0 {
-        notes.push(format!("shape guards: {applied} property accesses"));
+    let planned = planned(graph, plan);
+    let accesses: HashMap<Inst, (u32, u32)> = planned
+        .iter()
+        .map(|(&inst, &(_, shape, index))| (inst, (shape, index)))
+        .collect();
+    let segments = segments(graph, &planned);
+    let mut guards = 0;
+    let mut aliases = HashMap::new();
+    for segment in &segments {
+        guard_segment(graph, segment, &accesses, &mut aliases);
+        guards += segment.guards.len();
+    }
+    if !segments.is_empty() {
+        notes.push(format!(
+            "shape guards: {} property accesses, {} segments, {guards} guards",
+            accesses.len(),
+            segments.len()
+        ));
     }
     graph.verify()
+}
+
+fn guard_segment(
+    graph: &mut Graph,
+    segment: &Segment,
+    accesses: &HashMap<Inst, (u32, u32)>,
+    aliases: &mut HashMap<Value, Value>,
+) {
+    let first = graph.insts[segment.insts[0]].clone();
+    let block = first.block;
+    let last = *segment.insts.last().unwrap();
+    let position = graph.blocks[block]
+        .insts
+        .iter()
+        .position(|&inst| inst == last)
+        .unwrap();
+    let continuation = graph.blocks.push(BlockData::default());
+    let tail = graph.blocks[block].insts.split_off(position + 1);
+    for &inst in &tail {
+        graph.insts[inst].block = continuation;
+    }
+    graph.blocks[continuation].insts = tail;
+    graph.blocks[continuation].terminator = graph.blocks[block].terminator.take();
+
+    let fast = graph.blocks.push(BlockData::default());
+    let fallback = graph.blocks.push(BlockData::default());
+    graph.cold.insert(fallback);
+    let mut clones = HashMap::new();
+    for &inst in &segment.insts {
+        let data = graph.insts[inst].clone();
+        let mut op = data.op.clone();
+        for value in op.operands_mut() {
+            *value = clones.get(value).copied().unwrap_or(*value);
+        }
+        let (clone, result) = graph.append(fallback, data.span, op, data.result.is_some());
+        graph.insts[clone].source_name = data.source_name;
+        if let (Some(original), Some(result)) = (data.result, result) {
+            clones.insert(original, result);
+        }
+        graph.move_inst(inst, fast);
+        let Some(&(_, index)) = accesses.get(&inst) else {
+            continue;
+        };
+        graph.insts[inst].op = match data.op {
+            Op::Get(object, name) => Op::ShapedGet(object, name, index),
+            Op::Set(object, name, value) => Op::ShapedSet(object, name, index, value),
+            op => op,
+        };
+    }
+
+    let counts = graph.use_counts();
+    let mut inner: HashMap<Value, u32> = HashMap::new();
+    for &inst in &segment.insts {
+        for value in graph.insts[inst].op.operands_iter() {
+            *inner.entry(value).or_default() += 1;
+        }
+    }
+    let outputs: Vec<Value> = segment
+        .insts
+        .iter()
+        .filter_map(|&inst| graph.insts[inst].result)
+        .filter(|value| {
+            counts[*value] > inner.get(value).copied().unwrap_or(0)
+                || graph
+                    .closed_calls
+                    .values()
+                    .any(|(callee, _)| callee == value)
+        })
+        .collect();
+    let params: HashMap<Value, Value> = outputs
+        .iter()
+        .map(|&value| (value, graph.add_param(continuation)))
+        .collect();
+    graph.replace_uses(&params);
+    aliases.extend(params.iter().map(|(&value, &param)| (value, param)));
+    let originals: HashMap<Value, Value> = params.iter().map(|(&k, &v)| (v, k)).collect();
+    for &inst in &segment.insts {
+        for value in graph.insts[inst].op.operands_mut() {
+            *value = originals.get(value).copied().unwrap_or(*value);
+        }
+    }
+    let jump = |args| Terminator {
+        source_name: first.source_name,
+        span: first.span,
+        kind: TerminatorKind::Jump(Target {
+            block: continuation,
+            args,
+        }),
+    };
+    graph.blocks[fast].terminator = Some(jump(outputs.clone()));
+    graph.blocks[fallback].terminator = Some(jump(
+        outputs.iter().map(|value| clones[value]).collect(),
+    ));
+
+    let mut check_block = block;
+    for (position, &(object, shape)) in segment.guards.iter().enumerate() {
+        let object = super::resolve(aliases, object);
+        let next = if position + 1 == segment.guards.len() {
+            fast
+        } else {
+            graph.blocks.push(BlockData::default())
+        };
+        let check = graph
+            .append(check_block, first.span, Op::IsShape(object, shape), true)
+            .1
+            .unwrap();
+        graph.blocks[check_block].terminator = Some(Terminator {
+            source_name: first.source_name,
+            span: first.span,
+            kind: TerminatorKind::Branch(check, Target::new(next), Target::new(fallback)),
+        });
+        check_block = next;
+    }
 }

@@ -1,0 +1,190 @@
+**The intended end-state**
+
+This document proposes an architectural direction and migration, rather than describing features already available. DESIGN.md describes the current implementation. Details explicitly left open here should be resolved as the corresponding stage is implemented.
+
+The compiler should progressively make a program concrete within one shared graph infrastructure, from language operations down toward machine instructions. Lowering replaces operations locally and introduces implementation constraints as they become relevant. Different abstraction levels can coexist, so target information can inform optimization before decisions become expensive to undo.
+
+The structural backbone remains an ordered CFG with SSA values:
+
+```text
+Module → Function → Region → Block → Operation
+```
+
+Regions can nest. Values connect operation results, operands and block parameters across this structure. Machine instructions are another operation family, rather than a separate child hierarchy beneath semantic instructions. A lowering can introduce several operations or blocks; provenance records where they came from without restricting where they may subsequently move. A module groups compilation data without necessarily defining an isolated JS environment.
+
+The hierarchy describes organization, not nested storage ownership. Functions own their blocks and region records. Each block belongs directly to one region; a parent region includes its descendants' blocks transitively. Initially, regions form a tree rooted at the function region, using the existing loop/function candidates. Supporting arbitrary overlapping or multi-entry regions is outside the initial migration.
+
+Regions make the scope of reasoning explicit. They record entry guarantees, effects and the guarantees preserved through their blocks, together with boundaries and fallback relationships. Blocks retain explicit execution order; ordinary value dependencies and effect contracts determine which transformations are legal. This gives us a place to preserve knowledge through lowering without requiring a Sea of Nodes or a global effect graph.
+
+A guarantee applies only where every incoming execution path establishes it and execution has not invalidated it. Entry guards establish facts on their successful edges; guard failures and fallback paths do not inherit those facts. Exceptional exits and joins need their own valid incoming facts. Facts about immutable SSA values can survive effects that invalidate facts about mutable storage. Region membership alone is never sufficient evidence for a guarantee.
+
+The design is data-oriented: indexed entities, associated data and systems that analyze or transform it. Typical operations and generic graph algorithms form a common core. Frontend, runtime and target extensions provide additional operation families, contracts and rules. JS coercion semantics, this engine's NaN boxing and a target's register constraints belong to different layers, but can participate in the same infrastructure. Extensibility can begin with statically compiled Rust code; it does not require a dynamic plugin system.
+
+There are two useful kinds of explicit effects. Program operations describe what execution reads, writes or invalidates. Compiler passes describe which graph data they read and change, allowing affected analyses to be invalidated and recomputed. The ECS-like aspect is composing behavior around explicit data access; the Salsa-like aspect is tracking dependencies of derived information. Neither requires making every algorithm a rewrite rule or every mutation a fine-grained incremental query.
+
+Semantic rules establish legal alternatives; target constraints and costs help choose between them. Sharing a computation, hoisting it or choosing a representation should remain revisable when its register pressure becomes apparent. The longer-term ambition is to carry this continuity through scheduling and allocation, progressively adding placement constraints and committing decisions where enough is known. E-graph alternatives and compiled rule matching could support this, but are optional mechanisms rather than the foundation.
+
+Cranelift remains the working backend during migration. The immediate goal is to make more of the emitted program visible and optimizable in our graph. Whether taking ownership of machine lowering and allocation is worthwhile is a later, measurable decision.
+
+While Cranelift owns allocation, our graph can use target constraints and pressure estimates before emission, but cannot assume feedback from its allocator or revise choices during allocation. Achieving that part of the end-state requires an additional backend interface or ownership of those later decisions.
+
+**Examples of the intended benefits**
+
+These are benefits to work toward. Some become available by exposing lowering in the graph; allocation-driven decisions require deeper backend integration.
+
+**Preserve a stability proof while revising how a value is computed and stored.** Consider a loop repeatedly accessing `object.buffer[i]`. Entry guards and the region's effect summary establish that resolving `object.buffer` is safe and its value remains unchanged. We can resolve that property once before the loop and carry the preservation proof through lowering into cache checks and memory accesses.
+
+That does not require hoisting every derived address or keeping every shared calculation live. Depending on register pressure, we could keep the buffer reference in a register, recompute cheap element addresses near their uses, or fold offsets into machine addressing modes. If keeping the buffer reference live is expensive, the same proof could permit reloading it near a use, provided the lowered read is safe and the receiver stays alive. This offers an alternative to spilling the previously loaded value to the stack.
+
+Such a reload must be equivalent to the established direct access: it cannot repeat arbitrary JS property lookup with new accessor calls, exceptions or reentry. Its storage and lifetime dependencies must still hold at the new location.
+
+The region establishes which implementations are legal; target costs help choose between them. Hoisting and common-subexpression elimination expose opportunities that remain revisable as machine constraints become concrete. The hoped-for improvement is fewer checks and loads where they matter, without paying for unnecessarily long live ranges in hot loops.
+
+**Let shape specialization and hoisting cooperate through assumptions.** Several property reads on the same object can share a shape guard and become direct slot reads. But lowering the guard and its fallback first can make the region appear effectful and block hoisting that was previously possible. Hoisting preserved reads first reduces the number of accesses, which can make shape specialization less worthwhile. The transformations change each other's profitability, and their ordering can obscure the proofs needed to combine them.
+
+Represent specialization as a conditional region hypothesis: if the receiver has shape S and the relevant layout remains valid, these property reads can use direct slots. Keep separate the cost and failure edge of establishing that assumption, the effects that could invalidate it, and the operations that exploit it. Stable shape does not imply stable property values: hoisting a slot load still requires a no-clobber proof for that property, alongside the usual execution and lifetime constraints.
+
+The successful region should be analyzed under the established assumption without automatically inheriting effects from a fallback outside it. Moving a shape check still requires proving its own dependencies and failure behavior safe at the new location. Introducing guards should preserve the reasoning needed to move accesses; moving accesses should trigger reconsideration of guard profitability.
+
+This is an opportunity for e-graph-like alternatives under explicit assumptions: compare guarded direct reads, hoisted reads, and combinations before committing. A generic property read and a slot load are equivalent only under the required guards and preservation proofs. The goal is to reduce dependence on pass order without requiring an e-graph implementation as the first step.
+
+**Optimize runtime bookkeeping alongside the operations that need it.** A specialized numeric path may still acquire boxing, temporary roots or cleanup during emission. Making those explicit graph operations lets facts and simplification act on them. A proven immediate value needs no heap root; a value used only by numeric operations may remain unboxed until a fallback boundary. The benefit is eliminating overhead introduced after much of today's semantic optimization has finished.
+
+**Extend the operation vocabulary through contracts.** A hypothetical statically compiled extension for a host-provided numeric buffer could supply operations with explicit result types, read/write effects, lifetime requirements and lowering rules. Region analysis, load reuse and motion could then use those contracts, with buffer stability guaranteed by the host integration where required. The extension supplies its semantics while existing algorithms provide optimization, reducing the need to add operation-specific cases throughout the compiler. This example does not imply an existing runtime plugin API.
+
+**Recompute analyses according to what changed.** Replacing arithmetic inside a loop may invalidate value facts while leaving its CFG and dominance unchanged. Retargeting a branch can invalidate dominance and region boundaries without affecting unrelated functions. Explicit mutation contracts make those dependencies enforceable. Coarse invalidation can first prevent stale-analysis mistakes; finer dependency tracking can later avoid redundant work where measurements justify it.
+
+**Progressive migration**
+
+I’d migrate by making the existing architecture explicit, then extending it downward. Each stage should leave a working compiler and provide an immediate benefit.
+
+**1. Establish the structural model**
+
+Keep the current indexed CFG/SSA storage. Introduce explicit function and region identities, and separate structural data from JS/runtime metadata.
+
+- Modules own or reference functions.
+- Functions own blocks and a root region.
+- Nested regions group blocks; a block has one direct enclosing region.
+- Operations remain ordered within blocks.
+- Values remain operation results or block parameters.
+- Source provenance stays independent of containment.
+
+Initially, modules can be thin containers over existing compilation units. Avoid changing global-environment behavior or code publication as part of this work.
+
+**Result:** a clearer ownership model without changing compilation behavior.
+
+**2. Materialize existing regions**
+
+Turn the transient region plans and returned block sets into persistent region records.
+
+Separate:
+
+- Structural boundaries: membership, entry, exits, nesting.
+- Entry guarantees: facts established before execution.
+- Effect summaries: what execution may change.
+- Preserved guarantees: which facts remain valid throughout.
+- Version relationships: specialized region and fallback.
+
+Keep the existing loop/function region discovery initially. Don’t attempt arbitrary overlapping regions yet.
+
+Have versioning produce region identities, then make load reuse and hoisting consume them. Preserve explicit guards in the CFG: region metadata describes their consequences; it does not replace their execution.
+
+A region identity names a record, not a permanent proof. Transformations must assign membership to new or split blocks and invalidate affected boundaries and guarantees before they are consumed again. Preserve identity where the region still has a coherent meaning; allow rebuilding or retiring records when structure changes. The exact repair mechanism remains an implementation choice.
+
+**Result:** later passes can inspect why a region is optimizable instead of reconstructing that reasoning from block sets.
+
+**3. Introduce mutation and analysis contracts**
+
+Give graph mutations a small common interface that records what changed: operations, operands, CFG edges, membership or contracts.
+
+Use that to invalidate derived data:
+
+```text
+CFG changes       → dominance, loops, region boundaries
+Operation changes → facts, effects, cost estimates
+Guard changes     → dependent region guarantees
+```
+
+These are examples, not an exhaustive dependency table: operand changes can affect effects, CFG changes can affect facts, and membership or contract changes can affect region summaries. Mutating passes must report changes through the common interface; analyses must declare their dependencies or conservatively depend on the enclosing function revision. Direct edits that bypass invalidation cannot be part of the supported pass interface.
+
+Start conservatively, with function-level or region-level revisions and recomputation. Add finer dependency tracking only where compilation profiles justify it (probably nowhere, for now).
+
+Distinguish program effects from compiler-pass accesses. A pass can declare that it reads CFG/facts and writes operations, but prerequisites and ordering remain explicit.
+
+**Result:** analysis validity becomes an enforced convention rather than something every pass author must remember independently.
+
+**4. Separate mechanisms from operation rules**
+
+Retain a statically defined operation vocabulary initially. No plugin loader or dynamic ECS is necessary.
+
+Extract common interfaces for:
+
+- Operands, results and successors.
+- Effects and access resources.
+- Fact propagation.
+- Verification.
+- Rewrite and lowering rules.
+
+Move JS knowledge behind these interfaces progressively. Keep specialized planners where useful; generic graph algorithms need not become rewrite rules.
+
+The main operation families would be:
+
+| Family | Responsibilities |
+|---|---|
+| Core | CFG, SSA, basic typed operations |
+| JS | Coercions, bindings, properties, calls, constructors |
+| Runtime | Boxing, shapes, ownership, roots, helper conventions |
+| Target | Machine operations and physical constraints |
+
+Add multiple-result support when introducing operations that benefit from it. Separate semantic value facts from physical representations.
+
+**Result:** reusable algorithms stop depending directly on the full JS operation enum.
+
+**5. Move one lowering path into the graph**
+
+Choose a narrow hot path—typed-array numeric loops are a reasonable candidate.
+
+Replace emission-time decisions with graph transformations:
+
+```text
+JS operation
+  → specialized operation
+  → explicit representation conversions and runtime accesses
+  → typed arithmetic, addresses and loads
+  → CLIF
+```
+
+Allow these operation levels to coexist. Keep Cranelift as the backend, with emission becoming mechanical for the migrated subset. Other operations continue through the existing emitter.
+
+Run existing simplification and applicable load/motion passes after lowering. Preserve region identities where they remain meaningful, and update or invalidate their summaries.
+
+**Result:** a concrete test of whether the architecture improves optimization visibility and code quality before undertaking backend work.
+
+**6. Expand progressive lowering**
+
+Move additional emitter responsibilities into explicit operations as needed:
+
+- Property-cache fast and slow paths.
+- Direct and helper calls.
+- Boxing and unboxing.
+- Retains, releases and rooting.
+- Exception checks and fallback control flow.
+- Temporary storage and lifetime boundaries.
+
+Use the same operation storage rather than nesting generated instructions under their source operation. Track provenance separately.
+
+**Result:** the graph increasingly represents the actual program delivered to Cranelift, including its costs and lifetime pressure.
+
+**7. Add target feedback before replacing the backend**
+
+Introduce register classes, fixed-register constraints, rematerialization candidates and pressure estimates where useful. Use those to inform hoisting, sharing and representation choices.
+
+Then evaluate whether Cranelift remains sufficient. A custom machine lowering/allocation path should be a separate decision supported by evidence, not a prerequisite for the architectural migration.
+
+Likewise, compiled rule dispatch, e-graph alternatives and fine-grained incremental queries can come later. None is required to establish the model.
+
+**Validation throughout**
+
+Preserve behavioral tests and map-output checks. Add structural verification for region boundaries, guarantee validity and SSA after transformations. For migrated hot paths, compare compilation time, lowered graphs, assembly, spills and execution time against the existing path.
+
+**The first milestone I’d choose is steps 1–3, narrowly scoped to persistent regions and reliable invalidation.** That gives immediate value to the existing optimizer and establishes the foundation for moving emitter logic into the graph—without simultaneously redesigning operations, scheduling and code generation.

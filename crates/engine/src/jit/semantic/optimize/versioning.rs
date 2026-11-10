@@ -173,8 +173,7 @@ pub(super) fn apply_version(
     let hints = super::super::observations::numeric_hints(graph);
     let head = entry.map_or(graph.entry, |(_, header)| header);
     let mut tested =
-        EntryGuard::at_entry(graph, entry.map_or(graph.entry, |(preheader, _)| preheader));
-    assert!(fallback.is_none() || entry.is_none());
+        EntryGuard::at_entry(graph, entry.map_or(graph.entry, |(preheader, _)| preheader));    assert!(fallback.is_none() || entry.is_none());
     let reuse = fallback.is_some()
         && exits.iter().all(|block| guards.contains(block))
         && exits_true.is_empty();
@@ -707,16 +706,39 @@ pub(super) fn apply_version(
             .iter()
             .map(|(&old, &current)| (current, old))
             .collect();
-        let exits: Vec<_> = exits
+        let cfg = Cfg::new(graph);
+        let facts = Facts::compute(graph);
+        let order: HashMap<Block, usize> = cfg
+            .rpo
+            .iter()
+            .enumerate()
+            .map(|(index, &block)| (block, index))
+            .collect();
+        let mut exits: Vec<_> = exits
             .iter()
             .filter(|block| !guards.contains(block))
             .map(|&block| (block, false))
             .chain(exits_true.iter().map(|&block| (block, true)))
             .collect();
+        exits.sort_by_key(|(block, _)| order.get(&blocks[block]).copied().unwrap_or(usize::MAX));
         let mut pieces = canonical.pieces.borrow_mut();
-        let cfg = Cfg::new(graph);
         let mut stubs: HashMap<(usize, Vec<Value>, Option<Inst>), Block> = HashMap::new();
+        let mut resumed: HashMap<Block, Block> = HashMap::new();
         for &(block, taken) in &exits {
+            if let Some(stub) = shared_resume(graph, &cfg, &facts, blocks[&block], &resumed) {
+                let TerminatorKind::Branch(_, yes, no) = &mut graph.blocks[blocks[&block]]
+                    .terminator
+                    .as_mut()
+                    .unwrap()
+                    .kind
+                else {
+                    continue;
+                };
+                *if taken { yes } else { no } = Target::new(stub);
+                resumed.insert(blocks[&block], stub);
+                notes.push(format!("guard at {block}: shares an earlier resume"));
+                continue;
+            }
             let Some(&original) = reverse.get(&block) else {
                 notes.push(format!("guard at {block}: canonical block unavailable"));
                 continue;
@@ -809,6 +831,7 @@ pub(super) fn apply_version(
                 continue;
             };
             *if taken { yes } else { no } = Target::new(stub);
+            resumed.insert(blocks[&block], stub);
             notes.push(format!(
                 "guard at {block}: resumes in {}",
                 piece.body.graph.name
@@ -942,6 +965,41 @@ pub(super) fn apply_version(
         blocks,
         insts,
         values,
+    }
+}
+
+fn shared_resume(
+    graph: &Graph,
+    cfg: &Cfg,
+    facts: &Facts,
+    block: Block,
+    resumed: &HashMap<Block, Block>,
+) -> Option<Block> {
+    let mut current = block;
+    loop {
+        let pure = graph.blocks[current]
+            .insts
+            .iter()
+            .all(|&inst| graph.contract(&graph.insts[inst].op, facts).is_pure());
+        if !pure {
+            return None;
+        }
+        let [previous] = cfg.preds[current][..] else {
+            return None;
+        };
+        if let Some(&stub) = resumed.get(&previous) {
+            return Some(stub);
+        }
+        if !matches!(
+            graph.blocks[previous].terminator,
+            Some(Terminator {
+                kind: TerminatorKind::Jump(_),
+                ..
+            })
+        ) {
+            return None;
+        }
+        current = previous;
     }
 }
 

@@ -194,6 +194,7 @@ impl FunctionCompiler<'_, '_> {
             .map(|_| self.b.create_block())
             .collect();
         let facts = Facts::compute(graph);
+        let callees = graph.callees();
         let suspends = self.generator.is_some();
         let mut reprs: SecondaryMap<GraphValue, Repr> = SecondaryMap::with_default(Repr::Boxed);
         if !suspends {
@@ -457,7 +458,9 @@ impl FunctionCompiler<'_, '_> {
                                     target.graph.name,
                                     data.span.start,
                                     data.span.end,
-                                    crate::jit::bailouts::guard_text(data.span)
+                                    Some(crate::jit::bailouts::guard_text(data.span))
+                                        .filter(|text| !text.is_empty())
+                                        .unwrap_or_else(|| graph.entering_guard(inst))
                                 ));
                                 let site = self.b.ins().iconst(types::I64, site as i64);
                                 self.call_helper(Helper::Bailout, &[site]);
@@ -994,7 +997,11 @@ impl FunctionCompiler<'_, '_> {
                                 !graph.borrowed.contains(&value)
                                     && !self.slot_owned(graph, &cx, value)
                             });
-                            let observer = self.property_observer(data);
+                            let observer = data
+                                .result
+                                .is_none_or(|value| !callees.contains(&value))
+                                .then(|| self.property_observer(data))
+                                .flatten();
                             Some(self.cached_property_get(object, name, retain, observer))
                         }
                         Op::GetIndex(object, index)

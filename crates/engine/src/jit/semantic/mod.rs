@@ -899,6 +899,16 @@ impl Graph {
         }
     }
 
+    pub(in crate::jit) fn callees(&self) -> HashSet<Value> {
+        self.insts
+            .values()
+            .filter_map(|data| match data.op {
+                Op::Call { callee, .. } | Op::CallPack(callee, ..) => Some(callee),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub(super) fn caller_rooted(&self, value: Value) -> bool {
         match self.defining_op(value) {
             Some(Op::This | Op::Argument(_)) => true,
@@ -1400,7 +1410,7 @@ fn unsupported<T>(what: &str, span: Span) -> Result<T> {
 pub(in crate::jit) struct SpecializationPlan {
     pub(in crate::jit) inlines: Vec<specialize::Inline>,
     pub(in crate::jit) reads: Vec<reads::Read>,
-    pub(in crate::jit) shapes: Vec<shapes::Shape>,
+    pub(in crate::jit) shapes: shapes::Plan,
     pub(in crate::jit) numbers: Vec<(super::planner::Site, super::planner::ReadType)>,
     pub(in crate::jit) conditional: specialize::ConditionalPlan,
 }
@@ -1622,7 +1632,7 @@ pub(super) fn plan_canonical_with_budget(
     let reads = specialization.map_or_else(Vec::new, |(bodies, source)| {
         reads::plan(&graph, bodies, source)
     });
-    let shapes = specialization.map_or_else(Vec::new, |(bodies, source)| {
+    let shapes = specialization.map_or_else(shapes::Plan::default, |(bodies, source)| {
         shapes::plan(&graph, bodies, source)
     });
     let mut conditional = specialization
@@ -1675,7 +1685,6 @@ pub(super) fn optimize_planned(
     }
     caches::apply(&mut graph)?;
     reads::apply(&mut graph, &plan.reads, &mut notes)?;
-    shapes::apply(&mut graph, &plan.shapes, &mut notes)?;
     comparisons::expose(&mut graph);
     optimize::sink_closures(&mut graph, &mut notes);
     if optimize::lazy_captures(&mut graph, &mut notes) {
@@ -1720,6 +1729,7 @@ pub(super) fn optimize_planned(
         optimize::hoist(&mut graph, region, &mut notes);
         graph.verify()?;
     }
+    shapes::apply(&mut graph, &plan.shapes, &mut notes)?;
     optimize::views(&mut graph, &mut notes);
     comparisons::expose(&mut graph);
     graph.verify()?;

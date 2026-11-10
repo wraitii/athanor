@@ -473,14 +473,19 @@ impl Engine {
         &self,
         owner: u64,
         site: jit::planner::Site,
+        property: jit::planner::PropertyAccess,
         access: jit::planner::ShapeAccess,
     ) {
-        if !self.planner.borrow_mut().observe_shape(site, access) {
+        let Some(merged) = self
+            .planner
+            .borrow_mut()
+            .observe_shape(site, property, access)
+        else {
             return;
-        }
+        };
         self.log_recompilation(
             owner,
-            format_args!("shape feedback site={site} access={access:?}"),
+            format_args!("shape feedback site={site} {property:?} access={merged:?}"),
         );
         self.request_compilation(owner);
     }
@@ -1540,6 +1545,48 @@ mod feedback_tests {
             );
             assert_eq!(entry(&engine, code), original);
         }
+    }
+
+    #[test]
+    fn ineligible_method_feedback_keeps_the_existing_entry() {
+        let mut engine = new_engine().unwrap();
+        engine.compile(
+            "var object={run:function(x){return arguments[0];}};function invoke(x){return object.run(x);}",
+            "ineligible_method.js",
+        ).unwrap();
+        let code = code(&engine, "invoke");
+        let original = entry(&engine, code);
+        for _ in 0..3 {
+            assert_eq!(
+                engine
+                    .call("invoke", &[Value::number(7.0)])
+                    .unwrap()
+                    .value(),
+                Value::number(7.0)
+            );
+            assert_eq!(entry(&engine, code), original);
+        }
+    }
+
+    #[test]
+    fn shape_feedback_respecializes_property_reads() {
+        let mut engine = new_engine().unwrap();
+        engine.compile(
+            "var object={a:3,b:4};function read(){return object.a*object.b;}",
+            "shape_feedback.js",
+        ).unwrap();
+        let code = code(&engine, "read");
+        let original = entry(&engine, code);
+        let mut entries = Vec::new();
+        for _ in 0..4 {
+            assert_eq!(
+                engine.call("read", &[]).unwrap().value(),
+                Value::number(12.0)
+            );
+            entries.push(entry(&engine, code));
+        }
+        assert_ne!(entries[1], original);
+        assert!(entries[1..].windows(2).all(|pair| pair[0] == pair[1]));
     }
 
     #[test]

@@ -125,8 +125,8 @@ representation. Loop peeling could establish facts on the first iteration for a
 later specialized loop, but is not implemented here.
 
 Helper effect contracts let emission omit JS-exception checks for helpers that
-cannot throw. General receiver specialization and tiered
-compilation remain unimplemented.
+cannot throw. General receiver specialization remains unimplemented. Tiered
+compilation and feedback specialization are described in the semantic graph section below.
 
 `EngineOptions::ssa_opt` enables rewriting and defaults to true unless
 `JS_JIT_SSA=0`. `EngineOptions::ssa_dump` defaults to false unless
@@ -134,13 +134,13 @@ compilation remain unimplemented.
 to stderr. The existing IR listings show CLIF after cleanup when rewriting is
 enabled.
 
-Future compilation tiers can build on this boundary. Canonical semantic graphs
-of ordinary functions are retained separately from emitted bodies, as
-described below; canonical CLIF bodies are not retained. Runtime feedback would
-need stable operation-site IDs independent of CLIF entity IDs, and observed types
-would require runtime guards before becoming proven facts. Recompilation,
-entry-point replacement, on-stack replacement, and deoptimization remain future
-work.
+Compilation tiers build on this boundary. Canonical semantic graphs of ordinary
+functions are retained separately from emitted bodies; canonical CLIF bodies are
+not retained. Runtime feedback identifies semantic operation sites independently
+of CLIF entity IDs, and observed types require runtime guards before becoming
+proven facts. Feedback recompilation, entry-point replacement and on-stack
+replacement are implemented as described below. General deoptimization remains
+future work.
 
 ## Values, objects, and arrays
 
