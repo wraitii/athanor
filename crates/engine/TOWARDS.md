@@ -115,6 +115,18 @@ Distinguish program effects from compiler-pass accesses. A pass can declare that
 
 **4. Separate mechanisms from operation rules**
 
+Progressive lowering already happens within the semantic graph. In [arrays.rs](src/jit/semantic/arrays.rs), eligible `Array.map` calls expand behind native/receiver checks into an explicit loop, result allocation, element reads, callback calls and result writes, retaining the original call as fallback. Related array methods use the same machinery. Recognized `Array.push` calls become `ArrayAppend` operations and a resulting length, using guards for feedback-based recognition or the engine's fixed-method guarantee for directly proven array allocations. This exposes builtin work to ordinary graph optimization instead of leaving it hidden inside a call.
+
+These expansions are compiler-intrinsic behavior expressed as graph transformations. A builtin's general execution path and its specialized expansion implement the same operation under different established conditions. Recognition, guards and semantic rules justify the expansion; inlining, simplification and region analysis can then optimize its pieces. Generalizing this existing pattern is as important as moving later CLIF-emission decisions into the graph.
+
+The JIT already has much of the machinery behind treating runtime helpers and compiler intrinsics as implementations of known operations. [helpers.rs](src/jit/helpers.rs) defines helper identities, implementation pointers and ABI signature shapes. [effects.rs](src/jit/effects.rs) describes their reentry, reads/writes, allocation, errors, assumptions and temporary-stack effects. Separately, semantic operation contracts describe effects and result ownership using operand facts, while emission selects typed implementations or helper fallbacks. These are existing foundations to connect and generalize, rather than a new contract system to build from scratch.
+
+The intended distinction is between an operation's semantics and its implementation: a helper call can provide a general implementation, while specialization lowers proven cases into explicit graph operations. Helper bookkeeping such as retaining results, registering roots or updating error state must remain accounted for when replacing that call. ABI and temporary-stack details belong to the implementation contract; they should not become universal properties of every semantic operation.
+
+This also makes baseline and optimized compilation policies of the same compiler. A baseline policy can select general call implementations and perform only the lowering needed to emit executable code. An optimized policy can spend more time establishing assumptions, expanding operations, inlining callbacks and choosing specialized implementations. Both share operation semantics, correctness contracts and lowering machinery; feedback changes the available facts and the budget for exploiting them. Every policy must still discharge the guards, ownership and error-handling obligations of the implementations it selects.
+
+The current tiers already share substantial machinery. The intended architecture makes that continuity more explicit rather than introducing a separate semantic implementation for each tier. It does not by itself make baseline code generation cheap: Cranelift's allocation and emission costs remain, and a cheaper terminal lowering path would be a separate implementation choice.
+
 Retain a statically defined operation vocabulary initially. No plugin loader or dynamic ECS is necessary.
 
 Extract common interfaces for:
