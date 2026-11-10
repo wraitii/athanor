@@ -8,7 +8,11 @@ fn retarget(graph: &mut Graph, blocks: &HashSet<Block>, from: Value, to: Value) 
         for inst in graph.blocks[block].insts.clone() {
             if !matches!(
                 graph.insts[inst].op,
-                Op::IsNumber(_) | Op::AsNumber(_) | Op::IsInteger(_) | Op::AsInteger(_)
+                Op::IsNumber(_)
+                    | Op::AsNumber(_)
+                    | Op::IsInteger(_)
+                    | Op::AsInteger(_)
+                    | Op::AsObject(_)
             ) {
                 for value in graph.insts[inst].op.operands_mut() {
                     *value = resolve(&aliases, *value);
@@ -482,6 +486,7 @@ pub(super) fn apply_version(
     }
     graph.replace_uses(&replacements);
     let copied: HashSet<Block> = region.iter().copied().collect();
+    let mut objects: HashMap<Value, Value> = HashMap::new();
     for &block in guards {
         let Some(Terminator {
             source_name,
@@ -535,6 +540,14 @@ pub(super) fn apply_version(
             }
             _ => original.clone(),
         };
+        let shaped = match &test {
+            Some(Op::IsPropertyCached(object, _, name))
+                if !crate::heap::builtin_method(name) && graph.caller_rooted(*object) =>
+            {
+                Some(*object)
+            }
+            _ => None,
+        };
         let condition = test.map_or(condition, |op| {
             graph.append(current, span, op, true).1.unwrap()
         });
@@ -545,6 +558,21 @@ pub(super) fn apply_version(
             kind: TerminatorKind::Branch(condition, Target::new(next), otherwise),
         });
         current = next;
+        if let Some(object) = shaped
+            && !objects.contains_key(&object)
+        {
+            let alias = graph
+                .append(current, span, Op::AsObject(object), true)
+                .1
+                .unwrap();
+            objects.insert(object, alias);
+            retarget(graph, &copies, object, alias);
+            for arg in &mut args {
+                if *arg == object {
+                    *arg = alias;
+                }
+            }
+        }
     }
     for &(value, types) in checks {
         let checked = values.get(&value).copied().unwrap_or(value);

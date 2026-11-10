@@ -1515,6 +1515,43 @@ impl FunctionCompiler<'_, '_> {
         self.b.ins().band(initialized, hit)
     }
 
+    pub(super) fn property_shape_hit(
+        &mut self,
+        object: ClifValue,
+        address: ClifValue,
+    ) -> ClifValue {
+        let flags = MemFlagsData::trusted();
+        let view = self.view(object);
+        let shape = self.b.ins().load(types::I32, flags, view, SHAPE_OFFSET);
+        let expected = self
+            .b
+            .ins()
+            .load(types::I32, flags, address, CACHE_SHAPE_OFFSET);
+        let holder = self
+            .b
+            .ins()
+            .load(self.pointer, flags, address, CACHE_HOLDER_OFFSET);
+        let own = self.b.ins().icmp_imm_s(IntCC::Equal, holder, 0);
+        let holder = self.b.ins().select(own, view, holder);
+        let holder_shape = self.b.ins().load(types::I32, flags, holder, SHAPE_OFFSET);
+        let expected_holder =
+            self.b
+                .ins()
+                .load(types::I32, flags, address, CACHE_HOLDER_SHAPE_OFFSET);
+        let receiver_hit = self.b.ins().icmp(IntCC::Equal, shape, expected);
+        let holder_hit = self
+            .b
+            .ins()
+            .icmp(IntCC::Equal, holder_shape, expected_holder);
+        let hit = self.b.ins().band(receiver_hit, holder_hit);
+        let initialized = self
+            .b
+            .ins()
+            .load(types::I32, flags, address, CACHE_INITIALIZED_OFFSET);
+        let initialized = self.b.ins().icmp_imm_s(IntCC::NotEqual, initialized, 0);
+        self.b.ins().band(initialized, hit)
+    }
+
     pub(super) fn cached_property_load(
         &mut self,
         object: ClifValue,

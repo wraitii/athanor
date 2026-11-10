@@ -41,6 +41,7 @@ pub(crate) use arena::{
 };
 pub(crate) use array::HOLE;
 pub(crate) use natives::{MathFunction, NativeFunction};
+pub(crate) use object::builtin_method;
 pub use owned::OwnedValue;
 pub(crate) use properties::{PropertyAdditionCache, PropertyOverwriteCache, PropertyWriteCache};
 pub(crate) use regexp::regexp_flags;
@@ -200,6 +201,16 @@ impl Heap {
         let mut data = self.0.borrow_mut();
         for &value in owned {
             data.release(value);
+        }
+    }
+
+    pub(crate) fn release_frame(&self, values: &mut [Value]) {
+        let mut data = None;
+        for value in values {
+            let held = std::mem::replace(value, Value::UNDEFINED);
+            let Some(id) = heap_id(held) else { continue };
+            data.get_or_insert_with(|| self.0.borrow_mut())
+                .release_owned(id, held);
         }
     }
 
@@ -496,6 +507,16 @@ impl HeapData {
         };
         slot.references += 1;
         true
+    }
+
+    #[inline(always)]
+    fn release_owned(&mut self, id: u64, value: Value) {
+        let slot = self.slot_mut(id);
+        if slot.references > 1 {
+            slot.references -= 1;
+            return;
+        }
+        self.release(value);
     }
 
     fn release(&mut self, value: Value) {

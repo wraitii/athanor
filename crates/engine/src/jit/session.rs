@@ -437,8 +437,10 @@ impl<'a> JitCtx<'a> {
     }
 
     pub(crate) fn release_frame_locals(&mut self) {
-        self.global.heap().release_all(self.locals.frame());
-        self.locals.reset_frame();
+        let start = self.locals.start;
+        self.global
+            .heap()
+            .release_frame(&mut self.locals.values_mut()[start..]);
     }
 
     fn take_ownership(&mut self, value: Value) -> bool {

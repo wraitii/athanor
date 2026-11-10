@@ -347,6 +347,7 @@ pub(super) enum Op {
     StringSplitParts(Value, Vec<Value>),
     IsTypeof(Value, u8),
     AsNumber(Value),
+    AsObject(Value),
     EnterScope(Scope),
     EnterCaptures(Scope, Value),
     LeaveScope(Scope),
@@ -491,6 +492,7 @@ impl Op {
             | Op::IsString(value)
             | Op::IsStringSplit(value)
             | Op::IsTypeof(value, _)
+            | Op::AsObject(value)
             | Op::AsNumber(value) => ([Some(*value), None, None], &[]),
             Op::Define(object, _, value)
             | Op::DefineHidden(object, _, value)
@@ -621,6 +623,7 @@ impl Op {
             | Op::IsString(value)
             | Op::IsStringSplit(value)
             | Op::IsTypeof(value, _)
+            | Op::AsObject(value)
             | Op::AsNumber(value) => ([Some(value), None, None], &mut []),
             Op::Define(object, _, value)
             | Op::DefineHidden(object, _, value)
@@ -882,6 +885,14 @@ impl Graph {
         match self.values[value] {
             ValueDef::Result(inst) => Some(&self.insts[inst].op),
             ValueDef::Param(..) => None,
+        }
+    }
+
+    pub(super) fn caller_rooted(&self, value: Value) -> bool {
+        match self.defining_op(value) {
+            Some(Op::This | Op::Argument(_)) => true,
+            Some(Op::AsObject(source)) => self.caller_rooted(*source),
+            _ => false,
         }
     }
 
@@ -1224,6 +1235,7 @@ impl Graph {
             }
             Op::IsTypeof(..) => closed(HEAP_READ, &[], Unowned),
             Op::AsNumber(_) => closed(INTERNAL, &[], Unowned),
+            Op::AsObject(_) => closed(0, &[], Unowned),
             Op::EnterCaptures(..) => closed(HEAP_READ | INTERNAL | ERROR, &[], None),
             Op::EnterScope(scope) | Op::NextIteration(scope) | Op::FreshIteration(scope) => {
                 if self.materialized(*scope) {

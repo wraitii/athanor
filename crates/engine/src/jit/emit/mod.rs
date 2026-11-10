@@ -91,7 +91,7 @@ struct CallerFrame {
     floor: ClifValue,
 }
 
-const INLINE_FRAME_RELEASES: u32 = 4;
+const INLINE_FRAME_RELEASES: u32 = 0;
 
 fn data_base(b: &mut FunctionBuilder<'_>, pointer: Type, data: &FunctionData) -> ClifValue {
     let holder = b.ins().iconst(pointer, &raw const *data as i64);

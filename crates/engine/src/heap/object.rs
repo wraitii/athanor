@@ -20,6 +20,43 @@ pub(super) struct ObjectInfo {
 
 pub(super) const INLINE_PROPERTIES: usize = 8;
 
+pub(crate) fn builtin_method(name: &str) -> bool {
+    matches!(
+        name,
+        "fill"
+            | "test"
+            | "exec"
+            | "filter"
+            | "map"
+            | "every"
+            | "some"
+            | "find"
+            | "forEach"
+            | "at"
+            | "sort"
+            | "join"
+            | "pop"
+            | "indexOf"
+            | "concat"
+            | "push"
+            | "includes"
+            | "reverse"
+            | "slice"
+            | "flat"
+            | "flatMap"
+            | "match"
+            | "split"
+            | "startsWith"
+            | "replace"
+            | "padStart"
+            | "add"
+            | "has"
+            | "delete"
+            | "clear"
+            | "next"
+    )
+}
+
 #[repr(C)]
 pub(super) struct SmallObject {
     pub(super) values: [Value; INLINE_PROPERTIES],

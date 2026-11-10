@@ -309,7 +309,7 @@ impl FunctionCompiler<'_, '_> {
                     |value| {
                         facts.of(value).intersects(HEAP)
                             && !graph.borrowed.contains(&value)
-                            && !matches!(graph.defining_op(value), Some(Op::This | Op::Argument(_)))
+                            && !graph.caller_rooted(value)
                     },
                     |value| match graph.defining_op(value) {
                         Some(Op::Get(_, name)) => name != "length",
@@ -1091,7 +1091,7 @@ impl FunctionCompiler<'_, '_> {
                                     .bitcast(types::I64, MemFlagsData::new(), length),
                             )
                         }
-                        Op::AsNumber(value) => Some(get(self, *value)),
+                        Op::AsNumber(value) | Op::AsObject(value) => Some(get(self, *value)),
                         Op::IsInteger(_) | Op::AsInteger(_) => unreachable!(),
                         Op::ToInt32(_) => unreachable!(),
                         Op::ToNumeric(value) => {
@@ -1470,7 +1470,7 @@ impl FunctionCompiler<'_, '_> {
                 };
                 if let (Some(value), Some(result)) = (data.result, result) {
                     let result = self.convert(result, reprs[value]);
-                    let borrowed = (matches!(data.op, Op::This | Op::Argument(_))
+                    let borrowed = (graph.caller_rooted(value)
                         || graph.borrowed.contains(&value))
                         && !suspends;
                     if owned {
@@ -1778,7 +1778,11 @@ impl FunctionCompiler<'_, '_> {
                 let operand = self.operand(cx, *object);
                 let object = self.convert(operand, Repr::Boxed);
                 let address = self.property_cache(*site, name);
-                boolean(self.property_cache_hit(object, address))
+                if crate::heap::builtin_method(name) {
+                    boolean(self.property_cache_hit(object, address))
+                } else {
+                    boolean(self.property_shape_hit(object, address))
+                }
             }
             Op::IsNumber(value) => {
                 let operand = self.operand(cx, *value);

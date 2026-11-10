@@ -435,6 +435,7 @@ fn result_types(op: &Op, facts: &Facts) -> Types {
         Op::ArrayPosition(_) => Types::INT64,
         Op::ToInt32(_) => Types::INT32,
         Op::AsInteger(_) => Types::INT64,
+        Op::AsObject(_) => Types::OBJECT,
         Op::AsNumber(value) | Op::ToNumeric(value) | Op::Unary(UnaryOp::Plus, value)
             if facts.of(*value).within(Types::NUMBER) =>
         {

@@ -211,6 +211,7 @@ impl Graph {
             Op::StringSplit(receiver, args) => format!("string_split {receiver}({})", list(args)),
             Op::IsTypeof(value, kind) => format!("is_typeof {value} {kind}"),
             Op::AsNumber(value) => format!("as_number {value}"),
+            Op::AsObject(value) => format!("as_object {value}"),
             Op::EnterScope(scope) => format!("enter {scope}"),
             Op::EnterCaptures(scope, closure) => format!("enter_captures {scope}, {closure}"),
             Op::LeaveScope(scope) => format!("leave {scope}"),
