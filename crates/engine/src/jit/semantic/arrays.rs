@@ -330,7 +330,7 @@ pub(super) fn push_calls(
     bodies: &super::specialize::Repository,
     source: usize,
     notes: &mut Vec<String>,
-) -> Result<Vec<crate::jit::planner::Site>> {
+) -> Result<Vec<crate::jit::profile::Site>> {
     let mut sites = Vec::new();
     for block in Cfg::new(graph).rpo {
         for &inst in &graph.blocks[block].insts {
@@ -343,7 +343,7 @@ pub(super) fn push_calls(
             else {
                 continue;
             };
-            let site = crate::jit::planner::Site {
+            let site = crate::jit::profile::Site {
                 source: data.source_name.map_or(source, |name| name.0),
                 start: data.span.start,
                 end: data.span.end,

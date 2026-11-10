@@ -19,7 +19,7 @@ use crate::jit::helpers::{
     CACHE_HOLDER_OFFSET, CACHE_HOLDER_SHAPE_OFFSET, CACHE_INDEX_OFFSET, CACHE_INITIALIZED_OFFSET,
     CACHE_OVERWRITE_INDEX_OFFSET, CACHE_OVERWRITE_SHAPE_OFFSET, CACHE_SHAPE_OFFSET, HELPERS, Helper, PropertyCache,
 };
-use crate::jit::planner::{CallSite, Site};
+use crate::jit::profile::{CallSite, Site};
 use crate::jit::semantic::DirectTarget;
 use crate::jit::session::CALL_SITE_OFFSET;
 use crate::value::Value;
@@ -1345,7 +1345,7 @@ impl FunctionCompiler<'_, '_> {
         object: ClifValue,
         name: &str,
         retain: bool,
-        observer: Option<(u64, crate::jit::planner::Site)>,
+        observer: Option<(u64, crate::jit::profile::Site)>,
     ) -> ClifValue {
         self.cached_property_read(object, name, retain, false, observer)
     }
@@ -1360,7 +1360,7 @@ impl FunctionCompiler<'_, '_> {
         name: &str,
         retain: bool,
         probe: bool,
-        observer: Option<(u64, crate::jit::planner::Site)>,
+        observer: Option<(u64, crate::jit::profile::Site)>,
     ) -> ClifValue {
         let address = self.function_data(PropertyCache::new(name, observer));
         let flags = MemFlagsData::trusted();
@@ -1737,7 +1737,7 @@ impl FunctionCompiler<'_, '_> {
         object: ClifValue,
         name: &str,
         value: ClifValue,
-        observer: Option<(u64, crate::jit::planner::Site)>,
+        observer: Option<(u64, crate::jit::profile::Site)>,
     ) -> ClifValue {
         let address = self.function_data(PropertyCache::new(name, observer));
         let flags = MemFlagsData::trusted();
@@ -1824,7 +1824,7 @@ impl FunctionCompiler<'_, '_> {
         object: ClifValue,
         name: &str,
         value: Option<ClifValue>,
-        observer: Option<(u64, crate::jit::planner::Site)>,
+        observer: Option<(u64, crate::jit::profile::Site)>,
     ) -> ClifValue {
         if let Some(value) = value {
             return self.cached_property_set(object, name, value, observer);

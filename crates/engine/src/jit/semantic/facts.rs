@@ -5,10 +5,12 @@ use cranelift_codegen::entity::SecondaryMap;
 use oxc_syntax::operator::BinaryOperator;
 
 use super::super::effects::{Control, Memory};
+use super::guards;
 use super::{Block, Cfg, Constant, Graph, Inst, Op, TerminatorKind, UnaryOp, Value};
 use crate::heap::TypedKind;
+use cranelift_module::FuncId;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(in crate::jit) struct Types(u16);
 
 impl Types {
@@ -89,7 +91,37 @@ impl fmt::Display for Types {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::jit) enum Identity {
+    #[default]
+    Unset,
+    Code(FuncId),
+    Many,
+}
+
+impl Identity {
+    fn join(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Unset, other) | (other, Self::Unset) => other,
+            (left, right) if left == right => left,
+            _ => Self::Many,
+        }
+    }
+}
+
+struct Refinement {
+    block: Block,
+    mask: Option<Types>,
+    positive: bool,
+    identity: Option<FuncId>,
+}
+
 pub(in crate::jit) struct Facts {
+    cfg: Cfg,
+    refinements: HashMap<Value, Vec<Refinement>>,
+    probes: Vec<(String, Block, FuncId)>,
+    identities: SecondaryMap<Value, Identity>,
+    assumed: HashMap<Value, FuncId>,
     types: SecondaryMap<Value, Types>,
     indexed: HashSet<Value>,
     known: bool,
@@ -110,6 +142,38 @@ impl Facts {
         }
     }
 
+    pub(super) fn assumes(&self, value: Value) -> bool {
+        self.assumed.contains_key(&value)
+    }
+
+    pub(super) fn identity_at(&self, graph: &Graph, value: Value, block: Block) -> Identity {
+        if let Some(&code) = self.assumed.get(&value) {
+            return Identity::Code(code);
+        }
+        let mut identity = self.identities[value];
+        for refinement in self.refinements.get(&value).into_iter().flatten() {
+            if let Some(code) = refinement.identity
+                && self.cfg.dominates(refinement.block, block)
+            {
+                identity = identity.join(Identity::Code(code));
+            }
+        }
+        if let Some(Op::GlobalRead(name) | Op::ProbeGlobal(name)) = graph.defining_op(value) {
+            for (probed, entry, code) in &self.probes {
+                if probed == name && self.cfg.dominates(*entry, block) {
+                    identity = identity.join(Identity::Code(*code));
+                }
+            }
+        }
+        identity
+    }
+
+    pub(super) fn guarded_global(&self, name: &str, code: FuncId, block: Block) -> bool {
+        self.probes.iter().any(|(probed, entry, guarded)| {
+            probed == name && *guarded == code && self.cfg.dominates(*entry, block)
+        })
+    }
+
     pub(super) fn is_pure(&self, inst: Inst) -> bool {
         self.memory[inst].is_empty() && self.control[inst].is_empty()
     }
@@ -119,29 +183,40 @@ impl Facts {
     }
 
     pub(in crate::jit) fn compute(graph: &Graph) -> Self {
-        Self::assuming(graph, &HashMap::new())
+        Self::assuming(graph, &HashMap::new(), &HashMap::new())
     }
 
-    pub(super) fn assuming(graph: &Graph, assumptions: &HashMap<Value, Types>) -> Self {
+    pub(super) fn assuming(
+        graph: &Graph,
+        assumptions: &HashMap<Value, Types>,
+        identities: &HashMap<Value, FuncId>,
+    ) -> Self {
         let cfg = Cfg::new(graph);
         let steps = steps(graph, &cfg);
-        let mut refinements: HashMap<Value, Vec<(Block, Types, bool)>> = HashMap::new();
+        let mut refinements: HashMap<Value, Vec<Refinement>> = HashMap::new();
         for &block in &cfg.rpo {
             let Some(terminator) = &graph.blocks[block].terminator else {
                 continue;
             };
-            let Some((yes, value, mask)) = refined_edge(graph, &terminator.kind) else {
+            let Some(edge) = guards::edge_of(graph, &terminator.kind) else {
                 continue;
             };
             for target in terminator.kind.targets() {
                 // Dominance carries this edge's restriction only when the successor has no
                 // other entry path. The function entry also has an implicit incoming path.
                 if target.block != graph.entry && cfg.preds[target.block].len() == 1 {
-                    refinements.entry(value).or_default().push((
-                        target.block,
+                    let positive = target.block == edge.yes;
+                    let identity = edge.fact.code().filter(|_| positive);
+                    let mask = edge.fact.mask();
+                    if mask.is_none() && identity.is_none() {
+                        continue;
+                    }
+                    refinements.entry(edge.value).or_default().push(Refinement {
+                        block: target.block,
                         mask,
-                        target.block == yes,
-                    ));
+                        positive,
+                        identity,
+                    });
                 }
             }
         }
@@ -156,18 +231,46 @@ impl Facts {
                 .into_iter()
                 .flat_map(|target| &target.args)
             {
-                for &(entry, mask, positive) in refinements.get(arg).into_iter().flatten() {
-                    if cfg.dominates(entry, block) {
+                for refinement in refinements.get(arg).into_iter().flatten() {
+                    let Some(mask) = refinement.mask else {
+                        continue;
+                    };
+                    if cfg.dominates(refinement.block, block) {
                         edge_facts
                             .entry((block, *arg))
                             .or_default()
-                            .push((mask, positive));
+                            .push((mask, refinement.positive));
                     }
                 }
             }
         }
         let (indexed, reads) = super::string_split::result_facts(graph);
+        let mut probes = Vec::new();
+        for (&value, entries) in &refinements {
+            let Some(Op::ProbeGlobal(name)) = graph.defining_op(value) else {
+                continue;
+            };
+            for refinement in entries {
+                if let Some(code) = refinement.identity {
+                    probes.push((name.clone(), refinement.block, code));
+                }
+            }
+        }
+        let rpo = cfg.rpo.clone();
+        let marked: HashSet<Value> = graph
+            .insts
+            .values()
+            .filter_map(|data| match data.op {
+                Op::MarkClass(value) => Some(value),
+                _ => None,
+            })
+            .collect();
         let mut facts = Self {
+            cfg,
+            refinements,
+            probes,
+            identities: SecondaryMap::new(),
+            assumed: identities.clone(),
             types: SecondaryMap::new(),
             indexed,
             known: true,
@@ -180,10 +283,15 @@ impl Facts {
         let mut changed = true;
         while changed {
             changed = false;
-            for &block in &cfg.rpo {
+            for &block in &rpo {
                 for &inst in &graph.blocks[block].insts {
                     let data = &graph.insts[inst];
                     if let Some(result) = data.result {
+                        if let Op::Closure(_, target, _, false, _, _, _) = data.op
+                            && !marked.contains(&result)
+                        {
+                            changed |= facts.join_identity(result, Identity::Code(target));
+                        }
                         if assumptions.contains_key(&result) {
                             continue;
                         }
@@ -201,18 +309,28 @@ impl Facts {
                 let Some(terminator) = &graph.blocks[block].terminator else {
                     continue;
                 };
-                let refinement = refined_edge(graph, &terminator.kind);
+                let refinement = guards::edge_of(graph, &terminator.kind);
                 for target in terminator.kind.targets() {
                     for (&param, &arg) in graph.blocks[target.block].params.iter().zip(&target.args)
                     {
+                        let mut identity = facts.identity_at(graph, arg, block);
+                        if let Some(edge) = &refinement
+                            && edge.value == arg
+                            && target.block == edge.yes
+                            && let Some(code) = edge.fact.code()
+                        {
+                            identity = identity.join(Identity::Code(code));
+                        }
+                        changed |= facts.join_identity(param, identity);
                         if assumptions.contains_key(&param) {
                             continue;
                         }
                         let mut types = facts.of(arg);
-                        if let Some((yes, value, mask)) = refinement
-                            && value == arg
+                        if let Some(edge) = &refinement
+                            && edge.value == arg
+                            && let Some(mask) = edge.fact.mask()
                         {
-                            types = if target.block == yes {
+                            types = if target.block == edge.yes {
                                 Types(types.0 & mask.0)
                             } else {
                                 types.without(mask)
@@ -231,7 +349,7 @@ impl Facts {
                 }
             }
         }
-        for &block in &cfg.rpo {
+        for &block in &rpo {
             for &inst in &graph.blocks[block].insts {
                 let effects = graph.inst_contract(inst, &facts).effects;
                 facts.memory[inst] = effects.memory;
@@ -248,6 +366,15 @@ impl Facts {
                 .any(|&bound| self.of(bound).within(Types::INT32))
     }
 
+    fn join_identity(&mut self, value: Value, identity: Identity) -> bool {
+        let joined = self.identities[value].join(identity);
+        if joined == self.identities[value] {
+            return false;
+        }
+        self.identities[value] = joined;
+        true
+    }
+
     fn widen(&mut self, value: Value, types: Types) -> bool {
         let widened = self.types[value].union(types);
         if widened == self.types[value] {
@@ -256,29 +383,6 @@ impl Facts {
         self.types[value] = widened;
         true
     }
-}
-
-fn refined_edge(graph: &Graph, kind: &TerminatorKind) -> Option<(Block, Value, Types)> {
-    let TerminatorKind::Branch(condition, yes, no) = kind else {
-        return None;
-    };
-    if yes.block == no.block {
-        return None;
-    }
-    let (condition, yes) = match graph.defining_op(*condition)? {
-        Op::Unary(UnaryOp::Not, value) => (*value, no.block),
-        _ => (*condition, yes.block),
-    };
-    let (value, mask) = match *graph.defining_op(condition)? {
-        Op::IsUninitialized(value) => (value, Types::UNINITIALIZED),
-        Op::IsUndefined(value) => (value, Types::UNDEFINED),
-        Op::IsNullish(value) => (value, Types::UNDEFINED.union(Types::NULL)),
-        Op::IsString(value) => (value, Types::STRING),
-        Op::IsNumber(value) => (value, Types::NUMBER),
-        Op::IsInteger(value) => (value, Types::INTEGER),
-        _ => return None,
-    };
-    Some((yes, value, mask))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use cranelift_codegen::entity::SecondaryMap;
 use oxc_syntax::operator::BinaryOperator;
 
-use crate::jit::planner::{Observation, Site};
+use crate::jit::profile::{Observation, Site};
 
 use super::continuation::{Shape, liveness, unbox};
 use super::{
@@ -287,10 +287,6 @@ impl Plan {
             }
         }
         graph.cold.retain(|block| reachable.contains(block));
-        graph.closed_calls.retain(|inst, _| {
-            let block = graph.insts[*inst].block;
-            reachable.contains(&block) && graph.blocks[block].insts.contains(inst)
-        });
         graph.verify()?;
         Ok(graph)
     }
@@ -522,7 +518,7 @@ mod tests {
             .opportunities
             .iter()
             .find(|opportunity| {
-                opportunity.kind == Observation::Read(crate::jit::planner::ReadKind::Result)
+                opportunity.kind == Observation::Read(crate::jit::profile::ReadKind::Result)
                     && !candidate
                         .body
                         .contains(&graph.insts[opportunity.inst].block)
@@ -538,7 +534,7 @@ mod tests {
 
     #[test]
     fn extracted_inputs_keep_known_storage_and_numeric_hints() {
-        use crate::jit::planner::{ReadKind, ReadType};
+        use crate::jit::profile::{ReadKind, ReadType};
         let mut graph = graph(
             "function f(holder,x,n){const row=holder.row;let sum=0;for(let i=0;i<n;++i)sum+=row[i]*x;return sum;}",
         );
@@ -616,7 +612,7 @@ mod tests {
                 .any(|opportunity| opportunity.kind == Observation::Call)
         );
         assert!(opportunities.iter().any(|opportunity| opportunity.kind
-            == Observation::Read(crate::jit::planner::ReadKind::Receiver)));
+            == Observation::Read(crate::jit::profile::ReadKind::Receiver)));
         graph.verify().unwrap();
     }
 
@@ -655,7 +651,7 @@ mod tests {
             };
             repository.read_feedback.insert(
                 (opportunity.site, kind),
-                crate::jit::planner::ReadType::Array,
+                crate::jit::profile::ReadType::Array,
             );
         }
         let mut graph = graph;

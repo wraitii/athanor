@@ -219,7 +219,6 @@ impl RegionPlan {
                 bounds: &self.bounds,
                 typed_reads: &self.typed_reads,
                 code_guards: &self.identities,
-                closed_calls: &self.calls,
                 ..Default::default()
             };
             let version = apply_version(graph, &blocks, self.entry, &speculation, Some(canonical));
@@ -243,6 +242,7 @@ impl RegionPlan {
                 graph,
                 &version.body,
                 &Guarded::new(&self.requirements).with_code(&self.identities),
+                &HashMap::new(),
             ) {
                 return Err(format!("{label}: planned copy {reason}"));
             }
@@ -302,11 +302,11 @@ fn plan_region(
     let exits: Vec<_> = blocks
         .iter()
         .copied()
-        .filter(|&block| guard_fallback(graph, block).is_some())
+        .filter(|&block| cold_exit(graph, block).is_some())
         .collect();
     let fallbacks: HashSet<_> = exits
         .iter()
-        .filter_map(|&block| guard_fallback(graph, block))
+        .filter_map(|&block| cold_exit(graph, block))
         .collect();
     let written: HashSet<_> = body.difference(&fallbacks).copied().collect();
     let requirements = requirements(graph, &blocks);
@@ -335,18 +335,17 @@ fn plan_region(
     identities.sort_by(|a, b| a.0.cmp(&b.0));
     let guarded = Guarded::new(&requirements).with_code(&identities);
     let mut planning = graph.clone();
-    for call in &calls {
-        planning
-            .closed_calls
-            .insert(call.inst, (call.callee, call.memory, call.control));
-    }
+    let assumed: HashMap<Value, cranelift_module::FuncId> = calls
+        .iter()
+        .map(|call| (call.callee, call.target))
+        .collect();
     for requirement in &requirements {
         let Op::Call { args, .. } = &planning.insts[requirement.call].op else {
             unreachable!()
         };
         planning.insts[requirement.call].op = Op::CallNative(requirement.native, args.clone());
     }
-    if let Some(reason) = closure_failure(&planning, &written, &guarded) {
+    if let Some(reason) = closure_failure(&planning, &written, &guarded, &assumed) {
         return Err(reason);
     }
     let mut uses = planning.use_counts();
@@ -374,16 +373,23 @@ fn plan_region(
         }
         planning.remove_inst(inst);
     }
-    let reads = probe_reads(&planning, &body, &written, &blocks, entry.is_none());
+    let reads = probe_reads(
+        &planning,
+        &body,
+        &written,
+        &blocks,
+        entry.is_none(),
+        &assumed,
+    );
     let available: HashSet<_> = reads
         .iter()
         .filter_map(|&inst| planning.insts[inst].result)
         .collect();
-    let checks = entry_checks(&planning, &body, &blocks, &reads);
+    let checks = entry_checks(&planning, &body, &blocks, &reads, &assumed);
     let guards = invariant_guards(&planning, &body, &blocks, &reads);
     // Candidate facts must not narrow the original graph before its guards execute.
     let assumptions = checks.iter().copied().collect();
-    let facts = Facts::assuming(&planning, &assumptions);
+    let facts = Facts::assuming(&planning, &assumptions, &assumed);
     let objects = typed_objects(&planning, &body, &available, &facts);
     let typed: Vec<_> = objects
         .iter()
@@ -430,7 +436,7 @@ fn plan_region(
         && checks.is_empty()
         && guards.is_empty()
         && typed.is_empty()
-        && closure_failure(&planning, &body, &guarded).is_some()
+        && closure_failure(&planning, &body, &guarded, &assumed).is_some()
     {
         return Err("no invariant entry guards for reentrant fallbacks".into());
     }
@@ -565,7 +571,7 @@ mod tests {
 
     #[test]
     fn entry_numeric_observations_replace_copied_loop_observations() {
-        use crate::jit::planner::{Observation, ReadKind};
+        use crate::jit::profile::{Observation, ReadKind};
 
         let mut graph = graph(
             "function sum(point,n){let sum=0;for(let i=0;i<n;++i)sum+=point.x+i;return sum;}",
@@ -604,7 +610,7 @@ mod tests {
 
     #[test]
     fn observed_numeric_types_select_guarded_region_facts() {
-        use crate::jit::planner::{ReadKind, ReadType, Site};
+        use crate::jit::profile::{ReadKind, ReadType, Site};
         for observed in [ReadType::Integer, ReadType::Number] {
             let mut graph =
                 graph("function f(x,n){let sum=0;for(let i=0;i<n;++i)sum+=x+i;return sum;}");
@@ -650,7 +656,7 @@ mod tests {
 
     #[test]
     fn observed_storage_and_numbers_combine_for_bounded_integer_reads() {
-        use crate::jit::planner::{ReadKind, ReadType, Site};
+        use crate::jit::profile::{ReadKind, ReadType, Site};
         let graph = graph(
             "function f(x,offsets){let sum=0;for(let k=0;k<offsets.length;++k)sum+=(x+offsets[k])*1;return sum;}",
         );
@@ -709,7 +715,7 @@ mod tests {
     #[test]
     fn versioning_keeps_feedback_specialized_typed_reads() {
         use crate::heap::TypedKind;
-        use crate::jit::planner::{ReadKind, ReadType, Site};
+        use crate::jit::profile::{ReadKind, ReadType, Site};
 
         let graph = graph(
             "function f(xs,n){let sum=0;for(let i=0;i<n;++i)sum+=Math.floor(xs[i]);return sum;}",
@@ -849,7 +855,7 @@ mod tests {
 
     #[test]
     fn versioning_shares_repeated_typed_receiver_guards() {
-        use crate::jit::planner::{ReadKind, ReadType, Site};
+        use crate::jit::profile::{ReadKind, ReadType, Site};
 
         let graph = graph(
             "function f(xs,n){unknown();let sum=0;for(let i=0;i<n;++i)sum+=xs[i]+xs[i+1];return sum;}",
@@ -896,7 +902,7 @@ mod tests {
 
     #[test]
     fn nested_loop_continuations_survive_parent_pruning() {
-        use crate::jit::planner::{ReadKind, ReadType, Site};
+        use crate::jit::profile::{ReadKind, ReadType, Site};
 
         let graph = graph(
             "function f(rows,offsets,weights,points){unknown();let total=0;for(let y=0;y<points.length;++y){let base=points[y].x;for(let i=0;i<weights.length;++i){let x=base+offsets[i];if(x<0||x>=rows.length)continue;total+=rows[x][y]/weights[i];}}return total;}",

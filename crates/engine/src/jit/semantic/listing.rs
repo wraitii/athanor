@@ -418,7 +418,7 @@ impl Analysis {
             super::specialize::SPECIALIZATION_BODY_INSTS.saturating_mul(inline_multiplier)
         )
         .unwrap();
-        let relevant = |site: &crate::jit::planner::Site| {
+        let relevant = |site: &crate::jit::profile::Site| {
             site.source == source
                 && self.graph.span.start <= site.start
                 && site.end <= self.graph.span.end

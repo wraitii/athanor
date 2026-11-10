@@ -52,13 +52,13 @@ impl FunctionCompiler<'_, '_> {
     fn observe(
         &mut self,
         value: ClifValue,
-        mut site: crate::jit::planner::Site,
-        kind: crate::jit::planner::Observation,
+        mut site: crate::jit::profile::Site,
+        kind: crate::jit::profile::Observation,
     ) {
         let Some(feedback) = self.feedback else {
             return;
         };
-        use crate::jit::planner::Observation;
+        use crate::jit::profile::Observation;
         if !feedback.get_refinement && matches!(kind, Observation::Read(_)) {
             return;
         }
@@ -67,11 +67,11 @@ impl FunctionCompiler<'_, '_> {
         }
         let helper = match kind {
             Observation::Call => Helper::ObserveCall,
-            Observation::Read(crate::jit::planner::ReadKind::Result) => Helper::ObserveGet,
-            Observation::Read(crate::jit::planner::ReadKind::Receiver) => Helper::ObserveIndex,
-            Observation::Read(crate::jit::planner::ReadKind::Number) => Helper::ObserveNumber,
+            Observation::Read(crate::jit::profile::ReadKind::Result) => Helper::ObserveGet,
+            Observation::Read(crate::jit::profile::ReadKind::Receiver) => Helper::ObserveIndex,
+            Observation::Read(crate::jit::profile::ReadKind::Number) => Helper::ObserveNumber,
         };
-        let address = self.function_data(crate::jit::planner::ObservationCache {
+        let address = self.function_data(crate::jit::profile::ObservationCache {
             recorded: 0,
             owner: feedback.owner,
             site,
@@ -92,11 +92,11 @@ impl FunctionCompiler<'_, '_> {
     fn property_observer(
         &self,
         data: &crate::jit::semantic::InstData,
-    ) -> Option<(u64, crate::jit::planner::Site)> {
+    ) -> Option<(u64, crate::jit::profile::Site)> {
         let feedback = self.feedback.filter(|feedback| feedback.get_refinement)?;
         Some((
             feedback.owner,
-            crate::jit::planner::Site {
+            crate::jit::profile::Site {
                 source: data.source_name.map_or(self.source_name.0, |name| name.0),
                 start: data.span.start,
                 end: data.span.end,

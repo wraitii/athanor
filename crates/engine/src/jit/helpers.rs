@@ -717,49 +717,49 @@ extern "C" fn js_math_direct(
 }
 
 extern "C" fn js_observe_get(ctx: *mut JitCtx, value: Value, cache: u64) -> Value {
-    observe_read(ctx, value, cache, super::planner::ReadKind::Result)
+    observe_read(ctx, value, cache, super::profile::ReadKind::Result)
 }
 
 extern "C" fn js_observe_index(ctx: *mut JitCtx, value: Value, cache: u64) -> Value {
-    observe_read(ctx, value, cache, super::planner::ReadKind::Receiver)
+    observe_read(ctx, value, cache, super::profile::ReadKind::Receiver)
 }
 
 extern "C" fn js_observe_number(ctx: *mut JitCtx, value: Value, cache: u64) -> Value {
-    observe_read(ctx, value, cache, super::planner::ReadKind::Number)
+    observe_read(ctx, value, cache, super::profile::ReadKind::Number)
 }
 
 fn observe_read(
     ctx: *mut JitCtx,
     value: Value,
     cache: u64,
-    kind: super::planner::ReadKind,
+    kind: super::profile::ReadKind,
 ) -> Value {
     let context = unsafe { &*ctx };
-    let cache = unsafe { &mut *(cache as *mut super::planner::ObservationCache) };
+    let cache = unsafe { &mut *(cache as *mut super::profile::ObservationCache) };
     if cache.recorded == 0 {
         let heap = context.global.heap();
-        let observed = if kind == super::planner::ReadKind::Number {
+        let observed = if kind == super::profile::ReadKind::Number {
             value.as_number().map(|number| {
                 if number.abs() <= 9007199254740991.0
                     && number.trunc() == number
                     && !(number == 0.0 && number.is_sign_negative())
                 {
-                    super::planner::ReadType::Integer
+                    super::profile::ReadType::Integer
                 } else {
-                    super::planner::ReadType::Number
+                    super::profile::ReadType::Number
                 }
             })
         } else if heap.is_array(value) {
-            Some(super::planner::ReadType::Array)
+            Some(super::profile::ReadType::Array)
         } else {
-            heap.typed_kind(value).map(super::planner::ReadType::Typed)
+            heap.typed_kind(value).map(super::profile::ReadType::Typed)
         };
         if let Some(observed) = observed {
             context.engine.observe_get(cache, observed, kind);
         } else {
             context
                 .engine
-                .observe_get(cache, super::planner::ReadType::Unknown, kind);
+                .observe_get(cache, super::profile::ReadType::Unknown, kind);
         }
     }
     Value::UNDEFINED
@@ -767,7 +767,7 @@ fn observe_read(
 
 extern "C" fn js_observe_call(ctx: *mut JitCtx, callee: Value, cache: u64) -> Value {
     let context = unsafe { &*ctx };
-    let cache = unsafe { &mut *(cache as *mut super::planner::ObservationCache) };
+    let cache = unsafe { &mut *(cache as *mut super::profile::ObservationCache) };
     if cache.recorded == 0 {
         if let Some(code) = context.global.heap().closure_code(callee) {
             context.engine.observe_call(cache, code.0);

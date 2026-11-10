@@ -104,7 +104,7 @@ pub(super) fn version_string_leaves(
         let exits: Vec<_> = blocks
             .iter()
             .copied()
-            .filter(|&block| guard_fallback(graph, block).is_some())
+            .filter(|&block| cold_exit(graph, block).is_some())
             .collect();
         let exits_true: Vec<_> = blocks
             .iter()
@@ -157,7 +157,7 @@ pub(super) fn version_string_leaves(
         candidate.verify()?;
         let reachable: HashSet<_> = Cfg::new(&candidate).rpo.into_iter().collect();
         let copy: HashSet<_> = copy.intersection(&reachable).copied().collect();
-        if let Some(reason) = closure_failure(&candidate, &copy, &Guarded::default()) {
+        if let Some(reason) = closure_failure(&candidate, &copy, &Guarded::default(), &HashMap::new()) {
             notes.push(format!(
                 "string split continuation not versioned: guarded copy {reason}"
             ));
@@ -181,30 +181,15 @@ pub(super) fn version_string_leaves(
     Ok(regions)
 }
 
-fn guard_fallback(graph: &Graph, block: Block) -> Option<Block> {
+fn cold_exit(graph: &Graph, block: Block) -> Option<Block> {
     let Some(Terminator {
-        kind: TerminatorKind::Branch(condition, _, otherwise),
+        kind: TerminatorKind::Branch(_, _, otherwise),
         ..
     }) = &graph.blocks[block].terminator
     else {
         return None;
     };
-    let guard = matches!(
-        graph.defining_op(*condition),
-        Some(
-            Op::IsCode(..)
-                | Op::IsNumber(_)
-                | Op::IsInteger(_)
-                | Op::IsTyped(..)
-                | Op::IsIndexed(_)
-                | Op::IsArrayIndex(..)
-                | Op::IsPropertyCached(..)
-                | Op::IsShape(..)
-                | Op::IsArrayIteration(..)
-                | Op::IsStringSplit(_)
-        )
-    );
-    (guard && graph.cold.contains(&otherwise.block)).then_some(otherwise.block)
+    graph.cold.contains(&otherwise.block).then_some(otherwise.block)
 }
 
 fn invariant_guards(
@@ -222,7 +207,7 @@ fn invariant_guards(
     scan.iter()
         .copied()
         .filter(|&block| {
-            guard_fallback(graph, block).is_some()
+            cold_exit(graph, block).is_some()
                 && matches!(
                     &graph.blocks[block].terminator,
                     Some(Terminator { kind: TerminatorKind::Branch(condition, ..), .. })
@@ -263,7 +248,7 @@ pub(super) fn element_guess(graph: &Graph, object: Value) -> Option<TypedKind> {
         .iter()
         .flat_map(|(_, block)| block.insts.iter())
         .find_map(|&inst| match graph.insts[inst].op {
-            Op::ReadHint(value, _, crate::jit::planner::ReadType::Typed(element), _)
+            Op::ReadHint(value, _, crate::jit::profile::ReadType::Typed(element), _)
                 if value == object =>
             {
                 Some(element)
@@ -468,8 +453,9 @@ fn entry_checks(
     inside: &HashSet<Block>,
     scan: &[Block],
     probes: &[Inst],
+    assumed: &HashMap<Value, cranelift_module::FuncId>,
 ) -> Vec<(Value, Types)> {
-    let facts = Facts::compute(graph);
+    let facts = Facts::assuming(graph, &HashMap::new(), assumed);
     let probed: HashSet<Value> = probes
         .iter()
         .filter_map(|inst| graph.insts[*inst].result)
@@ -480,13 +466,13 @@ fn entry_checks(
         for &inst in &graph.blocks[block].insts {
             let op = &graph.insts[inst].op;
             for (index, value) in op.operands_iter().enumerate() {
-                let desired = if hints.get(&value) == Some(&crate::jit::planner::ReadType::Integer)
+                let desired = if hints.get(&value) == Some(&crate::jit::profile::ReadType::Integer)
                 {
                     Types::INTEGER
                 } else {
                     NUMERIC
                 };
-                if hints.get(&value) != Some(&crate::jit::planner::ReadType::Unknown)
+                if hints.get(&value) != Some(&crate::jit::profile::ReadType::Unknown)
                     && numeric_use(op, index)
                     && !facts.of(value).within(desired)
                     && (!inside.contains(&graph.def_block(value)) || probed.contains(&value))
@@ -502,7 +488,7 @@ fn entry_checks(
     checks
         .into_iter()
         .map(|value| {
-            let types = if hints.get(&value) == Some(&crate::jit::planner::ReadType::Integer) {
+            let types = if hints.get(&value) == Some(&crate::jit::profile::ReadType::Integer) {
                 Types::INT64
             } else {
                 Types::NUMBER
@@ -700,8 +686,9 @@ fn probe_reads(
     written: &HashSet<Block>,
     scan: &[Block],
     inputs: bool,
+    assumed: &HashMap<Value, cranelift_module::FuncId>,
 ) -> Vec<Inst> {
-    let writes = Writes::collect(graph, written);
+    let writes = Writes::collect_assuming(graph, written, assumed);
     let mut reads = Vec::new();
     let mut probed = HashSet::new();
     for &block in scan {

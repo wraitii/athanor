@@ -3,7 +3,7 @@ use std::cell::Cell;
 use crate::Engine;
 use crate::jit::entries::zeroed_cells;
 use crate::jit::helpers::HELPERS;
-use crate::jit::planner::CallSite;
+use crate::jit::profile::CallSite;
 
 use crate::environment::Environment;
 use crate::error::Error;

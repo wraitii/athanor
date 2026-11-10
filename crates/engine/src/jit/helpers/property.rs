@@ -1,5 +1,5 @@
 use super::*;
-use crate::jit::planner::{PropertyAccess, ShapeAccess};
+use crate::jit::profile::{PropertyAccess, ShapeAccess};
 
 #[repr(C)]
 pub(crate) struct GlobalCache {
@@ -172,7 +172,7 @@ pub(crate) struct PropertyCache {
     pub(crate) builtin_value: u64,
     pub(crate) name: Box<str>,
     write: crate::heap::PropertyWriteCache,
-    observer: Option<(u64, crate::jit::planner::Site)>,
+    observer: Option<(u64, crate::jit::profile::Site)>,
     reported: Option<ShapeAccess>,
 }
 
@@ -205,7 +205,7 @@ pub(crate) const CACHE_OVERWRITE_INDEX_OFFSET: i32 =
     CACHE_OVERWRITE_OFFSET + std::mem::offset_of!(crate::heap::PropertyOverwriteCache, index) as i32;
 
 impl PropertyCache {
-    pub(crate) fn new(name: &str, observer: Option<(u64, crate::jit::planner::Site)>) -> Self {
+    pub(crate) fn new(name: &str, observer: Option<(u64, crate::jit::profile::Site)>) -> Self {
         Self {
             initialized: 0,
             shape: crate::heap::DICTIONARY,

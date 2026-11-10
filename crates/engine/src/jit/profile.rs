@@ -116,7 +116,7 @@ impl CallProfile {
 }
 
 #[derive(Default)]
-pub(crate) struct Planner {
+pub(crate) struct Profile {
     calls: FxHashMap<*const CallSite, (Site, CallProfile)>,
     targets: HashMap<Site, u64>,
     natives: HashMap<Site, crate::heap::NativeFunction>,
@@ -124,11 +124,15 @@ pub(crate) struct Planner {
     reads: HashMap<(Site, ReadKind), ReadType>,
     observed_reads: HashSet<(u64, Site, ReadKind)>,
     shapes: HashMap<(Site, PropertyAccess), ShapeAccess>,
+}
+
+#[derive(Default)]
+pub(crate) struct Recompiles {
     pending: Vec<bool>,
     pending_count: usize,
 }
 
-impl Planner {
+impl Profile {
     pub(crate) fn observe(&mut self, owner: u64, site: Site, target: u64) -> bool {
         if !self.observed.insert((owner, site)) {
             return false;
@@ -193,29 +197,6 @@ impl Planner {
         self.reads.iter().map(|(&site, &element)| (site, element))
     }
 
-    pub(crate) fn take(&mut self, owner: u64) -> bool {
-        let pending = self
-            .pending
-            .get_mut(owner as usize)
-            .is_some_and(|pending| std::mem::replace(pending, false));
-        self.pending_count -= usize::from(pending);
-        pending
-    }
-
-    pub(crate) fn request(&mut self, owner: u64) -> bool {
-        let owner = owner as usize;
-        self.pending
-            .resize(self.pending.len().max(owner + 1), false);
-        let requested = !self.pending[owner];
-        self.pending_count += usize::from(requested);
-        self.pending[owner] = true;
-        requested
-    }
-
-    pub(crate) fn has_pending(&self) -> bool {
-        self.pending_count != 0
-    }
-
     pub(crate) fn record_call(&mut self, site: &CallSite, code_word: u64, count: u64) {
         let (_, profile) = self
             .calls
@@ -245,5 +226,30 @@ impl Planner {
 
     pub(super) fn targets(&self) -> impl Iterator<Item = (Site, u64)> + '_ {
         self.targets.iter().map(|(&site, &target)| (site, target))
+    }
+}
+
+impl Recompiles {
+    pub(crate) fn take(&mut self, owner: u64) -> bool {
+        let pending = self
+            .pending
+            .get_mut(owner as usize)
+            .is_some_and(|pending| std::mem::replace(pending, false));
+        self.pending_count -= usize::from(pending);
+        pending
+    }
+
+    pub(crate) fn request(&mut self, owner: u64) -> bool {
+        let owner = owner as usize;
+        self.pending
+            .resize(self.pending.len().max(owner + 1), false);
+        let requested = !self.pending[owner];
+        self.pending_count += usize::from(requested);
+        self.pending[owner] = true;
+        requested
+    }
+
+    pub(crate) fn has_pending(&self) -> bool {
+        self.pending_count != 0
     }
 }

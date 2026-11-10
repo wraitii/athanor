@@ -180,8 +180,8 @@ impl Compiler {
         owner: u64,
     ) -> Option<(
         *const super::osr::Site,
-        super::planner::Site,
-        super::planner::ReadKind,
+        super::profile::Site,
+        super::profile::ReadKind,
     )> {
         self.data
             .iter()
@@ -194,7 +194,7 @@ impl Compiler {
                     .opportunities
                     .iter()
                     .find_map(|opportunity| {
-                        let super::planner::Observation::Read(kind) = opportunity.kind else {
+                        let super::profile::Observation::Read(kind) = opportunity.kind else {
                             return None;
                         };
                         Some((site as *const _, opportunity.site, kind))
@@ -1023,45 +1023,45 @@ impl Compiler {
         Ok(())
     }
 
-    pub(crate) fn update_feedback(&mut self, planner: &super::planner::Planner) {
-        if planner.targets().all(|(site, target)| {
+    pub(crate) fn update_feedback(&mut self, profile: &super::Profile) {
+        if profile.targets().all(|(site, target)| {
             u32::try_from(target).map_or(true, |target| {
                 self.canonical.feedback.get(&site) == Some(&FuncId::from_u32(target))
             })
-        }) && planner
+        }) && profile
             .natives()
             .all(|(site, target)| self.canonical.native_feedback.get(&site) == Some(&target))
             && (!self.get_refinement
-                || planner.reads().all(|(site, observed)| {
+                || profile.reads().all(|(site, observed)| {
                     self.canonical.read_feedback.get(&site) == Some(&observed)
                 })
-                && planner.shapes().all(|(site, access)| {
+                && profile.shapes().all(|(site, access)| {
                     self.canonical.shape_feedback.get(&site) == Some(&access)
                 }))
         {
             return;
         }
         let canonical = Arc::make_mut(&mut self.canonical);
-        for (site, target) in planner.targets() {
+        for (site, target) in profile.targets() {
             if let Ok(target) = u32::try_from(target) {
                 canonical.feedback.insert(site, FuncId::from_u32(target));
             }
         }
-        for (site, target) in planner.natives() {
+        for (site, target) in profile.natives() {
             canonical.native_feedback.insert(site, target);
         }
         if self.get_refinement {
-            for (site, element) in planner.reads() {
+            for (site, element) in profile.reads() {
                 canonical.read_feedback.insert(site, element);
             }
-            for (site, access) in planner.shapes() {
+            for (site, access) in profile.shapes() {
                 canonical.shape_feedback.insert(site, access);
             }
         }
     }
 
-    pub(crate) fn call_profile(&self, planner: &super::Planner) -> String {
-        let mut sites = planner.calls();
+    pub(crate) fn call_profile(&self, profile: &super::Profile) -> String {
+        let mut sites = profile.calls();
         sites.sort_by_key(|(_, profile)| std::cmp::Reverse(profile.calls()));
         let total: u64 = sites.iter().map(|(_, profile)| profile.calls()).sum();
         let guarded: u64 = sites.iter().map(|(_, profile)| profile.guarded).sum();

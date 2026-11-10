@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::jit::planner::{Observation, ReadKind, ReadType, Site};
+use crate::jit::profile::{Observation, ReadKind, ReadType, Site};
 
 use super::{Cfg, Facts, Graph, Op, Types, specialize::Repository};
 

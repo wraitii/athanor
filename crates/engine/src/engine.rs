@@ -108,7 +108,8 @@ pub struct Engine {
     recompile_log: jit::recompile::Log,
     prefetch_stats: RefCell<PrefetchStats>,
     compiler: RefCell<Compiler>,
-    planner: RefCell<jit::Planner>,
+    profile: RefCell<jit::Profile>,
+    recompiles: RefCell<jit::Recompiles>,
     random_state: Cell<u64>,
     global: Environment,
     functions: RefCell<HashMap<String, Function>>,
@@ -146,7 +147,7 @@ impl Drop for Engine {
         if self.options.call_profile {
             eprint!(
                 "{}",
-                self.compiler.borrow().call_profile(&self.planner.borrow())
+                self.compiler.borrow().call_profile(&self.profile.borrow())
             );
         }
     }
@@ -343,7 +344,8 @@ impl Engine {
                 state_address,
                 recompile_log,
             )?),
-            planner: RefCell::new(jit::Planner::default()),
+            profile: RefCell::new(jit::Profile::default()),
+            recompiles: RefCell::new(jit::Recompiles::default()),
             random_state: Cell::new(0x330e),
             global,
             functions: RefCell::new(HashMap::new()),
@@ -393,10 +395,10 @@ impl Engine {
 
     pub(crate) fn record_calls<'s>(
         &self,
-        samples: impl Iterator<Item = (&'s jit::planner::CallSite, u64)>,
+        samples: impl Iterator<Item = (&'s jit::profile::CallSite, u64)>,
     ) {
-        let mut planner = self.planner.borrow_mut();
-        let mut run: Option<(&jit::planner::CallSite, u64, u64)> = None;
+        let mut profile = self.profile.borrow_mut();
+        let mut run: Option<(&jit::profile::CallSite, u64, u64)> = None;
         for (site, code) in samples {
             match &mut run {
                 Some((last, last_code, count))
@@ -406,19 +408,19 @@ impl Engine {
                 }
                 _ => {
                     if let Some((last, last_code, count)) = run.replace((site, code, 1)) {
-                        planner.record_call(last, last_code, count);
+                        profile.record_call(last, last_code, count);
                     }
                 }
             }
         }
         if let Some((site, code, count)) = run {
-            planner.record_call(site, code, count);
+            profile.record_call(site, code, count);
         }
     }
 
-    pub(crate) fn observe_call(&self, cache: &mut jit::planner::ObservationCache, target: u64) {
+    pub(crate) fn observe_call(&self, cache: &mut jit::profile::ObservationCache, target: u64) {
         let observed = self
-            .planner
+            .profile
             .borrow_mut()
             .observe(cache.owner, cache.site, target);
         if observed {
@@ -433,11 +435,11 @@ impl Engine {
 
     pub(crate) fn observe_native(
         &self,
-        cache: &mut jit::planner::ObservationCache,
+        cache: &mut jit::profile::ObservationCache,
         target: crate::heap::NativeFunction,
     ) {
         let observed = self
-            .planner
+            .profile
             .borrow_mut()
             .observe_native(cache.owner, cache.site, target);
         if observed {
@@ -448,15 +450,15 @@ impl Engine {
 
     pub(crate) fn observe_get(
         &self,
-        cache: &mut jit::planner::ObservationCache,
-        observed: jit::planner::ReadType,
-        kind: jit::planner::ReadKind,
+        cache: &mut jit::profile::ObservationCache,
+        observed: jit::profile::ReadType,
+        kind: jit::profile::ReadKind,
     ) {
         let recorded =
-            self.planner
+            self.profile
                 .borrow_mut()
                 .observe_get(cache.owner, cache.site, kind, observed);
-        if recorded && observed != jit::planner::ReadType::Unknown {
+        if recorded && observed != jit::profile::ReadType::Unknown {
             self.log_recompilation(
                 cache.owner,
                 format_args!(
@@ -472,12 +474,12 @@ impl Engine {
     pub(crate) fn observe_shape(
         &self,
         owner: u64,
-        site: jit::planner::Site,
-        property: jit::planner::PropertyAccess,
-        access: jit::planner::ShapeAccess,
+        site: jit::profile::Site,
+        property: jit::profile::PropertyAccess,
+        access: jit::profile::ShapeAccess,
     ) {
         let Some(merged) = self
-            .planner
+            .profile
             .borrow_mut()
             .observe_shape(site, property, access)
         else {
@@ -491,7 +493,7 @@ impl Engine {
     }
 
     fn request_compilation(&self, code: u64) {
-        if self.planner.borrow_mut().request(code) && self.recompile_log.enabled() {
+        if self.recompiles.borrow_mut().request(code) && self.recompile_log.enabled() {
             let compiling = self.worker.borrow().as_ref().is_some_and(|worker| {
                 worker
                     .in_flight
@@ -538,9 +540,9 @@ impl Engine {
 
     pub(crate) fn entry(&self, code: u64) -> Result<Option<jit::entries::Entry>, Error> {
         self.poll_compilation();
-        if !self.options.background_compile && self.planner.borrow_mut().take(code) {
+        if !self.options.background_compile && self.recompiles.borrow_mut().take(code) {
             let mut compiler = self.compiler.borrow_mut();
-            compiler.update_feedback(&self.planner.borrow());
+            compiler.update_feedback(&self.profile.borrow());
             let previous = self.code.borrow().get(code as usize).copied().flatten();
             if let Some(previous) = previous
                 && let Some(job) = compiler.recompilation(code, previous)
@@ -738,11 +740,11 @@ impl Engine {
         }) {
             return;
         }
-        if !self.planner.borrow_mut().take(code) {
+        if !self.recompiles.borrow_mut().take(code) {
             return;
         }
         self.direct.set_pending(code, false);
-        if !self.planner.borrow().has_pending() {
+        if !self.recompiles.borrow().has_pending() {
             self.compilation_state
                 .fetch_and(!jit::recompile::REQUESTED, Ordering::Relaxed);
         }
@@ -750,7 +752,7 @@ impl Engine {
             return;
         };
         let mut compiler = self.compiler.borrow_mut();
-        compiler.update_feedback(&self.planner.borrow());
+        compiler.update_feedback(&self.profile.borrow());
         let Some(job) = compiler.recompilation(code, previous) else {
             return;
         };
@@ -807,7 +809,7 @@ impl Engine {
         }
         let job = {
             let mut compiler = self.compiler.borrow_mut();
-            compiler.update_feedback(&self.planner.borrow());
+            compiler.update_feedback(&self.profile.borrow());
             compiler.osr_compilation(site)
         };
         let Some(job) = job else { return 0 };
@@ -1827,7 +1829,7 @@ mod feedback_tests {
                 Value::number(2.0)
             );
             assert_eq!(entry(&engine, read_code), original);
-            assert!(!engine.planner.borrow_mut().take(read_code));
+            assert!(!engine.recompiles.borrow_mut().take(read_code));
         }
         let invoke_code = code(&engine, "invoke");
         let original = entry(&engine, invoke_code);
@@ -1860,7 +1862,7 @@ mod feedback_tests {
             assert_eq!(engine.call("run", &[]).unwrap().value(), Value::number(9.0));
         }
         assert_eq!(entry(&engine, code), original);
-        assert!(!engine.planner.borrow_mut().take(code));
+        assert!(!engine.recompiles.borrow_mut().take(code));
     }
 
     fn background_engine() -> Engine {
@@ -2046,12 +2048,12 @@ mod feedback_tests {
         entry(&engine, code);
         let (site, location, kind) = engine.compiler.borrow().osr_read_site(code).unwrap();
         let site = unsafe { &*site };
-        let mut cache = jit::planner::ObservationCache {
+        let mut cache = jit::profile::ObservationCache {
             recorded: 0,
             owner: code,
             site: location,
         };
-        engine.observe_get(&mut cache, jit::planner::ReadType::Array, kind);
+        engine.observe_get(&mut cache, jit::profile::ReadType::Array, kind);
         assert!(!engine.direct.warmed(code));
         site.entries.set(jit::osr::TICK);
         engine.osr_entry(site);
@@ -2498,9 +2500,9 @@ mod feedback_tests {
             engine.submit_compilation(code);
         }
         assert_eq!(engine.worker.borrow().as_ref().unwrap().in_flight.len(), 1);
-        assert!(engine.planner.borrow().has_pending());
+        assert!(engine.recompiles.borrow().has_pending());
         finish_compilation(&engine);
-        assert!(!engine.planner.borrow().has_pending());
+        assert!(!engine.recompiles.borrow().has_pending());
         assert_eq!(
             engine.call("read", &[holder]).unwrap().value(),
             Value::number(3.0)

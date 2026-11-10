@@ -1,5 +1,6 @@
-use crate::jit::planner::{Observation, ReadKind};
+use crate::jit::profile::{Observation, ReadKind};
 
+use super::super::guards::{Fact, edge_of, implies};
 use super::*;
 
 fn retarget(graph: &mut Graph, blocks: &HashSet<Block>, from: Value, to: Value) {
@@ -41,31 +42,18 @@ pub(super) struct Speculation<'a> {
     pub(super) typed_reads: &'a [(Inst, TypedRead)],
     pub(super) checks: &'a [(Value, Types)],
     pub(super) code_guards: &'a [(String, cranelift_module::FuncId)],
-    pub(super) closed_calls: &'a [super::super::specialize::ConditionalCall],
 }
 
 #[derive(PartialEq, Eq, Hash)]
 enum EntryGuard {
-    Code(Value, cranelift_module::FuncId),
-    Number(Value),
-    Integer(Value),
-    Typed(Value, Option<TypedKind>),
-    Indexed(Value),
-    Shape(Value, u32),
+    Fact(Value, Fact),
     Value(Value),
 }
 
 impl EntryGuard {
     fn of(op: &Op) -> Option<Self> {
-        match *op {
-            Op::IsCode(value, code) => Some(Self::Code(value, code)),
-            Op::IsNumber(value) => Some(Self::Number(value)),
-            Op::IsInteger(value) => Some(Self::Integer(value)),
-            Op::IsTyped(value, element) => Some(Self::Typed(value, element)),
-            Op::IsIndexed(value) => Some(Self::Indexed(value)),
-            Op::IsShape(value, shape) => Some(Self::Shape(value, shape)),
-            _ => None,
-        }
+        let (value, fact) = implies(op)?;
+        Some(Self::Fact(value, fact))
     }
 
     fn at_entry(graph: &Graph, entry: Block) -> HashSet<Self> {
@@ -74,18 +62,11 @@ impl EntryGuard {
         cfg.rpo
             .iter()
             .filter_map(|&block| {
-                let TerminatorKind::Branch(condition, yes, no) =
-                    &graph.blocks[block].terminator.as_ref()?.kind
-                else {
-                    return None;
-                };
-                if yes.block == no.block
-                    || cfg.preds[yes.block].len() != 1
-                    || !cfg.dominates(yes.block, entry)
-                {
+                let edge = edge_of(graph, &graph.blocks[block].terminator.as_ref()?.kind)?;
+                if cfg.preds[edge.yes].len() != 1 || !cfg.dominates(edge.yes, entry) {
                     return None;
                 }
-                Self::of(graph.defining_op(*condition)?)
+                Some(Self::Fact(edge.value, edge.fact))
             })
             .collect()
     }
@@ -163,7 +144,6 @@ pub(super) fn apply_version(
         typed_reads,
         checks,
         code_guards,
-        closed_calls,
     } = *speculation;
     let local_generic = canonical.is_none().then(|| graph.clone());
     let local_canonical = local_generic.as_ref().map(Canonical::identity);
@@ -215,20 +195,6 @@ pub(super) fn apply_version(
             if let (Some(old), Some(new)) = (data.result, result) {
                 values.insert(old, new);
             }
-            let effects = closed_calls
-                .iter()
-                .find(|call| call.inst == inst)
-                .map(|call| (call.memory, call.control))
-                .or_else(|| {
-                    graph.closed_calls.get(&inst)
-                        .filter(|(expected, ..)| matches!(graph.insts[inst].op, Op::Call { callee, .. } if callee == *expected))
-                        .map(|(_, memory, control)| (*memory, *control))
-                });
-            if let Some((memory, control)) = effects
-                && let Op::Call { callee, .. } = graph.insts[copy].op
-            {
-                graph.closed_calls.insert(copy, (callee, memory, control));
-            }
             insts.insert(inst, copy);
         }
         let mut terminator = graph.blocks[block].terminator.clone().unwrap();
@@ -248,7 +214,7 @@ pub(super) fn apply_version(
         if guards.contains(&block) {
             continue;
         }
-        let fallback = guard_fallback(graph, block).unwrap();
+        let fallback = cold_exit(graph, block).unwrap();
         let terminator = graph.blocks[blocks[&block]].terminator.as_mut().unwrap();
         let TerminatorKind::Branch(_, _, otherwise) = &mut terminator.kind else {
             unreachable!();
@@ -581,11 +547,14 @@ pub(super) fn apply_version(
     }
     for &(value, types) in checks {
         let checked = values.get(&value).copied().unwrap_or(value);
-        let guard = if types == Types::INT64 {
-            EntryGuard::Integer(checked)
-        } else {
-            EntryGuard::Number(checked)
-        };
+        let guard = EntryGuard::Fact(
+            checked,
+            Fact::Type(if types == Types::INT64 {
+                Types::INTEGER
+            } else {
+                Types::NUMBER
+            }),
+        );
         if !tested.insert(guard) {
             continue;
         }
@@ -661,11 +630,11 @@ pub(super) fn apply_version(
         if element.is_none()
             && tested
                 .iter()
-                .any(|known| matches!(known, EntryGuard::Typed(value, _) if *value == guard.0))
+                .any(|known| matches!(known, EntryGuard::Fact(value, Fact::Typed(_)) if *value == guard.0))
         {
             continue;
         }
-        if tested.insert(EntryGuard::Typed(guard.0, element)) {
+        if tested.insert(EntryGuard::Fact(guard.0, Fact::Typed(element))) {
             mapped_typed.push(guard);
         }
     }
@@ -1027,12 +996,6 @@ pub(in crate::jit::semantic) fn repair(graph: &mut Graph, values: &HashMap<Value
                     *value = repair.entering(graph, block, *value);
                 }
             }
-            if let Some((expected, ..)) = graph.closed_calls.get_mut(&inst)
-                && matches!(graph.insts[inst].op, Op::Call { callee, .. } if callee == *expected)
-                && let Op::Call { callee, .. } = &op
-            {
-                *expected = *callee;
-            }
             graph.insts[inst].op = op;
         }
         let mut reaching = HashMap::new();
@@ -1197,7 +1160,7 @@ mod tests {
         };
         *test = condition;
         let (yes, no) = (yes.block, no.block);
-        let proof = EntryGuard::Typed(xs, Some(TypedKind::Float32));
+        let proof = EntryGuard::Fact(xs, Fact::Typed(Some(TypedKind::Float32)));
         assert!(EntryGuard::at_entry(&graph, yes).contains(&proof));
         assert!(!EntryGuard::at_entry(&graph, no).contains(&proof));
         assert!(!EntryGuard::at_entry(&graph, branch).contains(&proof));

@@ -209,12 +209,6 @@ fn extract(graph: &Graph, target: Target, facts: &Facts) -> super::Result<(Graph
         }
     }
     result.cold.retain(|block| reachable.contains(block));
-    result.closed_calls.retain(|inst, _| {
-        reachable.contains(&result.insts[*inst].block)
-            && result.blocks[result.insts[*inst].block]
-                .insts
-                .contains(inst)
-    });
     result.verify()?;
     Ok((result, inputs))
 }

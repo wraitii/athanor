@@ -8,6 +8,7 @@ mod comparisons;
 mod construction;
 pub(in crate::jit) mod continuation;
 pub(in crate::jit) mod facts;
+mod guards;
 mod inlining;
 mod listing;
 mod typed_lowering;
@@ -38,7 +39,7 @@ use super::math::METHODS;
 use crate::heap::TypedKind;
 
 pub(super) use borrow::receiver as borrowed_receiver;
-pub(super) use facts::{Facts, Types};
+pub(super) use facts::{Facts, Identity, Types};
 pub(super) use ids::{Binding, Block, Inst, RegionId, Scope, Value};
 pub(in crate::jit) use listing::ListingLine;
 #[cfg(test)]
@@ -74,6 +75,13 @@ mod ids {
 }
 
 #[derive(Clone)]
+pub(in crate::jit) struct CallSummary {
+    pub(super) memory: Memory,
+    pub(super) control: Control,
+    pub(super) requires: Vec<(String, cranelift_module::FuncId)>,
+}
+
+#[derive(Clone)]
 pub(super) struct Graph {
     pub(super) name: String,
     pub(super) span: Span,
@@ -82,7 +90,7 @@ pub(super) struct Graph {
     pub(in crate::jit) guards: usize,
     pub(in crate::jit) views: HashMap<Inst, Value>,
     pub(in crate::jit) borrowed: HashSet<Value>,
-    closed_calls: HashMap<Inst, (Value, Memory, Control)>,
+    pub(in crate::jit) summaries: std::sync::Arc<HashMap<cranelift_module::FuncId, CallSummary>>,
     pub(in crate::jit) cold: HashSet<Block>,
     pub(super) lazy_captures: HashSet<Binding>,
     pub(super) generator: bool,
@@ -230,12 +238,12 @@ pub(in crate::jit) struct DirectTarget {
 
 #[derive(Clone, Debug)]
 pub(super) enum Op {
-    Observe(Value, super::planner::Observation, super::planner::Site),
+    Observe(Value, super::profile::Observation, super::profile::Site),
     ReadHint(
         Value,
-        super::planner::ReadKind,
-        super::planner::ReadType,
-        super::planner::Site,
+        super::profile::ReadKind,
+        super::profile::ReadType,
+        super::profile::Site,
     ),
     OsrStart(std::sync::Arc<osr::Plan>, usize, Vec<Value>),
     Continuation(std::sync::Arc<continuation::Body>, Vec<Value>),
@@ -999,9 +1007,6 @@ impl Graph {
         if aliases.is_empty() {
             return;
         }
-        for (callee, ..) in self.closed_calls.values_mut() {
-            *callee = resolve(aliases, *callee);
-        }
         for data in self.insts.values_mut() {
             for value in data.op.operands_mut() {
                 *value = resolve(aliases, *value);
@@ -1056,14 +1061,30 @@ impl Graph {
     fn inst_contract(&self, inst: Inst, facts: &Facts) -> Contract {
         let op = &self.insts[inst].op;
         let mut contract = self.contract(op, facts);
-        if let (Op::Call { callee, .. }, Some((expected, memory, control))) =
-            (op, self.closed_calls.get(&inst))
-            && callee == expected
+        if let Op::Call { callee, .. } = op
+            && let Some(summary) = self.call_summary(inst, *callee, facts)
         {
-            contract.effects.memory = *memory;
-            contract.effects.control = *control;
+            contract.effects.memory = summary.memory;
+            contract.effects.control = summary.control;
         }
         contract
+    }
+
+    fn call_summary(&self, inst: Inst, callee: Value, facts: &Facts) -> Option<&CallSummary> {
+        if self.summaries.is_empty() {
+            return None;
+        }
+        let block = self.insts[inst].block;
+        let Identity::Code(code) = facts.identity_at(self, callee, block) else {
+            return None;
+        };
+        let summary = self.summaries.get(&code)?;
+        let guarded = facts.assumes(callee)
+            || summary
+                .requires
+                .iter()
+                .all(|(name, target)| facts.guarded_global(name, *target, block));
+        guarded.then_some(summary)
     }
 
     pub(super) fn contract(&self, op: &Op, facts: &Facts) -> Contract {
@@ -1396,7 +1417,7 @@ pub(in crate::jit) struct SpecializationPlan {
     pub(in crate::jit) inlines: Vec<specialize::Inline>,
     pub(in crate::jit) reads: Vec<reads::Read>,
     pub(in crate::jit) shapes: shapes::Plan,
-    pub(in crate::jit) numbers: Vec<(super::planner::Site, super::planner::ReadType)>,
+    pub(in crate::jit) numbers: Vec<(super::profile::Site, super::profile::ReadType)>,
     pub(in crate::jit) conditional: specialize::ConditionalPlan,
 }
 
@@ -1608,7 +1629,7 @@ pub(super) fn plan_canonical_with_budget(
         }
     }
     if let Some((bodies, _)) = specialization {
-        specialize::prove_closed_calls(&mut graph, bodies, &mut notes);
+        specialize::install_summaries(&mut graph, bodies, &mut notes);
     }
     if let Some((bodies, source)) = specialization {
         specialize::direct_calls(&mut graph, bodies, source);

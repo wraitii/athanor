@@ -8,8 +8,8 @@ use oxc_syntax::operator::BinaryOperator;
 use super::super::effects::{Assumption, Control, Effects, Locations, Memory};
 use super::super::math::METHODS;
 use super::{
-    Canonical, Cfg, DirectTarget, Facts, Graph, Inst, Native, Op, Result, TerminatorKind, Types,
-    UnaryOp,
+    CallSummary, Canonical, Cfg, DirectTarget, Facts, Graph, Inst, Native, Op, Result,
+    TerminatorKind, Types, UnaryOp, Value,
 };
 
 pub(super) const SPECIALIZATION_BUDGET: usize = 128;
@@ -20,19 +20,19 @@ pub(crate) const DEFAULT_RECOMPILE_INLINE_MULTIPLIER: usize = 4;
 #[derive(Clone, Default)]
 pub(in crate::jit) struct Repository {
     bodies: HashMap<FuncId, Arc<Body>>,
-    pub(in crate::jit) feedback: HashMap<crate::jit::planner::Site, FuncId>,
+    pub(in crate::jit) feedback: HashMap<crate::jit::profile::Site, FuncId>,
     pub(in crate::jit) native_feedback:
-        HashMap<crate::jit::planner::Site, crate::heap::NativeFunction>,
+        HashMap<crate::jit::profile::Site, crate::heap::NativeFunction>,
     pub(in crate::jit) read_feedback: HashMap<
-        (crate::jit::planner::Site, crate::jit::planner::ReadKind),
-        crate::jit::planner::ReadType,
+        (crate::jit::profile::Site, crate::jit::profile::ReadKind),
+        crate::jit::profile::ReadType,
     >,
     pub(in crate::jit) shape_feedback: HashMap<
         (
-            crate::jit::planner::Site,
-            crate::jit::planner::PropertyAccess,
+            crate::jit::profile::Site,
+            crate::jit::profile::PropertyAccess,
         ),
-        crate::jit::planner::ShapeAccess,
+        crate::jit::profile::ShapeAccess,
     >,
     locations: HashMap<(usize, u32), FuncId>,
     globals: HashMap<String, FuncId>,
@@ -50,14 +50,14 @@ struct Body {
 impl Repository {
     pub(in crate::jit) fn observed(
         &self,
-        site: crate::jit::planner::Site,
-        kind: crate::jit::planner::Observation,
+        site: crate::jit::profile::Site,
+        kind: crate::jit::profile::Observation,
     ) -> bool {
         match kind {
-            crate::jit::planner::Observation::Call => {
+            crate::jit::profile::Observation::Call => {
                 self.feedback.contains_key(&site) || self.native_feedback.contains_key(&site)
             }
-            crate::jit::planner::Observation::Read(kind) => {
+            crate::jit::profile::Observation::Read(kind) => {
                 self.read_feedback.contains_key(&(site, kind))
             }
         }
@@ -527,58 +527,79 @@ fn unresolved_operation(graph: &Graph, op: &Op) -> String {
     }
 }
 
-pub(super) fn prove_closed_calls(graph: &mut Graph, bodies: &Repository, notes: &mut Vec<String>) {
-    let mut candidates = Vec::new();
+pub(super) fn install_summaries(graph: &mut Graph, bodies: &Repository, notes: &mut Vec<String>) {
+    let marked: HashSet<Value> = graph
+        .insts
+        .values()
+        .filter_map(|data| match data.op {
+            Op::MarkClass(value) => Some(value),
+            _ => None,
+        })
+        .collect();
+    let mut closures = Vec::new();
+    let mut roots = Vec::new();
     for block in Cfg::new(graph).rpo {
         for &inst in &graph.blocks[block].insts {
             let Op::Call { callee, .. } = graph.insts[inst].op else {
                 continue;
             };
-            let Some(Op::Closure(_, target, _, false, _, _, _)) = graph.defining_op(callee) else {
-                continue;
-            };
-            if graph
-                .insts
-                .values()
-                .any(|data| matches!(data.op, Op::MarkClass(value) if value == callee))
-            {
-                continue;
+            match graph.defining_op(callee) {
+                Some(Op::Closure(_, target, _, false, _, _, _)) if !marked.contains(&callee) => {
+                    closures.push((inst, *target));
+                    roots.push(*target);
+                }
+                Some(Op::GlobalRead(name)) => {
+                    roots.extend(bodies.globals.get(name).copied());
+                }
+                _ => {}
             }
-            candidates.push((inst, callee, *target));
         }
     }
-    if candidates.is_empty() {
+    if roots.is_empty() {
         return;
     }
-    let summaries = bodies.effect_summaries(candidates.iter().map(|&(_, _, target)| target));
-    for (inst, callee, target) in candidates {
-        let Some(summary) = summaries.get(&target) else {
-            continue;
-        };
-        let Summary { effects, requires } = summary;
+    let summaries = bodies.effect_summaries(roots);
+    let mut installed = HashMap::new();
+    for (&target, Summary { effects, requires }) in &summaries {
         if effects.unsupported
             || !effects.unresolved.is_empty()
             || effects.writes()
-            || !requires.identities.is_empty()
             || !requires.natives.is_empty()
             || !requires.string_splits.is_empty()
         {
-            notes.push(format!(
-                "call {inst}: closed-call proof rejected: {}",
-                bodies.obligation_chain(target, true)
-            ));
             continue;
         }
-        graph
-            .closed_calls
-            .insert(inst, (callee, effects.memory, effects.control));
-        notes.push(format!("call {inst}: {target} proved closed and read-only"));
+        let mut required: Vec<_> = requires.identities.iter().cloned().collect();
+        required.sort();
+        installed.insert(
+            target,
+            CallSummary {
+                memory: effects.memory,
+                control: effects.control,
+                requires: required,
+            },
+        );
     }
+    for (inst, target) in closures {
+        match installed.get(&target) {
+            Some(summary) if summary.requires.is_empty() => {
+                notes.push(format!("call {inst}: {target} proved closed and read-only"));
+            }
+            None if !summaries.contains_key(&target) => {}
+            _ => {
+                notes.push(format!(
+                    "call {inst}: closed-call proof rejected: {}",
+                    bodies.obligation_chain(target, true)
+                ));
+            }
+        }
+    }
+    graph.summaries = Arc::new(installed);
 }
 
 #[derive(Clone, Default, PartialEq, Eq)]
 pub(in crate::jit) struct ConditionalPlan {
-    pub(super) native_calls: Vec<crate::jit::planner::Site>,
+    pub(super) native_calls: Vec<crate::jit::profile::Site>,
     pub(super) calls: Vec<ConditionalCall>,
 }
 
@@ -587,6 +608,7 @@ pub(super) struct ConditionalCall {
     pub(super) inst: Inst,
     pub(super) callee: super::Value,
     pub(super) name: String,
+    pub(super) target: FuncId,
     pub(super) memory: Memory,
     pub(super) control: Control,
     pub(super) identities: Vec<(String, FuncId)>,
@@ -651,6 +673,7 @@ pub(super) fn conditional_plan(
             inst,
             callee,
             name,
+            target,
             memory: effects.memory,
             control: effects.control,
             identities,
@@ -742,7 +765,7 @@ fn call_target(
     callee: super::Value,
 ) -> Option<FuncId> {
     let data = &graph.insts[call];
-    let site = crate::jit::planner::Site {
+    let site = crate::jit::profile::Site {
         source: data.source_name.map_or(source, |name| name.0),
         start: data.span.start,
         end: data.span.end,
@@ -1098,12 +1121,24 @@ mod tests {
         );
     }
 
+    fn closed_calls(graph: &Graph) -> Vec<Inst> {
+        let facts = Facts::compute(graph);
+        Cfg::new(graph)
+            .rpo
+            .into_iter()
+            .flat_map(|block| graph.blocks[block].insts.clone())
+            .filter(|&inst| matches!(graph.insts[inst].op, Op::Call { .. }))
+            .filter(|&inst| !graph.inst_contract(inst, &facts).effects.memory.reenters())
+            .collect()
+    }
+
     #[test]
     fn recursive_global_calls_are_guarded_as_a_group() {
         let (canonical, bodies) = fixture(
             "function first(n){if(n)return second(n-1);return state.value;} function second(n){if(n)return first(n-1);return state.value;} function main(n){return first(n);}",
         );
         let mut graph = canonical.graph;
+        install_summaries(&mut graph, &bodies, &mut Vec::new());
         let plan = conditional_plan(&graph, &bodies, &mut Vec::new());
         assert_eq!(plan.calls.len(), 1);
         assert_eq!(plan.calls[0].identities.len(), 2);
@@ -1111,11 +1146,11 @@ mod tests {
             super::super::optimize::version(&mut graph, &plan, None, &mut Vec::new()).unwrap();
         assert_eq!(regions.len(), 1);
         let region = &regions[0];
-        assert_eq!(graph.closed_calls.len(), 1);
+        let closed = closed_calls(&graph);
+        assert_eq!(closed.len(), 1);
         assert!(
-            graph
-                .closed_calls
-                .keys()
+            closed
+                .iter()
                 .all(|inst| graph.regions[*region].blocks.contains(&graph.insts[*inst].block))
         );
         assert_eq!(
@@ -1134,13 +1169,15 @@ mod tests {
             "function first(n){if(n)return first(n-1);return state.value;} function main(xs,n){let sum=0;for(let i=0;i<n;++i)sum+=Math.floor(xs[i]);return sum+first(n);}",
         );
         let mut graph = canonical.graph;
+        install_summaries(&mut graph, &bodies, &mut Vec::new());
         let plan = conditional_plan(&graph, &bodies, &mut Vec::new());
         let generic = plan.calls[0].inst;
         let mut notes = Vec::new();
         let regions = super::super::optimize::version(&mut graph, &plan, None, &mut notes).unwrap();
         assert_eq!(regions.len(), 1);
-        assert!(!graph.closed_calls.contains_key(&generic));
-        assert_eq!(graph.closed_calls.len(), 1);
+        let closed = closed_calls(&graph);
+        assert!(!closed.contains(&generic));
+        assert_eq!(closed.len(), 1);
         assert!(
             notes
                 .iter()
@@ -1172,12 +1209,13 @@ mod tests {
             "function first(n){if(n)return first(n-1);return 1;} function second(n){return n;} function main(n){let sum=0;for(let i=0;i<n;++i)sum+=first(i);second=other;return sum+second(n);}",
         );
         let mut graph = canonical.graph;
+        install_summaries(&mut graph, &bodies, &mut Vec::new());
         let plan = conditional_plan(&graph, &bodies, &mut Vec::new());
         assert_eq!(plan.calls.len(), 2);
         let mut notes = Vec::new();
         let regions = super::super::optimize::version(&mut graph, &plan, None, &mut notes).unwrap();
         assert_eq!(regions.len(), 1);
-        assert_eq!(graph.closed_calls.len(), 1);
+        assert_eq!(closed_calls(&graph).len(), 1);
         let probes: Vec<_> = operations(&graph)
             .into_iter()
             .filter_map(|op| match op {
@@ -1201,15 +1239,12 @@ mod tests {
             "function first(n){if(n)return first(n-1);return 1;} function main(rows){let sum=0;for(let y=0;y<2;++y){const row=rows[y];for(let x=0;x<2;++x)sum+=row[x]+first(x);}return sum;}",
         );
         let mut graph = canonical.graph;
+        install_summaries(&mut graph, &bodies, &mut Vec::new());
         let plan = conditional_plan(&graph, &bodies, &mut Vec::new());
         let regions =
             super::super::optimize::version(&mut graph, &plan, None, &mut Vec::new()).unwrap();
         assert!(!regions.is_empty());
-        assert!(!graph.closed_calls.is_empty());
-        let facts = Facts::compute(&graph);
-        for &inst in graph.closed_calls.keys() {
-            assert!(!graph.inst_contract(inst, &facts).effects.memory.reenters());
-        }
+        assert!(!closed_calls(&graph).is_empty());
         graph.verify().unwrap();
     }
 
@@ -1227,7 +1262,7 @@ mod tests {
         let regions =
             super::super::optimize::version(&mut graph, &plan, None, &mut Vec::new()).unwrap();
         assert!(regions.is_empty());
-        assert!(graph.closed_calls.is_empty());
+        assert!(closed_calls(&graph).is_empty());
         graph.verify().unwrap();
     }
 
@@ -1266,8 +1301,8 @@ mod tests {
             vec![],
             None,
         );
-        prove_closed_calls(&mut graph, &bodies, &mut Vec::new());
-        assert!(!graph.closed_calls.contains_key(&request.call));
+        install_summaries(&mut graph, &bodies, &mut Vec::new());
+        assert!(!closed_calls(&graph).contains(&request.call));
     }
 
     #[test]
@@ -1293,15 +1328,8 @@ mod tests {
             vec![],
             None,
         );
-        prove_closed_calls(&mut graph, &bodies, &mut Vec::new());
-        assert!(graph.closed_calls.contains_key(&request.call));
-        assert!(
-            !graph
-                .inst_contract(request.call, &Facts::compute(&graph))
-                .effects
-                .memory
-                .reenters()
-        );
+        install_summaries(&mut graph, &bodies, &mut Vec::new());
+        assert!(closed_calls(&graph).contains(&request.call));
     }
 
     #[test]
@@ -1343,7 +1371,7 @@ mod tests {
         for data in graph.insts.values() {
             if matches!(data.op, Op::Call { .. }) {
                 bodies.feedback.insert(
-                    crate::jit::planner::Site {
+                    crate::jit::profile::Site {
                         source: 0,
                         start: data.span.start,
                         end: data.span.end,
@@ -1385,7 +1413,7 @@ mod tests {
                 && matches!(canonical.graph.defining_op(callee), Some(Op::Get(_, name)) if name == "method")
             {
                 bodies.feedback.insert(
-                    crate::jit::planner::Site {
+                    crate::jit::profile::Site {
                         source: 0,
                         start: data.span.start,
                         end: data.span.end,

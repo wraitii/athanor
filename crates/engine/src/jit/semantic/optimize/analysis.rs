@@ -170,7 +170,15 @@ pub(super) struct Writes {
 
 impl Writes {
     pub(super) fn collect(graph: &Graph, blocks: &HashSet<Block>) -> Self {
-        let facts = Facts::compute(graph);
+        Self::collect_assuming(graph, blocks, &HashMap::new())
+    }
+
+    pub(super) fn collect_assuming(
+        graph: &Graph,
+        blocks: &HashSet<Block>,
+        assumed: &HashMap<Value, cranelift_module::FuncId>,
+    ) -> Self {
+        let facts = Facts::assuming(graph, &HashMap::new(), assumed);
         let mut writes = Vec::new();
         let fresh = unescaped(graph, blocks, &Cfg::new(graph));
         for &block in blocks {
@@ -260,8 +268,9 @@ pub(super) fn closure_failure(
     graph: &Graph,
     blocks: &HashSet<Block>,
     guarded: &Guarded,
+    assumed: &HashMap<Value, cranelift_module::FuncId>,
 ) -> Option<String> {
-    let facts = Facts::compute(graph);
+    let facts = Facts::assuming(graph, &HashMap::new(), assumed);
     let cfg = Cfg::new(graph);
     let fresh = unescaped(graph, blocks, &cfg);
     for &block in cfg.rpo.iter().filter(|block| blocks.contains(block)) {

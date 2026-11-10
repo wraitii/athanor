@@ -1,4 +1,4 @@
-use crate::jit::planner::{ReadKind, ReadType, Site};
+use crate::jit::profile::{ReadKind, ReadType, Site};
 
 use super::{
     BlockData, Cfg, Facts, Graph, Inst, Op, Target, Terminator, TerminatorKind, TypedRead, Types,

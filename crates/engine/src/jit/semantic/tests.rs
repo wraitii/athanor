@@ -180,14 +180,14 @@ fn comparisons_share_number_checks_with_refined_reads_without_splitting() {
         if matches!(data.op, Op::GetIndex(..)) {
             bodies.read_feedback.insert(
                 (
-                    crate::jit::planner::Site {
+                    crate::jit::profile::Site {
                         source: 0,
                         start: data.span.start,
                         end: data.span.end,
                     },
-                    crate::jit::planner::ReadKind::Receiver,
+                    crate::jit::profile::ReadKind::Receiver,
                 ),
-                crate::jit::planner::ReadType::Array,
+                crate::jit::profile::ReadType::Array,
             );
         }
     }
@@ -232,14 +232,14 @@ fn late_number_facts_remove_refinement_guards_and_assertions() {
         if matches!(data.op, Op::GetIndex(..)) {
             bodies.read_feedback.insert(
                 (
-                    crate::jit::planner::Site {
+                    crate::jit::profile::Site {
                         source: 0,
                         start: data.span.start,
                         end: data.span.end,
                     },
-                    crate::jit::planner::ReadKind::Receiver,
+                    crate::jit::profile::ReadKind::Receiver,
                 ),
-                crate::jit::planner::ReadType::Array,
+                crate::jit::profile::ReadType::Array,
             );
         }
     }
@@ -392,17 +392,17 @@ fn indexed_rows_borrow_from_owned_receivers_through_guards() {
             let text = &source[data.span.start as usize..data.span.end as usize];
             repository.read_feedback.insert(
                 (
-                    crate::jit::planner::Site {
+                    crate::jit::profile::Site {
                         source: 0,
                         start: data.span.start,
                         end: data.span.end,
                     },
-                    crate::jit::planner::ReadKind::Receiver,
+                    crate::jit::profile::ReadKind::Receiver,
                 ),
                 if text == "height[i&1]" {
-                    crate::jit::planner::ReadType::Array
+                    crate::jit::profile::ReadType::Array
                 } else {
-                    crate::jit::planner::ReadType::Typed(crate::heap::TypedKind::Float32)
+                    crate::jit::profile::ReadType::Typed(crate::heap::TypedKind::Float32)
                 },
             );
         }
@@ -433,7 +433,7 @@ fn indexed_rows_borrow_from_owned_receivers_through_guards() {
 #[test]
 #[should_panic(expected = "guard-only region should borrow the array row")]
 fn guard_only_region_borrows_rows_without_entry_assumptions() {
-    use crate::jit::planner::{ReadKind, ReadType, Site};
+    use crate::jit::profile::{ReadKind, ReadType, Site};
 
     let source =
         "function f(height){let sum=0;for(let i=0;i<8;++i)sum+=height[i][0]/1;return sum;}";
@@ -502,14 +502,14 @@ fn typed_loop_reads_are_reused_before_inner_loop_versioning() {
     let mut bodies = specialize::Repository::default();
     bodies.read_feedback.insert(
         (
-            crate::jit::planner::Site {
+            crate::jit::profile::Site {
                 source: 0,
                 start: read.span.start,
                 end: read.span.end,
             },
-            crate::jit::planner::ReadKind::Receiver,
+            crate::jit::profile::ReadKind::Receiver,
         ),
-        crate::jit::planner::ReadType::Typed(crate::heap::TypedKind::Uint16),
+        crate::jit::profile::ReadType::Typed(crate::heap::TypedKind::Uint16),
     );
     let analysis = optimize_canonical(canonical, true, Some((&bodies, 0))).unwrap();
     let operations = ops(&analysis.graph);
@@ -959,7 +959,7 @@ fn integer_facts_survive_loop_backedges_without_length_bounds() {
 
 #[test]
 fn unsupported_numeric_reads_are_not_observed_again() {
-    use crate::jit::planner::{Observation, ReadKind, ReadType, Site};
+    use crate::jit::profile::{Observation, ReadKind, ReadType, Site};
 
     let mut graph = lower_source("function f(point){return point.x + 1;}").unwrap();
     observations::plan(&mut graph, None);

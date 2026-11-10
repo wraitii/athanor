@@ -1,4 +1,4 @@
-use crate::jit::planner::{PropertyAccess, ShapeAccess, Site};
+use crate::jit::profile::{PropertyAccess, ShapeAccess, Site};
 
 use std::collections::{HashMap, HashSet};
 
@@ -276,10 +276,6 @@ fn guard_segment(
         .filter_map(|&inst| graph.insts[inst].result)
         .filter(|value| {
             counts[*value] > inner.get(value).copied().unwrap_or(0)
-                || graph
-                    .closed_calls
-                    .values()
-                    .any(|(callee, ..)| callee == value)
         })
         .collect();
     let params: HashMap<Value, Value> = outputs
