@@ -1,4 +1,5 @@
 use super::super::specialize::{ConditionalCall, ConditionalPlan};
+use super::super::guards::Fact;
 use super::versioning::{Canonical, Version};
 use super::*;
 
@@ -121,7 +122,7 @@ impl RegionPlan {
         child
             .checks
             .iter()
-            .all(|&(value, types)| facts.of(value).within(types))
+            .all(|&(value, types)| Fact::Type(facts.of(value)).implies(Fact::Type(types)))
             && child
                 .calls
                 .iter()
@@ -241,7 +242,7 @@ impl RegionPlan {
             if let Some(reason) = closure_failure(
                 graph,
                 &version.body,
-                &Guarded::new(&self.requirements).with_code(&self.identities),
+                &guarded_accesses(&self.requirements, &self.identities),
                 &HashMap::new(),
             ) {
                 return Err(format!("{label}: planned copy {reason}"));
@@ -333,7 +334,7 @@ fn plan_region(
     }
     let mut identities: Vec<_> = identities.into_iter().collect();
     identities.sort_by(|a, b| a.0.cmp(&b.0));
-    let guarded = Guarded::new(&requirements).with_code(&identities);
+    let guarded = guarded_accesses(&requirements, &identities);
     let mut planning = graph.clone();
     let assumed: HashMap<Value, cranelift_module::FuncId> = calls
         .iter()

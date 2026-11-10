@@ -717,7 +717,7 @@ fn global_writes_prevent_versioning_and_load_reuse() {
         ops.iter()
             .filter(|op| matches!(op, Op::GlobalRead(name) if name == "shared"))
             .count(),
-        3
+        2
     );
     assert!(!ops.iter().any(|op| matches!(op, Op::CallNative(..))));
 }
@@ -1069,7 +1069,7 @@ fn checked_typed_reads_expose_shared_numeric_checks() {
             Some(Op::IsExactPosition(..))
         ));
     }
-    optimize::reuse_loads(&mut graph, region, &mut Vec::new());
+    optimize::reuse_loads(&mut graph, &mut Vec::new());
     graph.verify().unwrap();
     let ops: Vec<_> = Cfg::new(&graph)
         .rpo

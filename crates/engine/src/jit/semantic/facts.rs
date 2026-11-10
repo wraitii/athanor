@@ -5,6 +5,9 @@ use cranelift_codegen::entity::SecondaryMap;
 use oxc_syntax::operator::BinaryOperator;
 
 use super::super::effects::{Control, Memory};
+use super::access::Access;
+use super::available;
+use super::fresh::Fresh;
 use super::guards;
 use super::{Block, Cfg, Constant, Graph, Inst, Op, TerminatorKind, UnaryOp, Value};
 use crate::heap::TypedKind;
@@ -119,12 +122,14 @@ struct Refinement {
 pub(in crate::jit) struct Facts {
     cfg: Cfg,
     refinements: HashMap<Value, Vec<Refinement>>,
-    probes: Vec<(String, Block, FuncId)>,
+    probes: Vec<(String, Value, Block, FuncId)>,
+    rejected: HashSet<Inst>,
     identities: SecondaryMap<Value, Identity>,
     assumed: HashMap<Value, FuncId>,
     types: SecondaryMap<Value, Types>,
     indexed: HashSet<Value>,
     known: bool,
+    fresh: std::cell::OnceCell<std::rc::Rc<Fresh>>,
     memory: SecondaryMap<Inst, Memory>,
     control: SecondaryMap<Inst, Control>,
 }
@@ -142,11 +147,17 @@ impl Facts {
         }
     }
 
+    pub(super) fn fresh(&self, graph: &Graph) -> std::rc::Rc<Fresh> {
+        self.fresh
+            .get_or_init(|| std::rc::Rc::new(Fresh::compute(graph)))
+            .clone()
+    }
+
     pub(super) fn assumes(&self, value: Value) -> bool {
         self.assumed.contains_key(&value)
     }
 
-    pub(super) fn identity_at(&self, graph: &Graph, value: Value, block: Block) -> Identity {
+    pub(super) fn identity_at(&self, value: Value, block: Block) -> Identity {
         if let Some(&code) = self.assumed.get(&value) {
             return Identity::Code(code);
         }
@@ -158,24 +169,78 @@ impl Facts {
                 identity = identity.join(Identity::Code(code));
             }
         }
-        if let Some(Op::GlobalRead(name) | Op::ProbeGlobal(name)) = graph.defining_op(value) {
-            for (probed, entry, code) in &self.probes {
-                if probed == name && self.cfg.dominates(*entry, block) {
-                    identity = identity.join(Identity::Code(*code));
-                }
-            }
-        }
         identity
     }
 
-    pub(super) fn guarded_global(&self, name: &str, code: FuncId, block: Block) -> bool {
-        self.probes.iter().any(|(probed, entry, guarded)| {
-            probed == name && *guarded == code && self.cfg.dominates(*entry, block)
-        })
+    pub(super) fn guarded_global(
+        &self,
+        name: &str,
+        code: FuncId,
+        inst: Inst,
+        block: Block,
+    ) -> bool {
+        !self.rejected.contains(&inst)
+            && self.probes.iter().any(|(probed, _, entry, guarded)| {
+                probed == name && *guarded == code && self.cfg.dominates(*entry, block)
+            })
+    }
+
+    pub(super) fn kills(&self, graph: &Graph, inst: Inst, write: &Access, read: &Access) -> bool {
+        self.fresh(graph).may_alias(inst, write, read) && write.field.conflicts(&read.field)
+    }
+
+    fn unavailable_probes(&self, graph: &Graph) -> Vec<Inst> {
+        let mut pending = Vec::new();
+        for &block in &self.cfg.rpo {
+            for &inst in &graph.blocks[block].insts {
+                let Op::Call { callee, .. } = graph.insts[inst].op else {
+                    continue;
+                };
+                if self.rejected.contains(&inst) || self.assumes(callee) {
+                    continue;
+                }
+                if graph.call_summary(inst, callee, self).is_some_and(|summary| !summary.requires.is_empty()) {
+                    pending.push(inst);
+                }
+            }
+        }
+        if pending.is_empty() {
+            return pending;
+        }
+        let Some(solved) = available::solve(graph, self, &self.cfg, HashSet::new(), true) else {
+            return pending;
+        };
+        pending
+            .into_iter()
+            .filter(|&inst| {
+                let Op::Call { callee, .. } = graph.insts[inst].op else {
+                    return false;
+                };
+                let Some(summary) = graph.call_summary(inst, callee, self) else {
+                    return false;
+                };
+                let block = graph.insts[inst].block;
+                let state = solved.before(graph, self, &self.cfg, inst);
+                !summary.requires.iter().all(|(name, code)| {
+                    self.probes.iter().any(|(probed, probe, entry, guarded)| {
+                        probed == name
+                            && guarded == code
+                            && self.cfg.dominates(*entry, block)
+                            && state.get(&available::LoadKey::Probe(name.clone())).is_some_and(
+                                |available| available.value == solved.canonical(*probe),
+                            )
+                    })
+                })
+            })
+            .collect()
     }
 
     pub(super) fn is_pure(&self, inst: Inst) -> bool {
         self.memory[inst].is_empty() && self.control[inst].is_empty()
+    }
+
+    pub(super) fn removable(&self, inst: Inst) -> bool {
+        self.memory[inst].writes.is_empty() && self.control[inst].is_empty()
     }
 
     pub(super) fn memory(&self, inst: Inst) -> Memory {
@@ -252,7 +317,7 @@ impl Facts {
             };
             for refinement in entries {
                 if let Some(code) = refinement.identity {
-                    probes.push((name.clone(), refinement.block, code));
+                    probes.push((name.clone(), value, refinement.block, code));
                 }
             }
         }
@@ -269,11 +334,13 @@ impl Facts {
             cfg,
             refinements,
             probes,
+            rejected: HashSet::new(),
             identities: SecondaryMap::new(),
             assumed: identities.clone(),
             types: SecondaryMap::new(),
             indexed,
             known: true,
+            fresh: Default::default(),
             memory: SecondaryMap::with_default(Memory::UNKNOWN),
             control: SecondaryMap::with_default(Control::UNKNOWN),
         };
@@ -313,7 +380,7 @@ impl Facts {
                 for target in terminator.kind.targets() {
                     for (&param, &arg) in graph.blocks[target.block].params.iter().zip(&target.args)
                     {
-                        let mut identity = facts.identity_at(graph, arg, block);
+                        let mut identity = facts.identity_at(arg, block);
                         if let Some(edge) = &refinement
                             && edge.value == arg
                             && target.block == edge.yes
@@ -349,12 +416,19 @@ impl Facts {
                 }
             }
         }
-        for &block in &rpo {
-            for &inst in &graph.blocks[block].insts {
-                let effects = graph.inst_contract(inst, &facts).effects;
-                facts.memory[inst] = effects.memory;
-                facts.control[inst] = effects.control;
+        loop {
+            for &block in &rpo {
+                for &inst in &graph.blocks[block].insts {
+                    let effects = graph.inst_contract(inst, &facts).effects;
+                    facts.memory[inst] = effects.memory;
+                    facts.control[inst] = effects.control;
+                }
             }
+            let unavailable = facts.unavailable_probes(graph);
+            if unavailable.is_empty() {
+                break;
+            }
+            facts.rejected.extend(unavailable);
         }
         facts
     }

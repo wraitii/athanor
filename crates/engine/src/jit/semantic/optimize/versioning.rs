@@ -1,5 +1,6 @@
 use crate::jit::profile::{Observation, ReadKind};
 
+use super::super::available::LoadKey;
 use super::super::guards::{Fact, edge_of, implies};
 use super::*;
 
@@ -54,6 +55,14 @@ impl EntryGuard {
     fn of(op: &Op) -> Option<Self> {
         let (value, fact) = implies(op)?;
         Some(Self::Fact(value, fact))
+    }
+
+    fn tested_by(&self, known: &HashSet<Self>) -> bool {
+        known.contains(self)
+            || matches!(self, Self::Fact(value, fact) if known.iter().any(|other| {
+                matches!(other, Self::Fact(known_value, known_fact)
+                    if known_value == value && known_fact.implies(*fact))
+            }))
     }
 
     fn at_entry(graph: &Graph, entry: Block) -> HashSet<Self> {
@@ -281,11 +290,13 @@ pub(super) fn apply_version(
     };
     let start = graph.blocks.push(BlockData::default());
     let mut current = start;
+    let mut guarded_probes = HashMap::new();
     for (name, code) in code_guards {
         let global = graph
             .append(current, span, Op::ProbeGlobal(name.clone()), true)
             .1
             .unwrap();
+        guarded_probes.insert(name.clone(), global);
         let check = graph
             .append(current, span, Op::IsCode(global, *code), true)
             .1
@@ -400,7 +411,10 @@ pub(super) fn apply_version(
     }
     let mut probes = HashMap::new();
     let mut replacements = HashMap::new();
-    let mut available = HashMap::new();
+    let mut available: HashMap<LoadKey, Value> = guarded_probes
+        .into_iter()
+        .map(|(name, value)| (LoadKey::Global(name), value))
+        .collect();
     for &inst in reads {
         let data = graph.insts[inst].clone();
         let mut op = match data.op {
@@ -492,8 +506,11 @@ pub(super) fn apply_version(
                 .unwrap_or(EntryGuard::Value(condition));
             (None, Some(key))
         };
-        if key.is_some_and(|key| !tested.insert(key)) {
-            continue;
+        if let Some(key) = key {
+            if key.tested_by(&tested) {
+                continue;
+            }
+            tested.insert(key);
         }
         let otherwise = match &test {
             Some(Op::IsPropertyCached(object, site, name)) if fallback.is_some() => {
@@ -555,9 +572,10 @@ pub(super) fn apply_version(
                 Types::NUMBER
             }),
         );
-        if !tested.insert(guard) {
+        if guard.tested_by(&tested) {
             continue;
         }
+        tested.insert(guard);
         let check = graph
             .append(
                 current,
@@ -627,16 +645,12 @@ pub(super) fn apply_version(
     let mut mapped_typed = Vec::new();
     for &(object, element) in typed {
         let guard = (values.get(&object).copied().unwrap_or(object), element);
-        if element.is_none()
-            && tested
-                .iter()
-                .any(|known| matches!(known, EntryGuard::Fact(value, Fact::Typed(_)) if *value == guard.0))
-        {
+        let key = EntryGuard::Fact(guard.0, Fact::Typed(element));
+        if key.tested_by(&tested) {
             continue;
         }
-        if tested.insert(EntryGuard::Fact(guard.0, Fact::Typed(element))) {
-            mapped_typed.push(guard);
-        }
+        tested.insert(key);
+        mapped_typed.push(guard);
     }
     let mut bounds: Vec<_> = bounds
         .iter()

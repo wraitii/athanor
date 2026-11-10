@@ -4,6 +4,7 @@ use oxc_syntax::operator::BinaryOperator;
 
 use super::super::effects::Locations;
 use super::access::{Access, Field};
+use super::available;
 use super::js::NUMERIC;
 use super::{
     Block, BlockData, Cfg, Constant, Facts, Graph, Inst, Native, Op, Region, RegionFallback,
@@ -18,9 +19,7 @@ mod analysis;
 mod planning;
 mod versioning;
 
-#[cfg(test)]
-use analysis::unescaped;
-use analysis::{Guarded, Requirement, Writes, closure_failure, requirements};
+use analysis::{Requirement, Writes, closure_failure, guarded_accesses, requirements};
 #[cfg(test)]
 pub(super) use planning::version;
 pub(super) use planning::version_with_report;
@@ -157,7 +156,7 @@ pub(super) fn version_string_leaves(
         candidate.verify()?;
         let reachable: HashSet<_> = Cfg::new(&candidate).rpo.into_iter().collect();
         let copy: HashSet<_> = copy.intersection(&reachable).copied().collect();
-        if let Some(reason) = closure_failure(&candidate, &copy, &Guarded::default(), &HashMap::new()) {
+        if let Some(reason) = closure_failure(&candidate, &copy, &[], &HashMap::new()) {
             notes.push(format!(
                 "string split continuation not versioned: guarded copy {reason}"
             ));
@@ -498,99 +497,22 @@ fn entry_checks(
         .collect()
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
-enum LoadKey {
-    ToInt32(Value),
-    Position(Value),
-    ExactPosition(Value, Value),
-    Constructor(Value),
-    Property(Value, String),
-    Index(Value, Value),
-    Global(String),
-    This,
-    Argument(usize),
-    Binary(BinaryOperator, Value, Value),
-}
-
-pub(super) fn reuse_loads(graph: &mut Graph, region: RegionId, notes: &mut Vec<String>) {
-    let region = graph.regions[region].blocks.clone();
-    let region = &region;
-    let cfg = Cfg::new(graph);
-    let writes = Writes::collect(graph, region);
-    let facts = &writes.facts;
-    let mut aliases = HashMap::new();
-    let mut available: HashMap<LoadKey, Vec<(Block, usize, Value)>> = HashMap::new();
-    let mut reused = Vec::new();
-    for &block in cfg.rpo.iter().filter(|block| region.contains(block)) {
-        for (index, &inst) in graph.blocks[block].insts.iter().enumerate() {
-            let data = &graph.insts[inst];
-            let Some(result) = data.result else {
-                continue;
-            };
-            let key = match &data.op {
-                Op::Get(object, name) | Op::ShapedGet(object, name, _) => {
-                    LoadKey::Property(resolve(&aliases, *object), name.clone())
-                }
-                Op::GetIndex(object, key)
-                | Op::TypedIndex(object, key, _)
-                | Op::IndexedGet(object, key)
-                | Op::ArrayLoad(object, key, _) => {
-                    LoadKey::Index(resolve(&aliases, *object), resolve(&aliases, *key))
-                }
-                Op::ConstructorPrototype(callee) => {
-                    LoadKey::Constructor(resolve(&aliases, *callee))
-                }
-                Op::GlobalRead(name) => LoadKey::Global(name.clone()),
-                Op::ToInt32(value) => LoadKey::ToInt32(resolve(&aliases, *value)),
-                Op::ArrayPosition(value) => LoadKey::Position(resolve(&aliases, *value)),
-                Op::IsExactPosition(key, position) => {
-                    LoadKey::ExactPosition(resolve(&aliases, *key), resolve(&aliases, *position))
-                }
-                Op::This => LoadKey::This,
-                Op::Argument(index) => LoadKey::Argument(*index),
-                Op::Binary(operator, left, right)
-                | Op::GuardedCompare {
-                    operator,
-                    left,
-                    right,
-                    ..
-                } if facts.is_pure(inst) => LoadKey::Binary(
-                    *operator,
-                    resolve(&aliases, *left),
-                    resolve(&aliases, *right),
-                ),
-                _ => continue,
-            };
-            let preserved = Access::read(&data.op, facts).is_none_or(|mut read| {
-                read.base = read.base.map(|base| resolve(&aliases, base));
-                !writes.clobbers(&read)
-            });
-            if !preserved {
-                continue;
-            }
-            let earlier = available.get(&key).and_then(|defs| {
-                defs.iter().find(|(def_block, def_index, _)| {
-                    if *def_block == block {
-                        *def_index < index
-                    } else {
-                        cfg.dominates(*def_block, block)
-                    }
-                })
-            });
-            match earlier {
-                Some(&(_, _, value)) => {
-                    aliases.insert(result, value);
-                    reused.push((inst, value));
-                }
-                None => available
-                    .entry(key)
-                    .or_default()
-                    .push((block, index, result)),
-            }
-        }
+pub(super) fn reuse_loads(graph: &mut Graph, notes: &mut Vec<String>) {
+    if graph.has_handlers || graph.generator {
+        return;
     }
+    let cfg = Cfg::new(graph);
+    let facts = Facts::compute(graph);
+    let Some(solved) = available::solve(graph, &facts, &cfg, graph.cold.clone(), false) else {
+        return;
+    };
+    let aliases: HashMap<Value, Value> = solved
+        .reused
+        .iter()
+        .map(|&(inst, value)| (graph.insts[inst].result.unwrap(), value))
+        .collect();
     graph.replace_uses(&aliases);
-    for (inst, value) in reused {
+    for &(inst, value) in &solved.reused {
         notes.push(format!(
             "{} reuses {value}",
             graph.op_text(&graph.insts[inst].op)
@@ -1054,24 +976,145 @@ mod tests {
             });
             graph.verify().unwrap();
             let scope = Cfg::new(&graph).rpo.into_iter().collect();
-            let fresh = unescaped(&graph, &scope, &Cfg::new(&graph));
-            assert_eq!(fresh.contains_key(&object), !external);
-            assert_eq!(fresh.contains_key(&receiver), !external);
             let writes = Writes::collect(&graph, &scope);
             assert!(writes.clobbers(&heap(object, Field::Named("x".into()))));
             assert_eq!(
                 writes.clobbers(&heap(other, Field::Named("x".into()))),
                 external
             );
+            let mut after = graph.clone();
+            after.append(merge, span, Op::GlobalWrite("leak".into(), receiver), false);
+            let writes = Writes::collect(&after, &scope);
+            assert_eq!(
+                writes.clobbers(&heap(other, Field::Named("x".into()))),
+                external
+            );
             for value in [object, receiver] {
-                let mut escaped = graph.clone();
-                escaped.append(merge, span, Op::GlobalWrite("leak".into(), value), false);
-                let fresh = unescaped(&escaped, &scope, &Cfg::new(&escaped));
-                assert!(!fresh.contains_key(&object));
-                assert!(!fresh.contains_key(&receiver));
+                let mut before = graph.clone();
+                before.append(entry, span, Op::GlobalWrite("leak".into(), value), false);
+                let writes = Writes::collect(&before, &scope);
+                assert!(writes.clobbers(&heap(other, Field::Named("x".into()))));
             }
-            let partial = HashSet::from([left, right, merge]);
-            assert!(!unescaped(&graph, &partial, &Cfg::new(&graph)).contains_key(&receiver));
+        }
+    }
+
+    #[test]
+    fn branches_decided_by_a_dominating_edge_on_the_same_condition_fold() {
+        for inverted in [false, true] {
+            let mut graph = empty_graph();
+            let entry = graph.entry;
+            let span = graph.span;
+            let argument = graph.append(entry, span, Op::Argument(0), true).1.unwrap();
+            let check = graph
+                .append(entry, span, Op::IsUndefined(argument), true)
+                .1
+                .unwrap();
+            let [yes, no, inner_yes, inner_no] =
+                std::array::from_fn(|_| graph.blocks.push(BlockData::default()));
+            graph.blocks[entry].terminator = Some(Terminator {
+                source_name: None,
+                span,
+                kind: TerminatorKind::Branch(check, Target::new(yes), Target::new(no)),
+            });
+            let repeated = if inverted {
+                graph.append(yes, span, Op::Unary(UnaryOp::Not, check), true).1.unwrap()
+            } else {
+                check
+            };
+            graph.blocks[yes].terminator = Some(Terminator {
+                source_name: None,
+                span,
+                kind: TerminatorKind::Branch(
+                    repeated,
+                    Target::new(inner_yes),
+                    Target::new(inner_no),
+                ),
+            });
+            for block in [no, inner_yes, inner_no] {
+                let zero = graph
+                    .append(block, span, Op::Constant(Constant::Number(0.0)), true)
+                    .1
+                    .unwrap();
+                graph.blocks[block].terminator = Some(Terminator {
+                    source_name: None,
+                    span,
+                    kind: TerminatorKind::Return(zero),
+                });
+            }
+            graph.verify().unwrap();
+            super::super::js::simplify(&mut graph);
+            let reachable: HashSet<Block> = Cfg::new(&graph).rpo.into_iter().collect();
+            assert_eq!(reachable.contains(&inner_yes), !inverted);
+            assert_eq!(reachable.contains(&inner_no), inverted);
+        }
+    }
+
+    #[test]
+    fn summaries_apply_only_while_the_guarded_global_is_unwritten() {
+        use super::super::super::effects::{Control, Memory};
+        let code = cranelift_module::FuncId::from_u32(0);
+        for written in [false, true] {
+            let mut graph = empty_graph();
+            graph.summaries = std::sync::Arc::new(HashMap::from([(
+                code,
+                super::super::CallSummary {
+                    memory: Memory::default(),
+                    control: Control::default(),
+                    requires: vec![("f".into(), code)],
+                },
+            )]));
+            let entry = graph.entry;
+            let span = graph.span;
+            let probe = graph
+                .append(entry, span, Op::ProbeGlobal("f".into()), true)
+                .1
+                .unwrap();
+            let check = graph
+                .append(entry, span, Op::IsCode(probe, code), true)
+                .1
+                .unwrap();
+            let body = graph.blocks.push(BlockData::default());
+            let exit = graph.blocks.push(BlockData::default());
+            graph.blocks[entry].terminator = Some(Terminator {
+                source_name: None,
+                span,
+                kind: TerminatorKind::Branch(check, Target::new(body), Target::new(exit)),
+            });
+            let value = graph
+                .append(body, span, Op::Constant(Constant::Number(1.0)), true)
+                .1
+                .unwrap();
+            if written {
+                graph.append(body, span, Op::GlobalWrite("f".into(), value), false);
+            }
+            let (call, result) = graph.append(
+                body,
+                span,
+                Op::Call {
+                    callee: probe,
+                    receiver: None,
+                    args: Vec::new(),
+                    target: None,
+                },
+                true,
+            );
+            graph.blocks[body].terminator = Some(Terminator {
+                source_name: None,
+                span,
+                kind: TerminatorKind::Return(result.unwrap()),
+            });
+            let zero = graph
+                .append(exit, span, Op::Constant(Constant::Number(0.0)), true)
+                .1
+                .unwrap();
+            graph.blocks[exit].terminator = Some(Terminator {
+                source_name: None,
+                span,
+                kind: TerminatorKind::Return(zero),
+            });
+            graph.verify().unwrap();
+            let facts = Facts::compute(&graph);
+            assert_eq!(facts.memory(call).is_empty(), !written);
         }
     }
 
@@ -1099,18 +1142,26 @@ mod tests {
                 args: vec![receiver],
             }),
         });
+        let other = graph.append(entry, span, Op::NewObject, true).1.unwrap();
+        let one = graph
+            .append(header, span, Op::Constant(Constant::Number(1.0)), true)
+            .1
+            .unwrap();
+        graph.append(header, span, Op::Set(receiver, "x".into(), one), false);
         graph.verify().unwrap();
         let scope = HashSet::from([entry, header]);
-        let fresh = unescaped(&graph, &scope, &Cfg::new(&graph));
-        assert!(fresh.contains_key(&object));
-        assert_eq!(fresh.get(&object), fresh.get(&receiver));
+        let writes = Writes::collect(&graph, &scope);
+        assert!(writes.clobbers(&heap(object, Field::Named("x".into()))));
+        assert!(writes.clobbers(&heap(receiver, Field::Named("x".into()))));
+        assert!(!writes.clobbers(&heap(other, Field::Named("x".into()))));
         graph.append(
             header,
             span,
             Op::GlobalWrite("leak".into(), receiver),
             false,
         );
-        assert!(unescaped(&graph, &scope, &Cfg::new(&graph)).is_empty());
+        let writes = Writes::collect(&graph, &scope);
+        assert!(writes.clobbers(&heap(other, Field::Named("x".into()))));
     }
 
     #[test]
@@ -1196,9 +1247,28 @@ mod tests {
             span,
             kind: TerminatorKind::Return(result),
         });
+        let other = graph.append(block, span, Op::NewObject, true).1.unwrap();
+        let one = graph
+            .append(block, span, Op::Constant(Constant::Number(1.0)), true)
+            .1
+            .unwrap();
+        graph.append(block, span, Op::Set(object, "x".into(), one), false);
         let scope = HashSet::from([block]);
-        assert!(unescaped(&graph, &scope, &Cfg::new(&graph)).contains_key(&object));
-        graph.append(block, span, Op::GlobalWrite("leak".into(), result), false);
-        assert!(!unescaped(&graph, &scope, &Cfg::new(&graph)).contains_key(&object));
+        let writes = Writes::collect(&graph, &scope);
+        assert!(!writes.clobbers(&heap(other, Field::Named("x".into()))));
+        let position = graph.blocks[block]
+            .insts
+            .iter()
+            .position(|&inst| matches!(graph.insts[inst].op, Op::Set(..)))
+            .unwrap();
+        graph.insert(
+            block,
+            position,
+            span,
+            Op::GlobalWrite("leak".into(), result),
+            false,
+        );
+        let writes = Writes::collect(&graph, &scope);
+        assert!(writes.clobbers(&heap(other, Field::Named("x".into()))));
     }
 }

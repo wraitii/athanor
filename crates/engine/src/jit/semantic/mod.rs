@@ -1,5 +1,6 @@
 mod access;
 mod arrays;
+mod available;
 mod borrow;
 mod build;
 mod caches;
@@ -8,6 +9,7 @@ mod comparisons;
 mod construction;
 pub(in crate::jit) mod continuation;
 pub(in crate::jit) mod facts;
+mod fresh;
 mod guards;
 mod inlining;
 mod listing;
@@ -995,10 +997,15 @@ impl Graph {
     pub(super) fn remove_inst(&mut self, inst: Inst) {
         let block = self.insts[inst].block;
         self.blocks[block].insts.retain(|&i| i != inst);
+        self.views.remove(&inst);
     }
 
     pub(super) fn move_inst(&mut self, inst: Inst, block: Block) {
+        let view = self.views.get(&inst).copied();
         self.remove_inst(inst);
+        if let Some(view) = view {
+            self.views.insert(inst, view);
+        }
         self.blocks[block].insts.push(inst);
         self.insts[inst].block = block;
     }
@@ -1011,6 +1018,9 @@ impl Graph {
             for value in data.op.operands_mut() {
                 *value = resolve(aliases, *value);
             }
+        }
+        for view in self.views.values_mut() {
+            *view = resolve(aliases, *view);
         }
         for data in self.blocks.values_mut() {
             if let Some(terminator) = &mut data.terminator {
@@ -1027,6 +1037,9 @@ impl Graph {
             for &inst in &data.insts {
                 for value in self.insts[inst].op.operands_iter() {
                     counts[value] += 1;
+                }
+                if let Some(&view) = self.views.get(&inst) {
+                    counts[view] += 1;
                 }
             }
             if let Some(terminator) = &data.terminator {
@@ -1075,7 +1088,7 @@ impl Graph {
             return None;
         }
         let block = self.insts[inst].block;
-        let Identity::Code(code) = facts.identity_at(self, callee, block) else {
+        let Identity::Code(code) = facts.identity_at(callee, block) else {
             return None;
         };
         let summary = self.summaries.get(&code)?;
@@ -1083,7 +1096,7 @@ impl Graph {
             || summary
                 .requires
                 .iter()
-                .all(|(name, target)| facts.guarded_global(name, *target, block));
+                .all(|(name, target)| facts.guarded_global(name, *target, inst, block));
         guarded.then_some(summary)
     }
 
@@ -1393,6 +1406,9 @@ impl Graph {
             for (index, &inst) in data.insts.iter().enumerate() {
                 for value in self.insts[inst].op.operands_iter() {
                     check(value, index)?;
+                }
+                if let Some(&view) = self.views.get(&inst) {
+                    check(view, index)?;
                 }
             }
             for value in data.terminator.as_ref().unwrap().kind.operands_iter() {
@@ -1735,26 +1751,24 @@ pub(super) fn optimize_planned(
     graph.verify()?;
     js::simplify(&mut graph);
     graph.verify()?;
+    optimize::reuse_loads(&mut graph, &mut notes);
+    graph.verify()?;
     for region in &regions {
-        optimize::reuse_loads(&mut graph, *region, &mut notes);
-        graph.verify()?;
         optimize::hoist(&mut graph, *region, &mut notes);
         graph.verify()?;
     }
     js::coercions(&mut graph);
     js::bit_tests(&mut graph);
     graph.verify()?;
+    optimize::reuse_loads(&mut graph, &mut notes);
+    graph.verify()?;
     for region in &regions {
-        optimize::reuse_loads(&mut graph, *region, &mut notes);
-        graph.verify()?;
         optimize::hoist(&mut graph, *region, &mut notes);
         graph.verify()?;
     }
     if typed_lowering::lower(&mut graph)? {
         js::simplify(&mut graph);
-        for region in &regions {
-            optimize::reuse_loads(&mut graph, *region, &mut notes);
-        }
+        optimize::reuse_loads(&mut graph, &mut notes);
     }
     shapes::apply(&mut graph, &plan.shapes, &mut notes)?;
     optimize::views(&mut graph, &mut notes);

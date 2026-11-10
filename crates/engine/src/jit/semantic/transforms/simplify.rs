@@ -43,7 +43,7 @@ pub(in crate::jit::semantic) fn simplify(graph: &mut Graph, folder: &mut impl Fo
                     }
                     None => {}
                 }
-                if facts.is_pure(inst)
+                if facts.removable(inst)
                     && graph.insts[inst]
                         .result
                         .is_none_or(|result| uses[result] == 0)
@@ -57,6 +57,7 @@ pub(in crate::jit::semantic) fn simplify(graph: &mut Graph, folder: &mut impl Fo
             graph.remove_inst(*inst);
         }
         changed |= fold_constant_branches(graph, &cfg);
+        changed |= fold_dominated_branches(graph, &cfg);
         changed |= thread_branches(graph);
         if !changed && dead.is_empty() {
             return;
@@ -78,6 +79,60 @@ fn fold_constant_branches(graph: &mut Graph, cfg: &Cfg) -> bool {
             continue;
         };
         let target = if *taken { yes } else { no }.clone();
+        graph.blocks[block].terminator.as_mut().unwrap().kind = TerminatorKind::Jump(target);
+        changed = true;
+    }
+    changed
+}
+
+fn branch_condition(graph: &Graph, condition: Value) -> (Value, bool) {
+    match graph.defining_op(condition) {
+        Some(Op::Unary(UnaryOp::Not, value)) => (*value, true),
+        _ => (condition, false),
+    }
+}
+
+fn fold_dominated_branches(graph: &mut Graph, cfg: &Cfg) -> bool {
+    let mut decided: HashMap<Value, Vec<(Block, bool)>> = HashMap::new();
+    for &block in &cfg.rpo {
+        let Some(Terminator {
+            kind: TerminatorKind::Branch(condition, yes, no),
+            ..
+        }) = &graph.blocks[block].terminator
+        else {
+            continue;
+        };
+        if yes.block == no.block {
+            continue;
+        }
+        let (condition, inverted) = branch_condition(graph, *condition);
+        for (target, taken) in [(yes.block, !inverted), (no.block, inverted)] {
+            if target != graph.entry && cfg.preds[target].len() == 1 {
+                decided.entry(condition).or_default().push((target, taken));
+            }
+        }
+    }
+    if decided.is_empty() {
+        return false;
+    }
+    let mut changed = false;
+    for &block in &cfg.rpo {
+        let Some(Terminator {
+            kind: TerminatorKind::Branch(condition, yes, no),
+            ..
+        }) = &graph.blocks[block].terminator
+        else {
+            continue;
+        };
+        let (condition, inverted) = branch_condition(graph, *condition);
+        let Some(&(_, value)) = decided.get(&condition).and_then(|facts| {
+            facts
+                .iter()
+                .find(|(target, _)| cfg.dominates(*target, block))
+        }) else {
+            continue;
+        };
+        let target = if value != inverted { yes } else { no }.clone();
         graph.blocks[block].terminator.as_mut().unwrap().kind = TerminatorKind::Jump(target);
         changed = true;
     }

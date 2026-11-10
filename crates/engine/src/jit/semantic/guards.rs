@@ -21,6 +21,14 @@ impl Fact {
         }
     }
 
+    pub(super) fn implies(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::Type(known), Self::Type(wanted)) => known.within(wanted),
+            (Self::Typed(Some(_)), Self::Typed(None)) => true,
+            _ => self == other,
+        }
+    }
+
     pub(super) fn code(self) -> Option<FuncId> {
         match self {
             Self::Code(code) => Some(code),
