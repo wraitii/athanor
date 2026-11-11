@@ -50,7 +50,7 @@ fn capture_array(ctx: &mut JitCtx, text: &str, found: regress::Match) -> Value {
         heap.release(value);
     }
     match array {
-        Some(value) => ctx.own(value),
+        Some(value) => value,
         None => fail(ctx, "heap exhausted"),
     }
 }
@@ -113,7 +113,7 @@ pub(super) fn call(
             heap.release(value);
         }
         return match array {
-            Some(value) => ctx.own(value),
+            Some(value) => value,
             None => fail(ctx, "heap exhausted"),
         };
     }
@@ -187,7 +187,7 @@ pub(super) fn replace(ctx: &mut JitCtx, text: &str, regexp: Value, replacement: 
     };
     output.push_str(suffix);
     match heap.string(&output) {
-        Some(value) => ctx.own(value),
+        Some(value) => value,
         None => fail(ctx, "heap exhausted"),
     }
 }

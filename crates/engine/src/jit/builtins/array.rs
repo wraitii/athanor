@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 
-use super::super::session::JitCtx;
+use super::super::session::{Held, JitCtx};
 use super::{arg, fail};
 use crate::heap::NativeFunction;
 use crate::value::Value;
@@ -98,10 +98,11 @@ pub(in crate::jit) fn from(ctx: *mut JitCtx, args: &[Value]) -> Value {
     {
         return fail(context, "Array.from mapper is not callable");
     }
-    let mut values = Vec::new();
+    let mut values = Held::new(&heap);
     let mut index = 0;
     if heap.len(source).is_some() {
-        let state = js_iterate_new(ctx, source);
+        let mut iteration = Held::new(&heap);
+        let state = iteration.push(js_iterate_new(ctx, source));
         if context.error.is_some() || context.exception_pending() {
             return Value::UNDEFINED;
         }
@@ -118,6 +119,7 @@ pub(in crate::jit) fn from(ctx: *mut JitCtx, args: &[Value]) -> Value {
             } else {
                 let callback_args = [value, Value::number(index as f64)];
                 let mapped = js_call(ctx, mapper, this_arg, callback_args.as_ptr(), 2);
+                heap.release(value);
                 if context.error.is_some() || context.exception_pending() {
                     return Value::UNDEFINED;
                 }
@@ -130,19 +132,20 @@ pub(in crate::jit) fn from(ctx: *mut JitCtx, args: &[Value]) -> Value {
         let Some(length) = array_like_length(context, source) else {
             return Value::UNDEFINED;
         };
-        if values.try_reserve(length).is_err() {
+        if !values.reserve(length) {
             return fail(context, "Array.from allocation failed");
         }
         for index in 0..length {
             let Some(value) = array_like_get(context, source, index) else {
                 return Value::UNDEFINED;
             };
-            let value = context.retain_temp(value);
+            let value = context.retain(value);
             let mapped = if mapper.is_undefined() {
                 value
             } else {
                 let callback_args = [value, Value::number(index as f64)];
                 let mapped = js_call(ctx, mapper, this_arg, callback_args.as_ptr(), 2);
+                heap.release(value);
                 if context.error.is_some() || context.exception_pending() {
                     return Value::UNDEFINED;
                 }
@@ -151,8 +154,8 @@ pub(in crate::jit) fn from(ctx: *mut JitCtx, args: &[Value]) -> Value {
             values.push(mapped);
         }
     }
-    match heap.array(&values) {
-        Some(value) => context.own(value),
+    match heap.array_from_owned(values.take()) {
+        Some(value) => value,
         None => fail(context, "heap exhausted"),
     }
 }
@@ -168,12 +171,12 @@ pub(in crate::jit) fn construct(ctx: *mut JitCtx, args: &[Value]) -> Value {
             return fail(context, "invalid array length");
         }
         return match heap.array_of_length(number as usize) {
-            Some(value) => context.own(value),
+            Some(value) => value,
             None => fail(context, "array allocation failed"),
         };
     }
     match heap.array(args) {
-        Some(value) => context.own(value),
+        Some(value) => value,
         None => fail(context, "heap exhausted"),
     }
 }
@@ -244,6 +247,7 @@ fn sort(ctx: *mut JitCtx, receiver: Value, args: &[Value]) -> Value {
         return fail(context, "sort comparator is not callable");
     }
     let mut values = Vec::new();
+    let mut kept = Held::new(&heap);
     let mut undefined = 0;
     for index in 0..length {
         if !heap.present(receiver, index) {
@@ -254,7 +258,7 @@ fn sort(ctx: *mut JitCtx, receiver: Value, args: &[Value]) -> Value {
             undefined += 1;
             continue;
         }
-        values.push(context.retain_temp(value));
+        values.push(kept.push(context.retain(value)));
     }
     let mut failed = false;
     if has_comparator {
@@ -269,7 +273,9 @@ fn sort(ctx: *mut JitCtx, receiver: Value, args: &[Value]) -> Value {
                 failed = true;
                 return Ordering::Equal;
             }
-            let Some(number) = sort_number(&heap, result) else {
+            let number = sort_number(&heap, result);
+            heap.release(result);
+            let Some(number) = number else {
                 context.error = Some(Box::new(crate::Error::Runtime(
                     "object conversion in sort is unsupported".into(),
                 )));
@@ -321,7 +327,7 @@ fn sort(ctx: *mut JitCtx, receiver: Value, args: &[Value]) -> Value {
         }
         heap.mark_hole(receiver, index);
     }
-    context.retain_temp(receiver)
+    context.retain(receiver)
 }
 
 fn flat(ctx: *mut JitCtx, receiver: Value, args: &[Value]) -> Value {
@@ -343,11 +349,13 @@ fn flat(ctx: *mut JitCtx, receiver: Value, args: &[Value]) -> Value {
     let Some(result) = heap.array(&[]) else {
         return fail(context, "heap exhausted");
     };
-    context.own(result);
+    let mut allocation = Held::new(&heap);
+    allocation.push(result);
     let mut next = 0;
     if !flatten_into(&heap, result, receiver, depth, &mut next) {
         return fail(context, "cannot append flat element");
     }
+    allocation.take();
     result
 }
 
@@ -378,7 +386,7 @@ pub(super) fn call(
     }
     if function == ArrayReverse {
         heap.reverse_array(receiver);
-        return context.retain_temp(receiver);
+        return context.retain(receiver);
     }
     if function == ArrayFlat {
         return flat(ctx, receiver, args);
@@ -398,7 +406,7 @@ pub(super) fn call(
                 return fail(context, "cannot fill array element");
             }
         }
-        return context.retain_temp(receiver);
+        return context.retain(receiver);
     }
     if function == ArrayIncludes {
         if length == 0 {
@@ -431,7 +439,8 @@ pub(super) fn call(
         let Some(result) = heap.array(&[]) else {
             return fail(context, "heap exhausted");
         };
-        context.own(result);
+        let mut allocation = Held::new(&heap);
+        allocation.push(result);
         for (next, index) in (start..end).enumerate() {
             let present = heap.present(receiver, index);
             let value = heap.get(receiver, index).unwrap();
@@ -442,13 +451,15 @@ pub(super) fn call(
                 heap.mark_hole(result, next);
             }
         }
+        allocation.take();
         return result;
     }
     if function == ArrayConcat {
         let Some(result) = heap.array(&[]) else {
             return fail(context, "heap exhausted");
         };
-        context.own(result);
+        let mut allocation = Held::new(&heap);
+        allocation.push(result);
         let mut next = 0;
         for value in std::iter::once(receiver).chain(args.iter().copied()) {
             if let Some(length) = heap.is_array(value).then(|| heap.len(value).unwrap()) {
@@ -470,6 +481,7 @@ pub(super) fn call(
                 next += 1;
             }
         }
+        allocation.take();
         return result;
     }
     if function == ArrayIndexOf {
@@ -504,7 +516,7 @@ pub(super) fn call(
         if length == 0 {
             return Value::UNDEFINED;
         }
-        let value = context.retain_temp(heap.get(receiver, length - 1).unwrap());
+        let value = context.retain(heap.get(receiver, length - 1).unwrap());
         heap.truncate(receiver, length - 1);
         return value;
     }
@@ -533,7 +545,7 @@ pub(super) fn call(
         } else {
             Value::UNDEFINED
         };
-        return context.retain_temp(value);
+        return context.retain(value);
     }
     if function == ArrayJoin {
         let separator = if arg(0) == Value::UNDEFINED {
@@ -559,7 +571,7 @@ pub(super) fn call(
             }
         }
         return match heap.string(&parts.join(&separator)) {
-            Some(value) => context.own(value),
+            Some(value) => value,
             None => fail(context, "heap exhausted"),
         };
     }
@@ -570,6 +582,7 @@ pub(super) fn call(
     if args.len() > 1 && arg(1) != Value::UNDEFINED {
         return fail(context, "array callback thisArg is unsupported");
     }
+    let mut allocation = Held::new(&heap);
     let result = if matches!(function, ArrayEvery | ArraySome | ArrayFind | ArrayForEach) {
         None
     } else {
@@ -581,7 +594,7 @@ pub(super) fn call(
         let Some(result) = heap.array(&initial) else {
             return fail(context, "heap exhausted");
         };
-        context.own(result);
+        allocation.push(result);
         if function == ArrayMap {
             for index in 0..length {
                 heap.mark_hole(result, index);
@@ -599,9 +612,11 @@ pub(super) fn call(
         } else {
             Value::UNDEFINED
         };
-        unsafe { &mut *ctx }.retain_temp(value);
+        let mut iteration = Held::new(&heap);
+        iteration.push(unsafe { &mut *ctx }.retain(value));
         let callback_args = [value, Value::number(index as f64), receiver];
         let mapped = js_call(ctx, callback, Value::UNDEFINED, callback_args.as_ptr(), 3);
+        iteration.push(mapped);
         let context = unsafe { &mut *ctx };
         if context.error.is_some() || context.exception_pending() {
             return Value::UNDEFINED;
@@ -628,7 +643,7 @@ pub(super) fn call(
             }
         } else if function == ArrayFind {
             if js_truthy(ctx, mapped) == Value::TRUE {
-                return context.retain_temp(value);
+                return context.retain(value);
             }
         } else if function == ArrayForEach {
         } else if js_truthy(ctx, mapped) == Value::TRUE {
@@ -640,6 +655,9 @@ pub(super) fn call(
         ArrayEvery => Value::TRUE,
         ArraySome => Value::FALSE,
         ArrayFind | ArrayForEach => Value::UNDEFINED,
-        _ => result.unwrap(),
+        _ => {
+            allocation.take();
+            result.unwrap()
+        }
     }
 }

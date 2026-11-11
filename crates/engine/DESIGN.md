@@ -66,7 +66,7 @@ missing; arrays and rest alone will not make the bootstrap runnable. The C++
 runner independently embeds SpiderMonkey and provides a workload reference,
 not Rust-engine bindings.
 
-## CLIF cleanup
+## CLIF emission and ownership
 
 Numeric facts and representation selection belong to the semantic graph and
 its emitter. There is no separate numeric dataflow analysis over CLIF. Unknown
@@ -77,62 +77,56 @@ operands are strings.
 
 ```text
 Oxc AST -> semantic optimization -> typed CLIF + annotations
-                                -> indexed-read scope and temporary cleanup
                                 -> Cranelift optimization and code generation
 ```
 
 `jit/clif.rs` pairs a CLIF `Function` with emission annotations for helper calls,
-indexed reads, invocation roots, inline temporary pushes, and guarded temporary
-clears. Annotations refer to that exact body and are consumed before Cranelift
-rewrites it. Source locations remain available separately for profiling.
+invocation roots and frame stores. Annotations refer to that exact body and are
+consumed before Cranelift rewrites it. Source locations remain available
+separately for profiling.
 
-`jit/temporaries.rs` summarizes each block's effect on the temporary stack and
-propagates a single may-register bit through the CFG. A guarded clear can be
-bypassed only when every incoming path is clean. Both the clear path and its
-empty-stack bypass leave the frame clean. Joins and loop backedges preserve any
-possible push. Unknown calls, retain helpers and generic addition are
-conservative barriers; inline pushes are recorded explicitly, so unrelated
-reference-count and frame-slot stores do not dirty the temporary stack. The
-cleanup bypasses the whole clear check, leaving unreachable blocks for Cranelift
-to remove. It is disabled with `JS_JIT_SSA=0`.
+Helpers listed by `Helper::returns_reference` return heap results with a
+reference the generated code owns; inline fast paths take the same reference by
+incrementing the count. Emission holds each such reference in a pooled Cranelift
+variable, which is `undefined` on paths that never took it. A result's references
+are released right after its last use in its block, counting the uses of borrowed
+values that may alias it. Maybe-owned results are owned or not heap-tagged, so
+they never alias their operands. Results used by a terminator or another block,
+and references taken without a result, are released inline at the block's end. A
+result stored into a frame slot takes a reference of its own.
+
+Early exits through a failed helper or a thrown exception pass the references
+live at the site to a ladder of cold exits per target: the exit taking `n`
+references releases the last one and continues to the exit taking `n - 1`.
+Cleanup code therefore grows with the deepest live set, not with the number of
+sites, and live ranges end at a reference's last use. The result of a helper
+that has just failed owns nothing and is left out.
+
+Generators keep these references in pooled stack slots instead. Their values are
+never slotted in the frame, so every heap value is a temporary, many of them
+live across calls; as SSA values they dominated register allocation. Each slot
+holds `undefined` outside the span using it: slots are cleared on entry and reset
+on release. A generator's ladder ends in one cleanup per target and semantic
+block, filled at the block's end, which releases every slot the block used.
+
+String literals are created on first execution and cached in the function's
+data, which keeps their reference for the lifetime of the compiled code. A
+literal is therefore borrowed and never tracked; this relies on strings being
+immutable.
+Runtime code holding references across calls into JavaScript uses `Held`, which
+releases them when dropped.
 
 Helpers also have effect summaries distinguishing heap and global reads and
 writes, internal bookkeeping and ownership, allocation, errors, and reentry.
 Semantic optimization uses the separate operation contracts described under
 [Contracts and facts](#contracts-and-facts).
 
-Indexed-read emission records the receiver, key, result, source location,
-successful continuation and runtime-read contract as invocation-scoped read
-descriptors. The original potentially failing read and its temporary ownership
-remain in the CFG. An SSA-enabled scope can reuse a dominating successful read
-inside a loop if the whole body has no observable writes, arbitrary reentry,
-catch, generator transitions, or unknown calls. A nonthrowing probe establishes
-the `DirectNumericIndexStorage` capability for a numeric key on an array or
-typed array. It guarantees stable direct reads and that any owning element is
-held by the receiver; it does not imply numeric array elements. Other receivers
-and keys keep the original read. The later site compares receiver and key bits
-in CLIF and falls back to its original helper on mismatch.
-
-Storage and lifetime are separate facts. One bounded frame root holds the receiver, key, and result across
-temporary clears, replacing the previous root or releasing it at frame exit.
-This extends their lifetimes; the current runtime has no finalizers. The storage
-probe must reject accessor or proxy behavior if introduced. Only one pair per
-function is currently selected. A future embedder type could provide equivalent
-field or method capabilities with explicit effects, result domains, ownership,
-and stability contracts; mutations outside the engine would also have to honor
-the scope. A typed-array element-domain fact could further specialize numeric
-representation. Loop peeling could establish facts on the first iteration for a
-later specialized loop, but is not implemented here.
-
 Helper effect contracts let emission omit JS-exception checks for helpers that
 cannot throw. General receiver specialization remains unimplemented. Tiered
 compilation and feedback specialization are described in the semantic graph section below.
 
 `EngineOptions::ssa_opt` enables rewriting and defaults to true unless
-`JS_JIT_SSA=0`. `EngineOptions::ssa_dump` defaults to false unless
-`JS_JIT_SSA_DUMP=1`; it prints per-function counts of removed temporary clears
-to stderr. The existing IR listings show CLIF after cleanup when rewriting is
-enabled.
+`JS_JIT_SSA=0`.
 
 Compilation tiers build on this boundary. Canonical semantic graphs of ordinary
 functions are retained separately from emitted bodies; canonical CLIF bodies are
@@ -1686,8 +1680,8 @@ Property probes use the same shape and holder cache as ordinary named reads,
 with a non-throwing, non-retaining miss path. Borrow analysis includes property
 and global probes; reentry and heap or global writes end those borrows. A path
 that never writes a frame slot skips the local-slot release scan on return,
-even when its generic sibling reserves slots. Temporary and indexed roots still
-receive their normal cleanup.
+even when its generic sibling reserves slots. Temporaries still receive their
+normal cleanup.
 
 Property caches also retain a builtin-method entry guarded by the receiver's
 exact heap kind. Arrays, typed arrays, strings, sets, regexps and generators
@@ -1808,16 +1802,14 @@ receive. Trivial block parameters introduced by specialization are folded before
 borrow analysis, preserving borrows through guard blocks. `--semantic-ir` lists
 the borrowed reads.
 
-Frames share one contiguous slot stack and one temporary stack in `JitCtx`;
-ordinary functions number their rooted values densely and reserve that many
-slots on entry, and `JitCtx` exposes the current frame's slot base and the
-temporary stack's storage, length, capacity and frame floor. Frame exit releases
-slots and temporaries under one heap borrow. A rooted graph value's slot takes
-a reference of its own: ordinary stores increment inline, and a temporary holding
-the same value keeps its reference until the block's clear. Object, array, map
-result, instance and string-split allocations instead use owned-result helpers
-when slotted. The frame adopts the allocation's reference directly; these helpers
-never register temporaries. Property, element and global reads stored this way
+Frames share one contiguous slot stack in `JitCtx`; ordinary functions number
+their rooted values densely and reserve that many slots on entry, and `JitCtx`
+exposes the current frame's slot base. Frame exit releases slots under one heap
+borrow. A rooted graph value's slot takes a reference of its own: ordinary
+stores increment inline, and the block keeps any reference it already holds on
+the same value until its end. Object, array, map result, instance and
+string-split allocations instead use owned-result helpers when slotted. The
+frame adopts the allocation's reference directly; the block never tracks it. Property, element and global reads stored this way
 skip temporary registration and acquire the slot's reference before replacing its
 old value. Global cache misses have a matching borrowed-result helper. Constructor
 results always have object facts; a proven primitive return selects the instance,

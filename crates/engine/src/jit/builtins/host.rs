@@ -82,7 +82,7 @@ pub(super) fn call(ctx: *mut JitCtx, function: NativeFunction, args: &[Value]) -
     let context = unsafe { &mut *ctx };
     match result {
         Ok(text) => match context.global.heap().string(&text) {
-            Some(value) => context.own(value),
+            Some(value) => value,
             None => fail(context, "heap exhausted"),
         },
         Err(error) => host_error(context, &error),

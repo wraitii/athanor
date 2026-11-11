@@ -25,7 +25,7 @@ use super::clif::{Annotations, FunctionBody};
 use super::entries::{Entry, VariantId};
 use super::function_data::FunctionData;
 use super::machine::MachineCode;
-use super::{analysis::CaptureAnalysis, emit, jitdump, temporaries};
+use super::{analysis::CaptureAnalysis, emit, jitdump};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum CompilationTier {
@@ -191,7 +191,6 @@ pub(crate) struct Compiler {
     generic_first: bool,
     get_refinement: bool,
     specialization_log: Option<String>,
-    ssa_dump: bool,
     backend: crate::Backend,
     inspection: Option<Arc<super::inspect::CompileOptions>>,
     next_id: u64,
@@ -315,7 +314,6 @@ impl Compiler {
             recompile_inline_multiplier: options.recompile_inline_multiplier,
             get_refinement: options.get_refinement,
             specialization_log: options.specialization_log,
-            ssa_dump: options.ssa_dump,
             backend: options.backend,
             inspection: options.compile,
             next_id: 0,
@@ -921,7 +919,7 @@ impl Compiler {
         let mut continuations = std::mem::take(&mut self.continuations);
         continuations.append(&mut pending);
         let mut dumped = Vec::new();
-        for (id, mut code) in continuations {
+        for (id, code) in continuations {
             let mut listing = None;
             self.context.clear();
             self.context.func = code.function;
@@ -930,18 +928,6 @@ impl Compiler {
                 .get(&id)
                 .cloned()
                 .unwrap_or_else(|| format!("jsfn_{}", id.as_u32()));
-            if self.ssa_opt {
-                super::read_scope::specialize(
-                    &mut self.context,
-                    &mut code.annotations,
-                    &self.module,
-                );
-                let removed =
-                    temporaries::remove_empty_clears(&mut self.context.func, &code.annotations);
-                if self.ssa_dump {
-                    eprintln!("js ssa [{name}]: removed {removed} empty temporary clears");
-                }
-            }
             if self.dump_ir
                 && let Some(semantic) = &code.listing
             {

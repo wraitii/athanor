@@ -6,7 +6,7 @@ use crate::value::Value;
 pub(in crate::jit) fn call(ctx: &mut JitCtx, function: NativeFunction, args: &[Value]) -> Value {
     let value = arg(args, 0);
     if function == NativeFunction::ObjectFreeze {
-        return ctx.retain_temp(value);
+        return ctx.retain(value);
     }
     if function == NativeFunction::ObjectIsFrozen {
         return Value::boolean(!value.is_object());
@@ -57,7 +57,7 @@ pub(in crate::jit) fn call(ctx: &mut JitCtx, function: NativeFunction, args: &[V
         heap.release(value);
     }
     match result {
-        Some(value) => ctx.own(value),
+        Some(value) => value,
         None => fail(ctx, "heap exhausted"),
     }
 }

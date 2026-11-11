@@ -59,7 +59,7 @@ pub(in crate::jit) fn call(
     use NativeFunction::*;
     if function == StringSplit {
         let value = split(ctx, receiver, args);
-        return unsafe { &mut *ctx }.own(value);
+        return value;
     }
     let context = unsafe { &mut *ctx };
     let heap = context.global.heap().clone();
@@ -136,7 +136,7 @@ pub(in crate::jit) fn call(
             let length = text.chars().count();
             if target <= length {
                 return match heap.string(&text) {
-                    Some(value) => context.own(value),
+                    Some(value) => value,
                     None => fail(context, "heap exhausted"),
                 };
             }
@@ -149,7 +149,7 @@ pub(in crate::jit) fn call(
             };
             if padding.is_empty() {
                 return match heap.string(&text) {
-                    Some(value) => context.own(value),
+                    Some(value) => value,
                     None => fail(context, "heap exhausted"),
                 };
             }
@@ -163,7 +163,7 @@ pub(in crate::jit) fn call(
         _ => unreachable!(),
     };
     match heap.string(&result) {
-        Some(value) => context.own(value),
+        Some(value) => value,
         None => fail(context, "heap exhausted"),
     }
 }

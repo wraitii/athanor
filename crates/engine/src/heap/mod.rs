@@ -110,11 +110,6 @@ pub(crate) enum PropertyRead {
     Prototype,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum IndexedStorageContract {
-    DirectNumericIndexStorage,
-}
-
 pub(crate) enum IndexRead {
     Primitive(Value),
     Borrowed(Value),

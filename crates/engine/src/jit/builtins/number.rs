@@ -116,7 +116,7 @@ pub(super) fn call(
         _ => unreachable!(),
     };
     match ctx.global.heap().string(&text) {
-        Some(value) => ctx.own(value),
+        Some(value) => value,
         None => fail(ctx, "heap exhausted"),
     }
 }

@@ -134,7 +134,7 @@ pub(crate) extern "C" fn js_add(ctx: *mut JitCtx, left: Value, right: Value) -> 
             .or_else(|| heap.error_text(right))
             .unwrap_or_else(|| right.to_string());
         return match heap.string(&(left + &right)) {
-            Some(value) => ctx.own(value),
+            Some(value) => value,
             None => {
                 ctx.error = Some(Box::new(crate::Error::Runtime(
                     "string heap exhausted".into(),

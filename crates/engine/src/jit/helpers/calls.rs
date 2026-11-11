@@ -14,20 +14,21 @@ pub(super) fn argument_values<'a>(
         return Some(values);
     }
     let state = js_iterate_new(ctx, arguments);
-    if unsafe { &*ctx }.error.is_some() {
-        return None;
-    }
-    loop {
+    let result = loop {
+        if unsafe { &*ctx }.error.is_some() {
+            break None;
+        }
         let value = js_iterate_next(ctx, state);
         if unsafe { &*ctx }.error.is_some() {
-            return None;
+            break None;
         }
         if value == Value::UNINITIALIZED {
-            return Some(values);
+            break Some(values);
         }
-        unsafe { &*ctx }.global.heap().retain(value);
         values.values.push(value);
-    }
+    };
+    unsafe { &*ctx }.global.heap().release(state);
+    result
 }
 
 pub(in crate::jit) extern "C" fn js_call_pack(
@@ -69,17 +70,6 @@ pub(in crate::jit) extern "C" fn js_call(
     invoke(ctx, closure, receiver, argv, argc)
 }
 
-pub(in crate::jit) extern "C" fn js_call_owned(
-    ctx: *mut JitCtx,
-    closure: Value,
-    receiver: Value,
-    argv: *const Value,
-    argc: u64,
-) -> Value {
-    let value = js_call(ctx, closure, receiver, argv, argc);
-    unsafe { &mut *ctx }.disown(value)
-}
-
 pub(super) fn invoke(
     ctx: *mut JitCtx,
     closure: Value,
@@ -119,12 +109,12 @@ pub(super) fn invoke(
         .lexical_this(closure)
         .unwrap_or(receiver);
     let value = entry.call(ctx, closure, receiver, argv, argc);
-    unsafe { &mut *ctx }.own(value)
+    value
 }
 
 pub(super) extern "C" fn js_new_instance(ctx: *mut JitCtx, prototype: Value) -> Value {
     let value = js_new_instance_owned(ctx, prototype);
-    unsafe { &mut *ctx }.own(value)
+    value
 }
 
 pub(super) extern "C" fn js_new_instance_owned(ctx: *mut JitCtx, prototype: Value) -> Value {
@@ -205,13 +195,20 @@ pub(super) fn invoke_constructor(
     argv: *const Value,
     argc: u64,
 ) -> Value {
-    unsafe { &mut *ctx }.own(instance);
     let result = invoke(ctx, constructor, instance, argv, argc);
     let context = unsafe { &*ctx };
+    let heap = context.global.heap();
     if context.error.is_some() || context.exception_pending() {
+        heap.release(result);
+        heap.release(instance);
         return Value::UNDEFINED;
     }
-    if result.is_object() { result } else { instance }
+    if result.is_object() {
+        heap.release(instance);
+        return result;
+    }
+    heap.release(result);
+    instance
 }
 
 pub(super) extern "C" fn js_construct(
@@ -259,7 +256,7 @@ pub(super) extern "C" fn js_construct(
             return Value::UNDEFINED;
         }
         return match ctx.global.heap().set_new() {
-            Some(value) => ctx.own(value),
+            Some(value) => value,
             None => {
                 ctx.error = Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
                 Value::UNDEFINED
@@ -304,7 +301,7 @@ pub(super) extern "C" fn js_construct(
     heap.release(message);
     heap.release(name);
     match result {
-        Some(value) => ctx.own(value),
+        Some(value) => value,
         None => {
             ctx.error = Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
             Value::UNDEFINED
@@ -443,7 +440,7 @@ pub(super) fn native_call(
                 ctx.error = Some(Box::new(crate::Error::Runtime("invalid Set entry".into())));
                 return Value::UNDEFINED;
             }
-            ctx.retain_temp(receiver)
+            ctx.retain(receiver)
         }
         NativeFunction::SetClear => {
             if !ctx.global.heap().set_clear(receiver) {

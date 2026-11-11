@@ -13,7 +13,8 @@ use std::collections::HashMap;
 
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
-    Block, BlockArg, Inst, InstBuilder, MemFlagsData, SigRef, Type, Value as ClifValue, types,
+    Block, BlockArg, Inst, InstBuilder, MemFlagsData, SigRef, StackSlot, Type, Value as ClifValue,
+    types,
 };
 use cranelift_frontend::{FunctionBuilder, Switch, Variable};
 use cranelift_jit::JITModule;
@@ -76,6 +77,15 @@ pub(super) struct FunctionCompiler<'a, 'f> {
     property_caches: HashMap<super::semantic::Inst, i64>,
     slots: HashMap<u32, u32>,
     slot_count: u32,
+    owned: Vec<Variable>,
+    free_owned: Vec<Variable>,
+    unchecked: Option<Variable>,
+    spilled: HashMap<u32, StackSlot>,
+    free_slots: Vec<StackSlot>,
+    block_slots: Vec<StackSlot>,
+    owned_slots: Vec<StackSlot>,
+    owned_entry: Option<(Block, Block)>,
+    unwinds: HashMap<Block, (Vec<Block>, Block)>,
 }
 
 enum Arguments {
@@ -87,7 +97,6 @@ enum Arguments {
 struct CallerFrame {
     start: ClifValue,
     base: ClifValue,
-    floor: ClifValue,
 }
 
 const INLINE_FRAME_RELEASES: u32 = 4;
@@ -243,7 +252,24 @@ fn build_callable(
         property_caches: HashMap::new(),
         slots: HashMap::new(),
         slot_count: 0,
+        owned: Vec::new(),
+        free_owned: Vec::new(),
+        unchecked: None,
+        spilled: HashMap::new(),
+        free_slots: Vec::new(),
+        block_slots: Vec::new(),
+        owned_slots: Vec::new(),
+        owned_entry: None,
+        unwinds: HashMap::new(),
     };
+
+    if matches!(kind, FunctionKind::Generator(_)) {
+        let init = compiler.b.create_block();
+        let start = compiler.b.create_block();
+        compiler.jump(init, &[]);
+        compiler.switch(start);
+        compiler.owned_entry = Some((init, start));
+    }
 
     let dispatch = if let FunctionKind::Generator(plan) = &kind {
         compiler.generator = Some(closure);
@@ -299,6 +325,7 @@ fn build_callable(
             let args = compiler.return_args(undefined, false);
             compiler.jump(return_block, &args);
         }
+        compiler.finish_owned_slots();
         return Ok(());
     }
     Ok(())
@@ -457,25 +484,11 @@ impl FunctionCompiler<'_, '_> {
             self.jump(done, &[]);
             self.switch(done);
         }
-        self.clear_temporaries();
-        let root = self.load_ctx(crate::jit::session::INDEX_ROOT_OFFSET);
-        let rooted = self
-            .b
-            .ins()
-            .icmp_imm_s(IntCC::NotEqual, root, Value::UNDEFINED.bits() as i64);
-        let unroot = self.b.create_block();
-        let done = self.b.create_block();
-        self.b.set_cold_block(unroot);
-        self.brif(rooted, unroot, &[], done, &[]);
-        self.switch(unroot);
-        self.call_helper(Helper::IndexUnroot, &[]);
-        self.jump(done, &[]);
-        self.switch(done);
+        self.release_owned();
         let start = self.load_ctx(crate::jit::session::LOCALS_START_OFFSET);
         self.store_ctx(start, crate::jit::session::LOCALS_LEN_OFFSET);
         self.store_ctx(caller.start, crate::jit::session::LOCALS_START_OFFSET);
         self.store_ctx(caller.base, crate::jit::session::LOCALS_OFFSET);
-        self.store_ctx(caller.floor, crate::jit::session::TEMPS_FLOOR_OFFSET);
         self.frame_code = false;
     }
 
@@ -500,7 +513,7 @@ impl FunctionCompiler<'_, '_> {
     fn enter_frame(&mut self) {
         use crate::jit::session::{
             LOCALS_LEN_OFFSET, LOCALS_LIMIT_OFFSET, LOCALS_OFFSET, LOCALS_START_OFFSET,
-            STACK_LIMIT_OFFSET, TEMPS_FLOOR_OFFSET, TEMPS_LEN_OFFSET,
+            STACK_LIMIT_OFFSET,
         };
         let roots = self.b.declare_var(types::I8);
         let clean = self.b.ins().iconst(types::I8, 0);
@@ -510,7 +523,6 @@ impl FunctionCompiler<'_, '_> {
         let caller = CallerFrame {
             start: self.load_ctx(LOCALS_START_OFFSET),
             base: self.load_ctx(LOCALS_OFFSET),
-            floor: self.load_ctx(TEMPS_FLOOR_OFFSET),
         };
         let start = self.load_ctx(LOCALS_LEN_OFFSET);
         let size = self.b.ins().iconst(types::I64, 0);
@@ -544,9 +556,6 @@ impl FunctionCompiler<'_, '_> {
         self.store_ctx(base, LOCALS_OFFSET);
         self.store_ctx(start, LOCALS_START_OFFSET);
         self.store_ctx(len, LOCALS_LEN_OFFSET);
-        let temps = self.load_ctx(TEMPS_LEN_OFFSET);
-        let floor = self.store_ctx(temps, TEMPS_FLOOR_OFFSET);
-        self.annotations.temporary_resets.insert(floor);
         self.frame = Some(caller);
         self.frame_code = false;
     }
@@ -573,38 +582,6 @@ impl FunctionCompiler<'_, '_> {
                 .replace(inst)
                 .iconst(types::I64, self.slot_count as i64);
         }
-    }
-
-    pub(super) fn clear_temporaries(&mut self) {
-        let flags = MemFlagsData::trusted();
-        let len = self.b.ins().load(
-            types::I64,
-            flags,
-            self.ctx,
-            crate::jit::session::TEMPS_LEN_OFFSET,
-        );
-        let floor = self.b.ins().load(
-            types::I64,
-            flags,
-            self.ctx,
-            crate::jit::session::TEMPS_FLOOR_OFFSET,
-        );
-        let pending = self.b.ins().icmp(IntCC::NotEqual, len, floor);
-        let clear = self.b.create_block();
-        let done = self.b.create_block();
-        self.brif(pending, clear, &[], done, &[]);
-        let branch = self
-            .b
-            .func
-            .layout
-            .last_inst(self.b.current_block().unwrap())
-            .unwrap();
-        self.annotations.temporary_clears.insert(branch, done);
-        self.switch(clear);
-        let dummy = self.constant(Value::UNDEFINED);
-        self.call_helper(Helper::TempClear, &[dummy]);
-        self.jump(done, &[]);
-        self.switch(done);
     }
 
     pub(super) fn argument_vector(&self) -> Result<(ClifValue, ClifValue), Error> {

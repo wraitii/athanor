@@ -19,11 +19,9 @@ mod math;
 pub(crate) mod osr;
 mod pack;
 pub(crate) mod profile;
-mod read_scope;
 pub(crate) mod recompile;
 mod semantic;
 mod session;
-mod temporaries;
 mod tiering;
 mod variants;
 

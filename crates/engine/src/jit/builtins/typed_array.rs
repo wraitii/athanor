@@ -1,6 +1,6 @@
 use super::{arg, fail};
 use crate::heap::TypedKind;
-use crate::jit::session::JitCtx;
+use crate::jit::session::{Held, JitCtx};
 use crate::value::Value;
 
 pub(in crate::jit) fn numeric(ctx: &mut JitCtx, value: Value) -> Option<f64> {
@@ -31,7 +31,8 @@ pub(in crate::jit) fn from(ctx: *mut JitCtx, kind: TypedKind, args: &[Value]) ->
             "typed array allocation failed or exceeds 256 MiB limit",
         );
     };
-    context.own(result);
+    let mut allocation = Held::new(&heap);
+    allocation.push(result);
     for index in 0..length {
         let value = heap.get(array, index).unwrap();
         let Some(number) = numeric(context, value) else {
@@ -41,6 +42,7 @@ pub(in crate::jit) fn from(ctx: *mut JitCtx, kind: TypedKind, args: &[Value]) ->
             return fail(context, "cannot set typed array element");
         }
     }
+    allocation.take();
     result
 }
 
@@ -57,7 +59,7 @@ pub(in crate::jit) fn construct(ctx: &mut JitCtx, kind: TypedKind, args: &[Value
         return fail(ctx, "invalid typed array length");
     }
     match ctx.global.heap().typed_new(kind, length as usize) {
-        Some(value) => ctx.own(value),
+        Some(value) => value,
         None => fail(
             ctx,
             "typed array allocation failed or exceeds 256 MiB limit",
@@ -94,5 +96,5 @@ pub(in crate::jit) fn fill(ctx: &mut JitCtx, receiver: Value, args: &[Value]) ->
         return Value::UNDEFINED;
     };
     heap.typed_fill(receiver, start, end, number);
-    ctx.retain_temp(receiver)
+    ctx.retain(receiver)
 }

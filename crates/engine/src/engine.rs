@@ -60,7 +60,6 @@ pub struct EngineOptions {
     pub recompile_log: bool,
     pub specialization_log: Option<String>,
     pub call_profile: bool,
-    pub ssa_dump: bool,
     pub backend: Backend,
     pub compile: Option<Arc<crate::CompileOptions>>,
 }
@@ -98,7 +97,6 @@ impl Default for EngineOptions {
                 .ok()
                 .filter(|filter| !filter.is_empty() && filter != "0"),
             call_profile: std::env::var("JS_JIT_CALL_PROFILE").as_deref() == Ok("1"),
-            ssa_dump: std::env::var("JS_JIT_SSA_DUMP").as_deref() == Ok("1"),
             backend: match std::env::var("JS_JIT_BACKEND").as_deref() {
                 Ok("native") => Backend::Native,
                 Ok("native-only") => Backend::NativeOnly,

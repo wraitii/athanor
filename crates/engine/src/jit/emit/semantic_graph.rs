@@ -302,6 +302,13 @@ impl FunctionCompiler<'_, '_> {
         });
 
         let cyclic = cyclic_blocks(graph, cfg);
+        let releases = super::slots::releases(graph, facts, cfg);
+        let early: std::collections::HashSet<GraphValue> =
+            releases.values().flatten().copied().collect();
+        let mut result_tokens: std::collections::HashMap<
+            GraphValue,
+            Vec<cranelift_frontend::Variable>,
+        > = std::collections::HashMap::new();
         let repeated = |block: crate::jit::semantic::Block| {
             suspends || graph.has_handlers || cyclic.contains(&block)
         };
@@ -435,10 +442,10 @@ impl FunctionCompiler<'_, '_> {
                 cx.define(value, param);
             }
             if retained_any {
-                self.clear_temporaries();
+                self.release_owned();
             }
-            let calls = self.annotations.helpers.len();
             for &inst in &data.insts {
+                let tracked = self.owned.len();
                 let handler = match &data.terminator.as_ref().unwrap().kind {
                     TerminatorKind::CheckException(_, error) => Some(blocks[error.block.index()]),
                     _ => None,
@@ -753,15 +760,7 @@ impl FunctionCompiler<'_, '_> {
                             Constant::Boolean(value) => self.constant(Value::boolean(*value)),
                             Constant::Number(value) => self.constant(Value::number(*value)),
                             Constant::Uninitialized => self.constant(Value::UNINITIALIZED),
-                            Constant::String(value) => {
-                                let text: Box<str> = value.as_str().into();
-                                let ptr = self.b.ins().iconst(self.pointer, text.as_ptr() as i64);
-                                let len = self.b.ins().iconst(types::I64, text.len() as i64);
-                                self.names.push(text);
-                                let result = self.call_helper(Helper::StringNew, &[ptr, len]);
-                                self.check_error();
-                                result
-                            }
+                            Constant::String(value) => self.string_constant(value),
                         }),
                         Op::GlobalRead(name) => {
                             let retain = data
@@ -838,7 +837,7 @@ impl FunctionCompiler<'_, '_> {
                             let helper = if graph.bindings[*binding].captured {
                                 Helper::CellGet
                             } else {
-                                Helper::TempRetain
+                                Helper::Retain
                             };
                             self.call_helper(helper, &[old]);
                             self.check_error();
@@ -1585,13 +1584,24 @@ impl FunctionCompiler<'_, '_> {
                     }
                     cx.define(value, result);
                 }
+                if self.owned.len() > tracked {
+                    let created = self.owned[tracked..].to_vec();
+                    if let Some(value) = data.result
+                        && early.contains(&value)
+                    {
+                        result_tokens.insert(value, created);
+                    }
+                }
+                for value in releases.get(&inst).into_iter().flatten() {
+                    if let Some(variables) = result_tokens.remove(value) {
+                        self.release_tracked(&variables);
+                    }
+                }
                 if handler.is_some() {
                     self.handlers.pop();
                 }
             }
-            if self.annotations.helpers.len() != calls {
-                self.clear_temporaries();
-            }
+            self.release_owned();
             let terminator = data.terminator.as_ref().unwrap();
             self.source_span = terminator.span;
             self.source_name = terminator.source_name.unwrap_or(source_name);
@@ -1665,7 +1675,7 @@ impl FunctionCompiler<'_, '_> {
                         let value = self.call_helper(Helper::LocalGet, &[slot]);
                         self.b.def_var(variable, value);
                     }
-                    self.clear_temporaries();
+                    self.release_owned();
                     let (block, args) = target(self, target_);
                     self.jump(block, &args);
                 }

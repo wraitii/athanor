@@ -1,5 +1,3 @@
-use super::helpers::Helper;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Effects {
     pub(super) memory: Memory,
@@ -25,9 +23,7 @@ pub(super) enum Assumption {
     NoAccessors,
     NoCoercionCallbacks,
     DirectIteration,
-    StableIndexStorage,
     FixedTypedStorage,
-    GuardedMathIdentity,
 }
 
 impl std::fmt::Display for Assumption {
@@ -36,9 +32,7 @@ impl std::fmt::Display for Assumption {
             Self::NoAccessors => "property access does not invoke accessors",
             Self::NoCoercionCallbacks => "coercion does not invoke JS callbacks",
             Self::DirectIteration => "iteration and enumeration use direct engine state",
-            Self::StableIndexStorage => "direct numeric array reads have stable storage",
             Self::FixedTypedStorage => "typed array storage never moves or resizes",
-            Self::GuardedMathIdentity => "native Math identity is checked by the entry guard",
         })
     }
 }
@@ -194,136 +188,5 @@ impl Control {
 impl std::fmt::Display for Control {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "throws={} ordered={}", self.throws, self.ordered)
-    }
-}
-
-pub(super) fn effects(helper: Helper) -> Effects {
-    use Helper::*;
-    let closed = Effects::of;
-    match helper {
-        Call
-        | CallOwned
-        | CallPack
-        | Construct
-        | ConstructPack
-        | ConstructResolved
-        | ConstructorCall
-        | ConstructorCallPack
-        | ConstructPackResolved => Effects::UNKNOWN,
-        FrameOverflow | FrameRelease | IndexUnroot | LocalSet | LocalReplace | Release
-        | LocalGet | TempClear | TempRetain | TempOwn | ErrorOrigin | Catch | Throw => {
-            closed(INTERNAL | ERROR)
-        }
-        ObserveCall | ObserveGet | ObserveIndex | ObserveNumber | ObserveNumberFailure => {
-            closed(HEAP_READ | INTERNAL)
-        }
-        VariantEntry | CompilePoll | CompileLeave | CallProfileFlush => closed(INTERNAL),
-        SemanticGlobalProbe => closed(GLOBAL_READ),
-        ConstructorPrototype
-        | SemanticPropertyProbeCached
-        | PropertyCachePrime
-        | SemanticMathNative
-        | ClosureThis
-        | LexicalReceiver
-        | ArrayIterationGuard
-        | IsStringSplit => closed(HEAP_READ),
-        StringSplit
-        | StringSplitOwned
-        | StringSplitParts
-        | StringSplitPartsOwned
-        | Spread
-        | NewPack => closed(HEAP_READ | ALLOCATION | INTERNAL | ERROR),
-        PackInit | PackRelease => closed(HEAP_WRITE | INTERNAL),
-        PackTake | PackTakeOwned => closed(HEAP_READ | HEAP_WRITE | INTERNAL),
-        PackAppend | PackExtend => closed(HEAP_READ | HEAP_WRITE | ALLOCATION | INTERNAL),
-        IndexRoot => closed(HEAP_READ | INTERNAL),
-        MathDirect => closed(ALLOCATION | INTERNAL | ERROR),
-        Truthy => closed(HEAP_READ),
-        TypedIndexGet => closed(HEAP_READ),
-        ArrayMapElement => closed(HEAP_READ | INTERNAL),
-        ArrayNew | ArrayNewOwned | Rest | ObjectNew | ObjectNewOwned | NewInstance
-        | NewInstanceOwned | StringNew | ArrayMapNew | ArrayMapNewOwned => {
-            closed(ALLOCATION | INTERNAL | ERROR)
-        }
-        GlobalGet | GlobalGetOptional | GlobalGetBorrowed | GlobalGetOptionalBorrowed => {
-            closed(GLOBAL_READ | INTERNAL | ERROR)
-        }
-        GlobalSet | GlobalInitialize => closed(GLOBAL_WRITE | INTERNAL | ERROR),
-        PropertyGet | PropertyGetCached | IndexGet | IndexGetNumeric => {
-            closed(HEAP_READ | GLOBAL_READ | ALLOCATION | INTERNAL | ERROR)
-        }
-        IterateNew | IterateNext | EnumerateNew | EnumerateNext => {
-            closed(HEAP_READ | INTERNAL | ALLOCATION | ERROR)
-        }
-        BitwiseAnd | BitwiseOr | BitwiseXor | ShiftLeft | ShiftRight | ShiftRightUnsigned | Add
-        | Sub | Mul | Div | Rem | Pow | LooseEqual | LooseNotEqual | StrictEqual
-        | StrictNotEqual | Less | LessEqual | Greater | GreaterEqual | UnaryPlus
-        | UnaryNegation | LogicalNot | BitwiseNot => {
-            closed(HEAP_READ | ALLOCATION | INTERNAL | ERROR)
-        }
-        _ => Effects::UNKNOWN,
-    }
-}
-
-#[expect(dead_code)]
-pub(super) fn assumptions(helper: Helper) -> &'static [Assumption] {
-    use Helper::*;
-    match helper {
-        IndexRoot => &[Assumption::StableIndexStorage],
-        MathDirect => &[
-            Assumption::GuardedMathIdentity,
-            Assumption::NoCoercionCallbacks,
-        ],
-        TypedIndexGet => &[Assumption::FixedTypedStorage],
-        PropertyGet | PropertyGetCached | IndexGet | IndexGetNumeric => {
-            &[Assumption::NoAccessors, Assumption::NoCoercionCallbacks]
-        }
-        IterateNew | IterateNext | EnumerateNew | EnumerateNext => &[Assumption::DirectIteration],
-        BitwiseAnd | BitwiseOr | BitwiseXor | ShiftLeft | ShiftRight | ShiftRightUnsigned | Add
-        | Sub | Mul | Div | Rem | Pow | LooseEqual | LooseNotEqual | StrictEqual
-        | StrictNotEqual | Less | LessEqual | Greater | GreaterEqual | UnaryPlus
-        | UnaryNegation | LogicalNot | BitwiseNot => &[Assumption::NoCoercionCallbacks],
-        _ => &[],
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum TemporaryEffect {
-    None,
-    Clear,
-    MayRegister,
-}
-
-pub(super) fn temporary_effect(helper: Helper) -> TemporaryEffect {
-    use Helper::*;
-    use TemporaryEffect::*;
-    match helper {
-        TempClear => Clear,
-        TempRetain | TempOwn | Add => MayRegister,
-        SemanticPropertyProbeCached
-        | PropertyCachePrime
-        | TypedIndexGet
-        | GlobalGetBorrowed
-        | GlobalGetOptionalBorrowed
-        | NewInstanceOwned
-        | StringSplitOwned
-        | StringSplitPartsOwned
-        | PackTakeOwned
-        | PackInit
-        | PackRelease
-        | PackAppend
-        | PackExtend
-        | ArrayNewOwned
-        | ObjectNewOwned
-        | ArrayMapNewOwned => None,
-        FrameOverflow | FrameRelease | IndexUnroot | LocalSet | LocalReplace | Release
-        | ErrorOrigin | Throw | MathDirect | ObserveCall | ObserveGet | ObserveIndex
-        | ObserveNumber | ObserveNumberFailure | VariantEntry | CompilePoll | CompileLeave
-        | CallProfileFlush | ClosureThis | LexicalReceiver | ArrayIterationGuard
-        | IsStringSplit | IndexRoot | Truthy | BitwiseAnd | BitwiseOr | BitwiseXor | ShiftLeft
-        | ShiftRight | ShiftRightUnsigned | Sub | Mul | Div | Rem | Pow | LooseEqual
-        | LooseNotEqual | StrictEqual | StrictNotEqual | Less | LessEqual | Greater
-        | GreaterEqual | UnaryPlus | UnaryNegation | LogicalNot | BitwiseNot => None,
-        _ => MayRegister,
     }
 }

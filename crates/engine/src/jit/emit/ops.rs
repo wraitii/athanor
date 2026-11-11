@@ -12,7 +12,6 @@ use crate::heap::{
     CODE_OFFSET, DATA_OFFSET, HOLE, INLINE_PROPERTY_LENGTH_OFFSET, KIND_OFFSET, LENGTH_OFFSET,
     MathFunction, NO_ELEMENTS, SHAPE_OFFSET, TypedKind, kind,
 };
-use crate::jit::clif::IndexedRead;
 use crate::jit::helpers::{
     self, CACHE_ADDITION_DESTINATION_OFFSET, CACHE_ADDITION_INDEX_OFFSET,
     CACHE_ADDITION_SOURCE_OFFSET, CACHE_BUILTIN_KIND_OFFSET, CACHE_BUILTIN_VALUE_OFFSET,
@@ -387,7 +386,13 @@ impl FunctionCompiler<'_, '_> {
         call_args.extend_from_slice(args);
         let call = self.b.ins().call_indirect(signature, callee, &call_args);
         self.annotations.helpers.insert(call, helper);
-        self.b.inst_results(call)[0]
+        let result = self.b.inst_results(call)[0];
+        self.unchecked = None;
+        if helper.returns_reference() {
+            self.track(result);
+            self.unchecked = self.owned.last().copied();
+        }
+        result
     }
 
     fn integer_binary(&mut self, op: BinaryOp, left: ClifValue, right: ClifValue) -> ClifValue {
@@ -628,16 +633,6 @@ impl FunctionCompiler<'_, '_> {
         };
         let result = self.call_helper(helper, &[object, index]);
         self.check_error();
-        if helper == Helper::IndexGet {
-            self.annotations.indexed_reads.push(IndexedRead {
-                call: self.b.func.dfg.value_def(result).unwrap_inst(),
-                receiver: object,
-                key: index,
-                result,
-                success: self.b.current_block().unwrap(),
-                source: (self.source_span.start, self.source_span.end),
-            });
-        }
         result
     }
 
@@ -1929,19 +1924,9 @@ impl FunctionCompiler<'_, '_> {
         let condition = self.pending(crate::jit::session::ERROR_OFFSET, 0);
         let failed = self.b.create_block();
         let done = self.b.create_block();
+        self.b.set_cold_block(failed);
         self.brif(condition, failed, &[], done, &[]);
         self.switch(failed);
-        let source_name = self.source_name;
-        let offset = *self
-            .source_names
-            .entry(source_name.0)
-            .or_insert_with(|| self.data.push(source_name));
-        let source = self.b.ins().iadd_imm_s(self.data_base, offset);
-        let start = self
-            .b
-            .ins()
-            .iconst(types::I64, self.source_span.start as i64);
-        let end = self.b.ins().iconst(types::I64, self.source_span.end as i64);
         let origin = match self.error_origin {
             Some(block) => block,
             None => {
@@ -1954,8 +1939,18 @@ impl FunctionCompiler<'_, '_> {
                 block
             }
         };
-        self.b.set_cold_block(failed);
-        self.jump(
+        let source_name = self.source_name;
+        let offset = *self
+            .source_names
+            .entry(source_name.0)
+            .or_insert_with(|| self.data.push(source_name));
+        let source = self.b.ins().iadd_imm_s(self.data_base, offset);
+        let start = self
+            .b
+            .ins()
+            .iconst(types::I64, self.source_span.start as i64);
+        let end = self.b.ins().iconst(types::I64, self.source_span.end as i64);
+        self.unwind(
             origin,
             &[
                 BlockArg::Value(source),
@@ -1965,6 +1960,7 @@ impl FunctionCompiler<'_, '_> {
         );
         self.switch(done);
         if !can_throw {
+            self.unchecked = None;
             return;
         }
         let condition = self.pending(
@@ -1972,12 +1968,20 @@ impl FunctionCompiler<'_, '_> {
             Value::UNINITIALIZED.bits() as i64,
         );
         let done = self.b.create_block();
-        if let Some(handler) = self.handlers.last().copied() {
-            self.brif(condition, handler, &[], done, &[]);
+        let target = match self.handlers.last().copied() {
+            Some(handler) => handler,
+            None => self.failed_exit(),
+        };
+        if !self.unwind_releases() {
+            self.brif(condition, target, &[], done, &[]);
         } else {
-            let exit = self.failed_exit();
-            self.brif(condition, exit, &[], done, &[]);
+            let thrown = self.b.create_block();
+            self.b.set_cold_block(thrown);
+            self.brif(condition, thrown, &[], done, &[]);
+            self.switch(thrown);
+            self.unwind(target, &[]);
         }
         self.switch(done);
+        self.unchecked = None;
     }
 }

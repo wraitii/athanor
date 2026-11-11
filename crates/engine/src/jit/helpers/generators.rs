@@ -13,7 +13,7 @@ pub(super) extern "C" fn js_generator_new(
         .heap()
         .generator(crate::heap::CodeId(code), closure, arguments, receiver)
     {
-        Some(value) => ctx.own(value),
+        Some(value) => value,
         None => {
             ctx.error = Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
             Value::UNDEFINED
@@ -24,7 +24,7 @@ pub(super) extern "C" fn js_generator_new(
 pub(super) extern "C" fn js_generator_closure(ctx: *mut JitCtx, generator: Value) -> Value {
     let ctx = unsafe { &mut *ctx };
     let closure = ctx.global.heap().generator_parts(generator).unwrap().1;
-    ctx.retain_temp(closure)
+    ctx.retain(closure)
 }
 
 pub(super) extern "C" fn js_generator_state(ctx: *mut JitCtx) -> u64 {
@@ -66,7 +66,7 @@ pub(super) fn generator_result(ctx: &mut JitCtx, value: Value, done: bool) -> Va
         .heap()
         .set_property(result, "done", Value::boolean(done));
     ctx.global.heap().release(value);
-    ctx.own(result)
+    result
 }
 
 pub(super) fn generator_next(ctx: *mut JitCtx, generator: Value) -> Value {

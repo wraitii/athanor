@@ -161,37 +161,6 @@ impl Heap {
         Some(Value::from_bits(TAG_OBJECT | id))
     }
 
-    pub(crate) fn supports_indexed_storage(
-        &self,
-        receiver: Value,
-        key: Value,
-        contract: IndexedStorageContract,
-    ) -> bool {
-        match contract {
-            IndexedStorageContract::DirectNumericIndexStorage => {
-                self.direct_numeric_index(receiver, key)
-            }
-        }
-    }
-
-    pub(super) fn direct_numeric_index(&self, receiver: Value, key: Value) -> bool {
-        let Some(number) = key.as_number() else {
-            return false;
-        };
-        let data = self.0.borrow();
-        let Some(payload) = heap_id(receiver)
-            .and_then(|id| data.live(id))
-            .map(|slot| &slot.payload)
-        else {
-            return false;
-        };
-        match payload {
-            Payload::TypedArray(_) => true,
-            Payload::Array(_) => element_index(number, u32::MAX as f64).is_some(),
-            _ => false,
-        }
-    }
-
     pub(crate) fn read_numeric_index(&self, receiver: Value, number: f64) -> Option<IndexRead> {
         let data = self.0.borrow();
         let payload = &data.live(heap_id(receiver)?)?.payload;

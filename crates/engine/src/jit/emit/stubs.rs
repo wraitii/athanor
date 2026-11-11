@@ -283,7 +283,7 @@ fn build_miss(
             target.default_call_conv,
             pointer,
             ctx,
-            Helper::CallOwned,
+            Helper::Call,
             &[callee, receiver, argv, argc],
         );
         let result = b.inst_results(call)[0];

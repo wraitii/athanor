@@ -103,7 +103,6 @@ define_helpers! {
     ArrayAppend => Binary, js_array_append;
     ArrayExtend => Binary, js_array_extend;
     Call => MethodCallable, js_call;
-    CallOwned => MethodCallable, js_call_owned;
     ObserveCall => Binary, js_observe_call;
     ObserveGet => Binary, js_observe_get;
     ObserveIndex => Binary, js_observe_index;
@@ -127,14 +126,11 @@ define_helpers! {
     MathDirect => MethodCallable, js_math_direct;
     FrameOverflow => Nullary, js_frame_overflow;
     FrameRelease => Nullary, js_frame_release;
-    IndexUnroot => Nullary, js_index_unroot;
     LocalSet => Binary, js_local_set;
     LocalReplace => IndexSet, js_local_replace;
     Release => Unary, js_release;
     Bailout => Unary, js_bailout;
-    TempClear => Unary, js_temp_clear;
-    TempRetain => Unary, js_temp_retain;
-    TempOwn => Unary, js_temp_own;
+    Retain => Unary, js_retain;
     IterateNew => Unary, js_iterate_new;
     IterateNext => Unary, js_iterate_next;
     EnumerateNew => Unary, js_enumerate_new;
@@ -145,7 +141,7 @@ define_helpers! {
     ObjectNew => Unary, js_object_new;
     ObjectNewOwned => Unary, js_object_new_owned;
     PropertyKey => Unary, js_property_key;
-    StringNew => ArrayNew, js_string_new;
+    StringConstant => SourceLocation, js_string_constant;
     RegExpNew => PropertyGet, js_regexp_new;
     ArrayNew => ArrayNew, js_array_new;
     ArrayNewOwned => ArrayNew, js_array_new_owned;
@@ -153,7 +149,6 @@ define_helpers! {
     IndexGet => Binary, js_index_get;
     IndexGetNumeric => NumericIndex, js_index_get_numeric;
     TypedIndexGet => Binary, js_typed_index_get;
-    IndexRoot => IndexSet, js_index_root;
     IndexSet => IndexSet, js_index_set;
     PropertyGet => PropertyGet, js_property_get;
     PropertyGetCached => Binary, js_property_get_cached;
@@ -240,19 +235,67 @@ extern "C" fn js_compile_leave(ctx: *mut JitCtx, code: u64) -> Value {
 }
 
 impl Helper {
+    /// Whether a heap result carries a reference the generated code must release.
+    pub(crate) fn returns_reference(self) -> bool {
+        matches!(
+            self,
+            Self::NewPack
+                | Self::Spread
+                | Self::PackTake
+                | Self::GeneratorNew
+                | Self::GeneratorClosure
+                | Self::LocalGet
+                | Self::CellNew
+                | Self::CellGet
+                | Self::CaptureGet
+                | Self::ClosureNew
+                | Self::Construct
+                | Self::NewInstance
+                | Self::ConstructorCall
+                | Self::ConstructorCallPack
+                | Self::ConstructResolved
+                | Self::ConstructPackResolved
+                | Self::ConstructPack
+                | Self::CallPack
+                | Self::Call
+                | Self::StringSplitParts
+                | Self::StringSplit
+                | Self::ArrayMapNew
+                | Self::ArrayMapElement
+                | Self::Retain
+                | Self::IterateNew
+                | Self::IterateNext
+                | Self::EnumerateNew
+                | Self::EnumerateNext
+                | Self::Typeof
+                | Self::ObjectNew
+                | Self::PropertyKey
+                | Self::RegExpNew
+                | Self::ArrayNew
+                | Self::Rest
+                | Self::IndexGet
+                | Self::IndexGetNumeric
+                | Self::PropertyGet
+                | Self::PropertyGetCached
+                | Self::GlobalGet
+                | Self::GlobalGetOptional
+                | Self::Catch
+                | Self::Add
+        )
+    }
+
     pub(crate) fn can_throw(self) -> bool {
         // These helpers may report engine errors, but never execute JavaScript or throw.
         !matches!(
             self,
-            Self::TempRetain
-                | Self::TempOwn
+            Self::Retain
+                | Self::StringConstant
                 | Self::CompilePoll
                 | Self::CompileLeave
                 | Self::LexicalReceiver
                 | Self::Release
                 | Self::FrameOverflow
                 | Self::FrameRelease
-                | Self::IndexUnroot
                 | Self::IndexGet
                 | Self::IndexGetNumeric
                 | Self::TypedIndexGet
@@ -419,10 +462,6 @@ extern "C" fn js_frame_release(ctx: *mut JitCtx) -> Value {
     unsafe { &mut *ctx }.release_frame_locals();
     Value::UNDEFINED
 }
-extern "C" fn js_index_unroot(ctx: *mut JitCtx) -> Value {
-    unsafe { &mut *ctx }.release_index_root();
-    Value::UNDEFINED
-}
 extern "C" fn js_local_set(ctx: *mut JitCtx, slot: u64, value: Value) -> Value {
     unsafe { &mut *ctx }.local_set(slot as usize, value)
 }
@@ -437,14 +476,7 @@ extern "C" fn js_release(ctx: *mut JitCtx, value: Value) -> Value {
 extern "C" fn js_local_replace(ctx: *mut JitCtx, slot: u64, value: Value, old: Value) -> Value {
     unsafe { &mut *ctx }.local_replace(slot as usize, value, old)
 }
-extern "C" fn js_temp_clear(ctx: *mut JitCtx, _: Value) -> Value {
-    unsafe { &mut *ctx }.clear();
-    Value::UNDEFINED
-}
-extern "C" fn js_temp_own(ctx: *mut JitCtx, value: Value) -> Value {
-    unsafe { &mut *ctx }.own(value)
-}
-extern "C" fn js_temp_retain(ctx: *mut JitCtx, value: Value) -> Value {
+extern "C" fn js_retain(ctx: *mut JitCtx, value: Value) -> Value {
     let ctx = unsafe { &mut *ctx };
     if value == Value::UNINITIALIZED {
         ctx.error = Some(Box::new(crate::Error::Runtime(
@@ -452,11 +484,11 @@ extern "C" fn js_temp_retain(ctx: *mut JitCtx, value: Value) -> Value {
         )));
         return Value::UNDEFINED;
     }
-    ctx.retain_temp(value)
+    ctx.retain(value)
 }
 extern "C" fn js_array_new(ctx: *mut JitCtx, argv: *const Value, argc: u64) -> Value {
     let value = js_array_new_owned(ctx, argv, argc);
-    unsafe { &mut *ctx }.own(value)
+    value
 }
 
 extern "C" fn js_array_new_owned(ctx: *mut JitCtx, argv: *const Value, argc: u64) -> Value {
@@ -488,7 +520,7 @@ extern "C" fn js_rest(ctx: *mut JitCtx, argv: *const Value, argc: u64, start: u6
 extern "C" fn js_cell_new(ctx: *mut JitCtx, value: Value) -> Value {
     let ctx = unsafe { &mut *ctx };
     match ctx.global.heap().cell(value) {
-        Some(cell) => ctx.own(cell),
+        Some(cell) => cell,
         None => {
             ctx.error = Some(Box::new(crate::Error::Runtime(
                 "invalid cell value or heap exhausted".into(),
@@ -507,7 +539,7 @@ extern "C" fn js_cell_get(ctx: *mut JitCtx, cell: Value) -> Value {
             )));
             Value::UNDEFINED
         }
-        Some(value) => ctx.retain_temp(value),
+        Some(value) => ctx.retain(value),
         None => {
             ctx.error = Some(Box::new(crate::Error::Runtime(
                 "invalid capture cell".into(),
@@ -530,7 +562,7 @@ extern "C" fn js_cell_set(ctx: *mut JitCtx, cell: Value, value: Value) -> Value 
 extern "C" fn js_capture_get(ctx: *mut JitCtx, closure: Value, index: u64) -> Value {
     let ctx = unsafe { &mut *ctx };
     match ctx.global.heap().capture(closure, index as usize) {
-        Some(cell) => ctx.retain_temp(cell),
+        Some(cell) => ctx.retain(cell),
         None => {
             ctx.error = Some(Box::new(crate::Error::Runtime(
                 "invalid closure capture".into(),
@@ -563,7 +595,7 @@ extern "C" fn js_closure_new(
         .heap()
         .closure(crate::heap::CodeId(code), captures)
     {
-        Some(value) => ctx.own(value),
+        Some(value) => value,
         None => {
             ctx.error = Some(Box::new(crate::Error::Runtime(
                 "invalid captures or heap exhausted".into(),
@@ -622,7 +654,7 @@ extern "C" fn js_string_split(
     argc: u64,
 ) -> Value {
     let value = js_string_split_owned(ctx, 0, receiver, argv, argc);
-    unsafe { &mut *ctx }.own(value)
+    value
 }
 
 extern "C" fn js_string_split_owned(
@@ -680,7 +712,7 @@ extern "C" fn js_array_iteration_guard(
 
 extern "C" fn js_array_map_new(ctx: *mut JitCtx, length: Value) -> Value {
     let value = js_array_map_new_owned(ctx, length);
-    unsafe { &mut *ctx }.own(value)
+    value
 }
 
 extern "C" fn js_array_map_new_owned(ctx: *mut JitCtx, length: Value) -> Value {
@@ -704,7 +736,7 @@ extern "C" fn js_array_map_element(ctx: *mut JitCtx, receiver: Value, index: usi
         return Value::UNINITIALIZED;
     }
     let value = context.global.heap().get(receiver, index).unwrap();
-    context.retain_temp(value)
+    context.retain(value)
 }
 
 extern "C" fn js_math_direct(
@@ -814,7 +846,7 @@ extern "C" fn js_regexp_new(ctx: *mut JitCtx, flags: u64, ptr: *const u8, len: u
     let pattern =
         unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len as usize)) };
     match ctx.global.heap().regexp(pattern, flags as u8) {
-        Ok(value) => ctx.own(value),
+        Ok(value) => value,
         Err(message) => {
             ctx.error = Some(Box::new(crate::Error::Runtime(format!(
                 "invalid regular expression: {message}"
@@ -824,12 +856,22 @@ extern "C" fn js_regexp_new(ctx: *mut JitCtx, flags: u64, ptr: *const u8, len: u
     }
 }
 
-extern "C" fn js_string_new(ctx: *mut JitCtx, ptr: *const u8, len: u64) -> Value {
+/// Creates a string literal's value on its first execution. The cache keeps the reference for
+/// the lifetime of the compiled code, so the result is borrowed.
+extern "C" fn js_string_constant(
+    ctx: *mut JitCtx,
+    cache: *mut u64,
+    ptr: *const u8,
+    len: u64,
+) -> Value {
     let ctx = unsafe { &mut *ctx };
     let text =
         unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len as usize)) };
     match ctx.global.heap().string(text) {
-        Some(value) => ctx.own(value),
+        Some(value) => {
+            unsafe { *cache = value.bits() };
+            value
+        }
         None => {
             ctx.error = Some(Box::new(crate::Error::Runtime(
                 "string heap exhausted".into(),
@@ -946,7 +988,7 @@ extern "C" fn js_typeof(ctx: *mut JitCtx, value: Value) -> Value {
         value.type_name()
     };
     match ctx.global.heap().interned(name) {
-        Some(value) => ctx.own(value),
+        Some(value) => value,
         None => {
             ctx.error = Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
             Value::UNDEFINED
@@ -957,7 +999,7 @@ extern "C" fn js_typeof(ctx: *mut JitCtx, value: Value) -> Value {
 extern "C" fn js_enumerate_new(ctx: *mut JitCtx, receiver: Value) -> Value {
     let ctx = unsafe { &mut *ctx };
     match ctx.global.heap().enumerate(receiver) {
-        Some(state) => ctx.own(state),
+        Some(state) => state,
         None => {
             ctx.error = Some(Box::new(crate::Error::Runtime(
                 "for-in receiver is unsupported".into(),
@@ -970,7 +1012,7 @@ extern "C" fn js_enumerate_new(ctx: *mut JitCtx, receiver: Value) -> Value {
 extern "C" fn js_enumerate_next(ctx: *mut JitCtx, state: Value) -> Value {
     let ctx = unsafe { &mut *ctx };
     match ctx.global.heap().enumerate_next(state) {
-        Some(Some(value)) => ctx.own(value),
+        Some(Some(value)) => value,
         Some(None) => Value::UNINITIALIZED,
         None => {
             ctx.error = Some(Box::new(crate::Error::Runtime(
@@ -990,7 +1032,7 @@ pub(super) extern "C" fn js_iterate_new(ctx: *mut JitCtx, iterable: Value) -> Va
         return Value::UNDEFINED;
     }
     match ctx.global.heap().array(&[iterable, Value::number(0.0)]) {
-        Some(value) => ctx.own(value),
+        Some(value) => value,
         None => {
             ctx.error = Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
             Value::UNDEFINED
@@ -1009,7 +1051,7 @@ pub(super) extern "C" fn js_iterate_next(ctx: *mut JitCtx, state: Value) -> Valu
         };
         heap.set(state, 1, Value::number(next as f64));
         return match heap.string(character.encode_utf8(&mut [0; 4])) {
-            Some(value) => ctx.own(value),
+            Some(value) => value,
             None => {
                 ctx.error = Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
                 Value::UNDEFINED
@@ -1021,12 +1063,12 @@ pub(super) extern "C" fn js_iterate_next(ctx: *mut JitCtx, state: Value) -> Valu
     }
     let value = heap.get(iterable, offset).unwrap();
     heap.set(state, 1, Value::number((offset + 1) as f64));
-    ctx.retain_temp(value)
+    ctx.retain(value)
 }
 
 extern "C" fn js_object_new(ctx: *mut JitCtx, _: Value) -> Value {
     let value = js_object_new_owned(ctx, Value::UNDEFINED);
-    unsafe { &mut *ctx }.own(value)
+    value
 }
 
 extern "C" fn js_object_new_owned(ctx: *mut JitCtx, _: Value) -> Value {
@@ -1063,7 +1105,7 @@ extern "C" fn js_mark_class(ctx: *mut JitCtx, closure: Value) -> Value {
 extern "C" fn js_new_pack(ctx: *mut JitCtx, destination: Value) -> Value {
     let mut values = unsafe { super::pack::buffer(ctx) };
     match unsafe { super::pack::store(ctx, destination, std::mem::take(&mut values.values)) } {
-        Some(value) => unsafe { &mut *ctx }.own(value),
+        Some(value) => value,
         None => {
             unsafe { &mut *ctx }.error =
                 Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
@@ -1077,7 +1119,7 @@ extern "C" fn js_spread(ctx: *mut JitCtx, destination: Value, value: Value) -> V
         return Value::UNDEFINED;
     };
     match unsafe { super::pack::store(ctx, destination, std::mem::take(&mut values.values)) } {
-        Some(value) => unsafe { &mut *ctx }.own(value),
+        Some(value) => value,
         None => {
             unsafe { &mut *ctx }.error =
                 Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
@@ -1105,7 +1147,7 @@ extern "C" fn js_pack_extend(ctx: *mut JitCtx, pack: Value, value: Value) -> Val
 
 extern "C" fn js_pack_take(ctx: *mut JitCtx, pack: Value, index: Value) -> Value {
     let value = js_pack_take_owned(ctx, pack, index);
-    unsafe { &mut *ctx }.own(value)
+    value
 }
 
 extern "C" fn js_pack_take_owned(ctx: *mut JitCtx, pack: Value, index: Value) -> Value {
@@ -1126,7 +1168,7 @@ extern "C" fn js_string_split_parts(
     argc: u64,
 ) -> Value {
     let value = js_string_split_parts_owned(ctx, destination, receiver, argv, argc);
-    unsafe { &mut *ctx }.own(value)
+    value
 }
 
 extern "C" fn js_string_split_parts_owned(

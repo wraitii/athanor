@@ -8,7 +8,6 @@ fn engines() -> impl Iterator<Item = Engine> {
                 Engine::with_options(EngineOptions {
                     opt_level,
                     ssa_opt,
-                    ssa_dump: false,
                     ..Default::default()
                 })
                 .unwrap()

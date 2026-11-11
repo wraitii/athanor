@@ -2,7 +2,11 @@ use std::collections::{HashMap, HashSet};
 
 use cranelift_codegen::entity::SecondaryMap;
 
-use crate::jit::semantic::{Block, Cfg, Graph, Value, borrowed_receiver};
+use crate::jit::semantic::{
+    Block, Cfg, Facts, Graph, Inst, Ownership, Types, Value, borrowed_receiver,
+};
+
+const HEAP: Types = Types::STRING.union(Types::OBJECT).union(Types::OTHER);
 
 /// Frame slots for values that outlive their block. Each slot owns exactly its current contents,
 /// so storing into a slot that held an earlier value must release it.
@@ -244,4 +248,93 @@ pub(super) fn assign(
         }
     }
     slots
+}
+
+/// For each instruction, the results whose references can be released right after it: their
+/// last use within their own block, counting the uses of every borrowed value that may alias them.
+/// Results used by a terminator or another block keep their references until the block's end.
+pub(super) fn releases(graph: &Graph, facts: &Facts, cfg: &Cfg) -> HashMap<Inst, Vec<Value>> {
+    let mut aliases: HashMap<Value, Vec<Value>> = HashMap::new();
+    for &block in &cfg.rpo {
+        for &inst in &graph.blocks[block].insts {
+            let data = &graph.insts[inst];
+            let Some(result) = data.result else {
+                continue;
+            };
+            if !facts.of(result).intersects(HEAP) {
+                continue;
+            }
+            if graph.contract(&data.op, facts).result != Ownership::Borrowed {
+                continue;
+            }
+            aliases.insert(result, data.op.operands_iter().collect());
+        }
+    }
+    let anchored = |value: Value| {
+        let mut pending = vec![value];
+        let mut visited = HashSet::new();
+        while let Some(current) = pending.pop() {
+            if !visited.insert(current) {
+                continue;
+            }
+            if let Some(owners) = aliases.get(&current) {
+                pending.extend(owners.iter().copied());
+            }
+        }
+        visited
+    };
+    let mut defined: HashMap<Value, (Block, usize, Inst)> = HashMap::new();
+    for &block in &cfg.rpo {
+        for (index, &inst) in graph.blocks[block].insts.iter().enumerate() {
+            if let Some(result) = graph.insts[inst].result {
+                defined.insert(result, (block, index, inst));
+            }
+        }
+    }
+    let mut last: HashMap<Value, Option<usize>> = HashMap::new();
+    for &block in &cfg.rpo {
+        let data = &graph.blocks[block];
+        let escape = |value: Value, last: &mut HashMap<Value, Option<usize>>| {
+            for value in anchored(value) {
+                last.insert(value, None);
+            }
+        };
+        for (index, &inst) in data.insts.iter().enumerate() {
+            for operand in graph.insts[inst].op.operands_iter() {
+                for value in anchored(operand) {
+                    match defined.get(&value) {
+                        Some(&(owner, _, _)) if owner == block => {
+                            let entry = last.entry(value).or_insert(Some(index));
+                            if let Some(position) = entry {
+                                *position = (*position).max(index);
+                            }
+                        }
+                        _ => {
+                            last.insert(value, None);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(terminator) = &data.terminator {
+            for operand in terminator.kind.operands_iter() {
+                escape(operand, &mut last);
+            }
+        }
+    }
+    let mut releases: HashMap<Inst, Vec<Value>> = HashMap::new();
+    for (&value, &(block, index, inst)) in &defined {
+        let position = match last.get(&value) {
+            Some(None) => continue,
+            Some(Some(position)) => *position,
+            None => index,
+        };
+        let after = if position == index {
+            inst
+        } else {
+            graph.blocks[block].insts[position]
+        };
+        releases.entry(after).or_default().push(value);
+    }
+    releases
 }

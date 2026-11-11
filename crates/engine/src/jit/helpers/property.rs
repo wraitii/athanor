@@ -72,7 +72,7 @@ pub(super) fn global_get(
             ))));
             Value::UNDEFINED
         }
-        Some(value) if retain => ctx.retain_temp(value),
+        Some(value) if retain => ctx.retain(value),
         Some(value) => value,
         None if optional => Value::UNDEFINED,
         None => {
@@ -130,13 +130,13 @@ pub(super) extern "C" fn js_property_get(
         unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len as usize)) };
     if object == Value::GLOBAL_OBJECT {
         let value = ctx.global.get_object_raw(name).unwrap_or(Value::UNDEFINED);
-        return ctx.retain_temp(value);
+        return ctx.retain(value);
     }
     match ctx.global.heap().read_property(object, name) {
-        Some(PropertyRead::Value(value)) => return ctx.retain_temp(value),
+        Some(PropertyRead::Value(value)) => return ctx.retain(value),
         Some(PropertyRead::Native(function)) => {
             return match ctx.global.heap().native_function(function) {
-                Some(value) => ctx.own(value),
+                Some(value) => value,
                 None => {
                     ctx.error = Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
                     Value::UNDEFINED
@@ -145,7 +145,7 @@ pub(super) extern "C" fn js_property_get(
         }
         Some(PropertyRead::Prototype) => {
             if let Some(value) = ctx.global.heap().property(object, name) {
-                return ctx.retain_temp(value);
+                return ctx.retain(value);
             }
         }
         None => {}
@@ -360,7 +360,7 @@ pub(super) extern "C" fn js_property_get_cached(
     let cache = unsafe { &mut *cache };
     let context = unsafe { &*ctx };
     if let Some(value) = cache.fill(context.engine, context.global.heap(), object) {
-        return unsafe { &mut *ctx }.retain_temp(value);
+        return unsafe { &mut *ctx }.retain(value);
     }
     js_property_get(ctx, object, cache.name.as_ptr(), cache.name.len() as u64)
 }
@@ -517,15 +517,6 @@ pub(super) fn typed_numeric_index(ctx: &JitCtx, key: Value) -> Option<Option<usi
     )
 }
 
-pub(super) extern "C" fn js_index_root(
-    ctx: *mut JitCtx,
-    receiver: Value,
-    key: Value,
-    result: Value,
-) -> Value {
-    Value::boolean(unsafe { &mut *ctx }.root_index_read(receiver, key, result))
-}
-
 pub(super) extern "C" fn js_index_get(ctx: *mut JitCtx, array: Value, index: Value) -> Value {
     if let Some(number) = index.as_number() {
         return js_index_get_numeric(ctx, array, number);
@@ -537,7 +528,7 @@ pub(super) extern "C" fn js_index_get_numeric(ctx: *mut JitCtx, array: Value, in
     let ctx = unsafe { &mut *ctx };
     match ctx.global.heap().read_numeric_index(array, index) {
         Some(IndexRead::Primitive(value)) => value,
-        Some(IndexRead::Borrowed(value)) => ctx.retain_temp(value),
+        Some(IndexRead::Borrowed(value)) => ctx.retain(value),
         Some(IndexRead::Character(character)) => index_get_character(ctx, character),
         None => index_get_slow(ctx, array, Value::number(index)),
     }
@@ -556,7 +547,7 @@ pub(super) extern "C" fn js_typed_index_get(ctx: *mut JitCtx, array: Value, inde
 #[inline(never)]
 pub(super) fn index_get_character(ctx: &mut JitCtx, character: char) -> Value {
     match ctx.global.heap().string(character.encode_utf8(&mut [0; 4])) {
-        Some(value) => ctx.own(value),
+        Some(value) => value,
         None => {
             ctx.error = Some(Box::new(crate::Error::Runtime(
                 "string heap exhausted".into(),
@@ -736,7 +727,7 @@ pub(super) extern "C" fn js_property_key(ctx: *mut JitCtx, value: Value) -> Valu
         return Value::UNDEFINED;
     };
     match ctx.global.heap().string(&name) {
-        Some(value) => ctx.own(value),
+        Some(value) => value,
         None => {
             ctx.error = Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
             Value::UNDEFINED

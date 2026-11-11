@@ -121,13 +121,12 @@ Release builds include line tables for profiling.
 
 Numeric facts and representation selection run on the semantic graph before
 CLIF emission. Numeric index operands select their specialized fallback helper
-directly. A small effect analysis removes guarded temporary clears when every
-incoming path is known clean, tracking inline pushes explicitly. Unknown calls
-and potentially owning reads remain barriers. `JS_JIT_SSA=0` disables semantic
-optimization and CLIF cleanup; `JS_JIT_SSA_DUMP=1` reports removed temporary
-clears. The embedding options are `EngineOptions::ssa_opt` and
-`EngineOptions::ssa_dump`. See [CLIF cleanup](crates/engine/DESIGN.md#clif-cleanup)
-for annotations and temporary-stack effects.
+directly. Generated code keeps the references it owns in stack slots and
+releases them after their last use, at the end of their semantic block, or on
+the way out of a failed one. `JS_JIT_SSA=0` disables semantic optimization; the embedding option is
+`EngineOptions::ssa_opt`. See
+[CLIF emission and ownership](crates/engine/DESIGN.md#clif-emission-and-ownership)
+for details.
 
 
 ## cpp
