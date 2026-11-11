@@ -326,7 +326,7 @@ mod tests {
         let graph =
             super::super::super::build::lower(function, semantic.scoping(), &HashSet::new())
                 .unwrap();
-        super::super::super::canonicalize(graph, true)
+        super::super::super::canonicalize_graph(graph, true)
             .unwrap()
             .graph
     }

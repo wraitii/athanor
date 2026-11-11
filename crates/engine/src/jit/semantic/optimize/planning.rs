@@ -856,7 +856,7 @@ mod tests {
         let graph =
             super::super::super::build::lower(function, semantic.scoping(), &HashSet::new())
                 .unwrap();
-        let graph = super::super::super::canonicalize(graph, true)
+        let graph = super::super::super::canonicalize_graph(graph, true)
             .unwrap()
             .graph;
         let mut function = super::super::super::FunctionState::new(graph, Vec::new(), true);
@@ -975,7 +975,7 @@ mod tests {
                 );
             }
         }
-        let canonical = super::super::super::Canonical::from_graph(graph);
+        let canonical = super::super::super::FunctionState::from_graph(graph);
         let analysis =
             super::super::super::optimize_canonical(canonical, true, Some((&repository, 7)))
                 .unwrap();
@@ -1029,7 +1029,7 @@ mod tests {
             (site, ReadKind::Receiver),
             ReadType::Typed(TypedKind::Uint16),
         );
-        let canonical = super::super::super::Canonical::from_graph(graph);
+        let canonical = super::super::super::FunctionState::from_graph(graph);
         let analysis =
             super::super::super::optimize_canonical(canonical, true, Some((&repository, 7)))
                 .unwrap();
@@ -1184,7 +1184,7 @@ mod tests {
                 ReadType::Typed(TypedKind::Uint16),
             );
         }
-        let canonical = super::super::super::Canonical::from_graph(graph);
+        let canonical = super::super::super::FunctionState::from_graph(graph);
         let analysis =
             super::super::super::optimize_canonical(canonical, true, Some((&repository, 7)))
                 .unwrap();
@@ -1230,7 +1230,7 @@ mod tests {
                 .read_feedback
                 .insert((site, ReadKind::Receiver), ReadType::Array);
         }
-        let canonical = super::super::super::Canonical::from_graph(graph);
+        let canonical = super::super::super::FunctionState::from_graph(graph);
         let analysis =
             super::super::super::optimize_canonical(canonical, true, Some((&repository, 7)))
                 .unwrap();
@@ -1307,7 +1307,7 @@ mod tests {
                 );
             }
         }
-        let canonical = super::super::super::Canonical::from_graph(graph);
+        let canonical = super::super::super::FunctionState::from_graph(graph);
         let analysis =
             super::super::super::optimize_canonical(canonical, true, Some((&repository, 7)))
                 .unwrap();

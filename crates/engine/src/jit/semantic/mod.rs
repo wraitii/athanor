@@ -1525,7 +1525,12 @@ pub(super) struct FunctionState {
 }
 
 impl FunctionState {
+    pub(in crate::jit) fn from_graph(graph: Graph) -> Self {
+        Self::new(graph, Vec::new(), true)
+    }
+
     fn new(graph: Graph, notes: Vec<String>, optimize: bool) -> Self {
+        let optimize = optimize && !graph.has_handlers && !graph.generator;
         Self {
             graph,
             notes,
@@ -1574,7 +1579,9 @@ pub(super) fn lower_global(
         closures,
         arguments_references,
     )?;
-    let planned = plan_canonical(canonicalize(graph, ssa_opt)?, ssa_opt, None)?;
+    let mut function = FunctionState::new(graph, Vec::new(), ssa_opt);
+    canonicalize(&mut function)?;
+    let planned = plan_canonical(function, ssa_opt, None)?;
     let versioning = Versioning::Speculate {
         fallback: None,
         continuations,
@@ -1595,7 +1602,7 @@ pub(super) fn canonical_for_emission(
     arguments_references: &std::collections::HashMap<u32, SymbolId>,
     generator: bool,
     ssa_opt: bool,
-) -> Result<Canonical> {
+) -> Result<FunctionState> {
     let graph = build::lower_parts(
         params,
         statements,
@@ -1609,7 +1616,9 @@ pub(super) fn canonical_for_emission(
         arguments_references,
         generator,
     )?;
-    canonicalize(graph, ssa_opt)
+    let mut function = FunctionState::new(graph, Vec::new(), ssa_opt);
+    canonicalize(&mut function)?;
+    Ok(function)
 }
 
 #[cfg(test)]
@@ -1621,50 +1630,37 @@ pub(super) fn analyze(
     optimize_graph(build::lower(function, scoping, captured)?, true)
 }
 
-#[derive(Clone)]
-pub(super) struct Canonical {
-    pub(super) graph: Graph,
-    notes: Vec<String>,
+fn canonicalize(function: &mut FunctionState) -> Result<()> {
+    if !function.optimize {
+        return Ok(());
+    }
+    transforms::promote(&mut function.graph, &mut function.notes);
+    function.graph.verify()?;
+    js::typeof_comparisons(&mut function.graph);
+    js::simplify(function);
+    function.graph.verify()
 }
 
-impl Canonical {
-    pub(in crate::jit) fn from_graph(graph: Graph) -> Self {
-        Self {
-            graph,
-            notes: Vec::new(),
-        }
-    }
-}
-
-fn canonicalize(graph: Graph, ssa_opt: bool) -> Result<Canonical> {
-    let optimize = ssa_opt && !graph.has_handlers && !graph.generator;
-    let mut function = FunctionState::new(graph, Vec::new(), optimize);
-    if optimize {
-        transforms::promote(&mut function.graph, &mut function.notes);
-        function.graph.verify()?;
-        js::typeof_comparisons(&mut function.graph);
-        js::simplify(&mut function);
-        function.graph.verify()?;
-    }
-    Ok(Canonical {
-        graph: function.graph,
-        notes: function.notes,
-    })
+#[cfg(test)]
+fn canonicalize_graph(graph: Graph, ssa_opt: bool) -> Result<FunctionState> {
+    let mut function = FunctionState::new(graph, Vec::new(), ssa_opt);
+    canonicalize(&mut function)?;
+    Ok(function)
 }
 
 #[cfg(test)]
 fn optimize_graph(graph: Graph, ssa_opt: bool) -> Result<FunctionState> {
-    optimize_canonical(canonicalize(graph, ssa_opt)?, ssa_opt, None)
+    optimize_canonical(canonicalize_graph(graph, ssa_opt)?, ssa_opt, None)
 }
 
 #[cfg(test)]
 pub(super) fn optimize_canonical(
-    canonical: Canonical,
+    function: FunctionState,
     ssa_opt: bool,
     specialization: Option<(&specialize::Repository, usize)>,
 ) -> Result<FunctionState> {
     optimize_planned(
-        plan_canonical(canonical, ssa_opt, specialization)?,
+        plan_canonical(function, ssa_opt, specialization)?,
         Versioning::Speculate {
             fallback: None,
             continuations: true,
@@ -1694,23 +1690,21 @@ impl Expansions {
 }
 
 pub(super) fn plan_canonical(
-    canonical: Canonical,
+    function: FunctionState,
     ssa_opt: bool,
     specialization: Option<(&specialize::Repository, usize)>,
 ) -> Result<FunctionState> {
-    plan_canonical_with_budget(canonical, ssa_opt, specialization, 1)
+    plan_canonical_with_budget(function, ssa_opt, specialization, 1)
 }
 
 pub(super) fn plan_canonical_with_budget(
-    canonical: Canonical,
+    mut function: FunctionState,
     ssa_opt: bool,
     specialization: Option<(&specialize::Repository, usize)>,
     inline_multiplier: usize,
 ) -> Result<FunctionState> {
-    let Canonical { graph, notes } = canonical;
-    let optimize = ssa_opt && !graph.has_handlers && !graph.generator;
-    let mut function = FunctionState::new(graph, notes, optimize);
-    if !optimize {
+    function.optimize = ssa_opt && !function.graph.has_handlers && !function.graph.generator;
+    if !function.optimize {
         return Ok(function);
     }
     let mut inline_budget = specialize::Budget::new(inline_multiplier);

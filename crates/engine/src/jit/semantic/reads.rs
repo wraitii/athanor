@@ -212,7 +212,7 @@ mod tests {
             .semantic;
         let graph =
             super::super::build::lower(function, semantic.scoping(), &HashSet::new()).unwrap();
-        let mut graph = super::super::canonicalize(graph, true).unwrap().graph;
+        let mut graph = super::super::canonicalize_graph(graph, true).unwrap().graph;
         let mut bodies = super::super::specialize::Repository::default();
         for data in graph.insts.values() {
             let Op::GetIndex(object, _) = data.op else {

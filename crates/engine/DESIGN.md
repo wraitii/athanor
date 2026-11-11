@@ -1102,12 +1102,14 @@ Oxc AST -> build -> promote -> simplify -> canonical graph
         -> views -> simplify -> borrow
 ```
 
-Planning and optimization carry a `FunctionState` containing the working graph,
-its facts, specialization plan, OSR plan and diagnostic notes. Canonical bodies
-retain only their graph and notes; each compilation attempt starts with empty
-analysis data. Passes explicitly refresh facts or control-flow analysis before
-using them. There is no automatic invalidation or cross-pass reuse policy. A control-flow
-refresh does not refresh other facts; each pass remains responsible for the
+Canonicalization, planning and optimization operate on the same `FunctionState`,
+containing the working graph, its facts, specialization plan, OSR plan and
+diagnostic notes. The repository retains graph and notes at the chosen reusable
+snapshot point; fetching a body creates a working state with empty analysis
+data. This snapshot boundary does not introduce a separate graph or state type.
+Passes explicitly refresh facts or control-flow analysis before using them. There
+is no automatic invalidation or cross-pass reuse policy. A control-flow refresh
+does not refresh other facts; each pass remains responsible for the
 validity of the analysis snapshot it uses while transforming the graph.
 `Facts` currently owns control-flow analysis as well as types, identities,
 effects and lazy freshness data. Consumers share its control-flow analysis

@@ -660,7 +660,7 @@ mod tests {
             .semantic;
         let graph =
             super::super::build::lower(function, semantic.scoping(), &HashSet::new()).unwrap();
-        let graph = super::super::canonicalize(graph, true).unwrap().graph;
+        let graph = super::super::canonicalize_graph(graph, true).unwrap().graph;
         let cfg = Cfg::new(&graph);
         let (header, body) = super::super::optimize::natural_loops(&graph, &cfg).remove(0);
         let (pred, target) = body

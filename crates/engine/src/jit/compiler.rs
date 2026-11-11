@@ -1290,7 +1290,7 @@ impl Compiler {
         let (source, canonical) = if let Some(region) = &region {
             (
                 emission.source_name.0,
-                super::semantic::Canonical::from_graph(
+                super::semantic::FunctionState::from_graph(
                     region
                         .plan
                         .extract(region.candidate)
@@ -1725,8 +1725,8 @@ impl Compiler {
         let mut specialization = None;
         let mut graph = semantic_function
             .map(|span| {
-                let canonical = match self.canonical.canonical(self.source_name.0, span.start) {
-                    Some(canonical) => Ok(canonical.clone()),
+                let canonical = match self.canonical.function(self.source_name.0, span.start) {
+                    Some(function) => Ok(function),
                     None => super::semantic::canonical_for_emission(
                         params,
                         statements,

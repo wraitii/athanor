@@ -457,7 +457,7 @@ mod tests {
             .semantic;
         let graph =
             super::super::build::lower(function, semantic.scoping(), &HashSet::new()).unwrap();
-        let mut graph = super::super::canonicalize(graph, true).unwrap().graph;
+        let mut graph = super::super::canonicalize_graph(graph, true).unwrap().graph;
         super::super::observations::plan(&mut graph, None);
         graph
     }

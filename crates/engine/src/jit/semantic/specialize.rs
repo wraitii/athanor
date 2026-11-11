@@ -8,7 +8,7 @@ use oxc_syntax::operator::BinaryOperator;
 use super::super::effects::{Assumption, Control, Effects, Locations, Memory};
 use super::super::math::METHODS;
 use super::{
-    CallSummary, Canonical, Cfg, DirectTarget, Facts, Graph, Inst, Native, Op, Result,
+    CallSummary, Cfg, DirectTarget, Facts, FunctionState, Graph, Inst, Native, Op, Result,
     TerminatorKind, Types, UnaryOp, Value,
 };
 
@@ -44,7 +44,8 @@ pub(in crate::jit) struct Repository {
 struct Body {
     name: String,
     source: usize,
-    canonical: Canonical,
+    graph: Graph,
+    notes: Vec<String>,
     arrow: bool,
 }
 
@@ -71,7 +72,7 @@ impl Repository {
         let Some(body) = self.bodies.get(&code) else {
             return Vec::new();
         };
-        self.graph_callees(&body.canonical.graph, body.source)
+        self.graph_callees(&body.graph, body.source)
     }
 
     pub(in crate::jit) fn graph_callees(&self, graph: &Graph, source: usize) -> Vec<FuncId> {
@@ -104,17 +105,18 @@ impl Repository {
         source: usize,
         name: &str,
         code: FuncId,
-        canonical: Canonical,
+        function: FunctionState,
     ) {
         self.locations
-            .insert((source, canonical.graph.span.start), code);
+            .insert((source, function.graph.span.start), code);
         self.globals.insert(name.to_owned(), code);
         self.bodies.insert(
             code,
             Arc::new(Body {
                 name: name.to_owned(),
                 source,
-                canonical,
+                graph: function.graph,
+                notes: function.notes,
                 arrow: false,
             }),
         );
@@ -124,18 +126,19 @@ impl Repository {
         &mut self,
         source: usize,
         code: FuncId,
-        canonical: Canonical,
+        function: FunctionState,
         arrow: bool,
     ) {
         self.locations
-            .insert((source, canonical.graph.span.start), code);
-        let name = canonical.graph.name.clone();
+            .insert((source, function.graph.span.start), code);
+        let name = function.graph.name.clone();
         self.bodies.insert(
             code,
             Arc::new(Body {
                 name,
                 source,
-                canonical,
+                graph: function.graph,
+                notes: function.notes,
                 arrow,
             }),
         );
@@ -150,20 +153,23 @@ impl Repository {
             .is_some_and(|code| self.number_first.contains(&code))
     }
 
-    pub(in crate::jit) fn emission(&self, code: FuncId) -> Option<(usize, Canonical)> {
+    pub(in crate::jit) fn emission(&self, code: FuncId) -> Option<(usize, FunctionState)> {
         let body = self.bodies.get(&code)?;
-        Some((body.source, body.canonical.clone()))
+        Some((
+            body.source,
+            FunctionState::new(body.graph.clone(), body.notes.clone(), true),
+        ))
     }
 
-    pub(in crate::jit) fn canonical(&self, source: usize, start: u32) -> Option<&Canonical> {
+    pub(in crate::jit) fn function(&self, source: usize, start: u32) -> Option<FunctionState> {
         let code = self.locations.get(&(source, start))?;
-        Some(&self.bodies.get(code)?.canonical)
+        self.emission(*code).map(|(_, function)| function)
     }
 
     pub(in crate::jit) fn lexical_this(&self, code: FuncId) -> bool {
         self.bodies
             .get(&code)
-            .is_some_and(|body| body.arrow && super::inlining::uses_this(&body.canonical.graph))
+            .is_some_and(|body| body.arrow && super::inlining::uses_this(&body.graph))
     }
 
     pub(super) fn name(&self, code: FuncId) -> Option<&str> {
@@ -172,7 +178,7 @@ impl Repository {
 
     pub(super) fn body(&self, code: FuncId) -> Option<&Graph> {
         let body = self.bodies.get(&code)?;
-        Some(&body.canonical.graph)
+        Some(&body.graph)
     }
 }
 
@@ -802,10 +808,10 @@ pub(super) fn direct_calls(graph: &mut Graph, bodies: &Repository, source: usize
             let Some(body) = bodies.bodies.get(&target) else {
                 continue;
             };
-            let Some(arity) = body.canonical.graph.arity else {
+            let Some(arity) = body.graph.arity else {
                 continue;
             };
-            let lexical_this = body.arrow && super::inlining::uses_this(&body.canonical.graph);
+            let lexical_this = body.arrow && super::inlining::uses_this(&body.graph);
             targets.push((
                 call,
                 DirectTarget {
@@ -949,7 +955,7 @@ mod tests {
     use oxc_span::SourceType;
     use oxc_syntax::operator::BinaryOperator;
 
-    fn fixture(source: &str) -> (Canonical, Repository) {
+    fn fixture(source: &str) -> (FunctionState, Repository) {
         let allocator = Allocator::default();
         let parsed = Parser::new(&allocator, source, SourceType::script()).parse();
         assert!(!parsed.diagnostics.has_errors());
@@ -964,7 +970,7 @@ mod tests {
             };
             let graph =
                 super::super::build::lower(function, semantic.scoping(), &HashSet::new()).unwrap();
-            let canonical = super::super::canonicalize(graph, true).unwrap();
+            let canonical = super::super::canonicalize_graph(graph, true).unwrap();
             let name = function.id.as_ref().unwrap().name.as_str();
             if name == "main" {
                 caller = Some(canonical);
@@ -1090,7 +1096,6 @@ mod tests {
             "function createTerrain(t){if(typeof t==='string')return t.split('|');return t.map(createTerrain);} function main(t){return createTerrain(t);}",
         );
         Arc::make_mut(bodies.bodies.get_mut(&FuncId::from_u32(0)).unwrap())
-            .canonical
             .graph
             .name = "<function>".into();
         let mut notes = Vec::new();
@@ -1353,8 +1358,12 @@ mod tests {
             ),
         ] {
             let (canonical, bodies) = fixture(source);
-            let first =
-                super::super::plan_canonical(canonical.clone(), true, Some((&bodies, 0))).unwrap();
+            let first = super::super::plan_canonical(
+                FunctionState::new(canonical.graph.clone(), canonical.notes.clone(), true),
+                true,
+                Some((&bodies, 0)),
+            )
+            .unwrap();
             let second = super::super::plan_canonical(canonical, true, Some((&bodies, 0))).unwrap();
             assert_eq!(first.plan.inlines.len(), count);
             assert!(first.plan.inlines == second.plan.inlines);
@@ -1434,8 +1443,12 @@ mod tests {
             }
         }
         for fallback in [None, Some(0x1234)] {
-            let planned =
-                super::super::plan_canonical(canonical.clone(), true, Some((&bodies, 0))).unwrap();
+            let planned = super::super::plan_canonical(
+                FunctionState::new(canonical.graph.clone(), canonical.notes.clone(), true),
+                true,
+                Some((&bodies, 0)),
+            )
+            .unwrap();
             let analysis = super::super::optimize_planned(
                 planned,
                 super::super::Versioning::Speculate {
@@ -1578,8 +1591,12 @@ mod tests {
         let (canonical, bodies) = fixture(&format!(
             "function helper(x){{{body}return x;}} function main(x){{return helper(x);}}"
         ));
-        let initial =
-            super::super::plan_canonical(canonical.clone(), true, Some((&bodies, 0))).unwrap();
+        let initial = super::super::plan_canonical(
+            FunctionState::new(canonical.graph.clone(), canonical.notes.clone(), true),
+            true,
+            Some((&bodies, 0)),
+        )
+        .unwrap();
         let recompiled =
             super::super::plan_canonical_with_budget(canonical, true, Some((&bodies, 0)), 2)
                 .unwrap();

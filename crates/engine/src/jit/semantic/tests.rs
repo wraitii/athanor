@@ -214,7 +214,7 @@ fn comparisons_share_number_checks_with_refined_reads_without_splitting() {
     let graph =
         lower_source("function f(height,x,limit){if(x<0||x>=limit)return 0;return height[x][0];}")
             .unwrap();
-    let mut graph = canonicalize(graph, true).unwrap().graph;
+    let mut graph = canonicalize_graph(graph, true).unwrap().graph;
     let x = graph
         .insts
         .values()
@@ -268,7 +268,7 @@ fn comparisons_share_number_checks_with_refined_reads_without_splitting() {
 #[test]
 fn late_number_facts_remove_refinement_guards_and_assertions() {
     let graph = lower_source("function f(height,x,limit){const xx=x+1;if(xx<0||xx>=limit)return 0;return height[xx][0];}").unwrap();
-    let mut graph = canonicalize(graph, true).unwrap().graph;
+    let mut graph = canonicalize_graph(graph, true).unwrap().graph;
     let sum = graph
         .insts
         .values()
@@ -352,7 +352,7 @@ fn folding_guard_edges_recomputes_number_facts_at_joins() {
         "function f(flag){let x;if(flag)x=1;else x='text';if(x<0)return 0;return +x;}",
     )
     .unwrap();
-    let graph = canonicalize(graph, true).unwrap().graph;
+    let graph = canonicalize_graph(graph, true).unwrap().graph;
     let mut function = FunctionState::new(graph, Vec::new(), true);
     comparisons::expose(&mut function);
     let mut graph = function.graph;
@@ -390,7 +390,7 @@ fn loop_versioning_reuses_exposed_comparison_checks() {
 #[test]
 fn comparison_checks_do_not_cross_non_dominating_branches() {
     let graph = lower_source("function f(x,y,flag){if(flag)return x<y;return x>y;}").unwrap();
-    let graph = canonicalize(graph, true).unwrap().graph;
+    let graph = canonicalize_graph(graph, true).unwrap().graph;
     let mut function = FunctionState::new(graph, Vec::new(), true);
     comparisons::expose(&mut function);
     let graph = function.graph;
@@ -407,7 +407,7 @@ fn comparison_checks_do_not_cross_non_dominating_branches() {
 #[test]
 fn indexed_reads_are_reused_probed_and_get_hoisted_views() {
     let graph = lower_source("function f(array){const zero=0;let sum=0;for(let i=0;i<2;++i){sum+=array[zero]+array[zero];}return sum;}").unwrap();
-    let mut canonical = canonicalize(graph, true).unwrap();
+    let mut canonical = canonicalize_graph(graph, true).unwrap();
     for data in canonical.graph.insts.values_mut() {
         if let Op::GetIndex(object, key) = data.op {
             data.op = Op::IndexedGet(object, key);
@@ -446,7 +446,7 @@ fn indexed_rows_borrow_from_owned_receivers_through_guards() {
         let source = format!(
             "function f(owner,n){{const height=owner.height;let sum=0;for(let i=0;i<n;++i){{const row=height[i&1];{body}}}return sum;}}"
         );
-        let canonical = canonicalize(lower_source(&source).unwrap(), true).unwrap();
+        let canonical = canonicalize_graph(lower_source(&source).unwrap(), true).unwrap();
         let mut repository = specialize::Repository::default();
         for data in canonical.graph.insts.values() {
             if !matches!(data.op, Op::GetIndex(..)) {
@@ -500,7 +500,7 @@ fn guard_only_region_borrows_rows_without_entry_assumptions() {
 
     let source =
         "function f(height){let sum=0;for(let i=0;i<8;++i)sum+=height[i][0]/1;return sum;}";
-    let canonical = canonicalize(lower_source(source).unwrap(), true).unwrap();
+    let canonical = canonicalize_graph(lower_source(source).unwrap(), true).unwrap();
     let mut repository = specialize::Repository::default();
     for data in canonical.graph.insts.values() {
         if !matches!(data.op, Op::GetIndex(..)) {
@@ -554,7 +554,7 @@ fn guard_only_region_borrows_rows_without_entry_assumptions() {
 #[test]
 fn typed_loop_reads_are_reused_before_inner_loop_versioning() {
     let graph = lower_source("function f(grid,width){let members=0;for(let y=0;y<2;++y){const indexY=y*width;for(let x=0;x<2;++x){if(grid[indexY+x])for(let i=0;i<16;++i)if(grid[indexY+x]&(1<<i))++members;}}return members;}").unwrap();
-    let canonical = canonicalize(graph, true).unwrap();
+    let canonical = canonicalize_graph(graph, true).unwrap();
     let read = canonical
         .graph
         .insts
@@ -849,7 +849,7 @@ fn capture_cell_writes_preserve_guarded_globals_and_properties() {
         .find_map(|(binding, data)| (data.name == "count").then_some(binding))
         .unwrap();
     graph.bindings[binding].captured = true;
-    let canonical = canonicalize(graph, true).unwrap();
+    let canonical = canonicalize_graph(graph, true).unwrap();
     let mut graph = canonical.graph.clone();
     let regions = optimize::version(
         &mut graph,
@@ -907,7 +907,7 @@ fn versions_on_native_calls_only_when_closed() {
 
 #[test]
 fn verifier_rejects_missing_late_and_mismatched_definitions() {
-    let graph = canonicalize(
+    let graph = canonicalize_graph(
         lower_source("function f(x) { return x + 1; }").unwrap(),
         true,
     )
@@ -959,7 +959,7 @@ fn borrowed_rows_flow_through_phi_parameters() {
     ] {
         let source =
             format!("function f(rows,choose){{const row={selection};{body}return row[0];}}");
-        let mut graph = canonicalize(lower_source(&source).unwrap(), true)
+        let mut graph = canonicalize_graph(lower_source(&source).unwrap(), true)
             .unwrap()
             .graph;
         let mut result = None;
@@ -993,7 +993,7 @@ fn borrowed_rows_flow_through_phi_parameters() {
 fn integer_facts_survive_loop_backedges_without_length_bounds() {
     for step in ["++k", "k = k + 1", "--k", "k = k - 1"] {
         let source = format!("function f(limit){{let k=0;while(k!==limit){{{step};}}return k;}}");
-        let graph = canonicalize(lower_source(&source).unwrap(), true)
+        let graph = canonicalize_graph(lower_source(&source).unwrap(), true)
             .unwrap()
             .graph;
         let facts = Facts::compute(&graph);
@@ -1053,7 +1053,7 @@ fn unsupported_numeric_reads_are_not_observed_again() {
 
 #[test]
 fn checked_typed_reads_expose_shared_numeric_checks() {
-    let mut graph = canonicalize(
+    let mut graph = canonicalize_graph(
         lower_source("function f(a,b,k){k=+k;return a[k]+b[k];}").unwrap(),
         true,
     )
@@ -1184,7 +1184,7 @@ fn checked_typed_reads_expose_shared_numeric_checks() {
 
 #[test]
 fn integer_typed_read_skips_exactness_roundtrip() {
-    let mut graph = canonicalize(
+    let mut graph = canonicalize_graph(
         lower_source("function f(a,k){k=k|0;return a[k];}").unwrap(),
         true,
     )
@@ -1229,7 +1229,7 @@ fn undefined_comparisons_refine_typed_read_results() {
             if operator == "===" { "0" } else { "x" },
             if operator == "===" { "x" } else { "0" }
         );
-        let mut graph = canonicalize(lower_source(&source).unwrap(), true)
+        let mut graph = canonicalize_graph(lower_source(&source).unwrap(), true)
             .unwrap()
             .graph;
         let inst = graph
@@ -1276,7 +1276,7 @@ fn undefined_comparisons_refine_typed_read_results() {
         "function f(x){return x!=undefined;}",
         "function f(x,undefined){return x===undefined;}",
     ] {
-        let graph = canonicalize(lower_source(source).unwrap(), true)
+        let graph = canonicalize_graph(lower_source(source).unwrap(), true)
             .unwrap()
             .graph;
         let mut function = FunctionState::new(graph, Vec::new(), true);

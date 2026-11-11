@@ -329,7 +329,7 @@ mod tests {
             .semantic;
         let graph =
             super::super::build::lower(function, semantic.scoping(), &HashSet::new()).unwrap();
-        let mut graph = super::super::canonicalize(graph, true).unwrap().graph;
+        let mut graph = super::super::canonicalize_graph(graph, true).unwrap().graph;
         for block in Cfg::new(&graph).rpo {
             for inst in graph.blocks[block].insts.clone() {
                 if let Op::Call {
