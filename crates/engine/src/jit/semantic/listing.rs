@@ -111,6 +111,12 @@ impl Graph {
                 format!("shape={shape} slot={index}"),
             );
         }
+        for (location, alternatives) in plan.shapes.polymorphic_reads() {
+            entries.insert(
+                format!("polymorphic get {}", site_name(*location)),
+                format!("{alternatives:?}"),
+            );
+        }
         for &(location, observed) in &plan.numbers {
             entries.insert(
                 format!("number {}", site_name(location)),

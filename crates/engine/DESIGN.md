@@ -273,6 +273,18 @@ receiver or eight uncacheable misses permanently marks the site megamorphic.
 Such a site skips probing and refilling the small cache. Existing entries remain
 allocated so an earlier dominating cache guard still supports its load.
 
+For own properties, feedback retains up to four receiver-shape/slot pairs.
+Polymorphic sites materialize these alternatives as local `IsShape` branches and
+`ShapedGet` loads in the semantic graph, after versioning and before final
+simplification. Each access rejoins locally and retains its original Get as the
+fallback. Property reads used as callees also take this path. Inlining preserves
+the source site, so inlined reads consume the same feedback. Available-check
+analysis tracks branch truth and excludes other shapes while a positive shape
+fact remains valid; writes and reentry invalidate that knowledge normally.
+These alternatives do not create entry contracts or versioning regions. A
+contextually selected monomorphic access retains the existing shape-guard path.
+Prototype and builtin alternatives remain in the runtime PIC.
+
 Megamorphic shape feedback is terminal and tracked per observing function, including
 inlined copies. Recompilation removes cache-hit speculation at the affected site
 and emits ordinary helper reads. Cache-miss paths have normal rather than cold

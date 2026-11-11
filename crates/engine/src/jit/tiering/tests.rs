@@ -1569,6 +1569,77 @@ mod call_variant_tests {
     }
 
     #[test]
+    fn polymorphic_get_dispatch_preserves_misses_and_owned_results() {
+        for background_compile in [false, true] {
+            for inlining in [false, true] {
+                let mut engine = Engine::with_options(EngineOptions {
+                    background_compile,
+                    inlining,
+                    call_specialization: false,
+                    ..Default::default()
+                })
+                .unwrap();
+                engine.compile(
+                    "function read(o){return o.x;} function invoke(o){return read(o);} function value(o){return o.value;} function change(o){o.x=second;o.extra=1;} function updatePrototype(){C.prototype.x=second;} function C(){} var first={value:11};var second={value:22};var a={x:first,y:0};var b={y:0,x:second};var dictionary={0:0,x:first};C.prototype.x=first;var inherited=new C();",
+                    "polymorphic-get-dispatch.js",
+                ).unwrap();
+                finish_compilation(&engine);
+                let a = engine.global().get_raw("a").unwrap();
+                let b = engine.global().get_raw("b").unwrap();
+                for name in ["read", "invoke"] {
+                    for _ in 0..16 {
+                        for object in [a, b] {
+                            engine.call(name, &[object]).unwrap();
+                        }
+                    }
+                    finish_compilation(&engine);
+                }
+                let read = code(&engine, "read");
+                assert!(
+                    !engine
+                        .tiering
+                        .compiler
+                        .borrow()
+                        .specialization_plan(VariantId::ordinary(read))
+                        .unwrap()
+                        .shapes
+                        .polymorphic_reads()
+                        .is_empty()
+                );
+                let held = engine.call("invoke", &[a]).unwrap();
+                engine.call("change", &[a]).unwrap();
+                assert_eq!(
+                    engine.call("value", &[held.value()]).unwrap().value(),
+                    Value::number(11.0)
+                );
+                for (name, expected) in [
+                    ("a", 22.0),
+                    ("b", 22.0),
+                    ("dictionary", 11.0),
+                    ("inherited", 11.0),
+                ] {
+                    let object = engine.global().get_raw(name).unwrap();
+                    let result = engine.call("invoke", &[object]).unwrap();
+                    assert_eq!(
+                        engine.call("value", &[result.value()]).unwrap().value(),
+                        Value::number(expected)
+                    );
+                }
+                engine.call("updatePrototype", &[]).unwrap();
+                let object = engine.global().get_raw("inherited").unwrap();
+                for _ in 0..16 {
+                    let result = engine.call("invoke", &[object]).unwrap();
+                    assert_eq!(
+                        engine.call("value", &[result.value()]).unwrap().value(),
+                        Value::number(22.0)
+                    );
+                }
+                finish_compilation(&engine);
+            }
+        }
+    }
+
+    #[test]
     fn megamorphic_gets_stop_speculating_on_cache_hits() {
         for background in [false, true] {
             let mut engine = engine(background);

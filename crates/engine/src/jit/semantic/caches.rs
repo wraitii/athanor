@@ -21,6 +21,7 @@ pub(super) fn apply(graph: &mut Graph, shapes: &super::shapes::Plan) -> super::R
                 Op::Get(_, ref name)
                     if name != "length"
                         && !shapes.megamorphic(graph, inst)
+                        && shapes.alternatives(graph, inst).is_none()
                         && graph.insts[inst]
                             .result
                             .is_some_and(|value| guarded.contains(&value))

@@ -224,6 +224,11 @@ extra entries only after the first. Overflow and repeated uncacheable reads swit
 the site to a persistent megamorphic mode. Feedback removes cache-hit speculation
 there and uses regular helper reads. Prototype guards and value retention still
 apply to every cached entry.
+Polymorphic own-property feedback also expands into local semantic shape branches
+and direct slot loads, independently of versioning. Inlined accesses use the same
+feedback; caller shape facts can eliminate checks and unused alternatives. Unknown
+shapes retain the original cached Get fallback. Prototype and builtin reads keep
+their runtime cache paths.
 Feedback recompilation and OSR multiply both the shared inlining instruction
 budget and the per-callee size limit by two; initial and prefetched compilation
 retain the base limits. Set

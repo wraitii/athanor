@@ -11,10 +11,22 @@ use super::{
 pub(in crate::jit) struct Plan {
     source: usize,
     accesses: Vec<(Site, PropertyAccess, u32, u32)>,
+    polymorphic: Vec<(Site, Vec<(u32, u32)>)>,
     megamorphic: Vec<Site>,
 }
 
 impl Plan {
+    pub(in crate::jit) fn polymorphic_reads(&self) -> &[(Site, Vec<(u32, u32)>)] {
+        &self.polymorphic
+    }
+
+    pub(super) fn alternatives(&self, graph: &Graph, inst: Inst) -> Option<&[(u32, u32)]> {
+        let site = site(graph, inst, self.source);
+        self.polymorphic
+            .iter()
+            .find_map(|(origin, entries)| (*origin == site).then_some(entries.as_slice()))
+    }
+
     pub(in crate::jit) fn megamorphic_sites(&self) -> &[Site] {
         &self.megamorphic
     }
@@ -67,6 +79,7 @@ pub(super) fn plan(graph: &Graph, bodies: &super::specialize::Repository, source
         })
         .collect();
     let mut accesses = Vec::new();
+    let mut polymorphic = Vec::new();
     let mut megamorphic = Vec::new();
     for (inst, data) in graph.insts.iter() {
         if property_access(&data.op) != Some(PropertyAccess::Get) {
@@ -89,14 +102,30 @@ pub(super) fn plan(graph: &Graph, bodies: &super::specialize::Repository, source
             let Some(property) = property_access(&data.op) else {
                 continue;
             };
-            if data.result.is_some_and(|value| callees.contains(&value)) {
-                continue;
-            }
             let site = site(graph, inst, source);
+            let callee = data.result.is_some_and(|value| callees.contains(&value));
             let object = match data.op {
                 Op::Get(object, _) | Op::ProbeProperty(object, _) | Op::Set(object, ..) => object,
                 _ => continue,
             };
+            if let Some(&ShapeAccess::PolymorphicRead { entries, len }) =
+                bodies.shape_feedback.get(&(site, property))
+                && matches!(data.op, Op::Get(..))
+                && (callee
+                    || !assumed.get(&object).is_some_and(|shape| {
+                        entries[..usize::from(len)]
+                            .iter()
+                            .any(|entry| entry.0 == *shape)
+                    }))
+            {
+                if !polymorphic.iter().any(|(origin, _)| *origin == site) {
+                    polymorphic.push((site, entries[..usize::from(len)].to_vec()));
+                }
+                continue;
+            }
+            if callee {
+                continue;
+            }
             let access = match (property, bodies.shape_feedback.get(&(site, property))) {
                 (PropertyAccess::Get, Some(&access)) => {
                     let Some((shape, index)) = access.read(assumed.get(&object).copied()) else {
@@ -117,6 +146,7 @@ pub(super) fn plan(graph: &Graph, bodies: &super::specialize::Repository, source
     Plan {
         source,
         accesses,
+        polymorphic,
         megamorphic,
     }
 }
@@ -243,7 +273,7 @@ fn segments(graph: &Graph, planned: &HashMap<Inst, (Value, u32, u32)>) -> Vec<Se
 }
 
 pub(super) fn apply(graph: &mut Graph, plan: &Plan, notes: &mut Vec<String>) -> super::Result<()> {
-    if plan.accesses.is_empty() {
+    if plan.accesses.is_empty() && plan.polymorphic.is_empty() {
         return Ok(());
     }
     let planned = planned(graph, plan);
@@ -264,6 +294,43 @@ pub(super) fn apply(graph: &mut Graph, plan: &Plan, notes: &mut Vec<String>) -> 
             accesses.len(),
             segments.len()
         ));
+    }
+    let reads: Vec<_> = Cfg::new(graph)
+        .rpo
+        .into_iter()
+        .filter(|block| !graph.cold.contains(block))
+        .flat_map(|block| graph.blocks[block].insts.clone())
+        .filter(|&inst| {
+            matches!(graph.insts[inst].op, Op::Get(..)) && plan.alternatives(graph, inst).is_some()
+        })
+        .collect();
+    for inst in &reads {
+        let data = graph.insts[*inst].clone();
+        let Op::Get(object, name) = data.op else {
+            unreachable!()
+        };
+        let alternatives = plan
+            .alternatives(graph, *inst)
+            .unwrap()
+            .iter()
+            .map(|&(shape, index)| super::dispatch::Alternative {
+                requirements: vec![(object, super::guards::Fact::Shape(shape))],
+                implementation: index,
+            })
+            .collect();
+        super::dispatch::apply(graph, *inst, alternatives, |graph, block, index| {
+            let (read, result) = graph.append(
+                block,
+                data.span,
+                Op::ShapedGet(object, name.clone(), index),
+                true,
+            );
+            graph.insts[read].source_name = data.source_name;
+            result
+        });
+    }
+    if !reads.is_empty() {
+        notes.push(format!("polymorphic gets: {} accesses", reads.len()));
     }
     graph.verify()
 }

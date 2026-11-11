@@ -1974,11 +1974,12 @@ pub(super) fn optimize_planned(
         &function.plan.shapes,
         &mut function.notes,
     )?;
-    if function
-        .graph
-        .insts
-        .values()
-        .any(|data| matches!(data.op, Op::EntryAssume(_, guards::Fact::Shape(_))))
+    if !function.plan.shapes.polymorphic_reads().is_empty()
+        || function
+            .graph
+            .insts
+            .values()
+            .any(|data| matches!(data.op, Op::EntryAssume(_, guards::Fact::Shape(_))))
     {
         optimize::reuse_loads(&mut function);
     }

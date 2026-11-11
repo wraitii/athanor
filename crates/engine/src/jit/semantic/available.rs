@@ -4,7 +4,7 @@ use oxc_syntax::operator::BinaryOperator;
 
 use super::access::Access;
 use super::guards::{Fact, implies};
-use super::{Block, Cfg, Facts, Graph, Inst, Op, Value, resolve};
+use super::{Block, Cfg, Facts, Graph, Inst, Op, TerminatorKind, UnaryOp, Value, resolve};
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(super) enum LoadKey {
@@ -30,6 +30,7 @@ pub(super) enum LoadKey {
 pub(super) struct Available {
     pub(super) value: Value,
     read: Option<Access>,
+    truth: Option<bool>,
 }
 
 pub(super) type AvailableLoads = HashMap<LoadKey, Available>;
@@ -38,8 +39,14 @@ pub(super) struct Solved {
     exits: HashMap<Block, AvailableLoads>,
     aliases: HashMap<Value, Value>,
     pub(super) reused: Vec<(Inst, Value)>,
+    pub(super) folded: Vec<(Inst, bool)>,
     cold: HashSet<Block>,
     probes: bool,
+}
+
+enum Reuse {
+    Value(Value),
+    Boolean(bool),
 }
 
 fn load_key(op: &Op, pure: bool, probes: bool, aliases: &HashMap<Value, Value>) -> Option<LoadKey> {
@@ -95,7 +102,7 @@ fn step(
     probes: bool,
     aliases: &HashMap<Value, Value>,
     state: &mut AvailableLoads,
-) -> Option<Value> {
+) -> Option<Reuse> {
     let data = &graph.insts[inst];
     let memory = facts.memory(inst);
     if memory.reenters() {
@@ -118,8 +125,17 @@ fn step(
     let result = data.result?;
     let key = load_key(&data.op, facts.is_pure(inst), probes, aliases)?;
     if let Some(entry) = state.get(&key) {
-        return Some(entry.value);
+        return Some(Reuse::Value(entry.value));
     }
+    let excluded = match &key {
+        LoadKey::Check(object, Fact::Shape(shape)) => state.iter().any(|(known, entry)| {
+            let LoadKey::Check(other, Fact::Shape(known_shape)) = known else {
+                return false;
+            };
+            entry.truth == Some(true) && object == other && shape != known_shape
+        }),
+        _ => false,
+    };
     let read = read_access(&data.op, facts).map(|mut read| {
         read.base = read.base.map(|base| resolve(aliases, base));
         read
@@ -129,9 +145,16 @@ fn step(
         Available {
             value: result,
             read,
+            truth: if excluded {
+                Some(false)
+            } else if matches!(data.op, Op::EntryAssume(..)) {
+                Some(true)
+            } else {
+                None
+            },
         },
     );
-    None
+    excluded.then_some(Reuse::Boolean(false))
 }
 
 fn entering(
@@ -139,17 +162,47 @@ fn entering(
     cfg: &Cfg,
     exits: &HashMap<Block, AvailableLoads>,
     block: Block,
+    aliases: &HashMap<Value, Value>,
 ) -> AvailableLoads {
     if block == graph.entry {
         return AvailableLoads::new();
     }
-    let mut incoming = cfg.preds[block].iter().filter_map(|pred| exits.get(pred));
+    let mut incoming = cfg.preds[block].iter().filter_map(|pred| {
+        let mut state = exits.get(pred)?.clone();
+        if let Some(terminator) = &graph.blocks[*pred].terminator
+            && let TerminatorKind::Branch(condition, yes, no) = &terminator.kind
+            && yes.block != no.block
+        {
+            let (condition, inverted) = match graph.defining_op(*condition) {
+                Some(Op::Unary(UnaryOp::Not, value)) => (*value, true),
+                _ => (*condition, false),
+            };
+            let condition = resolve(aliases, condition);
+            for entry in state.values_mut() {
+                if resolve(aliases, entry.value) == condition {
+                    entry.truth = Some((yes.block == block) != inverted);
+                }
+            }
+        }
+        Some(state)
+    });
     let Some(first) = incoming.next() else {
         return AvailableLoads::new();
     };
-    let mut state = first.clone();
+    let mut state = first;
     for other in incoming {
-        state.retain(|key, entry| other.get(key) == Some(entry));
+        state.retain(|key, entry| {
+            let Some(other) = other.get(key) else {
+                return false;
+            };
+            if entry.value != other.value || entry.read != other.read {
+                return false;
+            }
+            if entry.truth != other.truth {
+                entry.truth = None;
+            }
+            true
+        });
     }
     state
 }
@@ -167,14 +220,20 @@ pub(super) fn solve(
         let mut changed = false;
         let mut aliases = HashMap::new();
         let mut reused = Vec::new();
+        let mut folded = Vec::new();
         for &block in &cfg.rpo {
-            let mut state = entering(graph, cfg, &exits, block);
+            let mut state = entering(graph, cfg, &exits, block, &aliases);
             let is_cold = cold.contains(&block);
             for &inst in &graph.blocks[block].insts {
                 if let Some(value) = step(graph, facts, inst, is_cold, probes, &aliases, &mut state)
                 {
-                    aliases.insert(graph.insts[inst].result.unwrap(), value);
-                    reused.push((inst, value));
+                    match value {
+                        Reuse::Value(value) => {
+                            aliases.insert(graph.insts[inst].result.unwrap(), value);
+                            reused.push((inst, value));
+                        }
+                        Reuse::Boolean(value) => folded.push((inst, value)),
+                    }
                 }
             }
             if exits.get(&block) != Some(&state) {
@@ -187,6 +246,7 @@ pub(super) fn solve(
                 exits,
                 aliases,
                 reused,
+                folded,
                 cold,
                 probes,
             });
@@ -205,7 +265,7 @@ impl Solved {
         inst: Inst,
     ) -> AvailableLoads {
         let block = graph.insts[inst].block;
-        let mut state = entering(graph, cfg, &self.exits, block);
+        let mut state = entering(graph, cfg, &self.exits, block, &self.aliases);
         let cold = self.cold.contains(&block);
         for &earlier in &graph.blocks[block].insts {
             if earlier == inst {

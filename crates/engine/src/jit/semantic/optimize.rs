@@ -515,11 +515,14 @@ pub(super) fn reuse_loads(function: &mut FunctionState) {
         .map(|&(inst, value)| (graph.insts[inst].result.unwrap(), value))
         .collect();
     graph.replace_uses(&aliases);
+    for &(inst, value) in &solved.folded {
+        graph.insts[inst].op = Op::Constant(super::Constant::Boolean(value));
+    }
     for &(inst, value) in &solved.reused {
         notes.push(format!("{} reuses {value}", graph.note_inst(inst)));
         graph.remove_inst(inst);
     }
-    if !solved.reused.is_empty() {
+    if !solved.reused.is_empty() || !solved.folded.is_empty() {
         function.invalidate_values();
     }
 }
@@ -988,6 +991,48 @@ mod tests {
             assert!(writes.clobbers(&heap(array, Field::Length)));
             assert!(!writes.clobbers(&heap(array, Field::Named("allows".into()))));
             assert!(!writes.clobbers(&global("g_Map")));
+        }
+    }
+
+    #[test]
+    fn shape_exclusion_requires_a_live_positive_fact() {
+        for writes_shape in [false, true] {
+            let mut graph = empty_graph();
+            let entry = graph.entry;
+            let span = graph.span;
+            let object = graph.append_value(entry, span, Op::Argument(0));
+            let check = graph.append_value(entry, span, Op::IsShape(object, 2));
+            let yes = graph.blocks.push(BlockData::default());
+            let no = graph.blocks.push(BlockData::default());
+            let join = graph.blocks.push(BlockData::default());
+            graph.terminate(
+                entry,
+                span,
+                TerminatorKind::Branch(check, Target::new(yes), Target::new(no)),
+            );
+            if writes_shape {
+                graph.append(yes, span, Op::Set(object, "extra".into(), object), false);
+            }
+            let (positive, _) = graph.append(yes, span, Op::IsShape(object, 1), true);
+            let (negative, _) = graph.append(no, span, Op::IsShape(object, 1), true);
+            for block in [yes, no] {
+                graph.terminate(block, span, TerminatorKind::Jump(Target::new(join)));
+            }
+            let (merged, result) = graph.append(join, span, Op::IsShape(object, 1), true);
+            graph.terminate(join, span, TerminatorKind::Return(result.unwrap()));
+            graph.verify().unwrap();
+            let facts = Facts::compute(&graph);
+            let cfg = Cfg::new(&graph);
+            let solved =
+                super::super::available::solve(&graph, &facts, &cfg, HashSet::new(), false)
+                    .unwrap();
+            assert_eq!(solved.folded.contains(&(positive, false)), !writes_shape);
+            assert!(
+                !solved
+                    .folded
+                    .iter()
+                    .any(|&(inst, _)| inst == negative || inst == merged)
+            );
         }
     }
 

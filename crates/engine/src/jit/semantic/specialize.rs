@@ -1390,6 +1390,97 @@ mod tests {
     }
 
     #[test]
+    fn inlined_polymorphic_gets_simplify_without_versioning() {
+        use crate::jit::profile::{PropertyAccess, ShapeAccess, Site};
+        use crate::jit::variants::{Fact as InputFact, Input};
+        for (body, invalidated) in [
+            ("return readX(o);", false),
+            ("mutate(o);return readX(o);", true),
+            ("o.extra=1;return readX(o);", true),
+        ] {
+            for shape in [None, Some(10), Some(20), Some(30)] {
+                let (canonical, mut bodies) = fixture(&format!(
+                    "function readX(o){{return o.x;}} function main(o,mutate){{{body}}}"
+                ));
+                let (_, callee) = bodies.emission(FuncId::from_u32(0)).unwrap();
+                for block in Cfg::new(&callee.graph).rpo {
+                    for &inst in &callee.graph.blocks[block].insts {
+                        let data = &callee.graph.insts[inst];
+                        if matches!(data.op, Op::Get(..)) {
+                            bodies.shape_feedback.insert(
+                                (
+                                    Site {
+                                        source: 0,
+                                        start: data.span.start,
+                                        end: data.span.end,
+                                    },
+                                    PropertyAccess::Get,
+                                ),
+                                ShapeAccess::PolymorphicRead {
+                                    entries: [(10, 0), (20, 1), (0, 0), (0, 0)],
+                                    len: 2,
+                                },
+                            );
+                        }
+                    }
+                }
+                let mut planned =
+                    super::super::plan_canonical(canonical, true, Some((&bodies, 0))).unwrap();
+                assert_eq!(planned.plan.inlines.len(), 1);
+                assert_eq!(planned.plan.shapes.polymorphic_reads().len(), 1);
+                if let Some(shape) = shape {
+                    super::super::call_variants::assume(
+                        &mut planned.graph,
+                        &vec![(Input::Argument(0), InputFact::Shape(shape))],
+                    );
+                }
+                let optimized = super::super::optimize_planned(
+                    planned,
+                    super::super::Versioning::Generic,
+                    false,
+                )
+                .unwrap();
+                optimized.graph.verify().unwrap();
+                assert!(optimized.graph.regions.is_empty());
+                assert!(optimized.graph.entry_guards.is_empty());
+                let operations = operations(&optimized.graph);
+                assert_eq!(
+                    operations
+                        .iter()
+                        .filter(|op| matches!(op, Op::ShapedGet(..)))
+                        .count(),
+                    if invalidated || shape.is_none() {
+                        2
+                    } else {
+                        usize::from(shape != Some(30))
+                    }
+                );
+                assert_eq!(
+                    operations
+                        .iter()
+                        .filter(|op| matches!(op, Op::IsShape(..)))
+                        .count(),
+                    if invalidated || shape.is_none() { 2 } else { 0 }
+                );
+                if let Some(shape) = shape.filter(|shape| *shape != 30 && !invalidated) {
+                    assert!(operations.iter().any(|op| matches!(op, Op::ShapedGet(_, _, index) if *index == u32::from(shape == 20))));
+                    assert!(
+                        !operations
+                            .iter()
+                            .any(|op| matches!(op, Op::Get(_, name) if name == "x"))
+                    );
+                } else {
+                    assert!(
+                        operations
+                            .iter()
+                            .any(|op| matches!(op, Op::Get(_, name) if name == "x"))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn decision_records_include_nested_and_bounded_recursive_inlines() {
         for (source, count) in [
             (
