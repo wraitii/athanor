@@ -42,10 +42,13 @@ pub(crate) enum HelperShape {
 pub(crate) struct HelperSpec {
     pub(crate) shape: HelperShape,
     pub(crate) pointer: *const u8,
+    pub(crate) reference: bool,
 }
 
 macro_rules! define_helpers {
-    ($($variant:ident => $shape:ident, $function:ident;)*) => {
+    (@reference) => { false };
+    (@reference reference) => { true };
+    ($($variant:ident => $shape:ident, $function:ident $(, $reference:ident)?;)*) => {
         #[repr(usize)]
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
         pub(crate) enum Helper {
@@ -56,6 +59,7 @@ macro_rules! define_helpers {
             $(HelperSpec {
                 shape: HelperShape::$shape,
                 pointer: $function as *const () as *const u8,
+                reference: define_helpers!(@reference $($reference)?),
             }),*
         ];
     };
@@ -64,45 +68,45 @@ macro_rules! define_helpers {
 define_helpers! {
     PackInit => Unary, js_pack_init;
     PackRelease => Unary, js_pack_release;
-    NewPack => Unary, js_new_pack;
-    Spread => Binary, js_spread;
+    NewPack => Unary, js_new_pack, reference;
+    Spread => Binary, js_spread, reference;
     PackAppend => Binary, js_pack_append;
     PackExtend => Binary, js_pack_extend;
-    PackTake => Binary, js_pack_take;
-    PackTakeOwned => Binary, js_pack_take_owned;
+    PackTake => Binary, js_pack_take, reference;
+    PackTakeOwned => Binary, js_pack_take;
     CompilePoll => Nullary, js_compile_poll;
     VariantEntry => Pointer, js_variant_entry;
     OsrPoll => Callable, js_osr_poll;
     CompileLeave => Unary, js_compile_leave;
     Instanceof => Binary, js_instanceof;
     In => Binary, js_in;
-    GeneratorNew => Quaternary, js_generator_new;
-    GeneratorClosure => Unary, js_generator_closure;
+    GeneratorNew => Quaternary, js_generator_new, reference;
+    GeneratorClosure => Unary, js_generator_closure, reference;
     GeneratorState => Nullary, js_generator_state;
     GeneratorSuspend => IndexSet, js_generator_suspend;
     GeneratorComplete => Binary, js_generator_complete;
-    LocalGet => Unary, js_local_get;
-    CellNew => Unary, js_cell_new;
-    CellGet => Unary, js_cell_get;
+    LocalGet => Unary, js_local_get, reference;
+    CellNew => Unary, js_cell_new, reference;
+    CellGet => Unary, js_cell_get, reference;
     CellSet => Binary, js_cell_set;
-    CaptureGet => Binary, js_capture_get;
+    CaptureGet => Binary, js_capture_get, reference;
     BindThis => Binary, js_bind_this;
     DisableConstructor => Unary, js_disable_constructor;
     MarkClass => Unary, js_mark_class;
-    ClosureNew => Callable, js_closure_new;
-    Construct => Callable, js_construct;
+    ClosureNew => Callable, js_closure_new, reference;
+    Construct => Callable, js_construct, reference;
     ConstructorPrototype => Unary, js_constructor_prototype;
-    NewInstance => Unary, js_new_instance;
-    NewInstanceOwned => Unary, js_new_instance_owned;
-    ConstructorCall => MethodCallable, js_constructor_call;
-    ConstructorCallPack => IndexSet, js_constructor_call_pack;
-    ConstructResolved => MethodCallable, js_construct_resolved;
-    ConstructPackResolved => IndexSet, js_construct_pack_resolved;
-    ConstructPack => Binary, js_construct_pack;
-    CallPack => IndexSet, js_call_pack;
+    NewInstance => Unary, js_new_instance, reference;
+    NewInstanceOwned => Unary, js_new_instance;
+    ConstructorCall => MethodCallable, js_constructor_call, reference;
+    ConstructorCallPack => IndexSet, js_constructor_call_pack, reference;
+    ConstructResolved => MethodCallable, js_construct_resolved, reference;
+    ConstructPackResolved => IndexSet, js_construct_pack_resolved, reference;
+    ConstructPack => Binary, js_construct_pack, reference;
+    CallPack => IndexSet, js_call_pack, reference;
     ArrayAppend => Binary, js_array_append;
     ArrayExtend => Binary, js_array_extend;
-    Call => MethodCallable, js_call;
+    Call => MethodCallable, js_call, reference;
     ObserveCall => Binary, js_observe_call;
     ObserveGet => Binary, js_observe_get;
     ObserveIndex => Binary, js_observe_index;
@@ -116,13 +120,13 @@ define_helpers! {
     LexicalReceiver => Binary, js_lexical_receiver;
     ArrayIterationGuard => IndexSet, js_array_iteration_guard;
     IsStringSplit => Unary, js_is_string_split;
-    StringSplitParts => MethodCallable, js_string_split_parts;
-    StringSplitPartsOwned => MethodCallable, js_string_split_parts_owned;
-    StringSplit => MethodCallable, js_string_split;
-    StringSplitOwned => MethodCallable, js_string_split_owned;
-    ArrayMapNew => Unary, js_array_map_new;
-    ArrayMapNewOwned => Unary, js_array_map_new_owned;
-    ArrayMapElement => Binary, js_array_map_element;
+    StringSplitParts => MethodCallable, js_string_split_parts, reference;
+    StringSplitPartsOwned => MethodCallable, js_string_split_parts;
+    StringSplit => MethodCallable, js_string_split, reference;
+    StringSplitOwned => MethodCallable, js_string_split;
+    ArrayMapNew => Unary, js_array_map_new, reference;
+    ArrayMapNewOwned => Unary, js_array_map_new;
+    ArrayMapElement => Binary, js_array_map_element, reference;
     MathDirect => MethodCallable, js_math_direct;
     FrameOverflow => Nullary, js_frame_overflow;
     FrameRelease => Nullary, js_frame_release;
@@ -130,39 +134,39 @@ define_helpers! {
     LocalReplace => IndexSet, js_local_replace;
     Release => Unary, js_release;
     Bailout => Unary, js_bailout;
-    Retain => Unary, js_retain;
-    IterateNew => Unary, js_iterate_new;
-    IterateNext => Unary, js_iterate_next;
-    EnumerateNew => Unary, js_enumerate_new;
-    EnumerateNext => Unary, js_enumerate_next;
-    Typeof => Unary, js_typeof;
+    Retain => Unary, js_retain, reference;
+    IterateNew => Unary, js_iterate_new, reference;
+    IterateNext => Unary, js_iterate_next, reference;
+    EnumerateNew => Unary, js_enumerate_new, reference;
+    EnumerateNext => Unary, js_enumerate_next, reference;
+    Typeof => Unary, js_typeof, reference;
     IsTypeof => Binary, js_is_typeof;
     Truthy => Unary, js_truthy;
-    ObjectNew => Unary, js_object_new;
-    ObjectNewOwned => Unary, js_object_new_owned;
-    PropertyKey => Unary, js_property_key;
+    ObjectNew => Unary, js_object_new, reference;
+    ObjectNewOwned => Unary, js_object_new;
+    PropertyKey => Unary, js_property_key, reference;
     StringConstant => SourceLocation, js_string_constant;
-    RegExpNew => PropertyGet, js_regexp_new;
-    ArrayNew => ArrayNew, js_array_new;
-    ArrayNewOwned => ArrayNew, js_array_new_owned;
-    Rest => Rest, js_rest;
-    IndexGet => Binary, js_index_get;
-    IndexGetNumeric => NumericIndex, js_index_get_numeric;
+    RegExpNew => PropertyGet, js_regexp_new, reference;
+    ArrayNew => ArrayNew, js_array_new, reference;
+    ArrayNewOwned => ArrayNew, js_array_new;
+    Rest => Rest, js_rest, reference;
+    IndexGet => Binary, js_index_get, reference;
+    IndexGetNumeric => NumericIndex, js_index_get_numeric, reference;
     TypedIndexGet => Binary, js_typed_index_get;
     IndexSet => IndexSet, js_index_set;
-    PropertyGet => PropertyGet, js_property_get;
-    PropertyGetCached => Binary, js_property_get_cached;
+    PropertyGet => PropertyGet, js_property_get, reference;
+    PropertyGetCached => Binary, js_property_get_cached, reference;
     PropertyCachePrime => Binary, js_property_cache_prime;
     PropertySetCached => PropertySetCached, js_property_set_cached;
     PropertyDefineHidden => PropertySet, js_property_define_hidden;
-    GlobalGet => Pointer, js_global_get;
-    GlobalGetOptional => Pointer, js_global_get_optional;
+    GlobalGet => Pointer, js_global_get, reference;
+    GlobalGetOptional => Pointer, js_global_get_optional, reference;
     GlobalGetBorrowed => Pointer, js_global_get_borrowed;
     GlobalGetOptionalBorrowed => Pointer, js_global_get_optional_borrowed;
     GlobalSet => GlobalSet, js_global_set;
     GlobalInitialize => GlobalSet, js_global_initialize;
     Throw => Unary, js_throw;
-    Catch => Unary, js_catch;
+    Catch => Unary, js_catch, reference;
     ErrorOrigin => SourceLocation, js_error_origin;
     CallProfileFlush => Nullary, js_call_profile_flush;
     BitwiseAnd => Binary, js_bitwise_and;
@@ -171,7 +175,7 @@ define_helpers! {
     ShiftLeft => Binary, js_shift_left;
     ShiftRight => Binary, js_shift_right;
     ShiftRightUnsigned => Binary, js_shift_right_unsigned;
-    Add => Binary, js_add;
+    Add => Binary, js_add, reference;
     Sub => Binary, js_sub;
     Mul => Binary, js_mul;
     Div => Binary, js_div;
@@ -237,51 +241,7 @@ extern "C" fn js_compile_leave(ctx: *mut JitCtx, code: u64) -> Value {
 impl Helper {
     /// Whether a heap result carries a reference the generated code must release.
     pub(crate) fn returns_reference(self) -> bool {
-        matches!(
-            self,
-            Self::NewPack
-                | Self::Spread
-                | Self::PackTake
-                | Self::GeneratorNew
-                | Self::GeneratorClosure
-                | Self::LocalGet
-                | Self::CellNew
-                | Self::CellGet
-                | Self::CaptureGet
-                | Self::ClosureNew
-                | Self::Construct
-                | Self::NewInstance
-                | Self::ConstructorCall
-                | Self::ConstructorCallPack
-                | Self::ConstructResolved
-                | Self::ConstructPackResolved
-                | Self::ConstructPack
-                | Self::CallPack
-                | Self::Call
-                | Self::StringSplitParts
-                | Self::StringSplit
-                | Self::ArrayMapNew
-                | Self::ArrayMapElement
-                | Self::Retain
-                | Self::IterateNew
-                | Self::IterateNext
-                | Self::EnumerateNew
-                | Self::EnumerateNext
-                | Self::Typeof
-                | Self::ObjectNew
-                | Self::PropertyKey
-                | Self::RegExpNew
-                | Self::ArrayNew
-                | Self::Rest
-                | Self::IndexGet
-                | Self::IndexGetNumeric
-                | Self::PropertyGet
-                | Self::PropertyGetCached
-                | Self::GlobalGet
-                | Self::GlobalGetOptional
-                | Self::Catch
-                | Self::Add
-        )
+        HELPERS[self as usize].reference
     }
 
     pub(crate) fn can_throw(self) -> bool {
@@ -487,11 +447,6 @@ extern "C" fn js_retain(ctx: *mut JitCtx, value: Value) -> Value {
     ctx.retain(value)
 }
 extern "C" fn js_array_new(ctx: *mut JitCtx, argv: *const Value, argc: u64) -> Value {
-    let value = js_array_new_owned(ctx, argv, argc);
-    value
-}
-
-extern "C" fn js_array_new_owned(ctx: *mut JitCtx, argv: *const Value, argc: u64) -> Value {
     let ctx = unsafe { &mut *ctx };
     let values = if argc == 0 {
         &[]
@@ -653,17 +608,6 @@ extern "C" fn js_string_split(
     argv: *const Value,
     argc: u64,
 ) -> Value {
-    let value = js_string_split_owned(ctx, 0, receiver, argv, argc);
-    value
-}
-
-extern "C" fn js_string_split_owned(
-    ctx: *mut JitCtx,
-    _: u64,
-    receiver: Value,
-    argv: *const Value,
-    argc: u64,
-) -> Value {
     let args = if argc == 0 {
         &[]
     } else {
@@ -711,11 +655,6 @@ extern "C" fn js_array_iteration_guard(
 }
 
 extern "C" fn js_array_map_new(ctx: *mut JitCtx, length: Value) -> Value {
-    let value = js_array_map_new_owned(ctx, length);
-    value
-}
-
-extern "C" fn js_array_map_new_owned(ctx: *mut JitCtx, length: Value) -> Value {
     let context = unsafe { &mut *ctx };
     match context
         .global
@@ -1067,11 +1006,6 @@ pub(super) extern "C" fn js_iterate_next(ctx: *mut JitCtx, state: Value) -> Valu
 }
 
 extern "C" fn js_object_new(ctx: *mut JitCtx, _: Value) -> Value {
-    let value = js_object_new_owned(ctx, Value::UNDEFINED);
-    value
-}
-
-extern "C" fn js_object_new_owned(ctx: *mut JitCtx, _: Value) -> Value {
     let ctx = unsafe { &mut *ctx };
     match ctx.global.heap().object() {
         Some(value) => value,
@@ -1146,11 +1080,6 @@ extern "C" fn js_pack_extend(ctx: *mut JitCtx, pack: Value, value: Value) -> Val
 }
 
 extern "C" fn js_pack_take(ctx: *mut JitCtx, pack: Value, index: Value) -> Value {
-    let value = js_pack_take_owned(ctx, pack, index);
-    value
-}
-
-extern "C" fn js_pack_take_owned(ctx: *mut JitCtx, pack: Value, index: Value) -> Value {
     unsafe {
         super::pack::take_element(
             (&*ctx).global.heap(),
@@ -1161,17 +1090,6 @@ extern "C" fn js_pack_take_owned(ctx: *mut JitCtx, pack: Value, index: Value) ->
 }
 
 extern "C" fn js_string_split_parts(
-    ctx: *mut JitCtx,
-    destination: Value,
-    receiver: Value,
-    argv: *const Value,
-    argc: u64,
-) -> Value {
-    let value = js_string_split_parts_owned(ctx, destination, receiver, argv, argc);
-    value
-}
-
-extern "C" fn js_string_split_parts_owned(
     ctx: *mut JitCtx,
     destination: Value,
     receiver: Value,

@@ -108,16 +108,10 @@ pub(super) fn invoke(
         .heap()
         .lexical_this(closure)
         .unwrap_or(receiver);
-    let value = entry.call(ctx, closure, receiver, argv, argc);
-    value
+    entry.call(ctx, closure, receiver, argv, argc)
 }
 
 pub(super) extern "C" fn js_new_instance(ctx: *mut JitCtx, prototype: Value) -> Value {
-    let value = js_new_instance_owned(ctx, prototype);
-    value
-}
-
-pub(super) extern "C" fn js_new_instance_owned(ctx: *mut JitCtx, prototype: Value) -> Value {
     let context = unsafe { &mut *ctx };
     match context.global.heap().object_with_prototype(prototype) {
         Some(instance) => instance,

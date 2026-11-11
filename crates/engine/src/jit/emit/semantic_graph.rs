@@ -305,10 +305,7 @@ impl FunctionCompiler<'_, '_> {
         let releases = super::slots::releases(graph, facts, cfg);
         let early: std::collections::HashSet<GraphValue> =
             releases.values().flatten().copied().collect();
-        let mut result_tokens: std::collections::HashMap<
-            GraphValue,
-            Vec<cranelift_frontend::Variable>,
-        > = std::collections::HashMap::new();
+        let mut result_tokens = std::collections::HashMap::<GraphValue, Vec<Variable>>::new();
         let repeated = |block: crate::jit::semantic::Block| {
             suspends || graph.has_handlers || cyclic.contains(&block)
         };

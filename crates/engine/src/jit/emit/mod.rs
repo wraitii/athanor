@@ -290,10 +290,12 @@ fn build_callable(
     if let CallableBody::Factory(resume) = body {
         let (argv, argc) = compiler.argument_vector()?;
         let args = compiler.call_helper(Helper::ArrayNew, &[argv, argc]);
+        let arguments = *compiler.owned.last().unwrap();
         compiler.check_error();
         let code = compiler.b.ins().iconst(types::I64, resume.as_u32() as i64);
         let generator =
             compiler.call_helper(Helper::GeneratorNew, &[closure, receiver, args, code]);
+        compiler.release_tracked(&[arguments]);
         compiler.check_error();
         let args = compiler.return_args(generator, false);
         compiler.jump(return_block, &args);

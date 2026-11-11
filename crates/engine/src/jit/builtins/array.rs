@@ -602,6 +602,7 @@ pub(super) fn call(
         }
         Some(result)
     };
+    let mut iteration = Held::new(&heap);
     for index in 0..length {
         let present = heap.present(receiver, index);
         if !present && function != ArrayFind {
@@ -612,7 +613,7 @@ pub(super) fn call(
         } else {
             Value::UNDEFINED
         };
-        let mut iteration = Held::new(&heap);
+        iteration.release();
         iteration.push(unsafe { &mut *ctx }.retain(value));
         let callback_args = [value, Value::number(index as f64), receiver];
         let mapped = js_call(ctx, callback, Value::UNDEFINED, callback_args.as_ptr(), 3);

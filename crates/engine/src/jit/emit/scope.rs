@@ -144,7 +144,9 @@ impl FunctionCompiler<'_, '_> {
     }
 
     /// Holds a reference in a variable of its own. Every variable is `undefined` outside the
-    /// span that owns it, so paths that never took the reference release nothing. Generators keep
+    /// span that owns it, so paths that never took the reference release nothing. Paths on which
+    /// a variable was never defined read Cranelift's zero default instead, which is not
+    /// heap-tagged either. Generators keep
     /// their references in stack slots instead: nothing in a generator is slotted in the frame,
     /// so its temporaries are numerous and long-lived, and in memory they cost the register
     /// allocator nothing.
@@ -229,15 +231,13 @@ impl FunctionCompiler<'_, '_> {
 
     /// Releases some of the block's references before its end.
     pub(super) fn release_tracked(&mut self, variables: &[Variable]) {
+        let unchecked = self
+            .unchecked
+            .filter(|unchecked| !variables.contains(unchecked));
         self.release_variables(variables);
         self.owned.retain(|owned| !variables.contains(owned));
         self.free_owned.extend_from_slice(variables);
-        if self
-            .unchecked
-            .is_some_and(|unchecked| variables.contains(&unchecked))
-        {
-            self.unchecked = None;
-        }
+        self.unchecked = unchecked;
     }
 
     /// References the current block holds in variables at this point, leaving out the result of

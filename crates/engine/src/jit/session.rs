@@ -121,6 +121,11 @@ impl Held {
         self.values.try_reserve(additional).is_ok()
     }
 
+    pub(crate) fn release(&mut self) {
+        self.heap.release_all(&self.values);
+        self.values.clear();
+    }
+
     pub(crate) fn take(mut self) -> Vec<Value> {
         std::mem::take(&mut self.values)
     }
@@ -227,14 +232,13 @@ impl<'a> JitCtx<'a> {
         };
         let function: extern "C" fn(*mut JitCtx, Value, Value, *const Value, u64) -> Value =
             unsafe { std::mem::transmute(entry) };
-        let value = function(
+        function(
             self,
             Value::UNDEFINED,
             Value::GLOBAL_OBJECT,
             std::ptr::null(),
             0,
-        );
-        value
+        )
     }
 
     pub(crate) fn throw(&mut self, value: Value) {

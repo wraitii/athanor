@@ -270,19 +270,22 @@ pub(super) fn releases(graph: &Graph, facts: &Facts, cfg: &Cfg) -> HashMap<Inst,
             aliases.insert(result, data.op.operands_iter().collect());
         }
     }
-    let anchored = |value: Value| {
-        let mut pending = vec![value];
-        let mut visited = HashSet::new();
-        while let Some(current) = pending.pop() {
-            if !visited.insert(current) {
-                continue;
+    let anchors: HashMap<Value, Vec<Value>> = aliases
+        .keys()
+        .map(|&value| {
+            let mut pending = vec![value];
+            let mut visited = HashSet::new();
+            while let Some(current) = pending.pop() {
+                if !visited.insert(current) {
+                    continue;
+                }
+                if let Some(owners) = aliases.get(&current) {
+                    pending.extend(owners.iter().copied());
+                }
             }
-            if let Some(owners) = aliases.get(&current) {
-                pending.extend(owners.iter().copied());
-            }
-        }
-        visited
-    };
+            (value, visited.into_iter().collect())
+        })
+        .collect();
     let mut defined: HashMap<Value, (Block, usize, Inst)> = HashMap::new();
     for &block in &cfg.rpo {
         for (index, &inst) in graph.blocks[block].insts.iter().enumerate() {
@@ -295,13 +298,13 @@ pub(super) fn releases(graph: &Graph, facts: &Facts, cfg: &Cfg) -> HashMap<Inst,
     for &block in &cfg.rpo {
         let data = &graph.blocks[block];
         let escape = |value: Value, last: &mut HashMap<Value, Option<usize>>| {
-            for value in anchored(value) {
+            for &value in anchored(&anchors, &value) {
                 last.insert(value, None);
             }
         };
         for (index, &inst) in data.insts.iter().enumerate() {
             for operand in graph.insts[inst].op.operands_iter() {
-                for value in anchored(operand) {
+                for &value in anchored(&anchors, &operand) {
                     match defined.get(&value) {
                         Some(&(owner, _, _)) if owner == block => {
                             let entry = last.entry(value).or_insert(Some(index));
@@ -337,4 +340,12 @@ pub(super) fn releases(graph: &Graph, facts: &Facts, cfg: &Cfg) -> HashMap<Inst,
         releases.entry(after).or_default().push(value);
     }
     releases
+}
+
+/// A value together with every value it borrows from, directly or not.
+fn anchored<'a>(anchors: &'a HashMap<Value, Vec<Value>>, value: &'a Value) -> &'a [Value] {
+    match anchors.get(value) {
+        Some(values) => values,
+        None => std::slice::from_ref(value),
+    }
 }

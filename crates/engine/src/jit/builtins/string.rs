@@ -58,8 +58,7 @@ pub(in crate::jit) fn call(
 ) -> Value {
     use NativeFunction::*;
     if function == StringSplit {
-        let value = split(ctx, receiver, args);
-        return value;
+        return split(ctx, receiver, args);
     }
     let context = unsafe { &mut *ctx };
     let heap = context.global.heap().clone();
