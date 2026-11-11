@@ -786,6 +786,32 @@ fn global_writes_prevent_versioning_and_load_reuse() {
 }
 
 #[test]
+fn small_constant_products_preserve_integer_types() {
+    for (factor, expected) in [
+        ("3", Types::INT64),
+        ("4194304", Types::INT64),
+        ("4194305", Types::NUMBER),
+        ("0", Types::NUMBER),
+        ("-1", Types::NUMBER),
+        ("0.5", Types::NUMBER),
+    ] {
+        for expression in [format!("(x|0)*{factor}"), format!("{factor}*(x|0)")] {
+            let graph = lower_source(&format!("function f(x){{return {expression};}}")).unwrap();
+            let facts = Facts::compute(&graph);
+            let result = graph
+                .insts
+                .values()
+                .find_map(|data| {
+                    matches!(data.op, Op::Binary(BinaryOperator::Multiplication, ..))
+                        .then(|| data.result.unwrap())
+                })
+                .unwrap();
+            assert_eq!(facts.of(result), expected, "{expression}");
+        }
+    }
+}
+
+#[test]
 fn integer_coercions_are_reused_and_hoisted_out_of_bit_loops() {
     let analysis = analyze_source(
         "function f() { const grid=new Float64Array(4); let sum=0; for(let x=0;x<grid.length;++x) { const word=grid[x]; for(let i=0;i<16;++i) { sum+=word&(1<<i); sum+=word^i; } } return sum; }",

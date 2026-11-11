@@ -1734,6 +1734,15 @@ impl FunctionCompiler<'_, '_> {
                 let value = self.b.ins().iconst(types::I8, i64::from(*value));
                 boolean(value)
             }
+            Op::Binary(oxc_syntax::operator::BinaryOperator::Multiplication, left, right)
+                if target == Some(Repr::Int64) =>
+            {
+                let left = self.operand(cx, *left);
+                let right = self.operand(cx, *right);
+                let left = self.convert(left, Repr::Int64);
+                let right = self.convert(right, Repr::Int64);
+                Some(Some(Operand::new(self.b.ins().imul(left, right), Repr::Int64)))
+            }
             Op::Binary(operator, left, right)
             | Op::GuardedCompare {
                 operator,

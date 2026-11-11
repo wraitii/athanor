@@ -17,6 +17,32 @@ fn engines() -> impl Iterator<Item = Engine> {
 }
 
 #[test]
+fn constant_integer_products_preserve_extremes_and_zero_signs() {
+    for factor in [0.0, -1.0, 0.5, 3.0, 4_194_304.0, 4_194_305.0] {
+        for expression in [format!("(x|0)*{factor}"), format!("{factor}*(x|0)")] {
+            for mut engine in engines() {
+                engine
+                    .compile(
+                        &format!("function main(x){{return {expression};}}"),
+                        "integer-products.js",
+                    )
+                    .unwrap();
+                for input in [i32::MIN, -1, 0, 1, i32::MAX] {
+                    assert_eq!(
+                        engine
+                            .call("main", &[Value::number(input as f64)])
+                            .unwrap()
+                            .value(),
+                        Value::number(input as f64 * factor),
+                        "{expression}, x={input}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn indexed_stores_preserve_values_and_ownership() {
     let source = r#"
         function store(a, k, v) { return a[k] = v; }

@@ -1,5 +1,7 @@
 # Benchmarks
 
+Run commands from `cranelift-exp/` unless noted otherwise.
+
 ## V8 benchmark suite v7
 
 `v8-v7/` holds the V8 Benchmark Suite version 7 (the predecessor of Octane):
@@ -30,36 +32,59 @@ node --max-opt=2 bench/v8-v7/shell.cjs richards   # + Maglev
 node --max-opt=3 bench/v8-v7/shell.cjs richards   # + TurboFan (default)
 ```
 
-### Results (2026-11-10, Apple Silicon, node 23.9.0, bun 1.3.1)
+To run QuickJS through the C++ runner:
 
-| benchmark     | jit  | node jitless | node ≤Sparkplug | node ≤Maglev | node  | bun    |
-|---------------|------|--------------|-----------------|--------------|-------|--------|
-| richards      | 3329 | 1753         | 1952            | 33717        | 46221 | 53147  |
-| navier-stokes | 4773 | 2503         | 3620            | 28048        | 40662 | 34429  |
+```sh
+make -C cpp-quickjs
+cpp-quickjs/build/mapgen-runner --bootstrap bench/v8-v7/quickjs.js bench/v8-v7/richards.js
+cpp-quickjs/build/mapgen-runner --bootstrap bench/v8-v7/quickjs.js bench/v8-v7/navier-stokes.js
+```
 
-JIT scores are medians of three runs after adding inline packed-array stores:
-richards 3340/3149/3329, navier-stokes 4706/4773/4801. Other engines and tiers
-were run once. These are about 20% and 16% above the previously recorded JIT
-scores (2780 and 4100), respectively; this is not an isolated before/after build
-comparison.
+### Gaussian blur
 
-- The JIT beats V8's interpreter and baseline tiers on both, and is roughly
-  6–14x behind Maglev/TurboFan.
-- The other benchmarks do not run yet (first error reported):
-  - deltablue: `cannot assign property "inheritsFrom" of undefined`
-  - crypto: `cannot read property "charCodeAt" of string`
-  - raytrace: `value is not callable in this engine`
-  - earley-boyer: `unsupported unary operator in unary expression`
-  - regexp, splay: ``unknown variable `String` ``
+`gaussian-blur.js` benchmarks a 3×3 Gaussian convolution over the interior of
+an ordinary 128×128 grayscale array. The image, kernel, and output are passed
+as arguments; the output buffer is reused and border pixels remain unchanged.
+The reference value is arbitrary, so compare scores only across engines running
+this benchmark.
+
+```sh
+target/release/js-runner --load bench/v8-v7/base.js --load bench/gaussian-blur.js \
+  --load bench/v8-v7/driver.js --eval 'function main(){}'
+node bench/v8-v7/shell.cjs ../gaussian-blur
+cpp-quickjs/build/mapgen-runner --bootstrap bench/v8-v7/quickjs.js bench/gaussian-blur.js
+```
+
+### Results
+
+Apple Silicon; node 23.9.0, bun 1.3.1, QuickJS 2026-06-04. Higher is better.
+
+| benchmark | jit | node jitless | node ≤Sparkplug | node ≤Maglev | node | bun | QuickJS |
+|-----------|----:|-------------:|----------------:|-------------:|-----:|----:|--------:|
+| richards | 3272 | 1753 | 1952 | 33717 | 46221 | 53147 | 1177 |
+| navier-stokes | 6293 | 2503 | 3620 | 28048 | 40662 | 34429 | 1779 |
+| gaussian-blur | 207 | 13.2 | 20.3 | 235 | 659 | 1313 | 7.99 |
+
+JIT, QuickJS, and Gaussian blur scores are medians of three runs; other scores
+are from single runs. All Gaussian blur runs produced an output buffer sum of
+`2019780`.
+
+Unsupported benchmarks:
+
+| benchmark | first error |
+|-----------|-------------|
+| deltablue | `cannot assign property "inheritsFrom" of undefined` |
+| crypto | `cannot read property "charCodeAt" of string` |
+| raytrace | `value is not callable in this engine` |
+| earley-boyer | `unsupported unary operator in unary expression` |
+| regexp, splay | ``unknown variable `String` `` |
 
 ### Published results
 
-[ahaoboy/js-engine-benchmark](https://github.com/ahaoboy/js-engine-benchmark)
-runs the same suite (forked from mozilla/arewefastyet `benchmarks/v8-v7`) on
-~40 engines for ubuntu, macos-arm64 and windows, with results in
-`macos-arm64.json`, `ubuntu.json` and `windows.json`. Hardware is not
-published (presumably CI runners), so compare ratios to node, not raw scores.
-Selected macos-arm64 rows as published (dated 11/10/2026):
+Selected macos-arm64 results from
+[ahaoboy/js-engine-benchmark](https://github.com/ahaoboy/js-engine-benchmark).
+Hardware is unspecified; compare ratios to node rather than raw
+scores across machines. Its node version is 27 alpha versus 23.9 locally.
 
 | engine         | Richards | NavierStokes | Score |
 |----------------|----------|--------------|-------|
@@ -73,15 +98,9 @@ Selected macos-arm64 rows as published (dated 11/10/2026):
 | quickjs-ng 0.18.0 | 1171  | 2637         | 1556  |
 | hermes 0.12.0  | 759      | 1121         | 1322  |
 
-Relative to node on the same machine, the JIT is at ~7% on richards and ~12%
-on navier-stokes. On richards that places it above QuickJS (~4% of node) and
-Hermes (~2.5%) and below quanta (~10%); on navier-stokes it is slightly above
-quickjs-ng (~11%) and well below SpiderMonkey (~60%). Node versions differ (23.9 locally, 27 alpha
-there), so this placement is approximate.
-
 ## Map generation
 
-The real workload is random map generation. From the repository root:
+Run random map generation from the repository root:
 
 ```sh
 cargo run --release --manifest-path cranelift-exp/Cargo.toml -- --map \
@@ -106,6 +125,5 @@ All engines must report the same `heightHash` (`dd1de906` for belgian_uplands).
 | jit             | 979 ms         |
 | QuickJS         | 7537 ms         |
 
-Refreshed 2026-11-10. JIT time is the median of three runs (975/979/981 ms);
-the C++ runners were run once each. All five runs produced `heightHash`
-`dd1de906`.
+JIT time is the median of three runs; C++ runners were run once each.
+All runs produced the expected `heightHash`.

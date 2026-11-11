@@ -419,7 +419,7 @@ impl Facts {
                         } else {
                             match steps.get(&inst) {
                                 Some(bounds) if facts.bounded(&data.op, bounds) => Types::INT32,
-                                _ => result_types(&data.op, &facts),
+                                _ => result_types(graph, &data.op, &facts),
                             }
                         };
                         changed |= facts.widen(result, types);
@@ -695,7 +695,17 @@ fn number(value: f64) -> Types {
     }
 }
 
-fn result_types(op: &Op, facts: &Facts) -> Types {
+fn integer_product(graph: &Graph, facts: &Facts, left: Value, right: Value) -> bool {
+    // Positive factors avoid negative zero; 2^31 * 2^22 stays exactly representable.
+    let scaled = |value, factor| {
+        facts.of(value).within(Types::INT32)
+            && matches!(graph.defining_op(factor), Some(Op::Constant(Constant::Number(n)))
+                if *n > 0.0 && n.fract() == 0.0 && *n <= 4_194_304.0)
+    };
+    scaled(left, right) || scaled(right, left)
+}
+
+fn result_types(graph: &Graph, op: &Op, facts: &Facts) -> Types {
     match op {
         Op::OsrStart(..) => Types::INT32,
         Op::Continuation(body, _) => body.result,
@@ -777,6 +787,11 @@ fn result_types(op: &Op, facts: &Facts) -> Types {
         Op::Binary(BinaryOperator::Addition | BinaryOperator::Subtraction, left, right)
             if facts.of(*left).within(Types::INTEGER)
                 && facts.of(*right).within(Types::INTEGER) =>
+        {
+            Types::INT64
+        }
+        Op::Binary(BinaryOperator::Multiplication, left, right)
+            if integer_product(graph, facts, *left, *right) =>
         {
             Types::INT64
         }
