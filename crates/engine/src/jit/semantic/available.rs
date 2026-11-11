@@ -9,11 +9,14 @@ use super::{Block, Cfg, Facts, Graph, Inst, Op, TerminatorKind, UnaryOp, Value, 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(super) enum LoadKey {
     ToInt32(Value),
+    NumericFloat(Value),
+    SaturatingInteger(Value),
     Position(Value),
     ExactPosition(Value, Value),
     InBounds(Value, Value),
     BooleanAnd(Value, Value),
     Length(Value),
+    ArrayKind(Value),
     Array(Value, bool),
     Constructor(Value),
     Property(Value, String),
@@ -49,7 +52,13 @@ enum Reuse {
     Boolean(bool),
 }
 
-fn load_key(op: &Op, pure: bool, probes: bool, aliases: &HashMap<Value, Value>) -> Option<LoadKey> {
+fn load_key(
+    graph: &Graph,
+    op: &Op,
+    pure: bool,
+    probes: bool,
+    aliases: &HashMap<Value, Value>,
+) -> Option<LoadKey> {
     let at = |value: &Value| resolve(aliases, *value);
     Some(match op {
         Op::Get(object, name) | Op::ShapedGet(object, name, _) => {
@@ -62,12 +71,26 @@ fn load_key(op: &Op, pure: bool, probes: bool, aliases: &HashMap<Value, Value>) 
         Op::ConstructorPrototype(callee) => LoadKey::Constructor(at(callee)),
         Op::GlobalRead(name) => LoadKey::Global(name.clone()),
         Op::ProbeGlobal(name) if probes => LoadKey::Probe(name.clone()),
+        Op::NumericFloat(value) => {
+            let value = at(value);
+            let value = match graph.defining_op(value) {
+                Some(Op::AsInteger(input))
+                    if matches!(graph.defining_op(at(input)), Some(Op::SaturatingInteger(_))) =>
+                {
+                    at(input)
+                }
+                _ => value,
+            };
+            LoadKey::NumericFloat(value)
+        }
+        Op::SaturatingInteger(value) => LoadKey::SaturatingInteger(at(value)),
         Op::ToInt32(value) => LoadKey::ToInt32(at(value)),
         Op::ArrayPosition(value) => LoadKey::Position(at(value)),
         Op::IsExactPosition(key, position) => LoadKey::ExactPosition(at(key), at(position)),
         Op::BooleanAnd(left, right) => LoadKey::BooleanAnd(at(left), at(right)),
         Op::IsInBounds(position, length) => LoadKey::InBounds(at(position), at(length)),
         Op::IndexedLength(object) => LoadKey::Length(at(object)),
+        Op::ArrayKind(object) => LoadKey::ArrayKind(at(object)),
         Op::IsArray(object, holey) => LoadKey::Array(at(object), *holey),
         Op::This => LoadKey::This,
         Op::Argument(index) => LoadKey::Argument(*index),
@@ -106,7 +129,12 @@ fn step(
     let data = &graph.insts[inst];
     let memory = facts.memory(inst);
     if memory.reenters() {
-        state.clear();
+        state.retain(|key, _| {
+            matches!(
+                key,
+                LoadKey::NumericFloat(_) | LoadKey::SaturatingInteger(_)
+            )
+        });
         return None;
     }
     if memory.writes_state() {
@@ -123,7 +151,7 @@ fn step(
         return None;
     }
     let result = data.result?;
-    let key = load_key(&data.op, facts.is_pure(inst), probes, aliases)?;
+    let key = load_key(graph, &data.op, facts.is_pure(inst), probes, aliases)?;
     if let Some(entry) = state.get(&key) {
         return Some(Reuse::Value(entry.value));
     }

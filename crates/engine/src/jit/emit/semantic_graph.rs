@@ -215,7 +215,13 @@ impl FunctionCompiler<'_, '_> {
         let mut reprs: SecondaryMap<GraphValue, Repr> = SecondaryMap::with_default(Repr::Boxed);
         if !suspends {
             for value in graph.values.keys() {
-                reprs[value] = Repr::of(facts.of(value));
+                // Saturation can exceed the safe integer range, so its facts remain broad.
+                reprs[value] = if matches!(graph.defining_op(value), Some(Op::SaturatingInteger(_)))
+                {
+                    Repr::Int64
+                } else {
+                    Repr::of(facts.of(value))
+                };
             }
         }
         let values: Vec<Variable> = graph
@@ -973,7 +979,7 @@ impl FunctionCompiler<'_, '_> {
                         Op::CachedProperty(object, site) => {
                             let object = get(self, *object);
                             let offset = self.property_caches[site];
-                            let address = self.b.ins().iadd_imm_s(self.data_base, offset);
+                            let address = self.data_address(offset);
                             let retain = data.result.is_none_or(|value| {
                                 !graph.borrowed.contains(&value)
                                     && !self.slot_owned(graph, &cx, value)
@@ -1140,6 +1146,7 @@ impl FunctionCompiler<'_, '_> {
                         | Op::IsInBounds(..)
                         | Op::IsArrayIndex(..)
                         | Op::IsArray(..)
+                        | Op::ArrayKind(..)
                         | Op::BooleanAnd(..)
                         | Op::ArrayLoad(..) => {
                             unreachable!()
@@ -1169,7 +1176,11 @@ impl FunctionCompiler<'_, '_> {
                             )
                         }
                         Op::AsNumber(value) | Op::AsObject(value) => Some(get(self, *value)),
-                        Op::IsInteger(_) | Op::AsInteger(_) => unreachable!(),
+                        Op::IsInteger(_)
+                        | Op::AsInteger(_)
+                        | Op::NumericFloat(_)
+                        | Op::SaturatingInteger(_)
+                        | Op::IntegerCheck(..) => unreachable!(),
                         Op::ToInt32(_) => unreachable!(),
                         Op::ToNumeric(value) => {
                             let value = get(self, *value);
@@ -1851,6 +1862,38 @@ impl FunctionCompiler<'_, '_> {
                 let float = self.convert(operand, Repr::Float);
                 Some(Some(Operand::new(self.b.ins().fneg(float), Repr::Float)))
             }
+            Op::NumericFloat(value) => {
+                let operand = self.operand(cx, *value);
+                Some(Some(Operand::new(
+                    self.convert(operand, Repr::Float),
+                    Repr::Float,
+                )))
+            }
+            Op::SaturatingInteger(value) => {
+                let operand = self.operand(cx, *value);
+                Some(Some(Operand::new(
+                    self.convert(operand, Repr::Int64),
+                    Repr::Int64,
+                )))
+            }
+            Op::IntegerCheck(value, float, exact) => {
+                let operand = self.operand(cx, *value);
+                let boxed = self.convert(operand, Repr::Boxed);
+                let float = self.operand(cx, *float).value;
+                let exact = self.operand(cx, *exact).value;
+                let numeric = self.is_number(boxed);
+                let integral = self.b.ins().fcmp(FloatCC::Equal, float, exact);
+                let magnitude = self.b.ins().fabs(float);
+                let limit = self.b.ins().f64const(9007199254740991.0);
+                let safe = self
+                    .b
+                    .ins()
+                    .fcmp(FloatCC::LessThanOrEqual, magnitude, limit);
+                let positive_zero = self.b.ins().icmp_imm_s(IntCC::NotEqual, boxed, i64::MIN);
+                let valid = self.b.ins().band(numeric, integral);
+                let valid = self.b.ins().band(valid, safe);
+                boolean(self.b.ins().band(valid, positive_zero))
+            }
             Op::IsInteger(value) => {
                 let operand = self.operand(cx, *value);
                 let boxed = self.convert(operand, Repr::Boxed);
@@ -1991,10 +2034,27 @@ impl FunctionCompiler<'_, '_> {
                 boolean(self.b.ins().band(left, right))
             }
             Op::IsArrayIndex(..) => unreachable!(),
+            Op::ArrayKind(object) => {
+                let view = match graph.views.get(&inst) {
+                    Some(&view) => self.operand(cx, view).value,
+                    None => {
+                        let object = self.operand(cx, *object);
+                        let object = self.convert(object, Repr::Boxed);
+                        self.view(object)
+                    }
+                };
+                let kind = self.view_kind(view);
+                Some(Some(Operand::new(kind, Repr::Int32)))
+            }
             Op::IsArray(object, holey) => {
-                let object = self.operand(cx, *object);
-                let object = self.convert(object, Repr::Boxed);
-                let view = self.view(object);
+                let view = match graph.views.get(&inst) {
+                    Some(&view) => self.operand(cx, view).value,
+                    None => {
+                        let object = self.operand(cx, *object);
+                        let object = self.convert(object, Repr::Boxed);
+                        self.view(object)
+                    }
+                };
                 let kind = self.view_kind(view);
                 let expected = kind::ARRAY | if *holey { kind::HOLEY } else { 0 };
                 boolean(self.b.ins().icmp_imm_s(IntCC::Equal, kind, expected as i64))
@@ -2018,9 +2078,14 @@ impl FunctionCompiler<'_, '_> {
                 )))
             }
             Op::IndexedLength(object) => {
-                let operand = self.operand(cx, *object);
-                let object = self.convert(operand, Repr::Boxed);
-                let view = self.view(object);
+                let view = match graph.views.get(&inst) {
+                    Some(&view) => self.operand(cx, view).value,
+                    None => {
+                        let object = self.operand(cx, *object);
+                        let object = self.convert(object, Repr::Boxed);
+                        self.view(object)
+                    }
+                };
                 if target == Some(Repr::Int64) {
                     let length = self.view_length_integer(view);
                     Some(Some(Operand::new(length, Repr::Int64)))

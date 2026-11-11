@@ -349,9 +349,16 @@ impl FunctionCompiler<'_, '_> {
         }
     }
 
+    pub(super) fn data_address(&mut self, offset: i64) -> ClifValue {
+        if offset == 0 {
+            return self.data_base;
+        }
+        self.b.ins().iadd_imm_s(self.data_base, offset)
+    }
+
     pub(super) fn function_data<T>(&mut self, value: T) -> ClifValue {
         let offset = self.data.push(value);
-        self.b.ins().iadd_imm_s(self.data_base, offset)
+        self.data_address(offset)
     }
 
     pub(super) fn property_cache(
@@ -368,7 +375,7 @@ impl FunctionCompiler<'_, '_> {
                 offset
             }
         };
-        self.b.ins().iadd_imm_s(self.data_base, offset)
+        self.data_address(offset)
     }
 
     pub(super) fn call_helper(&mut self, helper: Helper, args: &[ClifValue]) -> ClifValue {
@@ -1944,7 +1951,7 @@ impl FunctionCompiler<'_, '_> {
             .source_names
             .entry(source_name.0)
             .or_insert_with(|| self.data.push(source_name));
-        let source = self.b.ins().iadd_imm_s(self.data_base, offset);
+        let source = self.data_address(offset);
         let start = self
             .b
             .ins()

@@ -596,7 +596,7 @@ pub(super) fn hoist(function: &mut FunctionState, region: RegionId) {
             let pure = facts.is_pure(inst);
             if data.result.is_some()
                 && invariant(graph, &data.op)
-                && (pure || writes.preserves(&data.op))
+                && (pure || writes.preserves(graph, inst))
             {
                 moved.push(inst);
                 graph.move_inst(inst, preheader);
@@ -608,9 +608,8 @@ pub(super) fn hoist(function: &mut FunctionState, region: RegionId) {
             for inst in graph.blocks[block].insts.clone() {
                 let data = &graph.insts[inst];
                 if data.result.is_some()
-                    && !matches!(data.op, Op::Constant(_))
                     && (facts.is_pure(inst)
-                        || (facts.removable(inst) && writes.preserves(&data.op)))
+                        || (facts.removable(inst) && writes.preserves(graph, inst)))
                     && invariant(graph, &data.op)
                 {
                     moved.push(inst);
@@ -662,7 +661,7 @@ fn probe_reads(
                 && data.op.operands_iter().all(|value| {
                     !inside.contains(&graph.def_block(value)) || probed.contains(&value)
                 })
-                && (input || writes.preserves(&data.op))
+                && (input || writes.preserves(graph, inst))
             {
                 reads.push(inst);
                 probed.extend(data.result);
@@ -686,17 +685,22 @@ pub(super) fn views(function: &mut FunctionState) {
     let mut placed: HashMap<(Block, Value), Value> = HashMap::new();
     for &block in &cfg.rpo {
         for inst in graph.blocks[block].insts.clone() {
-            let (Op::GetIndex(object, key)
-            | Op::TypedIndex(object, key, _)
-            | Op::IndexedGet(object, key)
-            | Op::ArrayLoad(object, key, _)
-            | Op::SetIndex(object, key, _)) = graph.insts[inst].op
-            else {
-                continue;
+            let object = match graph.insts[inst].op {
+                Op::GetIndex(object, key)
+                | Op::TypedIndex(object, key, _)
+                | Op::IndexedGet(object, key)
+                | Op::ArrayLoad(object, key, _)
+                | Op::SetIndex(object, key, _)
+                    if facts.of(key).intersects(Types::NUMBER) =>
+                {
+                    object
+                }
+                Op::IsArray(object, _) | Op::ArrayKind(object) | Op::IndexedLength(object) => {
+                    object
+                }
+                _ => continue,
             };
-            if !facts.of(key).intersects(Types::NUMBER)
-                || !facts.of(object).intersects(Types::OBJECT)
-            {
+            if !facts.of(object).intersects(Types::OBJECT) {
                 continue;
             }
             let Some(preheader) = loops.iter().find_map(|(header, body)| {

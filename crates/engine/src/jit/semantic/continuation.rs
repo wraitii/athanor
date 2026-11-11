@@ -401,6 +401,9 @@ impl Shape {
                     .chain(target.args)
                     .collect();
                 let stub = result.blocks.push(BlockData::default());
+                if result.cold.contains(&block) || graph.cold.contains(&target.block) {
+                    result.cold.insert(stub);
+                }
                 result.append(stub, graph.span, Op::ContinuationStore(values), false);
                 let value = append(result, stub, index(position));
                 terminate(result, stub, TerminatorKind::Return(value));

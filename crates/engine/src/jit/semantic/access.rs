@@ -92,6 +92,7 @@ impl Access {
             | Op::IndexedGet(object, _)
             | Op::ArrayLoad(object, _, _)
             | Op::IndexedLength(object)
+            | Op::ArrayKind(object)
             | Op::IsArray(object, _)
             | Op::ConstructorPrototype(object) => (Locations::HEAP, Some(*object)),
             Op::ProbeShapeProperty(object, ..) => {

@@ -379,7 +379,7 @@ impl FunctionCompiler<'_, '_> {
     /// execution. The cache owns the reference, so the value is never tracked.
     pub(super) fn string_constant(&mut self, value: &str) -> ClifValue {
         let offset = self.data.push(0u64);
-        let cache = self.b.ins().iadd_imm_s(self.data_base, offset);
+        let cache = self.data_address(offset);
         let cached = self
             .b
             .ins()

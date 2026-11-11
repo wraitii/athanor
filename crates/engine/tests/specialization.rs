@@ -729,3 +729,63 @@ fn array_read_feedback_preserves_layouts_bounds_and_fallbacks() {
         }
     }
 }
+
+#[test]
+fn integer_feedback_guards_preserve_numeric_boundaries() {
+    let source = r#"
+        function work(a) {
+            let result = a;
+            for (let i = 0; i < 20; ++i)
+                result = a * 0.5;
+            return result;
+        }
+        function bits(a) { return a | 0; }
+        function warm() {
+            const h = {call: work, bits: bits};
+            for (let i = 0; i < 100; ++i) {
+                h.call(4);
+                h.bits(4);
+            }
+        }
+        function check(which) {
+            const h = {call: work, bits: bits};
+            if (which === 0) return 1 / h.call(-0) === -Infinity;
+            if (which === 1) { const x = h.call(0 / 0); return x !== x; }
+            if (which === 2) return h.call(Infinity) === Infinity;
+            if (which === 3) return h.call(-Infinity) === -Infinity;
+            if (which === 4) return h.call(0.5) === 0.25;
+            if (which === 5) return h.call(9007199254740991) === 4503599627370495.5;
+            if (which === 6) return h.call(9007199254740992) === 4503599627370496;
+            if (which === 7) return h.call('6') === 3;
+            if (which === 8) return h.bits(4294967297) === 1;
+            if (which === 9) return h.bits(-1.5) === -1;
+            if (which === 10) return h.bits(Infinity) === 0;
+            return h.bits(0 / 0) === 0;
+        }
+    "#;
+    for case in 0..12 {
+        let mut options = vec![EngineOptions {
+            background_compile: false,
+            ..Default::default()
+        }];
+        #[cfg(target_arch = "aarch64")]
+        options.push(EngineOptions {
+            backend: js_engine::Backend::NativeOnly,
+            background_compile: false,
+            ..Default::default()
+        });
+        for options in options {
+            let mut engine = Engine::with_options(options).unwrap();
+            engine.compile(source, "integer-feedback.js").unwrap();
+            engine.call("warm", &[]).unwrap();
+            assert_eq!(
+                engine
+                    .call("check", &[Value::number(case as f64)])
+                    .unwrap()
+                    .value(),
+                Value::TRUE,
+                "case {case}"
+            );
+        }
+    }
+}

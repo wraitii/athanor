@@ -1,5 +1,29 @@
 use js_engine::{Engine, EngineOptions, Error, OptLevel, Value};
 
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn native_backend_resolves_unoptimized_value_aliases() {
+    let mut engine = Engine::with_options(EngineOptions {
+        backend: js_engine::Backend::NativeOnly,
+        ..Default::default()
+    })
+    .unwrap();
+    engine
+        .compile(
+            "function main(x) { let y = x; if (x) y = x + 1; return y; }",
+            "aliases.js",
+        )
+        .unwrap();
+    assert_eq!(
+        engine.call("main", &[Value::number(2.0)]).unwrap().value(),
+        Value::number(3.0)
+    );
+    assert_eq!(
+        engine.call("main", &[Value::number(0.0)]).unwrap().value(),
+        Value::number(0.0)
+    );
+}
+
 fn engines() -> impl Iterator<Item = Engine> {
     [OptLevel::None, OptLevel::Speed]
         .into_iter()
@@ -989,5 +1013,33 @@ fn integer_loop_values_widen_and_merge_with_fractions() {
     for mut engine in engines() {
         engine.compile(source, "integer_loops.js").unwrap();
         assert_eq!(engine.call("main", &[]).unwrap().value(), Value::TRUE);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn native_bitwise_lowering_preserves_numeric_and_primitive_coercions() {
+    let mut engine = Engine::with_options(EngineOptions {
+        backend: js_engine::Backend::NativeOnly,
+        background_compile: false,
+        ..Default::default()
+    })
+    .unwrap();
+    engine
+        .compile("function main(x) { return (x >> 1) ^ 3; }", "bitwise.js")
+        .unwrap();
+    for (input, expected) in [
+        (Value::number(10.9), 6.0),
+        (Value::number(4294967306.0), 6.0),
+        (Value::number(-3.0), -3.0),
+        (Value::number(f64::NAN), 3.0),
+        (Value::number(f64::INFINITY), 3.0),
+        (Value::TRUE, 3.0),
+        (Value::NULL, 3.0),
+    ] {
+        assert_eq!(
+            engine.call("main", &[input]).unwrap().value(),
+            Value::number(expected)
+        );
     }
 }

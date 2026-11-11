@@ -287,6 +287,7 @@ impl Graph {
                 "load_array {object}[{key}] {}",
                 if *holey { "holey" } else { "packed" }
             ),
+            Op::ArrayKind(value) => format!("array_kind {value}"),
             Op::IndexedLength(value) => format!("indexed_length {value}"),
             Op::IndexedGet(object, key) => format!("get_indexed {object}[{key}]"),
             Op::PackTake(object, key) => format!("pack_take {object}[{key}]"),
@@ -398,6 +399,11 @@ impl Graph {
             }
             Op::IsInteger(value) => format!("is_integer {value}"),
             Op::AsInteger(value) => format!("as_integer {value}"),
+            Op::NumericFloat(value) => format!("numeric_float {value}"),
+            Op::SaturatingInteger(value) => format!("saturating_integer {value}"),
+            Op::IntegerCheck(value, float, exact) => {
+                format!("integer_check {value}, {float}, {exact}")
+            }
             Op::IsNumber(value) => format!("is_number {value}"),
             Op::IsString(value) => format!("is_string {value}"),
             Op::IsStringSplit(value) => format!("is_string_split {value}"),

@@ -4,6 +4,7 @@ use super::{
 };
 
 pub(super) fn lower(function: &mut FunctionState) -> super::Result<bool> {
+    let bits_changed = lower_bitwise(function);
     let arrays_changed = lower_arrays(function);
     function.ensure_values();
     let graph = &mut function.graph;
@@ -74,7 +75,72 @@ pub(super) fn lower(function: &mut FunctionState) -> super::Result<bool> {
         function.invalidate_cfg();
     }
     function.graph.verify()?;
-    Ok(changed || arrays_changed)
+    Ok(changed || arrays_changed || bits_changed)
+}
+
+fn lower_bitwise(function: &mut FunctionState) -> bool {
+    use oxc_syntax::operator::BinaryOperator;
+
+    function.ensure_values();
+    let facts = &function.facts;
+    let graph = &mut function.graph;
+    let candidates: Vec<_> = facts
+        .cfg
+        .rpo
+        .iter()
+        .flat_map(|&block| graph.blocks[block].insts.iter().copied())
+        .filter(|&inst| {
+            matches!(graph.insts[inst].op, Op::Binary(
+            BinaryOperator::BitwiseAnd | BinaryOperator::BitwiseOR
+            | BinaryOperator::BitwiseXOR | BinaryOperator::ShiftLeft
+            | BinaryOperator::ShiftRight | BinaryOperator::ShiftRightZeroFill,
+            left, right,
+        ) if !facts.of(left).within(Types::NUMBER) || !facts.of(right).within(Types::NUMBER))
+        })
+        .collect();
+    for &inst in &candidates {
+        let data = graph.insts[inst].clone();
+        let Op::Binary(operator, left, right) = data.op else {
+            unreachable!()
+        };
+        let (block, continuation, fallback) = super::dispatch::split(graph, inst);
+        let fast = graph.blocks.push(BlockData::default());
+        let left_number = append(graph, &data, block, Op::IsNumber(left));
+        let right_number = append(graph, &data, block, Op::IsNumber(right));
+        let both = append(
+            graph,
+            &data,
+            block,
+            Op::BooleanAnd(left_number, right_number),
+        );
+        graph.terminate(
+            block,
+            data.span,
+            TerminatorKind::Branch(both, Target::new(fast), Target::new(fallback)),
+        );
+        let left = append(graph, &data, fast, Op::AsNumber(left));
+        let right = append(graph, &data, fast, Op::AsNumber(right));
+        let left = append(graph, &data, fast, Op::ToInt32(left));
+        let right = append(graph, &data, fast, Op::ToInt32(right));
+        let result = append(graph, &data, fast, Op::Binary(operator, left, right));
+        graph.terminate(
+            fast,
+            data.span,
+            TerminatorKind::Jump(Target {
+                block: continuation,
+                args: vec![result],
+            }),
+        );
+        for region in graph.regions.values_mut() {
+            if region.blocks.contains(&block) {
+                region.blocks.extend([continuation, fallback, fast]);
+            }
+        }
+    }
+    if !candidates.is_empty() {
+        function.invalidate_cfg();
+    }
+    !candidates.is_empty()
 }
 
 pub(super) fn lower_arrays(function: &mut FunctionState) -> bool {
@@ -127,6 +193,46 @@ fn append(
     let (inst, value) = graph.append(block, source.span, op, true);
     graph.insts[inst].source_name = source.source_name;
     value.unwrap()
+}
+
+pub(super) fn lower_array_kinds(function: &mut FunctionState) -> bool {
+    let graph = &mut function.graph;
+    let mut changed = false;
+    for block in graph.blocks.keys().collect::<Vec<_>>() {
+        for inst in graph.blocks[block].insts.clone() {
+            let data = graph.insts[inst].clone();
+            let Op::IsArray(object, holey) = data.op else {
+                continue;
+            };
+            let at = graph.blocks[block]
+                .insts
+                .iter()
+                .position(|&i| i == inst)
+                .unwrap();
+            let (load, kind) = graph.insert(block, at, data.span, Op::ArrayKind(object), true);
+            graph.insts[load].source_name = data.source_name;
+            let expected =
+                crate::heap::kind::ARRAY | if holey { crate::heap::kind::HOLEY } else { 0 };
+            let (constant, expected) = graph.insert(
+                block,
+                at + 1,
+                data.span,
+                Op::Constant(Constant::Number(expected as f64)),
+                true,
+            );
+            graph.insts[constant].source_name = data.source_name;
+            graph.insts[inst].op = Op::Binary(
+                oxc_syntax::operator::BinaryOperator::StrictEquality,
+                kind.unwrap(),
+                expected.unwrap(),
+            );
+            changed = true;
+        }
+    }
+    if changed {
+        function.invalidate_values();
+    }
+    changed
 }
 
 #[cfg(test)]

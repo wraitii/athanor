@@ -222,8 +222,13 @@ impl FunctionCompiler<'_, '_> {
                 let result = if matches!(left.repr, Repr::Int32 | Repr::Int64)
                     && matches!(right.repr, Repr::Int32 | Repr::Int64)
                 {
-                    let left = self.convert(left, Repr::Int64);
-                    let right = self.convert(right, Repr::Int64);
+                    let repr = if left.repr == Repr::Int32 && right.repr == Repr::Int32 {
+                        Repr::Int32
+                    } else {
+                        Repr::Int64
+                    };
+                    let left = self.convert(left, repr);
+                    let right = self.convert(right, repr);
                     let condition = match op {
                         BinaryOp::Less => IntCC::SignedLessThan,
                         BinaryOp::LessEqual => IntCC::SignedLessThanOrEqual,

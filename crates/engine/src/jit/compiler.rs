@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use cranelift_codegen::Context;
-use cranelift_codegen::control::ControlPlane;
 use cranelift_codegen::ir::{AbiParam, Signature, types};
 use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::FunctionBuilderContext;
@@ -395,9 +394,7 @@ impl Compiler {
         if !native {
             return MachineCode::from_cranelift(&mut self.context, &self.module, id);
         }
-        self.context
-            .optimize(self.module.isa(), &mut ControlPlane::default())
-            .map_err(|error| Error::Compile(format!("{error:?}")))?;
+        super::clif::canonicalize_parameters(&mut self.context.func);
         let reason = match super::aarch64::compile(&self.context.func) {
             Ok(machine) => {
                 if let Some(stats) = &mut self.stats {

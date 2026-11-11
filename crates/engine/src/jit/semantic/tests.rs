@@ -1792,3 +1792,313 @@ fn call_variant_contracts_respect_disabled_numeric_speculation() {
             .is_empty()
     );
 }
+
+#[test]
+fn numeric_lowering_reuses_guard_conversions_across_calls() {
+    let mut graph = lower_source("function f(a, callback){return a;}").unwrap();
+    let block = graph.entry;
+    let span = graph.span;
+    let TerminatorKind::Return(value) = graph.blocks[block].terminator.as_ref().unwrap().kind
+    else {
+        panic!()
+    };
+    let success = graph.blocks.push(BlockData::default());
+    let fallback = graph.blocks.push(BlockData::default());
+    let callback = graph.append_value(block, span, Op::Argument(1));
+    let guard = graph.append_value(block, span, Op::IsInteger(value));
+    graph.terminate(
+        block,
+        span,
+        TerminatorKind::Branch(guard, Target::new(success), Target::new(fallback)),
+    );
+    graph.append_value(
+        success,
+        span,
+        Op::Call {
+            callee: callback,
+            receiver: None,
+            args: Vec::new(),
+            target: None,
+        },
+    );
+    let integer = graph.append_value(success, span, Op::AsInteger(value));
+    let factor = graph.append_value(success, span, Op::Constant(Constant::Number(0.5)));
+    let product = graph.append_value(
+        success,
+        span,
+        Op::Binary(BinaryOperator::Multiplication, integer, factor),
+    );
+    graph.terminate(success, span, TerminatorKind::Return(product));
+    graph.terminate(fallback, span, TerminatorKind::Return(value));
+    let mut function = FunctionState::new(graph, Vec::new(), true);
+    numeric_lowering::lower(&mut function);
+    optimize::reuse_loads(&mut function);
+    function.graph.verify().unwrap();
+    function.ensure_values();
+    assert_eq!(function.facts.of(integer), Types::INT64);
+    let graph = &function.graph;
+    let Some(Op::IntegerCheck(_, _, exact)) = graph.defining_op(guard) else {
+        panic!()
+    };
+    let Some(Op::Binary(BinaryOperator::Multiplication, left, _)) = graph.defining_op(product)
+    else {
+        panic!()
+    };
+    assert_eq!(left, exact);
+    assert_eq!(
+        ops(graph)
+            .iter()
+            .filter(|op| matches!(op, Op::SaturatingInteger(_)))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn hoisting_moves_constant_arithmetic_and_lowered_conversions() {
+    for operator in [
+        BinaryOperator::Multiplication,
+        BinaryOperator::Addition,
+        BinaryOperator::Subtraction,
+    ] {
+        let mut graph = lower_source("function f(a){while(a){a=a.next;}return a;}").unwrap();
+        let cfg = Cfg::new(&graph);
+        let (header, body) = optimize::natural_loops(&graph, &cfg).pop().unwrap();
+        let preheader = optimize::preheader(&graph, &cfg, header, &body).unwrap();
+        let block = *body.iter().find(|&&block| block != header).unwrap();
+        let span = graph.span;
+        let input = graph.append_value(preheader, span, Op::Argument(1));
+        let integer = graph.append_value(preheader, span, Op::AsInteger(input));
+        let factor = graph.append_value(block, span, Op::Constant(Constant::Number(0.5)));
+        let product = graph.append_value(block, span, Op::Binary(operator, integer, factor));
+        let mut function = FunctionState::new(graph, Vec::new(), true);
+        let region = function.graph.regions.push(Region {
+            blocks: function.graph.blocks.keys().collect(),
+            fallback: None,
+        });
+        numeric_lowering::lower(&mut function);
+        optimize::reuse_loads(&mut function);
+        optimize::hoist(&mut function, region);
+        function.graph.verify().unwrap();
+        let graph = &function.graph;
+        assert_eq!(graph.def_block(factor), preheader);
+        assert_eq!(graph.def_block(product), preheader);
+        let Some(Op::Binary(_, left, right)) = graph.defining_op(product) else {
+            panic!()
+        };
+        assert_eq!(graph.def_block(*left), preheader);
+        assert_eq!(graph.def_block(*right), preheader);
+        assert!(
+            graph.blocks[block]
+                .insts
+                .iter()
+                .any(|&inst| matches!(graph.insts[inst].op, Op::Get(..)))
+        );
+    }
+}
+
+#[test]
+fn array_kind_reuse_stops_at_calls_and_writes() {
+    for call in [false, true] {
+        let mut graph = lower_source("function f(a){return a;}").unwrap();
+        let block = graph.entry;
+        let span = graph.span;
+        let object = graph.append_value(block, span, Op::Argument(0));
+        graph.append_value(block, span, Op::IsArray(object, false));
+        graph.append_value(block, span, Op::IsArray(object, true));
+        if call {
+            let callback = graph.append_value(block, span, Op::Argument(1));
+            graph.append_value(
+                block,
+                span,
+                Op::Call {
+                    callee: callback,
+                    receiver: None,
+                    args: vec![object],
+                    target: None,
+                },
+            );
+        } else {
+            let index = graph.append_value(block, span, Op::Constant(Constant::Number(100.0)));
+            graph.append_value(block, span, Op::SetIndex(object, index, index));
+        }
+        let result = graph.append_value(block, span, Op::IsArray(object, false));
+        graph.terminate(block, span, TerminatorKind::Return(result));
+        let mut function = FunctionState::new(graph, Vec::new(), true);
+        typed_lowering::lower_array_kinds(&mut function);
+        optimize::reuse_loads(&mut function);
+        function.graph.verify().unwrap();
+        assert_eq!(
+            ops(&function.graph)
+                .iter()
+                .filter(|op| matches!(op, Op::ArrayKind(_)))
+                .count(),
+            2
+        );
+    }
+}
+
+#[test]
+fn array_metadata_uses_shared_loop_views() {
+    let mut graph = lower_source("function f(a){while(a){a=a.next;}return a;}").unwrap();
+    let cfg = Cfg::new(&graph);
+    let (header, body) = optimize::natural_loops(&graph, &cfg).pop().unwrap();
+    let preheader = optimize::preheader(&graph, &cfg, header, &body).unwrap();
+    let block = *body.iter().find(|&&block| block != header).unwrap();
+    let span = graph.span;
+    let object = graph.append_value(preheader, span, Op::Argument(1));
+    graph.append_value(block, span, Op::IsArray(object, false));
+    graph.append_value(block, span, Op::IsArray(object, true));
+    graph.append_value(block, span, Op::IndexedLength(object));
+    let mut function = FunctionState::new(graph, Vec::new(), true);
+    typed_lowering::lower_array_kinds(&mut function);
+    optimize::reuse_loads(&mut function);
+    optimize::views(&mut function);
+    function.graph.verify().unwrap();
+    let views: Vec<_> = function
+        .graph
+        .views
+        .iter()
+        .filter(|(inst, _)| {
+            matches!(
+                function.graph.insts[**inst].op,
+                Op::ArrayKind(_) | Op::IndexedLength(_)
+            )
+        })
+        .map(|(_, view)| *view)
+        .collect();
+    assert_eq!(views.len(), 2);
+    assert_eq!(views[0], views[1]);
+    assert_eq!(function.graph.def_block(views[0]), preheader);
+}
+
+#[test]
+fn hoisting_distinguishes_pure_unknown_reads_and_ordered_operations() {
+    for write in 0..4 {
+        let mut graph = lower_source("function f(a){return a;}").unwrap();
+        let entry = graph.entry;
+        let span = graph.span;
+        let input = graph.append_value(entry, span, Op::Argument(0));
+        let other = graph.append_value(entry, span, Op::Argument(1));
+        let number = graph.append_value(entry, span, Op::Constant(Constant::Number(2.0)));
+        let header = graph.blocks.push(BlockData::default());
+        let body = graph.blocks.push(BlockData::default());
+        let exit = graph.blocks.push(BlockData::default());
+        graph.terminate(entry, span, TerminatorKind::Jump(Target::new(header)));
+        let ordered = graph.append_value(header, span, Op::ArrayPosition(number));
+        let allocated = graph.append_value(header, span, Op::NewObject);
+        graph.terminate(
+            header,
+            span,
+            TerminatorKind::Branch(input, Target::new(body), Target::new(exit)),
+        );
+        let unknown = graph.append_value(
+            body,
+            span,
+            Op::Binary(BinaryOperator::StrictEquality, input, other),
+        );
+        let pure = graph.append_value(
+            body,
+            span,
+            Op::Binary(BinaryOperator::StrictEquality, number, number),
+        );
+        let unequal = graph.append_value(
+            body,
+            span,
+            Op::Binary(BinaryOperator::StrictInequality, number, number),
+        );
+        match write {
+            0 => {}
+            1 => {
+                graph.append_value(body, span, Op::SetIndex(input, number, other));
+            }
+            2 => {
+                graph.append_value(body, span, Op::GlobalWrite("value".into(), other));
+            }
+            _ => {
+                graph.append_value(
+                    body,
+                    span,
+                    Op::Call {
+                        callee: other,
+                        receiver: None,
+                        args: vec![input],
+                        target: None,
+                    },
+                );
+            }
+        }
+        graph.terminate(body, span, TerminatorKind::Jump(Target::new(header)));
+        graph.terminate(exit, span, TerminatorKind::Return(input));
+        let mut function = FunctionState::new(graph, Vec::new(), true);
+        let region = function.graph.regions.push(Region {
+            blocks: function.graph.blocks.keys().collect(),
+            fallback: None,
+        });
+        optimize::hoist(&mut function, region);
+        function.graph.verify().unwrap();
+        assert_eq!(
+            function.graph.def_block(unknown),
+            if write == 0 { entry } else { body }
+        );
+        assert_eq!(function.graph.def_block(pure), entry);
+        assert_eq!(function.graph.def_block(unequal), entry);
+        assert_eq!(function.graph.def_block(ordered), header);
+        assert_eq!(function.graph.def_block(allocated), header);
+    }
+}
+
+#[test]
+fn continuation_exit_stubs_preserve_cold_paths() {
+    for cold_source in [false, true] {
+        let mut graph = lower_source("function f(a){return a;}").unwrap();
+        let entry = graph.entry;
+        let span = graph.span;
+        let value = graph.append_value(entry, span, Op::Argument(0));
+        let hot = graph.blocks.push(BlockData::default());
+        let cold = graph.blocks.push(BlockData::default());
+        graph.terminate(
+            entry,
+            span,
+            TerminatorKind::Branch(value, Target::new(hot), Target::new(cold)),
+        );
+        graph.terminate(hot, span, TerminatorKind::Return(value));
+        graph.terminate(cold, span, TerminatorKind::Return(value));
+        graph.cold.insert(cold);
+        if cold_source {
+            graph.cold.insert(entry);
+        }
+        let shape = continuation::Shape {
+            body: HashSet::from([entry]),
+            exits: [hot, cold]
+                .into_iter()
+                .map(|block| continuation::Exit {
+                    block,
+                    outputs: Vec::new(),
+                    params: Vec::new(),
+                })
+                .collect(),
+            returns: None,
+        };
+        let mut result = graph.clone();
+        shape.store_exits(&graph, &mut result, entry);
+        result.verify().unwrap();
+        let targets = result.blocks[entry]
+            .terminator
+            .as_ref()
+            .unwrap()
+            .kind
+            .targets()
+            .collect::<Vec<_>>();
+        assert_eq!(result.cold.contains(&targets[0].block), cold_source);
+        assert!(result.cold.contains(&targets[1].block));
+        for target in targets {
+            assert!(
+                result.blocks[target.block]
+                    .insts
+                    .iter()
+                    .any(|&inst| matches!(result.insts[inst].op, Op::ContinuationStore(_)))
+            );
+        }
+    }
+}

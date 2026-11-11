@@ -65,8 +65,20 @@ impl<F: std::borrow::Borrow<Facts>> Writes<F> {
             .any(|(inst, write)| self.kills(*inst, write, read))
     }
 
-    pub(super) fn preserves(&self, op: &Op) -> bool {
-        Access::read(op, self.facts.borrow()).is_some_and(|read| !self.clobbers(&read))
+    pub(super) fn preserves(&self, graph: &Graph, inst: Inst) -> bool {
+        let facts = self.facts.borrow();
+        if let Some(read) = Access::read(&graph.insts[inst].op, facts) {
+            return !self.clobbers(&read);
+        }
+        if !facts.removable(inst) || facts.memory(inst).reenters() {
+            return false;
+        }
+        let read = Access {
+            location: facts.memory(inst).reads,
+            base: None,
+            field: Field::Any,
+        };
+        !self.writes.iter().any(|(_, write)| write.overlaps(&read))
     }
 }
 

@@ -2,6 +2,7 @@ mod liveness;
 pub(crate) mod moves;
 
 use std::cmp::Ordering;
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap};
 
 use cranelift_codegen::dominator_tree::DominatorTree;
@@ -142,6 +143,30 @@ fn overlap(a: &[Segment], b: &[Segment]) -> bool {
         }
     }
     false
+}
+
+fn assign_slots(mut intervals: Vec<(u32, u32, usize)>, count: usize) -> (Vec<Option<u32>>, u32) {
+    intervals.sort_unstable();
+    let mut active = BinaryHeap::<Reverse<(u32, u32)>>::new();
+    let mut available = BinaryHeap::<Reverse<u32>>::new();
+    let mut slots = vec![None; count];
+    let mut slot_count = 0;
+    for (start, end, index) in intervals {
+        while active.peek().is_some_and(|Reverse((end, _))| *end < start) {
+            available.push(Reverse(active.pop().unwrap().0.1));
+        }
+        let slot = available
+            .pop()
+            .map(|Reverse(slot)| slot)
+            .unwrap_or_else(|| {
+                let slot = slot_count;
+                slot_count += 1;
+                slot
+            });
+        slots[index] = Some(slot);
+        active.push(Reverse((end, slot)));
+    }
+    (slots, slot_count)
 }
 
 fn merge_segments(a: &[Segment], b: &[Segment]) -> Vec<Segment> {
@@ -444,19 +469,31 @@ pub(crate) fn allocate(
     let mut registers = SecondaryMap::new();
     let mut slots = SecondaryMap::new();
     let mut split = SecondaryMap::new();
-    let mut slot_count = 0;
-    for (bundle, &reg) in bundles.iter().zip(&assigned) {
+    let mut slot_bundles = Vec::new();
+    for (index, (bundle, &reg)) in bundles.iter().zip(&assigned).enumerate() {
+        if bundle.members.is_empty() {
+            continue;
+        }
+        let has_hot = bundle.segments.iter().any(|s| !s.cold);
+        let has_cold = bundle.segments.iter().any(|s| s.cold);
+        let spillable = bundle.members.iter().any(|&member| remat[member] == 0);
+        if (reg.is_none() || has_hot && has_cold) && spillable {
+            slot_bundles.push((
+                bundle.segments[0].start,
+                bundle.segments.last().unwrap().end,
+                index,
+            ));
+        }
+    }
+    let (bundle_slots, slot_count) = assign_slots(slot_bundles, bundles.len());
+    for (index, (bundle, &reg)) in bundles.iter().zip(&assigned).enumerate() {
         if bundle.members.is_empty() {
             continue;
         }
         let has_hot = bundle.segments.iter().any(|s| !s.cold);
         let has_cold = bundle.segments.iter().any(|s| s.cold);
         let divided = reg.is_some() && has_hot && has_cold;
-        let spillable = bundle.members.iter().any(|&member| remat[member] == 0);
-        let slot = ((reg.is_none() || divided) && spillable).then(|| {
-            slot_count += 1;
-            slot_count - 1
-        });
+        let slot = bundle_slots[index];
         for &member in &bundle.members {
             registers[member] = reg;
             slots[member] = slot;
@@ -534,5 +571,19 @@ impl Frame {
 
     pub(crate) fn stack_slot(&self, slot: StackSlot) -> u32 {
         self.stack_slots[slot]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::assign_slots;
+
+    #[test]
+    fn spill_slots_reuse_only_after_inclusive_lifetimes() {
+        let (slots, count) = assign_slots(vec![(0, 10, 0), (5, 7, 1), (7, 9, 2), (11, 12, 3)], 4);
+        assert_eq!(count, 3);
+        assert_ne!(slots[0], slots[1]);
+        assert_ne!(slots[1], slots[2]);
+        assert_eq!(slots[0], slots[3]);
     }
 }

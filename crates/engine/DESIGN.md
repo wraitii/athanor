@@ -77,7 +77,8 @@ operands are strings.
 
 ```text
 Oxc AST -> semantic optimization -> typed CLIF + annotations
-                                -> Cranelift optimization and code generation
+                                -> our phi cleanup, instruction selection and allocation
+                                or Cranelift optimization and code generation
 ```
 
 `jit/clif.rs` pairs a CLIF `Function` with emission annotations for helper calls,
@@ -1109,7 +1110,8 @@ plans, available feedback, the region tree and per-region assumptions, and pass
 notes separately. Detailed region snapshots are captured before versioning and
 after replanning each emitted region, only when requested. `jit/inspect.rs` formats
 the function views; `--filter NAME` restricts their output by name substring.
-`--clif` adds dumps from both sides of Cranelift optimization, and assembly includes
+`--clif` adds dumps before and after backend preparation (our phi cleanup on the
+native path, or Cranelift optimization on its path), and assembly includes
 byte offsets and semantic-location IDs. The graph verifier checks scope and
 control-flow invariants. Semantic
 optimization is disabled by `JS_JIT_SSA=0`, for graphs with exception handlers and for

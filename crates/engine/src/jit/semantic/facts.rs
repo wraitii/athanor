@@ -769,8 +769,10 @@ fn result_types(graph: &Graph, op: &Op, facts: &Facts) -> Types {
         | Op::IsInBounds(..)
         | Op::BooleanAnd(..) => Types::BOOLEAN,
         Op::IndexedLength(_) => Types::INT64,
+        Op::ArrayKind(_) => Types::INT32,
         Op::IsNumber(_)
         | Op::IsInteger(_)
+        | Op::IntegerCheck(..)
         | Op::IsString(_)
         | Op::IsStringSplit(_)
         | Op::IsTypeof(..) => Types::BOOLEAN,
@@ -779,6 +781,7 @@ fn result_types(graph: &Graph, op: &Op, facts: &Facts) -> Types {
         Op::ArrayPosition(_) => Types::INT64,
         Op::ToInt32(_) => Types::INT32,
         Op::AsInteger(_) => Types::INT64,
+        Op::NumericFloat(_) | Op::SaturatingInteger(_) => Types::NUMBER,
         Op::AsObject(_) => Types::OBJECT,
         Op::AsNumber(value) | Op::ToNumeric(value) | Op::Unary(UnaryOp::Plus, value)
             if facts.of(*value).within(Types::NUMBER) =>

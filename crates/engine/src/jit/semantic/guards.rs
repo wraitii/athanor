@@ -97,7 +97,7 @@ pub(super) fn implies(op: &Op) -> Option<(Value, Fact)> {
         Op::IsNullish(value) => (value, Fact::Type(Types::UNDEFINED.union(Types::NULL))),
         Op::IsString(value) => (value, Fact::Type(Types::STRING)),
         Op::IsNumber(value) => (value, Fact::Type(Types::NUMBER)),
-        Op::IsInteger(value) => (value, Fact::Type(Types::INTEGER)),
+        Op::IsInteger(value) | Op::IntegerCheck(value, ..) => (value, Fact::Type(Types::INTEGER)),
         Op::IsCode(value, code) => (value, Fact::Code(code)),
         Op::EntryAssume(value, fact) => (value, fact),
         Op::IsShape(value, shape) => (value, Fact::Shape(shape)),

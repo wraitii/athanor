@@ -18,6 +18,7 @@ mod machine;
 mod math;
 pub(crate) mod osr;
 mod pack;
+mod phis;
 pub(crate) mod profile;
 pub(crate) mod recompile;
 mod semantic;

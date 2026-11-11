@@ -15,6 +15,7 @@ mod guards;
 mod inlining;
 mod js;
 mod listing;
+mod numeric_lowering;
 mod observations;
 mod optimize;
 pub(super) mod osr;
@@ -333,6 +334,7 @@ pub(super) enum Op {
     // Requires matching layout, exact position and bounds checks with no intervening array mutation.
     ArrayLoad(Value, Value, bool),
     IndexedLength(Value),
+    ArrayKind(Value),
     IndexedGet(Value, Value),
     // Extracted values stay rooted independently of the pack across argument initialization.
     PackTake(Value, Value),
@@ -392,6 +394,9 @@ pub(super) enum Op {
     IsNumber(Value),
     IsInteger(Value),
     AsInteger(Value),
+    NumericFloat(Value),
+    SaturatingInteger(Value),
+    IntegerCheck(Value, Value, Value),
     IsString(Value),
     IsStringSplit(Value),
     StringSplit(Value, Vec<Value>),
@@ -502,6 +507,7 @@ impl Op {
             | Op::IteratorNew(value)
             | Op::IteratorNext(value)
             | Op::IsIndexed(value)
+            | Op::ArrayKind(value)
             | Op::IndexedLength(value)
             | Op::EnumerateNew(value)
             | Op::EnumerateNext(value)
@@ -534,6 +540,8 @@ impl Op {
             | Op::IsNumber(value)
             | Op::IsInteger(value)
             | Op::AsInteger(value)
+            | Op::NumericFloat(value)
+            | Op::SaturatingInteger(value)
             | Op::IsString(value)
             | Op::IsStringSplit(value)
             | Op::IsTypeof(value, _)
@@ -559,7 +567,8 @@ impl Op {
             | Op::ArrayAppend(object, key, _)
             | Op::ConstructorResult(object, key)
             | Op::ConstructPack(object, key) => ([Some(*object), Some(*key), None], &[]),
-            Op::IsArrayIndex(object, key, position, _) => {
+            Op::IntegerCheck(object, key, position)
+            | Op::IsArrayIndex(object, key, position, _) => {
                 ([Some(*object), Some(*key), Some(*position)], &[])
             }
             Op::CallPack(callee, receiver, args)
@@ -643,6 +652,7 @@ impl Op {
             | Op::IteratorNew(value)
             | Op::IteratorNext(value)
             | Op::IsIndexed(value)
+            | Op::ArrayKind(value)
             | Op::IndexedLength(value)
             | Op::EnumerateNew(value)
             | Op::EnumerateNext(value)
@@ -675,6 +685,8 @@ impl Op {
             | Op::IsNumber(value)
             | Op::IsInteger(value)
             | Op::AsInteger(value)
+            | Op::NumericFloat(value)
+            | Op::SaturatingInteger(value)
             | Op::IsString(value)
             | Op::IsStringSplit(value)
             | Op::IsTypeof(value, _)
@@ -700,7 +712,8 @@ impl Op {
             | Op::ArrayAppend(object, key, _)
             | Op::ConstructorResult(object, key)
             | Op::ConstructPack(object, key) => ([Some(object), Some(key), None], &mut []),
-            Op::IsArrayIndex(object, key, position, _) => {
+            Op::IntegerCheck(object, key, position)
+            | Op::IsArrayIndex(object, key, position, _) => {
                 ([Some(object), Some(key), Some(position)], &mut [])
             }
             Op::CallPack(callee, receiver, args)
@@ -1315,9 +1328,14 @@ impl Graph {
                 ..
             } => self.contract(&Op::Binary(*operator, *left, *right), facts),
             Op::Binary(operator, ..) => match operator {
-                BinaryOperator::StrictEquality | BinaryOperator::StrictInequality => {
-                    closed(HEAP_READ, Unowned)
-                }
+                BinaryOperator::StrictEquality | BinaryOperator::StrictInequality => closed(
+                    if operands.within(Types::NUMBER) {
+                        0
+                    } else {
+                        HEAP_READ
+                    },
+                    Unowned,
+                ),
                 BinaryOperator::Equality
                 | BinaryOperator::Inequality
                 | BinaryOperator::LessThan
@@ -1360,15 +1378,19 @@ impl Graph {
             Op::IsArrayIndex(..) | Op::IsArray(..) => closed(HEAP_READ, Unowned),
             Op::ArrayPosition(_) => closed(INTERNAL, Unowned),
             Op::IsExactPosition(..) | Op::IsInBounds(..) | Op::BooleanAnd(..) => closed(0, Unowned),
-            Op::IndexedLength(_) => closed(HEAP_READ, Unowned),
+            Op::ArrayKind(_) | Op::IndexedLength(_) => closed(HEAP_READ, Unowned),
             Op::IndexedGet(..) | Op::ArrayLoad(..) => {
                 closed(HEAP_READ | INTERNAL | ERROR, Borrowed)
             }
             Op::PackTake(..) => closed(HEAP_READ | HEAP_WRITE | INTERNAL, Owned),
             Op::TypedIndex(..) => closed(HEAP_READ, Unowned),
-            Op::IsNumber(_) | Op::IsInteger(_) | Op::AsInteger(_) | Op::IsString(_) => {
-                closed(0, Unowned)
-            }
+            Op::IsNumber(_)
+            | Op::IsInteger(_)
+            | Op::AsInteger(_)
+            | Op::NumericFloat(_)
+            | Op::SaturatingInteger(_)
+            | Op::IntegerCheck(..)
+            | Op::IsString(_) => closed(0, Unowned),
             Op::IsTypeof(..) => closed(HEAP_READ, Unowned),
             Op::AsNumber(_) => closed(INTERNAL, Unowned),
             Op::AsObject(_) => closed(0, Unowned),
@@ -1983,6 +2005,9 @@ pub(super) fn optimize_planned(
     {
         optimize::reuse_loads(&mut function);
     }
+    if typed_lowering::lower_array_kinds(&mut function) {
+        optimize::reuse_loads(&mut function);
+    }
     optimize::views(&mut function);
     comparisons::expose(&mut function);
     function.graph.verify()?;
@@ -1999,6 +2024,13 @@ pub(super) fn optimize_planned(
     for region in &regions {
         optimize::hoist(&mut function, *region);
         function.graph.verify()?;
+    }
+    if numeric_lowering::lower(&mut function) {
+        optimize::reuse_loads(&mut function);
+        for region in &regions {
+            optimize::hoist(&mut function, *region);
+            function.graph.verify()?;
+        }
     }
     function.ensure_facts();
     borrow::borrows(&mut function.graph, &function.facts, &mut function.notes);

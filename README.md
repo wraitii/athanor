@@ -40,9 +40,9 @@ error. Compilation options cannot be combined with `--load`, `--function`,
   it; `--semantic-ir` enables it again. `JS_JIT_SSA=0` selects the unoptimized
   semantic graph and disables engine CLIF cleanup; Cranelift still uses its normal
   optimization level.
-- `--clif` adds Cranelift IR before and after Cranelift optimization. The first
-  view includes the engine's CLIF cleanup and a helper-call legend; neither view
-  includes register allocation.
+- `--clif` adds Cranelift IR before and after backend preparation: our block-parameter
+  cleanup for the native backend, or Cranelift optimization for its backend.
+  The first view includes a helper-call legend; neither view includes register allocation.
 - `--planner` prints the inline budget, available call/read feedback, selected
   inlines, read refinements, conditional effects/identity guards, OSR plans, and
   optimization notes. It also shows the region tree before versioning and the
@@ -257,6 +257,11 @@ replace a baseline body even when its specialization plan is unchanged.
 compile-only output, and synchronous compilation with `JS_JIT_BACKGROUND=0` use
 the optimized tier. The former `JS_JIT_SYNC_OPT_LEVEL` and
 `JS_JIT_SYNC_SINGLE_PASS` settings and their `EngineOptions` fields were removed.
+
+The native AArch64 path skips Cranelift optimization, including during background
+recompilation. It runs our redundant block-parameter elimination before native
+instruction selection and allocation. Cranelift optimization still runs for its
+own backend, including native backend fallbacks.
 
 Set `JS_JIT_RECOMPILE_LOG=1` (`EngineOptions::recompile_log`) to trace recompilation
 to stderr in either mode. Events include feedback sites and types, requests,
