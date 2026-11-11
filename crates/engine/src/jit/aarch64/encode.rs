@@ -118,6 +118,114 @@ pub(super) fn sub_imm(width: Width, rd: u8, rn: u8, imm12: u32, shift12: bool) -
     0x5100_0000 | width.sf() | (u32::from(shift12) << 22) | (imm12 << 10) | rd_rn(rd, rn)
 }
 
+pub(super) fn subs_imm(width: Width, rd: u8, rn: u8, imm12: u32, shift12: bool) -> u32 {
+    sub_imm(width, rd, rn, imm12, shift12) | (1 << 29)
+}
+
+pub(super) fn adds_imm(width: Width, rd: u8, rn: u8, imm12: u32, shift12: bool) -> u32 {
+    add_imm(width, rd, rn, imm12, shift12) | (1 << 29)
+}
+
+pub(super) fn arith_imm(value: i64) -> Option<(u32, bool)> {
+    if (0..4096).contains(&value) {
+        return Some((value as u32, false));
+    }
+    if value & 0xFFF == 0 && (0..4096).contains(&(value >> 12)) {
+        return Some(((value >> 12) as u32, true));
+    }
+    None
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Logical {
+    And,
+    Orr,
+    Eor,
+}
+
+fn shifted_mask(value: u64) -> bool {
+    value != 0 && {
+        let filled = (value - 1) | value;
+        filled.wrapping_add(1) & filled == 0
+    }
+}
+
+fn bitmask(width: Width, value: u64) -> Option<u32> {
+    let bits = if width == Width::X { 64 } else { 32 };
+    let full = u64::MAX >> (64 - bits);
+    if value & !full != 0 || value == 0 || value == full {
+        return None;
+    }
+    let mut size = bits;
+    loop {
+        size /= 2;
+        let mask = (1u64 << size) - 1;
+        if value & mask != (value >> size) & mask {
+            size *= 2;
+            break;
+        }
+        if size <= 2 {
+            break;
+        }
+    }
+    let mask = u64::MAX >> (64 - size);
+    let mut element = value & mask;
+    let (rotation, ones) = if shifted_mask(element) {
+        let rotation = element.trailing_zeros();
+        (rotation, (element >> rotation).trailing_ones())
+    } else {
+        element |= !mask;
+        if !shifted_mask(!element) {
+            return None;
+        }
+        let leading = element.leading_ones();
+        (
+            64 - leading,
+            leading + element.trailing_ones() - (64 - size),
+        )
+    };
+    let immr = (size - rotation) & (size - 1);
+    let nimms = ((!(u64::from(size) - 1)) << 1) | u64::from(ones - 1);
+    let n = ((nimms >> 6) & 1) ^ 1;
+    Some(((n as u32) << 22) | (immr << 16) | (((nimms & 0x3F) as u32) << 10))
+}
+
+pub(super) fn logical_imm(op: Logical, width: Width, rd: u8, rn: u8, value: u64) -> Option<u32> {
+    let base = match op {
+        Logical::And => 0x1200_0000,
+        Logical::Orr => 0x3200_0000,
+        Logical::Eor => 0x5200_0000,
+    };
+    Some(base | width.sf() | bitmask(width, value)? | rd_rn(rd, rn))
+}
+
+fn bitfield(base: u32, width: Width, rd: u8, rn: u8, immr: u32, imms: u32) -> u32 {
+    let n = if width == Width::X { 1 << 22 } else { 0 };
+    base | width.sf() | n | (immr << 16) | (imms << 10) | rd_rn(rd, rn)
+}
+
+pub(super) fn shift_imm(op: Shift, width: Width, rd: u8, rn: u8, amount: u32) -> u32 {
+    let bits = if width == Width::X { 64 } else { 32 };
+    let amount = amount & (bits - 1);
+    match op {
+        Shift::Lsl => bitfield(
+            0x5300_0000,
+            width,
+            rd,
+            rn,
+            (bits - amount) & (bits - 1),
+            bits - 1 - amount,
+        ),
+        Shift::Lsr => bitfield(0x5300_0000, width, rd, rn, amount, bits - 1),
+        Shift::Asr => bitfield(0x1300_0000, width, rd, rn, amount, bits - 1),
+    }
+}
+
+pub(super) fn compare_branch(nonzero: bool, width: Width, rt: u8) -> u32 {
+    let base = if nonzero { 0x3500_0000 } else { 0x3400_0000 };
+    base | width.sf() | u32::from(rt)
+}
+
 pub(super) fn mov(width: Width, rd: u8, rm: u8) -> u32 {
     alu(Alu::Orr, width, rd, ZR, rm)
 }
@@ -265,8 +373,39 @@ pub(super) fn mem_unscaled(op: Mem, rt: u8, rn: u8, offset: i32) -> Option<u32> 
 }
 
 pub(super) fn mem_register(op: Mem, rt: u8, rn: u8, rm: u8) -> u32 {
+    mem_indexed(op, rt, rn, rm, Index::Lsl, false)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Index {
+    Lsl,
+    Uxtw,
+    Sxtw,
+}
+
+impl Index {
+    fn option(self) -> u32 {
+        match self {
+            Self::Lsl => 0b011,
+            Self::Uxtw => 0b010,
+            Self::Sxtw => 0b110,
+        }
+    }
+}
+
+pub(super) fn mem_indexed(op: Mem, rt: u8, rn: u8, rm: u8, index: Index, scaled: bool) -> u32 {
     let base = op.scaled() & !0x0100_0000;
-    base | 0x0020_6800 | rd_rn_rm(rt, rn, rm)
+    base | 0x0020_0800 | (index.option() << 13) | (u32::from(scaled) << 12) | rd_rn_rm(rt, rn, rm)
+}
+
+pub(super) fn alu_shifted(sub: bool, width: Width, rd: u8, rn: u8, rm: u8, amount: u32) -> u32 {
+    let op = if sub { Alu::Sub } else { Alu::Add };
+    alu(op, width, rd, rn, rm) | (amount << 10)
+}
+
+pub(super) fn alu_extended(sub: bool, rd: u8, rn: u8, rm: u8, index: Index, amount: u32) -> u32 {
+    let base = if sub { 0xCB20_0000 } else { 0x8B20_0000 };
+    base | (index.option() << 13) | (amount << 10) | rd_rn_rm(rd, rn, rm)
 }
 
 pub(super) fn load_acquire(size: u32, rt: u8, rn: u8) -> u32 {
@@ -277,6 +416,21 @@ pub(super) fn load_acquire(size: u32, rt: u8, rn: u8) -> u32 {
         _ => 0xC8DF_FC00,
     };
     base | rd_rn(rt, rn)
+}
+
+pub(super) fn pair(load: bool, float: bool, rt: u8, rt2: u8, rn: u8, offset: u32) -> Option<u32> {
+    if offset % 8 != 0 || offset / 8 > 63 {
+        return None;
+    }
+    let base = match (float, load) {
+        (false, false) => 0xA900_0000,
+        (false, true) => 0xA940_0000,
+        (true, false) => 0x6D00_0000,
+        (true, true) => 0x6D40_0000,
+    };
+    Some(
+        base | ((offset / 8) << 15) | (u32::from(rt2) << 10) | (u32::from(rn) << 5) | u32::from(rt),
+    )
 }
 
 pub(super) const STP_FP_LR_PRE: u32 = 0xA9BF_7BFD;
@@ -326,6 +480,7 @@ pub(super) fn float_binary(op: FloatOp, ty: Float, rd: u8, rn: u8, rm: u8) -> u3
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum FloatUnary {
+    Mov,
     Abs,
     Neg,
     Sqrt,
@@ -337,6 +492,7 @@ pub(super) enum FloatUnary {
 
 pub(super) fn float_unary(op: FloatUnary, ty: Float, rd: u8, rn: u8) -> u32 {
     let base = match op {
+        FloatUnary::Mov => 0x1E20_4000,
         FloatUnary::Abs => 0x1E20_C000,
         FloatUnary::Neg => 0x1E21_4000,
         FloatUnary::Sqrt => 0x1E21_C000,
@@ -346,6 +502,24 @@ pub(super) fn float_unary(op: FloatUnary, ty: Float, rd: u8, rn: u8) -> u32 {
         FloatUnary::Trunc => 0x1E25_C000,
     };
     base | ty.ftype() | rd_rn(rd, rn)
+}
+
+pub(super) fn fcsel(ty: Float, rd: u8, rn: u8, rm: u8, cond: Cond) -> u32 {
+    0x1E20_0C00 | ty.ftype() | rd_rn_rm(rd, rn, rm) | ((cond as u32) << 12)
+}
+
+pub(super) fn move_to_float(width: Width, rd: u8, rn: u8) -> u32 {
+    match width {
+        Width::W => 0x1E27_0000 | rd_rn(rd, rn),
+        Width::X => 0x9E67_0000 | rd_rn(rd, rn),
+    }
+}
+
+pub(super) fn move_to_int(width: Width, rd: u8, rn: u8) -> u32 {
+    match width {
+        Width::W => 0x1E26_0000 | rd_rn(rd, rn),
+        Width::X => 0x9E66_0000 | rd_rn(rd, rn),
+    }
 }
 
 pub(super) fn fcmp(ty: Float, rn: u8, rm: u8) -> u32 {

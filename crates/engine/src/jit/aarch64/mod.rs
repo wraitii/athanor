@@ -1,7 +1,9 @@
 mod abi;
+mod alloc;
 mod asm;
 mod encode;
 mod lower;
+mod select;
 
 use cranelift_codegen::ir::Function;
 

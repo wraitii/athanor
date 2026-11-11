@@ -1,18 +1,23 @@
 use cranelift_codegen::binemit::Reloc;
 use cranelift_codegen::entity::SecondaryMap;
-use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
+use cranelift_codegen::ir::condcodes::{CondCode, FloatCC, IntCC};
 use cranelift_codegen::ir::{
-    AbiParam, ArgumentExtension, Block, BlockCall, ExternalName, FuncRef, Function, Inst,
-    InstructionData, Opcode, SigRef, Type, Value, types,
+    ArgumentExtension, Block, BlockCall, ExternalName, FuncRef, Function, Inst, InstructionData,
+    Opcode, SigRef, Type, Value, types,
 };
 use cranelift_codegen::isa::CallConv;
 use cranelift_module::{ModuleReloc, ModuleRelocTarget};
 
 use super::Unsupported;
 use super::abi::{self, Location};
+use super::alloc::TARGET;
 use super::asm::{Assembler, Label};
-use super::encode::{self as e, Alu, Cond, Extend, Float, FloatOp, FloatUnary, Mem, Shift, Width};
-use crate::jit::alloc::{Frame, RegClass};
+use super::encode::{
+    self as e, Alu, Cond, Extend, Float, FloatOp, FloatUnary, Index, Logical, Mem, Shift, Width,
+};
+use super::select::{Address, Selection};
+use crate::jit::alloc::moves::{self, Loc, Move};
+use crate::jit::alloc::{self, Allocation, Frame, Hint, Place, RegClass};
 use crate::jit::machine::{MachineCode, SourceRange};
 
 const T0: u8 = 9;
@@ -25,14 +30,26 @@ const F1: u8 = 17;
 
 pub(super) fn lower(func: &Function) -> Result<MachineCode, Unsupported> {
     check_types(func)?;
-    match lower_with(func, false)? {
+    let order = block_order(func);
+    let hints = hints(func)?;
+    let selection = Selection::new(func);
+    let operands = |inst, out: &mut Vec<Value>| selection.operands(func, inst, out);
+    let allocation =
+        alloc::allocate(func, &order, &TARGET, &hints, &operands).map_err(Unsupported)?;
+    match lower_with(func, &order, &allocation, &selection, false)? {
         Some(machine) => Ok(machine),
-        None => lower_with(func, true)?
+        None => lower_with(func, &order, &allocation, &selection, true)?
             .ok_or_else(|| Unsupported("conditional branch out of range".into())),
     }
 }
 
-fn lower_with(func: &Function, far: bool) -> Result<Option<MachineCode>, Unsupported> {
+fn lower_with(
+    func: &Function,
+    order: &[Block],
+    allocation: &Allocation,
+    selection: &Selection,
+    far: bool,
+) -> Result<Option<MachineCode>, Unsupported> {
     let conv = func.signature.call_conv;
     let incoming = abi::assign(conv, &func.signature.params)?.stack_size;
     let (outgoing, tail_calls) = call_stack_sizes(func)?;
@@ -40,12 +57,20 @@ fn lower_with(func: &Function, far: bool) -> Result<Option<MachineCode>, Unsuppo
         return Err(Unsupported(format!("tail call from {conv}")));
     }
     let tail_args = incoming.max(tail_calls);
-    let frame = Frame::spill_all(func, max_edge_args(func), outgoing);
+    let frame = Frame::new(func, allocation, outgoing);
     if frame.size >= 1 << 24 || tail_args >= 1 << 24 {
         return Err(Unsupported("frame too large".into()));
     }
+    let entry = func
+        .layout
+        .entry_block()
+        .ok_or_else(|| Unsupported("no entry block".into()))?;
     let mut lower = Lower {
         func,
+        allocation,
+        selection,
+        stubs: Vec::new(),
+        block: entry,
         frame,
         incoming,
         tail_args,
@@ -60,10 +85,14 @@ fn lower_with(func: &Function, far: bool) -> Result<Option<MachineCode>, Unsuppo
         lower.labels[block] = Some(lower.asm.label());
     }
     lower.prologue()?;
-    let order = block_order(func);
     for (index, &block) in order.iter().enumerate() {
         let next = order.get(index + 1).copied();
         lower.block(block, next)?;
+    }
+    for (label, block, call) in std::mem::take(&mut lower.stubs) {
+        lower.asm.bind(label);
+        lower.block = block;
+        lower.edge(call, None)?;
     }
     let Lower {
         asm,
@@ -116,12 +145,50 @@ fn call_stack_sizes(func: &Function) -> Result<(u32, u32), Unsupported> {
     Ok((outgoing, tail))
 }
 
-fn max_edge_args(func: &Function) -> u32 {
-    func.layout
-        .blocks()
-        .map(|block| func.dfg.block_params(block).len() as u32)
-        .max()
-        .unwrap_or(0)
+fn hints(func: &Function) -> Result<Vec<Hint>, Unsupported> {
+    let dfg = &func.dfg;
+    let mut hints = Vec::new();
+    let mut add = |values: &[Value], locations: &[Location], block: Block| {
+        for (&value, location) in values.iter().zip(locations) {
+            if let Location::Reg { class, reg } = *location {
+                hints.push(Hint {
+                    value,
+                    class,
+                    reg,
+                    block,
+                });
+            }
+        }
+    };
+    let signature = &func.signature;
+    if let Some(entry) = func.layout.entry_block() {
+        let locations = abi::assign(signature.call_conv, &signature.params)?.locations;
+        add(dfg.block_params(entry), &locations, entry);
+    }
+    for block in func.layout.blocks() {
+        for inst in func.layout.block_insts(block) {
+            let opcode = dfg.insts[inst].opcode();
+            let args = dfg.inst_args(inst);
+            if opcode == Opcode::Return {
+                let locations = abi::assign_returns(signature.call_conv, &signature.returns)?;
+                add(args, &locations, block);
+                continue;
+            }
+            let Some(sig_ref) = dfg.call_signature(inst) else {
+                continue;
+            };
+            let callee = &dfg.signatures[sig_ref];
+            let args = match opcode {
+                Opcode::CallIndirect | Opcode::ReturnCallIndirect => &args[1..],
+                _ => args,
+            };
+            let locations = abi::assign(callee.call_conv, &callee.params)?.locations;
+            add(args, &locations, block);
+            let locations = abi::assign_returns(callee.call_conv, &callee.returns)?;
+            add(dfg.inst_results(inst), &locations, block);
+        }
+    }
+    Ok(hints)
 }
 
 fn block_order(func: &Function) -> Vec<Block> {
@@ -156,7 +223,7 @@ fn int_cond(cond: IntCC) -> Cond {
     }
 }
 
-fn float_conds(cond: FloatCC) -> (Cond, Option<Cond>) {
+pub(super) fn float_conds(cond: FloatCC) -> (Cond, Option<Cond>) {
     match cond {
         FloatCC::Ordered => (Cond::Vc, None),
         FloatCC::Unordered => (Cond::Vs, None),
@@ -175,7 +242,7 @@ fn float_conds(cond: FloatCC) -> (Cond, Option<Cond>) {
     }
 }
 
-fn load_op(opcode: Opcode, ty: Type) -> Option<Mem> {
+pub(super) fn load_op(opcode: Opcode, ty: Type) -> Option<Mem> {
     Some(match opcode {
         Opcode::Load => match ty {
             types::I8 => Mem::Ldrb,
@@ -196,7 +263,7 @@ fn load_op(opcode: Opcode, ty: Type) -> Option<Mem> {
     })
 }
 
-fn store_op(opcode: Opcode, ty: Type) -> Option<Mem> {
+pub(super) fn store_op(opcode: Opcode, ty: Type) -> Option<Mem> {
     Some(match opcode {
         Opcode::Store => match ty {
             types::I8 => Mem::Strb,
@@ -214,8 +281,39 @@ fn store_op(opcode: Opcode, ty: Type) -> Option<Mem> {
     })
 }
 
+#[derive(Clone, Copy)]
+enum Test {
+    Flags(Cond),
+    Zero {
+        nonzero: bool,
+        width: Width,
+        reg: u8,
+    },
+}
+
+impl Test {
+    fn invert(self) -> Self {
+        match self {
+            Self::Flags(cond) => Self::Flags(cond.invert()),
+            Self::Zero {
+                nonzero,
+                width,
+                reg,
+            } => Self::Zero {
+                nonzero: !nonzero,
+                width,
+                reg,
+            },
+        }
+    }
+}
+
 struct Lower<'a> {
     func: &'a Function,
+    allocation: &'a Allocation,
+    selection: &'a Selection,
+    stubs: Vec<(Label, Block, BlockCall)>,
+    block: Block,
     frame: Frame,
     incoming: u32,
     tail_args: u32,
@@ -234,6 +332,34 @@ impl Lower<'_> {
 
     fn ty(&self, value: Value) -> Type {
         self.func.dfg.value_type(value)
+    }
+
+    fn class(&self, value: Value) -> RegClass {
+        RegClass::of(self.ty(value)).expect("value types are checked")
+    }
+
+    fn constant(&self, value: Value) -> Option<u64> {
+        let bits = alloc::constant(self.func, value)? as u64;
+        let width = self.ty(value).bits();
+        Some(if width >= 64 {
+            bits
+        } else {
+            bits & ((1 << width) - 1)
+        })
+    }
+
+    fn loc_in(&self, value: Value, block: Block) -> Loc {
+        if let Some(bits) = self.constant(value) {
+            return Loc::Imm(bits);
+        }
+        match self.allocation.place(value, block) {
+            Place::Reg(reg) => Loc::Reg(self.class(value), reg),
+            Place::Slot(index) => Loc::Slot(self.frame.slot(index)),
+        }
+    }
+
+    fn loc(&self, value: Value) -> Loc {
+        self.loc_in(value, self.block)
     }
 
     fn mov_imm(&mut self, width: Width, rd: u8, value: u64) {
@@ -266,6 +392,147 @@ impl Lower<'_> {
         }
     }
 
+    fn load_imm(&mut self, rd: u8, value: u64) {
+        let width = if value >> 32 == 0 { Width::W } else { Width::X };
+        self.mov_imm(width, rd, value);
+    }
+
+    fn signed_constant(&self, value: Value) -> Option<i64> {
+        let bits = self.constant(value)?;
+        let width = self.ty(value).bits();
+        Some(if width >= 64 {
+            bits as i64
+        } else {
+            ((bits << (64 - width)) as i64) >> (64 - width)
+        })
+    }
+
+    fn binary_imm(&mut self, opcode: Opcode, result: Value, args: &[Value]) -> bool {
+        let width = width(self.ty(result));
+        let commutative = opcode != Opcode::Isub;
+        let (x, constant) = match self.signed_constant(args[1]) {
+            Some(constant) => (args[0], constant),
+            None => match self.signed_constant(args[0]) {
+                Some(constant) if commutative => (args[1], constant),
+                _ => return false,
+            },
+        };
+        let encode: Box<dyn Fn(u8, u8) -> u32> = match opcode {
+            Opcode::Iadd | Opcode::Isub => {
+                let Some(amount) = (if opcode == Opcode::Isub {
+                    constant.checked_neg()
+                } else {
+                    Some(constant)
+                }) else {
+                    return false;
+                };
+                if let Some((imm, shift)) = e::arith_imm(amount) {
+                    Box::new(move |d, a| e::add_imm(width, d, a, imm, shift))
+                } else if let Some((imm, shift)) = amount.checked_neg().and_then(e::arith_imm) {
+                    Box::new(move |d, a| e::sub_imm(width, d, a, imm, shift))
+                } else {
+                    return false;
+                }
+            }
+            _ => {
+                let op = match opcode {
+                    Opcode::Band => Logical::And,
+                    Opcode::Bor => Logical::Orr,
+                    _ => Logical::Eor,
+                };
+                let bits = match width {
+                    Width::X => constant as u64,
+                    Width::W => constant as u64 & 0xFFFF_FFFF,
+                };
+                if e::logical_imm(op, width, 0, 0, bits).is_none() {
+                    return false;
+                }
+                Box::new(move |d, a| e::logical_imm(op, width, d, a, bits).unwrap())
+            }
+        };
+        let a = self.use_reg(x, T0);
+        let d = self.def_reg(result, T0);
+        self.asm.emit(encode(d, a));
+        self.commit(result, d);
+        true
+    }
+
+    fn compare(&mut self, cond: IntCC, x: Value, y: Value) -> Cond {
+        let (cond, x, y) = if self.constant(x).is_some() && self.constant(y).is_none() {
+            (cond.swap_args(), y, x)
+        } else {
+            (cond, x, y)
+        };
+        let ty = self.ty(x);
+        let signed = matches!(
+            cond,
+            IntCC::SignedLessThan
+                | IntCC::SignedLessThanOrEqual
+                | IntCC::SignedGreaterThan
+                | IntCC::SignedGreaterThanOrEqual
+        );
+        let extend = match (ty, signed) {
+            (types::I8, false) => Some(Extend::Uxtb),
+            (types::I8, true) => Some(Extend::Sxtb),
+            (types::I16, false) => Some(Extend::Uxth),
+            (types::I16, true) => Some(Extend::Sxth),
+            _ => None,
+        };
+        let width = width(ty);
+        let mut a = self.use_reg(x, T0);
+        if let Some(extend) = extend {
+            self.asm.emit(e::extend(extend, Width::W, T0, a));
+            a = T0;
+        }
+        let unsigned = self.constant(y).map(|bits| bits as i64);
+        let sign_extended = self.signed_constant(y);
+        let negatable =
+            signed || (extend.is_none() && matches!(cond, IntCC::Equal | IntCC::NotEqual));
+        if let Some((imm, shift)) =
+            (if signed { sign_extended } else { unsigned }).and_then(e::arith_imm)
+        {
+            self.asm.emit(e::subs_imm(width, e::ZR, a, imm, shift));
+        } else if let Some((imm, shift)) = sign_extended
+            .filter(|_| negatable)
+            .and_then(i64::checked_neg)
+            .and_then(e::arith_imm)
+        {
+            self.asm.emit(e::adds_imm(width, e::ZR, a, imm, shift));
+        } else {
+            let mut b = self.use_reg(y, T1);
+            if let Some(extend) = extend {
+                self.asm.emit(e::extend(extend, Width::W, T1, b));
+                b = T1;
+            }
+            self.asm.emit(e::alu(Alu::Subs, width, e::ZR, a, b));
+        }
+        int_cond(cond)
+    }
+
+    fn access(&mut self, inst: Inst, op: Mem, rt: u8, base: Value, offset: i64) {
+        match self.selection.address(inst) {
+            Some(Address::Offset { base, offset }) => {
+                let base = self.use_reg(base, T1);
+                self.memory(op, rt, base, offset);
+            }
+            Some(Address::Indexed {
+                base,
+                index,
+                kind,
+                scaled,
+            }) => {
+                let base = self.use_reg(base, T1);
+                let index = self.use_reg(index, T2);
+                self.asm
+                    .emit(e::mem_indexed(op, rt, base, index, kind, scaled));
+            }
+            None => {
+                let base = self.use_reg(base, T1);
+                self.memory(op, rt, base, offset);
+            }
+        }
+    }
+
     fn memory(&mut self, op: Mem, rt: u8, base: u8, offset: i64) {
         if let Ok(unsigned) = u32::try_from(offset)
             && let Some(word) = e::mem_scaled(op, rt, base, unsigned)
@@ -283,92 +550,98 @@ impl Lower<'_> {
         self.asm.emit(e::mem_register(op, rt, base, ADDRESS));
     }
 
-    fn slot(&self, value: Value) -> i64 {
-        i64::from(self.frame.value(value))
+    fn spill_op(class: RegClass, load: bool) -> Mem {
+        match (class, load) {
+            (RegClass::Int, true) => Mem::LdrX,
+            (RegClass::Int, false) => Mem::StrX,
+            (RegClass::Float, true) => Mem::LdrD,
+            (RegClass::Float, false) => Mem::StrD,
+        }
     }
 
-    fn load_int(&mut self, value: Value, reg: u8) {
-        self.memory(Mem::LdrX, reg, e::SP, self.slot(value));
-    }
-
-    fn store_int(&mut self, value: Value, reg: u8) {
-        self.memory(Mem::StrX, reg, e::SP, self.slot(value));
-    }
-
-    fn load_float(&mut self, value: Value, reg: u8) {
-        let op = if self.ty(value) == types::F32 {
-            Mem::LdrS
-        } else {
-            Mem::LdrD
-        };
-        self.memory(op, reg, e::SP, self.slot(value));
-    }
-
-    fn store_float(&mut self, value: Value, reg: u8) {
-        let op = if self.ty(value) == types::F32 {
-            Mem::StrS
-        } else {
-            Mem::StrD
-        };
-        self.memory(op, reg, e::SP, self.slot(value));
-    }
-
-    fn load_location(&mut self, value: Value, location: Location, base: u8, area: i64) {
-        match location {
-            Location::Reg {
-                class: RegClass::Int,
-                reg,
-            } => self.load_int(value, reg),
-            Location::Reg {
-                class: RegClass::Float,
-                reg,
-            } => self.load_float(value, reg),
-            Location::Stack { offset, ty } => {
-                let op = store_op(Opcode::Store, ty).expect("argument types are checked");
-                let reg = self.load_scratch(value);
-                self.memory(op, reg, base, area + i64::from(offset));
+    fn use_reg(&mut self, value: Value, scratch: u8) -> u8 {
+        match self.loc(value) {
+            Loc::Reg(_, reg) => reg,
+            Loc::Slot(offset) => {
+                let op = Self::spill_op(self.class(value), true);
+                self.memory(op, scratch, e::SP, i64::from(offset));
+                scratch
+            }
+            Loc::Imm(bits) => {
+                self.load_imm(scratch, bits);
+                scratch
             }
         }
     }
 
-    fn store_location(&mut self, value: Value, location: Location, base: u8, area: i64) {
-        match location {
-            Location::Reg {
-                class: RegClass::Int,
-                reg,
-            } => self.store_int(value, reg),
-            Location::Reg {
-                class: RegClass::Float,
-                reg,
-            } => self.store_float(value, reg),
-            Location::Stack { offset, ty } => {
-                let op = load_op(Opcode::Load, ty).expect("argument types are checked");
-                let reg = if matches!(op, Mem::LdrS | Mem::LdrD) {
-                    F0
-                } else {
-                    T0
+    fn def_reg(&self, value: Value, scratch: u8) -> u8 {
+        match self.loc(value) {
+            Loc::Reg(_, reg) => reg,
+            Loc::Slot(_) | Loc::Imm(_) => scratch,
+        }
+    }
+
+    fn commit(&mut self, value: Value, reg: u8) {
+        if let Loc::Slot(offset) = self.loc(value) {
+            let op = Self::spill_op(self.class(value), false);
+            self.memory(op, reg, e::SP, i64::from(offset));
+        }
+    }
+
+    fn emit_move(&mut self, m: Move) {
+        match (m.from, m.to) {
+            (Loc::Reg(_, from), Loc::Reg(_, to)) => {
+                let word = match m.class {
+                    RegClass::Int => e::mov(Width::X, to, from),
+                    RegClass::Float => e::float_unary(FloatUnary::Mov, Float::D, to, from),
                 };
-                self.memory(op, reg, base, area + i64::from(offset));
-                self.store_scratch(value, reg);
+                self.asm.emit(word);
+            }
+            (Loc::Reg(_, from), Loc::Slot(offset)) => {
+                self.memory(
+                    Self::spill_op(m.class, false),
+                    from,
+                    e::SP,
+                    i64::from(offset),
+                );
+            }
+            (Loc::Slot(offset), Loc::Reg(_, to)) => {
+                self.memory(Self::spill_op(m.class, true), to, e::SP, i64::from(offset));
+            }
+            (Loc::Imm(bits), Loc::Reg(_, to)) => self.load_imm(to, bits),
+            (Loc::Imm(bits), Loc::Slot(offset)) => {
+                self.load_imm(T0, bits);
+                self.memory(Mem::StrX, T0, e::SP, i64::from(offset));
+            }
+            (_, Loc::Imm(_)) => unreachable!("constants are never move destinations"),
+            (Loc::Slot(from), Loc::Slot(to)) => {
+                let temporary = match m.class {
+                    RegClass::Int => T0,
+                    RegClass::Float => F0,
+                };
+                self.memory(
+                    Self::spill_op(m.class, true),
+                    temporary,
+                    e::SP,
+                    i64::from(from),
+                );
+                self.memory(
+                    Self::spill_op(m.class, false),
+                    temporary,
+                    e::SP,
+                    i64::from(to),
+                );
             }
         }
     }
 
-    fn load_scratch(&mut self, value: Value) -> u8 {
-        if RegClass::of(self.ty(value)) == Some(RegClass::Float) {
-            self.load_float(value, F0);
-            F0
-        } else {
-            self.load_int(value, T0);
-            T0
-        }
-    }
-
-    fn store_scratch(&mut self, value: Value, reg: u8) {
-        if RegClass::of(self.ty(value)) == Some(RegClass::Float) {
-            self.store_float(value, reg);
-        } else {
-            self.store_int(value, reg);
+    fn parallel(&mut self, pending: Vec<Move>) {
+        let ordered = moves::sequence(pending, |class| match class {
+            RegClass::Int => Loc::Reg(class, T1),
+            RegClass::Float => Loc::Reg(class, F1),
+        });
+        for m in ordered {
+            self.emit_move(m);
         }
     }
 
@@ -388,6 +661,26 @@ impl Lower<'_> {
         }
     }
 
+    fn callee_saves(&mut self, load: bool) {
+        let saved = &self.allocation.callee_saved;
+        let mut index = 0;
+        while index < saved.len() {
+            let (class, reg) = saved[index];
+            let offset = self.frame.saves + 8 * index as u32;
+            if let Some(&(next_class, next)) = saved.get(index + 1)
+                && next_class == class
+                && let Some(word) =
+                    e::pair(load, class == RegClass::Float, reg, next, e::SP, offset)
+            {
+                self.asm.emit(word);
+                index += 2;
+                continue;
+            }
+            self.memory(Self::spill_op(class, load), reg, e::SP, i64::from(offset));
+            index += 1;
+        }
+    }
+
     fn prologue(&mut self) -> Result<(), Unsupported> {
         let func = self.func;
         let signature = &func.signature;
@@ -397,24 +690,47 @@ impl Lower<'_> {
         self.asm.emit(e::STP_FP_LR_PRE);
         self.asm.emit(e::mov_sp(e::FP, e::SP));
         self.adjust_sp(self.frame.size, true);
-        let entry = func
-            .layout
-            .entry_block()
-            .ok_or_else(|| Unsupported("no entry block".into()))?;
+        self.callee_saves(false);
+        let params = func.dfg.block_params(self.block);
+        let moves = params
+            .iter()
+            .zip(&locations)
+            .filter_map(|(&param, location)| match *location {
+                Location::Reg { class, reg } => Some(Move {
+                    class,
+                    from: Loc::Reg(class, reg),
+                    to: self.loc(param),
+                }),
+                Location::Stack { .. } => None,
+            })
+            .collect();
+        self.parallel(moves);
         let area = self.incoming_area();
-        for (&param, location) in func.dfg.block_params(entry).iter().zip(locations) {
-            self.store_location(param, location, e::FP, area);
+        for (&param, location) in params.iter().zip(locations) {
+            let Location::Stack { offset, ty } = location else {
+                continue;
+            };
+            let op = load_op(Opcode::Load, ty).expect("argument types are checked");
+            let scratch = match self.class(param) {
+                RegClass::Int => T0,
+                RegClass::Float => F0,
+            };
+            let reg = self.def_reg(param, scratch);
+            self.memory(op, reg, e::FP, area + i64::from(offset));
+            self.commit(param, reg);
         }
         Ok(())
     }
 
     fn epilogue(&mut self, pop: u32) {
+        self.callee_saves(true);
         self.asm.emit(e::mov_sp(e::SP, e::FP));
         self.asm.emit(e::LDP_FP_LR_POST);
         self.adjust_sp(pop, false);
     }
 
     fn block(&mut self, block: Block, next: Option<Block>) -> Result<(), Unsupported> {
+        self.block = block;
         self.block_starts.push(self.asm.offset());
         let label = self.label(block);
         self.asm.bind(label);
@@ -434,40 +750,38 @@ impl Lower<'_> {
         Ok(())
     }
 
-    fn edge(&mut self, call: BlockCall, next: Option<Block>) -> Result<(), Unsupported> {
+    fn edge_moves(&self, call: BlockCall) -> Result<Vec<Move>, Unsupported> {
         let dfg = &self.func.dfg;
         let target = call.block(&dfg.value_lists);
         let params = dfg.block_params(target);
-        let args = call
-            .args(&dfg.value_lists)
-            .map(|arg| {
-                arg.as_value()
-                    .ok_or_else(|| Unsupported("non-value block argument".into()))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let moves: Vec<(Value, Value)> = args
-            .iter()
-            .zip(params)
-            .filter(|(arg, param)| arg != param)
-            .map(|(&arg, &param)| (arg, param))
-            .collect();
-        let overlapping = moves.iter().any(|(arg, _)| params.contains(arg));
-        if overlapping {
-            let scratch = i64::from(self.frame.scratch);
-            for (index, &(arg, _)) in moves.iter().enumerate() {
-                self.load_int(arg, T0);
-                self.memory(Mem::StrX, T0, e::SP, scratch + 8 * index as i64);
-            }
-            for (index, &(_, param)) in moves.iter().enumerate() {
-                self.memory(Mem::LdrX, T0, e::SP, scratch + 8 * index as i64);
-                self.store_int(param, T0);
-            }
-        } else {
-            for &(arg, param) in &moves {
-                self.load_int(arg, T0);
-                self.store_int(param, T0);
+        let mut pending = Vec::with_capacity(params.len());
+        for (arg, &param) in call.args(&dfg.value_lists).zip(params) {
+            let arg = arg
+                .as_value()
+                .ok_or_else(|| Unsupported("non-value block argument".into()))?;
+            pending.push(Move {
+                class: self.class(param),
+                from: self.loc(arg),
+                to: self.loc_in(param, target),
+            });
+        }
+        if self.allocation.is_cold(self.block) != self.allocation.is_cold(target) {
+            for &value in self.allocation.boundary(target) {
+                pending.push(Move {
+                    class: self.class(value),
+                    from: self.loc(value),
+                    to: self.loc_in(value, target),
+                });
             }
         }
+        pending.retain(|m| m.from != m.to);
+        Ok(pending)
+    }
+
+    fn edge(&mut self, call: BlockCall, next: Option<Block>) -> Result<(), Unsupported> {
+        let moves = self.edge_moves(call)?;
+        self.parallel(moves);
+        let target = call.block(&self.func.dfg.value_lists);
         if next != Some(target) {
             let label = self.label(target);
             self.asm.jump(e::B, label);
@@ -475,53 +789,104 @@ impl Lower<'_> {
         Ok(())
     }
 
-    fn has_args(&self, call: BlockCall) -> bool {
-        call.len(&self.func.dfg.value_lists) > 0
+    fn needs_stub(&self, call: BlockCall) -> Result<bool, Unsupported> {
+        Ok(!self.edge_moves(call)?.is_empty())
     }
 
     fn condition(&mut self, value: Value) -> Cond {
         let ty = self.ty(value);
-        self.load_int(value, T0);
+        let reg = self.use_reg(value, T0);
         match ty {
-            types::I8 => self.asm.emit(e::tst_low_byte(T0)),
+            types::I8 => self.asm.emit(e::tst_low_byte(reg)),
             types::I16 => {
-                self.asm.emit(e::extend(Extend::Uxth, Width::W, T0, T0));
+                self.asm.emit(e::extend(Extend::Uxth, Width::W, T0, reg));
                 self.asm.emit(e::alu(Alu::Subs, Width::W, e::ZR, T0, e::ZR));
             }
             _ => self
                 .asm
-                .emit(e::alu(Alu::Subs, width(ty), e::ZR, T0, e::ZR)),
+                .emit(e::alu(Alu::Subs, width(ty), e::ZR, reg, e::ZR)),
         }
         Cond::Ne
     }
 
-    fn call_args(
-        &mut self,
-        conv: CallConv,
-        params: &[AbiParam],
-        args: &[Value],
-        base: u8,
-        area: i64,
-    ) -> Result<(), Unsupported> {
-        let locations = abi::assign(conv, params)?.locations;
-        for ((&arg, location), param) in args.iter().zip(locations).zip(params) {
-            self.load_location(arg, location, base, area);
-            let Location::Reg { reg, .. } = location else {
-                continue;
-            };
-            if conv != CallConv::AppleAarch64 {
-                continue;
+    fn fused_flags(&mut self, def: Inst) -> Cond {
+        let dfg = &self.func.dfg;
+        let args = dfg.inst_args(def);
+        match dfg.insts[def] {
+            InstructionData::IntCompare { cond, .. } => self.compare(cond, args[0], args[1]),
+            InstructionData::FloatCompare { cond, .. } => {
+                let ty = float(self.ty(args[0]));
+                let a = self.use_reg(args[0], F0);
+                let b = self.use_reg(args[1], F1);
+                self.asm.emit(e::fcmp(ty, a, b));
+                float_conds(cond).0
             }
-            let extend = match (param.extension, param.value_type) {
-                (ArgumentExtension::Uext, types::I8) => Extend::Uxtb,
-                (ArgumentExtension::Uext, types::I16) => Extend::Uxth,
-                (ArgumentExtension::Sext, types::I8) => Extend::Sxtb,
-                (ArgumentExtension::Sext, types::I16) => Extend::Sxth,
-                _ => continue,
-            };
-            self.asm.emit(e::extend(extend, Width::W, reg, reg));
+            _ => unreachable!("only compares are fused"),
         }
-        Ok(())
+    }
+
+    fn select_condition(&mut self, value: Value, user: Inst) -> Cond {
+        match self.selection.compare(user) {
+            Some(def) => self.fused_flags(def),
+            None => self.condition(value),
+        }
+    }
+
+    fn zero_test(&mut self, value: Value, nonzero: bool) -> Option<Test> {
+        let ty = self.ty(value);
+        if !matches!(ty, types::I32 | types::I64) {
+            return None;
+        }
+        let reg = self.use_reg(value, T0);
+        Some(Test::Zero {
+            nonzero,
+            width: width(ty),
+            reg,
+        })
+    }
+
+    fn branch_test(&mut self, value: Value, user: Inst) -> Test {
+        let dfg = &self.func.dfg;
+        let Some(def) = self.selection.compare(user) else {
+            return self
+                .zero_test(value, true)
+                .unwrap_or_else(|| Test::Flags(self.condition(value)));
+        };
+        if let InstructionData::IntCompare {
+            cond: cond @ (IntCC::Equal | IntCC::NotEqual),
+            ..
+        } = dfg.insts[def]
+        {
+            let args = dfg.inst_args(def);
+            let operand = if self.constant(args[1]) == Some(0) {
+                Some(args[0])
+            } else if self.constant(args[0]) == Some(0) {
+                Some(args[1])
+            } else {
+                None
+            };
+            if let Some(test) =
+                operand.and_then(|operand| self.zero_test(operand, cond == IntCC::NotEqual))
+            {
+                return test;
+            }
+        }
+        Test::Flags(self.fused_flags(def))
+    }
+
+    fn branch_if(&mut self, test: Test, target: Label) {
+        match test {
+            Test::Flags(cond) => self.asm.branch(cond, target),
+            Test::Zero {
+                nonzero,
+                width,
+                reg,
+            } => self.asm.conditional(
+                e::compare_branch(nonzero, width, reg),
+                e::compare_branch(!nonzero, width, reg),
+                target,
+            ),
+        }
     }
 
     fn call(
@@ -529,28 +894,85 @@ impl Lower<'_> {
         inst: Inst,
         sig_ref: SigRef,
         args: &[Value],
+        callee: Option<Value>,
         emit: impl FnOnce(&mut Self),
     ) -> Result<(), Unsupported> {
         let func = self.func;
         let signature = &func.dfg.signatures[sig_ref];
         let conv = signature.call_conv;
-        let stack_size = abi::assign(conv, &signature.params)?.stack_size;
-        if func.dfg.insts[inst].opcode().is_return() {
-            let area = i64::from(16 + self.tail_args - stack_size);
-            self.call_args(conv, &signature.params, args, e::FP, area)?;
-            emit(self);
+        let assignment = abi::assign(conv, &signature.params)?;
+        let tail = func.dfg.insts[inst].opcode().is_return();
+        let (base, area) = if tail {
+            (
+                e::FP,
+                i64::from(16 + self.tail_args - assignment.stack_size),
+            )
+        } else {
+            (e::SP, 0)
+        };
+        let mut pending = Vec::with_capacity(args.len() + 1);
+        for (&arg, location) in args.iter().zip(&assignment.locations) {
+            match *location {
+                Location::Reg { class, reg } => pending.push(Move {
+                    class,
+                    from: self.loc(arg),
+                    to: Loc::Reg(class, reg),
+                }),
+                Location::Stack { offset, ty } => {
+                    let op = store_op(Opcode::Store, ty).expect("argument types are checked");
+                    let scratch = match self.class(arg) {
+                        RegClass::Int => T0,
+                        RegClass::Float => F0,
+                    };
+                    let reg = self.use_reg(arg, scratch);
+                    self.memory(op, reg, base, area + i64::from(offset));
+                }
+            }
+        }
+        if let Some(callee) = callee {
+            pending.push(Move {
+                class: RegClass::Int,
+                from: self.loc(callee),
+                to: Loc::Reg(RegClass::Int, CALLEE),
+            });
+        }
+        self.parallel(pending);
+        if conv == CallConv::AppleAarch64 {
+            for (param, location) in signature.params.iter().zip(&assignment.locations) {
+                let Location::Reg { reg, .. } = *location else {
+                    continue;
+                };
+                let extend = match (param.extension, param.value_type) {
+                    (ArgumentExtension::Uext, types::I8) => Extend::Uxtb,
+                    (ArgumentExtension::Uext, types::I16) => Extend::Uxth,
+                    (ArgumentExtension::Sext, types::I8) => Extend::Sxtb,
+                    (ArgumentExtension::Sext, types::I16) => Extend::Sxth,
+                    _ => continue,
+                };
+                self.asm.emit(e::extend(extend, Width::W, reg, reg));
+            }
+        }
+        emit(self);
+        if tail {
             return Ok(());
         }
-        self.call_args(conv, &signature.params, args, e::SP, 0)?;
-        emit(self);
         if conv == CallConv::Tail {
-            self.adjust_sp(stack_size, true);
+            self.adjust_sp(assignment.stack_size, true);
         }
         let locations = abi::assign_returns(conv, &signature.returns)?;
         let results = func.dfg.inst_results(inst);
+        let mut pending = Vec::with_capacity(results.len());
         for (&result, location) in results.iter().zip(locations) {
-            self.store_location(result, location, e::SP, 0);
+            let Location::Reg { class, reg } = location else {
+                continue;
+            };
+            pending.push(Move {
+                class,
+                from: Loc::Reg(class, reg),
+                to: self.loc(result),
+            });
         }
+        self.parallel(pending);
         Ok(())
     }
 
@@ -583,16 +1005,20 @@ impl Lower<'_> {
         Ok(())
     }
 
-    fn table_target(&mut self, call: BlockCall, stubs: &mut Vec<(Label, BlockCall)>) -> Label {
-        if !self.has_args(call) {
-            return self.label(call.block(&self.func.dfg.value_lists));
+    fn edge_target(&mut self, call: BlockCall) -> Result<Label, Unsupported> {
+        let target = call.block(&self.func.dfg.value_lists);
+        if !self.needs_stub(call)? {
+            return Ok(self.label(target));
         }
         let label = self.asm.label();
-        stubs.push((label, call));
-        label
+        self.stubs.push((label, self.block, call));
+        Ok(label)
     }
 
     fn inst(&mut self, inst: Inst, next: Option<Block>) -> Result<(), Unsupported> {
+        if self.selection.skips(inst) {
+            return Ok(());
+        }
         let func = self.func;
         let dfg = &func.dfg;
         let data = &dfg.insts[inst];
@@ -601,18 +1027,20 @@ impl Lower<'_> {
         let result = dfg.inst_results(inst).first().copied();
         let result_ty = result.map(|result| self.ty(result));
         match (opcode, data) {
-            (Opcode::Iconst, InstructionData::UnaryImm { imm, .. }) => {
-                let ty = result_ty.unwrap();
-                self.mov_imm(width(ty), T0, imm.bits() as u64);
-                self.store_int(result.unwrap(), T0);
-            }
+            (Opcode::Iconst, _) => {}
             (Opcode::F64const, InstructionData::UnaryIeee64 { imm, .. }) => {
+                let result = result.unwrap();
                 self.mov_imm(Width::X, T0, imm.bits());
-                self.store_int(result.unwrap(), T0);
+                let d = self.def_reg(result, F0);
+                self.asm.emit(e::move_to_float(Width::X, d, T0));
+                self.commit(result, d);
             }
             (Opcode::F32const, InstructionData::UnaryIeee32 { imm, .. }) => {
+                let result = result.unwrap();
                 self.mov_imm(Width::W, T0, u64::from(imm.bits()));
-                self.store_int(result.unwrap(), T0);
+                let d = self.def_reg(result, F0);
+                self.asm.emit(e::move_to_float(Width::W, d, T0));
+                self.commit(result, d);
             }
             (
                 Opcode::Iadd
@@ -623,32 +1051,53 @@ impl Lower<'_> {
                 | Opcode::Bxor,
                 _,
             ) => {
+                let result = result.unwrap();
+                if opcode != Opcode::Imul && self.binary_imm(opcode, result, args) {
+                    return Ok(());
+                }
                 let width = width(result_ty.unwrap());
-                self.load_int(args[0], T0);
-                self.load_int(args[1], T1);
+                if let Some(operand) = self.selection.operand(inst) {
+                    let a = self.use_reg(args[1 - operand.position], T0);
+                    let b = self.use_reg(operand.value, T1);
+                    let d = self.def_reg(result, T0);
+                    let sub = opcode == Opcode::Isub;
+                    let word = match operand.kind {
+                        Index::Lsl => e::alu_shifted(sub, width, d, a, b, operand.shift),
+                        kind => e::alu_extended(sub, d, a, b, kind, operand.shift),
+                    };
+                    self.asm.emit(word);
+                    self.commit(result, d);
+                    return Ok(());
+                }
+                let a = self.use_reg(args[0], T0);
+                let b = self.use_reg(args[1], T1);
+                let d = self.def_reg(result, T0);
                 let word = match opcode {
-                    Opcode::Iadd => e::alu(Alu::Add, width, T0, T0, T1),
-                    Opcode::Isub => e::alu(Alu::Sub, width, T0, T0, T1),
-                    Opcode::Imul => e::mul(width, T0, T0, T1),
-                    Opcode::Band => e::alu(Alu::And, width, T0, T0, T1),
-                    Opcode::Bor => e::alu(Alu::Orr, width, T0, T0, T1),
-                    _ => e::alu(Alu::Eor, width, T0, T0, T1),
+                    Opcode::Iadd => e::alu(Alu::Add, width, d, a, b),
+                    Opcode::Isub => e::alu(Alu::Sub, width, d, a, b),
+                    Opcode::Imul => e::mul(width, d, a, b),
+                    Opcode::Band => e::alu(Alu::And, width, d, a, b),
+                    Opcode::Bor => e::alu(Alu::Orr, width, d, a, b),
+                    _ => e::alu(Alu::Eor, width, d, a, b),
                 };
                 self.asm.emit(word);
-                self.store_int(result.unwrap(), T0);
+                self.commit(result, d);
             }
             (Opcode::Bnot | Opcode::Ineg, _) => {
+                let result = result.unwrap();
                 let width = width(result_ty.unwrap());
-                self.load_int(args[0], T0);
+                let a = self.use_reg(args[0], T0);
+                let d = self.def_reg(result, T0);
                 let word = if opcode == Opcode::Bnot {
-                    e::alu(Alu::Orn, width, T0, e::ZR, T0)
+                    e::alu(Alu::Orn, width, d, e::ZR, a)
                 } else {
-                    e::alu(Alu::Sub, width, T0, e::ZR, T0)
+                    e::alu(Alu::Sub, width, d, e::ZR, a)
                 };
                 self.asm.emit(word);
-                self.store_int(result.unwrap(), T0);
+                self.commit(result, d);
             }
             (Opcode::Ishl | Opcode::Ushr | Opcode::Sshr, _) => {
+                let result = result.unwrap();
                 let ty = result_ty.unwrap();
                 if !matches!(ty, types::I32 | types::I64) {
                     return Err(Unsupported(format!("{opcode}.{ty}")));
@@ -658,69 +1107,94 @@ impl Lower<'_> {
                     Opcode::Ushr => Shift::Lsr,
                     _ => Shift::Asr,
                 };
-                self.load_int(args[0], T0);
-                self.load_int(args[1], T1);
-                self.asm.emit(e::shift(op, width(ty), T0, T0, T1));
-                self.store_int(result.unwrap(), T0);
+                let a = self.use_reg(args[0], T0);
+                if let Some(amount) = self.constant(args[1]) {
+                    let d = self.def_reg(result, T0);
+                    self.asm
+                        .emit(e::shift_imm(op, width(ty), d, a, amount as u32));
+                    self.commit(result, d);
+                    return Ok(());
+                }
+                let b = self.use_reg(args[1], T1);
+                let d = self.def_reg(result, T0);
+                self.asm.emit(e::shift(op, width(ty), d, a, b));
+                self.commit(result, d);
             }
             (Opcode::Icmp, _) => {
-                let cond = data.cond_code().unwrap();
-                let ty = self.ty(args[0]);
-                self.load_int(args[0], T0);
-                self.load_int(args[1], T1);
-                let signed = matches!(
-                    cond,
-                    IntCC::SignedLessThan
-                        | IntCC::SignedLessThanOrEqual
-                        | IntCC::SignedGreaterThan
-                        | IntCC::SignedGreaterThanOrEqual
-                );
-                let extend = match (ty, signed) {
-                    (types::I8, false) => Some(Extend::Uxtb),
-                    (types::I8, true) => Some(Extend::Sxtb),
-                    (types::I16, false) => Some(Extend::Uxth),
-                    (types::I16, true) => Some(Extend::Sxth),
-                    _ => None,
-                };
-                if let Some(extend) = extend {
-                    self.asm.emit(e::extend(extend, Width::W, T0, T0));
-                    self.asm.emit(e::extend(extend, Width::W, T1, T1));
-                }
-                self.asm.emit(e::alu(Alu::Subs, width(ty), e::ZR, T0, T1));
-                self.asm.emit(e::cset(T0, int_cond(cond)));
-                self.store_int(result.unwrap(), T0);
+                let result = result.unwrap();
+                let cond = self.compare(data.cond_code().unwrap(), args[0], args[1]);
+                let d = self.def_reg(result, T0);
+                self.asm.emit(e::cset(d, cond));
+                self.commit(result, d);
             }
             (Opcode::Fcmp, _) => {
+                let result = result.unwrap();
                 let (first, second) = float_conds(data.fp_cond_code().unwrap());
                 let ty = float(self.ty(args[0]));
-                self.load_float(args[0], F0);
-                self.load_float(args[1], F1);
-                self.asm.emit(e::fcmp(ty, F0, F1));
-                self.asm.emit(e::cset(T0, first));
+                let a = self.use_reg(args[0], F0);
+                let b = self.use_reg(args[1], F1);
+                self.asm.emit(e::fcmp(ty, a, b));
+                let d = self.def_reg(result, T0);
+                self.asm.emit(e::cset(d, first));
                 if let Some(second) = second {
                     self.asm.emit(e::cset(T1, second));
-                    self.asm.emit(e::alu(Alu::Orr, Width::W, T0, T0, T1));
+                    self.asm.emit(e::alu(Alu::Orr, Width::W, d, d, T1));
                 }
-                self.store_int(result.unwrap(), T0);
+                self.commit(result, d);
             }
             (Opcode::Select, _) => {
+                let result = result.unwrap();
                 let ty = result_ty.unwrap();
-                let cond = self.condition(args[0]);
-                self.load_int(args[1], T1);
-                self.load_int(args[2], T2);
-                let width = if matches!(ty, types::I64 | types::F64) {
+                let cond = self.select_condition(args[0], inst);
+                if self.class(result) == RegClass::Float {
+                    let a = self.use_reg(args[1], F0);
+                    let b = self.use_reg(args[2], F1);
+                    let d = self.def_reg(result, F0);
+                    self.asm.emit(e::fcsel(float(ty), d, a, b, cond));
+                    self.commit(result, d);
+                } else {
+                    let a = self.use_reg(args[1], T1);
+                    let b = self.use_reg(args[2], T2);
+                    let d = self.def_reg(result, T0);
+                    let width = if ty == types::I64 { Width::X } else { Width::W };
+                    self.asm.emit(e::csel(width, d, a, b, cond));
+                    self.commit(result, d);
+                }
+            }
+            (Opcode::Bitcast | Opcode::Ireduce, _) => {
+                let result = result.unwrap();
+                let from = self.class(args[0]);
+                let to = self.class(result);
+                let width = if self.ty(result).bits() == 64 {
                     Width::X
                 } else {
                     Width::W
                 };
-                self.asm.emit(e::csel(width, T0, T1, T2, cond));
-                self.store_int(result.unwrap(), T0);
-            }
-            (Opcode::Bitcast | Opcode::Ireduce, _) => {
-                self.load_int(args[0], T0);
-                self.store_int(result.unwrap(), T0);
+                match (from, to) {
+                    (RegClass::Int, RegClass::Float) => {
+                        let a = self.use_reg(args[0], T0);
+                        let d = self.def_reg(result, F0);
+                        self.asm.emit(e::move_to_float(width, d, a));
+                        self.commit(result, d);
+                    }
+                    (RegClass::Float, RegClass::Int) => {
+                        let a = self.use_reg(args[0], F0);
+                        let d = self.def_reg(result, T0);
+                        self.asm.emit(e::move_to_int(width, d, a));
+                        self.commit(result, d);
+                    }
+                    _ => {
+                        let m = Move {
+                            class: to,
+                            from: self.loc(args[0]),
+                            to: self.loc(result),
+                        };
+                        self.parallel(vec![m]);
+                    }
+                }
             }
             (Opcode::Uextend | Opcode::Sextend, _) => {
+                let result = result.unwrap();
                 let from = self.ty(args[0]);
                 let signed = opcode == Opcode::Sextend;
                 let extend = match (from, signed) {
@@ -732,10 +1206,11 @@ impl Lower<'_> {
                     (types::I32, true) => Extend::Sxtw,
                     _ => return Err(Unsupported(format!("{opcode} from {from}"))),
                 };
-                self.load_int(args[0], T0);
+                let a = self.use_reg(args[0], T0);
+                let d = self.def_reg(result, T0);
                 self.asm
-                    .emit(e::extend(extend, width(result_ty.unwrap()), T0, T0));
-                self.store_int(result.unwrap(), T0);
+                    .emit(e::extend(extend, width(result_ty.unwrap()), d, a));
+                self.commit(result, d);
             }
             (
                 Opcode::Load
@@ -750,27 +1225,30 @@ impl Lower<'_> {
                 if data.memflags_trap_code(dfg).is_some() {
                     return Err(Unsupported("trapping load".into()));
                 }
+                let result = result.unwrap();
                 let ty = result_ty.unwrap();
                 let op =
                     load_op(opcode, ty).ok_or_else(|| Unsupported(format!("{opcode}.{ty}")))?;
                 let offset = i64::from(data.load_store_offset().unwrap());
-                self.load_int(args[0], T1);
-                if matches!(op, Mem::LdrS | Mem::LdrD) {
-                    self.memory(op, F0, T1, offset);
-                    self.store_float(result.unwrap(), F0);
+                let scratch = if matches!(op, Mem::LdrS | Mem::LdrD) {
+                    F0
                 } else {
-                    self.memory(op, T0, T1, offset);
-                    self.store_int(result.unwrap(), T0);
-                }
+                    T0
+                };
+                let d = self.def_reg(result, scratch);
+                self.access(inst, op, d, args[0], offset);
+                self.commit(result, d);
             }
             (Opcode::AtomicLoad, _) => {
+                let result = result.unwrap();
                 let ty = result_ty.unwrap();
                 if RegClass::of(ty) != Some(RegClass::Int) {
                     return Err(Unsupported(format!("{opcode}.{ty}")));
                 }
-                self.load_int(args[0], T1);
-                self.asm.emit(e::load_acquire(ty.bytes(), T0, T1));
-                self.store_int(result.unwrap(), T0);
+                let base = self.use_reg(args[0], T1);
+                let d = self.def_reg(result, T0);
+                self.asm.emit(e::load_acquire(ty.bytes(), d, base));
+                self.commit(result, d);
             }
             (Opcode::Store | Opcode::Istore8 | Opcode::Istore16 | Opcode::Istore32, _) => {
                 if data.memflags_trap_code(dfg).is_some() {
@@ -780,14 +1258,17 @@ impl Lower<'_> {
                 let op =
                     store_op(opcode, ty).ok_or_else(|| Unsupported(format!("{opcode}.{ty}")))?;
                 let offset = i64::from(data.load_store_offset().unwrap());
-                self.load_int(args[1], T1);
-                if matches!(op, Mem::StrS | Mem::StrD) {
-                    self.load_float(args[0], F0);
-                    self.memory(op, F0, T1, offset);
+                let scratch = if matches!(op, Mem::StrS | Mem::StrD) {
+                    F0
                 } else {
-                    self.load_int(args[0], T0);
-                    self.memory(op, T0, T1, offset);
-                }
+                    T0
+                };
+                let value = if self.constant(args[0]) == Some(0) {
+                    e::ZR
+                } else {
+                    self.use_reg(args[0], scratch)
+                };
+                self.access(inst, op, value, args[1], offset);
             }
             (
                 Opcode::StackAddr,
@@ -795,21 +1276,25 @@ impl Lower<'_> {
                     stack_slot, offset, ..
                 },
             ) => {
+                let result = result.unwrap();
                 let offset =
                     i64::from(self.frame.stack_slot(*stack_slot)) + i64::from(i32::from(*offset));
+                let d = self.def_reg(result, T0);
                 if offset < 4096 {
                     self.asm
-                        .emit(e::add_imm(Width::X, T0, e::SP, offset as u32, false));
+                        .emit(e::add_imm(Width::X, d, e::SP, offset as u32, false));
                 } else {
                     self.mov_imm(Width::X, T0, offset as u64);
                     self.asm.emit(e::mov_sp(T1, e::SP));
-                    self.asm.emit(e::alu(Alu::Add, Width::X, T0, T1, T0));
+                    self.asm.emit(e::alu(Alu::Add, Width::X, d, T1, T0));
                 }
-                self.store_int(result.unwrap(), T0);
+                self.commit(result, d);
             }
             (Opcode::GetStackPointer, _) => {
-                self.asm.emit(e::mov_sp(T0, e::SP));
-                self.store_int(result.unwrap(), T0);
+                let result = result.unwrap();
+                let d = self.def_reg(result, T0);
+                self.asm.emit(e::mov_sp(d, e::SP));
+                self.commit(result, d);
             }
             (
                 Opcode::Fadd
@@ -820,6 +1305,7 @@ impl Lower<'_> {
                 | Opcode::Fmax,
                 _,
             ) => {
+                let result = result.unwrap();
                 let op = match opcode {
                     Opcode::Fadd => FloatOp::Add,
                     Opcode::Fsub => FloatOp::Sub,
@@ -828,11 +1314,12 @@ impl Lower<'_> {
                     Opcode::Fmin => FloatOp::Min,
                     _ => FloatOp::Max,
                 };
-                self.load_float(args[0], F0);
-                self.load_float(args[1], F1);
+                let a = self.use_reg(args[0], F0);
+                let b = self.use_reg(args[1], F1);
+                let d = self.def_reg(result, F0);
                 self.asm
-                    .emit(e::float_binary(op, float(result_ty.unwrap()), F0, F0, F1));
-                self.store_float(result.unwrap(), F0);
+                    .emit(e::float_binary(op, float(result_ty.unwrap()), d, a, b));
+                self.commit(result, d);
             }
             (
                 Opcode::Fneg
@@ -844,6 +1331,7 @@ impl Lower<'_> {
                 | Opcode::Nearest,
                 _,
             ) => {
+                let result = result.unwrap();
                 let op = match opcode {
                     Opcode::Fneg => FloatUnary::Neg,
                     Opcode::Fabs => FloatUnary::Abs,
@@ -853,114 +1341,113 @@ impl Lower<'_> {
                     Opcode::Trunc => FloatUnary::Trunc,
                     _ => FloatUnary::Nearest,
                 };
-                self.load_float(args[0], F0);
+                let a = self.use_reg(args[0], F0);
+                let d = self.def_reg(result, F0);
                 self.asm
-                    .emit(e::float_unary(op, float(result_ty.unwrap()), F0, F0));
-                self.store_float(result.unwrap(), F0);
+                    .emit(e::float_unary(op, float(result_ty.unwrap()), d, a));
+                self.commit(result, d);
             }
             (Opcode::FcvtFromSint | Opcode::FcvtFromUint, _) => {
+                let result = result.unwrap();
                 let from = self.ty(args[0]);
                 if !matches!(from, types::I32 | types::I64) {
                     return Err(Unsupported(format!("{opcode} from {from}")));
                 }
-                self.load_int(args[0], T0);
+                let a = self.use_reg(args[0], T0);
+                let d = self.def_reg(result, F0);
                 self.asm.emit(e::int_to_float(
                     opcode == Opcode::FcvtFromSint,
                     width(from),
                     float(result_ty.unwrap()),
-                    F0,
-                    T0,
+                    d,
+                    a,
                 ));
-                self.store_float(result.unwrap(), F0);
+                self.commit(result, d);
             }
             (Opcode::FcvtToSintSat | Opcode::FcvtToUintSat, _) => {
+                let result = result.unwrap();
                 let ty = result_ty.unwrap();
                 if !matches!(ty, types::I32 | types::I64) {
                     return Err(Unsupported(format!("{opcode}.{ty}")));
                 }
-                self.load_float(args[0], F0);
+                let a = self.use_reg(args[0], F0);
+                let d = self.def_reg(result, T0);
                 self.asm.emit(e::float_to_int(
                     opcode == Opcode::FcvtToSintSat,
                     width(ty),
                     float(self.ty(args[0])),
-                    T0,
-                    F0,
+                    d,
+                    a,
                 ));
-                self.store_int(result.unwrap(), T0);
+                self.commit(result, d);
             }
             (Opcode::Fdemote | Opcode::Fpromote, _) => {
-                self.load_float(args[0], F0);
+                let result = result.unwrap();
+                let a = self.use_reg(args[0], F0);
+                let d = self.def_reg(result, F0);
                 let word = if opcode == Opcode::Fdemote {
-                    e::demote(F0, F0)
+                    e::demote(d, a)
                 } else {
-                    e::promote(F0, F0)
+                    e::promote(d, a)
                 };
                 self.asm.emit(word);
-                self.store_float(result.unwrap(), F0);
+                self.commit(result, d);
             }
             (Opcode::CallIndirect, InstructionData::CallIndirect { sig_ref, .. }) => {
-                let callee = args[0];
-                self.call(inst, *sig_ref, &args[1..], |this| {
-                    this.load_int(callee, CALLEE);
+                self.call(inst, *sig_ref, &args[1..], Some(args[0]), |this| {
                     this.asm.emit(e::blr(CALLEE));
                 })?;
             }
             (Opcode::ReturnCallIndirect, InstructionData::CallIndirect { sig_ref, .. }) => {
-                let callee = args[0];
-                let sig_ref = *sig_ref;
-                self.call(inst, sig_ref, &args[1..], |this| {
-                    this.load_int(callee, CALLEE)
-                })?;
-                self.tail_jump(sig_ref)?;
+                self.call(inst, *sig_ref, &args[1..], Some(args[0]), |_| {})?;
+                self.tail_jump(*sig_ref)?;
                 self.asm.emit(e::br(CALLEE));
             }
             (Opcode::Call, InstructionData::Call { func_ref, .. }) => {
                 let target = self.direct_target(*func_ref)?;
                 let sig_ref = dfg.ext_funcs[*func_ref].signature;
-                self.call(inst, sig_ref, args, |this| this.emit_call(e::BL, target))?;
+                self.call(inst, sig_ref, args, None, |this| {
+                    this.emit_call(e::BL, target)
+                })?;
             }
             (Opcode::ReturnCall, InstructionData::Call { func_ref, .. }) => {
                 let target = self.direct_target(*func_ref)?;
                 let sig_ref = dfg.ext_funcs[*func_ref].signature;
-                self.call(inst, sig_ref, args, |_| {})?;
+                self.call(inst, sig_ref, args, None, |_| {})?;
                 self.tail_jump(sig_ref)?;
                 self.emit_call(e::B, target);
             }
             (Opcode::BrTable, InstructionData::BranchTable { arg, table, .. }) => {
                 let table = &dfg.jump_tables[*table];
                 let entries = table.as_slice();
-                match self.ty(*arg) {
+                let reg = self.use_reg(*arg, T0);
+                let index = match self.ty(*arg) {
                     types::I8 => {
-                        self.load_int(*arg, T0);
-                        self.asm.emit(e::extend(Extend::Uxtb, Width::W, T0, T0));
+                        self.asm.emit(e::extend(Extend::Uxtb, Width::W, T0, reg));
+                        T0
                     }
                     types::I16 => {
-                        self.load_int(*arg, T0);
-                        self.asm.emit(e::extend(Extend::Uxth, Width::W, T0, T0));
+                        self.asm.emit(e::extend(Extend::Uxth, Width::W, T0, reg));
+                        T0
                     }
                     types::I32 => {
-                        self.load_int(*arg, T0);
-                        self.asm.emit(e::extend(Extend::Uxtw, Width::X, T0, T0));
+                        self.asm.emit(e::extend(Extend::Uxtw, Width::X, T0, reg));
+                        T0
                     }
-                    _ => self.load_int(*arg, T0),
-                }
-                let mut stubs = Vec::new();
+                    _ => reg,
+                };
                 self.mov_imm(Width::X, T1, entries.len() as u64);
-                self.asm.emit(e::alu(Alu::Subs, Width::X, e::ZR, T0, T1));
-                let default = self.table_target(table.default_block(), &mut stubs);
+                self.asm.emit(e::alu(Alu::Subs, Width::X, e::ZR, index, T1));
+                let default = self.edge_target(table.default_block())?;
                 self.asm.branch(Cond::Hs, default);
                 let start = self.asm.label();
                 self.asm.address(e::adr(T1), start);
-                self.asm.emit(e::add_lsl(Width::X, T1, T1, T0, 2));
+                self.asm.emit(e::add_lsl(Width::X, T1, T1, index, 2));
                 self.asm.emit(e::br(T1));
                 self.asm.bind(start);
                 for &entry in entries {
-                    let target = self.table_target(entry, &mut stubs);
+                    let target = self.edge_target(entry)?;
                     self.asm.jump(e::B, target);
-                }
-                for (label, call) in stubs {
-                    self.asm.bind(label);
-                    self.edge(call, None)?;
                 }
             }
             (Opcode::Jump, InstructionData::Jump { destination, .. }) => {
@@ -968,26 +1455,32 @@ impl Lower<'_> {
             }
             (Opcode::Brif, InstructionData::Brif { arg, blocks, .. }) => {
                 let [then_call, else_call] = *blocks;
-                let cond = self.condition(*arg);
-                let then_label = if self.has_args(then_call) {
-                    self.asm.label()
+                let test = self.branch_test(*arg, inst);
+                let then_block = then_call.block(&dfg.value_lists);
+                if next == Some(then_block) && !self.needs_stub(then_call)? {
+                    let target = self.edge_target(else_call)?;
+                    self.branch_if(test.invert(), target);
                 } else {
-                    self.label(then_call.block(&dfg.value_lists))
-                };
-                self.asm.branch(cond, then_label);
-                let then_stub = self.has_args(then_call);
-                self.edge(else_call, if then_stub { None } else { next })?;
-                if then_stub {
-                    self.asm.bind(then_label);
-                    self.edge(then_call, next)?;
+                    let target = self.edge_target(then_call)?;
+                    self.branch_if(test, target);
+                    self.edge(else_call, next)?;
                 }
             }
             (Opcode::Return, _) => {
                 let signature = &func.signature;
                 let locations = abi::assign_returns(signature.call_conv, &signature.returns)?;
+                let mut pending = Vec::with_capacity(args.len());
                 for (&value, location) in args.iter().zip(locations) {
-                    self.load_location(value, location, e::SP, 0);
+                    let Location::Reg { class, reg } = location else {
+                        continue;
+                    };
+                    pending.push(Move {
+                        class,
+                        from: self.loc(value),
+                        to: Loc::Reg(class, reg),
+                    });
                 }
+                self.parallel(pending);
                 self.epilogue(self.pop);
                 self.asm.emit(e::RET);
             }

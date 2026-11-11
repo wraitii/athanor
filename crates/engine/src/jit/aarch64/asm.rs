@@ -51,14 +51,18 @@ impl Assembler {
     }
 
     pub(super) fn branch(&mut self, cond: Cond, target: Label) {
+        self.conditional(e::b_cond(cond), e::b_cond(cond.invert()), target);
+    }
+
+    pub(super) fn conditional(&mut self, word: u32, inverted: u32, target: Label) {
         if self.far {
-            self.emit(e::b_cond(cond.invert()) | (2 << 5));
+            self.emit(inverted | (2 << 5));
             self.jump(e::B, target);
             return;
         }
         self.fixups
             .push((self.words.len() as u32, target, Fixup::Imm19));
-        self.emit(e::b_cond(cond));
+        self.emit(word);
     }
 
     pub(super) fn conditional_overflow(&self) -> bool {
