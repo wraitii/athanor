@@ -200,6 +200,30 @@ Feedback requests are submitted at function return to the background compiler po
 once the function has completed eight calls. Earlier feedback remains pending until
 that threshold is reached; calls before feedback also count. An OSR request makes
 the enclosing function eligible immediately and queues it after the loop fragment.
+Inlining is enabled by default; set `JS_JIT_INLINE=0` to disable JS function
+inlining in every compilation tier (`EngineOptions::inlining`).
+Calls left after inlining can dispatch to up to four observed function targets.
+Each target uses its ordinary entry or a specialized variant guarded at the caller
+on integer/number inputs or observed receiver/input shapes. A variant is requested
+only for supported guards emitted at an optimized callee's entry. Caller shape
+hints can narrow a callee's polymorphic own-property feedback before this analysis;
+only hints that produce entry guards become part of the variant contract. Unknown targets
+keep using the generic call. Set `JS_JIT_CALL_VARIANTS=0` to disable this dispatch
+and variant selection (`EngineOptions::call_variants`). To keep polymorphic direct
+call dispatch while disabling specialized callee variants, set
+`JS_JIT_CALL_SPECIALIZATION=0` (`EngineOptions::call_specialization`).
+Variants compile on first guarded use, using the ordinary body until background
+compilation finishes. `JS_JIT_BACKGROUND=0` compiles them synchronously.
+New call targets and numeric guard failures replan both the ordinary body and its
+active specialized variants. Feedback received during compilation remains pending.
+`--planner` lists call alternatives, and specialized callee IR contains
+`entry-assume` facts rather than repeated input guards. Shape assumptions expire
+across writes and reentry; internal speculation retains its own guards.
+Named get caches keep up to four receiver shapes or builtin kinds, allocating
+extra entries only after the first. Overflow and repeated uncacheable reads switch
+the site to a persistent megamorphic mode. Feedback removes cache-hit speculation
+there and uses regular helper reads. Prototype guards and value retention still
+apply to every cached entry.
 Feedback recompilation and OSR multiply both the shared inlining instruction
 budget and the per-callee size limit by two; initial and prefetched compilation
 retain the base limits. Set

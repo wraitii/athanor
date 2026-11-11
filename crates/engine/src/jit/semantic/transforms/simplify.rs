@@ -45,7 +45,7 @@ pub(in crate::jit::semantic) fn simplify(function: &mut FunctionState, folder: &
                     }
                     None => {}
                 }
-                if let Op::Assume(value, ..) = graph.insts[inst].op {
+                if let Op::Assume(value, ..) | Op::EntryAssume(value, _) = graph.insts[inst].op {
                     if uses[value] == 0 {
                         dead.push(inst);
                     }
@@ -87,10 +87,12 @@ fn fold_constant_branches(graph: &mut Graph, cfg: &Cfg) -> bool {
         else {
             continue;
         };
-        let Some(Op::Constant(Constant::Boolean(taken))) = graph.defining_op(*condition) else {
-            continue;
+        let taken = match graph.defining_op(*condition) {
+            Some(Op::Constant(Constant::Boolean(taken))) => *taken,
+            Some(Op::EntryAssume(..)) => true,
+            _ => continue,
         };
-        let target = if *taken { yes } else { no }.clone();
+        let target = if taken { yes } else { no }.clone();
         graph.blocks[block].terminator.as_mut().unwrap().kind = TerminatorKind::Jump(target);
         changed = true;
     }

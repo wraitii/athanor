@@ -46,6 +46,21 @@ pub(super) fn assumed(
 }
 
 impl Fact {
+    pub(super) fn test(self, value: Value) -> Option<Op> {
+        Some(match self {
+            Self::Type(types) if types == Types::NUMBER => Op::IsNumber(value),
+            Self::Type(types) if types == Types::INTEGER => Op::IsInteger(value),
+            Self::Type(types) if types == Types::STRING => Op::IsString(value),
+            Self::Type(types) if types == Types::UNDEFINED => Op::IsUndefined(value),
+            Self::Code(code) => Op::IsCode(value, code),
+            Self::Shape(shape) => Op::IsShape(value, shape),
+            Self::Typed(element) => Op::IsTyped(value, element),
+            Self::Indexed => Op::IsIndexed(value),
+            Self::Native(native) => Op::IsNative(value, native),
+            _ => return None,
+        })
+    }
+
     pub(super) fn mask(self) -> Option<Types> {
         match self {
             Self::Type(mask) => Some(mask),
@@ -84,6 +99,7 @@ pub(super) fn implies(op: &Op) -> Option<(Value, Fact)> {
         Op::IsNumber(value) => (value, Fact::Type(Types::NUMBER)),
         Op::IsInteger(value) => (value, Fact::Type(Types::INTEGER)),
         Op::IsCode(value, code) => (value, Fact::Code(code)),
+        Op::EntryAssume(value, fact) => (value, fact),
         Op::IsShape(value, shape) => (value, Fact::Shape(shape)),
         Op::IsTyped(value, element) => (value, Fact::Typed(element)),
         Op::IsIndexed(value) => (value, Fact::Indexed),
@@ -104,4 +120,22 @@ pub(super) fn edge_of(graph: &Graph, kind: &TerminatorKind) -> Option<Edge> {
     };
     let (value, fact) = implies(graph.defining_op(condition)?)?;
     Some(Edge { yes, value, fact })
+}
+
+pub(super) fn record_entry(graph: &mut Graph, value: Value, fact: Fact) {
+    use crate::jit::variants::{Fact as InputFact, Input};
+    let input = match graph.defining_op(value) {
+        Some(Op::This) => Input::This,
+        Some(Op::Argument(index)) => Input::Argument(*index),
+        _ => return,
+    };
+    let fact = match fact {
+        Fact::Type(types) if types == Types::NUMBER => InputFact::Number,
+        Fact::Type(types) if types == Types::INTEGER => InputFact::Integer,
+        Fact::Shape(shape) => InputFact::Shape(shape),
+        _ => return,
+    };
+    if !graph.entry_guards.contains(&(input, fact)) {
+        graph.entry_guards.push((input, fact));
+    }
 }

@@ -416,3 +416,41 @@ fn shaped_overwrites_release_replaced_values() {
         45855.0,
     );
 }
+
+#[test]
+fn polymorphic_gets_mix_builtin_methods_and_own_properties() {
+    check(
+        "function invoke(o){return o.slice(1).length;}
+        function main(){
+            const a={slice:function(n){return 'abcd';}};
+            const b=[0,1,2];
+            const c='abcde';
+            const d={pad:0,slice:function(n){return 'ab';}};
+            const objects=[a,b,c,d];
+            let sum=0;
+            for(let i=0;i<40;++i)sum+=invoke(objects[i%4]);
+            return sum;
+        }",
+        120.0,
+    );
+}
+
+#[test]
+fn polymorphic_prototype_gets_preserve_retained_values_after_overflow() {
+    check(
+        "function A(){} function B(){} function C(){} function D(){}
+        A.prototype.x={v:1}; B.prototype.x={v:2}; C.prototype.x={v:3}; D.prototype.x={v:4};
+        function read(o){return o.x;}
+        function main(){
+            const objects=[new A(),new B(),new C(),new D()];
+            let sum=0;
+            for(let i=0;i<40;++i)sum+=read(objects[i%4]).v;
+            const kept=[read(objects[0]),read(objects[1]),read(objects[2]),read(objects[3])];
+            A.prototype.x={v:100};
+            objects[1].x={v:200};
+            for(let i=0;i<4;++i)sum+=read(objects[i]).v+kept[i].v;
+            return sum;
+        }",
+        417.0,
+    );
+}

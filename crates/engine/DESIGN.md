@@ -250,21 +250,35 @@ closures carry a shape id other than `NO_SHAPE` or `DICTIONARY`, so a shape id
 alone fixes the value index of each own property. A count reaching zero resets
 the shape to `NO_SHAPE`, since disposal pops values without changing it.
 
-Each compiled named read has a monomorphic site cache holding the receiver's
-shape id, a holder address (zero for an own property), the holder's shape id and
-a value index. A shape's root fixes the prototype's address, and receivers keep
-their prototype alive, so matching both shapes fixes where the value lives.
-Generated code selects the holder (the receiver when the address is zero),
-compares both shapes (non-objects and the global object read the all-zero view)
-and loads the holder's value inline on a match; heap results are retained unless
-the read is borrowed or goes straight into a slot. An empty cache expects a
-dictionary receiver whose holder has no shape, which no receiver matches. A
-miss calls the generic read and refills the cache when the receiver or its
-direct prototype holds a shaped property of that name. Deeper chains and absent
-properties are not cached. Arena chunks stay mapped for the heap's lifetime, so
-a cached holder address is always safe to read. Writes, `in` and probes
-still go through helpers. Typed arrays provide contiguous
-numeric storage without per-element reference counting.
+Each compiled named read has a bounded polymorphic site cache. One entry is
+inline in the cache record; three more are allocated together when a second
+receiver shape or builtin kind appears. Each entry holds the receiver's shape,
+a holder address (zero for an own property), the holder's shape and a value index,
+or a builtin receiver kind and a borrowed native function. Builtin function
+values remain owned by the engine's native-function cache.
+
+A shape's root fixes the prototype's address, and receivers keep their prototype
+alive, so matching both shapes fixes where the value lives. Generated code checks
+the receiver before reading a cached holder and loads the current slot value on a
+match. Heap results are retained unless borrowed or stored directly in a slot.
+The separate semantic cache guard and load reselect the same stable entry by
+receiver; they do not communicate through mutable last-hit state. Entries are
+refreshed for prototype shape changes without consuming another receiver slot.
+Arena chunks remain mapped for the heap's lifetime.
+
+A refill caches shaped own or direct-prototype properties and returns the value
+from that lookup, avoiding a second generic read. Deeper prototype chains, absent
+properties and dictionary receivers use the generic helper. A fifth distinct
+receiver or eight uncacheable misses permanently marks the site megamorphic.
+Such a site skips probing and refilling the small cache. Existing entries remain
+allocated so an earlier dominating cache guard still supports its load.
+
+Megamorphic shape feedback is terminal and tracked per observing function, including
+inlined copies. Recompilation removes cache-hit speculation at the affected site
+and emits ordinary helper reads. Cache-miss paths have normal rather than cold
+block placement: they can be routine at a polymorphic or megamorphic site.
+Typed arrays provide contiguous numeric storage without per-element reference
+counting.
 
 Named writes pass a site cache to the heap helper. It caches the property's atom
 and the last receiver shape's own-slot lookup, including an absent slot. A weak
@@ -1810,3 +1824,101 @@ exception checks load fixed `JitCtx` fields inline. Scalar replacement of
 unescaped objects, general branch-sensitive facts, structural facts about loaded
 values (such as an array of `{x: number}`) and object kinds are not
 implemented.
+
+## Compiled variant identity
+
+Closures identify logical functions. `VariantId` identifies a stable entry slot,
+while `Entry` describes the native body currently implementing that slot.
+Compilation jobs, publication, direct-call targets, and current emission plans
+carry the variant separately from the logical function. Recompilation replaces
+the body without changing either identity; fallback addresses continue to name
+specific older bodies. OSR fragments retain their separate site-based entries.
+
+Ordinary variant slots equal logical function IDs, preserving generic dispatch
+stubs and the direct-entry layout. Specialized variants use stable atomic entry
+cells owned by a shared registry; their IDs identify those cells. The registry
+is shared across compiler snapshots and retains cells until engine shutdown.
+It interns contracts by logical function and ordered input requirements, bounded
+to four variants per function and 128 per engine. Ordinary and specialized native
+bodies are published independently. Warmup, pending feedback, and observations
+still belong to logical functions.
+
+After inlining, fixed-arity calls can select variants for integer/number inputs
+or observed shapes of the receiver and arguments. Requirements come from actual
+guards emitted for an optimized callee's entry, after versioning has applied its
+profitability checks. The shared assumption/versioning guard emitter reports its
+supported input facts; shape guard emission uses its existing preservation analysis
+to report input shape checks eligible at entry. Call specialization consumes this
+report rather than recognizing a second set of prologue instructions. Analysis
+disables inlining and nested call-variant selection, and is reused per target and
+offered input shapes within each caller plan. Caller shape hints come from explicit
+shape checks, entry assumptions, and monomorphic property feedback. They are planning
+hints, so callers still emit guards even when an intervening effect could have
+invalidated the original fact. The ordinary callee need not already have a matching
+entry guard: own-property feedback retains up to four shape/slot alternatives,
+and an offered shape can select one during contextual planning. Only supported
+guards emitted at entry enter the resulting contract; unused hints and guards
+after reentry are excluded. Prototype reads do not supply own-slot alternatives.
+Arithmetic uses or property feedback alone do not create requirements. Caller guards are explicit
+semantic branches, with the ordinary call as fallback. The callee retains the
+original closure and boxed ABI. Calls with rest/arguments, generators, exception
+handlers, lexical receiver resolution, or mismatched arity are excluded for now.
+Shape contracts use feedback available when the caller is compiled; callee
+feedback alone does not currently trigger recompilation of its callers.
+
+A specialized body starts with `EntryAssume` facts, distinct from the speculative
+`Assume` proposals. Numeric input facts persist through optimization. Shape facts
+participate in available-check analysis and expire across invalidating effects.
+The assumption's boolean result is always true, allowing redundant shape checks
+and branches to simplify without discarding the entry contract.
+
+First guarded use installs the ordinary body into the variant cell and requests
+optimized compilation. Execution continues through that body until the execution
+thread publishes the specialized entry. Synchronous compilation uses the same
+contract and publication path. Recursive calls reuse interned variants without
+waiting for their specialized bodies. Compilation failure retains the ordinary
+body. Variant choices are part of specialization-plan equality; fallback addresses
+still reference immutable body generations rather than mutable variant cells.
+
+`JS_JIT_CALL_VARIANTS=0` disables selection. Caller-side dispatch does not move
+unrelated internal guards or introduce context-specific feedback.
+
+### Guarded alternatives and polymorphic calls
+
+Semantic dispatch lowers a bounded list of guarded alternatives around an operation.
+Each alternative carries facts about evaluated SSA values and an implementation.
+The shared guard vocabulary produces tests, each miss advances to the next
+alternative, and all successful results join the original operation's continuation.
+The original operation remains the final fallback. Inlining, property and array
+transforms share the same operation-splitting helper. Unsupported fact tests reject
+an alternative before rewriting the graph.
+
+Calls currently use up to four observed code targets, in discovery order. Each
+contributes a code check, an optional variant with useful callee entry requirements,
+and an ordinary direct-call alternative. A contract miss therefore retains direct
+dispatch for the known function. Code checks are visible to semantic analysis;
+emission omits its defensive target check when dominating facts already establish
+that code. The actual closure and receiver are preserved on every path.
+
+Generic fallback calls retain observation until the target set reaches its bound.
+Observation caches suppress repeated identical callees; per-owner target-set
+versions prevent repeated recompilation without losing changes seen by another
+owner. Saturation freezes the selected set, leaving further targets generic.
+
+Call feedback growth and numeric despecialization share an update result indicating
+whether the policy changed and whether observation is complete. Caches separately
+count failures before disabling numeric speculation. Feedback changes replan the
+logical function's ordinary body and all active specialized variants, preserving
+immutable entry contracts. Background requests remain pending while any variant
+of that function is compiling and are reconsidered after publication. Synchronous
+invalidation clears variant cells so the next guarded call services pending work.
+
+This first use of guarded alternatives does not add polymorphic inlining or
+context-specific shape observations. Callee feedback remains shared; several
+receiver contracts for the same function need further feedback support.
+
+`JS_JIT_CALL_SPECIALIZATION=0` suppresses callee contract analysis and specialized
+variant requests while retaining bounded polymorphic direct-call dispatch and
+get PICs. It is independent of `JS_JIT_INLINE`; together these switches separate
+callee specialization from the other effects of inlining. Ordinary bodies retain
+their own speculative optimization and feedback recompilation.

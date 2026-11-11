@@ -22,6 +22,7 @@ mod semantic;
 mod session;
 mod temporaries;
 mod tiering;
+mod variants;
 
 pub(crate) use compiler::{CompilationTier, CompiledFunction, Compiler, RecompileJob};
 pub(crate) use entries::DirectEntries;

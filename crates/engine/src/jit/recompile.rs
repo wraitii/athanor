@@ -41,8 +41,20 @@ impl Log {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Key {
-    Function(u64),
+    Variant {
+        function: u64,
+        variant: super::entries::VariantId,
+    },
     Loop(usize),
+}
+
+impl Key {
+    pub(crate) fn ordinary(function: u64) -> Self {
+        Self::Variant {
+            function,
+            variant: super::entries::VariantId::ordinary(function),
+        }
+    }
 }
 
 pub(crate) struct Completion {
@@ -367,7 +379,7 @@ mod tests {
         .unwrap();
         assert_eq!(service.threads.len(), 4);
         let mut queue = scheduler::Queue::new();
-        let key = Key::Function(1);
+        let key = Key::ordinary(1);
         let ticket = queue.submit(key, Priority::Optimize, (), &[]);
         service.in_flight.insert(key, ticket);
         let shared = service.shared.clone();

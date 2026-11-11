@@ -157,36 +157,65 @@ pub(super) extern "C" fn js_property_get(
     Value::UNDEFINED
 }
 
-/// A named property read site. Generated code compares a receiver's shape with `shape` and
-/// the holder's (the receiver itself when `holder` is 0) with `holder_shape`; on a match it
-/// loads the holder's shaped value at `index`. A miss refills the cache from the receiver.
-/// An empty cache expects a dictionary receiver holding a property with no shape, which none do.
+pub(crate) const PROPERTY_CACHE_LIMIT: usize = 4;
+const PROPERTY_CACHE_MISS_LIMIT: u32 = 8;
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub(crate) struct PropertyCacheEntry {
+    shape: u32,
+    index: u32,
+    holder: u64,
+    holder_shape: u32,
+    builtin_kind: u32,
+    builtin_value: u64,
+}
+
+impl PropertyCacheEntry {
+    const EMPTY: Self = Self {
+        shape: crate::heap::DICTIONARY,
+        index: 0,
+        holder: 0,
+        holder_shape: crate::heap::NO_SHAPE,
+        builtin_kind: 0,
+        builtin_value: Value::UNDEFINED.bits(),
+    };
+
+    fn same_receiver(&self, other: &Self) -> bool {
+        self.builtin_kind == other.builtin_kind
+            && (self.builtin_kind != 0 || self.shape == other.shape)
+    }
+}
+
 #[repr(C)]
 pub(crate) struct PropertyCache {
-    pub(crate) initialized: u32,
-    pub(crate) shape: u32,
-    pub(crate) index: u32,
-    pub(crate) holder: u64,
-    pub(crate) holder_shape: u32,
-    pub(crate) builtin_kind: u32,
-    pub(crate) builtin_value: u64,
+    entry: PropertyCacheEntry,
+    // The box stays allocated, including after saturation; generated code reads its nullable pointer.
+    overflow: Option<Box<[PropertyCacheEntry; PROPERTY_CACHE_LIMIT - 1]>>,
+    len: u32,
+    megamorphic: u32,
+    misses: u32,
     pub(crate) name: Box<str>,
     write: crate::heap::PropertyWriteCache,
     observer: Option<(u64, crate::jit::profile::Site)>,
     reported: Option<ShapeAccess>,
 }
 
-pub(crate) const CACHE_INITIALIZED_OFFSET: i32 =
-    std::mem::offset_of!(PropertyCache, initialized) as i32;
-pub(crate) const CACHE_SHAPE_OFFSET: i32 = std::mem::offset_of!(PropertyCache, shape) as i32;
-pub(crate) const CACHE_INDEX_OFFSET: i32 = std::mem::offset_of!(PropertyCache, index) as i32;
-pub(crate) const CACHE_HOLDER_OFFSET: i32 = std::mem::offset_of!(PropertyCache, holder) as i32;
+pub(crate) const CACHE_LEN_OFFSET: i32 = std::mem::offset_of!(PropertyCache, len) as i32;
+pub(crate) const CACHE_MEGAMORPHIC_OFFSET: i32 =
+    std::mem::offset_of!(PropertyCache, megamorphic) as i32;
+pub(crate) const CACHE_OVERFLOW_OFFSET: i32 = std::mem::offset_of!(PropertyCache, overflow) as i32;
+pub(crate) const CACHE_ENTRY_OFFSET: i32 = std::mem::offset_of!(PropertyCache, entry) as i32;
+pub(crate) const CACHE_ENTRY_SIZE: i64 = std::mem::size_of::<PropertyCacheEntry>() as i64;
+pub(crate) const CACHE_SHAPE_OFFSET: i32 = std::mem::offset_of!(PropertyCacheEntry, shape) as i32;
+pub(crate) const CACHE_INDEX_OFFSET: i32 = std::mem::offset_of!(PropertyCacheEntry, index) as i32;
+pub(crate) const CACHE_HOLDER_OFFSET: i32 = std::mem::offset_of!(PropertyCacheEntry, holder) as i32;
 pub(crate) const CACHE_HOLDER_SHAPE_OFFSET: i32 =
-    std::mem::offset_of!(PropertyCache, holder_shape) as i32;
+    std::mem::offset_of!(PropertyCacheEntry, holder_shape) as i32;
 pub(crate) const CACHE_BUILTIN_KIND_OFFSET: i32 =
-    std::mem::offset_of!(PropertyCache, builtin_kind) as i32;
+    std::mem::offset_of!(PropertyCacheEntry, builtin_kind) as i32;
 pub(crate) const CACHE_BUILTIN_VALUE_OFFSET: i32 =
-    std::mem::offset_of!(PropertyCache, builtin_value) as i32;
+    std::mem::offset_of!(PropertyCacheEntry, builtin_value) as i32;
 
 const CACHE_ADDITION_OFFSET: i32 = std::mem::offset_of!(PropertyCache, write) as i32
     + std::mem::offset_of!(crate::heap::PropertyWriteCache, addition) as i32;
@@ -205,15 +234,17 @@ pub(crate) const CACHE_OVERWRITE_INDEX_OFFSET: i32 = CACHE_OVERWRITE_OFFSET
     + std::mem::offset_of!(crate::heap::PropertyOverwriteCache, index) as i32;
 
 impl PropertyCache {
-    pub(crate) fn new(name: &str, observer: Option<(u64, crate::jit::profile::Site)>) -> Self {
+    pub(crate) fn new(
+        name: &str,
+        observer: Option<(u64, crate::jit::profile::Site)>,
+        megamorphic: bool,
+    ) -> Self {
         Self {
-            initialized: 0,
-            shape: crate::heap::DICTIONARY,
-            index: 0,
-            holder: 0,
-            holder_shape: crate::heap::NO_SHAPE,
-            builtin_kind: 0,
-            builtin_value: Value::UNDEFINED.bits(),
+            entry: PropertyCacheEntry::EMPTY,
+            overflow: None,
+            len: 0,
+            megamorphic: u32::from(megamorphic),
+            misses: 0,
             write: Default::default(),
             name: name.into(),
             observer,
@@ -221,14 +252,33 @@ impl PropertyCache {
         }
     }
 
-    fn builtin(&mut self, heap: &crate::heap::Heap, receiver: Value) -> Option<Value> {
-        let (kind, function) = heap.builtin_property(receiver, &self.name)?;
-        let value = heap.native_function(function)?;
-        // The engine's native-function cache owns the reference backing this borrowed value.
-        heap.release(value);
-        self.builtin_kind = kind;
-        self.builtin_value = value.bits();
-        Some(value)
+    fn insert(&mut self, entry: PropertyCacheEntry) {
+        if self.len == 0 {
+            self.entry = entry;
+            self.len = 1;
+            return;
+        }
+        if self.entry.same_receiver(&entry) {
+            self.entry = entry;
+            return;
+        }
+        if let Some(overflow) = self.overflow.as_mut() {
+            for current in overflow.iter_mut().take(self.len as usize - 1) {
+                if current.same_receiver(&entry) {
+                    *current = entry;
+                    return;
+                }
+            }
+        }
+        if self.len as usize == PROPERTY_CACHE_LIMIT {
+            self.megamorphic = 1;
+            return;
+        }
+        let overflow = self
+            .overflow
+            .get_or_insert_with(|| Box::new([PropertyCacheEntry::EMPTY; PROPERTY_CACHE_LIMIT - 1]));
+        overflow[self.len as usize - 1] = entry;
+        self.len += 1;
     }
 
     fn fill(
@@ -237,17 +287,29 @@ impl PropertyCache {
         heap: &crate::heap::Heap,
         receiver: Value,
     ) -> Option<Value> {
-        if let Some(value) = self.builtin(heap, receiver) {
-            self.initialized = 1;
+        if self.megamorphic != 0 {
+            return None;
+        }
+        if let Some((kind, function)) = heap.builtin_property(receiver, &self.name) {
+            let value = heap.native_function(function)?;
+            // The engine's native-function cache owns the reference backing this borrowed value.
+            heap.release(value);
+            self.insert(PropertyCacheEntry {
+                builtin_kind: kind,
+                builtin_value: value.bits(),
+                ..PropertyCacheEntry::EMPTY
+            });
             self.observe(engine, PropertyAccess::Get, ShapeAccess::Varying);
             return Some(value);
         }
         if let Some(found) = heap.cached_property(receiver, &self.name) {
-            self.initialized = 1;
-            self.shape = found.shape;
-            self.index = found.index;
-            self.holder = found.holder;
-            self.holder_shape = found.holder_shape;
+            self.insert(PropertyCacheEntry {
+                shape: found.shape,
+                index: found.index,
+                holder: found.holder,
+                holder_shape: found.holder_shape,
+                ..PropertyCacheEntry::EMPTY
+            });
             self.observe(
                 engine,
                 PropertyAccess::Get,
@@ -260,9 +322,13 @@ impl PropertyCache {
                     ShapeAccess::Varying
                 },
             );
-        } else {
-            self.observe(engine, PropertyAccess::Get, ShapeAccess::Varying);
+            return Some(found.value);
         }
+        self.misses += 1;
+        if self.misses == PROPERTY_CACHE_MISS_LIMIT {
+            self.megamorphic = 1;
+        }
+        self.observe(engine, PropertyAccess::Get, ShapeAccess::Varying);
         None
     }
 
@@ -270,7 +336,15 @@ impl PropertyCache {
         let Some((owner, site)) = self.observer else {
             return;
         };
-        if self.reported == Some(ShapeAccess::Varying) || self.reported == Some(access) {
+        let access = if self.megamorphic != 0 {
+            ShapeAccess::Megamorphic
+        } else {
+            access
+        };
+        if self.reported == Some(ShapeAccess::Megamorphic)
+            || self.reported == Some(access)
+            || self.reported == Some(ShapeAccess::Varying) && access != ShapeAccess::Megamorphic
+        {
             return;
         }
         self.reported = Some(access);
@@ -667,5 +741,91 @@ pub(super) extern "C" fn js_property_key(ctx: *mut JitCtx, value: Value) -> Valu
             ctx.error = Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
             Value::UNDEFINED
         }
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use crate::{Engine, EngineOptions};
+
+    fn engine(source: &str) -> Engine {
+        let mut engine = Engine::with_options(EngineOptions {
+            inlining: false,
+            background_compile: false,
+            ..Default::default()
+        })
+        .unwrap();
+        engine.compile(source, "read-cache.js").unwrap();
+        engine
+    }
+
+    #[test]
+    fn read_cache_keeps_four_shapes_and_stops_refilling_on_overflow() {
+        let engine = engine(
+            "var a={x:1}; var b={pad:0,x:2}; var c={x:3,tail:0}; var d={one:0,two:0,x:4}; var e={x:5,last:0,other:0};",
+        );
+        let heap = engine.global().heap();
+        let mut cache = PropertyCache::new("x", None, false);
+        for (index, name) in ["a", "b", "c", "d"].into_iter().enumerate() {
+            let object = engine.global().get_raw(name).unwrap();
+            assert_eq!(
+                cache.fill(&engine, heap, object),
+                Some(Value::number((index + 1) as f64))
+            );
+            assert_eq!(cache.len, (index + 1) as u32);
+            assert_eq!(cache.megamorphic, 0);
+            assert_eq!(cache.overflow.is_none(), index == 0);
+        }
+        for name in ["d", "c", "b", "a"] {
+            let object = engine.global().get_raw(name).unwrap();
+            cache.fill(&engine, heap, object);
+            assert_eq!(cache.len, 4);
+            assert_eq!(cache.megamorphic, 0);
+        }
+        let fifth = engine.global().get_raw("e").unwrap();
+        assert_eq!(cache.fill(&engine, heap, fifth), Some(Value::number(5.0)));
+        assert_eq!(cache.megamorphic, 1);
+        let first = engine.global().get_raw("a").unwrap();
+        assert_eq!(cache.fill(&engine, heap, first), None);
+        assert_eq!(cache.len, 4);
+    }
+
+    #[test]
+    fn prototype_updates_refresh_an_entry_without_spending_another_shape() {
+        let mut engine = engine(
+            "function C(){} C.prototype.x=1; var a=new C(); function update(){C.prototype.pad=0;C.prototype.x=2;}",
+        );
+        let object = engine.global().get_raw("a").unwrap();
+        let mut cache = PropertyCache::new("x", None, false);
+        assert_eq!(
+            cache.fill(&engine, engine.global().heap(), object),
+            Some(Value::number(1.0))
+        );
+        let old_holder_shape = cache.entry.holder_shape;
+        engine.call("update", &[]).unwrap();
+        assert_eq!(
+            cache.fill(&engine, engine.global().heap(), object),
+            Some(Value::number(2.0))
+        );
+        assert_ne!(cache.entry.holder_shape, old_holder_shape);
+        assert_eq!(cache.len, 1);
+        assert!(cache.overflow.is_none());
+    }
+
+    #[test]
+    fn repeated_uncacheable_reads_switch_to_megamorphic_mode() {
+        let engine = engine("var dictionary={x:7,0:0};");
+        let object = engine.global().get_raw("dictionary").unwrap();
+        let mut cache = PropertyCache::new("x", None, false);
+        for _ in 0..PROPERTY_CACHE_MISS_LIMIT {
+            assert_eq!(cache.fill(&engine, engine.global().heap(), object), None);
+        }
+        assert_eq!(cache.megamorphic, 1);
+        assert_eq!(cache.len, 0);
+        assert!(cache.overflow.is_none());
+        let misses = cache.misses;
+        cache.fill(&engine, engine.global().heap(), object);
+        assert_eq!(cache.misses, misses);
     }
 }

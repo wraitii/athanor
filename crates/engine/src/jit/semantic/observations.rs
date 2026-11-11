@@ -43,11 +43,11 @@ pub(super) fn plan(
         .collect();
     let mut numbers = Vec::new();
     for block in cfg.rpo {
-        if graph.cold.contains(&block) {
-            continue;
-        }
         for inst in graph.blocks[block].insts.clone() {
             let data = &graph.insts[inst];
+            if graph.cold.contains(&block) && !matches!(data.op, Op::Call { target: None, .. }) {
+                continue;
+            }
             let site = Site {
                 source: data
                     .source_name
@@ -158,7 +158,15 @@ pub(super) fn plan(
                     repository.read_feedback.get(&(site, kind)).copied()
                 });
                 if observed.is_none()
-                    && specialization.is_some_and(|(repository, _)| repository.observed(site, kind))
+                    && specialization.is_some_and(|(repository, _)| {
+                        if kind == Observation::Call {
+                            repository.feedback.get(&site).is_some_and(|targets| {
+                                targets.len() == crate::jit::profile::CALL_TARGET_LIMIT
+                            })
+                        } else {
+                            repository.observed(site, kind)
+                        }
+                    })
                 {
                     continue;
                 }

@@ -105,7 +105,7 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
         unreachable!();
     };
     let callback = args[0];
-    let (block, continuation, fallback) = super::inlining::split_call(graph, inst);
+    let (block, continuation, fallback) = super::dispatch::split(graph, inst);
     let start = graph.blocks.push(BlockData::default());
     let header = graph.blocks.push(BlockData::default());
     let read = graph.blocks.push(BlockData::default());
@@ -329,7 +329,7 @@ pub(super) fn push_calls(
         else {
             unreachable!()
         };
-        let (block, continuation, fallback) = super::inlining::split_call(graph, inst);
+        let (block, continuation, fallback) = super::dispatch::split(graph, inst);
         let fast = graph.blocks.push(BlockData::default());
         let kind = if known_array {
             TerminatorKind::Jump(Target::new(fast))

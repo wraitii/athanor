@@ -36,8 +36,10 @@ pub(crate) enum ReadType {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ShapeAccess {
     Read { shape: u32, index: u32 },
+    PolymorphicRead { entries: [(u32, u32); 4], len: u8 },
     Overwrite { shape: u32, index: u32 },
     Varying,
+    Megamorphic,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -47,8 +49,50 @@ pub(crate) enum PropertyAccess {
 }
 
 impl ShapeAccess {
+    pub(crate) fn read(self, preferred: Option<u32>) -> Option<(u32, u32)> {
+        match self {
+            Self::Read { shape, index } => Some((shape, index)),
+            Self::PolymorphicRead { entries, len } => entries[..usize::from(len)]
+                .iter()
+                .copied()
+                .find(|&(shape, _)| Some(shape) == preferred),
+            _ => None,
+        }
+    }
+
     fn merge(self, other: Self) -> Self {
-        if self == other { self } else { Self::Varying }
+        let reads = |access| match access {
+            Self::Read { shape, index } => Some(([(shape, index); 4], 1)),
+            Self::PolymorphicRead { entries, len } => Some((entries, len)),
+            _ => None,
+        };
+        if let (Some((mut entries, mut len)), Some((incoming, count))) = (reads(self), reads(other))
+        {
+            for &entry in &incoming[..usize::from(count)] {
+                if entries[..usize::from(len)].contains(&entry) {
+                    continue;
+                }
+                if usize::from(len) == entries.len()
+                    || entries[..usize::from(len)]
+                        .iter()
+                        .any(|known| known.0 == entry.0)
+                {
+                    return Self::Varying;
+                }
+                entries[usize::from(len)] = entry;
+                len += 1;
+            }
+            if len > 1 {
+                entries[usize::from(len)..].fill((0, 0));
+                entries[..usize::from(len)].sort_unstable();
+                return Self::PolymorphicRead { entries, len };
+            }
+        }
+        match (self, other) {
+            (Self::Megamorphic, _) | (_, Self::Megamorphic) => Self::Megamorphic,
+            _ if self == other => self,
+            _ => Self::Varying,
+        }
     }
 }
 
@@ -59,11 +103,19 @@ pub(crate) enum Observation {
     NumberFailure,
 }
 
+pub(crate) struct Update {
+    pub(crate) changed: bool,
+    pub(crate) complete: bool,
+}
+
 pub(crate) const NUMBER_FAILURE_LIMIT: u64 = 8;
+pub(crate) const CALL_TARGET_LIMIT: usize = 4;
 
 #[repr(C)]
 pub(crate) struct ObservationCache {
-    pub(crate) recorded: u64,
+    pub(crate) complete: u64,
+    pub(crate) last_callee: u64,
+    pub(crate) failures: u64,
     pub(crate) owner: u64,
     pub(crate) site: Site,
 }
@@ -121,12 +173,14 @@ impl CallProfile {
 #[derive(Default)]
 pub(crate) struct Profile {
     calls: FxHashMap<*const CallSite, (Site, CallProfile)>,
-    targets: HashMap<Site, u64>,
+    targets: HashMap<Site, Vec<u64>>,
+    call_versions: HashMap<(u64, Site), usize>,
     natives: HashMap<Site, crate::heap::NativeFunction>,
     observed: HashSet<(u64, Site)>,
     reads: HashMap<(Site, ReadKind), ReadType>,
     observed_reads: HashSet<(u64, Site, ReadKind)>,
     shapes: HashMap<(Site, PropertyAccess), ShapeAccess>,
+    shape_versions: HashMap<(u64, Site, PropertyAccess), ShapeAccess>,
     number_first: HashSet<u64>,
 }
 
@@ -137,12 +191,17 @@ pub(crate) struct Recompiles {
 }
 
 impl Profile {
-    pub(crate) fn observe(&mut self, owner: u64, site: Site, target: u64) -> bool {
-        if !self.observed.insert((owner, site)) {
-            return false;
+    pub(crate) fn observe(&mut self, owner: u64, site: Site, target: u64) -> Update {
+        let targets = self.targets.entry(site).or_default();
+        if targets.len() < CALL_TARGET_LIMIT && !targets.contains(&target) {
+            targets.push(target);
         }
-        self.targets.entry(site).or_insert(target);
-        true
+        let changed =
+            self.call_versions.insert((owner, site), targets.len()) != Some(targets.len());
+        Update {
+            changed,
+            complete: targets.len() == CALL_TARGET_LIMIT,
+        }
     }
 
     pub(crate) fn observe_native(
@@ -181,16 +240,19 @@ impl Profile {
         owner: u64,
         site: Site,
         observed: ReadType,
-    ) -> bool {
+    ) -> Update {
         let key = (site, ReadKind::Number);
         let known = self.reads.get(&key).copied();
         let policy_changed = (observed == ReadType::Number || known == Some(ReadType::Integer))
             && self.number_first.insert(owner);
-        if known == Some(ReadType::Unknown) || known == Some(observed) {
-            return policy_changed;
+        let changed = known != Some(ReadType::Unknown) && known != Some(observed);
+        if changed {
+            self.reads.insert(key, observed);
         }
-        self.reads.insert(key, observed);
-        true
+        Update {
+            changed: changed || policy_changed,
+            complete: self.reads.get(&key) == Some(&ReadType::Unknown),
+        }
     }
 
     pub(super) fn number_first(&self) -> impl Iterator<Item = u64> + '_ {
@@ -199,17 +261,18 @@ impl Profile {
 
     pub(crate) fn observe_shape(
         &mut self,
+        owner: u64,
         site: Site,
         property: PropertyAccess,
         access: ShapeAccess,
     ) -> Option<ShapeAccess> {
         let known = self.shapes.get(&(site, property)).copied();
         let merged = known.map_or(access, |known| known.merge(access));
-        if known == Some(merged) {
-            return None;
+        let changed = self.shape_versions.insert((owner, site, property), merged) != Some(merged);
+        if known != Some(merged) {
+            self.shapes.insert((site, property), merged);
         }
-        self.shapes.insert((site, property), merged);
-        (known.is_some() || merged != ShapeAccess::Varying).then_some(merged)
+        (changed && (known.is_some() || merged != ShapeAccess::Varying)).then_some(merged)
     }
 
     pub(super) fn shapes(
@@ -249,8 +312,10 @@ impl Profile {
         merged.into_iter().collect()
     }
 
-    pub(super) fn targets(&self) -> impl Iterator<Item = (Site, u64)> + '_ {
-        self.targets.iter().map(|(&site, &target)| (site, target))
+    pub(super) fn targets(&self) -> impl Iterator<Item = (Site, &[u64])> + '_ {
+        self.targets
+            .iter()
+            .map(|(&site, targets)| (site, targets.as_slice()))
     }
 }
 
@@ -276,5 +341,118 @@ impl Recompiles {
 
     pub(crate) fn has_pending(&self) -> bool {
         self.pending_count != 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn site() -> Site {
+        Site {
+            source: 1,
+            start: 0,
+            end: 10,
+        }
+    }
+
+    #[test]
+    fn call_feedback_grows_to_a_bound_and_updates_each_owner() {
+        let mut profile = Profile::default();
+        assert!(profile.observe(1, site(), 10).changed);
+        assert!(!profile.observe(1, site(), 10).changed);
+        assert!(profile.observe(2, site(), 10).changed);
+        for target in 11..14 {
+            assert!(profile.observe(1, site(), target).changed);
+        }
+        let overflow = profile.observe(1, site(), 14);
+        assert!(!overflow.changed);
+        assert!(overflow.complete);
+        let other_owner = profile.observe(2, site(), 14);
+        assert!(other_owner.changed);
+        assert!(other_owner.complete);
+        assert!(!profile.observe(2, site(), 14).changed);
+        assert_eq!(profile.targets().next().unwrap().1, &[10, 11, 12, 13]);
+    }
+
+    #[test]
+    fn number_feedback_widens_and_stops_at_unknown() {
+        let mut profile = Profile::default();
+        profile.observe_get(1, site(), ReadKind::Number, ReadType::Integer);
+        let widened = profile.observe_number_failure(1, site(), ReadType::Number);
+        assert!(widened.changed);
+        assert!(!widened.complete);
+        assert!(
+            !profile
+                .observe_number_failure(1, site(), ReadType::Number)
+                .changed
+        );
+        let disabled = profile.observe_number_failure(1, site(), ReadType::Unknown);
+        assert!(disabled.changed);
+        assert!(disabled.complete);
+        let repeated = profile.observe_number_failure(1, site(), ReadType::Number);
+        assert!(!repeated.changed);
+        assert!(repeated.complete);
+        assert_eq!(profile.reads().next().unwrap().1, ReadType::Unknown);
+    }
+
+    #[test]
+    fn own_read_feedback_retains_bounded_shape_alternatives() {
+        let mut profile = Profile::default();
+        for shape in [30, 10, 20, 40] {
+            assert!(
+                profile
+                    .observe_shape(
+                        1,
+                        site(),
+                        PropertyAccess::Get,
+                        ShapeAccess::Read {
+                            shape,
+                            index: shape / 10
+                        }
+                    )
+                    .is_some()
+            );
+        }
+        for shape in [10, 20, 30, 40] {
+            assert!(
+                profile
+                    .observe_shape(
+                        1,
+                        site(),
+                        PropertyAccess::Get,
+                        ShapeAccess::Read {
+                            shape,
+                            index: shape / 10
+                        }
+                    )
+                    .is_none()
+            );
+            let access = profile.shapes().next().unwrap().1;
+            assert_eq!(access.read(Some(shape)), Some((shape, shape / 10)));
+            assert_eq!(access.read(None), None);
+        }
+        let fifth = ShapeAccess::Read {
+            shape: 50,
+            index: 5,
+        };
+        assert_eq!(
+            profile.observe_shape(1, site(), PropertyAccess::Get, fifth),
+            Some(ShapeAccess::Varying)
+        );
+        assert!(
+            profile
+                .observe_shape(1, site(), PropertyAccess::Get, fifth)
+                .is_none()
+        );
+        assert_eq!(
+            profile.observe_shape(1, site(), PropertyAccess::Get, ShapeAccess::Megamorphic),
+            Some(ShapeAccess::Megamorphic)
+        );
+        assert!(
+            profile
+                .observe_shape(1, site(), PropertyAccess::Get, fifth)
+                .is_none()
+        );
     }
 }

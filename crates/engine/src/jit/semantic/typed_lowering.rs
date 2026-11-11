@@ -26,7 +26,7 @@ pub(super) fn lower(function: &mut FunctionState) -> super::Result<bool> {
         let Op::TypedIndex(object, key, mut read) = data.op else {
             unreachable!()
         };
-        let (block, continuation, load) = super::inlining::split_call(graph, inst);
+        let (block, continuation, load) = super::dispatch::split(graph, inst);
         graph.cold.remove(&load);
         let bounds = graph.blocks.push(BlockData::default());
         let failure = graph.blocks.push(BlockData::default());

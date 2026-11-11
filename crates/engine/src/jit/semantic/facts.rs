@@ -176,7 +176,7 @@ impl Facts {
         self.assumed.contains_key(&value)
     }
 
-    pub(super) fn identity_at(&self, value: Value, block: Block) -> Identity {
+    pub(in crate::jit) fn identity_at(&self, value: Value, block: Block) -> Identity {
         if let Some(&code) = self.assumed.get(&value) {
             return Identity::Code(code);
         }
@@ -299,6 +299,17 @@ impl Facts {
         cfg: Cfg,
         candidates: &[(Value, guards::Fact)],
     ) -> Self {
+        let entry_facts: Vec<_> = cfg
+            .rpo
+            .iter()
+            .flat_map(|&block| &graph.blocks[block].insts)
+            .filter_map(|&inst| match graph.insts[inst].op {
+                Op::EntryAssume(value, fact) => Some((value, fact)),
+                _ => None,
+            })
+            .chain(candidates.iter().copied())
+            .collect();
+        let candidates = &entry_facts;
         let assumptions: HashMap<Value, Types> = candidates
             .iter()
             .filter_map(|&(value, fact)| Some((value, fact.mask()?)))
@@ -731,7 +742,10 @@ fn result_types(graph: &Graph, op: &Op, facts: &Facts) -> Types {
         Op::MapElement(..) => Types::ALL,
         Op::IsArrayIteration(..) => Types::BOOLEAN,
         Op::IteratorNext(_) | Op::EnumerateNext(_) => Types::ALL,
-        Op::IsUninitialized(_) | Op::IsPropertyCached(..) | Op::IsShape(..) => Types::BOOLEAN,
+        Op::EntryAssume(..)
+        | Op::IsUninitialized(_)
+        | Op::IsPropertyCached(..)
+        | Op::IsShape(..) => Types::BOOLEAN,
         Op::ProbeProperty(..)
         | Op::ProbeShapeProperty(..)
         | Op::ProbeIndex(..)

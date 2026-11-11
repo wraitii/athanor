@@ -150,28 +150,30 @@ impl Heap {
         Some(Value::from_bits(TAG_OBJECT | id))
     }
 
-    /// Where a site cache may find a property: on the receiver itself, or on its prototype.
+    /// Where a site cache may find a property, together with its borrowed current value.
     pub(crate) fn cached_property(&self, receiver: Value, name: &str) -> Option<CachedProperty> {
         let data = self.0.borrow();
         let id = heap_id(receiver)?;
         let shape = data.cacheable_shape(id)?;
         let atom = data.atoms.find(name)?;
-        if let Some(index) = data.shapes.get(shape).slot(atom) {
-            return Some(CachedProperty {
-                shape,
-                holder: 0,
-                holder_shape: shape,
-                index: index as u32,
-            });
-        }
-        let holder = heap_id(data.object(id)?.prototype?)?;
-        let holder_shape = data.cacheable_shape(holder)?;
-        let index = data.shapes.get(holder_shape).slot(atom)?;
+        let (holder, holder_shape, index) = if let Some(index) = data.shapes.get(shape).slot(atom) {
+            (0, shape, index)
+        } else {
+            let holder = heap_id(data.object(id)?.prototype?)?;
+            let holder_shape = data.cacheable_shape(holder)?;
+            let index = data.shapes.get(holder_shape).slot(atom)?;
+            (holder, holder_shape, index)
+        };
+        let owner = if holder == 0 { id } else { holder };
+        let PropertyView::Shaped { values, .. } = data.properties(owner)? else {
+            return None;
+        };
         Some(CachedProperty {
             shape,
             holder,
             holder_shape,
             index: index as u32,
+            value: *values.get(index)?,
         })
     }
 
@@ -670,6 +672,7 @@ impl Heap {
 /// A receiver's shape fixes its prototype's address, so a matching receiver and holder shape
 /// fix where the value lives. `holder` is 0 for an own property.
 pub(crate) struct CachedProperty {
+    pub(crate) value: Value,
     pub(crate) shape: u32,
     pub(crate) holder: u64,
     pub(crate) holder_shape: u32,

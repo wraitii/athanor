@@ -47,10 +47,16 @@ impl Graph {
             if sites.contains(location) {
                 entries.insert(
                     format!("feedback call {}", site_name(*location)),
-                    format!(
-                        "{target} ({})",
-                        repository.name(*target).unwrap_or("unknown")
-                    ),
+                    target
+                        .iter()
+                        .map(|target| {
+                            format!(
+                                "{target} ({})",
+                                repository.name(*target).unwrap_or("unknown")
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", "),
                 );
             }
         }
@@ -336,7 +342,14 @@ impl Graph {
                     None => format!("call {callee}({})", list(args)),
                 };
                 match target {
-                    Some(target) => format!("{call} direct={}", target.code),
+                    Some(target) => match target.variant {
+                        crate::jit::entries::VariantId::Ordinary(_) => {
+                            format!("{call} direct={}", target.code)
+                        }
+                        crate::jit::entries::VariantId::Specialized(_) => {
+                            format!("{call} direct={} specialized", target.code)
+                        }
+                    },
                     None => call,
                 }
             }
@@ -364,6 +377,7 @@ impl Graph {
                 let bounded = if read.bounded { " bounded" } else { "" };
                 format!("get_typed {object}[{key}]{element}{bounded}")
             }
+            Op::EntryAssume(value, fact) => format!("entry-assume {value} {fact:?}"),
             Op::Assume(value, fact, origin) => {
                 let site = origin
                     .site
@@ -595,10 +609,12 @@ impl FunctionState {
         let mut feedback = Vec::new();
         for (site, target) in &repository.feedback {
             if relevant(site) {
-                feedback.push(format!(
-                    "  call {site} -> {target} ({})",
-                    repository.name(*target).unwrap_or("unknown")
-                ));
+                for target in target {
+                    feedback.push(format!(
+                        "  call {site} -> {target} ({})",
+                        repository.name(*target).unwrap_or("unknown")
+                    ));
+                }
             }
         }
         for (site, native) in &repository.native_feedback {
@@ -628,6 +644,19 @@ impl FunctionState {
                 inline.arrow
             )
             .unwrap();
+        }
+        writeln!(out, "call alternatives: {}", self.plan.call_variants.len()).unwrap();
+        for (site, variant) in &self.plan.call_variants {
+            if let Some(variant) = repository.variants.get(*variant) {
+                writeln!(
+                    out,
+                    "  {site}: {} {:?}",
+                    variant.function, variant.requirements
+                )
+                .unwrap();
+            } else if let crate::jit::entries::VariantId::Ordinary(function) = variant {
+                writeln!(out, "  {site}: {function} ordinary").unwrap();
+            }
         }
         writeln!(out, "numeric observations: {}", self.plan.numbers.len()).unwrap();
         for (site, observed) in &self.plan.numbers {

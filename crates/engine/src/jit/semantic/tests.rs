@@ -1458,3 +1458,337 @@ fn unchanged_hoisting_preserves_facts() {
         &function.facts.fresh(&function.graph)
     ));
 }
+
+#[test]
+fn trusted_numeric_inputs_do_not_acquire_speculative_entry_guards() {
+    let mut function =
+        canonicalize_graph(lower_source("function f(x){return x*2;}").unwrap(), true).unwrap();
+    call_variants::assume(
+        &mut function.graph,
+        &vec![(
+            crate::jit::variants::Input::Argument(0),
+            crate::jit::variants::Fact::Number,
+        )],
+    );
+    let function = plan_canonical(function, true, None).unwrap();
+    let function = optimize_planned(
+        function,
+        Versioning::Speculate {
+            fallback: None,
+            continuations: true,
+        },
+        false,
+    )
+    .unwrap();
+    function.graph.verify().unwrap();
+    assert!(
+        ops(&function.graph)
+            .iter()
+            .any(|op| matches!(op, Op::EntryAssume(_, guards::Fact::Type(_))))
+    );
+    assert!(
+        !ops(&function.graph)
+            .iter()
+            .any(|op| matches!(op, Op::IsNumber(_)))
+    );
+}
+
+#[test]
+fn trusted_shapes_expire_after_writes_and_reentry() {
+    for source in [
+        "function f(object, mutate){let before=object.x; mutate(object);return object.x;}",
+        "function f(object){let before=object.x; object.extra=1;return object.x;}",
+    ] {
+        let mut function = canonicalize_graph(lower_source(source).unwrap(), true).unwrap();
+        call_variants::assume(
+            &mut function.graph,
+            &vec![(
+                crate::jit::variants::Input::Argument(0),
+                crate::jit::variants::Fact::Shape(10),
+            )],
+        );
+        let reads: Vec<_> = Cfg::new(&function.graph)
+            .rpo
+            .into_iter()
+            .flat_map(|block| function.graph.blocks[block].insts.clone())
+            .filter_map(|inst| match function.graph.insts[inst].op {
+                Op::Get(object, _) => Some((inst, object)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reads.len(), 2);
+        for (inst, object) in reads {
+            let data = function.graph.insts[inst].clone();
+            let position = function.graph.blocks[data.block]
+                .insts
+                .iter()
+                .position(|&other| other == inst)
+                .unwrap();
+            function.graph.insert(
+                data.block,
+                position,
+                data.span,
+                Op::IsShape(object, 10),
+                true,
+            );
+        }
+        function.invalidate_cfg();
+        optimize::reuse_loads(&mut function);
+        function.graph.verify().unwrap();
+        assert_eq!(
+            ops(&function.graph)
+                .iter()
+                .filter(|op| matches!(op, Op::IsShape(_, 10)))
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn trusted_input_shapes_remove_redundant_callee_checks() {
+    let mut function = canonicalize_graph(
+        lower_source("function f(object){return object.x;}").unwrap(),
+        true,
+    )
+    .unwrap();
+    let mut repository = specialize::Repository::default();
+    for block in Cfg::new(&function.graph).rpo {
+        for &inst in &function.graph.blocks[block].insts {
+            let data = &function.graph.insts[inst];
+            if matches!(data.op, Op::Get(..)) {
+                repository.shape_feedback.insert(
+                    (
+                        crate::jit::profile::Site {
+                            source: 0,
+                            start: data.span.start,
+                            end: data.span.end,
+                        },
+                        crate::jit::profile::PropertyAccess::Get,
+                    ),
+                    crate::jit::profile::ShapeAccess::Read {
+                        shape: 10,
+                        index: 0,
+                    },
+                );
+            }
+        }
+    }
+    call_variants::assume(
+        &mut function.graph,
+        &vec![(
+            crate::jit::variants::Input::Argument(0),
+            crate::jit::variants::Fact::Shape(10),
+        )],
+    );
+    let function = plan_canonical(function, true, Some((&repository, 0))).unwrap();
+    let function = optimize_planned(
+        function,
+        Versioning::Speculate {
+            fallback: None,
+            continuations: true,
+        },
+        false,
+    )
+    .unwrap();
+    function.graph.verify().unwrap();
+    assert!(
+        ops(&function.graph)
+            .iter()
+            .any(|op| matches!(op, Op::ShapedGet(..)))
+    );
+    assert!(
+        !ops(&function.graph)
+            .iter()
+            .any(|op| matches!(op, Op::IsShape(..)))
+    );
+}
+
+#[test]
+fn caller_shapes_select_useful_polymorphic_callee_contracts() {
+    use crate::jit::profile::{PropertyAccess, ShapeAccess, Site};
+    use crate::jit::variants::{Fact as InputFact, Input};
+    for (source, useful) in [
+        ("function f(object){return object.x;}", true),
+        ("function f(object){return 1;}", false),
+        (
+            "function f(object, callback){callback();return object.x;}",
+            false,
+        ),
+    ] {
+        let function = canonicalize_graph(lower_source(source).unwrap(), true).unwrap();
+        let mut repository = specialize::Repository::default();
+        for block in Cfg::new(&function.graph).rpo {
+            for &inst in &function.graph.blocks[block].insts {
+                let data = &function.graph.insts[inst];
+                if matches!(data.op, Op::Get(..)) {
+                    repository.shape_feedback.insert(
+                        (
+                            Site {
+                                source: 0,
+                                start: data.span.start,
+                                end: data.span.end,
+                            },
+                            PropertyAccess::Get,
+                        ),
+                        ShapeAccess::PolymorphicRead {
+                            entries: [(10, 0), (20, 1), (0, 0), (0, 0)],
+                            len: 2,
+                        },
+                    );
+                }
+            }
+        }
+        assert!(
+            call_variants::requirements(
+                canonicalize_graph(lower_source(source).unwrap(), true).unwrap(),
+                &repository,
+                0
+            )
+            .unwrap()
+            .is_empty()
+        );
+        for shape in [10, 20, 30] {
+            let offered = vec![(Input::Argument(0), InputFact::Shape(shape))];
+            let contract = call_variants::contextual_requirements(
+                canonicalize_graph(lower_source(source).unwrap(), true).unwrap(),
+                &repository,
+                0,
+                &offered,
+            )
+            .unwrap();
+            assert_eq!(
+                contract,
+                if useful && shape != 30 {
+                    offered
+                } else {
+                    Vec::new()
+                },
+                "{source}, shape {shape}"
+            );
+            if contract.is_empty() {
+                continue;
+            }
+            let mut specialized = FunctionState::from_graph(function.graph.clone());
+            call_variants::assume(&mut specialized.graph, &contract);
+            let specialized = plan_canonical(specialized, true, Some((&repository, 0))).unwrap();
+            let specialized = optimize_planned(
+                specialized,
+                Versioning::Speculate {
+                    fallback: None,
+                    continuations: true,
+                },
+                false,
+            )
+            .unwrap();
+            assert!(ops(&specialized.graph).iter().any(
+                |op| matches!(op, Op::ShapedGet(_, _, index) if *index == u32::from(shape == 20))
+            ));
+            assert!(
+                !ops(&specialized.graph)
+                    .iter()
+                    .any(|op| matches!(op, Op::IsShape(..)))
+            );
+        }
+    }
+}
+
+#[test]
+fn call_variant_contracts_only_lift_entry_guards() {
+    use crate::jit::variants::{Fact as InputFact, Input};
+    for (source, expected) in [
+        (
+            "function f(x){return x*2;}",
+            vec![(Input::Argument(0), InputFact::Number)],
+        ),
+        ("function f(x){return x;}", vec![]),
+        ("function f(x, callback){callback();return x*2;}", vec![]),
+    ] {
+        let function = canonicalize_graph(lower_source(source).unwrap(), true).unwrap();
+        assert_eq!(
+            call_variants::requirements(function, &specialize::Repository::default(), 0).unwrap(),
+            expected,
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn call_variant_contracts_do_not_lift_shape_guards_after_reentry() {
+    use crate::jit::profile::{PropertyAccess, ShapeAccess, Site};
+    use crate::jit::variants::{Fact as InputFact, Input};
+    for (source, expected) in [
+        (
+            "function f(object){return object.x;}",
+            vec![(Input::Argument(0), InputFact::Shape(10))],
+        ),
+        (
+            "function f(object, callback){callback();return object.x;}",
+            vec![],
+        ),
+        (
+            "function f(flag, object){if(flag)return object.x;return 0;}",
+            vec![],
+        ),
+    ] {
+        let function = canonicalize_graph(lower_source(source).unwrap(), true).unwrap();
+        let mut repository = specialize::Repository::default();
+        for block in Cfg::new(&function.graph).rpo {
+            for &inst in &function.graph.blocks[block].insts {
+                let data = &function.graph.insts[inst];
+                if matches!(data.op, Op::Get(..)) {
+                    repository.shape_feedback.insert(
+                        (
+                            Site {
+                                source: 0,
+                                start: data.span.start,
+                                end: data.span.end,
+                            },
+                            PropertyAccess::Get,
+                        ),
+                        ShapeAccess::Read {
+                            shape: 10,
+                            index: 0,
+                        },
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            call_variants::requirements(function, &repository, 0).unwrap(),
+            expected,
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn call_variant_contracts_respect_disabled_numeric_speculation() {
+    use crate::jit::profile::{ReadKind, ReadType, Site};
+    let function =
+        canonicalize_graph(lower_source("function f(x){return x*2;}").unwrap(), true).unwrap();
+    let mut repository = specialize::Repository::default();
+    for block in Cfg::new(&function.graph).rpo {
+        for &inst in &function.graph.blocks[block].insts {
+            let data = &function.graph.insts[inst];
+            if matches!(data.op, Op::Argument(_)) {
+                repository.read_feedback.insert(
+                    (
+                        Site {
+                            source: 0,
+                            start: data.span.start,
+                            end: data.span.end,
+                        },
+                        ReadKind::Number,
+                    ),
+                    ReadType::Unknown,
+                );
+            }
+        }
+    }
+    assert!(
+        call_variants::requirements(function, &repository, 0)
+            .unwrap()
+            .is_empty()
+    );
+}

@@ -17,11 +17,14 @@ pub(super) const SPECIALIZATION_BODY_INSTS: usize = 64;
 pub(super) const SPECIALIZATION_ROUNDS: usize = 2;
 pub(crate) const DEFAULT_RECOMPILE_INLINE_MULTIPLIER: usize = 4;
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(in crate::jit) struct Repository {
+    pub(in crate::jit) call_variants: bool,
+    pub(in crate::jit) call_specialization: bool,
+    pub(in crate::jit) variants: crate::jit::variants::Registry,
     bodies: HashMap<FuncId, Arc<Body>>,
     pub(in crate::jit) number_first: HashSet<FuncId>,
-    pub(in crate::jit) feedback: HashMap<crate::jit::profile::Site, FuncId>,
+    pub(in crate::jit) feedback: HashMap<crate::jit::profile::Site, Vec<FuncId>>,
     pub(in crate::jit) native_feedback:
         HashMap<crate::jit::profile::Site, crate::heap::NativeFunction>,
     pub(in crate::jit) read_feedback: HashMap<
@@ -40,6 +43,25 @@ pub(in crate::jit) struct Repository {
     pub(in crate::jit) sources: HashMap<usize, usize>,
 }
 
+impl Default for Repository {
+    fn default() -> Self {
+        Self {
+            call_variants: true,
+            call_specialization: true,
+            variants: Default::default(),
+            bodies: Default::default(),
+            number_first: Default::default(),
+            feedback: Default::default(),
+            native_feedback: Default::default(),
+            read_feedback: Default::default(),
+            shape_feedback: Default::default(),
+            locations: Default::default(),
+            globals: Default::default(),
+            sources: Default::default(),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Body {
     name: String,
@@ -50,6 +72,17 @@ struct Body {
 }
 
 impl Repository {
+    pub(in crate::jit) fn with_call_options(
+        call_variants: bool,
+        call_specialization: bool,
+    ) -> Self {
+        Self {
+            call_variants,
+            call_specialization,
+            ..Default::default()
+        }
+    }
+
     pub(in crate::jit) fn observed(
         &self,
         site: crate::jit::profile::Site,
@@ -787,8 +820,12 @@ fn call_target(
         start: data.span.start,
         end: data.span.end,
     };
-    if let Some(&target) = bodies.feedback.get(&site) {
-        return Some(target);
+    if let Some(target) = bodies
+        .feedback
+        .get(&site)
+        .and_then(|targets| targets.first())
+    {
+        return Some(*target);
     }
     match graph.defining_op(callee) {
         Some(Op::GlobalRead(name)) => bodies.globals.get(name).copied(),
@@ -800,6 +837,9 @@ fn call_target(
 pub(super) fn direct_calls(graph: &mut Graph, bodies: &Repository, source: usize) {
     let mut targets = Vec::new();
     for block in Cfg::new(graph).rpo {
+        if graph.cold.contains(&block) {
+            continue;
+        }
         for &call in &graph.blocks[block].insts {
             let Op::Call { callee, .. } = graph.insts[call].op else {
                 continue;
@@ -817,6 +857,7 @@ pub(super) fn direct_calls(graph: &mut Graph, bodies: &Repository, source: usize
             targets.push((
                 call,
                 DirectTarget {
+                    variant: crate::jit::entries::VariantId::ordinary(target.as_u32() as u64),
                     code: target,
                     arity,
                     lexical_this,
@@ -837,6 +878,9 @@ pub(super) fn requests(
     source: usize,
     budget: &Budget,
 ) -> Vec<Request> {
+    if budget.body_limit == 0 {
+        return Vec::new();
+    }
     let mut requests = Vec::new();
     for block in Cfg::new(graph).rpo {
         for &call in &graph.blocks[block].insts {
@@ -1396,7 +1440,7 @@ mod tests {
                         start: data.span.start,
                         end: data.span.end,
                     },
-                    FuncId::from_u32(0),
+                    vec![FuncId::from_u32(0)],
                 );
             }
         }
@@ -1438,7 +1482,7 @@ mod tests {
                         start: data.span.start,
                         end: data.span.end,
                     },
-                    FuncId::from_u32(0),
+                    vec![FuncId::from_u32(0)],
                 );
             }
         }

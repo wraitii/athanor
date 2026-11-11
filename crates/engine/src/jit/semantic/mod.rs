@@ -4,9 +4,11 @@ mod available;
 mod borrow;
 mod build;
 mod caches;
+pub(in crate::jit) mod call_variants;
 mod comparisons;
 mod construction;
 pub(in crate::jit) mod continuation;
+mod dispatch;
 pub(in crate::jit) mod facts;
 mod fresh;
 mod guards;
@@ -41,7 +43,7 @@ use super::math::METHODS;
 use crate::heap::TypedKind;
 
 pub(super) use borrow::receiver as borrowed_receiver;
-pub(super) use facts::{Facts, Identity, Types};
+pub(in crate::jit) use facts::{Facts, Identity, Types};
 pub(super) use ids::{Binding, Block, Inst, RegionId, Scope, Value};
 pub(in crate::jit) use listing::ListingLine;
 #[cfg(test)]
@@ -94,9 +96,12 @@ pub(super) struct Graph {
     pub(in crate::jit) borrowed: HashSet<Value>,
     pub(in crate::jit) summaries: std::sync::Arc<HashMap<cranelift_module::FuncId, CallSummary>>,
     pub(in crate::jit) cold: HashSet<Block>,
+    pub(in crate::jit) megamorphic_gets: HashSet<super::profile::Site>,
     pub(super) lazy_captures: HashSet<Binding>,
     pub(super) generator: bool,
     pub(super) has_assumes: bool,
+    // Input checks reported by the shared guard emitters for call specialization.
+    pub(super) entry_guards: crate::jit::variants::Requirements,
     /// Parameter count of a function whose entry takes its arguments in registers; `None` when
     /// it reads `arguments` or a rest parameter, or is a generator.
     pub(in crate::jit) arity: Option<u16>,
@@ -234,6 +239,7 @@ pub(super) enum ArrayMethod {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::jit) struct DirectTarget {
+    pub(in crate::jit) variant: crate::jit::entries::VariantId,
     pub(in crate::jit) code: cranelift_module::FuncId,
     pub(in crate::jit) arity: u16,
     pub(in crate::jit) lexical_this: bool,
@@ -249,6 +255,8 @@ pub(super) enum Op {
         super::profile::Site,
     ),
     Assume(Value, guards::Fact, guards::Origin),
+    // A caller-established fact, unlike the speculative proposals in Assume.
+    EntryAssume(Value, guards::Fact),
     OsrStart(std::sync::Arc<osr::Plan>, usize, Vec<Value>),
     Continuation(std::sync::Arc<continuation::Body>, Vec<Value>),
     ContinuationOutput(Value, usize),
@@ -458,7 +466,8 @@ impl Op {
             Op::ContinuationOutput(value, _)
             | Op::Observe(value, ..)
             | Op::ReadHint(value, ..)
-            | Op::Assume(value, ..) => ([Some(*value), None, None], &[]),
+            | Op::Assume(value, ..)
+            | Op::EntryAssume(value, _) => ([Some(*value), None, None], &[]),
             Op::Argument(_)
             | Op::Arguments
             | Op::Rest(_)
@@ -598,7 +607,8 @@ impl Op {
             Op::ContinuationOutput(value, _)
             | Op::Observe(value, ..)
             | Op::ReadHint(value, ..)
-            | Op::Assume(value, ..) => ([Some(value), None, None], &mut []),
+            | Op::Assume(value, ..)
+            | Op::EntryAssume(value, _) => ([Some(value), None, None], &mut []),
             Op::Argument(_)
             | Op::Arguments
             | Op::Rest(_)
@@ -1204,6 +1214,7 @@ impl Graph {
                 closed(INTERNAL, None)
             }
             Op::Assume(..) => closed(0, None),
+            Op::EntryAssume(..) => closed(0, Unowned),
             Op::NewInstance(_) => closed(ALLOCATION | INTERNAL | ERROR, Owned),
             Op::ConstructorResult(..) => closed(0, Borrowed),
             Op::Rest(_) | Op::Arguments => closed(ALLOCATION | INTERNAL | ERROR, Owned),
@@ -1508,6 +1519,7 @@ fn unsupported<T>(what: &str, span: Span) -> Result<T> {
 
 #[derive(Clone, Default, PartialEq, Eq)]
 pub(in crate::jit) struct SpecializationPlan {
+    pub(in crate::jit) call_variants: Vec<(super::profile::Site, super::entries::VariantId)>,
     pub(in crate::jit) inlines: Vec<specialize::Inline>,
     pub(in crate::jit) reads: Vec<reads::Read>,
     pub(in crate::jit) shapes: shapes::Plan,
@@ -1739,10 +1751,20 @@ pub(super) fn plan_canonical(
 }
 
 pub(super) fn plan_canonical_with_budget(
+    function: FunctionState,
+    ssa_opt: bool,
+    specialization: Option<(&specialize::Repository, usize)>,
+    inline_multiplier: usize,
+) -> Result<FunctionState> {
+    plan_canonical_inner(function, ssa_opt, specialization, inline_multiplier, true)
+}
+
+fn plan_canonical_inner(
     mut function: FunctionState,
     ssa_opt: bool,
     specialization: Option<(&specialize::Repository, usize)>,
     inline_multiplier: usize,
+    select_call_variants: bool,
 ) -> Result<FunctionState> {
     function.optimize = ssa_opt && !function.graph.has_handlers && !function.graph.generator;
     if !function.optimize {
@@ -1808,8 +1830,12 @@ pub(super) fn plan_canonical_with_budget(
         specialize::install_summaries(&mut function.graph, bodies, &mut function.notes);
     }
     function.invalidate_values();
+    let mut call_variants = Vec::new();
     if let Some((bodies, source)) = specialization {
         specialize::direct_calls(&mut function.graph, bodies, source);
+        if select_call_variants {
+            call_variants = call_variants::apply(&mut function.graph, bodies, source)?;
+        }
     }
     let numbers = observations::plan(&mut function.graph, specialization);
     let reads = specialization.map_or_else(Vec::new, |(bodies, source)| {
@@ -1827,6 +1853,7 @@ pub(super) fn plan_canonical_with_budget(
             arrays::push_calls(&mut function.graph, bodies, source, &mut function.notes)?;
     }
     function.plan = SpecializationPlan {
+        call_variants,
         conditional,
         inlines: inline_budget.inlines,
         reads,
@@ -1854,8 +1881,16 @@ pub(super) fn optimize_planned(
         function.ensure_facts();
         return Ok(function);
     }
+    function.graph.entry_guards.clear();
     function.invalidate_cfg();
-    caches::apply(&mut function.graph)?;
+    function.graph.megamorphic_gets = function
+        .plan
+        .shapes
+        .megamorphic_sites()
+        .iter()
+        .copied()
+        .collect();
+    caches::apply(&mut function.graph, &function.plan.shapes)?;
     reads::apply(
         &mut function.graph,
         &function.plan.reads,
@@ -1939,6 +1974,14 @@ pub(super) fn optimize_planned(
         &function.plan.shapes,
         &mut function.notes,
     )?;
+    if function
+        .graph
+        .insts
+        .values()
+        .any(|data| matches!(data.op, Op::EntryAssume(_, guards::Fact::Shape(_))))
+    {
+        optimize::reuse_loads(&mut function);
+    }
     optimize::views(&mut function);
     comparisons::expose(&mut function);
     function.graph.verify()?;

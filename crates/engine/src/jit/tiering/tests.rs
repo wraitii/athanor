@@ -21,14 +21,19 @@ fn code(engine: &Engine, name: &str) -> u64 {
 fn entry(engine: &Engine, code: u64) -> jit::entries::Entry {
     if !engine
         .tiering
-        .code
+        .variants
         .borrow()
-        .get(code as usize)
-        .is_some_and(Option::is_some)
+        .get(VariantId::ordinary(code))
+        .is_some()
     {
         engine.tiering.entry(code).unwrap().unwrap();
     }
-    engine.tiering.code.borrow()[code as usize].unwrap()
+    engine
+        .tiering
+        .variants
+        .borrow()
+        .get(VariantId::ordinary(code))
+        .unwrap()
 }
 
 #[test]
@@ -45,11 +50,9 @@ fn ordinary_functions_compile_on_first_call_across_sources() {
     assert!(
         engine
             .tiering
-            .code
+            .variants
             .borrow()
-            .get(first as usize)
-            .copied()
-            .flatten()
+            .get(VariantId::ordinary(first))
             .is_none()
     );
     engine
@@ -65,11 +68,9 @@ fn ordinary_functions_compile_on_first_call_across_sources() {
     assert!(
         engine
             .tiering
-            .code
+            .variants
             .borrow()
-            .get(first as usize)
-            .copied()
-            .flatten()
+            .get(VariantId::ordinary(first))
             .is_some()
     );
     assert_eq!(
@@ -79,11 +80,9 @@ fn ordinary_functions_compile_on_first_call_across_sources() {
     assert!(
         engine
             .tiering
-            .code
+            .variants
             .borrow()
-            .get(unused as usize)
-            .copied()
-            .flatten()
+            .get(VariantId::ordinary(unused))
             .is_none()
     );
 }
@@ -104,11 +103,9 @@ fn closure_creation_does_not_compile_its_body() {
     assert!(
         engine
             .tiering
-            .code
+            .variants
             .borrow()
-            .get(id as usize)
-            .copied()
-            .flatten()
+            .get(VariantId::ordinary(id))
             .is_none()
     );
     assert!(engine.tiering.compiler.borrow().has_lazy(id));
@@ -880,7 +877,9 @@ fn osr_request_queues_the_enclosing_function_before_return() {
         .unwrap();
     let site = unsafe { &*site };
     let mut cache = jit::profile::ObservationCache {
-        recorded: 0,
+        complete: 0,
+        last_callee: 0,
+        failures: 0,
         owner: code,
         site: location,
     };
@@ -902,7 +901,7 @@ fn osr_request_queues_the_enclosing_function_before_return() {
         assert!(
             worker
                 .in_flight
-                .contains_key(&jit::recompile::Key::Function(code))
+                .contains_key(&jit::recompile::Key::ordinary(code))
         );
     }
     finish_compilation(&engine);
@@ -920,7 +919,7 @@ fn osr_request_queues_the_enclosing_function_before_return() {
             .as_ref()
             .unwrap()
             .in_flight
-            .contains_key(&jit::recompile::Key::Function(code))
+            .contains_key(&jit::recompile::Key::ordinary(code))
     );
     finish_compilation(&engine);
 }
@@ -1022,7 +1021,9 @@ fn baseline_bodies_upgrade_without_specialization_changes() {
     .unwrap();
     let replacement = baseline.recompile(job).unwrap().unwrap();
     let unpublished = baseline.take_unpublished(replacement);
-    let (_, original) = engine
+    let jit::compiler::Installed {
+        entry: original, ..
+    } = engine
         .tiering
         .compiler
         .borrow_mut()
@@ -1030,10 +1031,9 @@ fn baseline_bodies_upgrade_without_specialization_changes() {
         .unwrap();
     engine
         .tiering
-        .code
+        .variants
         .borrow_mut()
-        .resize(code as usize + 1, None);
-    engine.tiering.code.borrow_mut()[code as usize] = Some(original);
+        .publish(VariantId::ordinary(code), original);
     assert_eq!(
         engine.call("f", &[Value::number(2.0)]).unwrap().value(),
         Value::number(3.0)
@@ -1051,8 +1051,14 @@ fn baseline_bodies_upgrade_without_specialization_changes() {
         .recompile(job)
         .unwrap()
         .unwrap();
-    let (_, optimized) = engine.tiering.compiler.borrow_mut().install(replacement);
-    engine.tiering.code.borrow_mut()[code as usize] = Some(optimized);
+    let jit::compiler::Installed {
+        entry: optimized, ..
+    } = engine.tiering.compiler.borrow_mut().install(replacement);
+    engine
+        .tiering
+        .variants
+        .borrow_mut()
+        .publish(VariantId::ordinary(code), optimized);
     assert_ne!(original.code, optimized.code);
     assert_eq!(
         engine.call("f", &[Value::number(2.0)]).unwrap().value(),
@@ -1143,7 +1149,12 @@ fn synchronous_compilation_prefetches_callees_exposed_by_inlining() {
         .compile("var holder={items:[3]};", "holder.js")
         .unwrap();
     let holder = engine.global().get_raw("holder").unwrap();
-    let entry = engine.tiering.code.borrow()[callee as usize].unwrap();
+    let entry = engine
+        .tiering
+        .variants
+        .borrow()
+        .get(VariantId::ordinary(callee))
+        .unwrap();
     let callable = engine.global().get_raw("callee").unwrap();
     let result =
         unsafe { jit::call(entry, &[holder], &engine, callable, Value::UNDEFINED) }.unwrap();
@@ -1204,7 +1215,11 @@ fn prefetched_closures_preserve_captures_and_lexical_this() {
     finish_compilation(&engine);
     assert!(!engine.tiering.compiler.borrow().has_lazy(closure));
     assert!(
-        engine.tiering.code.borrow()[closure as usize]
+        engine
+            .tiering
+            .variants
+            .borrow()
+            .get(VariantId::ordinary(closure))
             .unwrap()
             .lexical_this
     );
@@ -1255,7 +1270,7 @@ fn background_recompilation_starts_after_eight_returns_and_guards_replacements()
             .as_ref()
             .unwrap()
             .in_flight
-            .contains_key(&jit::recompile::Key::Function(code))
+            .contains_key(&jit::recompile::Key::ordinary(code))
     );
     engine
         .compile("function unrelated(){return 42;}", "later.js")
@@ -1338,7 +1353,7 @@ fn background_warmup_counts_direct_calls_before_feedback() {
             .as_ref()
             .unwrap()
             .in_flight
-            .contains_key(&jit::recompile::Key::Function(code))
+            .contains_key(&jit::recompile::Key::ordinary(code))
     );
     finish_compilation(&engine);
 }
@@ -1417,4 +1432,564 @@ fn background_versions_preserve_captures_heap_returns_and_foreign_errors() {
     engine.call("replace", &[]).unwrap();
     assert_eq!(engine.call("invoke", &[input]).unwrap().value(), input);
     finish_compilation(&engine);
+}
+
+#[cfg(test)]
+mod call_variant_tests {
+    use super::*;
+    use crate::jit::variants::{Fact, Input};
+    use crate::{Engine, Value};
+    use std::sync::atomic::Ordering;
+
+    fn engine(background_compile: bool) -> Engine {
+        Engine::with_options(EngineOptions {
+            inlining: false,
+            call_variants: true,
+            background_compile,
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    fn variants(engine: &Engine, name: &str) -> Vec<Arc<crate::jit::variants::Variant>> {
+        let code = engine
+            .global()
+            .heap()
+            .closure_code(engine.global().get_raw(name).unwrap())
+            .unwrap()
+            .0;
+        engine.tiering.compiler.borrow().variants_for_function(code)
+    }
+
+    fn selected(engine: &Engine, variant: VariantId) -> Vec<VariantId> {
+        engine
+            .tiering
+            .compiler
+            .borrow()
+            .specialization_plan(variant)
+            .unwrap()
+            .call_variants
+            .iter()
+            .map(|(_, variant)| *variant)
+            .collect()
+    }
+
+    #[test]
+    fn disabling_call_specialization_preserves_polymorphic_dispatch() {
+        let mut engine = Engine::with_options(EngineOptions {
+            inlining: false,
+            call_specialization: false,
+            call_variants: true,
+            background_compile: false,
+            ..Default::default()
+        })
+        .unwrap();
+        engine.compile("function a(x){return x+x;} function b(x){return x*3;} function invoke(f,x){return f(x);}", "unspecialized-dispatch.js").unwrap();
+        for _ in 0..8 {
+            for (name, expected) in [("a", 4.0), ("b", 6.0)] {
+                let callable = engine.global().get_raw(name).unwrap();
+                assert_eq!(
+                    engine
+                        .call("invoke", &[callable, Value::number(2.0)])
+                        .unwrap()
+                        .value(),
+                    Value::number(expected)
+                );
+            }
+        }
+        let invoke = code(&engine, "invoke");
+        engine.tiering.entry(invoke).unwrap();
+        let selected = selected(&engine, VariantId::ordinary(invoke));
+        for name in ["a", "b"] {
+            assert!(selected.contains(&VariantId::ordinary(code(&engine, name))));
+            assert!(variants(&engine, name).is_empty());
+        }
+        assert!(
+            selected
+                .iter()
+                .all(|variant| matches!(variant, VariantId::Ordinary(_)))
+        );
+    }
+
+    #[test]
+    fn caller_shapes_specialize_an_already_polymorphic_callee() {
+        for background in [false, true] {
+            let mut engine = engine(background);
+            engine.compile(
+                "function readX(o){return o.x;} function useA(o){return o.y+readX(o);} function useB(o){return o.y+readX(o);} function change(o){o.extra=1;} var a={x:1,y:10}; var b={y:20,x:2};",
+                "contextual-shapes.js",
+            ).unwrap();
+            finish_compilation(&engine);
+            let a = engine.global().get_raw("a").unwrap();
+            let b = engine.global().get_raw("b").unwrap();
+            for _ in 0..16 {
+                for (object, expected) in [(a, 1.0), (b, 2.0)] {
+                    assert_eq!(
+                        engine.call("readX", &[object]).unwrap().value(),
+                        Value::number(expected)
+                    );
+                }
+            }
+            finish_compilation(&engine);
+            for _ in 0..3 {
+                for _ in 0..16 {
+                    for (name, object, expected) in [("useA", a, 11.0), ("useB", b, 22.0)] {
+                        assert_eq!(
+                            engine.call(name, &[object]).unwrap().value(),
+                            Value::number(expected)
+                        );
+                    }
+                }
+                finish_compilation(&engine);
+            }
+            let specialized = variants(&engine, "readX");
+            assert_eq!(specialized.len(), 2);
+            for variant in &specialized {
+                assert!(matches!(
+                    variant.requirements.as_slice(),
+                    [(Input::Argument(0), Fact::Shape(_))]
+                ));
+                assert_ne!(variant.entry.load(Ordering::Acquire), 0);
+            }
+            for (name, object, expected) in [("useA", b, 22.0), ("useB", a, 11.0)] {
+                assert_eq!(
+                    engine.call(name, &[object]).unwrap().value(),
+                    Value::number(expected)
+                );
+            }
+            engine.call("change", &[a]).unwrap();
+            for _ in 0..16 {
+                assert_eq!(
+                    engine.call("useA", &[a]).unwrap().value(),
+                    Value::number(11.0)
+                );
+            }
+            finish_compilation(&engine);
+        }
+    }
+
+    #[test]
+    fn megamorphic_gets_stop_speculating_on_cache_hits() {
+        for background in [false, true] {
+            let mut engine = engine(background);
+            let mut source = String::from(
+                "function value(){return this.value;} function invoke(o){return o.run();}",
+            );
+            for index in 0..6 {
+                source.push_str(&format!(
+                    "var o{index}={{run:value,value:{index},pad{index}:0}};"
+                ));
+            }
+            engine.compile(&source, "megamorphic-read.js").unwrap();
+            finish_compilation(&engine);
+            for _ in 0..8 {
+                for index in 0..6 {
+                    let object = engine.global().get_raw(&format!("o{index}")).unwrap();
+                    assert_eq!(
+                        engine.call("invoke", &[object]).unwrap().value(),
+                        Value::number(index as f64)
+                    );
+                }
+                finish_compilation(&engine);
+            }
+            let invoke = code(&engine, "invoke");
+            engine.tiering.entry(invoke).unwrap();
+            let compiler = engine.tiering.compiler.borrow();
+            let plan = compiler
+                .specialization_plan(VariantId::ordinary(invoke))
+                .unwrap();
+            assert!(!plan.shapes.megamorphic_sites().is_empty());
+            drop(compiler);
+            let settled = entry(&engine, invoke);
+            for _ in 0..4 {
+                for index in 0..6 {
+                    let object = engine.global().get_raw(&format!("o{index}")).unwrap();
+                    assert_eq!(
+                        engine.call("invoke", &[object]).unwrap().value(),
+                        Value::number(index as f64)
+                    );
+                }
+            }
+            finish_compilation(&engine);
+            assert_eq!(entry(&engine, invoke), settled);
+        }
+    }
+
+    #[test]
+    fn polymorphic_calls_learn_targets_and_bound_dispatch() {
+        for background in [false, true] {
+            for reverse in [false, true] {
+                let mut engine = engine(background);
+                engine.compile(
+                    "function a(x){return x+1;} function b(x){return x*2;} function c(x){return x-1;} function d(x){return x*3;} function e(x){return x+4;} function invoke(f,x){return f(x);}",
+                    "polymorphic.js",
+                ).unwrap();
+                finish_compilation(&engine);
+                let invoke = code(&engine, "invoke");
+                let mut targets = vec![("a", 11.0), ("b", 20.0), ("c", 9.0), ("d", 30.0)];
+                if reverse {
+                    targets.reverse();
+                }
+                for &(name, expected) in &targets {
+                    let callable = engine.global().get_raw(name).unwrap();
+                    for _ in 0..12 {
+                        assert_eq!(
+                            engine
+                                .call("invoke", &[callable, Value::number(10.0)])
+                                .unwrap()
+                                .value(),
+                            Value::number(expected)
+                        );
+                    }
+                    finish_compilation(&engine);
+                    engine.tiering.entry(invoke).unwrap();
+                }
+                let selected = selected(&engine, VariantId::ordinary(invoke));
+                for &(name, _) in &targets {
+                    assert!(
+                        selected.contains(&VariantId::ordinary(code(&engine, name))),
+                        "missing {name}"
+                    );
+                    assert!(
+                        !variants(&engine, name).is_empty(),
+                        "no variant for {name}, background={background}, reverse={reverse}"
+                    );
+                }
+                let settled = entry(&engine, invoke);
+                let fifth = engine.global().get_raw("e").unwrap();
+                for _ in 0..12 {
+                    assert_eq!(
+                        engine
+                            .call("invoke", &[fifth, Value::number(10.0)])
+                            .unwrap()
+                            .value(),
+                        Value::number(14.0)
+                    );
+                }
+                finish_compilation(&engine);
+                assert_eq!(entry(&engine, invoke), settled);
+            }
+        }
+    }
+
+    #[test]
+    fn specialized_callers_relearn_targets_and_widen_numeric_feedback() {
+        for background in [false, true] {
+            let mut engine = engine(background);
+            engine.compile(
+                "function a(x){return x+1;} function b(x){return x*2;} var task={run:a}; function dispatch(x){return this.task.run(x);} var holder={task:task,run:dispatch}; function outer(x){return holder.run(x);} function replace(){task.run=b;}",
+                "specialized-dispatch.js",
+            ).unwrap();
+            finish_compilation(&engine);
+            for _ in 0..16 {
+                engine.call("outer", &[Value::number(10.0)]).unwrap();
+            }
+            finish_compilation(&engine);
+            let dispatch = code(&engine, "dispatch");
+            let variants = variants(&engine, "dispatch");
+            assert!(!variants.is_empty());
+            engine.call("replace", &[]).unwrap();
+            for _ in 0..16 {
+                assert_eq!(
+                    engine
+                        .call("outer", &[Value::number(10.5)])
+                        .unwrap()
+                        .value(),
+                    Value::number(21.0)
+                );
+            }
+            finish_compilation(&engine);
+            engine.tiering.entry(dispatch).unwrap();
+            finish_compilation(&engine);
+            let b = VariantId::ordinary(code(&engine, "b"));
+            assert!(selected(&engine, VariantId::ordinary(dispatch)).contains(&b));
+            for variant in variants {
+                assert!(selected(&engine, variant.id()).contains(&b));
+                assert_ne!(variant.entry.load(Ordering::Acquire), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn polymorphic_dispatch_evaluates_operands_once_and_preserves_captures() {
+        let mut engine = engine(false);
+        engine.compile(
+            "var evaluations=0; function make(n){return function(x){return this.base+n+x;};} var first={base:10,run:make(1)}; var second={base:20,run:make(2)}; function third(x){return this.base-x;} var other={base:30,run:third}; function receiver(o){evaluations=evaluations+1;return o;} function argument(){evaluations=evaluations+1;return 3;} function invoke(o){return receiver(o).run(argument());} function count(){return evaluations;} function flip(o){o.run=third;return 3;} function mutate(o){return o.run(flip(o));}",
+            "polymorphic-order.js",
+        ).unwrap();
+        for _ in 0..8 {
+            for (name, expected) in [("first", 14.0), ("second", 25.0), ("other", 27.0)] {
+                let object = engine.global().get_raw(name).unwrap();
+                assert_eq!(
+                    engine.call("invoke", &[object]).unwrap().value(),
+                    Value::number(expected)
+                );
+            }
+        }
+        assert_eq!(
+            engine.call("count", &[]).unwrap().value(),
+            Value::number(48.0)
+        );
+        let first = engine.global().get_raw("first").unwrap();
+        assert_eq!(
+            engine.call("mutate", &[first]).unwrap().value(),
+            Value::number(14.0)
+        );
+        assert_eq!(
+            engine.call("mutate", &[first]).unwrap().value(),
+            Value::number(7.0)
+        );
+    }
+
+    #[test]
+    fn feedback_arriving_during_compilation_is_replanned() {
+        let mut engine = engine(true);
+        engine.compile(
+            "function a(x){return x+1;} function b(x){return x*2;} function c(x){return x-1;} function invoke(f,x){return f(x);}",
+            "pending-polymorphism.js",
+        ).unwrap();
+        finish_compilation(&engine);
+        let invoke = code(&engine, "invoke");
+        let a = engine.global().get_raw("a").unwrap();
+        for _ in 0..12 {
+            engine.call("invoke", &[a, Value::number(10.0)]).unwrap();
+        }
+        finish_compilation(&engine);
+        let site = engine.tiering.profile.borrow().targets().next().unwrap().0;
+        let mut cache = jit::profile::ObservationCache {
+            complete: 0,
+            last_callee: 0,
+            failures: 0,
+            owner: invoke,
+            site,
+        };
+        engine.tiering.observe_call(&mut cache, code(&engine, "b"));
+        engine.tiering.submit_compilation(invoke);
+        assert!(
+            engine
+                .tiering
+                .worker
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .in_flight
+                .contains_key(&jit::recompile::Key::ordinary(invoke))
+        );
+        engine.tiering.observe_call(&mut cache, code(&engine, "c"));
+        finish_compilation(&engine);
+        assert!(
+            selected(&engine, VariantId::ordinary(invoke))
+                .contains(&VariantId::ordinary(code(&engine, "c")))
+        );
+    }
+
+    #[test]
+    fn integer_failures_replan_specialized_bodies() {
+        for background in [false, true] {
+            let mut engine = engine(background);
+            engine.compile(
+                "function read(x){return this.value+x;} var holder={value:10,run:read}; function outer(x){return holder.run(x);} function fraction(){holder.value=0.5;}",
+                "variant-widening.js",
+            ).unwrap();
+            finish_compilation(&engine);
+            for _ in 0..16 {
+                engine.call("outer", &[Value::number(2.0)]).unwrap();
+            }
+            finish_compilation(&engine);
+            let variants = variants(&engine, "read");
+            assert!(!variants.is_empty());
+            engine.call("fraction", &[]).unwrap();
+            for _ in 0..16 {
+                assert_eq!(
+                    engine.call("outer", &[Value::number(2.0)]).unwrap().value(),
+                    Value::number(2.5)
+                );
+            }
+            finish_compilation(&engine);
+            engine.tiering.entry(code(&engine, "read")).unwrap();
+            finish_compilation(&engine);
+            for variant in variants {
+                let compiler = engine.tiering.compiler.borrow();
+                let plan = compiler.specialization_plan(variant.id()).unwrap();
+                assert!(
+                    plan.numbers
+                        .iter()
+                        .any(|(_, kind)| *kind == jit::profile::ReadType::Number)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn numeric_call_variants_preserve_guard_misses_and_callee_identity() {
+        let mut engine = engine(false);
+        engine
+            .compile(
+                r#"
+            function twice(x) { return x + x; }
+            function call(x) { return twice(x); }
+            function numeric() { return call(21); }
+            function text() { return call("a") === "aa"; }
+            function replaced() { twice = function(x) { return x + 1; }; return call(21); }
+        "#,
+                "numeric-variants.js",
+            )
+            .unwrap();
+        assert_eq!(
+            engine.call("numeric", &[]).unwrap().value(),
+            Value::number(42.0)
+        );
+        assert_eq!(
+            engine.call("call", &[Value::number(2.5)]).unwrap().value(),
+            Value::number(5.0)
+        );
+        let variants = variants(&engine, "twice");
+        assert_eq!(variants.len(), 1);
+        assert_eq!(
+            variants[0].requirements,
+            vec![(Input::Argument(0), Fact::Number)]
+        );
+        let specialized = variants[0].entry.load(Ordering::Acquire);
+        assert_ne!(specialized, 0);
+        assert_ne!(
+            specialized,
+            engine
+                .tiering
+                .entry(variants[0].function)
+                .unwrap()
+                .unwrap()
+                .code
+        );
+        engine.tiering.request_compilation(variants[0].function);
+        engine.tiering.entry(variants[0].function).unwrap();
+        assert_eq!(variants[0].entry.load(Ordering::Acquire), specialized);
+        assert_eq!(
+            engine.call("text", &[]).unwrap().value(),
+            Value::boolean(true)
+        );
+        assert_eq!(
+            engine.call("replaced", &[]).unwrap().value(),
+            Value::number(22.0)
+        );
+    }
+
+    #[test]
+    fn recursive_variants_reuse_their_entry_and_preserve_closure_captures() {
+        for background in [false, true] {
+            let mut engine = engine(background);
+            engine
+                .compile(
+                    r#"
+                function fib(n) { return n < 2 ? n : fib(n-1) + fib(n-2); }
+                function run() { return fib(12); }
+                function make(offset) { return function(n) { return n + offset; }; }
+                function call(f, n) { return f(n); }
+                function captures() { return call(make(10), 2) + call(make(20), 3); }
+            "#,
+                    "recursive-variants.js",
+                )
+                .unwrap();
+            assert_eq!(
+                engine.call("run", &[]).unwrap().value(),
+                Value::number(144.0)
+            );
+            assert_eq!(variants(&engine, "fib").len(), 1);
+            assert_eq!(
+                engine.call("captures", &[]).unwrap().value(),
+                Value::number(35.0)
+            );
+        }
+    }
+
+    #[test]
+    fn variants_preserve_owned_results_and_thrown_values() {
+        for background in [false, true] {
+            let mut engine = engine(background);
+            engine.compile(r#"
+                function pass(n, object) { if (n < 0) throw object; return object; }
+                function call(n, object) { return pass(n, object); }
+                function positive() { return call(1, {value:7}); }
+                function negative() { const payload = {value:9}; try { call(-1, payload); } catch (error) { return error === payload; } return false; }
+            "#, "variant-ownership.js").unwrap();
+            let result = engine.call("positive", &[]).unwrap();
+            finish_compilation(&engine);
+            assert_eq!(
+                engine.call("negative", &[]).unwrap().value(),
+                Value::boolean(true)
+            );
+            engine.drain_disposals(1000);
+            assert_eq!(
+                engine.global().heap().property(result.value(), "value"),
+                Some(Value::number(7.0))
+            );
+        }
+    }
+
+    #[test]
+    fn background_variants_publish_separately_from_ordinary_entries() {
+        let mut engine = engine(true);
+        engine
+            .compile(
+                "function twice(x){return x+x;} function run(){return twice(21);}",
+                "background-variant.js",
+            )
+            .unwrap();
+        assert_eq!(
+            engine.call("run", &[]).unwrap().value(),
+            Value::number(42.0)
+        );
+        let variants = variants(&engine, "twice");
+        assert_eq!(variants.len(), 1);
+        let variant = &variants[0];
+        assert_ne!(variant.entry.load(Ordering::Acquire), 0);
+        finish_compilation(&engine);
+        let specialized = engine.tiering.variants.borrow().get(variant.id()).unwrap();
+        let ordinary = engine.tiering.entry(variant.function).unwrap().unwrap();
+        assert_eq!(variant.entry.load(Ordering::Acquire), specialized.code);
+        assert_ne!(specialized.code, ordinary.code);
+        assert_eq!(
+            engine.call("run", &[]).unwrap().value(),
+            Value::number(42.0)
+        );
+    }
+
+    #[test]
+    fn receiver_shape_variants_keep_generic_calls_and_mutations_correct() {
+        let mut engine = engine(false);
+        engine
+            .compile(
+                r#"
+            function read() { return this.x; }
+            var same = {x:3, read:read};
+            var other = {pad:0, x:7, read:read};
+            function warmRead() { for (let i=0; i<32; ++i) same.read(); return same.read(); }
+        "#,
+                "shape-variants.js",
+            )
+            .unwrap();
+        engine.call("warmRead", &[]).unwrap();
+        engine
+            .compile(
+                r#"
+            function call(object) { return object.read(); }
+            function warm() { for (let i=0; i<32; ++i) call(same); return call(same); }
+            function changed() { same.extra=9; same.x=11; return call(same)+call(other); }
+        "#,
+                "shape-caller.js",
+            )
+            .unwrap();
+        assert_eq!(
+            engine.call("warm", &[]).unwrap().value(),
+            Value::number(3.0)
+        );
+        let variants = variants(&engine, "read");
+        assert!(variants.iter().any(|variant| matches!(
+            variant.requirements.as_slice(),
+            [(Input::This, Fact::Shape(_))]
+        ) && variant.entry.load(Ordering::Acquire) != 0));
+        assert_eq!(
+            engine.call("changed", &[]).unwrap().value(),
+            Value::number(18.0)
+        );
+    }
 }

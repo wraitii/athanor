@@ -11,9 +11,18 @@ use super::{
 pub(in crate::jit) struct Plan {
     source: usize,
     accesses: Vec<(Site, PropertyAccess, u32, u32)>,
+    megamorphic: Vec<Site>,
 }
 
 impl Plan {
+    pub(in crate::jit) fn megamorphic_sites(&self) -> &[Site] {
+        &self.megamorphic
+    }
+
+    pub(super) fn megamorphic(&self, graph: &Graph, inst: Inst) -> bool {
+        self.megamorphic.contains(&site(graph, inst, self.source))
+    }
+
     pub(super) fn accesses(&self) -> &[(Site, PropertyAccess, u32, u32)] {
         &self.accesses
     }
@@ -49,7 +58,28 @@ fn site(graph: &Graph, inst: Inst, source: usize) -> Site {
 
 pub(super) fn plan(graph: &Graph, bodies: &super::specialize::Repository, source: usize) -> Plan {
     let callees = graph.callees();
+    let assumed: HashMap<_, _> = graph.blocks[graph.entry]
+        .insts
+        .iter()
+        .filter_map(|&inst| match graph.insts[inst].op {
+            Op::EntryAssume(value, super::guards::Fact::Shape(shape)) => Some((value, shape)),
+            _ => None,
+        })
+        .collect();
     let mut accesses = Vec::new();
+    let mut megamorphic = Vec::new();
+    for (inst, data) in graph.insts.iter() {
+        if property_access(&data.op) != Some(PropertyAccess::Get) {
+            continue;
+        }
+        let site = site(graph, inst, source);
+        if bodies.shape_feedback.get(&(site, PropertyAccess::Get))
+            == Some(&ShapeAccess::Megamorphic)
+            && !megamorphic.contains(&site)
+        {
+            megamorphic.push(site);
+        }
+    }
     for block in Cfg::new(graph).rpo {
         if graph.cold.contains(&block) {
             continue;
@@ -63,9 +93,18 @@ pub(super) fn plan(graph: &Graph, bodies: &super::specialize::Repository, source
                 continue;
             }
             let site = site(graph, inst, source);
+            let object = match data.op {
+                Op::Get(object, _) | Op::ProbeProperty(object, _) | Op::Set(object, ..) => object,
+                _ => continue,
+            };
             let access = match (property, bodies.shape_feedback.get(&(site, property))) {
-                (PropertyAccess::Get, Some(&ShapeAccess::Read { shape, index }))
-                | (PropertyAccess::Set, Some(&ShapeAccess::Overwrite { shape, index })) => {
+                (PropertyAccess::Get, Some(&access)) => {
+                    let Some((shape, index)) = access.read(assumed.get(&object).copied()) else {
+                        continue;
+                    };
+                    (site, property, shape, index)
+                }
+                (PropertyAccess::Set, Some(&ShapeAccess::Overwrite { shape, index })) => {
                     (site, property, shape, index)
                 }
                 _ => continue,
@@ -75,7 +114,11 @@ pub(super) fn plan(graph: &Graph, bodies: &super::specialize::Repository, source
             }
         }
     }
-    Plan { source, accesses }
+    Plan {
+        source,
+        accesses,
+        megamorphic,
+    }
 }
 
 fn planned(graph: &Graph, plan: &Plan) -> HashMap<Inst, (Value, u32, u32)> {
@@ -233,6 +276,14 @@ fn guard_segment(
 ) {
     let first = graph.insts[segment.insts[0]].clone();
     let block = first.block;
+    let at_entry = block == graph.entry && {
+        let facts = Facts::compute(graph);
+        graph.blocks[block]
+            .insts
+            .iter()
+            .take_while(|&&inst| inst != segment.insts[0])
+            .all(|&inst| shape_preserving(graph, &facts, &graph.insts[inst].op))
+    };
     let last = *segment.insts.last().unwrap();
     let position = graph.blocks[block]
         .insts
@@ -318,6 +369,9 @@ fn guard_segment(
         } else {
             graph.blocks.push(BlockData::default())
         };
+        if at_entry {
+            super::guards::record_entry(graph, object, super::guards::Fact::Shape(shape));
+        }
         let check = graph.append_value(check_block, first.span, Op::IsShape(object, shape));
         graph.blocks[check_block].terminator = Some(Terminator {
             source_name: first.source_name,

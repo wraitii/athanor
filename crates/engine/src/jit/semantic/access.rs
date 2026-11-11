@@ -97,9 +97,9 @@ impl Access {
             Op::ProbeShapeProperty(object, ..) => {
                 (Locations::HEAP.union(Locations::CODE), Some(*object))
             }
-            Op::IsShape(object, _) | Op::IsPropertyCached(object, ..) => {
-                (Locations::CODE, Some(*object))
-            }
+            Op::EntryAssume(object, super::guards::Fact::Shape(_))
+            | Op::IsShape(object, _)
+            | Op::IsPropertyCached(object, ..) => (Locations::CODE, Some(*object)),
             Op::GlobalRead(_) => (Locations::GLOBAL, None),
             _ => return None,
         };

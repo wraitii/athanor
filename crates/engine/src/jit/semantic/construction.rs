@@ -62,7 +62,7 @@ pub(super) fn expand(graph: &mut Graph, expanded: &mut HashSet<Inst>) {
             | Op::ConstructPackResolved(callee, prototype, _) => (callee, prototype),
             _ => unreachable!(),
         };
-        let (block, continuation, fallback) = super::inlining::split_call(graph, inst);
+        let (block, continuation, fallback) = super::dispatch::split(graph, inst);
         let fast = graph.blocks.push(BlockData::default());
         let (check, unresolved) =
             graph.append(block, data.span, Op::IsUninitialized(prototype), true);

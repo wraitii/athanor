@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use oxc_ast::ast::Program;
 use oxc_semantic::{AstNodes, Scoping};
 
+use super::entries::{VariantId, Variants};
 use crate::EngineOptions;
 use crate::error::Error;
 use crate::jit::{self, Compiler};
@@ -39,8 +40,7 @@ pub(crate) struct Tiering {
     compiler: RefCell<Compiler>,
     profile: RefCell<jit::Profile>,
     recompiles: RefCell<jit::Recompiles>,
-    // Code IDs are function indices in this engine's persistent Cranelift module.
-    code: RefCell<Vec<Option<jit::entries::Entry>>>,
+    variants: RefCell<Variants>,
     direct: jit::DirectEntries,
     overflow_calls: RefCell<HashMap<u64, usize>>,
 }
@@ -73,7 +73,7 @@ impl Tiering {
             )?),
             profile: RefCell::new(jit::Profile::default()),
             recompiles: RefCell::new(jit::Recompiles::default()),
-            code: RefCell::new(Vec::new()),
+            variants: RefCell::new(Variants::default()),
             direct,
             overflow_calls: RefCell::new(HashMap::new()),
         })
@@ -117,13 +117,9 @@ impl Tiering {
             .compiler
             .borrow_mut()
             .compile_program(program, scoping, nodes, source, filename)?;
-        let mut entries = self.code.borrow_mut();
+        let mut entries = self.variants.borrow_mut();
         for (code, entry) in code {
-            let index = usize::try_from(code).unwrap();
-            if entries.len() <= index {
-                entries.resize(index + 1, None);
-            }
-            entries[index] = Some(entry);
+            entries.publish(VariantId::ordinary(code), entry);
             self.publish(code, entry);
         }
         Ok((functions, globals, initializer))
@@ -155,18 +151,29 @@ impl Tiering {
     }
 
     pub(crate) fn observe_call(&self, cache: &mut jit::profile::ObservationCache, target: u64) {
-        let observed = self
+        let update = self
             .profile
             .borrow_mut()
             .observe(cache.owner, cache.site, target);
-        if observed {
-            self.log_recompilation(
-                cache.owner,
-                format_args!("call feedback site={} target={target}", cache.site),
-            );
+        let site = cache.site;
+        self.apply_feedback(
+            cache,
+            update,
+            format_args!("call feedback site={site} target={target}"),
+        );
+    }
+
+    fn apply_feedback(
+        &self,
+        cache: &mut jit::profile::ObservationCache,
+        update: jit::profile::Update,
+        event: std::fmt::Arguments<'_>,
+    ) {
+        cache.complete = u64::from(update.complete);
+        if update.changed {
+            self.log_recompilation(cache.owner, event);
             self.request_compilation(cache.owner);
         }
-        cache.recorded = 1;
     }
 
     pub(crate) fn observe_native(
@@ -174,14 +181,19 @@ impl Tiering {
         cache: &mut jit::profile::ObservationCache,
         target: crate::heap::NativeFunction,
     ) {
-        let observed = self
+        let changed = self
             .profile
             .borrow_mut()
             .observe_native(cache.owner, cache.site, target);
-        if observed {
-            self.request_compilation(cache.owner);
-        }
-        cache.recorded = 1;
+        let site = cache.site;
+        self.apply_feedback(
+            cache,
+            jit::profile::Update {
+                changed,
+                complete: false,
+            },
+            format_args!("native feedback site={site} target={target:?}"),
+        );
     }
 
     pub(crate) fn observe_get(
@@ -190,40 +202,37 @@ impl Tiering {
         observed: jit::profile::ReadType,
         kind: jit::profile::ReadKind,
     ) {
-        let recorded =
+        let changed =
             self.profile
                 .borrow_mut()
-                .observe_get(cache.owner, cache.site, kind, observed);
-        if recorded && observed != jit::profile::ReadType::Unknown {
-            self.log_recompilation(
-                cache.owner,
-                format_args!(
-                    "read feedback site={} kind={kind:?} type={observed:?}",
-                    cache.site
-                ),
-            );
-            self.request_compilation(cache.owner);
-        }
-        cache.recorded = 1;
+                .observe_get(cache.owner, cache.site, kind, observed)
+                && observed != jit::profile::ReadType::Unknown;
+        let site = cache.site;
+        self.apply_feedback(
+            cache,
+            jit::profile::Update {
+                changed,
+                complete: true,
+            },
+            format_args!("read feedback site={site} kind={kind:?} type={observed:?}"),
+        );
     }
 
     pub(crate) fn observe_number_failure(
         &self,
-        cache: &jit::profile::ObservationCache,
+        cache: &mut jit::profile::ObservationCache,
         observed: jit::profile::ReadType,
     ) {
-        if !self
-            .profile
-            .borrow_mut()
-            .observe_number_failure(cache.owner, cache.site, observed)
-        {
-            return;
-        }
-        self.log_recompilation(
-            cache.owner,
-            format_args!("number guard failure site={} type={observed:?}", cache.site),
+        let update =
+            self.profile
+                .borrow_mut()
+                .observe_number_failure(cache.owner, cache.site, observed);
+        let site = cache.site;
+        self.apply_feedback(
+            cache,
+            update,
+            format_args!("number guard failure site={site} type={observed:?}"),
         );
-        self.request_compilation(cache.owner);
     }
 
     pub(crate) fn observe_shape(
@@ -236,7 +245,7 @@ impl Tiering {
         let Some(merged) = self
             .profile
             .borrow_mut()
-            .observe_shape(site, property, access)
+            .observe_shape(owner, site, property, access)
         else {
             return;
         };
@@ -252,7 +261,7 @@ impl Tiering {
             let compiling = self.worker.borrow().as_ref().is_some_and(|worker| {
                 worker
                     .in_flight
-                    .contains_key(&jit::recompile::Key::Function(code))
+                    .contains_key(&jit::recompile::Key::ordinary(code))
             });
             self.log_recompilation(
                 code,
@@ -271,7 +280,10 @@ impl Tiering {
             self.compilation_state
                 .fetch_or(jit::recompile::REQUESTED, Ordering::Relaxed);
         } else {
-            self.direct.withdraw(code);
+            self.direct.withdraw(VariantId::ordinary(code));
+            for variant in self.compiler.borrow().variants_for_function(code) {
+                variant.entry.store(0, Ordering::Release);
+            }
         }
     }
 
@@ -286,41 +298,39 @@ impl Tiering {
     }
 
     pub(crate) fn has_code(&self, code: u64) -> bool {
-        self.code
+        self.variants
             .borrow()
-            .get(code as usize)
-            .is_some_and(Option::is_some)
+            .get(VariantId::ordinary(code))
+            .is_some()
             || self.compiler.borrow().has_lazy(code)
     }
 
     pub(crate) fn entry(&self, code: u64) -> Result<Option<jit::entries::Entry>, Error> {
         self.poll_compilation();
         if !self.options.background_compile && self.recompiles.borrow_mut().take(code) {
-            let mut compiler = self.compiler.borrow_mut();
-            compiler.update_feedback(&self.profile.borrow());
-            let previous = self.code.borrow().get(code as usize).copied().flatten();
-            if let Some(previous) = previous
-                && let Some(job) = compiler.recompilation(code, previous)
-            {
-                match compiler.recompile(job) {
+            for job in self.recompilations(code) {
+                let replacement = self.compiler.borrow_mut().recompile(job);
+                match replacement {
                     Ok(Some(replacement)) => {
-                        let (code, entry) = compiler.install(replacement);
-                        self.code.borrow_mut()[code as usize] = Some(entry);
-                        self.recompile_log.event(format_args!(
-                            "installed code={code} function={} entry={:#x}",
-                            compiler.function_name(code),
-                            entry.code
-                        ));
+                        let installed = self.compiler.borrow_mut().install(replacement);
+                        self.variants
+                            .borrow_mut()
+                            .publish(installed.variant, installed.entry);
+                        self.publish_variant(installed.variant, installed.entry);
                     }
                     Ok(None) => {}
                     Err(error) => eprintln!("js jit: recompilation failed: {error}"),
                 }
             }
+            for variant in self.compiler.borrow().variants_for_function(code) {
+                if let Some(entry) = self.variants.borrow().get(variant.id()) {
+                    variant.publish(entry);
+                }
+            }
         }
-        let Ok(index) = usize::try_from(code) else {
-            return Ok(None);
-        };
-        let mut entry = self.code.borrow().get(index).copied().flatten();
+
+        let variant = VariantId::ordinary(code);
+        let mut entry = self.variants.borrow().get(variant);
         if entry.is_none() {
             entry = if self.options.background_compile {
                 self.wait_for_entry(code)?
@@ -328,11 +338,7 @@ impl Tiering {
                 self.compiler.borrow_mut().compile_lazy(code)?
             };
             if let Some(compiled) = entry {
-                let mut entries = self.code.borrow_mut();
-                if entries.len() <= index {
-                    entries.resize(index + 1, None);
-                }
-                entries[index] = Some(compiled);
+                self.variants.borrow_mut().publish(variant, compiled);
             }
             if entry.is_some() {
                 self.queue_callees(code);
@@ -374,7 +380,7 @@ impl Tiering {
             self.queue_callees(code);
             loop {
                 self.poll_compilation();
-                if let Some(entry) = self.code.borrow().get(code as usize).copied().flatten() {
+                if let Some(entry) = self.variants.borrow().get(VariantId::ordinary(code)) {
                     return Ok(Some(entry));
                 }
                 if let Some(error) = self.compilation_errors.borrow().get(&code) {
@@ -384,7 +390,7 @@ impl Tiering {
                 let service = service.as_mut().unwrap();
                 if !service
                     .in_flight
-                    .contains_key(&jit::recompile::Key::Function(code))
+                    .contains_key(&jit::recompile::Key::ordinary(code))
                 {
                     return Err(Error::Compile(format!(
                         "compilation produced no entry for code={code}"
@@ -489,9 +495,11 @@ impl Tiering {
             return;
         }
         if self.worker.borrow().as_ref().is_some_and(|worker| {
-            worker
-                .in_flight
-                .contains_key(&jit::recompile::Key::Function(code))
+            worker.in_flight.keys().any(|key| {
+                matches!(key,
+                    jit::recompile::Key::Variant { function, .. } if *function == code
+                )
+            })
         }) {
             return;
         }
@@ -503,17 +511,31 @@ impl Tiering {
             self.compilation_state
                 .fetch_and(!jit::recompile::REQUESTED, Ordering::Relaxed);
         }
-        let Some(previous) = self.code.borrow().get(code as usize).copied().flatten() else {
-            return;
-        };
+        for job in self.recompilations(code) {
+            if let Err(error) = self.enqueue_compilation(job, jit::recompile::Priority::Optimize) {
+                eprintln!("js jit: recompilation failed: {error}");
+            }
+        }
+    }
+
+    fn recompilations(&self, code: u64) -> Vec<jit::RecompileJob> {
         let mut compiler = self.compiler.borrow_mut();
         compiler.update_feedback(&self.profile.borrow());
-        let Some(job) = compiler.recompilation(code, previous) else {
-            return;
-        };
-        if let Err(error) = self.enqueue_compilation(job, jit::recompile::Priority::Optimize) {
-            eprintln!("js jit: recompilation failed: {error}");
+        let entries = self.variants.borrow();
+        let mut jobs = Vec::new();
+        if let Some(previous) = entries.get(VariantId::ordinary(code))
+            && let Some(job) = compiler.recompilation(code, previous)
+        {
+            jobs.push(job);
         }
+        for variant in compiler.variants_for_function(code) {
+            if let Some(previous) = entries.get(variant.id())
+                && let Some(job) = compiler.variant_compilation(variant.id(), previous)
+            {
+                jobs.push(job);
+            }
+        }
+        jobs
     }
 
     fn enqueue_compilation(
@@ -531,6 +553,47 @@ impl Tiering {
             )?);
         }
         service.as_mut().unwrap().submit(job, priority, &[])
+    }
+
+    pub(crate) fn variant_entry(&self, variant: &jit::variants::Variant) -> usize {
+        if variant.entry.load(Ordering::Acquire) != 0 {
+            return variant.entry.load(Ordering::Acquire);
+        }
+        let ordinary = match self.entry(variant.function) {
+            Ok(Some(entry)) if entry.adapter.is_some() && !entry.lexical_this => entry,
+            _ => return 0,
+        };
+        let current = variant.entry.load(Ordering::Acquire);
+        if current != 0 {
+            return current;
+        }
+        variant.publish(ordinary);
+        self.variants.borrow_mut().publish(variant.id(), ordinary);
+        let job = {
+            let mut compiler = self.compiler.borrow_mut();
+            compiler.update_feedback(&self.profile.borrow());
+            compiler.variant_compilation(variant.id(), ordinary)
+        };
+        let Some(job) = job else { return ordinary.code };
+        if self.options.background_compile {
+            if let Err(error) = self.enqueue_compilation(job, jit::recompile::Priority::Optimize) {
+                eprintln!("js jit: variant compilation failed: {error}");
+            }
+        } else {
+            let replacement = self.compiler.borrow_mut().recompile(job);
+            match replacement {
+                Ok(Some(replacement)) => {
+                    let installed = self.compiler.borrow_mut().install(replacement);
+                    self.variants
+                        .borrow_mut()
+                        .publish(installed.variant, installed.entry);
+                    variant.publish(installed.entry);
+                }
+                Ok(None) => {}
+                Err(error) => eprintln!("js jit: variant compilation failed: {error}"),
+            }
+        }
+        variant.entry.load(Ordering::Acquire)
     }
 
     pub(crate) fn osr_entered(&self, site: &jit::osr::Site) {
@@ -580,7 +643,7 @@ impl Tiering {
         if !self.options.background_compile {
             let mut compiler = self.compiler.borrow_mut();
             match compiler.recompile(job) {
-                Ok(Some(replacement)) => site.entry.set(compiler.install(replacement).1.code),
+                Ok(Some(replacement)) => site.entry.set(compiler.install(replacement).entry.code),
                 Ok(None) => {}
                 Err(error) => eprintln!("js jit: OSR compilation failed: {error}"),
             }
@@ -628,7 +691,7 @@ impl Tiering {
                             key,
                             result,
                         } = completion;
-                        if let jit::recompile::Key::Function(code) = key {
+                        if let jit::recompile::Key::Variant { function: code, .. } = key {
                             completed.push(code);
                         }
                         match result {
@@ -636,7 +699,12 @@ impl Tiering {
                                 let initial = compiled.initial();
                                 let installed =
                                     self.compiler.borrow_mut().install_unpublished(compiled);
-                                let Some((code, entry)) = installed else {
+                                let Some(jit::compiler::Installed {
+                                    function: code,
+                                    variant,
+                                    entry,
+                                }) = installed
+                                else {
                                     if initial && self.recompile_log.enabled() {
                                         self.prefetch_stats.borrow_mut().discarded += 1;
                                         self.recompile_log.event(format_args!(
@@ -647,7 +715,7 @@ impl Tiering {
                                     continue;
                                 };
                                 match key {
-                                    jit::recompile::Key::Function(_) => {
+                                    jit::recompile::Key::Variant { .. } => {
                                         if initial && self.recompile_log.enabled() {
                                             let mut stats = self.prefetch_stats.borrow_mut();
                                             stats.installed += 1;
@@ -657,14 +725,8 @@ impl Tiering {
                                                 format_args!("prefetch installed"),
                                             );
                                         }
-                                        {
-                                            let mut entries = self.code.borrow_mut();
-                                            if entries.len() <= code as usize {
-                                                entries.resize(code as usize + 1, None);
-                                            }
-                                            entries[code as usize] = Some(entry);
-                                        }
-                                        self.publish(code, entry);
+                                        self.variants.borrow_mut().publish(variant, entry);
+                                        self.publish_variant(variant, entry);
                                     }
                                     jit::recompile::Key::Loop(address) => {
                                         let site = unsafe { &*(address as *const jit::osr::Site) };
@@ -686,7 +748,7 @@ impl Tiering {
                             }
                             Ok(None) => {}
                             Err(error) => {
-                                if let jit::recompile::Key::Function(code) = key
+                                if let jit::recompile::Key::Variant { function: code, .. } = key
                                     && self.compiler.borrow().has_lazy(code)
                                 {
                                     self.compilation_errors.borrow_mut().insert(code, error);
@@ -711,9 +773,17 @@ impl Tiering {
     }
 
     pub(crate) fn publish(&self, code: u64, entry: jit::entries::Entry) {
+        self.publish_variant(VariantId::ordinary(code), entry);
+    }
+
+    fn publish_variant(&self, variant: VariantId, entry: jit::entries::Entry) {
+        if let Some(variant) = self.compiler.borrow().variant(variant) {
+            variant.publish(entry);
+            return;
+        }
         match entry.adapter {
-            Some(_) => self.direct.publish(code, entry),
-            None => self.direct.withdraw(code),
+            Some(_) => self.direct.publish(variant, entry),
+            None => self.direct.withdraw(variant),
         }
     }
 }

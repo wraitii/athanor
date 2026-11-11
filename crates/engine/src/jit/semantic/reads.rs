@@ -86,7 +86,7 @@ pub(super) fn apply(
             | Op::TypedIndex(object, key, TypedRead { element: None, .. }) => (object, key),
             _ => unreachable!(),
         };
-        let (block, continuation, fallback) = super::inlining::split_call(graph, read.inst);
+        let (block, continuation, fallback) = super::dispatch::split(graph, read.inst);
         let fast = if read.typed {
             let fast = graph.blocks.push(BlockData::default());
             let check = graph.append_value(block, data.span, Op::IsTyped(object, read.element));

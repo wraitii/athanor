@@ -73,26 +73,32 @@ impl FunctionCompiler<'_, '_> {
             Observation::NumberFailure => Helper::ObserveNumberFailure,
         };
         let address = self.function_data(crate::jit::profile::ObservationCache {
-            recorded: 0,
+            complete: 0,
+            last_callee: 0,
+            failures: 0,
             owner: feedback.owner,
             site,
         });
-        let recorded = self
+        let complete = self
             .b
             .ins()
             .load(types::I64, MemFlagsData::trusted(), address, 0);
         let observe = self.b.create_block();
         let next = self.b.create_block();
-        let recorded = if kind == Observation::NumberFailure {
-            self.b.ins().icmp_imm_u(
-                IntCC::UnsignedGreaterThanOrEqual,
-                recorded,
-                crate::jit::profile::NUMBER_FAILURE_LIMIT as i64,
-            )
+        let complete = if kind == Observation::Call {
+            let last = self.b.ins().load(
+                types::I64,
+                MemFlagsData::trusted(),
+                address,
+                std::mem::offset_of!(crate::jit::profile::ObservationCache, last_callee) as i32,
+            );
+            let same = self.b.ins().icmp(IntCC::Equal, value, last);
+            let complete = self.b.ins().icmp_imm_s(IntCC::NotEqual, complete, 0);
+            self.b.ins().bor(complete, same)
         } else {
-            recorded
+            complete
         };
-        self.b.ins().brif(recorded, next, &[], observe, &[]);
+        self.b.ins().brif(complete, next, &[], observe, &[]);
         self.b.switch_to_block(observe);
         self.call_helper(helper, &[value, address]);
         self.b.ins().jump(next, &[]);
@@ -204,7 +210,6 @@ impl FunctionCompiler<'_, '_> {
             .values()
             .map(|_| self.b.create_block())
             .collect();
-        let callees = graph.callees();
         let suspends = self.generator.is_some();
         let mut reprs: SecondaryMap<GraphValue, Repr> = SecondaryMap::with_default(Repr::Boxed);
         if !suspends {
@@ -602,6 +607,7 @@ impl FunctionCompiler<'_, '_> {
                                 Some(self.constant(Value::number(-1.0)))
                             }
                         }
+                        Op::EntryAssume(..) => Some(self.constant(Value::boolean(true))),
                         Op::ReadHint(..) | Op::Assume(..) => None,
                         Op::Observe(value, kind, site) => {
                             let value = get(self, *value);
@@ -974,7 +980,13 @@ impl FunctionCompiler<'_, '_> {
                                 !graph.borrowed.contains(&value)
                                     && !self.slot_owned(graph, &cx, value)
                             });
-                            Some(self.cached_property_load(object, address, retain))
+                            let builtins = match &graph.insts[*site].op {
+                                Op::Get(_, name) | Op::FillPropertyCache(_, _, name) => {
+                                    crate::heap::builtin_method(name)
+                                }
+                                _ => true,
+                            };
+                            Some(self.cached_property_load(object, address, retain, builtins))
                         }
                         Op::ShapedGet(object, _, index) => {
                             let object = get(self, *object);
@@ -992,12 +1004,14 @@ impl FunctionCompiler<'_, '_> {
                         }
                         Op::FillPropertyCache(object, site, name) => {
                             let object = get(self, *object);
-                            let address = self.property_cache(*site, name);
+                            let observer = self.property_observer(data);
+                            let address = self.property_cache(*site, name, observer);
                             Some(self.fill_property_cache(object, address))
                         }
                         Op::PrimePropertyCache(object, site, name) => {
                             let object = get(self, *object);
-                            let address = self.property_cache(*site, name);
+                            let observer = self.property_observer(data);
+                            let address = self.property_cache(*site, name, observer);
                             self.call_helper(Helper::PropertyCachePrime, &[object, address]);
                             None
                         }
@@ -1007,12 +1021,20 @@ impl FunctionCompiler<'_, '_> {
                                 !graph.borrowed.contains(&value)
                                     && !self.slot_owned(graph, &cx, value)
                             });
-                            let observer = data
-                                .result
-                                .is_none_or(|value| !callees.contains(&value))
-                                .then(|| self.property_observer(data))
-                                .flatten();
-                            Some(self.cached_property_get(object, name, retain, observer))
+                            let observer = self.property_observer(data);
+                            let site = crate::jit::profile::Site {
+                                source: data.source_name.map_or(self.source_name.0, |name| name.0),
+                                start: data.span.start,
+                                end: data.span.end,
+                            };
+                            let megamorphic = graph.megamorphic_gets.contains(&site);
+                            Some(self.cached_property_get(
+                                object,
+                                name,
+                                retain,
+                                observer,
+                                megamorphic,
+                            ))
                         }
                         Op::GetIndex(object, index)
                         | Op::TypedIndex(object, index, _)
@@ -1225,6 +1247,7 @@ impl FunctionCompiler<'_, '_> {
                             target,
                         } => {
                             let closure = graph.defining_op(*callee);
+                            let identity = cx.facts.identity_at(*callee, data.block);
                             let callee = get(self, *callee);
                             let receiver = receiver
                                 .map(|v| get(self, v))
@@ -1246,7 +1269,14 @@ impl FunctionCompiler<'_, '_> {
                                         .result
                                         .is_some_and(|value| self.slot_owned(graph, &cx, value));
                                     self.direct_call(
-                                        *target, callee, receiver, &args, data.span, owned,
+                                        *target,
+                                        callee,
+                                        receiver,
+                                        &args,
+                                        data.span,
+                                        owned,
+                                        identity
+                                            == crate::jit::semantic::Identity::Code(target.code),
                                     )?
                                 }
                                 None => self.generic_call(callee, receiver, &args, data.span)?,
@@ -1354,7 +1384,13 @@ impl FunctionCompiler<'_, '_> {
                         Op::ProbeProperty(object, name) => {
                             let object = get(self, *object);
                             let observer = self.property_observer(data);
-                            Some(self.cached_property_probe(object, name, observer))
+                            let site = crate::jit::profile::Site {
+                                source: data.source_name.map_or(self.source_name.0, |name| name.0),
+                                start: data.span.start,
+                                end: data.span.end,
+                            };
+                            let megamorphic = graph.megamorphic_gets.contains(&site);
+                            Some(self.cached_property_probe(object, name, observer, megamorphic))
                         }
                         Op::ProbeShapeProperty(object, _, shape, index) => {
                             let object = get(self, *object);
@@ -1855,7 +1891,8 @@ impl FunctionCompiler<'_, '_> {
             Op::IsPropertyCached(object, site, name) => {
                 let operand = self.operand(cx, *object);
                 let object = self.convert(operand, Repr::Boxed);
-                let address = self.property_cache(*site, name);
+                let observer = self.property_observer(data);
+                let address = self.property_cache(*site, name, observer);
                 if crate::heap::builtin_method(name) {
                     boolean(self.property_cache_hit(object, address))
                 } else {

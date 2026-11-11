@@ -71,6 +71,7 @@ define_helpers! {
     PackTake => Binary, js_pack_take;
     PackTakeOwned => Binary, js_pack_take_owned;
     CompilePoll => Nullary, js_compile_poll;
+    VariantEntry => Pointer, js_variant_entry;
     OsrPoll => Callable, js_osr_poll;
     CompileLeave => Unary, js_compile_leave;
     Instanceof => Binary, js_instanceof;
@@ -193,6 +194,13 @@ define_helpers! {
     UnaryNegation => Unary, js_unary_negation;
     LogicalNot => Unary, js_logical_not;
     BitwiseNot => Unary, js_bitwise_not;
+}
+
+extern "C" fn js_variant_entry(ctx: *mut JitCtx, variant: *const super::variants::Variant) -> u64 {
+    unsafe { &*ctx }
+        .engine
+        .tiering
+        .variant_entry(unsafe { &*variant }) as u64
 }
 
 extern "C" fn js_compile_poll(ctx: *mut JitCtx) -> Value {
@@ -730,14 +738,14 @@ extern "C" fn js_observe_number(ctx: *mut JitCtx, value: Value, cache: u64) -> V
 extern "C" fn js_observe_number_failure(ctx: *mut JitCtx, value: Value, cache: u64) -> Value {
     let context = unsafe { &*ctx };
     let cache = unsafe { &mut *(cache as *mut super::profile::ObservationCache) };
-    if cache.recorded >= super::profile::NUMBER_FAILURE_LIMIT {
+    if cache.complete != 0 {
         return Value::UNDEFINED;
     }
     let observed = if value.as_number().is_some() {
         super::profile::ReadType::Number
     } else {
-        cache.recorded += 1;
-        if cache.recorded < super::profile::NUMBER_FAILURE_LIMIT {
+        cache.failures += 1;
+        if cache.failures < super::profile::NUMBER_FAILURE_LIMIT {
             return Value::UNDEFINED;
         }
         super::profile::ReadType::Unknown
@@ -757,7 +765,7 @@ fn observe_read(
 ) -> Value {
     let context = unsafe { &*ctx };
     let cache = unsafe { &mut *(cache as *mut super::profile::ObservationCache) };
-    if cache.recorded == 0 {
+    if cache.complete == 0 {
         let heap = context.global.heap();
         let observed = if kind == super::profile::ReadKind::Number {
             value.as_number().map(|number| {
@@ -790,13 +798,12 @@ fn observe_read(
 extern "C" fn js_observe_call(ctx: *mut JitCtx, callee: Value, cache: u64) -> Value {
     let context = unsafe { &*ctx };
     let cache = unsafe { &mut *(cache as *mut super::profile::ObservationCache) };
-    if cache.recorded == 0 {
+    if cache.complete == 0 {
+        cache.last_callee = callee.bits();
         if let Some(code) = context.global.heap().closure_code(callee) {
             context.engine.tiering.observe_call(cache, code.0);
         } else if let Some(native) = context.global.heap().native(callee) {
             context.engine.tiering.observe_native(cache, native);
-        } else {
-            cache.recorded = 1;
         }
     }
     Value::UNDEFINED

@@ -217,7 +217,7 @@ pub(super) fn expand(graph: &mut Graph, expanded: &mut HashSet<Inst>) {
         else {
             unreachable!()
         };
-        let (block, continuation, fallback) = super::inlining::split_call(graph, inst);
+        let (block, continuation, fallback) = super::dispatch::split(graph, inst);
         let fast = graph.blocks.push(BlockData::default());
         let (guard, check) = graph.append(block, data.span, Op::IsStringSplit(callee), true);
         graph.insts[guard].source_name = data.source_name;

@@ -694,6 +694,14 @@ fn entry_checks(
             }
             tested.insert(key);
         }
+        if entry.is_none()
+            && let Some((value, fact)) = test
+                .as_ref()
+                .or_else(|| graph.defining_op(condition))
+                .and_then(implies)
+        {
+            super::super::guards::record_entry(graph, value, fact);
+        }
         let otherwise = match &test {
             Some(Op::IsPropertyCached(object, site, name)) if fallback.is_some() => {
                 let prime = graph.blocks.push(BlockData::default());
@@ -752,6 +760,9 @@ fn entry_checks(
             continue;
         }
         tested.insert(guard);
+        if entry.is_none() {
+            super::super::guards::record_entry(graph, value, fact);
+        }
         let check = if fact == Fact::Type(Types::INTEGER) {
             Op::IsInteger(checked)
         } else {

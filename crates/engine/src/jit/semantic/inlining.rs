@@ -2,42 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use super::specialize::Inline;
 use super::{
-    Block, BlockData, Cfg, Constant, Graph, Inst, Op, Scope, ScopeKind, Target, Terminator,
-    TerminatorKind,
+    BlockData, Cfg, Constant, Graph, Inst, Op, Scope, ScopeKind, Target, Terminator, TerminatorKind,
 };
-
-pub(super) fn split_call(graph: &mut Graph, inst: Inst) -> (Block, Block, Block) {
-    let call = graph.insts[inst].clone();
-    let block = call.block;
-    let position = graph.blocks[block]
-        .insts
-        .iter()
-        .position(|&current| current == inst)
-        .unwrap();
-    let continuation = graph.blocks.push(BlockData::default());
-    if let Some(original) = call.result {
-        let result = graph.add_param(continuation);
-        graph.replace_uses(&HashMap::from([(original, result)]));
-    }
-    let tail = graph.blocks[block].insts.split_off(position + 1);
-    graph.blocks[continuation].insts = tail;
-    for &inst in &graph.blocks[continuation].insts {
-        graph.insts[inst].block = continuation;
-    }
-    graph.blocks[continuation].terminator = graph.blocks[block].terminator.take();
-    let fallback = graph.blocks.push(BlockData::default());
-    graph.move_inst(inst, fallback);
-    graph.blocks[fallback].terminator = Some(Terminator {
-        source_name: call.source_name,
-        span: call.span,
-        kind: TerminatorKind::Jump(Target {
-            block: continuation,
-            args: call.result.into_iter().collect(),
-        }),
-    });
-    graph.cold.insert(fallback);
-    (block, continuation, fallback)
-}
 
 fn scope_at(graph: &Graph, inst: Inst) -> Option<Scope> {
     let mut pending = vec![(graph.entry, Vec::new())];
@@ -142,7 +108,7 @@ pub(super) fn apply(graph: &mut Graph, body: &Graph, plan: &Inline) {
         .then(|| direct_captures(graph, plan.call, *callee))
         .flatten();
     let parent = scope_at(graph, plan.call);
-    let (block, continuation, fallback) = split_call(graph, plan.call);
+    let (block, continuation, fallback) = super::dispatch::split(graph, plan.call);
     let current = graph.blocks.push(BlockData::default());
     graph.blocks[block].terminator = Some(Terminator {
         source_name: call.source_name,

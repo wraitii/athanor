@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use super::{BlockData, Cfg, Graph, Op, Target, Terminator, TerminatorKind};
 
-pub(super) fn apply(graph: &mut Graph) -> super::Result<()> {
+pub(super) fn apply(graph: &mut Graph, shapes: &super::shapes::Plan) -> super::Result<()> {
     let guarded: HashSet<_> = graph
         .insts
         .values()
@@ -20,6 +20,7 @@ pub(super) fn apply(graph: &mut Graph) -> super::Result<()> {
                 graph.insts[inst].op,
                 Op::Get(_, ref name)
                     if name != "length"
+                        && !shapes.megamorphic(graph, inst)
                         && graph.insts[inst]
                             .result
                             .is_some_and(|value| guarded.contains(&value))
@@ -31,7 +32,8 @@ pub(super) fn apply(graph: &mut Graph) -> super::Result<()> {
         let Op::Get(object, name) = data.op else {
             unreachable!();
         };
-        let (block, continuation, fallback) = super::inlining::split_call(graph, inst);
+        let (block, continuation, fallback) = super::dispatch::split(graph, inst);
+        graph.cold.remove(&fallback);
         graph.insts[inst].op = Op::FillPropertyCache(object, inst, name.clone());
         let fast = graph.blocks.push(BlockData::default());
         let (check_inst, check) = graph.append(

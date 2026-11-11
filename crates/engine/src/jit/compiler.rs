@@ -21,7 +21,7 @@ use crate::EngineOptions;
 use crate::error::{Error, compile_at, unsupported_at};
 
 use super::clif::{Annotations, FunctionBody};
-use super::entries::Entry;
+use super::entries::{Entry, VariantId};
 use super::function_data::FunctionData;
 use super::{analysis::CaptureAnalysis, emit, jitdump, temporaries};
 
@@ -76,6 +76,7 @@ struct Emission {
 pub(crate) struct RecompileJob {
     pub(crate) tier: CompilationTier,
     pub(crate) code: FuncId,
+    variant: VariantId,
     initial: bool,
     previous: Entry,
     emission: Emission,
@@ -95,7 +96,10 @@ struct OsrRequest {
 impl RecompileJob {
     pub(crate) fn key(&self) -> super::recompile::Key {
         self.region.as_ref().map_or(
-            super::recompile::Key::Function(self.code.as_u32() as u64),
+            super::recompile::Key::Variant {
+                function: self.code.as_u32() as u64,
+                variant: self.variant,
+            },
             |region| super::recompile::Key::Loop(region.site),
         )
     }
@@ -103,10 +107,17 @@ impl RecompileJob {
 
 pub(crate) struct Replacement {
     code: FuncId,
+    variant: VariantId,
     initial: bool,
     entry: Entry,
     emission: Emission,
     region: bool,
+}
+
+pub(crate) struct Installed {
+    pub(crate) function: u64,
+    pub(crate) variant: VariantId,
+    pub(crate) entry: Entry,
 }
 
 pub(crate) struct Unpublished {
@@ -148,7 +159,7 @@ impl Drop for Compiler {
 pub(crate) struct Compiler {
     continuations: Vec<(FuncId, FunctionBody)>,
     log: super::recompile::Log,
-    emissions: HashMap<FuncId, Emission>,
+    emissions: HashMap<VariantId, Emission>,
     lazy: HashMap<FuncId, (Emission, Arc<super::semantic::specialize::Repository>)>,
     sources: Arc<HashMap<usize, Arc<(String, String)>>>,
     names: Vec<Box<str>>,
@@ -167,6 +178,7 @@ pub(crate) struct Compiler {
     dump: Option<jitdump::Writer>,
     dump_ir: bool,
     ssa_opt: bool,
+    inlining: bool,
     recompile_inline_multiplier: usize,
     osr: bool,
     speculative_continuations: bool,
@@ -181,6 +193,14 @@ pub(crate) struct Compiler {
 }
 
 impl Compiler {
+    #[cfg(test)]
+    pub(super) fn specialization_plan(
+        &self,
+        variant: VariantId,
+    ) -> Option<&super::semantic::SpecializationPlan> {
+        self.emissions.get(&variant).map(|emission| &emission.plan)
+    }
+
     #[cfg(test)]
     pub(crate) fn osr_transfers(&self) -> u64 {
         self.data
@@ -269,7 +289,10 @@ impl Compiler {
             data: Vec::new(),
             continuations: Vec::new(),
             source_name: (0, 0),
-            canonical: Arc::default(),
+            canonical: Arc::new(super::semantic::specialize::Repository::with_call_options(
+                options.call_variants,
+                options.call_specialization,
+            )),
             module,
             signature,
             fixed: HashMap::new(),
@@ -281,6 +304,7 @@ impl Compiler {
             dump,
             dump_ir,
             ssa_opt: options.ssa_opt,
+            inlining: options.inlining,
             recompile_inline_multiplier: options.recompile_inline_multiplier,
             get_refinement: options.get_refinement,
             specialization_log: options.specialization_log,
@@ -1022,8 +1046,11 @@ impl Compiler {
 
     pub(crate) fn update_feedback(&mut self, profile: &super::Profile) {
         if profile.targets().all(|(site, target)| {
-            u32::try_from(target).map_or(true, |target| {
-                self.canonical.feedback.get(&site) == Some(&FuncId::from_u32(target))
+            self.canonical.feedback.get(&site).is_some_and(|known| {
+                known
+                    .iter()
+                    .map(|target| u64::from(target.as_u32()))
+                    .eq(target.iter().copied())
             })
         }) && profile
             .natives()
@@ -1044,10 +1071,14 @@ impl Compiler {
             return;
         }
         let canonical = Arc::make_mut(&mut self.canonical);
-        for (site, target) in profile.targets() {
-            if let Ok(target) = u32::try_from(target) {
-                canonical.feedback.insert(site, FuncId::from_u32(target));
-            }
+        for (site, targets) in profile.targets() {
+            canonical.feedback.insert(
+                site,
+                targets
+                    .iter()
+                    .filter_map(|&target| u32::try_from(target).ok().map(FuncId::from_u32))
+                    .collect(),
+            );
         }
         for (site, target) in profile.natives() {
             canonical.native_feedback.insert(site, target);
@@ -1197,19 +1228,49 @@ impl Compiler {
     }
 
     pub(crate) fn recompilation(&self, code: u64, previous: Entry) -> Option<RecompileJob> {
+        let variant = VariantId::ordinary(code);
         let code = FuncId::from_u32(u32::try_from(code).ok()?);
         Some(RecompileJob {
             tier: CompilationTier::Optimized,
             region: None,
             code,
+            variant,
             initial: false,
             previous,
-            emission: self.emissions.get(&code)?.clone(),
+            emission: self.emissions.get(&variant)?.clone(),
             canonical: self.canonical.clone(),
             sources: self.sources.clone(),
             label: self.function_names.get(&code)?.clone(),
             queued_at: None,
         })
+    }
+
+    pub(crate) fn variants_for_function(
+        &self,
+        function: u64,
+    ) -> Vec<Arc<super::variants::Variant>> {
+        self.canonical.variants.for_function(function)
+    }
+
+    pub(crate) fn variant(&self, id: VariantId) -> Option<Arc<super::variants::Variant>> {
+        self.canonical.variants.get(id)
+    }
+
+    pub(crate) fn variant_compilation(
+        &self,
+        id: VariantId,
+        previous: Entry,
+    ) -> Option<RecompileJob> {
+        let variant = self.variant(id)?;
+        let mut job = self.recompilation(variant.function, previous)?;
+        job.variant = id;
+        if let Some(emission) = self.emissions.get(&id) {
+            job.emission = emission.clone();
+        } else {
+            job.emission.specialized = false;
+        }
+        job.label += &format!(".variant{:?}", variant.requirements);
+        Some(job)
     }
 
     pub(crate) fn osr_compilation(&self, site: &super::osr::Site) -> Option<RecompileJob> {
@@ -1276,6 +1337,7 @@ impl Compiler {
         let RecompileJob {
             tier,
             code,
+            variant,
             initial,
             previous,
             mut emission,
@@ -1287,7 +1349,7 @@ impl Compiler {
         } = job;
         self.canonical = canonical;
         self.sources = sources;
-        let (source, canonical) = if let Some(region) = &region {
+        let (source, mut canonical) = if let Some(region) = &region {
             (
                 emission.source_name.0,
                 super::semantic::FunctionState::from_graph(
@@ -1303,7 +1365,14 @@ impl Compiler {
             };
             canonical
         };
-        let inline_multiplier = if initial {
+        if region.is_none()
+            && let Some(variant) = self.variant(variant)
+        {
+            super::semantic::call_variants::assume(&mut canonical.graph, &variant.requirements);
+        }
+        let inline_multiplier = if !self.inlining {
+            0
+        } else if initial {
             1
         } else {
             self.recompile_inline_multiplier
@@ -1446,6 +1515,7 @@ impl Compiler {
         }
         Ok(Some(Replacement {
             code,
+            variant,
             initial,
             entry,
             emission,
@@ -1472,6 +1542,7 @@ impl Compiler {
             tier: CompilationTier::Optimized,
             region: None,
             code: id,
+            variant: VariantId::ordinary(code),
             initial: true,
             previous: Entry::generic(0),
             emission,
@@ -1488,7 +1559,7 @@ impl Compiler {
         };
         let id = FuncId::from_u32(index);
         let mut callees = self.canonical.callees(id);
-        if let Some(emission) = self.emissions.get(&id) {
+        if let Some(emission) = self.emissions.get(&VariantId::ordinary(code)) {
             for &callee in &emission.callees {
                 if !callees.contains(&callee) {
                     callees.push(callee);
@@ -1527,18 +1598,22 @@ impl Compiler {
         let Some(replacement) = result? else {
             return Ok(None);
         };
-        Ok(Some(self.install(replacement).1))
+        Ok(Some(self.install(replacement).entry))
     }
 
-    pub(crate) fn install(&mut self, replacement: Replacement) -> (u64, Entry) {
+    pub(crate) fn install(&mut self, replacement: Replacement) -> Installed {
         if replacement.initial {
             self.lazy.remove(&replacement.code);
         }
         if !replacement.region {
             self.emissions
-                .insert(replacement.code, replacement.emission);
+                .insert(replacement.variant, replacement.emission);
         }
-        (replacement.code.as_u32() as u64, replacement.entry)
+        Installed {
+            function: replacement.code.as_u32() as u64,
+            variant: replacement.variant,
+            entry: replacement.entry,
+        }
     }
 
     pub(crate) fn take_unpublished(&mut self, replacement: Replacement) -> Unpublished {
@@ -1550,7 +1625,7 @@ impl Compiler {
         }
     }
 
-    pub(crate) fn install_unpublished(&mut self, compiled: Unpublished) -> Option<(u64, Entry)> {
+    pub(crate) fn install_unpublished(&mut self, compiled: Unpublished) -> Option<Installed> {
         // Dispatch may have compiled this lazy body while the worker was running.
         if compiled.replacement.initial && !self.lazy.contains_key(&compiled.replacement.code) {
             return None;
@@ -1742,10 +1817,11 @@ impl Compiler {
                         self.ssa_opt,
                     ),
                 }?;
-                let planned = super::semantic::plan_canonical(
+                let planned = super::semantic::plan_canonical_with_budget(
                     canonical,
                     self.ssa_opt,
                     Some((&self.canonical, self.source_name.0)),
+                    usize::from(self.inlining),
                 )?;
                 specialization = self.specialization_entries(
                     name.0,
@@ -1786,7 +1862,7 @@ impl Compiler {
                 specialization.as_deref(),
             );
             self.emissions.insert(
-                code,
+                VariantId::ordinary(code.as_u32() as u64),
                 Emission {
                     tier: CompilationTier::Optimized,
                     specialized: true,
@@ -1840,7 +1916,7 @@ impl Compiler {
                     graph,
                     &self.canonical,
                     self.source_name.0,
-                    1,
+                    usize::from(self.inlining),
                 )
             }),
             listing: self
