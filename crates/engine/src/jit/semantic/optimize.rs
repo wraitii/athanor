@@ -8,9 +8,9 @@ use super::available;
 use super::guards;
 use super::js::NUMERIC;
 use super::{
-    Block, BlockData, Cfg, Constant, Facts, Graph, Inst, Native, Op, Region, RegionFallback,
-    RegionId, Result, Target, Terminator, TerminatorKind, TypedRead, Types, UnaryOp, Value,
-    ValueDef, resolve,
+    Block, BlockData, Cfg, Constant, Facts, FunctionState, Graph, Inst, Native, Op, Region,
+    RegionFallback, RegionId, Result, Target, Terminator, TerminatorKind, TypedRead, Types,
+    UnaryOp, Value, ValueDef, resolve,
 };
 use crate::heap::TypedKind;
 
@@ -158,7 +158,9 @@ pub(super) fn version_string_leaves(
         );
         notes.extend(version.notes.iter().cloned());
         let copy = version.body;
-        super::js::simplify(&mut candidate);
+        let mut function = FunctionState::new(candidate, Vec::new(), true);
+        super::js::simplify(&mut function);
+        let mut candidate = function.graph;
         candidate.verify()?;
         let reachable: HashSet<_> = Cfg::new(&candidate).rpo.into_iter().collect();
         let copy: HashSet<_> = copy.intersection(&reachable).copied().collect();
@@ -390,7 +392,6 @@ fn counts_up(
         terminator
             .kind
             .targets()
-            .iter()
             .filter(|target| target.block == header)
             .all(|target| {
                 let arg = target.args[index];
@@ -492,13 +493,20 @@ fn entry_assumes(
     checks
 }
 
-pub(super) fn reuse_loads(graph: &mut Graph, notes: &mut Vec<String>) {
+pub(super) fn reuse_loads(function: &mut FunctionState) {
+    let graph = &function.graph;
     if graph.has_handlers || graph.generator {
         return;
     }
-    let cfg = Cfg::new(graph);
-    let facts = Facts::compute(graph);
-    let Some(solved) = available::solve(graph, &facts, &cfg, graph.cold.clone(), false) else {
+    function.refresh_facts();
+    let FunctionState {
+        graph,
+        facts,
+        notes,
+        ..
+    } = function;
+    let cfg = &facts.cfg;
+    let Some(solved) = available::solve(graph, facts, cfg, graph.cold.clone(), false) else {
         return;
     };
     let aliases: HashMap<Value, Value> = solved
@@ -539,33 +547,35 @@ pub(super) fn natural_loops(graph: &Graph, cfg: &Cfg) -> Vec<(Block, HashSet<Blo
     loops
 }
 
-pub(super) fn normalise_regions(
-    graph: &mut Graph,
-    regions: &[RegionId],
-    notes: &mut Vec<String>,
-) -> Result<()> {
-    graph.verify()?;
-    super::js::simplify(graph);
-    graph.verify()?;
-    reuse_loads(graph, notes);
-    graph.verify()?;
+pub(super) fn normalise_regions(function: &mut FunctionState, regions: &[RegionId]) -> Result<()> {
+    function.graph.verify()?;
+    super::js::simplify(function);
+    function.graph.verify()?;
+    reuse_loads(function);
+    function.graph.verify()?;
     for region in regions {
-        hoist(graph, *region, notes);
-        graph.verify()?;
+        hoist(function, *region);
+        function.graph.verify()?;
     }
     Ok(())
 }
 
-pub(super) fn hoist(graph: &mut Graph, region: RegionId, notes: &mut Vec<String>) {
+pub(super) fn hoist(function: &mut FunctionState, region: RegionId) {
+    function.refresh_facts();
+    let FunctionState {
+        graph,
+        facts,
+        notes,
+        ..
+    } = function;
     let region = graph.regions[region].blocks.clone();
     let region = &region;
-    let cfg = Cfg::new(graph);
-    let facts = Facts::compute(graph);
-    for (header, body) in natural_loops(graph, &cfg) {
+    let cfg = &facts.cfg;
+    for (header, body) in natural_loops(graph, cfg) {
         if !body.is_subset(region) {
             continue;
         }
-        let Some(preheader) = preheader(graph, &cfg, header, &body) else {
+        let Some(preheader) = preheader(graph, cfg, header, &body) else {
             continue;
         };
         let writes = Writes::collect(graph, &body);
@@ -653,10 +663,16 @@ fn probe_reads(
     reads
 }
 
-pub(super) fn views(graph: &mut Graph, notes: &mut Vec<String>) {
-    let cfg = Cfg::new(graph);
-    let facts = Facts::compute(graph);
-    let mut loops = natural_loops(graph, &cfg);
+pub(super) fn views(function: &mut FunctionState) {
+    function.refresh_facts();
+    let FunctionState {
+        graph,
+        facts,
+        notes,
+        ..
+    } = function;
+    let cfg = &facts.cfg;
+    let mut loops = natural_loops(graph, cfg);
     loops.reverse();
     let mut placed: HashMap<(Block, Value), Value> = HashMap::new();
     for &block in &cfg.rpo {
@@ -676,7 +692,7 @@ pub(super) fn views(graph: &mut Graph, notes: &mut Vec<String>) {
             }
             let Some(preheader) = loops.iter().find_map(|(header, body)| {
                 (body.contains(&block) && !body.contains(&graph.def_block(object)))
-                    .then(|| preheader(graph, &cfg, *header, body))
+                    .then(|| preheader(graph, cfg, *header, body))
                     .flatten()
             }) else {
                 continue;
@@ -696,9 +712,16 @@ pub(super) fn views(graph: &mut Graph, notes: &mut Vec<String>) {
     }
 }
 
-pub(super) fn sink_closures(graph: &mut Graph, notes: &mut Vec<String>) {
-    let cfg = Cfg::new(graph);
-    let loops = natural_loops(graph, &cfg);
+pub(super) fn sink_closures(function: &mut FunctionState) {
+    function.refresh_cfg();
+    let FunctionState {
+        graph,
+        facts,
+        notes,
+        ..
+    } = function;
+    let cfg = &facts.cfg;
+    let loops = natural_loops(graph, cfg);
     let mut uses: HashMap<Value, HashSet<Block>> = HashMap::new();
     let mut closures = Vec::new();
     for &block in &cfg.rpo {
@@ -774,8 +797,15 @@ pub(super) fn sink_closures(graph: &mut Graph, notes: &mut Vec<String>) {
     }
 }
 
-pub(super) fn forward_captured_parameters(graph: &mut Graph, notes: &mut Vec<String>) {
-    let cfg = Cfg::new(graph);
+pub(super) fn forward_captured_parameters(function: &mut FunctionState) {
+    function.refresh_cfg();
+    let FunctionState {
+        graph,
+        facts,
+        notes,
+        ..
+    } = function;
+    let cfg = &facts.cfg;
     let mut aliases = HashMap::new();
     let mut removed = Vec::new();
     for &binding in &graph.lazy_captures {
@@ -835,11 +865,18 @@ pub(super) fn forward_captured_parameters(graph: &mut Graph, notes: &mut Vec<Str
     }
 }
 
-pub(super) fn lazy_captures(graph: &mut Graph, notes: &mut Vec<String>) -> bool {
+pub(super) fn lazy_captures(function: &mut FunctionState) -> bool {
+    function.refresh_cfg();
+    let FunctionState {
+        graph,
+        facts,
+        notes,
+        ..
+    } = function;
     let mut demoted = false;
     let mut candidates = HashSet::new();
     let mut eager = HashSet::new();
-    for block in Cfg::new(graph).rpo {
+    for &block in &facts.cfg.rpo {
         for &inst in &graph.blocks[block].insts {
             match &graph.insts[inst].op {
                 Op::Closure(_, _, _, false, _, captures, _) if graph.cold.contains(&block) => {
@@ -1060,7 +1097,9 @@ mod tests {
                 graph.terminate(block, span, TerminatorKind::Return(zero));
             }
             graph.verify().unwrap();
-            super::super::js::simplify(&mut graph);
+            let mut function = FunctionState::new(graph, Vec::new(), true);
+            super::super::js::simplify(&mut function);
+            let graph = function.graph;
             let reachable: HashSet<Block> = Cfg::new(&graph).rpo.into_iter().collect();
             assert_eq!(reachable.contains(&inner_yes), !inverted);
             assert_eq!(reachable.contains(&inner_no), inverted);

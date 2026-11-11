@@ -42,7 +42,7 @@ pub(super) struct Inspection {
 impl Inspection {
     pub(super) fn new(
         options: Option<&CompileOptions>,
-        graph: &semantic::Analysis,
+        graph: &semantic::FunctionState,
         repository: &semantic::specialize::Repository,
         source: usize,
         inline_multiplier: usize,

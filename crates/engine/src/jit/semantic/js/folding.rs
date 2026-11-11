@@ -4,12 +4,13 @@ use oxc_syntax::operator::BinaryOperator;
 
 use super::super::transforms::{self, Fold, Folder};
 use super::super::{
-    Block, Cfg, Constant, Facts, Graph, Inst, Op, Terminator, TerminatorKind, Types, UnaryOp, Value,
+    Block, Cfg, Constant, Facts, FunctionState, Graph, Inst, Op, Terminator, TerminatorKind, Types,
+    UnaryOp, Value,
 };
 use super::NUMERIC;
 
-pub(in crate::jit::semantic) fn simplify(graph: &mut Graph) {
-    transforms::simplify(graph, &mut Rules);
+pub(in crate::jit::semantic) fn simplify(function: &mut FunctionState) {
+    transforms::simplify(function, &mut Rules);
 }
 
 struct Rules;

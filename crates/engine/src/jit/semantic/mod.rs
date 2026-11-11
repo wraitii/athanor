@@ -785,14 +785,15 @@ impl TerminatorKind {
             .chain(tail.iter().copied())
     }
 
-    pub(super) fn targets(&self) -> Vec<&Target> {
-        match self {
-            TerminatorKind::Jump(target) => vec![target],
-            TerminatorKind::CheckException(normal, error) => vec![normal, error],
-            TerminatorKind::Branch(_, then, otherwise) => vec![then, otherwise],
-            TerminatorKind::Yield(_, _, target) => vec![target],
-            TerminatorKind::Return(_) | TerminatorKind::Fallback(_) => Vec::new(),
-        }
+    pub(super) fn targets(&self) -> impl Iterator<Item = &Target> {
+        let (first, second) = match self {
+            TerminatorKind::Jump(target) => (Some(target), None),
+            TerminatorKind::CheckException(normal, error) => (Some(normal), Some(error)),
+            TerminatorKind::Branch(_, then, otherwise) => (Some(then), Some(otherwise)),
+            TerminatorKind::Yield(_, _, target) => (Some(target), None),
+            TerminatorKind::Return(_) | TerminatorKind::Fallback(_) => (None, None),
+        };
+        first.into_iter().chain(second)
     }
 
     pub(super) fn targets_mut(&mut self) -> Vec<&mut Target> {
@@ -824,6 +825,7 @@ pub(in crate::jit) struct TypedRead {
     pub(in crate::jit) bounded: bool,
 }
 
+#[derive(Default)]
 pub(super) struct Cfg {
     pub(super) rpo: Vec<Block>,
     pub(super) preds: SecondaryMap<Block, Vec<Block>>,
@@ -836,14 +838,15 @@ impl Cfg {
     }
 
     pub(super) fn from_entry(graph: &Graph, entry: Block) -> Self {
-        let mut visited = HashSet::from([entry]);
+        let mut visited = vec![false; graph.blocks.len()];
+        visited[entry.index()] = true;
         let mut postorder = Vec::new();
         let mut stack = vec![(entry, 0)];
         while let Some((block, index)) = stack.pop() {
-            let successors = graph.successors(block);
-            if let Some(&next) = successors.get(index) {
+            if let Some(next) = graph.successors(block).nth(index) {
                 stack.push((block, index + 1));
-                if visited.insert(next) {
+                if !visited[next.index()] {
+                    visited[next.index()] = true;
                     stack.push((next, 0));
                 }
             } else {
@@ -912,16 +915,16 @@ impl Cfg {
 }
 
 impl Graph {
-    pub(super) fn successors(&self, block: Block) -> Vec<Block> {
-        let mut successors = Vec::new();
-        if let Some(terminator) = &self.blocks[block].terminator {
-            for target in terminator.kind.targets() {
-                if !successors.contains(&target.block) {
-                    successors.push(target.block);
-                }
-            }
-        }
-        successors
+    pub(super) fn successors(&self, block: Block) -> impl Iterator<Item = Block> + use<> {
+        let mut targets = self.blocks[block]
+            .terminator
+            .iter()
+            .flat_map(|terminator| terminator.kind.targets());
+        let first = targets.next().map(|target| target.block);
+        let second = targets.next().map(|target| target.block);
+        first
+            .into_iter()
+            .chain(second.filter(|block| Some(*block) != first))
     }
 
     pub(super) fn def_block(&self, value: Value) -> Block {
@@ -1512,27 +1515,40 @@ pub(in crate::jit) struct SpecializationPlan {
     pub(in crate::jit) conditional: specialize::ConditionalPlan,
 }
 
-pub(super) struct Planned {
+pub(super) struct FunctionState {
     pub(in crate::jit) plan: SpecializationPlan,
     pub(super) graph: Graph,
+    pub(super) osr: Option<std::sync::Arc<osr::Plan>>,
+    pub(in crate::jit) facts: Facts,
     notes: Vec<String>,
     optimize: bool,
 }
 
-pub(super) struct Analysis {
-    pub(in crate::jit) plan: SpecializationPlan,
-    pub(super) graph: Graph,
-    pub(super) osr: Option<std::sync::Arc<osr::Plan>>,
-    facts: Facts,
-    notes: Vec<String>,
-}
+impl FunctionState {
+    fn new(graph: Graph, notes: Vec<String>, optimize: bool) -> Self {
+        Self {
+            graph,
+            notes,
+            optimize,
+            facts: Facts::default(),
+            plan: SpecializationPlan::default(),
+            osr: None,
+        }
+    }
 
-impl Analysis {
+    fn refresh_facts(&mut self) {
+        self.facts = Facts::compute(&self.graph);
+    }
+
+    fn refresh_cfg(&mut self) {
+        self.facts.cfg = Cfg::new(&self.graph);
+    }
+
     pub(in crate::jit) fn prepare_osr(&mut self, source: usize) -> Result<()> {
         self.osr = osr::Plan::discover(&self.graph, source).map(std::sync::Arc::new);
         if let Some(plan) = &self.osr {
             plan.instrument(&mut self.graph)?;
-            self.facts = Facts::compute(&self.graph);
+            self.refresh_facts();
             borrow::borrows(&mut self.graph, &self.facts, &mut self.notes);
         }
         Ok(())
@@ -1549,7 +1565,7 @@ pub(super) fn lower_global(
     ssa_opt: bool,
     continuations: bool,
     report_regions: bool,
-) -> Result<Analysis> {
+) -> Result<FunctionState> {
     let graph = build::lower_global(
         statements,
         span,
@@ -1601,7 +1617,7 @@ pub(super) fn analyze(
     function: &oxc_ast::ast::Function<'_>,
     scoping: &Scoping,
     captured: &HashSet<SymbolId>,
-) -> Result<Analysis> {
+) -> Result<FunctionState> {
     optimize_graph(build::lower(function, scoping, captured)?, true)
 }
 
@@ -1620,20 +1636,24 @@ impl Canonical {
     }
 }
 
-fn canonicalize(mut graph: Graph, ssa_opt: bool) -> Result<Canonical> {
-    let mut notes = Vec::new();
-    if ssa_opt && !graph.has_handlers && !graph.generator {
-        transforms::promote(&mut graph, &mut notes);
-        graph.verify()?;
-        js::typeof_comparisons(&mut graph);
-        js::simplify(&mut graph);
-        graph.verify()?;
+fn canonicalize(graph: Graph, ssa_opt: bool) -> Result<Canonical> {
+    let optimize = ssa_opt && !graph.has_handlers && !graph.generator;
+    let mut function = FunctionState::new(graph, Vec::new(), optimize);
+    if optimize {
+        transforms::promote(&mut function.graph, &mut function.notes);
+        function.graph.verify()?;
+        js::typeof_comparisons(&mut function.graph);
+        js::simplify(&mut function);
+        function.graph.verify()?;
     }
-    Ok(Canonical { graph, notes })
+    Ok(Canonical {
+        graph: function.graph,
+        notes: function.notes,
+    })
 }
 
 #[cfg(test)]
-fn optimize_graph(graph: Graph, ssa_opt: bool) -> Result<Analysis> {
+fn optimize_graph(graph: Graph, ssa_opt: bool) -> Result<FunctionState> {
     optimize_canonical(canonicalize(graph, ssa_opt)?, ssa_opt, None)
 }
 
@@ -1642,7 +1662,7 @@ pub(super) fn optimize_canonical(
     canonical: Canonical,
     ssa_opt: bool,
     specialization: Option<(&specialize::Repository, usize)>,
-) -> Result<Analysis> {
+) -> Result<FunctionState> {
     optimize_planned(
         plan_canonical(canonical, ssa_opt, specialization)?,
         Versioning::Speculate {
@@ -1677,7 +1697,7 @@ pub(super) fn plan_canonical(
     canonical: Canonical,
     ssa_opt: bool,
     specialization: Option<(&specialize::Repository, usize)>,
-) -> Result<Planned> {
+) -> Result<FunctionState> {
     plan_canonical_with_budget(canonical, ssa_opt, specialization, 1)
 }
 
@@ -1686,79 +1706,92 @@ pub(super) fn plan_canonical_with_budget(
     ssa_opt: bool,
     specialization: Option<(&specialize::Repository, usize)>,
     inline_multiplier: usize,
-) -> Result<Planned> {
-    let Canonical {
-        mut graph,
-        mut notes,
-    } = canonical;
+) -> Result<FunctionState> {
+    let Canonical { graph, notes } = canonical;
     let optimize = ssa_opt && !graph.has_handlers && !graph.generator;
+    let mut function = FunctionState::new(graph, notes, optimize);
     if !optimize {
-        return Ok(Planned {
-            plan: SpecializationPlan::default(),
-            graph,
-            notes,
-            optimize,
-        });
+        return Ok(function);
     }
     let mut inline_budget = specialize::Budget::new(inline_multiplier);
     let mut expansions = Expansions::default();
     if let Some((bodies, source)) = specialization {
-        expansions.calls(&mut graph, source, &mut notes)?;
-        let requests = specialize::requests(&graph, bodies, source, &inline_budget);
-        let plan = specialize::plan_round(&graph, bodies, source, &requests, &mut inline_budget);
-        specialize::apply(&mut graph, bodies, source, plan, &mut notes)?;
-        js::simplify(&mut graph);
-        expansions.calls(&mut graph, source, &mut notes)?;
-        graph.verify()?;
+        expansions.calls(&mut function.graph, source, &mut function.notes)?;
+        let requests = specialize::requests(&function.graph, bodies, source, &inline_budget);
+        let plan = specialize::plan_round(
+            &function.graph,
+            bodies,
+            source,
+            &requests,
+            &mut inline_budget,
+        );
+        specialize::apply(
+            &mut function.graph,
+            bodies,
+            source,
+            plan,
+            &mut function.notes,
+        )?;
+        js::simplify(&mut function);
+        expansions.calls(&mut function.graph, source, &mut function.notes)?;
+        function.graph.verify()?;
     }
-    expansions.constructors(&mut graph);
+    expansions.constructors(&mut function.graph);
     if let Some((bodies, source)) = specialization {
         for _ in 0..specialize::SPECIALIZATION_ROUNDS {
-            let requests = specialize::requests(&graph, bodies, source, &inline_budget);
-            let plan =
-                specialize::plan_round(&graph, bodies, source, &requests, &mut inline_budget);
+            let requests = specialize::requests(&function.graph, bodies, source, &inline_budget);
+            let plan = specialize::plan_round(
+                &function.graph,
+                bodies,
+                source,
+                &requests,
+                &mut inline_budget,
+            );
             if plan.is_empty() {
                 break;
             }
-            specialize::apply(&mut graph, bodies, source, plan, &mut notes)?;
-            js::simplify(&mut graph);
-            expansions.calls(&mut graph, source, &mut notes)?;
-            expansions.constructors(&mut graph);
-            graph.verify()?;
+            specialize::apply(
+                &mut function.graph,
+                bodies,
+                source,
+                plan,
+                &mut function.notes,
+            )?;
+            js::simplify(&mut function);
+            expansions.calls(&mut function.graph, source, &mut function.notes)?;
+            expansions.constructors(&mut function.graph);
+            function.graph.verify()?;
         }
     }
     if let Some((bodies, _)) = specialization {
-        specialize::install_summaries(&mut graph, bodies, &mut notes);
+        specialize::install_summaries(&mut function.graph, bodies, &mut function.notes);
     }
     if let Some((bodies, source)) = specialization {
-        specialize::direct_calls(&mut graph, bodies, source);
+        specialize::direct_calls(&mut function.graph, bodies, source);
     }
-    let numbers = observations::plan(&mut graph, specialization);
+    let numbers = observations::plan(&mut function.graph, specialization);
     let reads = specialization.map_or_else(Vec::new, |(bodies, source)| {
-        reads::plan(&graph, bodies, source)
+        reads::plan(&function.graph, bodies, source)
     });
     let shapes = specialization.map_or_else(shapes::Plan::default, |(bodies, source)| {
-        shapes::plan(&graph, bodies, source)
+        shapes::plan(&function.graph, bodies, source)
     });
     let mut conditional = specialization
         .map_or_else(specialize::ConditionalPlan::default, |(bodies, _)| {
-            specialize::conditional_plan(&graph, bodies, &mut notes)
+            specialize::conditional_plan(&function.graph, bodies, &mut function.notes)
         });
     if let Some((bodies, source)) = specialization {
-        conditional.native_calls = arrays::push_calls(&mut graph, bodies, source, &mut notes)?;
+        conditional.native_calls =
+            arrays::push_calls(&mut function.graph, bodies, source, &mut function.notes)?;
     }
-    Ok(Planned {
-        plan: SpecializationPlan {
-            conditional,
-            inlines: inline_budget.inlines,
-            reads,
-            shapes,
-            numbers,
-        },
-        graph,
-        notes,
-        optimize,
-    })
+    function.plan = SpecializationPlan {
+        conditional,
+        inlines: inline_budget.inlines,
+        reads,
+        shapes,
+        numbers,
+    };
+    Ok(function)
 }
 
 #[derive(Clone, Copy)]
@@ -1771,37 +1804,29 @@ pub(super) enum Versioning {
 }
 
 pub(super) fn optimize_planned(
-    planned: Planned,
+    mut function: FunctionState,
     versioning: Versioning,
     report_regions: bool,
-) -> Result<Analysis> {
-    let Planned {
-        plan,
-        mut graph,
-        mut notes,
-        optimize,
-    } = planned;
-    if !optimize {
-        let facts = Facts::compute(&graph);
-        return Ok(Analysis {
-            plan,
-            graph,
-            facts,
-            notes,
-            osr: None,
-        });
+) -> Result<FunctionState> {
+    if !function.optimize {
+        function.refresh_facts();
+        return Ok(function);
     }
-    caches::apply(&mut graph)?;
-    reads::apply(&mut graph, &plan.reads, &mut notes)?;
-    comparisons::expose(&mut graph);
-    optimize::sink_closures(&mut graph, &mut notes);
-    if optimize::lazy_captures(&mut graph, &mut notes) {
-        transforms::promote(&mut graph, &mut notes);
-        js::simplify(&mut graph);
+    caches::apply(&mut function.graph)?;
+    reads::apply(
+        &mut function.graph,
+        &function.plan.reads,
+        &mut function.notes,
+    )?;
+    comparisons::expose(&mut function);
+    optimize::sink_closures(&mut function);
+    if optimize::lazy_captures(&mut function) {
+        transforms::promote(&mut function.graph, &mut function.notes);
+        js::simplify(&mut function);
     }
-    graph.verify()?;
-    optimize::forward_captured_parameters(&mut graph, &mut notes);
-    graph.verify()?;
+    function.graph.verify()?;
+    optimize::forward_captured_parameters(&mut function);
+    function.graph.verify()?;
     let regions = match versioning {
         Versioning::Generic => Vec::new(),
         Versioning::Speculate {
@@ -1809,27 +1834,27 @@ pub(super) fn optimize_planned(
             continuations,
         } => {
             let mut regions = optimize::version_with_report(
-                &mut graph,
-                &plan.conditional,
+                &mut function.graph,
+                &function.plan.conditional,
                 fallback,
                 continuations,
-                &mut notes,
+                &mut function.notes,
                 report_regions,
-                &plan.shapes,
+                &function.plan.shapes,
             )?;
-            graph.verify()?;
+            function.graph.verify()?;
             if regions.is_empty() {
                 regions.extend(optimize::version_string_leaves(
-                    &mut graph,
+                    &mut function.graph,
                     continuations,
-                    &mut notes,
+                    &mut function.notes,
                 )?);
             }
             regions
         }
     };
     if report_regions {
-        for (id, region) in &graph.regions {
+        for (id, region) in &function.graph.regions {
             let mut blocks: Vec<_> = region.blocks.iter().copied().collect();
             blocks.sort();
             let blocks = blocks
@@ -1844,45 +1869,45 @@ pub(super) fn optimize_planned(
                 }
                 None => "none".into(),
             };
-            notes.push(format!("{id}: blocks [{blocks}], fallback {fallback}"));
+            function
+                .notes
+                .push(format!("{id}: blocks [{blocks}], fallback {fallback}"));
         }
     }
-    optimize::normalise_regions(&mut graph, &regions, &mut notes)?;
-    js::coercions(&mut graph);
-    js::bit_tests(&mut graph);
-    graph.verify()?;
-    optimize::reuse_loads(&mut graph, &mut notes);
-    graph.verify()?;
+    optimize::normalise_regions(&mut function, &regions)?;
+    js::coercions(&mut function);
+    js::bit_tests(&mut function);
+    function.graph.verify()?;
+    optimize::reuse_loads(&mut function);
+    function.graph.verify()?;
     for region in &regions {
-        optimize::hoist(&mut graph, *region, &mut notes);
-        graph.verify()?;
+        optimize::hoist(&mut function, *region);
+        function.graph.verify()?;
     }
-    if typed_lowering::lower(&mut graph)? {
-        js::simplify(&mut graph);
-        optimize::reuse_loads(&mut graph, &mut notes);
+    if typed_lowering::lower(&mut function)? {
+        js::simplify(&mut function);
+        optimize::reuse_loads(&mut function);
     }
-    shapes::apply(&mut graph, &plan.shapes, &mut notes)?;
-    optimize::views(&mut graph, &mut notes);
-    comparisons::expose(&mut graph);
-    graph.verify()?;
-    js::simplify(&mut graph);
-    graph.verify()?;
-    optimize::sink_closures(&mut graph, &mut notes);
-    optimize::lazy_captures(&mut graph, &mut notes);
-    graph.verify()?;
-    string_split::forward_packs(&mut graph);
-    transforms::trim(&mut graph);
-    transforms::remove_trivial_params(&mut graph);
-    graph.verify()?;
-    let facts = Facts::compute(&graph);
-    borrow::borrows(&mut graph, &facts, &mut notes);
-    Ok(Analysis {
-        plan,
-        graph,
-        facts,
-        notes,
-        osr: None,
-    })
+    shapes::apply(
+        &mut function.graph,
+        &function.plan.shapes,
+        &mut function.notes,
+    )?;
+    optimize::views(&mut function);
+    comparisons::expose(&mut function);
+    function.graph.verify()?;
+    js::simplify(&mut function);
+    function.graph.verify()?;
+    optimize::sink_closures(&mut function);
+    optimize::lazy_captures(&mut function);
+    function.graph.verify()?;
+    string_split::forward_packs(&mut function.graph);
+    transforms::trim(&mut function.graph);
+    transforms::remove_trivial_params(&mut function.graph);
+    function.graph.verify()?;
+    function.refresh_facts();
+    borrow::borrows(&mut function.graph, &function.facts, &mut function.notes);
+    Ok(function)
 }
 
 #[cfg(test)]

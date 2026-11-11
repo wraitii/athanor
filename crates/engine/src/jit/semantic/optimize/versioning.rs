@@ -29,9 +29,10 @@ fn retarget(graph: &mut Graph, blocks: &HashSet<Block>, from: Value, to: Value) 
     }
 }
 
-/// Entry conditions for a versioned copy, checked in this order.
+/// Guarded assumptions and exits for a versioned copy.
 #[derive(Default)]
 pub(super) struct Speculation<'a> {
+    pub(super) locals: &'a [Inst],
     pub(super) fallback: Option<usize>,
     pub(super) continuations: bool,
     pub(super) reads: &'a [Inst],
@@ -190,7 +191,8 @@ pub(super) fn apply_version(
     let head = entry.map_or(graph.entry, |(_, header)| header);
     let tested = EntryGuard::at_entry(graph, entry.map_or(graph.entry, |(preheader, _)| preheader));
     assert!(fallback.is_none() || entry.is_none());
-    let reuse = fallback.is_some()
+    let reuse = speculation.locals.is_empty()
+        && fallback.is_some()
         && exits.iter().all(|block| guards.contains(block))
         && exits_true.is_empty();
     let mut copy = duplicate(graph, region, reuse, speculation);
@@ -210,6 +212,7 @@ pub(super) fn apply_version(
         tested,
         &mut copy,
     );
+    local_checks(graph, speculation, canonical, &copy, &mut notes);
     if !reuse && continuations {
         wire_failures(graph, region, speculation, canonical, &copy, &mut notes);
     }
@@ -755,7 +758,14 @@ fn entry_checks(
             Op::IsNumber(checked)
         };
         let check = graph.append_value(current, span, check);
-        current = continue_if(graph, current, check, &original);
+        let failure = number_failure(
+            graph,
+            checked,
+            super::super::observations::numeric_site(graph, value),
+            original.clone(),
+            span,
+        );
+        current = continue_if(graph, current, check, &failure);
     }
     let mut numbers = HashMap::new();
     let mut aliases = HashMap::new();
@@ -847,6 +857,144 @@ fn entry_checks(
         start,
         previous,
         aliases,
+    }
+}
+
+fn number_failure(
+    graph: &mut Graph,
+    value: Value,
+    site: Option<crate::jit::profile::Site>,
+    fallback: Target,
+    span: oxc_span::Span,
+) -> Target {
+    let Some(site) = site else {
+        return fallback;
+    };
+    let failure = graph.blocks.push(BlockData::default());
+    graph.cold.insert(failure);
+    graph.append(
+        failure,
+        span,
+        Op::Observe(value, Observation::NumberFailure, site),
+        false,
+    );
+    graph.terminate(failure, span, TerminatorKind::Jump(fallback));
+    Target::new(failure)
+}
+
+fn local_checks(
+    graph: &mut Graph,
+    speculation: &Speculation<'_>,
+    canonical: &Canonical<'_>,
+    copy: &Copy,
+    notes: &mut Vec<String>,
+) {
+    let reverse: HashMap<_, _> = canonical
+        .blocks
+        .iter()
+        .map(|(&old, &current)| (current, old))
+        .collect();
+    let facts = Facts::compute(graph);
+    for &inst in speculation.locals {
+        let mapped = copy.insts[&inst];
+        let data = graph.insts[mapped].clone();
+        let Op::Assume(value, Fact::Type(types), origin) = data.op else {
+            continue;
+        };
+        let known = match graph.defining_op(value) {
+            Some(Op::AsInteger(_)) => Types::INTEGER,
+            Some(Op::AsNumber(_)) => Types::NUMBER,
+            _ => facts.of(value),
+        };
+        if known.intersects(types) && known.within(types) {
+            continue;
+        }
+        let block = data.block;
+        let cfg = Cfg::new(graph);
+        let [before] = cfg.preds[block][..] else {
+            continue;
+        };
+        let mut fallback = Target::new(graph.insts[inst].block);
+        if speculation.continuations {
+            let original = reverse[&fallback.block];
+            let piece = canonical
+                .pieces
+                .borrow_mut()
+                .resume(canonical.graph, &Target::new(original));
+            match piece {
+                Ok(piece) => {
+                    let inputs: Option<Vec<_>> = piece
+                        .inputs
+                        .iter()
+                        .map(|input| {
+                            let current = *canonical.values.get(input)?;
+                            let mapped = copy.values.get(&current).copied().unwrap_or(current);
+                            value_available(graph, &cfg, mapped, before).then_some(mapped)
+                        })
+                        .collect();
+                    if let Some(inputs) = inputs {
+                        let stub = graph.blocks.push(BlockData::default());
+                        let result = graph.append_value(
+                            stub,
+                            data.span,
+                            Op::Continuation(piece.body.clone(), inputs),
+                        );
+                        graph.terminate(stub, data.span, TerminatorKind::Return(result));
+                        graph.cold.insert(stub);
+                        fallback = Target::new(stub);
+                        notes.push(format!(
+                            "local assumption {inst}: resumes in {}",
+                            piece.body.graph.name
+                        ));
+                    } else {
+                        notes.push(format!(
+                            "local assumption {inst}: canonical inputs unavailable"
+                        ));
+                    }
+                }
+                Err(reason) => notes.push(format!(
+                    "local assumption {inst}: continuation unavailable: {reason}"
+                )),
+            }
+        }
+        let integer = types.within(Types::INTEGER);
+        let (guard, check) = graph.append(
+            before,
+            data.span,
+            if integer {
+                Op::IsInteger(value)
+            } else {
+                Op::IsNumber(value)
+            },
+            true,
+        );
+        graph.insts[guard].source_name = data.source_name;
+        let fallback = number_failure(graph, value, origin.site, fallback, data.span);
+        graph.terminate(
+            before,
+            data.span,
+            TerminatorKind::Branch(check.unwrap(), Target::new(block), fallback),
+        );
+        let (unbox, number) = graph.insert(
+            block,
+            0,
+            data.span,
+            if integer {
+                Op::AsInteger(value)
+            } else {
+                Op::AsNumber(value)
+            },
+            true,
+        );
+        graph.insts[unbox].source_name = data.source_name;
+        let cfg = Cfg::new(graph);
+        let dominated = copy
+            .copies
+            .iter()
+            .copied()
+            .filter(|&candidate| cfg.dominates(block, candidate))
+            .collect();
+        retarget(graph, &dominated, value, number.unwrap());
     }
 }
 
@@ -1165,10 +1313,12 @@ impl Repair<'_> {
         if self.cfg.dominates(graph.def_block(value), block) {
             return value;
         }
+        // A dominating copy may precede a newer original definition on another path.
+        // Walk predecessors to merge the definitions reaching this block.
         let copy = self.values[&value]
             .iter()
             .copied()
-            .find(|&copy| self.cfg.dominates(graph.def_block(copy), block));
+            .find(|&copy| graph.def_block(copy) == block);
         match copy {
             Some(copy) => copy,
             None => self.entering(graph, block, value),

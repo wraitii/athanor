@@ -17,6 +17,8 @@ pub(super) struct Point {
 }
 
 pub(super) struct Reach {
+    pub(super) inst: Inst,
+    pub(super) local: bool,
     pub(super) value: Value,
     pub(super) fact: Fact,
     pub(super) use_block: Block,
@@ -273,6 +275,8 @@ pub(super) fn place_assumes(
                 _ => None,
             };
             reached.push(Reach {
+                inst,
+                local: false,
                 value,
                 fact,
                 use_block: block,

@@ -34,13 +34,17 @@ node --max-opt=3 bench/v8-v7/shell.cjs richards   # + TurboFan (default)
 
 | benchmark     | jit  | node jitless | node ≤Sparkplug | node ≤Maglev | node  | bun    |
 |---------------|------|--------------|-----------------|--------------|-------|--------|
-| richards      | 2780 | 1735         | 1906            | 33152        | 45292 | 52392  |
-| navier-stokes | 4100 | 2490         | 3493            | 27251        | 38469 | 32615  |
+| richards      | 3329 | 1753         | 1952            | 33717        | 46221 | 53147  |
+| navier-stokes | 4773 | 2503         | 3620            | 28048        | 40662 | 34429  |
+
+JIT scores are medians of three runs after adding inline packed-array stores:
+richards 3340/3149/3329, navier-stokes 4706/4773/4801. Other engines and tiers
+were run once. These are about 20% and 16% above the previously recorded JIT
+scores (2780 and 4100), respectively; this is not an isolated before/after build
+comparison.
 
 - The JIT beats V8's interpreter and baseline tiers on both, and is roughly
-  10x behind Maglev/TurboFan.
-- richards previously reached ~3100; the current dip is suspected to come from
-  excluding callee `Get`s from shape feedback.
+  6–14x behind Maglev/TurboFan.
 - The other benchmarks do not run yet (first error reported):
   - deltablue: `cannot assign property "inheritsFrom" of undefined`
   - crypto: `cannot read property "charCodeAt" of string`
@@ -69,9 +73,9 @@ Selected macos-arm64 rows as published (dated 11/10/2026):
 | quickjs-ng 0.18.0 | 1171  | 2637         | 1556  |
 | hermes 0.12.0  | 759      | 1121         | 1322  |
 
-Relative to node on the same machine, the JIT is at ~6% on richards and ~11%
+Relative to node on the same machine, the JIT is at ~7% on richards and ~12%
 on navier-stokes. On richards that places it above QuickJS (~4% of node) and
-Hermes (~2.5%) and below quanta (~10%); on navier-stokes it is level with
+Hermes (~2.5%) and below quanta (~10%); on navier-stokes it is slightly above
 quickjs-ng (~11%) and well below SpiderMonkey (~60%). Node versions differ (23.9 locally, 27 alpha
 there), so this placement is approximate.
 
@@ -98,6 +102,10 @@ All engines must report the same `heightHash` (`dd1de906` for belgian_uplands).
 
 | engine          | belgian_uplands |
 |-----------------|-----------------|
-| SpiderMonkey 128 | 333 ms         |
-| jit             | ~960 ms         |
-| QuickJS         | 7630 ms         |
+| SpiderMonkey 128 | 330 ms         |
+| jit             | 979 ms         |
+| QuickJS         | 7537 ms         |
+
+Refreshed 2026-11-10. JIT time is the median of three runs (975/979/981 ms);
+the C++ runners were run once each. All five runs produced `heightHash`
+`dd1de906`.

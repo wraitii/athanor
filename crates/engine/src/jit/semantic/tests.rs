@@ -26,7 +26,7 @@ fn lower_source(source: &str) -> Result<Graph> {
     })
 }
 
-fn analyze_source(source: &str) -> Analysis {
+fn analyze_source(source: &str) -> FunctionState {
     with_function(source, |function, scoping| {
         analyze(function, scoping, &HashSet::new())
     })
@@ -40,6 +40,64 @@ fn ops(graph: &Graph) -> Vec<&Op> {
         .flat_map(|block| &graph.blocks[block].insts)
         .map(|&inst| &graph.insts[inst].op)
         .collect()
+}
+
+#[test]
+fn cfg_preserves_edge_order_and_deduplicates_successors() {
+    let mut graph = lower_source("function f(a){return a;}").unwrap();
+    let entry = graph.entry;
+    let span = graph.span;
+    let TerminatorKind::Return(value) = graph.blocks[entry].terminator.as_ref().unwrap().kind
+    else {
+        panic!()
+    };
+    let left = graph.blocks.push(BlockData::default());
+    let right = graph.blocks.push(BlockData::default());
+    let join = graph.blocks.push(BlockData::default());
+    let unreachable = graph.blocks.push(BlockData::default());
+    graph.terminate(
+        entry,
+        span,
+        TerminatorKind::Branch(value, Target::new(left), Target::new(right)),
+    );
+    graph.terminate(
+        left,
+        span,
+        TerminatorKind::Branch(value, Target::new(join), Target::new(join)),
+    );
+    graph.terminate(
+        right,
+        span,
+        TerminatorKind::CheckException(Target::new(right), Target::new(join)),
+    );
+    graph.terminate(join, span, TerminatorKind::Return(value));
+    graph.terminate(unreachable, span, TerminatorKind::Jump(Target::new(join)));
+
+    assert_eq!(graph.successors(entry).collect::<Vec<_>>(), [left, right]);
+    assert_eq!(graph.successors(left).collect::<Vec<_>>(), [join]);
+    assert_eq!(
+        graph.blocks[left]
+            .terminator
+            .as_ref()
+            .unwrap()
+            .kind
+            .targets()
+            .count(),
+        2
+    );
+    assert_eq!(graph.successors(join).count(), 0);
+
+    let cfg = Cfg::new(&graph);
+    assert_eq!(cfg.rpo, [entry, right, left, join]);
+    assert_eq!(cfg.preds[join], [right, left]);
+    assert!(cfg.dominates(entry, join));
+    assert!(!cfg.dominates(left, join));
+    assert!(!cfg.dominates(right, join));
+
+    let cfg = Cfg::from_entry(&graph, left);
+    assert_eq!(cfg.rpo, [left, join]);
+    assert_eq!(cfg.preds[join], [left]);
+    assert!(cfg.dominates(left, join));
 }
 
 #[test]
@@ -63,7 +121,9 @@ fn constructor_result_facts_and_folding_preserve_object_returns() {
         let result = graph.append_value(block, span, Op::ConstructorResult(returned, instance));
         graph.terminate(block, span, TerminatorKind::Return(result));
         assert_eq!(Facts::compute(&graph).of(result), Types::OBJECT);
-        js::simplify(&mut graph);
+        let mut function = FunctionState::new(graph, Vec::new(), true);
+        js::simplify(&mut function);
+        let graph = function.graph;
         graph.verify().unwrap();
         let TerminatorKind::Return(value) = graph.blocks[block].terminator.as_ref().unwrap().kind
         else {
@@ -183,7 +243,9 @@ fn comparisons_share_number_checks_with_refined_reads_without_splitting() {
     let reads = reads::plan(&graph, &bodies, 0);
     reads::apply(&mut graph, &reads, &mut Vec::new()).unwrap();
     let blocks = graph.blocks.len();
-    comparisons::expose(&mut graph);
+    let mut function = FunctionState::new(graph, Vec::new(), true);
+    comparisons::expose(&mut function);
+    let graph = function.graph;
     graph.verify().unwrap();
     assert_eq!(graph.blocks.len(), blocks);
     let checks: Vec<_> = ops(&graph)
@@ -234,7 +296,9 @@ fn late_number_facts_remove_refinement_guards_and_assertions() {
     }
     let reads = reads::plan(&graph, &bodies, 0);
     reads::apply(&mut graph, &reads, &mut Vec::new()).unwrap();
-    comparisons::expose(&mut graph);
+    let mut function = FunctionState::new(graph, Vec::new(), true);
+    comparisons::expose(&mut function);
+    let mut graph = function.graph;
     assert!(
         ops(&graph)
             .iter()
@@ -260,7 +324,9 @@ fn late_number_facts_remove_refinement_guards_and_assertions() {
             data.op = Op::Constant(Constant::Number(2.0));
         }
     }
-    js::simplify(&mut graph);
+    let mut function = FunctionState::new(graph, Vec::new(), true);
+    js::simplify(&mut function);
+    let graph = function.graph;
     graph.verify().unwrap();
     assert!(
         !ops(&graph)
@@ -286,15 +352,19 @@ fn folding_guard_edges_recomputes_number_facts_at_joins() {
         "function f(flag){let x;if(flag)x=1;else x='text';if(x<0)return 0;return +x;}",
     )
     .unwrap();
-    let mut graph = canonicalize(graph, true).unwrap().graph;
-    comparisons::expose(&mut graph);
+    let graph = canonicalize(graph, true).unwrap().graph;
+    let mut function = FunctionState::new(graph, Vec::new(), true);
+    comparisons::expose(&mut function);
+    let mut graph = function.graph;
     assert!(ops(&graph).iter().any(|op| matches!(op, Op::IsNumber(_))));
     for data in graph.insts.values_mut() {
         if matches!(data.op, Op::Argument(0)) {
             data.op = Op::Constant(Constant::Boolean(true));
         }
     }
-    js::simplify(&mut graph);
+    let mut function = FunctionState::new(graph, Vec::new(), true);
+    js::simplify(&mut function);
+    let graph = function.graph;
     graph.verify().unwrap();
     assert!(!ops(&graph).iter().any(|op| matches!(
         op,
@@ -320,8 +390,10 @@ fn loop_versioning_reuses_exposed_comparison_checks() {
 #[test]
 fn comparison_checks_do_not_cross_non_dominating_branches() {
     let graph = lower_source("function f(x,y,flag){if(flag)return x<y;return x>y;}").unwrap();
-    let mut graph = canonicalize(graph, true).unwrap().graph;
-    comparisons::expose(&mut graph);
+    let graph = canonicalize(graph, true).unwrap().graph;
+    let mut function = FunctionState::new(graph, Vec::new(), true);
+    comparisons::expose(&mut function);
+    let graph = function.graph;
     graph.verify().unwrap();
     assert_eq!(
         ops(&graph)
@@ -341,8 +413,10 @@ fn indexed_reads_are_reused_probed_and_get_hoisted_views() {
             data.op = Op::IndexedGet(object, key);
         }
     }
-    let mut viewed = canonical.graph.clone();
-    optimize::views(&mut viewed, &mut Vec::new());
+    let viewed = canonical.graph.clone();
+    let mut function = FunctionState::new(viewed, Vec::new(), true);
+    optimize::views(&mut function);
+    let viewed = function.graph;
     assert!(
         viewed
             .views
@@ -1015,7 +1089,9 @@ fn checked_typed_reads_expose_shared_numeric_checks() {
         graph.insts[inst].source_name = Some((17, 3));
     }
     let previous_insts = graph.insts.len();
-    assert!(typed_lowering::lower(&mut graph).unwrap());
+    let mut function = FunctionState::new(graph, Vec::new(), true);
+    assert!(typed_lowering::lower(&mut function).unwrap());
+    let graph = function.graph;
     let cfg = Cfg::new(&graph);
     assert!(
         cfg.rpo
@@ -1058,7 +1134,9 @@ fn checked_typed_reads_expose_shared_numeric_checks() {
             Some(Op::IsExactPosition(..))
         ));
     }
-    optimize::reuse_loads(&mut graph, &mut Vec::new());
+    let mut function = FunctionState::new(graph, Vec::new(), true);
+    optimize::reuse_loads(&mut function);
+    let graph = function.graph;
     graph.verify().unwrap();
     let ops: Vec<_> = Cfg::new(&graph)
         .rpo
@@ -1128,7 +1206,9 @@ fn integer_typed_read_skips_exactness_roundtrip() {
             bounded: false,
         },
     );
-    assert!(typed_lowering::lower(&mut graph).unwrap());
+    let mut function = FunctionState::new(graph, Vec::new(), true);
+    assert!(typed_lowering::lower(&mut function).unwrap());
+    let graph = function.graph;
     assert!(matches!(
         graph.insts[inst].op,
         Op::TypedIndex(_, _, TypedRead { bounded: true, .. })
@@ -1168,7 +1248,9 @@ fn undefined_comparisons_refine_typed_read_results() {
                 bounded: false,
             },
         );
-        comparisons::expose(&mut graph);
+        let mut function = FunctionState::new(graph, Vec::new(), true);
+        comparisons::expose(&mut function);
+        let graph = function.graph;
         graph.verify().unwrap();
         assert!(
             ops(&graph)
@@ -1194,10 +1276,12 @@ fn undefined_comparisons_refine_typed_read_results() {
         "function f(x){return x!=undefined;}",
         "function f(x,undefined){return x===undefined;}",
     ] {
-        let mut graph = canonicalize(lower_source(source).unwrap(), true)
+        let graph = canonicalize(lower_source(source).unwrap(), true)
             .unwrap()
             .graph;
-        comparisons::expose(&mut graph);
+        let mut function = FunctionState::new(graph, Vec::new(), true);
+        comparisons::expose(&mut function);
+        let graph = function.graph;
         assert!(
             !ops(&graph)
                 .iter()

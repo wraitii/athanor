@@ -12,7 +12,7 @@ pub(super) fn numbers(graph: &mut Graph) -> Vec<(Value, Fact)> {
         .into_iter()
         .map(|requirement| requirement.call)
         .collect();
-    let mut proposals: Vec<(Block, Value, Fact, Option<crate::jit::profile::Site>)> = Vec::new();
+    let mut proposals: Vec<(Inst, Value, Fact, Option<crate::jit::profile::Site>)> = Vec::new();
     let mut seen = HashSet::new();
     for &block in &cfg.rpo {
         for &inst in &graph.blocks[block].insts {
@@ -38,18 +38,29 @@ pub(super) fn numbers(graph: &mut Graph) -> Vec<(Value, Fact)> {
                     continue;
                 }
                 let site = super::super::observations::numeric_site(graph, value);
-                proposals.push((block, value, fact, site));
+                proposals.push((inst, value, fact, site));
             }
         }
     }
-    let span = graph.span;
-    for &(block, value, fact, site) in &proposals {
+    for &(before, value, fact, site) in &proposals {
+        let block = graph.insts[before].block;
+        let at = graph.blocks[block]
+            .insts
+            .iter()
+            .position(|&inst| inst == before)
+            .unwrap();
         let origin = Origin {
             site,
             kind: Kind::Number,
             gain: 1,
         };
-        graph.append(block, span, Op::Assume(value, fact, origin), false);
+        graph.insert(
+            block,
+            at,
+            graph.insts[before].span,
+            Op::Assume(value, fact, origin),
+            false,
+        );
     }
     proposals
         .into_iter()
@@ -183,7 +194,57 @@ pub(super) fn assume(graph: &mut Graph, conditional: &ConditionalPlan) -> Vec<Re
     natives(graph);
     let probes = identities(graph, conditional);
     let assumed = assumed_calls(graph, conditional);
-    let reached = place_assumes(graph, &assumed);
+    let mut reached = place_assumes(graph, &assumed);
+    let cfg = Cfg::new(graph);
+    let loops = natural_loops(graph, &cfg);
+    let hints = super::super::observations::numeric_hints(graph);
+    let local: Vec<_> = cfg
+        .rpo
+        .iter()
+        .flat_map(|&block| graph.blocks[block].insts.iter().copied())
+        .filter(|&inst| {
+            matches!(graph.insts[inst].op, Op::Assume(value, Fact::Type(_), _)
+                if matches!(hints.get(&value), Some(ReadType::Integer | ReadType::Number)))
+                && !reached.iter().any(|reach| reach.inst == inst)
+                && loops
+                    .iter()
+                    .any(|(_, body)| body.contains(&graph.insts[inst].block))
+        })
+        .collect();
+    for inst in local {
+        let data = graph.insts[inst].clone();
+        let Op::Assume(value, fact, origin) = data.op else {
+            unreachable!()
+        };
+        let block = data.block;
+        let at = graph.blocks[block]
+            .insts
+            .iter()
+            .position(|&current| current == inst)
+            .unwrap();
+        let next = graph.blocks.push(BlockData::default());
+        graph.blocks[next].insts = graph.blocks[block].insts.split_off(at);
+        for &moved in &graph.blocks[next].insts {
+            graph.insts[moved].block = next;
+        }
+        graph.blocks[next].terminator = graph.blocks[block].terminator.take();
+        graph.terminate(block, data.span, TerminatorKind::Jump(Target::new(next)));
+        for region in graph.regions.values_mut() {
+            if region.blocks.contains(&block) {
+                region.blocks.insert(next);
+            }
+        }
+        reached.push(Reach {
+            inst,
+            local: true,
+            value,
+            fact,
+            use_block: next,
+            header: None,
+            global: None,
+            origin,
+        });
+    }
     for inst in probes {
         graph.remove_inst(inst);
     }

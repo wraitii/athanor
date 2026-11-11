@@ -94,8 +94,7 @@ fn root(parents: &mut HashMap<Value, Value>, value: Value) -> Value {
 }
 
 impl Fresh {
-    pub(super) fn compute(graph: &Graph) -> Self {
-        let cfg = Cfg::new(graph);
+    pub(super) fn compute(graph: &Graph, cfg: &Cfg) -> Self {
         let reachable: HashSet<Block> = cfg.rpo.iter().copied().collect();
         let mut allocations = HashSet::new();
         let mut sources: HashMap<Value, Value> = HashMap::new();

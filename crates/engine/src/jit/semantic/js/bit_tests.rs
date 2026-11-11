@@ -1,11 +1,13 @@
 use oxc_syntax::operator::BinaryOperator;
 
-use super::super::{Cfg, Constant, Facts, Graph, Op, TerminatorKind, Types, ValueDef};
+use super::super::{Constant, Op, TerminatorKind, Types, ValueDef};
 
-pub(in crate::jit::semantic) fn bit_tests(graph: &mut Graph) {
-    let facts = Facts::compute(graph);
+pub(in crate::jit::semantic) fn bit_tests(function: &mut super::super::FunctionState) {
+    function.refresh_facts();
+    let graph = &mut function.graph;
+    let facts = &function.facts;
     let uses = graph.use_counts();
-    for block in Cfg::new(graph).rpo {
+    for &block in &facts.cfg.rpo {
         let terminator = graph.blocks[block].terminator.as_ref().unwrap();
         let TerminatorKind::Branch(condition, _, _) = terminator.kind else {
             continue;

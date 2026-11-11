@@ -8,6 +8,8 @@ pub(super) fn plan(
     graph: &mut Graph,
     specialization: Option<(&Repository, usize)>,
 ) -> Vec<(Site, ReadType)> {
+    let number_first = specialization
+        .is_some_and(|(repository, source)| repository.number_first(source, graph.span.start));
     let mut carried: HashMap<_, Vec<_>> = HashMap::new();
     for block in Cfg::new(graph).rpo {
         for &inst in &graph.blocks[block].insts {
@@ -68,6 +70,14 @@ pub(super) fn plan(
                     if let Some(&observed) = specialization
                         .and_then(|(repository, _)| repository.read_feedback.get(&(origin, kind)))
                     {
+                        let observed = if number_first
+                            && kind == ReadKind::Number
+                            && observed == ReadType::Integer
+                        {
+                            ReadType::Number
+                        } else {
+                            observed
+                        };
                         hints.push((value, kind, origin, observed));
                     }
                 }

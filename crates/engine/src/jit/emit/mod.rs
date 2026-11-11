@@ -118,6 +118,7 @@ pub(super) fn build_function(
     params: Span,
     kind: FunctionKind,
     graph: &super::semantic::Graph,
+    facts: &super::semantic::Facts,
     continuations: &HashMap<usize, FuncId>,
     feedback: Option<Feedback>,
 ) -> Result<(), Error> {
@@ -125,7 +126,7 @@ pub(super) fn build_function(
         out,
         params,
         kind,
-        CallableBody::Graph(graph),
+        CallableBody::Graph(graph, facts),
         continuations,
         feedback,
     )
@@ -149,6 +150,7 @@ pub(super) fn build_factory(
 pub(super) fn build_global(
     out: Output<'_, '_>,
     graph: &super::semantic::Graph,
+    facts: &super::semantic::Facts,
     continuations: &HashMap<usize, FuncId>,
 ) -> Result<(), Error> {
     debug_assert!(graph.arity.is_none());
@@ -156,14 +158,14 @@ pub(super) fn build_global(
         out,
         Span::new(0, 0),
         FunctionKind::Ordinary,
-        CallableBody::Graph(graph),
+        CallableBody::Graph(graph, facts),
         continuations,
         None,
     )
 }
 
 enum CallableBody<'g> {
-    Graph(&'g super::semantic::Graph),
+    Graph(&'g super::semantic::Graph, &'g super::semantic::Facts),
     Factory(FuncId),
 }
 
@@ -191,7 +193,7 @@ fn build_callable(
     let values = b.block_params(entry).to_vec();
     let (ctx, closure, receiver) = (values[0], values[1], values[2]);
     let arguments = match body {
-        CallableBody::Graph(graph) if graph.arity.is_some() => {
+        CallableBody::Graph(graph, _) if graph.arity.is_some() => {
             Arguments::Fixed(values[3..].to_vec())
         }
         _ => Arguments::Vector {
@@ -275,13 +277,13 @@ fn build_callable(
         compiler.return_value(result);
         return Ok(());
     }
-    if let CallableBody::Graph(graph) = body {
+    if let CallableBody::Graph(graph, facts) = body {
         let graph_closure = if compiler.generator.is_some() {
             compiler.call_helper(Helper::GeneratorClosure, &[closure])
         } else {
             closure
         };
-        compiler.emit_semantic_graph(graph, graph_closure, continuations)?;
+        compiler.emit_semantic_graph(graph, facts, graph_closure, continuations)?;
         compiler.patch_frame_size();
         if let Some(dispatch) = dispatch {
             compiler.switch(dispatch);

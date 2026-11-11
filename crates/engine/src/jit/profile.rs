@@ -56,7 +56,10 @@ impl ShapeAccess {
 pub(crate) enum Observation {
     Call,
     Read(ReadKind),
+    NumberFailure,
 }
+
+pub(crate) const NUMBER_FAILURE_LIMIT: u64 = 8;
 
 #[repr(C)]
 pub(crate) struct ObservationCache {
@@ -124,6 +127,7 @@ pub(crate) struct Profile {
     reads: HashMap<(Site, ReadKind), ReadType>,
     observed_reads: HashSet<(u64, Site, ReadKind)>,
     shapes: HashMap<(Site, PropertyAccess), ShapeAccess>,
+    number_first: HashSet<u64>,
 }
 
 #[derive(Default)]
@@ -170,6 +174,27 @@ impl Profile {
         }
         self.reads.entry((site, kind)).or_insert(observed);
         true
+    }
+
+    pub(crate) fn observe_number_failure(
+        &mut self,
+        owner: u64,
+        site: Site,
+        observed: ReadType,
+    ) -> bool {
+        let key = (site, ReadKind::Number);
+        let known = self.reads.get(&key).copied();
+        let policy_changed = (observed == ReadType::Number || known == Some(ReadType::Integer))
+            && self.number_first.insert(owner);
+        if known == Some(ReadType::Unknown) || known == Some(observed) {
+            return policy_changed;
+        }
+        self.reads.insert(key, observed);
+        true
+    }
+
+    pub(super) fn number_first(&self) -> impl Iterator<Item = u64> + '_ {
+        self.number_first.iter().copied()
     }
 
     pub(crate) fn observe_shape(

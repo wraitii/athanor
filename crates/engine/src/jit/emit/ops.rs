@@ -1087,6 +1087,11 @@ impl FunctionCompiler<'_, '_> {
         for (element, block) in &kinds {
             switch.set_entry(element.kind() as u128, *block);
         }
+        let overwrite = value.map(|_| {
+            let block = self.b.create_block();
+            switch.set_entry(kind::ARRAY as u128, block);
+            block
+        });
         let elements = value.is_none().then(|| {
             let packed = self.b.create_block();
             let holey = self.b.create_block();
@@ -1098,6 +1103,11 @@ impl FunctionCompiler<'_, '_> {
         });
         let typed_block = (value.is_none() && typed).then(|| self.b.create_block());
         switch.emit(self.b, kind, typed_block.unwrap_or(slow));
+        if let Some(overwrite) = overwrite {
+            self.switch(overwrite);
+            let value = self.convert(value.unwrap(), Repr::Boxed);
+            self.overwrite_slot(view, position, value, slow, done);
+        }
         if let Some(typed_block) = typed_block {
             self.switch(typed_block);
             let typed = self.has_kind(view, kind::TYPED);

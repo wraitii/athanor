@@ -13,30 +13,38 @@ pub(in crate::jit) struct Body {
 }
 
 impl Body {
-    fn new(mut graph: Graph, outputs: usize) -> Self {
-        let mut notes = Vec::new();
-        super::js::simplify(&mut graph);
-        super::js::coercions(&mut graph);
-        super::js::bit_tests(&mut graph);
-        if super::typed_lowering::lower_arrays(&mut graph) {
-            super::js::simplify(&mut graph);
-            super::optimize::reuse_loads(&mut graph, &mut notes);
+    fn new(graph: Graph, outputs: usize) -> Self {
+        let mut function = super::FunctionState::new(graph, Vec::new(), true);
+        super::js::simplify(&mut function);
+        super::js::coercions(&mut function);
+        super::js::bit_tests(&mut function);
+        if super::typed_lowering::lower_arrays(&mut function) {
+            super::js::simplify(&mut function);
+            super::optimize::reuse_loads(&mut function);
         }
-        super::optimize::views(&mut graph, &mut notes);
-        super::js::simplify(&mut graph);
-        super::transforms::trim(&mut graph);
-        super::transforms::remove_trivial_params(&mut graph);
-        let facts = super::Facts::compute(&graph);
+        super::optimize::views(&mut function);
+        super::js::simplify(&mut function);
+        super::transforms::trim(&mut function.graph);
+        super::transforms::remove_trivial_params(&mut function.graph);
+        function.refresh_facts();
+        let super::FunctionState {
+            mut graph,
+            facts,
+            mut notes,
+            ..
+        } = function;
         super::borrow::borrows(&mut graph, &facts, &mut notes);
-        let result = Cfg::new(&graph)
-            .rpo
-            .iter()
-            .fold(super::Types::default(), |types, &block| {
-                match graph.blocks[block].terminator.as_ref().unwrap().kind {
-                    TerminatorKind::Return(value) => types.union(facts.of(value)),
-                    _ => types,
-                }
-            });
+        let result =
+            facts
+                .cfg
+                .rpo
+                .iter()
+                .fold(super::Types::default(), |types, &block| {
+                    match graph.blocks[block].terminator.as_ref().unwrap().kind {
+                        TerminatorKind::Return(value) => types.union(facts.of(value)),
+                        _ => types,
+                    }
+                });
         Self {
             graph,
             result,

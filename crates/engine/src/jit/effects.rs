@@ -214,7 +214,9 @@ pub(super) fn effects(helper: Helper) -> Effects {
         | LocalGet | TempClear | TempRetain | TempOwn | ErrorOrigin | Catch | Throw => {
             closed(INTERNAL | ERROR)
         }
-        ObserveCall | ObserveGet | ObserveIndex | ObserveNumber => closed(HEAP_READ | INTERNAL),
+        ObserveCall | ObserveGet | ObserveIndex | ObserveNumber | ObserveNumberFailure => {
+            closed(HEAP_READ | INTERNAL)
+        }
         CompilePoll | CompileLeave | CallProfileFlush => closed(INTERNAL),
         SemanticGlobalProbe => closed(GLOBAL_READ),
         ConstructorPrototype
@@ -316,11 +318,11 @@ pub(super) fn temporary_effect(helper: Helper) -> TemporaryEffect {
         | ArrayMapNewOwned => None,
         FrameOverflow | FrameRelease | IndexUnroot | LocalSet | LocalReplace | Release
         | ErrorOrigin | Throw | MathDirect | ObserveCall | ObserveGet | ObserveIndex
-        | ObserveNumber | CompilePoll | CompileLeave | CallProfileFlush | ClosureThis
-        | LexicalReceiver | ArrayIterationGuard | IsStringSplit | IndexRoot | Truthy
-        | BitwiseAnd | BitwiseOr | BitwiseXor | ShiftLeft | ShiftRight | ShiftRightUnsigned
-        | Sub | Mul | Div | Rem | Pow | LooseEqual | LooseNotEqual | StrictEqual
-        | StrictNotEqual | Less | LessEqual | Greater | GreaterEqual | UnaryPlus
+        | ObserveNumber | ObserveNumberFailure | CompilePoll | CompileLeave | CallProfileFlush
+        | ClosureThis | LexicalReceiver | ArrayIterationGuard | IsStringSplit | IndexRoot
+        | Truthy | BitwiseAnd | BitwiseOr | BitwiseXor | ShiftLeft | ShiftRight
+        | ShiftRightUnsigned | Sub | Mul | Div | Rem | Pow | LooseEqual | LooseNotEqual
+        | StrictEqual | StrictNotEqual | Less | LessEqual | Greater | GreaterEqual | UnaryPlus
         | UnaryNegation | LogicalNot | BitwiseNot => None,
         _ => MayRegister,
     }

@@ -107,6 +107,7 @@ define_helpers! {
     ObserveGet => Binary, js_observe_get;
     ObserveIndex => Binary, js_observe_index;
     ObserveNumber => Binary, js_observe_number;
+    ObserveNumberFailure => Binary, js_observe_number_failure;
     SemanticGlobalProbe => Pointer, js_semantic_global_probe;
     SemanticPropertyProbeCached => Binary, js_semantic_property_probe_cached;
     SemanticIndexProbe => Binary, js_semantic_index_probe;
@@ -724,6 +725,28 @@ extern "C" fn js_observe_index(ctx: *mut JitCtx, value: Value, cache: u64) -> Va
 
 extern "C" fn js_observe_number(ctx: *mut JitCtx, value: Value, cache: u64) -> Value {
     observe_read(ctx, value, cache, super::profile::ReadKind::Number)
+}
+
+extern "C" fn js_observe_number_failure(ctx: *mut JitCtx, value: Value, cache: u64) -> Value {
+    let context = unsafe { &*ctx };
+    let cache = unsafe { &mut *(cache as *mut super::profile::ObservationCache) };
+    if cache.recorded >= super::profile::NUMBER_FAILURE_LIMIT {
+        return Value::UNDEFINED;
+    }
+    let observed = if value.as_number().is_some() {
+        super::profile::ReadType::Number
+    } else {
+        cache.recorded += 1;
+        if cache.recorded < super::profile::NUMBER_FAILURE_LIMIT {
+            return Value::UNDEFINED;
+        }
+        super::profile::ReadType::Unknown
+    };
+    context
+        .engine
+        .tiering
+        .observe_number_failure(cache, observed);
+    Value::UNDEFINED
 }
 
 fn observe_read(

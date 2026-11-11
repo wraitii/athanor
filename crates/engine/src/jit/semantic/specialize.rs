@@ -20,6 +20,7 @@ pub(crate) const DEFAULT_RECOMPILE_INLINE_MULTIPLIER: usize = 4;
 #[derive(Clone, Default)]
 pub(in crate::jit) struct Repository {
     bodies: HashMap<FuncId, Arc<Body>>,
+    pub(in crate::jit) number_first: HashSet<FuncId>,
     pub(in crate::jit) feedback: HashMap<crate::jit::profile::Site, FuncId>,
     pub(in crate::jit) native_feedback:
         HashMap<crate::jit::profile::Site, crate::heap::NativeFunction>,
@@ -60,6 +61,9 @@ impl Repository {
             crate::jit::profile::Observation::Read(kind) => {
                 self.read_feedback.contains_key(&(site, kind))
             }
+            crate::jit::profile::Observation::NumberFailure => self
+                .read_feedback
+                .contains_key(&(site, crate::jit::profile::ReadKind::Number)),
         }
     }
 
@@ -139,6 +143,11 @@ impl Repository {
 
     pub(in crate::jit) fn code(&self, source: usize, start: u32) -> Option<FuncId> {
         self.locations.get(&(source, start)).copied()
+    }
+
+    pub(super) fn number_first(&self, source: usize, start: u32) -> bool {
+        self.code(source, start)
+            .is_some_and(|code| self.number_first.contains(&code))
     }
 
     pub(in crate::jit) fn emission(&self, code: FuncId) -> Option<(usize, Canonical)> {

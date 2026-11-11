@@ -1,14 +1,18 @@
 use super::{
-    BlockData, Cfg, Constant, Facts, Graph, Op, Target, Terminator, TerminatorKind, TypedRead,
+    BlockData, Constant, FunctionState, Graph, Op, Target, Terminator, TerminatorKind, TypedRead,
     Types,
 };
 
-pub(super) fn lower(graph: &mut Graph) -> super::Result<bool> {
-    let arrays_changed = lower_arrays(graph);
-    let facts = Facts::compute(graph);
-    let reads: Vec<_> = Cfg::new(graph)
+pub(super) fn lower(function: &mut FunctionState) -> super::Result<bool> {
+    let arrays_changed = lower_arrays(function);
+    function.refresh_facts();
+    let graph = &mut function.graph;
+    let facts = &function.facts;
+    let reads: Vec<_> = facts
+        .cfg
         .rpo
-        .into_iter()
+        .iter()
+        .copied()
         .flat_map(|block| graph.blocks[block].insts.clone())
         .filter(|&inst| {
             matches!(graph.insts[inst].op,
@@ -70,10 +74,12 @@ pub(super) fn lower(graph: &mut Graph) -> super::Result<bool> {
     Ok(changed || arrays_changed)
 }
 
-pub(super) fn lower_arrays(graph: &mut Graph) -> bool {
-    let facts = Facts::compute(graph);
+pub(super) fn lower_arrays(function: &mut FunctionState) -> bool {
+    function.refresh_facts();
+    let graph = &mut function.graph;
+    let facts = &function.facts;
     let mut changed = false;
-    for block in Cfg::new(graph).rpo {
+    for &block in &facts.cfg.rpo {
         for inst in graph.blocks[block].insts.clone() {
             let data = graph.insts[inst].clone();
             let Op::IsArrayIndex(object, key, position, holey) = data.op else {
@@ -119,6 +125,7 @@ fn append(
 
 #[cfg(test)]
 mod tests {
+    use super::super::Cfg;
     use super::*;
     use oxc_allocator::Allocator;
     use oxc_ast::ast::Statement;
@@ -178,9 +185,11 @@ mod tests {
                 Op::NewArray(vec![data.result.unwrap(), second]),
             );
             graph.blocks[block].terminator.as_mut().unwrap().kind = TerminatorKind::Return(result);
-            lower(&mut graph).unwrap();
-            super::super::optimize::reuse_loads(&mut graph, &mut Vec::new());
-            super::super::js::simplify(&mut graph);
+            let mut function = FunctionState::new(graph, Vec::new(), true);
+            lower(&mut function).unwrap();
+            super::super::optimize::reuse_loads(&mut function);
+            super::super::js::simplify(&mut function);
+            let graph = function.graph;
             graph.verify().unwrap();
             let count = |predicate: fn(&Op) -> bool| {
                 Cfg::new(&graph)

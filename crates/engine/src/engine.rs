@@ -47,6 +47,7 @@ pub struct EngineOptions {
     pub continuations: bool,
     pub generic_first: bool,
     pub recompile_log: bool,
+    pub specialization_log: Option<String>,
     pub call_profile: bool,
     pub ssa_dump: bool,
     pub compile: Option<Arc<crate::CompileOptions>>,
@@ -75,6 +76,9 @@ impl Default for EngineOptions {
             continuations: std::env::var_os("JS_JIT_NO_CONTINUATIONS").is_none(),
             generic_first: std::env::var("JS_JIT_GENERIC_FIRST").as_deref() != Ok("0"),
             recompile_log: std::env::var("JS_JIT_RECOMPILE_LOG").as_deref() == Ok("1"),
+            specialization_log: std::env::var("JS_JIT_SPECIALIZATION_LOG")
+                .ok()
+                .filter(|filter| !filter.is_empty() && filter != "0"),
             call_profile: std::env::var("JS_JIT_CALL_PROFILE").as_deref() == Ok("1"),
             ssa_dump: std::env::var("JS_JIT_SSA_DUMP").as_deref() == Ok("1"),
             compile: None,

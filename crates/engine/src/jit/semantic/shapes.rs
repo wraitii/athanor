@@ -14,6 +14,10 @@ pub(in crate::jit) struct Plan {
 }
 
 impl Plan {
+    pub(super) fn accesses(&self) -> &[(Site, PropertyAccess, u32, u32)] {
+        &self.accesses
+    }
+
     pub(super) fn read(&self, graph: &Graph, inst: Inst) -> Option<(u32, u32)> {
         let site = site(graph, inst, self.source);
         self.accesses

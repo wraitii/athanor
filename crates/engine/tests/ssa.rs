@@ -17,6 +17,83 @@ fn engines() -> impl Iterator<Item = Engine> {
 }
 
 #[test]
+fn indexed_stores_preserve_values_and_ownership() {
+    let source = r#"
+        function store(a, k, v) { return a[k] = v; }
+        function main() {
+            const a = [{n: 1}, 'old', Math.abs];
+            const saved = a[0];
+            for (let i = 0; i < 300; ++i) {
+                a[0] = a[0];
+                a[0] = {n: i};
+                a[1] = 'value' + i;
+            }
+            store(a, 2, {n: 7});
+            const assigned = store(a, 0, {n: 1000});
+            a[1] = assigned;
+            a[0] = 5;
+            return saved.n === 1 && assigned.n === 1000 &&
+                a[0] === 5 && a[1].n === 1000 && a[2].n === 7;
+        }
+    "#;
+    for mut engine in engines() {
+        engine.compile(source, "indexed-stores.js").unwrap();
+        assert_eq!(engine.call("main", &[]).unwrap().value(), Value::TRUE);
+    }
+}
+
+#[test]
+fn indexed_stores_preserve_fallbacks_and_array_transitions() {
+    let source = r#"
+        function store(a, k, v) { a[k] = v; }
+        function rejected(k) { const a = [1, 2]; store(a, k, 9); }
+        function booleanKey() { const a = [1, 2]; a[true] = 9; }
+        function main() {
+            const a = [1, 2];
+            for (let i = 0; i < 4; ++i)
+                a[i] = i + 10;
+            const holey = new Array(3);
+            store(holey, 1, 20);
+            store(holey, 0, 10);
+            store(holey, 2, 3);
+            store(holey, 2, 30);
+            store(a, 1, 20);
+            store(a, 2, 30);
+            store(a, '0', 40);
+            const o = {};
+            store(o, 0, 90);
+            return a.length === 4 && a[0] === 40 && a[1] === 20 &&
+                a[2] === 30 && a[3] === 13 && o[0] === 90 &&
+                holey[0] === 10 && holey[1] === 20 && holey[2] === 30;
+        }
+    "#;
+    for mut engine in engines() {
+        engine
+            .compile(source, "indexed-store-fallbacks.js")
+            .unwrap();
+        assert_eq!(engine.call("main", &[]).unwrap().value(), Value::TRUE);
+        for key in [
+            Value::number(-1.0),
+            Value::number(0.5),
+            Value::number(f64::NAN),
+            Value::number(f64::INFINITY),
+            Value::number(5.0),
+            Value::TRUE,
+            Value::FALSE,
+        ] {
+            assert!(matches!(
+                engine.call("rejected", &[key]),
+                Err(Error::Runtime(_))
+            ));
+        }
+        assert!(matches!(
+            engine.call("booleanKey", &[]),
+            Err(Error::Runtime(_))
+        ));
+    }
+}
+
+#[test]
 fn numeric_lowering_preserves_mixed_paths_loops_and_calls() {
     let source = r#"
         function add(x) { return x + 1; }

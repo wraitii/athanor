@@ -67,6 +67,7 @@ struct Emission {
     specialized: bool,
     callees: Vec<FuncId>,
     plan: super::semantic::SpecializationPlan,
+    specialization: Option<Arc<BTreeMap<String, String>>>,
     osr: Option<Arc<super::semantic::osr::Plan>>,
     source_name: (usize, usize),
     params: oxc_span::Span,
@@ -171,6 +172,7 @@ pub(crate) struct Compiler {
     speculative_continuations: bool,
     generic_first: bool,
     get_refinement: bool,
+    specialization_log: Option<String>,
     ssa_dump: bool,
     inspection: Option<Arc<super::inspect::CompileOptions>>,
     next_id: u64,
@@ -281,6 +283,7 @@ impl Compiler {
             ssa_opt: options.ssa_opt,
             recompile_inline_multiplier: options.recompile_inline_multiplier,
             get_refinement: options.get_refinement,
+            specialization_log: options.specialization_log,
             ssa_dump: options.ssa_dump,
             inspection: options.compile,
             next_id: 0,
@@ -714,6 +717,7 @@ impl Compiler {
                             specialized: false,
                             callees: Vec::new(),
                             plan: Default::default(),
+                            specialization: None,
                             osr: None,
                             source_name: self.source_name,
                             params: callable.params.span,
@@ -782,7 +786,7 @@ impl Compiler {
             )?;
             let (function, annotations) =
                 self.emit_body(self.signature.clone(), self.source_name, |out| {
-                    emit::build_global(out, &graph.graph, &continuations)
+                    emit::build_global(out, &graph.graph, &graph.facts, &continuations)
                 })?;
             pending.push((
                 id,
@@ -1029,6 +1033,12 @@ impl Compiler {
                     self.canonical.read_feedback.get(&site) == Some(&observed)
                 }) && profile.shapes().all(|(site, access)| {
                     self.canonical.shape_feedback.get(&site) == Some(&access)
+                }) && profile.number_first().all(|code| {
+                    u32::try_from(code).map_or(true, |code| {
+                        self.canonical
+                            .number_first
+                            .contains(&FuncId::from_u32(code))
+                    })
                 }))
         {
             return;
@@ -1043,6 +1053,11 @@ impl Compiler {
             canonical.native_feedback.insert(site, target);
         }
         if self.get_refinement {
+            for code in profile.number_first() {
+                if let Ok(code) = u32::try_from(code) {
+                    canonical.number_first.insert(FuncId::from_u32(code));
+                }
+            }
             for (site, element) in profile.reads() {
                 canonical.read_feedback.insert(site, element);
             }
@@ -1105,6 +1120,73 @@ impl Compiler {
             );
         }
         report
+    }
+
+    fn specialization_entries(
+        &self,
+        label: &str,
+        graph: &super::semantic::Graph,
+        plan: &super::semantic::SpecializationPlan,
+        source: usize,
+    ) -> Option<Arc<BTreeMap<String, String>>> {
+        let filter = self.specialization_log.as_deref()?;
+        if !matches!(filter, "1" | "*") && !label.contains(filter) {
+            return None;
+        }
+        Some(Arc::new(graph.specialization_entries(
+            plan,
+            &self.canonical,
+            source,
+            |mut site| {
+                if site.source == 0 {
+                    site.source = source;
+                }
+                let filename = self
+                    .sources
+                    .get(&site.source)
+                    .map_or("<unknown>", |source| source.1.as_str());
+                format!("{filename}:{}..{}", site.start, site.end)
+            },
+        )))
+    }
+
+    fn log_specialization(
+        &self,
+        code: FuncId,
+        label: &str,
+        action: &str,
+        previous: Option<&BTreeMap<String, String>>,
+        current: Option<&BTreeMap<String, String>>,
+    ) {
+        use std::fmt::Write;
+
+        let Some(current) = current else {
+            return;
+        };
+        let empty = BTreeMap::new();
+        let previous = previous.unwrap_or(&empty);
+        let mut changes = String::new();
+        for (key, before) in previous {
+            match current.get(key) {
+                None => writeln!(changes, "  - {key} = {before}").unwrap(),
+                Some(after) if before != after => {
+                    writeln!(changes, "  ~ {key}: {before} -> {after}").unwrap();
+                }
+                _ => {}
+            }
+        }
+        for (key, after) in current {
+            if !previous.contains_key(key) {
+                writeln!(changes, "  + {key} = {after}").unwrap();
+            }
+        }
+        if changes.is_empty() {
+            changes.push_str("  no changes\n");
+        }
+        eprintln!(
+            "[js jit specialization] code={} function={label} action={action}\n{changes}",
+            code.as_u32()
+        );
     }
 
     pub(crate) fn function_name(&self, code: u64) -> &str {
@@ -1234,7 +1316,21 @@ impl Compiler {
         )
         .map_err(Error::Unsupported)?;
         emission.callees = self.canonical.graph_callees(&planned.graph, source);
+        let specialization =
+            self.specialization_entries(&label, &planned.graph, &planned.plan, source);
+        let previous_specialization = if region.is_some() {
+            None
+        } else {
+            emission.specialization.as_deref()
+        };
         if region.is_some() && planned.plan == Default::default() {
+            self.log_specialization(
+                code,
+                &label,
+                "skip-osr-empty",
+                previous_specialization,
+                specialization.as_deref(),
+            );
             return Ok(None);
         }
         if self.log.enabled() {
@@ -1255,6 +1351,13 @@ impl Compiler {
             && region.is_none()
             && planned.plan == emission.plan
         {
+            self.log_specialization(
+                code,
+                &label,
+                "skip-unchanged",
+                previous_specialization,
+                specialization.as_deref(),
+            );
             return Ok(None);
         }
         let versioning = if initial && region.is_none() && self.generic_first {
@@ -1265,6 +1368,18 @@ impl Compiler {
                 continuations: self.speculative_continuations,
             }
         };
+        self.log_specialization(
+            code,
+            &label,
+            match versioning {
+                super::semantic::Versioning::Generic => "compile-generic",
+                _ if region.is_some() => "compile-osr",
+                _ => "compile-specialized",
+            },
+            previous_specialization,
+            specialization.as_deref(),
+        );
+        emission.specialization = specialization;
         emission.tier = tier;
         emission.specialized = matches!(versioning, super::semantic::Versioning::Speculate { .. });
         let mut graph =
@@ -1288,6 +1403,7 @@ impl Compiler {
                 emission.params,
                 emit::FunctionKind::Ordinary,
                 &graph.graph,
+                &graph.facts,
                 &continuations,
                 feedback,
             )
@@ -1486,6 +1602,7 @@ impl Compiler {
                 feedback,
                 ids,
             )?;
+            let facts = super::semantic::Facts::compute(&target.graph);
             let (function, annotations) =
                 self.emit_body(self.signature.clone(), source_name, |out| {
                     emit::build_function(
@@ -1493,16 +1610,12 @@ impl Compiler {
                         params,
                         emit::FunctionKind::Ordinary,
                         &target.graph,
+                        &facts,
                         ids,
                         feedback,
                     )
                 })?;
-            let listing = self.listing().then(|| {
-                target
-                    .graph
-                    .listing(&super::semantic::Facts::compute(&target.graph))
-                    .lines()
-            });
+            let listing = self.listing().then(|| target.graph.listing(&facts).lines());
             self.continuations.push((
                 id,
                 FunctionBody {
@@ -1609,6 +1722,7 @@ impl Compiler {
         name: (&str, u32),
         semantic_function: Option<oxc_span::Span>,
     ) -> Result<FunctionBody, Error> {
+        let mut specialization = None;
         let mut graph = semantic_function
             .map(|span| {
                 let canonical = match self.canonical.canonical(self.source_name.0, span.start) {
@@ -1633,6 +1747,12 @@ impl Compiler {
                     self.ssa_opt,
                     Some((&self.canonical, self.source_name.0)),
                 )?;
+                specialization = self.specialization_entries(
+                    name.0,
+                    &planned.graph,
+                    &planned.plan,
+                    self.source_name.0,
+                );
                 super::semantic::optimize_planned(
                     planned,
                     super::semantic::Versioning::Speculate {
@@ -1658,6 +1778,13 @@ impl Compiler {
         };
         if let Some(code) = feedback {
             let graph = graph.as_ref().unwrap();
+            self.log_specialization(
+                code,
+                name.0,
+                "compile-initial",
+                None,
+                specialization.as_deref(),
+            );
             self.emissions.insert(
                 code,
                 Emission {
@@ -1667,6 +1794,7 @@ impl Compiler {
                         .canonical
                         .graph_callees(&graph.graph, self.source_name.0),
                     plan: graph.plan.clone(),
+                    specialization,
                     osr: graph.osr.clone(),
                     source_name: self.source_name,
                     params: params.span,
@@ -1692,6 +1820,7 @@ impl Compiler {
                     params.span,
                     kind,
                     &graph.graph,
+                    &graph.facts,
                     &continuations,
                     feedback,
                 ),

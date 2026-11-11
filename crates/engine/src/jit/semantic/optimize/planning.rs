@@ -28,6 +28,7 @@ fn pure_guard(graph: &Graph, block: Block) -> bool {
 
 #[derive(Default)]
 pub(super) struct Candidates {
+    locals: Vec<Inst>,
     facts: Vec<(Value, Fact)>,
     codes: Vec<(String, cranelift_module::FuncId)>,
     origins: Vec<(Value, Fact, Origin)>,
@@ -35,6 +36,7 @@ pub(super) struct Candidates {
 }
 
 struct RegionPlan {
+    locals: Vec<Inst>,
     body: HashSet<Block>,
     entry: Option<(Block, Block)>,
     requirements: Vec<Requirement>,
@@ -136,6 +138,14 @@ impl RegionPlan {
             )
             .unwrap();
         }
+        for &inst in &self.locals {
+            writeln!(
+                out,
+                "{indent}  local assumption {inst}: {}",
+                graph.op_text(&graph.insts[inst].op)
+            )
+            .unwrap();
+        }
         for &inst in &self.reads {
             writeln!(
                 out,
@@ -173,18 +183,20 @@ impl RegionPlan {
     }
 
     fn speculative(&self) -> bool {
-        !self.identities.is_empty()
+        !self.locals.is_empty()
+            || !self.identities.is_empty()
             || !self.requirements.is_empty()
             || !self.checks.is_empty()
             || !self.guards.is_empty()
     }
 
     fn covers(&self, child: &Self, facts: &Facts) -> bool {
-        child
-            .checks
-            .iter()
-            .filter(|(_, fact)| matches!(fact, Fact::Type(_)))
-            .all(|&(value, fact)| Fact::Type(facts.of(value)).implies(fact))
+        child.locals.iter().all(|inst| self.locals.contains(inst))
+            && child
+                .checks
+                .iter()
+                .filter(|(_, fact)| matches!(fact, Fact::Type(_)))
+                .all(|&(value, fact)| Fact::Type(facts.of(value)).implies(fact))
             && child
                 .calls
                 .iter()
@@ -215,6 +227,9 @@ impl RegionPlan {
     }
 
     fn remap(&mut self, version: &Version) {
+        for inst in &mut self.locals {
+            *inst = version.insts.get(inst).copied().unwrap_or(*inst);
+        }
         let block = |old: Block| version.blocks.get(&old).copied().unwrap_or(old);
         self.body = self.body.iter().map(|&old| block(old)).collect();
         self.entry = self
@@ -262,6 +277,7 @@ impl RegionPlan {
         }
         // Earlier copies can introduce exit phis or move a child's probes to parent entry.
         let candidates = Candidates {
+            locals: std::mem::take(&mut self.locals),
             facts: std::mem::take(&mut self.assumes),
             codes: std::mem::take(&mut self.identities),
             ..Default::default()
@@ -298,6 +314,7 @@ impl RegionPlan {
                 })
                 .collect();
             let speculation = Speculation {
+                locals: &self.locals,
                 fallback,
                 continuations,
                 reads: &self.reads,
@@ -389,6 +406,19 @@ fn plan_region(
     conditional: &[ConditionalCall],
     candidates: &Candidates,
 ) -> Result<(RegionPlan, Facts)> {
+    let known = Facts::compute(graph);
+    let locals: Vec<_> = candidates
+        .locals
+        .iter()
+        .copied()
+        .filter(|&inst| {
+            let block = graph.insts[inst].block;
+            body.contains(&block)
+                && graph.blocks[block].insts.contains(&inst)
+                && matches!(graph.insts[inst].op, Op::Assume(value, Fact::Type(types), _)
+                    if !known.of(value).within(types))
+        })
+        .collect();
     let blocks: Vec<_> = Cfg::new(graph)
         .rpo
         .into_iter()
@@ -603,7 +633,8 @@ fn plan_region(
             }
         }
     }
-    if identities.is_empty()
+    if locals.is_empty()
+        && identities.is_empty()
         && requirements.is_empty()
         && checks.is_empty()
         && guards.is_empty()
@@ -632,6 +663,7 @@ fn plan_region(
     );
     Ok((
         RegionPlan {
+            locals,
             body,
             entry,
             requirements,
@@ -682,6 +714,10 @@ fn plan(
                     .get(&reach.header)
                     .is_some_and(|outer| outer.is_superset(&body))
         }) {
+            if reach.local {
+                proposals.locals.push(reach.inst);
+                continue;
+            }
             match (reach.fact, &reach.global) {
                 (Fact::Code(code), Some(name)) => {
                     proposals.codes.push((name.clone(), code));
@@ -719,7 +755,7 @@ fn plan(
                 .filter(|block| !graph.cold.contains(block))
                 .map(|&block| graph.blocks[block].insts.len())
                 .sum(),
-            checks: parent.checks.len() + parent.identities.len(),
+            checks: parent.checks.len() + parent.identities.len() + parent.locals.len(),
             reentry: parent.reentry.as_deref(),
             survivors: &parent.survivors,
         };
@@ -820,10 +856,12 @@ mod tests {
         let graph =
             super::super::super::build::lower(function, semantic.scoping(), &HashSet::new())
                 .unwrap();
-        let mut graph = super::super::super::canonicalize(graph, true)
+        let graph = super::super::super::canonicalize(graph, true)
             .unwrap()
             .graph;
-        super::super::super::comparisons::expose(&mut graph);
+        let mut function = super::super::super::FunctionState::new(graph, Vec::new(), true);
+        super::super::super::comparisons::expose(&mut function);
+        let graph = function.graph;
         graph
     }
 
@@ -1165,6 +1203,65 @@ mod tests {
             })
             .count();
         assert_eq!(checks, 1);
+        graph.verify().unwrap();
+    }
+
+    #[test]
+    fn varying_numeric_reads_specialize_inside_the_outer_loop() {
+        use crate::jit::profile::{ReadKind, ReadType, Site};
+
+        let graph = graph(
+            "function f(a,n,m){let total=0;for(let j=0;j<m;++j)for(let i=0;i<n;++i)total+=a[i];return total;}",
+        );
+        let mut repository = super::super::super::specialize::Repository::default();
+        for data in graph.insts.values() {
+            if !matches!(data.op, Op::GetIndex(..)) {
+                continue;
+            }
+            let site = Site {
+                source: 7,
+                start: data.span.start,
+                end: data.span.end,
+            };
+            repository
+                .read_feedback
+                .insert((site, ReadKind::Number), ReadType::Integer);
+            repository
+                .read_feedback
+                .insert((site, ReadKind::Receiver), ReadType::Array);
+        }
+        let canonical = super::super::super::Canonical::from_graph(graph);
+        let analysis =
+            super::super::super::optimize_canonical(canonical, true, Some((&repository, 7)))
+                .unwrap();
+        let graph = &analysis.graph;
+        let cfg = Cfg::new(graph);
+        let additions: Vec<_> = cfg
+            .rpo
+            .iter()
+            .flat_map(|&block| &graph.blocks[block].insts)
+            .filter_map(|&inst| {
+                matches!(
+                    graph.insts[inst].op,
+                    Op::Binary(BinaryOperator::Addition, ..)
+                )
+                .then(|| graph.insts[inst].result.unwrap())
+            })
+            .collect();
+        assert!(!additions.is_empty());
+        assert!(
+            additions
+                .iter()
+                .all(|&value| analysis.facts.of(value).within(Types::NUMBER))
+        );
+        assert_eq!(natural_loops(graph, &cfg).len(), 2);
+        assert!(
+            analysis
+                .notes
+                .iter()
+                .any(|note| note.starts_with("local assumption") && note.contains("resumes in"))
+        );
+        assert!(!super::super::super::continuation::bodies(graph).is_empty());
         graph.verify().unwrap();
     }
 

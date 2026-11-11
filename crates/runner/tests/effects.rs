@@ -1,6 +1,167 @@
 use std::process::Command;
 
 #[test]
+fn numeric_guard_failures_widen_feedback_and_then_stop_speculating() {
+    let source = "function accumulate(a){let sum=0;for(let i=0;i<10;++i)sum+=a[i];return sum;}";
+    let execute = r#"
+        const runner = {call: accumulate};
+        const values = Array(10).fill(5);
+        for (let i = 0; i < 32; ++i)
+            if (runner.call(values) !== 50) throw 'integer';
+        values[5] = 'x';
+        if (runner.call(values) !== '25x5555') throw 'isolated failure';
+        values[5] = 5.2;
+        for (let i = 0; i < 32; ++i)
+            if (runner.call(values) !== 50.2) throw 'fractional';
+        values[5] = 'x';
+        for (let i = 0; i < 32; ++i)
+            if (runner.call(values) !== '25x5555') throw 'string';
+        values[5] = 5.2;
+        for (let i = 0; i < 32; ++i)
+            if (runner.call(values) !== 50.2) throw 'numeric again';
+    "#;
+    for continuations in [false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_js-runner"));
+        command.env("JS_JIT_SPECIALIZATION_LOG", "accumulate");
+        if !continuations {
+            command.env("JS_JIT_NO_CONTINUATIONS", "1");
+        }
+        let output = command
+            .args([
+                "--compile",
+                "--planner",
+                "--filter",
+                "accumulate",
+                "--eval",
+                source,
+                "--execute",
+                execute,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let log = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            log.lines()
+                .any(|line| line.contains("~ feedback Number ")
+                    && line.ends_with("Integer -> Number")),
+            "{log}"
+        );
+        assert!(
+            log.lines()
+                .any(|line| line.contains("~ feedback Number ")
+                    && line.ends_with("Number -> Unknown")),
+            "{log}"
+        );
+        assert!(
+            log.lines()
+                .filter(|line| line.starts_with("[js jit specialization]"))
+                .all(|line| line.contains("function=accumulate")),
+            "{log}"
+        );
+        let dump = String::from_utf8(output.stdout).unwrap();
+        let plans: Vec<_> = dump
+            .split("planner ")
+            .skip(1)
+            .filter(|part| part.starts_with("accumulate"))
+            .collect();
+        let numeric: Vec<_> = plans
+            .iter()
+            .filter(|plan| plan.contains("Number -> "))
+            .collect();
+        assert_eq!(numeric.len(), 3, "{dump}");
+        assert!(numeric[0].contains("Number -> Integer"), "{dump}");
+        assert!(numeric[1].contains("Number -> Number"), "{dump}");
+        assert!(numeric[2].contains("Number -> Unknown"), "{dump}");
+        let graph = dump
+            .rsplit_once("semantic IR ")
+            .unwrap()
+            .1
+            .split("planner ")
+            .next()
+            .unwrap();
+        assert!(!graph.contains("observe NumberFailure"), "{graph}");
+        assert!(graph.contains(":number|string"), "{graph}");
+    }
+}
+
+#[test]
+fn integer_failure_replans_other_numeric_sites_as_numbers() {
+    let source = "function accumulate(a,b,c){let sum=0;for(let i=0;i<10;++i){sum+=a[i];sum+=b[i];sum+=c[i];}return sum;}";
+    let execute = r#"
+        const runner = {call: accumulate};
+        const a = Array(10).fill(1);
+        const b = Array(10).fill(2);
+        const c = Array(10).fill(3);
+        for (let i = 0; i < 32; ++i)
+            if (runner.call(a,b,c) !== 60) throw 'integer';
+        a.fill(1.5);
+        b.fill(2.5);
+        c.fill(3.5);
+        for (let i = 0; i < 32; ++i)
+            if (runner.call(a,b,c) !== 75) throw 'fractional';
+        a.fill(1);
+        b.fill(2);
+        c.fill(3);
+        for (let i = 0; i < 32; ++i)
+            if (runner.call(a,b,c) !== 60) throw 'integer again';
+    "#;
+    for continuations in [false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_js-runner"));
+        command.env("JS_JIT_SPECIALIZATION_LOG", "accumulate");
+        if !continuations {
+            command.env("JS_JIT_NO_CONTINUATIONS", "1");
+        }
+        let output = command
+            .args([
+                "--compile",
+                "--planner",
+                "--filter",
+                "accumulate",
+                "--eval",
+                source,
+                "--execute",
+                execute,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let log = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            log.contains("+ policy numeric speculation = number-first"),
+            "{log}"
+        );
+        assert_eq!(
+            log.lines()
+                .filter(|line| line.starts_with("[js jit specialization]")
+                    && line.ends_with("action=compile-specialized"))
+                .count(),
+            2,
+            "{log}"
+        );
+        let dump = String::from_utf8(output.stdout).unwrap();
+        let final_graph = dump
+            .rsplit_once("semantic IR ")
+            .unwrap()
+            .1
+            .split("planner ")
+            .next()
+            .unwrap();
+        assert!(!final_graph.contains("is_integer"), "{final_graph}");
+        assert!(final_graph.contains("is_number"), "{final_graph}");
+        assert!(final_graph.contains(":int32 = increment"), "{final_graph}");
+    }
+}
+
+#[test]
 fn property_probes_report_shapes_and_specialize_region_entry() {
     let source = "function f(){return this.x*this.y;}";
     let execute = "let o={x:3,y:4,f:f};

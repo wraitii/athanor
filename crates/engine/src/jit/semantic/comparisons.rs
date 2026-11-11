@@ -2,11 +2,13 @@ use std::collections::HashMap;
 
 use oxc_syntax::operator::BinaryOperator;
 
-use super::{Block, Cfg, Constant, Facts, Graph, Op, Types, Value};
+use super::{Block, Constant, Op, Types, Value};
 
-pub(super) fn expose(graph: &mut Graph) {
-    let cfg = Cfg::new(graph);
-    let facts = Facts::compute(graph);
+pub(super) fn expose(function: &mut super::FunctionState) {
+    function.refresh_facts();
+    let graph = &mut function.graph;
+    let facts = &function.facts;
+    let cfg = &facts.cfg;
     let mut checks: HashMap<Value, Vec<(Block, Value)>> = HashMap::new();
     let mut aliases = HashMap::new();
     let mut removed = Vec::new();

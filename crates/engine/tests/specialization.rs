@@ -39,6 +39,50 @@ fn numeric_loop_continuations_preserve_accumulators_and_shared_bounds() {
     assert_eq!(execute(true), execute(false));
 }
 
+#[test]
+fn local_numeric_assumptions_resume_after_effects_and_loaded_values() {
+    let source = r#"
+        function accumulate(values, state) {
+            let total = 0;
+            for (let row = 0; row < 2; ++row)
+                for (let i = 0; i < 4;) {
+                    state.count++;
+                    total += values[i++];
+                }
+            return total;
+        }
+        function main() {
+            const runner = {call: accumulate};
+            const state = {count: 0};
+            for (let i = 0; i < 40; ++i)
+                runner.call([1, 2, 3, 4], state);
+            state.count = 0;
+            const mixed = runner.call([1, 2, "x", 4], state);
+            const effects = state.count;
+            const fractional = runner.call([1, 2, 0.5, 4], state);
+            const missing = runner.call([1, 2], state);
+            return mixed === "3x412x4" && effects === 8
+                && fractional === 15 && missing !== missing;
+        }
+    "#;
+    for ssa_opt in [false, true] {
+        for osr in [false, true] {
+            let mut engine = Engine::with_options(EngineOptions {
+                ssa_opt,
+                osr,
+                background_compile: false,
+                ..Default::default()
+            })
+            .unwrap();
+            engine.compile(source, "local-assumptions.js").unwrap();
+            assert_eq!(
+                engine.call("main", &[]).unwrap().value(),
+                Value::boolean(true)
+            );
+        }
+    }
+}
+
 fn run(source: &str, enabled: bool) -> Result<Value, String> {
     let mut engine = Engine::with_options(EngineOptions {
         ssa_opt: enabled,

@@ -5,8 +5,7 @@ use super::{
     Value,
 };
 
-pub(super) fn result_facts(graph: &Graph) -> (HashSet<Value>, HashMap<Inst, Types>) {
-    let cfg = Cfg::new(graph);
+pub(super) fn result_facts(graph: &Graph, cfg: &Cfg) -> (HashSet<Value>, HashMap<Inst, Types>) {
     let mut arrays = HashMap::new();
     for &block in &cfg.rpo {
         for &inst in &graph.blocks[block].insts {
@@ -383,7 +382,7 @@ mod tests {
             "const parts=text.split('|'); const alias=flag ? parts : other(); alias[0]=7; return parts[0];",
         ] {
             let graph = native_graph(body);
-            let (_, reads) = result_facts(&graph);
+            let (_, reads) = result_facts(&graph, &Cfg::new(&graph));
             assert!(reads.is_empty(), "{body}");
         }
     }
@@ -392,7 +391,7 @@ mod tests {
     fn split_results_merge_when_every_incoming_array_is_known() {
         let graph =
             native_graph("const parts=flag ? text.split('|') : text.split(','); return parts[0];");
-        let (_, reads) = result_facts(&graph);
+        let (_, reads) = result_facts(&graph, &Cfg::new(&graph));
         assert_eq!(reads.len(), 1);
         assert!(reads.values().all(|types| *types == Types::STRING));
     }
@@ -404,7 +403,7 @@ mod tests {
             "const parts=text.split('|'); if(flag) return other(parts); return parts[0];",
         ] {
             let graph = native_graph(body);
-            let (_, reads) = result_facts(&graph);
+            let (_, reads) = result_facts(&graph, &Cfg::new(&graph));
             assert_eq!(reads.len(), 1, "{body}");
             assert!(reads.values().all(|types| *types == Types::STRING));
         }
@@ -415,7 +414,7 @@ mod tests {
         let graph = native_graph(
             "const parts=text.split('|'); let result; for(let i=0;i<2;++i){result=parts[0];parts[0]=7;} return result;",
         );
-        let (_, reads) = result_facts(&graph);
+        let (_, reads) = result_facts(&graph, &Cfg::new(&graph));
         assert!(reads.is_empty());
     }
 }

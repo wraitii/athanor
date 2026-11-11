@@ -1,11 +1,13 @@
 use oxc_syntax::operator::BinaryOperator;
 
-use super::super::{Cfg, Facts, Graph, Op, Types, UnaryOp};
+use super::super::{Op, Types, UnaryOp};
 use super::NUMERIC;
 
-pub(in crate::jit::semantic) fn coercions(graph: &mut Graph) {
-    let facts = Facts::compute(graph);
-    for block in Cfg::new(graph).rpo {
+pub(in crate::jit::semantic) fn coercions(function: &mut super::super::FunctionState) {
+    function.refresh_facts();
+    let graph = &mut function.graph;
+    let facts = &function.facts;
+    for &block in &facts.cfg.rpo {
         for inst in graph.blocks[block].insts.clone() {
             let op = &graph.insts[inst].op;
             let bitwise = matches!(

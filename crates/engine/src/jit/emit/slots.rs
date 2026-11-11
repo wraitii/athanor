@@ -235,7 +235,6 @@ pub(super) fn assign(
                     .unwrap()
                     .kind
                     .targets()
-                    .iter()
                     .filter(|target| target.block == block)
                     .all(|target| slots.of(target.args[index]) == Some(slot))
             });

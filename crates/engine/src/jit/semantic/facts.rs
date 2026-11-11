@@ -120,7 +120,7 @@ struct Refinement {
 }
 
 pub(in crate::jit) struct Facts {
-    cfg: Cfg,
+    pub(in crate::jit) cfg: Cfg,
     refinements: HashMap<Value, Vec<Refinement>>,
     probes: Vec<(String, Value, Block, FuncId)>,
     rejected: HashSet<Inst>,
@@ -132,6 +132,25 @@ pub(in crate::jit) struct Facts {
     fresh: std::cell::OnceCell<std::rc::Rc<Fresh>>,
     memory: SecondaryMap<Inst, Memory>,
     control: SecondaryMap<Inst, Control>,
+}
+
+impl Default for Facts {
+    fn default() -> Self {
+        Self {
+            cfg: Cfg::default(),
+            refinements: HashMap::new(),
+            probes: Vec::new(),
+            rejected: HashSet::new(),
+            identities: SecondaryMap::new(),
+            assumed: HashMap::new(),
+            types: SecondaryMap::new(),
+            indexed: HashSet::new(),
+            known: false,
+            fresh: Default::default(),
+            memory: SecondaryMap::with_default(Memory::UNKNOWN),
+            control: SecondaryMap::with_default(Control::UNKNOWN),
+        }
+    }
 }
 
 impl Facts {
@@ -149,7 +168,7 @@ impl Facts {
 
     pub(super) fn fresh(&self, graph: &Graph) -> std::rc::Rc<Fresh> {
         self.fresh
-            .get_or_init(|| std::rc::Rc::new(Fresh::compute(graph)))
+            .get_or_init(|| std::rc::Rc::new(Fresh::compute(graph, &self.cfg)))
             .clone()
     }
 
@@ -322,7 +341,7 @@ impl Facts {
                 }
             }
         }
-        let (indexed, reads) = super::string_split::result_facts(graph);
+        let (indexed, reads) = super::string_split::result_facts(graph, &cfg);
         let mut probes = Vec::new();
         for (&value, entries) in &refinements {
             let Some(Op::ProbeGlobal(name)) = graph.defining_op(value) else {

@@ -207,6 +207,25 @@ impl Tiering {
         cache.recorded = 1;
     }
 
+    pub(crate) fn observe_number_failure(
+        &self,
+        cache: &jit::profile::ObservationCache,
+        observed: jit::profile::ReadType,
+    ) {
+        if !self
+            .profile
+            .borrow_mut()
+            .observe_number_failure(cache.owner, cache.site, observed)
+        {
+            return;
+        }
+        self.log_recompilation(
+            cache.owner,
+            format_args!("number guard failure site={} type={observed:?}", cache.site),
+        );
+        self.request_compilation(cache.owner);
+    }
+
     pub(crate) fn observe_shape(
         &self,
         owner: u64,

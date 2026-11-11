@@ -3,8 +3,8 @@ use std::collections::{HashMap, HashSet};
 use cranelift_codegen::entity::SecondaryMap;
 
 use super::super::{
-    Block, Cfg, Constant, Facts, Graph, Inst, Op, Target, Terminator, TerminatorKind, UnaryOp,
-    Value,
+    Block, Cfg, Constant, Facts, FunctionState, Graph, Inst, Op, Target, Terminator,
+    TerminatorKind, UnaryOp, Value,
 };
 
 pub(in crate::jit::semantic) enum Fold {
@@ -20,17 +20,18 @@ pub(in crate::jit::semantic) trait Folder {
     fn fold(&mut self, graph: &Graph, facts: &Facts, inst: Inst) -> Option<Fold>;
 }
 
-pub(in crate::jit::semantic) fn simplify(graph: &mut Graph, folder: &mut impl Folder) {
+pub(in crate::jit::semantic) fn simplify(function: &mut FunctionState, folder: &mut impl Folder) {
     loop {
-        let facts = Facts::compute(graph);
-        let cfg = Cfg::new(graph);
+        function.refresh_facts();
+        let FunctionState { graph, facts, .. } = function;
+        let cfg = &facts.cfg;
         let uses = graph.use_counts();
         let mut aliases = HashMap::new();
         let mut dead = Vec::new();
-        let mut changed = folder.refine(graph, &cfg);
+        let mut changed = folder.refine(graph, cfg);
         for &block in &cfg.rpo {
             for &inst in &graph.blocks[block].insts {
-                match folder.fold(graph, &facts, inst) {
+                match folder.fold(graph, facts, inst) {
                     Some(Fold::Op(op)) => {
                         graph.insts[inst].op = op;
                         changed = true;
@@ -62,8 +63,8 @@ pub(in crate::jit::semantic) fn simplify(graph: &mut Graph, folder: &mut impl Fo
         for inst in &dead {
             graph.remove_inst(*inst);
         }
-        changed |= fold_constant_branches(graph, &cfg);
-        changed |= fold_dominated_branches(graph, &cfg);
+        changed |= fold_constant_branches(graph, cfg);
+        changed |= fold_dominated_branches(graph, cfg);
         changed |= thread_branches(graph);
         if !changed && dead.is_empty() {
             return;

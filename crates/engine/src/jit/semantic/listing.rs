@@ -10,6 +10,142 @@ pub(in crate::jit) struct SourceLocation {
 pub(in crate::jit) type ListingLine = (u32, Option<SourceLocation>, String);
 
 impl Graph {
+    pub(in crate::jit) fn specialization_entries(
+        &self,
+        plan: &SpecializationPlan,
+        repository: &specialize::Repository,
+        source: usize,
+        site_name: impl Fn(crate::jit::profile::Site) -> String,
+    ) -> std::collections::BTreeMap<String, String> {
+        use crate::jit::profile::Site;
+
+        let mut entries = std::collections::BTreeMap::new();
+        if repository.number_first(source, self.span.start) {
+            entries.insert("policy numeric speculation".into(), "number-first".into());
+        }
+        let site = |inst: Inst| {
+            let data = &self.insts[inst];
+            Site {
+                source: data.source_name.map_or(source, |name| name.0),
+                start: data.span.start,
+                end: data.span.end,
+            }
+        };
+        let mut sites = HashSet::new();
+        for block in Cfg::new(self).rpo {
+            for &inst in &self.blocks[block].insts {
+                sites.insert(site(inst));
+                match self.insts[inst].op {
+                    Op::Observe(_, _, origin) | Op::ReadHint(_, _, _, origin) => {
+                        sites.insert(origin);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for (location, target) in &repository.feedback {
+            if sites.contains(location) {
+                entries.insert(
+                    format!("feedback call {}", site_name(*location)),
+                    format!(
+                        "{target} ({})",
+                        repository.name(*target).unwrap_or("unknown")
+                    ),
+                );
+            }
+        }
+        for (location, native) in &repository.native_feedback {
+            if sites.contains(location) {
+                entries.insert(
+                    format!("feedback native {}", site_name(*location)),
+                    format!("{native:?}"),
+                );
+            }
+        }
+        for ((location, kind), observed) in &repository.read_feedback {
+            if sites.contains(location) {
+                entries.insert(
+                    format!("feedback {kind:?} {}", site_name(*location)),
+                    format!("{observed:?}"),
+                );
+            }
+        }
+        for ((location, access), observed) in &repository.shape_feedback {
+            if sites.contains(location) {
+                entries.insert(
+                    format!("feedback shape {access:?} {}", site_name(*location)),
+                    format!("{observed:?}"),
+                );
+            }
+        }
+        for inline in &plan.inlines {
+            entries.insert(
+                format!("inline {} {}", site_name(site(inline.call)), inline.call),
+                format!(
+                    "{} ({}) guard_code={} arrow={}",
+                    inline.target,
+                    repository.name(inline.target).unwrap_or("unknown"),
+                    inline.guard_code,
+                    inline.arrow
+                ),
+            );
+        }
+        for read in &plan.reads {
+            entries.insert(
+                format!("read {} {}", site_name(site(read.inst)), read.inst),
+                format!(
+                    "typed={} element={:?} guard_number={}",
+                    read.typed, read.element, read.guard_number
+                ),
+            );
+        }
+        for &(location, access, shape, index) in plan.shapes.accesses() {
+            entries.insert(
+                format!("shape {access:?} {}", site_name(location)),
+                format!("shape={shape} slot={index}"),
+            );
+        }
+        for &(location, observed) in &plan.numbers {
+            entries.insert(
+                format!("number {}", site_name(location)),
+                format!("{observed:?}"),
+            );
+        }
+        for location in &plan.conditional.native_calls {
+            entries.insert(
+                format!("native call {}", site_name(*location)),
+                "Array.push".into(),
+            );
+        }
+        for call in &plan.conditional.calls {
+            let mut identities: Vec<_> = call
+                .identities
+                .iter()
+                .map(|(name, target)| format!("{name}={target}"))
+                .collect();
+            identities.sort();
+            entries.insert(
+                format!(
+                    "conditional call {} {}",
+                    site_name(site(call.inst)),
+                    call.inst
+                ),
+                format!(
+                    "{} -> {} callee={} {} {} requires=[{}]",
+                    call.name,
+                    call.target,
+                    call.callee,
+                    call.memory,
+                    call.control,
+                    identities.join(", ")
+                ),
+            );
+        }
+        entries
+    }
+}
+
+impl Graph {
     fn binding_name(&self, binding: Binding) -> String {
         format!("{}#{}", self.bindings[binding].name, binding.index())
     }
@@ -402,13 +538,13 @@ impl Graph {
     }
 }
 
-impl Analysis {
+impl FunctionState {
     pub(in crate::jit) fn listing_lines(&self) -> Vec<ListingLine> {
         self.graph.listing(&self.facts).lines()
     }
 }
 
-impl fmt::Display for Analysis {
+impl fmt::Display for FunctionState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.graph.listing(&self.facts))?;
         for note in &self.notes {
@@ -418,7 +554,7 @@ impl fmt::Display for Analysis {
     }
 }
 
-impl Analysis {
+impl FunctionState {
     pub(in crate::jit) fn plan_report(
         &self,
         repository: &super::specialize::Repository,

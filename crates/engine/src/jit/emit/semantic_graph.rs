@@ -59,7 +59,7 @@ impl FunctionCompiler<'_, '_> {
             return;
         };
         use crate::jit::profile::Observation;
-        if !feedback.get_refinement && matches!(kind, Observation::Read(_)) {
+        if !feedback.get_refinement && kind != Observation::Call {
             return;
         }
         if site.source == 0 {
@@ -70,6 +70,7 @@ impl FunctionCompiler<'_, '_> {
             Observation::Read(crate::jit::profile::ReadKind::Result) => Helper::ObserveGet,
             Observation::Read(crate::jit::profile::ReadKind::Receiver) => Helper::ObserveIndex,
             Observation::Read(crate::jit::profile::ReadKind::Number) => Helper::ObserveNumber,
+            Observation::NumberFailure => Helper::ObserveNumberFailure,
         };
         let address = self.function_data(crate::jit::profile::ObservationCache {
             recorded: 0,
@@ -82,6 +83,15 @@ impl FunctionCompiler<'_, '_> {
             .load(types::I64, MemFlagsData::trusted(), address, 0);
         let observe = self.b.create_block();
         let next = self.b.create_block();
+        let recorded = if kind == Observation::NumberFailure {
+            self.b.ins().icmp_imm_u(
+                IntCC::UnsignedGreaterThanOrEqual,
+                recorded,
+                crate::jit::profile::NUMBER_FAILURE_LIMIT as i64,
+            )
+        } else {
+            recorded
+        };
         self.b.ins().brif(recorded, next, &[], observe, &[]);
         self.b.switch_to_block(observe);
         self.call_helper(helper, &[value, address]);
@@ -184,6 +194,7 @@ impl FunctionCompiler<'_, '_> {
     pub(super) fn emit_semantic_graph(
         &mut self,
         graph: &Graph,
+        facts: &Facts,
         closure: ClifValue,
         continuations: &std::collections::HashMap<usize, FuncId>,
     ) -> Result<(), Error> {
@@ -193,7 +204,6 @@ impl FunctionCompiler<'_, '_> {
             .values()
             .map(|_| self.b.create_block())
             .collect();
-        let facts = Facts::compute(graph);
         let callees = graph.callees();
         let suspends = self.generator.is_some();
         let mut reprs: SecondaryMap<GraphValue, Repr> = SecondaryMap::with_default(Repr::Boxed);
@@ -233,7 +243,7 @@ impl FunctionCompiler<'_, '_> {
         let rooted = |value: crate::jit::semantic::Value| {
             suspends || facts.of(value).intersects(HEAP) && !graph.borrowed.contains(&value)
         };
-        let cfg = crate::jit::semantic::Cfg::new(graph);
+        let cfg = &facts.cfg;
         let reachable = cfg.rpo.clone();
         let mut pack_slots = SecondaryMap::new();
         let mut pack_cleanup = Vec::new();
@@ -285,7 +295,7 @@ impl FunctionCompiler<'_, '_> {
             self.b.ins().stack_addr(self.pointer, slot, 0)
         });
 
-        let cyclic = cyclic_blocks(graph, &cfg);
+        let cyclic = cyclic_blocks(graph, cfg);
         let repeated = |block: crate::jit::semantic::Block| {
             suspends || graph.has_handlers || cyclic.contains(&block)
         };
@@ -315,13 +325,13 @@ impl FunctionCompiler<'_, '_> {
             values: &values,
             direct: (!suspends).then(|| RefCell::new(SecondaryMap::new())),
             reprs: &reprs,
-            facts: &facts,
+            facts,
             slots: if suspends || self.frame_size.is_none() {
                 Slots::none()
             } else {
                 slots::assign(
                     graph,
-                    &cfg,
+                    cfg,
                     |value| {
                         facts.of(value).intersects(HEAP)
                             && !graph.borrowed.contains(&value)
@@ -1998,13 +2008,18 @@ impl FunctionCompiler<'_, '_> {
                 Some(Some(Operand::new(result, Repr::Boxed)))
             }
             Op::SetIndex(object, key, value) => {
-                let Some(&view) = graph.views.get(&inst) else {
-                    return Ok(None);
-                };
-                let view = self.operand(cx, view).value;
                 let object = self.operand(cx, *object);
                 let object = self.convert(object, Repr::Boxed);
-                let key = self.operand(cx, *key);
+                let view = match graph.views.get(&inst) {
+                    Some(&view) => self.operand(cx, view).value,
+                    None => self.view(object),
+                };
+                let key = match self.operand(cx, *key) {
+                    key if key.repr == Repr::Bool => {
+                        Operand::new(self.convert(key, Repr::Boxed), Repr::Boxed)
+                    }
+                    key => key,
+                };
                 let value = self.operand(cx, *value);
                 self.viewed_index_access(view, object, key, Some(value), true, true, true);
                 Some(None)
@@ -2025,12 +2040,11 @@ fn cyclic_blocks(
         if !seen.insert(root) {
             continue;
         }
-        let mut stack = vec![(root, graph.successors(root), 0)];
-        while let Some((block, successors, next)) = stack.last_mut() {
-            if let Some(&successor) = successors.get(*next) {
-                *next += 1;
+        let mut stack = vec![(root, graph.successors(root))];
+        while let Some((block, successors)) = stack.last_mut() {
+            if let Some(successor) = successors.next() {
                 if seen.insert(successor) {
-                    stack.push((successor, graph.successors(successor), 0));
+                    stack.push((successor, graph.successors(successor)));
                 }
             } else {
                 finished.push(*block);
@@ -2054,7 +2068,7 @@ fn cyclic_blocks(
                 }
             }
         }
-        if component.len() > 1 || graph.successors(root).contains(&root) {
+        if component.len() > 1 || graph.successors(root).any(|block| block == root) {
             cyclic.extend(component);
         }
     }

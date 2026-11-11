@@ -164,6 +164,13 @@ and tile data, plus generator timing.
 Set `JS_JIT_GET_REFINEMENT=0` to disable get feedback and refinement while keeping
 other optimizations enabled (`EngineOptions::get_refinement`).
 
+An integer-speculation failure that requests recompilation puts its owning
+function into a persistent number-first policy. Later plans use general-number
+guards for speculative numeric reads, including inlined reads, while preserving
+proven integer facts such as loop indices. Observed integer feedback is retained
+separately from this policy. Repeated non-number failures can still disable
+numeric speculation at the affected site.
+
 Loop replacement (`EngineOptions::osr`) is on by default; set `JS_JIT_OSR=0` to
 disable it. Every eligible loop polls at its header and, after 1024 iterations
 with applicable feedback, requests a specialized native fragment. The running
@@ -238,6 +245,32 @@ creation; function events include the logical code ID and function name. Request
 made while a job is outstanding are marked `compiling=true`. An `unchanged` plan
 keeps the current entry without emitting replacement code. Logging is disabled
 by default and can affect timing when enabled.
+
+Set `JS_JIT_SPECIALIZATION_LOG=lin_solve` to log specialization-plan differences
+to stderr for function names containing `lin_solve`; use `1` or `*` for all
+functions (`EngineOptions::specialization_log`). This works independently of
+`JS_JIT_RECOMPILE_LOG`; enable both to correlate decisions with compilation
+times, publication and guard failures.
+
+Each record identifies the logical function and whether compilation is generic,
+specialized, an OSR fragment, or skipped. `+` adds a decision, `-` removes one,
+and `~` changes its value. Entries include relevant feedback, numeric assumptions,
+read refinements, inlines, shape accesses and conditional calls. Locations use
+source filenames and byte ranges, including sites in inlined functions.
+Function plans are compared with the last installed plan, including across
+compiler workers. Initial plans and OSR proposals are reported as additions;
+an OSR proposal is not compared with the enclosing function's plan. Snapshots
+are retained only for matching functions. These are planning decisions before
+region lowering; use `--planner` and semantic IR to inspect guards and fallbacks.
+
+For example, from `cranelift-exp/`:
+
+```sh
+JS_JIT_SPECIALIZATION_LOG=lin_solve JS_JIT_RECOMPILE_LOG=1 \
+  target/release/js-runner --load bench/v8-v7/base.js \
+  --load bench/v8-v7/navier-stokes.js --load bench/v8-v7/driver.js \
+  --eval 'function main(){}' 2>specialization.log
+```
 
 ## cpp-quickjs
 
