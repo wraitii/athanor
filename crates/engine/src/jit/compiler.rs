@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use cranelift_codegen::Context;
+use cranelift_codegen::control::ControlPlane;
 use cranelift_codegen::ir::{AbiParam, Signature, types};
 use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::FunctionBuilderContext;
@@ -144,6 +145,7 @@ struct CompileStats {
     blocks: usize,
     insts: usize,
     bytes: usize,
+    native: usize,
 }
 
 impl Drop for Compiler {
@@ -153,6 +155,9 @@ impl Drop for Compiler {
                 "js jit stats: {} functions, {} blocks, {} instructions, {} code bytes",
                 stats.functions, stats.blocks, stats.insts, stats.bytes
             );
+            if self.backend != crate::Backend::Cranelift {
+                eprintln!("js jit stats: {} native functions", stats.native);
+            }
         }
     }
 }
@@ -187,6 +192,7 @@ pub(crate) struct Compiler {
     get_refinement: bool,
     specialization_log: Option<String>,
     ssa_dump: bool,
+    backend: crate::Backend,
     inspection: Option<Arc<super::inspect::CompileOptions>>,
     next_id: u64,
     context: Context,
@@ -310,6 +316,7 @@ impl Compiler {
             get_refinement: options.get_refinement,
             specialization_log: options.specialization_log,
             ssa_dump: options.ssa_dump,
+            backend: options.backend,
             inspection: options.compile,
             next_id: 0,
             context,
@@ -382,6 +389,35 @@ impl Compiler {
             cranelift_codegen::ir::Function::new(),
         );
         Ok((function, annotations))
+    }
+
+    fn machine_code(&mut self, id: FuncId, name: &str) -> Result<MachineCode, Error> {
+        let native =
+            self.backend != crate::Backend::Cranelift && self.module.isa().name() == "aarch64";
+        if !native {
+            return MachineCode::from_cranelift(&mut self.context, &self.module, id);
+        }
+        self.context
+            .optimize(self.module.isa(), &mut ControlPlane::default())
+            .map_err(|error| Error::Compile(format!("{error:?}")))?;
+        let reason = match super::aarch64::compile(&self.context.func) {
+            Ok(machine) => {
+                if let Some(stats) = &mut self.stats {
+                    stats.native += 1;
+                }
+                return Ok(machine);
+            }
+            Err(super::aarch64::Unsupported(reason)) => reason,
+        };
+        if self.backend == crate::Backend::NativeOnly {
+            return Err(Error::Compile(format!(
+                "native backend cannot compile {name}: {reason}"
+            )));
+        }
+        if self.inspection.as_deref().is_some_and(|o| o.matches(name)) {
+            println!("[{name}] native backend fallback: {reason}");
+        }
+        MachineCode::from_cranelift(&mut self.context, &self.module, id)
     }
 
     fn entry(&mut self, id: FuncId) -> Result<Entry, Error> {
@@ -942,7 +978,7 @@ impl Compiler {
             } else {
                 self.fixed.remove(&id);
             }
-            let machine = MachineCode::from_cranelift(&mut self.context, &self.module, id)?;
+            let machine = self.machine_code(id, &name)?;
             machine.define(&mut self.module, id)?;
             if let Some(stats) = &mut self.stats {
                 stats.bytes += machine.bytes.len();

@@ -1,3 +1,5 @@
+mod aarch64;
+mod alloc;
 mod analysis;
 pub(crate) mod bailouts;
 mod builtins;

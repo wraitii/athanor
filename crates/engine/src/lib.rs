@@ -7,7 +7,7 @@ mod jit;
 mod parse;
 mod value;
 
-pub use engine::{Engine, EngineOptions, OptLevel};
+pub use engine::{Backend, Engine, EngineOptions, OptLevel};
 pub use environment::Environment;
 pub use error::Error;
 pub use heap::OwnedValue;
