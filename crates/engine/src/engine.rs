@@ -199,6 +199,24 @@ pub struct Engine {
 
 impl Drop for Engine {
     fn drop(&mut self) {
+        if std::env::var_os("JS_JIT_HEAP_CYCLES").is_some_and(|value| value == "1") {
+            let start = std::time::Instant::now();
+            let stats = self.global.heap().cycle_stats();
+            eprintln!(
+                "heap cycles: arena_bytes={}, scanned_slots={}, live={}, unreachable={}, cyclic_components={}, cyclic_nodes={}, unreachable_components={}, unreachable_cyclic_nodes={}, cyclic_kinds={:?}, unreachable_kinds={:?}; snapshot={:?}",
+                stats.arena_bytes,
+                stats.scanned_slots,
+                stats.live,
+                stats.unreachable,
+                stats.cyclic_components,
+                stats.cyclic_nodes,
+                stats.unreachable_components,
+                stats.unreachable_cyclic_nodes,
+                stats.cyclic_kinds,
+                stats.unreachable_kinds,
+                start.elapsed()
+            );
+        }
         self.tiering.log_prefetch_uses();
         crate::jit::bailouts::report();
         self.tiering.report();

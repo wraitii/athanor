@@ -104,6 +104,13 @@ impl Default for Properties {
 }
 
 impl Properties {
+    pub(super) fn visit_values(&self, visit: &mut impl FnMut(Value)) {
+        match self {
+            Self::Shaped(values) => values.iter().copied().for_each(visit),
+            Self::Dictionary(table) => table.slots.iter().for_each(|slot| visit(slot.value)),
+        }
+    }
+
     pub(super) fn raw(&self) -> (*const u8, usize) {
         match self {
             Self::Shaped(values) => (values.as_ptr().cast(), values.len()),

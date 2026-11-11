@@ -122,7 +122,10 @@ impl Arena {
         address.is_multiple_of(SLOT_SIZE) && self.chunks.iter().any(|chunk| chunk.contains(address))
     }
 
-    #[cfg(test)]
+    pub(super) fn capacity(&self) -> usize {
+        self.chunks.iter().map(|chunk| chunk.capacity).sum()
+    }
+
     pub(super) fn len(&self) -> usize {
         match self.chunks.split_last() {
             Some((_, full)) => full.iter().map(|chunk| chunk.capacity).sum::<usize>() + self.used,
@@ -130,7 +133,6 @@ impl Arena {
         }
     }
 
-    #[cfg(test)]
     pub(super) fn slots(&self) -> impl Iterator<Item = &Slot> {
         let last = self.chunks.len().saturating_sub(1);
         self.chunks

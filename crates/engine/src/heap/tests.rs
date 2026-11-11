@@ -1,6 +1,89 @@
 use super::*;
 
 #[test]
+fn cycle_stats_distinguish_rooted_and_unreachable_self_cycles() {
+    let heap = Heap::default();
+    let object = heap.object().unwrap();
+    assert!(heap.set_property(object, "self", object));
+
+    let stats = heap.cycle_stats();
+    assert_eq!((stats.live, stats.unreachable), (1, 0));
+    assert_eq!((stats.cyclic_components, stats.cyclic_nodes), (1, 1));
+    assert_eq!(
+        (stats.unreachable_components, stats.unreachable_cyclic_nodes),
+        (0, 0)
+    );
+
+    heap.release(object);
+    let stats = heap.cycle_stats();
+    assert_eq!((stats.live, stats.unreachable), (1, 1));
+    assert_eq!((stats.cyclic_components, stats.cyclic_nodes), (1, 1));
+    assert_eq!(
+        (stats.unreachable_components, stats.unreachable_cyclic_nodes),
+        (1, 1)
+    );
+}
+
+#[test]
+fn cycle_stats_count_duplicate_edges_and_acyclic_tails() {
+    let heap = Heap::default();
+    let first = heap.object().unwrap();
+    let second = heap.object().unwrap();
+    let tail = heap.object().unwrap();
+    assert!(heap.set_property(first, "second", second));
+    assert!(heap.set_property(first, "duplicate", second));
+    assert!(heap.set_property(second, "first", first));
+    assert!(heap.set_property(second, "tail", tail));
+    heap.release(first);
+    heap.release(second);
+    heap.release(tail);
+
+    let stats = heap.cycle_stats();
+    assert_eq!((stats.live, stats.unreachable), (3, 3));
+    assert_eq!((stats.cyclic_components, stats.cyclic_nodes), (1, 2));
+    assert_eq!(
+        (stats.unreachable_components, stats.unreachable_cyclic_nodes),
+        (1, 2)
+    );
+}
+
+#[test]
+fn cycle_stats_include_closure_cells() {
+    let heap = Heap::default();
+    let cell = heap.cell(Value::UNDEFINED).unwrap();
+    let closure = heap.closure(CodeId(1), &[cell]).unwrap();
+    assert!(heap.cell_set(cell, closure));
+    heap.release(cell);
+    heap.release(closure);
+
+    let stats = heap.cycle_stats();
+    assert_eq!((stats.live, stats.unreachable), (2, 2));
+    assert_eq!((stats.cyclic_components, stats.cyclic_nodes), (1, 2));
+    assert_eq!(
+        (stats.unreachable_components, stats.unreachable_cyclic_nodes),
+        (1, 2)
+    );
+}
+
+#[test]
+fn cycle_stats_drain_pending_disposals() {
+    let heap = Heap::default();
+    let cycle = heap.object().unwrap();
+    assert!(heap.set_property(cycle, "self", cycle));
+    let holder = heap.array(&[cycle]).unwrap();
+    heap.release(cycle);
+    heap.release(holder);
+
+    let stats = heap.cycle_stats();
+    assert_eq!((stats.live, stats.unreachable), (1, 1));
+    assert_eq!((stats.cyclic_components, stats.cyclic_nodes), (1, 1));
+    assert_eq!(
+        (stats.unreachable_components, stats.unreachable_cyclic_nodes),
+        (1, 1)
+    );
+}
+
+#[test]
 fn split_results_own_reused_source() {
     let heap = Heap::default();
     let source = heap.string("terrain/grass").unwrap();

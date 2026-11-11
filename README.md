@@ -349,3 +349,32 @@ instrumentation rather than profiler output.
 
 Upstream `qjs`'s `-T/--trace` option traces memory allocation, and `-d/--dump`
 prints memory usage statistics. Neither is a CPU profiler.
+
+### Heap cycle diagnostics
+
+Set `JS_JIT_HEAP_CYCLES=1` to report a heap snapshot to stderr at engine shutdown,
+while globals and other engine roots still exist. The diagnostic fully drains
+pending reference-count disposal, subtracts heap-internal owning edges from copied
+reference counts, and traces from the remaining external owners. It does not
+collect cycles or add work to retain/release paths.
+
+`cyclic_components` counts strongly connected groups with more than one member
+or a self-edge, not all possible paths around a cycle. `cyclic_nodes` counts their
+members; `unreachable_components` and `unreachable_cyclic_nodes` restrict these
+to groups without an external owner. `unreachable` also includes acyclic objects
+retained by those groups. Kind counts distinguish cycle members from all retained
+garbage. `live` counts allocated positive-reference slots after disposal, not
+bytes or arena capacity. `arena_bytes` reports allocated slot storage, excluding
+out-of-line payload allocations; `scanned_slots` includes freed slots below the
+arena high-water mark. Snapshot time includes draining and graph analysis.
+
+This is a synchronous diagnostic with temporary graph storage, not a production
+collector or a bounded-pause operation. It assumes reference counts are correct;
+missing releases look like external owners. A single shutdown snapshot measures
+retention at that boundary, not peak retention or accumulation across repeated
+runs. Host handles and globals intentionally keep objects reachable.
+
+```sh
+JS_JIT_HEAP_CYCLES=1 cargo run --release --manifest-path cranelift-exp/Cargo.toml -- \
+  --map binaries/data/mods/public/maps/random/belgian_uplands.js
+```

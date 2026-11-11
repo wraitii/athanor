@@ -9,6 +9,7 @@ use crate::value::{TAG_OBJECT, TAG_STRING, Value};
 
 mod arena;
 mod array;
+mod cycles;
 mod function;
 mod generator;
 pub(crate) mod kind;
