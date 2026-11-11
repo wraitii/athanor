@@ -81,14 +81,12 @@ pub(super) fn expand(
     }
     for (inst, method) in sites {
         expanded.insert(inst);
+        let site = graph.note_inst(inst);
         iteration(graph, inst, method);
         graph.verify()?;
-        let span = graph.insts[inst].span;
         notes.push(format!(
-            "array {} at {}..{}: expose callback loop behind native and array checks",
-            method.name(),
-            span.start,
-            span.end
+            "array {} at {site}: expose callback loop behind native and array checks",
+            method.name()
         ));
     }
     Ok(())

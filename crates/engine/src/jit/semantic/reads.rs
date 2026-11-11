@@ -79,6 +79,7 @@ pub(super) fn apply(
     notes: &mut Vec<String>,
 ) -> super::Result<()> {
     for read in reads {
+        let site = graph.note_inst(read.inst);
         let data = graph.insts[read.inst].clone();
         let (object, key) = match data.op {
             Op::GetIndex(object, key)
@@ -149,8 +150,7 @@ pub(super) fn apply(
                 guard = otherwise;
             }
             notes.push(format!(
-                "read at {}..{}: packed/holey indexed receiver checks",
-                data.span.start, data.span.end
+                "read at {site}: packed/holey indexed receiver checks"
             ));
             continue;
         }
@@ -176,10 +176,7 @@ pub(super) fn apply(
                 args: vec![value.unwrap()],
             }),
         });
-        notes.push(format!(
-            "read at {}..{}: {} receiver check",
-            data.span.start, data.span.end, "typed"
-        ));
+        notes.push(format!("read at {site}: typed receiver check"));
     }
     graph.verify()
 }

@@ -1741,7 +1741,10 @@ impl FunctionCompiler<'_, '_> {
                 let right = self.operand(cx, *right);
                 let left = self.convert(left, Repr::Int64);
                 let right = self.convert(right, Repr::Int64);
-                Some(Some(Operand::new(self.b.ins().imul(left, right), Repr::Int64)))
+                Some(Some(Operand::new(
+                    self.b.ins().imul(left, right),
+                    Repr::Int64,
+                )))
             }
             Op::Binary(operator, left, right)
             | Op::GuardedCompare {

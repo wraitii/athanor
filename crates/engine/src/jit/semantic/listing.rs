@@ -529,6 +529,22 @@ impl fmt::Display for Listing<'_> {
 }
 
 impl Graph {
+    pub(super) fn note_inst(&self, inst: Inst) -> String {
+        let data = &self.insts[inst];
+        let op = self.op_text(&data.op);
+        let op = data
+            .result
+            .map_or(op.clone(), |value| format!("{value} = {op}"));
+        let source = data.source_name.map_or_else(
+            || "source ?".to_owned(),
+            |(source, _)| format!("source {source}"),
+        );
+        format!(
+            "{inst} [{source}:{}..{}; {op}]",
+            data.span.start, data.span.end
+        )
+    }
+
     pub(in crate::jit) fn inst_location(&self, inst: Inst) -> u32 {
         u32::try_from(inst.index() + 1).unwrap()
     }

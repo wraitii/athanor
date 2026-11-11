@@ -596,14 +596,15 @@ pub(super) fn install_summaries(graph: &mut Graph, bodies: &Repository, notes: &
         );
     }
     for (inst, target) in closures {
+        let site = graph.note_inst(inst);
         match installed.get(&target) {
             Some(summary) if summary.requires.is_empty() => {
-                notes.push(format!("call {inst}: {target} proved closed and read-only"));
+                notes.push(format!("call {site}: {target} proved closed and read-only"));
             }
             None if !summaries.contains_key(&target) => {}
             _ => {
                 notes.push(format!(
-                    "call {inst}: closed-call proof rejected: {}",
+                    "call {site}: closed-call proof rejected: {}",
                     bodies.obligation_chain(target, true)
                 ));
             }
@@ -652,6 +653,7 @@ pub(super) fn conditional_plan(
     let summaries = bodies.effect_summaries(candidates.iter().map(|(_, _, _, target)| *target));
     let mut plan = ConditionalPlan::default();
     for (inst, callee, name, target) in candidates {
+        let site = graph.note_inst(inst);
         let Some(summary) = summaries.get(&target) else {
             continue;
         };
@@ -663,7 +665,7 @@ pub(super) fn conditional_plan(
             || !requires.string_splits.is_empty()
         {
             notes.push(format!(
-                "call {inst}: conditional proof rejected: {}",
+                "call {site}: conditional proof rejected: {}",
                 bodies.obligation_chain(target, false)
             ));
             continue;
@@ -680,7 +682,7 @@ pub(super) fn conditional_plan(
         assumptions.sort();
         if !assumptions.is_empty() {
             notes.push(format!(
-                "call {inst}: conditional effects require {}",
+                "call {site}: conditional effects require {}",
                 assumptions.join(", ")
             ));
         }
@@ -931,13 +933,11 @@ pub(super) fn apply(
 ) -> Result<()> {
     for inline in plan.inlines {
         let body = bodies.body(inline.target).unwrap();
+        let site = graph.note_inst(inline.call);
         super::inlining::apply(graph, body, &inline);
         graph.verify()?;
-        let span = graph.insts[inline.call].span;
         notes.push(format!(
-            "call at {}..{}: inline {} with {} code check(s)",
-            span.start,
-            span.end,
+            "call {site}: inline {} with {} code check(s)",
             inline.target,
             usize::from(inline.guard_code)
         ));

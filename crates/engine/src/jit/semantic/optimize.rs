@@ -516,10 +516,7 @@ pub(super) fn reuse_loads(function: &mut FunctionState) {
         .collect();
     graph.replace_uses(&aliases);
     for &(inst, value) in &solved.reused {
-        notes.push(format!(
-            "{} reuses {value}",
-            graph.op_text(&graph.insts[inst].op)
-        ));
+        notes.push(format!("{} reuses {value}", graph.note_inst(inst)));
         graph.remove_inst(inst);
     }
     if !solved.reused.is_empty() {
@@ -878,7 +875,10 @@ pub(super) fn forward_captured_parameters(function: &mut FunctionState) {
     }
     graph.replace_uses(&aliases);
     for inst in removed {
-        notes.push(format!("forwarded captured parameter read at {inst}"));
+        notes.push(format!(
+            "forwarded captured parameter read at {}",
+            graph.note_inst(inst)
+        ));
         graph.remove_inst(inst);
     }
     if !aliases.is_empty() {
