@@ -274,10 +274,31 @@ impl Facts {
     }
 
     pub(in crate::jit) fn compute(graph: &Graph) -> Self {
-        Self::assuming(graph, &[])
+        let mut facts = Self::values(graph);
+        facts.compute_effects(graph);
+        facts
+    }
+
+    // Effect queries remain conservative until compute_effects runs.
+    pub(super) fn values(graph: &Graph) -> Self {
+        Self::values_with_cfg(graph, Cfg::new(graph))
+    }
+
+    pub(super) fn values_with_cfg(graph: &Graph, cfg: Cfg) -> Self {
+        Self::assuming_values(graph, cfg, &[])
     }
 
     pub(super) fn assuming(graph: &Graph, candidates: &[(Value, guards::Fact)]) -> Self {
+        let mut facts = Self::assuming_values(graph, Cfg::new(graph), candidates);
+        facts.compute_effects(graph);
+        facts
+    }
+
+    pub(super) fn assuming_values(
+        graph: &Graph,
+        cfg: Cfg,
+        candidates: &[(Value, guards::Fact)],
+    ) -> Self {
         let assumptions: HashMap<Value, Types> = candidates
             .iter()
             .filter_map(|&(value, fact)| Some((value, fact.mask()?)))
@@ -288,7 +309,6 @@ impl Facts {
             .collect();
         let assumptions = &assumptions;
         let identities = &identities;
-        let cfg = Cfg::new(graph);
         let steps = steps(graph, &cfg);
         let mut refinements: HashMap<Value, Vec<Refinement>> = HashMap::new();
         for &block in &cfg.rpo {
@@ -448,21 +468,28 @@ impl Facts {
                 }
             }
         }
+        facts
+    }
+
+    pub(super) fn compute_effects(&mut self, graph: &Graph) {
+        self.rejected.clear();
+        self.fresh.take();
+        self.memory.clear();
+        self.control.clear();
         loop {
-            for &block in &rpo {
+            for &block in &self.cfg.rpo {
                 for &inst in &graph.blocks[block].insts {
-                    let effects = graph.inst_contract(inst, &facts).effects;
-                    facts.memory[inst] = effects.memory;
-                    facts.control[inst] = effects.control;
+                    let effects = graph.inst_contract(inst, self).effects;
+                    self.memory[inst] = effects.memory;
+                    self.control[inst] = effects.control;
                 }
             }
-            let unavailable = facts.unavailable_probes(graph);
+            let unavailable = self.unavailable_probes(graph);
             if unavailable.is_empty() {
                 break;
             }
-            facts.rejected.extend(unavailable);
+            self.rejected.extend(unavailable);
         }
-        facts
     }
 
     fn bounded(&self, op: &Op, bounds: &[Value]) -> bool {

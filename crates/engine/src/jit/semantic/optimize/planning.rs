@@ -269,8 +269,8 @@ impl RegionPlan {
         canonical: &Canonical<'_>,
         shapes: &super::super::shapes::Plan,
     ) -> Result<()> {
-        let cfg = Cfg::new(graph);
-        let live: HashSet<_> = cfg.rpo.iter().copied().collect();
+        let known = Facts::values(graph);
+        let live: HashSet<_> = known.cfg.rpo.iter().copied().collect();
         self.body.retain(|block| live.contains(block));
         if self.body.is_empty() {
             return Ok(());
@@ -282,7 +282,14 @@ impl RegionPlan {
             codes: std::mem::take(&mut self.identities),
             ..Default::default()
         };
-        let (mut current, _) = plan_region(graph, self.body, self.entry, &self.calls, &candidates)?;
+        let (mut current, _) = plan_region(
+            graph,
+            &known,
+            self.body,
+            self.entry,
+            &self.calls,
+            &candidates,
+        )?;
         current.children = self.children;
         self = current;
         if report_regions {
@@ -298,9 +305,11 @@ impl RegionPlan {
         let mut child_canonical = None;
         let mut region_fallback = None;
         if self.speculative() {
-            let blocks: Vec<_> = Cfg::new(graph)
+            let blocks: Vec<_> = known
+                .cfg
                 .rpo
-                .into_iter()
+                .iter()
+                .copied()
                 .filter(|block| self.body.contains(block))
                 .collect();
             let fallback = fallback.filter(|_| self.entry.is_none());
@@ -401,12 +410,12 @@ impl RegionPlan {
 
 fn plan_region(
     graph: &Graph,
+    known: &Facts,
     body: HashSet<Block>,
     entry: Option<(Block, Block)>,
     conditional: &[ConditionalCall],
     candidates: &Candidates,
 ) -> Result<(RegionPlan, Facts)> {
-    let known = Facts::compute(graph);
     let locals: Vec<_> = candidates
         .locals
         .iter()
@@ -419,9 +428,11 @@ fn plan_region(
                     if !known.of(value).within(types))
         })
         .collect();
-    let blocks: Vec<_> = Cfg::new(graph)
+    let blocks: Vec<_> = known
+        .cfg
         .rpo
-        .into_iter()
+        .iter()
+        .copied()
         .filter(|block| body.contains(block))
         .collect();
     let exits: Vec<_> = blocks
@@ -578,17 +589,15 @@ fn plan_region(
         .iter()
         .filter_map(|&(value, fact)| Some((value, fact.mask()?)))
         .collect();
-    let facts = Facts::assuming(&planning, &guards::assumed(&assumptions, &assumed));
+    // Call rewrites and dead callee removal leave control flow unchanged.
+    let facts = Facts::assuming_values(
+        &planning,
+        known.cfg.clone(),
+        &guards::assumed(&assumptions, &assumed),
+    );
     let typed = typed_entry(&planning, &body, &available, &facts, &assumes);
     let objects: Vec<Value> = typed.iter().map(|&(object, _)| object).collect();
-    let mut bounded = bounded_reads(
-        &planning,
-        &Cfg::new(&planning),
-        &body,
-        &objects,
-        &available,
-        &facts,
-    );
+    let mut bounded = bounded_reads(&planning, &facts.cfg, &body, &objects, &available, &facts);
     bounded.retain(|_, &mut (object, bound)| {
         assumes.contains(&(object, Fact::Bound(bound)))
             && (reentry.is_none() || typed.iter().any(|&(typed, _)| typed == object))
@@ -689,14 +698,15 @@ fn plan(
     reached: &[Reach],
     notes: &mut Vec<String>,
 ) -> Vec<RegionPlan> {
-    let cfg = Cfg::new(graph);
-    let mut candidates: Vec<_> = natural_loops(graph, &cfg)
+    let known = Facts::values(graph);
+    let cfg = &known.cfg;
+    let mut candidates: Vec<_> = natural_loops(graph, cfg)
         .into_iter()
         .filter_map(|(header, body)| {
             if graph.cold.contains(&header) {
                 return None;
             }
-            let preheader = preheader(graph, &cfg, header, &body)?;
+            let preheader = preheader(graph, cfg, header, &body)?;
             Some((body, Some((preheader, header))))
         })
         .collect();
@@ -733,7 +743,7 @@ fn plan(
             }
         }
         let (mut parent, facts) =
-            match plan_region(graph, body, entry, &conditional.calls, &proposals) {
+            match plan_region(graph, &known, body, entry, &conditional.calls, &proposals) {
                 Ok(plan) => plan,
                 Err(reason) => {
                     let label = entry.map_or_else(

@@ -498,7 +498,7 @@ pub(super) fn reuse_loads(function: &mut FunctionState) {
     if graph.has_handlers || graph.generator {
         return;
     }
-    function.refresh_facts();
+    function.ensure_facts();
     let FunctionState {
         graph,
         facts,
@@ -521,6 +521,9 @@ pub(super) fn reuse_loads(function: &mut FunctionState) {
             graph.op_text(&graph.insts[inst].op)
         ));
         graph.remove_inst(inst);
+    }
+    if !solved.reused.is_empty() {
+        function.invalidate_values();
     }
 }
 
@@ -553,32 +556,33 @@ pub(super) fn normalise_regions(function: &mut FunctionState, regions: &[RegionI
     function.graph.verify()?;
     reuse_loads(function);
     function.graph.verify()?;
-    for region in regions {
-        hoist(function, *region);
+    for &region in regions {
+        hoist(function, region);
         function.graph.verify()?;
     }
     Ok(())
 }
 
 pub(super) fn hoist(function: &mut FunctionState, region: RegionId) {
-    function.refresh_facts();
-    let FunctionState {
-        graph,
-        facts,
-        notes,
-        ..
-    } = function;
-    let region = graph.regions[region].blocks.clone();
-    let region = &region;
-    let cfg = &facts.cfg;
-    for (header, body) in natural_loops(graph, cfg) {
-        if !body.is_subset(region) {
+    function.ensure_cfg();
+    let region = function.graph.regions[region].blocks.clone();
+    let loops = natural_loops(&function.graph, &function.facts.cfg);
+    for (header, body) in loops {
+        if !body.is_subset(&region) {
             continue;
         }
+        function.ensure_facts();
+        let FunctionState {
+            graph,
+            facts,
+            notes,
+            ..
+        } = function;
+        let cfg = &facts.cfg;
         let Some(preheader) = preheader(graph, cfg, header, &body) else {
             continue;
         };
-        let writes = Writes::collect(graph, &body);
+        let writes = Writes::with_facts(graph, &body, &*facts);
         let invariant = |graph: &Graph, op: &Op| {
             op.operands_iter()
                 .all(|value| !body.contains(&graph.def_block(value)))
@@ -605,7 +609,8 @@ pub(super) fn hoist(function: &mut FunctionState, region: RegionId) {
                 let data = &graph.insts[inst];
                 if data.result.is_some()
                     && !matches!(data.op, Op::Constant(_))
-                    && facts.is_pure(inst)
+                    && (facts.is_pure(inst)
+                        || (facts.removable(inst) && writes.preserves(&data.op)))
                     && invariant(graph, &data.op)
                 {
                     moved.push(inst);
@@ -613,6 +618,7 @@ pub(super) fn hoist(function: &mut FunctionState, region: RegionId) {
                 }
             }
         }
+        let changed = !moved.is_empty();
         for inst in moved {
             let data = &graph.insts[inst];
             notes.push(format!(
@@ -620,6 +626,9 @@ pub(super) fn hoist(function: &mut FunctionState, region: RegionId) {
                 data.result.unwrap(),
                 graph.op_text(&data.op)
             ));
+        }
+        if changed {
+            function.invalidate_values();
         }
     }
 }
@@ -664,7 +673,7 @@ fn probe_reads(
 }
 
 pub(super) fn views(function: &mut FunctionState) {
-    function.refresh_facts();
+    function.ensure_values();
     let FunctionState {
         graph,
         facts,
@@ -710,10 +719,13 @@ pub(super) fn views(function: &mut FunctionState) {
             graph.views.insert(inst, view);
         }
     }
+    if !placed.is_empty() {
+        function.invalidate_values();
+    }
 }
 
 pub(super) fn sink_closures(function: &mut FunctionState) {
-    function.refresh_cfg();
+    function.ensure_cfg();
     let FunctionState {
         graph,
         facts,
@@ -722,6 +734,7 @@ pub(super) fn sink_closures(function: &mut FunctionState) {
     } = function;
     let cfg = &facts.cfg;
     let loops = natural_loops(graph, cfg);
+    let mut changed = false;
     let mut uses: HashMap<Value, HashSet<Block>> = HashMap::new();
     let mut closures = Vec::new();
     for &block in &cfg.rpo {
@@ -748,6 +761,7 @@ pub(super) fn sink_closures(function: &mut FunctionState) {
         let value = graph.insts[inst].result.unwrap();
         let Some(users) = uses.get(&value) else {
             graph.remove_inst(inst);
+            changed = true;
             notes.push(format!("unused closure {value} removed after inlining"));
             continue;
         };
@@ -779,6 +793,7 @@ pub(super) fn sink_closures(function: &mut FunctionState) {
             }
         }
         graph.remove_inst(inst);
+        changed = true;
         let position = graph.blocks[target]
             .insts
             .iter()
@@ -795,10 +810,13 @@ pub(super) fn sink_closures(function: &mut FunctionState) {
             "closure {value} materialized only in fallback {target}"
         ));
     }
+    if changed {
+        function.invalidate_values();
+    }
 }
 
 pub(super) fn forward_captured_parameters(function: &mut FunctionState) {
-    function.refresh_cfg();
+    function.ensure_cfg();
     let FunctionState {
         graph,
         facts,
@@ -863,10 +881,13 @@ pub(super) fn forward_captured_parameters(function: &mut FunctionState) {
         notes.push(format!("forwarded captured parameter read at {inst}"));
         graph.remove_inst(inst);
     }
+    if !aliases.is_empty() {
+        function.invalidate_values();
+    }
 }
 
 pub(super) fn lazy_captures(function: &mut FunctionState) -> bool {
-    function.refresh_cfg();
+    function.ensure_cfg();
     let FunctionState {
         graph,
         facts,
@@ -874,6 +895,7 @@ pub(super) fn lazy_captures(function: &mut FunctionState) -> bool {
         ..
     } = function;
     let mut demoted = false;
+    let mut changed = false;
     let mut candidates = HashSet::new();
     let mut eager = HashSet::new();
     for &block in &facts.cfg.rpo {
@@ -894,6 +916,7 @@ pub(super) fn lazy_captures(function: &mut FunctionState) -> bool {
         {
             if candidates.contains(&binding) {
                 if graph.lazy_captures.insert(binding) {
+                    changed = true;
                     notes.push(format!(
                         "binding {binding} materialized as a cell only on closure creation"
                     ));
@@ -902,9 +925,13 @@ pub(super) fn lazy_captures(function: &mut FunctionState) -> bool {
                 data.captured = false;
                 graph.lazy_captures.remove(&binding);
                 demoted = true;
+                changed = true;
                 notes.push(format!("binding {binding} no longer needs a capture cell"));
             }
         }
+    }
+    if changed {
+        function.invalidate_values();
     }
     demoted
 }

@@ -5,7 +5,8 @@ use oxc_syntax::operator::BinaryOperator;
 use super::{Block, Constant, Op, Types, Value};
 
 pub(super) fn expose(function: &mut super::FunctionState) {
-    function.refresh_facts();
+    function.ensure_values();
+    let mut changed = false;
     let graph = &mut function.graph;
     let facts = &function.facts;
     let cfg = &facts.cfg;
@@ -22,6 +23,7 @@ pub(super) fn expose(function: &mut super::FunctionState) {
                         .find(|(definition, _)| cfg.dominates(*definition, block))
                 });
                 if let Some(&(_, earlier)) = earlier {
+                    changed = true;
                     aliases.insert(data.result.unwrap(), earlier);
                     removed.push(inst);
                 } else {
@@ -51,6 +53,7 @@ pub(super) fn expose(function: &mut super::FunctionState) {
                     None
                 };
                 if let Some(value) = value {
+                    changed = true;
                     if operator == BinaryOperator::StrictEquality {
                         graph.insts[inst].op = Op::IsUndefined(value);
                     } else {
@@ -108,6 +111,7 @@ pub(super) fn expose(function: &mut super::FunctionState) {
                 *number = result.unwrap();
                 checks.entry(value).or_default().push((block, *number));
             }
+            changed = true;
             graph.insts[inst].op = Op::GuardedCompare {
                 operator,
                 left,
@@ -119,5 +123,8 @@ pub(super) fn expose(function: &mut super::FunctionState) {
     graph.replace_uses(&aliases);
     for inst in removed {
         graph.remove_inst(inst);
+    }
+    if changed {
+        function.invalidate_values();
     }
 }

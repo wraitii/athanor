@@ -5,7 +5,7 @@ use super::{
 
 pub(super) fn lower(function: &mut FunctionState) -> super::Result<bool> {
     let arrays_changed = lower_arrays(function);
-    function.refresh_facts();
+    function.ensure_values();
     let graph = &mut function.graph;
     let facts = &function.facts;
     let reads: Vec<_> = facts
@@ -70,12 +70,15 @@ pub(super) fn lower(function: &mut FunctionState) -> super::Result<bool> {
             }),
         });
     }
-    graph.verify()?;
+    if changed {
+        function.invalidate_cfg();
+    }
+    function.graph.verify()?;
     Ok(changed || arrays_changed)
 }
 
 pub(super) fn lower_arrays(function: &mut FunctionState) -> bool {
-    function.refresh_facts();
+    function.ensure_values();
     let graph = &mut function.graph;
     let facts = &function.facts;
     let mut changed = false;
@@ -108,6 +111,9 @@ pub(super) fn lower_arrays(function: &mut FunctionState) -> bool {
             graph.insts[inst].op = Op::BooleanAnd(layout, valid);
             changed = true;
         }
+    }
+    if changed {
+        function.invalidate_values();
     }
     changed
 }

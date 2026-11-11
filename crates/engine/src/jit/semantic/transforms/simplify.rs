@@ -22,13 +22,14 @@ pub(in crate::jit::semantic) trait Folder {
 
 pub(in crate::jit::semantic) fn simplify(function: &mut FunctionState, folder: &mut impl Folder) {
     loop {
-        function.refresh_facts();
+        function.ensure_facts();
         let FunctionState { graph, facts, .. } = function;
         let cfg = &facts.cfg;
         let uses = graph.use_counts();
         let mut aliases = HashMap::new();
         let mut dead = Vec::new();
-        let mut changed = folder.refine(graph, cfg);
+        let mut cfg_changed = folder.refine(graph, cfg);
+        let mut changed = cfg_changed;
         for &block in &cfg.rpo {
             for &inst in &graph.blocks[block].insts {
                 match folder.fold(graph, facts, inst) {
@@ -63,10 +64,14 @@ pub(in crate::jit::semantic) fn simplify(function: &mut FunctionState, folder: &
         for inst in &dead {
             graph.remove_inst(*inst);
         }
-        changed |= fold_constant_branches(graph, cfg);
-        changed |= fold_dominated_branches(graph, cfg);
-        changed |= thread_branches(graph);
-        if !changed && dead.is_empty() {
+        cfg_changed |= fold_constant_branches(graph, cfg);
+        cfg_changed |= fold_dominated_branches(graph, cfg);
+        cfg_changed |= thread_branches(graph);
+        if cfg_changed {
+            function.invalidate_cfg();
+        } else if changed || !dead.is_empty() {
+            function.invalidate_values();
+        } else {
             return;
         }
     }

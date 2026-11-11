@@ -3,7 +3,8 @@ use oxc_syntax::operator::BinaryOperator;
 use super::super::{Constant, Op, TerminatorKind, Types, ValueDef};
 
 pub(in crate::jit::semantic) fn bit_tests(function: &mut super::super::FunctionState) {
-    function.refresh_facts();
+    function.ensure_values();
+    let mut changed = false;
     let graph = &mut function.graph;
     let facts = &function.facts;
     let uses = graph.use_counts();
@@ -59,5 +60,9 @@ pub(in crate::jit::semantic) fn bit_tests(function: &mut super::super::FunctionS
         );
         graph.insts[shift].source_name = source_name;
         graph.insts[inst].op = Op::Binary(BinaryOperator::BitwiseAnd, shifted.unwrap(), one);
+        changed = true;
+    }
+    if changed {
+        function.invalidate_values();
     }
 }

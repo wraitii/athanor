@@ -1,13 +1,14 @@
 use super::super::fresh::Fresh;
 use super::*;
 
-pub(super) struct Writes {
+pub(super) struct Writes<F = Facts> {
     writes: Vec<(Inst, Access)>,
     fresh: std::rc::Rc<Fresh>,
-    pub(super) facts: Facts,
+    pub(super) facts: F,
 }
 
 impl Writes {
+    #[cfg(test)]
     pub(super) fn collect(graph: &Graph, blocks: &HashSet<Block>) -> Self {
         Self::collect_assuming(graph, blocks, &HashMap::new())
     }
@@ -18,15 +19,22 @@ impl Writes {
         assumed: &HashMap<Value, cranelift_module::FuncId>,
     ) -> Self {
         let facts = Facts::assuming(graph, &guards::assumed(&HashMap::new(), assumed));
+        Self::with_facts(graph, blocks, facts)
+    }
+}
+
+impl<F: std::borrow::Borrow<Facts>> Writes<F> {
+    pub(super) fn with_facts(graph: &Graph, blocks: &HashSet<Block>, facts: F) -> Self {
+        let known = facts.borrow();
         let mut writes = Vec::new();
-        let fresh = facts.fresh(graph);
+        let fresh = known.fresh(graph);
         for &block in blocks {
             for &inst in &graph.blocks[block].insts {
-                let memory = facts.memory(inst);
+                let memory = known.memory(inst);
                 if memory.writes_state() {
                     writes.push((
                         inst,
-                        Access::written(&graph.insts[inst].op, &facts, memory.writes),
+                        Access::written(&graph.insts[inst].op, known, memory.writes),
                     ));
                 }
             }
@@ -58,7 +66,7 @@ impl Writes {
     }
 
     pub(super) fn preserves(&self, op: &Op) -> bool {
-        Access::read(op, &self.facts).is_some_and(|read| !self.clobbers(&read))
+        Access::read(op, self.facts.borrow()).is_some_and(|read| !self.clobbers(&read))
     }
 }
 

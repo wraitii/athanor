@@ -24,9 +24,10 @@ impl Body {
         }
         super::optimize::views(&mut function);
         super::js::simplify(&mut function);
+        function.invalidate_cfg();
         super::transforms::trim(&mut function.graph);
         super::transforms::remove_trivial_params(&mut function.graph);
-        function.refresh_facts();
+        function.ensure_facts();
         let super::FunctionState {
             mut graph,
             facts,

@@ -4,7 +4,8 @@ use super::super::{Op, Types, UnaryOp};
 use super::NUMERIC;
 
 pub(in crate::jit::semantic) fn coercions(function: &mut super::super::FunctionState) {
-    function.refresh_facts();
+    function.ensure_values();
+    let mut changed = false;
     let graph = &mut function.graph;
     let facts = &function.facts;
     for &block in &facts.cfg.rpo {
@@ -50,6 +51,10 @@ pub(in crate::jit::semantic) fn coercions(function: &mut super::super::FunctionS
                 position += 1;
             }
             graph.insts[inst].op = op;
+            changed = true;
         }
+    }
+    if changed {
+        function.invalidate_values();
     }
 }

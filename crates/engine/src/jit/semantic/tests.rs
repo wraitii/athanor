@@ -1363,3 +1363,72 @@ fn forwarded_undefined_facts_stop_at_joins_and_alternate_predecessors() {
     let facts = Facts::compute(&graph);
     assert_eq!(facts.of(parameter), facts.of(value));
 }
+
+#[test]
+fn facts_refresh_after_instruction_and_control_flow_changes() {
+    let graph = lower_source("function f(){return 1;}").unwrap();
+    let mut function = FunctionState::new(graph, Vec::new(), true);
+    function.ensure_facts();
+    let (inst, value) = function
+        .graph
+        .insts
+        .iter()
+        .find_map(|(inst, data)| {
+            matches!(data.op, Op::Constant(Constant::Number(1.0)))
+                .then_some((inst, data.result.unwrap()))
+        })
+        .unwrap();
+    let cfg_storage = function.facts.cfg.rpo.as_ptr();
+    assert_eq!(function.facts.of(value), Types::INT32);
+    function.graph.insts[inst].op = Op::Constant(Constant::String("one".into()));
+    function.invalidate_values();
+    function.ensure_facts();
+    assert_eq!(function.facts.of(value), Types::STRING);
+    assert_eq!(function.facts.cfg.rpo.as_ptr(), cfg_storage);
+    assert!(function.facts.is_pure(inst));
+
+    let graph = &mut function.graph;
+    let exit = graph.blocks.push(BlockData::default());
+    graph.terminate(exit, graph.span, TerminatorKind::Return(value));
+    graph.terminate(
+        graph.entry,
+        graph.span,
+        TerminatorKind::Jump(Target::new(exit)),
+    );
+    function.invalidate_cfg();
+    function.ensure_facts();
+    function.graph.verify().unwrap();
+    assert!(function.facts.cfg.rpo.contains(&exit));
+    assert!(function.facts.cfg.dominates(function.graph.entry, exit));
+    assert_eq!(function.facts.of(value), Types::STRING);
+}
+
+#[test]
+fn unchanged_hoisting_preserves_facts() {
+    let graph = canonicalize_graph(
+        lower_source("function f(a){while(a){a=a.next;}return a;}").unwrap(),
+        true,
+    )
+    .unwrap()
+    .graph;
+    let mut function = FunctionState::new(graph, Vec::new(), true);
+    let region = function.graph.regions.push(Region {
+        blocks: function.graph.blocks.keys().collect(),
+        fallback: None,
+    });
+    function.ensure_facts();
+    assert!(!optimize::natural_loops(&function.graph, &function.facts.cfg).is_empty());
+    let fresh = function.facts.fresh(&function.graph);
+    optimize::hoist(&mut function, region);
+    function.ensure_facts();
+    assert!(std::rc::Rc::ptr_eq(
+        &fresh,
+        &function.facts.fresh(&function.graph)
+    ));
+    function.invalidate_effects();
+    function.ensure_facts();
+    assert!(!std::rc::Rc::ptr_eq(
+        &fresh,
+        &function.facts.fresh(&function.graph)
+    ));
+}

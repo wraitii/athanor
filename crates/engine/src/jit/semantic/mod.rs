@@ -825,7 +825,7 @@ pub(in crate::jit) struct TypedRead {
     pub(in crate::jit) bounded: bool,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct Cfg {
     pub(super) rpo: Vec<Block>,
     pub(super) preds: SecondaryMap<Block, Vec<Block>>,
@@ -1515,6 +1515,14 @@ pub(in crate::jit) struct SpecializationPlan {
     pub(in crate::jit) conditional: specialize::ConditionalPlan,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum FactsLevel {
+    None,
+    Cfg,
+    Values,
+    Effects,
+}
+
 pub(super) struct FunctionState {
     pub(in crate::jit) plan: SpecializationPlan,
     pub(super) graph: Graph,
@@ -1522,6 +1530,8 @@ pub(super) struct FunctionState {
     pub(in crate::jit) facts: Facts,
     notes: Vec<String>,
     optimize: bool,
+    // Graph mutations invalidate this level and all dependent analyses.
+    facts_level: FactsLevel,
 }
 
 impl FunctionState {
@@ -1536,24 +1546,54 @@ impl FunctionState {
             notes,
             optimize,
             facts: Facts::default(),
+            facts_level: FactsLevel::None,
             plan: SpecializationPlan::default(),
             osr: None,
         }
     }
 
-    fn refresh_facts(&mut self) {
-        self.facts = Facts::compute(&self.graph);
+    fn ensure_cfg(&mut self) {
+        if self.facts_level < FactsLevel::Cfg {
+            self.facts.cfg = Cfg::new(&self.graph);
+            self.facts_level = FactsLevel::Cfg;
+        }
     }
 
-    fn refresh_cfg(&mut self) {
-        self.facts.cfg = Cfg::new(&self.graph);
+    fn ensure_values(&mut self) {
+        self.ensure_cfg();
+        if self.facts_level < FactsLevel::Values {
+            let cfg = std::mem::take(&mut self.facts.cfg);
+            self.facts = Facts::values_with_cfg(&self.graph, cfg);
+            self.facts_level = FactsLevel::Values;
+        }
+    }
+
+    fn ensure_facts(&mut self) {
+        self.ensure_values();
+        if self.facts_level < FactsLevel::Effects {
+            self.facts.compute_effects(&self.graph);
+            self.facts_level = FactsLevel::Effects;
+        }
+    }
+
+    fn invalidate_cfg(&mut self) {
+        self.facts_level = FactsLevel::None;
+    }
+
+    fn invalidate_values(&mut self) {
+        self.facts_level = self.facts_level.min(FactsLevel::Cfg);
+    }
+
+    fn invalidate_effects(&mut self) {
+        self.facts_level = self.facts_level.min(FactsLevel::Values);
     }
 
     pub(in crate::jit) fn prepare_osr(&mut self, source: usize) -> Result<()> {
         self.osr = osr::Plan::discover(&self.graph, source).map(std::sync::Arc::new);
-        if let Some(plan) = &self.osr {
+        if let Some(plan) = self.osr.clone() {
+            self.invalidate_cfg();
             plan.instrument(&mut self.graph)?;
-            self.refresh_facts();
+            self.ensure_facts();
             borrow::borrows(&mut self.graph, &self.facts, &mut self.notes);
         }
         Ok(())
@@ -1634,6 +1674,7 @@ fn canonicalize(function: &mut FunctionState) -> Result<()> {
     if !function.optimize {
         return Ok(());
     }
+    function.invalidate_cfg();
     transforms::promote(&mut function.graph, &mut function.notes);
     function.graph.verify()?;
     js::typeof_comparisons(&mut function.graph);
@@ -1710,6 +1751,7 @@ pub(super) fn plan_canonical_with_budget(
     let mut inline_budget = specialize::Budget::new(inline_multiplier);
     let mut expansions = Expansions::default();
     if let Some((bodies, source)) = specialization {
+        function.invalidate_cfg();
         expansions.calls(&mut function.graph, source, &mut function.notes)?;
         let requests = specialize::requests(&function.graph, bodies, source, &inline_budget);
         let plan = specialize::plan_round(
@@ -1727,9 +1769,11 @@ pub(super) fn plan_canonical_with_budget(
             &mut function.notes,
         )?;
         js::simplify(&mut function);
+        function.invalidate_cfg();
         expansions.calls(&mut function.graph, source, &mut function.notes)?;
         function.graph.verify()?;
     }
+    function.invalidate_cfg();
     expansions.constructors(&mut function.graph);
     if let Some((bodies, source)) = specialization {
         for _ in 0..specialize::SPECIALIZATION_ROUNDS {
@@ -1744,6 +1788,7 @@ pub(super) fn plan_canonical_with_budget(
             if plan.is_empty() {
                 break;
             }
+            function.invalidate_cfg();
             specialize::apply(
                 &mut function.graph,
                 bodies,
@@ -1752,14 +1797,17 @@ pub(super) fn plan_canonical_with_budget(
                 &mut function.notes,
             )?;
             js::simplify(&mut function);
+            function.invalidate_cfg();
             expansions.calls(&mut function.graph, source, &mut function.notes)?;
             expansions.constructors(&mut function.graph);
             function.graph.verify()?;
         }
     }
+    function.invalidate_effects();
     if let Some((bodies, _)) = specialization {
         specialize::install_summaries(&mut function.graph, bodies, &mut function.notes);
     }
+    function.invalidate_values();
     if let Some((bodies, source)) = specialization {
         specialize::direct_calls(&mut function.graph, bodies, source);
     }
@@ -1803,9 +1851,10 @@ pub(super) fn optimize_planned(
     report_regions: bool,
 ) -> Result<FunctionState> {
     if !function.optimize {
-        function.refresh_facts();
+        function.ensure_facts();
         return Ok(function);
     }
+    function.invalidate_cfg();
     caches::apply(&mut function.graph)?;
     reads::apply(
         &mut function.graph,
@@ -1815,12 +1864,14 @@ pub(super) fn optimize_planned(
     comparisons::expose(&mut function);
     optimize::sink_closures(&mut function);
     if optimize::lazy_captures(&mut function) {
+        function.invalidate_cfg();
         transforms::promote(&mut function.graph, &mut function.notes);
         js::simplify(&mut function);
     }
     function.graph.verify()?;
     optimize::forward_captured_parameters(&mut function);
     function.graph.verify()?;
+    function.invalidate_cfg();
     let regions = match versioning {
         Versioning::Generic => Vec::new(),
         Versioning::Speculate {
@@ -1882,6 +1933,7 @@ pub(super) fn optimize_planned(
         js::simplify(&mut function);
         optimize::reuse_loads(&mut function);
     }
+    function.invalidate_cfg();
     shapes::apply(
         &mut function.graph,
         &function.plan.shapes,
@@ -1895,11 +1947,16 @@ pub(super) fn optimize_planned(
     optimize::sink_closures(&mut function);
     optimize::lazy_captures(&mut function);
     function.graph.verify()?;
+    function.invalidate_cfg();
     string_split::forward_packs(&mut function.graph);
     transforms::trim(&mut function.graph);
     transforms::remove_trivial_params(&mut function.graph);
     function.graph.verify()?;
-    function.refresh_facts();
+    for region in &regions {
+        optimize::hoist(&mut function, *region);
+        function.graph.verify()?;
+    }
+    function.ensure_facts();
     borrow::borrows(&mut function.graph, &function.facts, &mut function.notes);
     Ok(function)
 }
