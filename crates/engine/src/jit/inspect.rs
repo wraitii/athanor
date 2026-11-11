@@ -6,7 +6,7 @@ use cranelift_module::Module;
 
 use crate::error::Error;
 
-use super::{clif::Annotations, semantic};
+use super::{clif::Annotations, machine::MachineCode, semantic};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompileOptions {
@@ -148,6 +148,7 @@ impl CompileOptions {
         &self,
         name: &str,
         context: &Context,
+        machine: &MachineCode,
         module: &JITModule,
     ) -> Result<(), Error> {
         if self.clif {
@@ -159,19 +160,15 @@ impl CompileOptions {
         if !self.asm {
             return Ok(());
         }
-        let compiled = context
-            .compiled_code()
-            .ok_or_else(|| Error::Compile("missing compiled code".into()))?;
         let cs = module
             .isa()
             .to_capstone()
             .map_err(|error| Error::Compile(error.to_string()))?;
-        let code = compiled.code_buffer();
-        let locations = compiled.buffer.get_srclocs_sorted();
+        let code = &machine.bytes;
         let mut starts = vec![0];
         starts.extend(
-            compiled
-                .bb_starts
+            machine
+                .block_starts
                 .iter()
                 .copied()
                 .filter(|&start| start != 0),
@@ -190,12 +187,6 @@ impl CompileOptions {
             for inst in instructions.iter() {
                 let offset = inst.address() as u32;
                 let end = offset + inst.bytes().len() as u32;
-                let index = locations.partition_point(|location| location.start <= offset);
-                let location = index
-                    .checked_sub(1)
-                    .and_then(|i| locations.get(i))
-                    .filter(|location| offset < location.end)
-                    .map(|location| location.loc.as_abs());
                 write!(
                     out,
                     "  +{offset:06x}  {:8} {}",
@@ -203,32 +194,28 @@ impl CompileOptions {
                     inst.op_str().unwrap_or("")
                 )
                 .unwrap();
-                match location.filter(|location| !location.is_default()) {
-                    Some(location) => write!(out, " ; @{:04x}", location.bits()).unwrap(),
+                match machine.location_at(offset) {
+                    Some(location) => write!(out, " ; @{location:04x}").unwrap(),
                     None => out.push_str(" ; unattributed"),
                 }
-                for reloc in compiled
-                    .buffer
-                    .relocs()
+                for reloc in machine
+                    .relocs
                     .iter()
                     .filter(|reloc| offset <= reloc.offset && reloc.offset < end)
                 {
                     write!(
                         out,
                         " ; reloc {} {} {:+}",
-                        reloc.kind,
-                        reloc.target.display(Some(&context.func.params)),
-                        reloc.addend
+                        reloc.kind, reloc.name, reloc.addend
                     )
                     .unwrap();
                 }
-                for trap in compiled
-                    .buffer
-                    .traps()
+                for (_, code) in machine
+                    .traps
                     .iter()
-                    .filter(|trap| offset <= trap.offset && trap.offset < end)
+                    .filter(|(trap, _)| offset <= *trap && *trap < end)
                 {
-                    write!(out, " ; trap {}", trap.code).unwrap();
+                    write!(out, " ; trap {code}").unwrap();
                 }
                 out.push('\n');
                 decoded = end as usize;

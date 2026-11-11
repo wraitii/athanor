@@ -15,6 +15,7 @@ use crate::jit::entries::{
 };
 use crate::jit::helpers::{self, Helper};
 use crate::jit::jitdump::Writer;
+use crate::jit::machine::MachineCode;
 use crate::jit::session::{
     CALL_SAMPLE_CODE_OFFSET, CALL_SAMPLE_SIZE, CALL_SAMPLES, CALL_SAMPLES_LEN_OFFSET,
     CALL_SAMPLES_OFFSET, CALL_SITE_OFFSET, ERROR_OFFSET, EXCEPTION_OFFSET,
@@ -171,11 +172,12 @@ fn define(
         b.seal_all_blocks();
         b.finalize(module.target_config());
     }
-    module
-        .define_function(id, &mut context)
-        .map_err(|error| Error::Compile(error.to_string()))?;
-    let size = context.compiled_code().unwrap().code_buffer().len();
-    Ok(Stub { id, size })
+    let machine = MachineCode::from_cranelift(&mut context, module, id)?;
+    machine.define(module, id)?;
+    Ok(Stub {
+        id,
+        size: machine.bytes.len(),
+    })
 }
 
 /// Tail calls published code of this arity, and otherwise dispatches through published

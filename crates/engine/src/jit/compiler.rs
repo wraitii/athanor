@@ -23,6 +23,7 @@ use crate::error::{Error, compile_at, unsupported_at};
 use super::clif::{Annotations, FunctionBody};
 use super::entries::{Entry, VariantId};
 use super::function_data::FunctionData;
+use super::machine::MachineCode;
 use super::{analysis::CaptureAnalysis, emit, jitdump, temporaries};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -941,41 +942,27 @@ impl Compiler {
             } else {
                 self.fixed.remove(&id);
             }
-            self.module
-                .define_function(id, &mut self.context)
-                .map_err(|error| Error::Compile(format!("{error:?}")))?;
+            let machine = MachineCode::from_cranelift(&mut self.context, &self.module, id)?;
+            machine.define(&mut self.module, id)?;
             if let Some(stats) = &mut self.stats {
-                stats.bytes += self
-                    .context
-                    .compiled_code()
-                    .map_or(0, |compiled| compiled.code_buffer().len());
+                stats.bytes += machine.bytes.len();
             }
             if let Some(options) = self.inspection.as_deref().filter(|o| o.matches(&name)) {
-                options.print_compiled(&name, &self.context, &self.module)?;
+                options.print_compiled(&name, &self.context, &machine, &self.module)?;
             }
             if self.dump.is_some() {
-                let Some(compiled) = self.context.compiled_code() else {
-                    return Err(Error::Compile("missing compiled code".into()));
-                };
-                let size = compiled.code_buffer().len();
+                let size = machine.bytes.len();
                 let mut locations = BTreeMap::new();
-                let ranges = compiled.buffer.get_srclocs_sorted();
+                let ranges = &machine.locations;
                 if self.dump_ir {
                     locations.insert(0, 0);
-                    for location in ranges {
-                        if (location.end as usize) < size {
-                            locations.entry(location.end).or_insert(0);
+                    for range in ranges {
+                        if (range.end as usize) < size {
+                            locations.entry(range.end).or_insert(0);
                         }
                     }
-                    for location in ranges {
-                        locations.insert(
-                            location.start,
-                            if location.loc.as_abs().is_default() {
-                                0
-                            } else {
-                                location.loc.as_abs().bits()
-                            },
-                        );
+                    for range in ranges {
+                        locations.insert(range.start, range.location.unwrap_or(0));
                     }
                 } else {
                     let source_locations: HashMap<_, _> = code
@@ -991,11 +978,10 @@ impl Compiler {
                         })
                         .collect();
                     let mut default_line = None;
-                    for location in ranges {
-                        if location.loc.as_abs().is_default() {
+                    for range in ranges {
+                        let Some(offset) = range.location else {
                             continue;
-                        }
-                        let offset = location.loc.as_abs().bits();
+                        };
                         let offset = if code.annotations.semantic_locations {
                             let Some(offset) = source_locations.get(&offset) else {
                                 continue;
@@ -1006,7 +992,7 @@ impl Compiler {
                         };
                         let line = line_at(lines, offset);
                         default_line.get_or_insert(line);
-                        locations.insert(location.start, line);
+                        locations.insert(range.start, line);
                     }
                     locations.insert(0, default_line.unwrap_or(1));
                 }

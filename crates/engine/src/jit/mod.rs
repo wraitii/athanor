@@ -12,6 +12,7 @@ mod generator;
 mod helpers;
 mod inspect;
 mod jitdump;
+mod machine;
 mod math;
 pub(crate) mod osr;
 mod pack;
