@@ -755,7 +755,9 @@ fn recursively_inlined_bodies_expand_arrays_and_constructors_once() {
     assert!(!caller.contains(" = construct_pack "));
     let start = source.find("new SimpleTerrain").unwrap();
     assert!(caller.lines().any(|line| {
-        line.contains(&format!("note: call at {start}..")) && line.contains("inline funcid")
+        line.contains("note: call inst")
+            && line.contains(&format!(":{start}.."))
+            && line.contains("inline funcid")
     }));
     assert_eq!(caller.matches("note: array map at ").count(), maps);
 }

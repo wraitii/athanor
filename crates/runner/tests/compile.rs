@@ -51,7 +51,7 @@ fn filter_selects_all_views_without_removing_inline_candidates() {
         .next()
         .unwrap();
     assert!(!semantic.contains("note:"));
-    assert!(text.contains("note: call at "));
+    assert!(text.contains("note: call inst"));
     assert!(text.contains("inline funcid"));
     assert!(text.contains(" ; @"));
     assert!(text.contains(" ; unattributed"));
