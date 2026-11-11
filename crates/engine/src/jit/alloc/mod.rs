@@ -1,7 +1,8 @@
 mod liveness;
 pub(crate) mod moves;
 
-use std::collections::BTreeMap;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BinaryHeap};
 
 use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::entity::SecondaryMap;
@@ -59,12 +60,14 @@ pub(crate) struct Hint {
 pub(crate) enum Place {
     Reg(u8),
     Slot(u32),
+    Remat,
 }
 
 pub(crate) struct Allocation {
     registers: SecondaryMap<Value, Option<u8>>,
     slots: SecondaryMap<Value, Option<u32>>,
     split: SecondaryMap<Value, bool>,
+    remat: SecondaryMap<Value, bool>,
     cold: SecondaryMap<Block, bool>,
     boundary: SecondaryMap<Block, Vec<Value>>,
     slot_count: u32,
@@ -75,6 +78,7 @@ impl Allocation {
     pub(crate) fn place(&self, value: Value, block: Block) -> Place {
         match self.registers[value] {
             Some(reg) if !(self.split[value] && self.cold[block]) => Place::Reg(reg),
+            _ if self.remat[value] => Place::Remat,
             _ => Place::Slot(self.slots[value].expect("values without a register have a slot")),
         }
     }
@@ -88,17 +92,24 @@ impl Allocation {
     }
 }
 
-pub(crate) fn constant(func: &Function, value: Value) -> Option<i64> {
+pub(crate) fn constant(func: &Function, value: Value) -> Option<u64> {
     let ValueDef::Result(inst, _) = func.dfg.value_def(value) else {
         return None;
     };
-    match func.dfg.insts[inst] {
-        InstructionData::UnaryImm {
-            opcode: Opcode::Iconst,
-            imm,
-        } => Some(imm.bits()),
-        _ => None,
-    }
+    let InstructionData::UnaryImm {
+        opcode: Opcode::Iconst,
+        imm,
+    } = func.dfg.insts[inst]
+    else {
+        return None;
+    };
+    let bits = imm.bits() as u64;
+    let width = func.dfg.value_type(value).bits();
+    Some(if width >= 64 {
+        bits
+    } else {
+        bits & ((1 << width) - 1)
+    })
 }
 
 const REGISTERS: usize = 32;
@@ -225,15 +236,50 @@ struct Bundle {
     members: Vec<Value>,
     segments: Vec<Segment>,
     weight: f64,
-    preferences: Vec<(u8, f64)>,
 }
 
-impl Bundle {
-    fn prefer(&mut self, reg: u8, weight: f64) {
-        match self.preferences.iter_mut().find(|(r, _)| *r == reg) {
-            Some((_, total)) => *total += weight,
-            None => self.preferences.push((reg, weight)),
+struct Candidate {
+    weight: f64,
+    first: Value,
+    index: usize,
+}
+
+impl Candidate {
+    fn new(index: usize, bundle: &Bundle) -> Self {
+        Self {
+            weight: bundle.weight,
+            first: bundle.members[0],
+            index,
         }
+    }
+}
+
+impl Ord for Candidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.weight
+            .total_cmp(&other.weight)
+            .then(other.first.cmp(&self.first))
+    }
+}
+
+impl PartialOrd for Candidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Candidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Candidate {}
+
+fn prefer(preferences: &mut Vec<(u8, f64)>, reg: u8, weight: f64) {
+    match preferences.iter_mut().find(|(r, _)| *r == reg) {
+        Some((_, total)) => *total += weight,
+        None => preferences.push((reg, weight)),
     }
 }
 
@@ -243,6 +289,7 @@ pub(crate) fn allocate(
     target: &Target,
     hints: &[Hint],
     operands: Operands,
+    remat: &SecondaryMap<Value, u32>,
 ) -> Result<Allocation, String> {
     let cfg = ControlFlowGraph::with_function(func);
     let domtree = DominatorTree::with_function(func, &cfg);
@@ -251,13 +298,14 @@ pub(crate) fn allocate(
     for block in func.layout.blocks() {
         cold[block] = func.layout.is_cold(block) && Some(block) != entry;
     }
-    let mut constants = SecondaryMap::<Value, bool>::new();
-    for value in func.dfg.values() {
-        constants[value] = constant(func, value).is_some();
-    }
-    let liveness = liveness::compute(func, order, &cfg, &cold, &constants, operands)?;
+    let liveness = liveness::compute(func, order, &cfg, &cold, remat, operands)?;
     let blocks = block_weights(func, &cfg, &domtree, &cold);
-    let weights = value_weights(func, &blocks, operands);
+    let mut weights = value_weights(func, &blocks, operands);
+    for value in func.dfg.values() {
+        if remat[value] > 1 {
+            weights[value] *= f64::from(remat[value] - 1) / 2.0;
+        }
+    }
 
     let mut bundles = Vec::new();
     let mut bundle_of = SecondaryMap::<Value, Option<usize>>::new();
@@ -273,20 +321,20 @@ pub(crate) fn allocate(
             members: vec![value],
             segments: segments.clone(),
             weight: weights[value],
-            preferences: Vec::new(),
         });
     }
 
-    let mut partners = Vec::new();
+    let mut partners = SecondaryMap::<Value, Vec<(Value, f64)>>::new();
     for (a, b, weight) in copies(func, &blocks) {
         let (Some(x), Some(y)) = (bundle_of[a], bundle_of[b]) else {
             continue;
         };
-        if x == y || bundles[x].class != bundles[y].class {
+        if bundles[x].class != bundles[y].class {
             continue;
         }
-        if overlap(&bundles[x].segments, &bundles[y].segments) {
-            partners.push((a, b, weight));
+        partners[a].push((b, weight));
+        partners[b].push((a, weight));
+        if x == y || overlap(&bundles[x].segments, &bundles[y].segments) {
             continue;
         }
         let (keep, gone) = if bundles[x].members.len() >= bundles[y].members.len() {
@@ -306,24 +354,13 @@ pub(crate) fn allocate(
         bundle.weight += weight;
     }
 
+    let mut hinted = SecondaryMap::<Value, Vec<(u8, f64)>>::new();
     for hint in hints {
         let Some(index) = bundle_of[hint.value] else {
             continue;
         };
-        let bundle = &mut bundles[index];
-        if bundle.class == hint.class {
-            bundle.prefer(hint.reg, blocks[hint.block]);
-        }
-    }
-
-    let mut related = vec![Vec::new(); bundles.len()];
-    for (a, b, weight) in partners {
-        let (Some(x), Some(y)) = (bundle_of[a], bundle_of[b]) else {
-            continue;
-        };
-        if x != y {
-            related[x].push((y, weight));
-            related[y].push((x, weight));
+        if bundles[index].class == hint.class {
+            prefer(&mut hinted[hint.value], hint.reg, blocks[hint.block]);
         }
     }
 
@@ -337,39 +374,35 @@ pub(crate) fn allocate(
         }
     }
 
-    let mut queue: Vec<usize> = (0..bundles.len())
-        .filter(|&index| !bundles[index].members.is_empty())
+    let mut queue: BinaryHeap<Candidate> = bundles
+        .iter()
+        .enumerate()
+        .filter(|(_, bundle)| !bundle.members.is_empty())
+        .map(|(index, bundle)| Candidate::new(index, bundle))
         .collect();
-    queue.sort_by(|&a, &b| {
-        bundles[b]
-            .weight
-            .total_cmp(&bundles[a].weight)
-            .then(bundles[a].members[0].cmp(&bundles[b].members[0]))
-    });
-
     let mut assigned = vec![None; bundles.len()];
     let mut callee_saved = Vec::new();
-    for &index in &queue {
-        let bundle = &bundles[index];
-        let class = bundle.class;
-        let hot: Vec<Segment> = bundle
-            .segments
-            .iter()
-            .filter(|s| !s.cold)
-            .copied()
-            .collect();
-        let occupy = if hot.is_empty() {
-            &bundle.segments
-        } else {
-            &hot
-        };
-        let mut preferences = bundle.preferences.clone();
-        for &(other, weight) in &related[index] {
-            if let Some(reg) = assigned[other] {
-                preferences.push((reg, weight));
+    while let Some(Candidate { index, .. }) = queue.pop() {
+        let class = bundles[index].class;
+        let mut preferences = Vec::new();
+        for &member in &bundles[index].members {
+            for &(reg, weight) in &hinted[member] {
+                prefer(&mut preferences, reg, weight);
+            }
+            for &(other, weight) in &partners[member] {
+                if let Some(reg) = bundle_of[other].and_then(|other| assigned[other]) {
+                    prefer(&mut preferences, reg, weight);
+                }
             }
         }
         preferences.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let segments = &bundles[index].segments;
+        let hot: Vec<Segment> = segments.iter().filter(|s| !s.cold).copied().collect();
+        let occupy = if hot.is_empty() {
+            segments.clone()
+        } else {
+            hot
+        };
         let available = target.registers(class);
         let allocatable =
             |reg: &u8| available.caller_saved.contains(reg) || available.callee_saved.contains(reg);
@@ -379,12 +412,26 @@ pub(crate) fn allocate(
             .filter(allocatable)
             .chain(available.caller_saved.iter().copied())
             .chain(available.callee_saved.iter().copied())
-            .find(|&reg| free(&occupied[occupancy_index(class, reg)], occupy));
+            .find(|&reg| free(&occupied[occupancy_index(class, reg)], &occupy));
         let Some(reg) = choice else {
+            if bundles[index].members.len() > 1 {
+                for member in std::mem::take(&mut bundles[index].members) {
+                    let single = Bundle {
+                        class,
+                        members: vec![member],
+                        segments: liveness.segments[member].clone(),
+                        weight: weights[member],
+                    };
+                    bundle_of[member] = Some(bundles.len());
+                    queue.push(Candidate::new(bundles.len(), &single));
+                    bundles.push(single);
+                    assigned.push(None);
+                }
+            }
             continue;
         };
         let map = &mut occupied[occupancy_index(class, reg)];
-        for segment in occupy {
+        for segment in &occupy {
             map.insert(segment.start, segment.end);
         }
         assigned[index] = Some(reg);
@@ -398,13 +445,15 @@ pub(crate) fn allocate(
     let mut slots = SecondaryMap::new();
     let mut split = SecondaryMap::new();
     let mut slot_count = 0;
-    for &index in &queue {
-        let bundle = &bundles[index];
+    for (bundle, &reg) in bundles.iter().zip(&assigned) {
+        if bundle.members.is_empty() {
+            continue;
+        }
         let has_hot = bundle.segments.iter().any(|s| !s.cold);
         let has_cold = bundle.segments.iter().any(|s| s.cold);
-        let reg = assigned[index];
         let divided = reg.is_some() && has_hot && has_cold;
-        let slot = (reg.is_none() || divided).then(|| {
+        let spillable = bundle.members.iter().any(|&member| remat[member] == 0);
+        let slot = ((reg.is_none() || divided) && spillable).then(|| {
             slot_count += 1;
             slot_count - 1
         });
@@ -433,10 +482,16 @@ pub(crate) fn allocate(
         }
     }
 
+    let mut rematerialized = SecondaryMap::new();
+    for value in func.dfg.values() {
+        rematerialized[value] = remat[value] > 0;
+    }
+
     Ok(Allocation {
         registers,
         slots,
         split,
+        remat: rematerialized,
         cold,
         boundary,
         slot_count,

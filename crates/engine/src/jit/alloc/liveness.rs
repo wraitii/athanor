@@ -39,7 +39,7 @@ pub(super) fn compute(
     order: &[Block],
     cfg: &ControlFlowGraph,
     cold: &SecondaryMap<Block, bool>,
-    constants: &SecondaryMap<Value, bool>,
+    remat: &SecondaryMap<Value, u32>,
     operands: super::Operands,
 ) -> Result<Liveness, String> {
     let mut header = SecondaryMap::<Block, u32>::new();
@@ -61,7 +61,7 @@ pub(super) fn compute(
             next += 1;
             operands(inst, &mut values);
             for &value in &values {
-                if constants[value] {
+                if remat[value] == 1 {
                     continue;
                 }
                 let at = use_position(index);
@@ -80,7 +80,7 @@ pub(super) fn compute(
                 calls.push(call_position(index));
             }
             for &result in func.dfg.inst_results(inst) {
-                if !constants[result] {
+                if remat[result] != 1 {
                     definition[result] = Some((block, def_position(index)));
                 }
             }
@@ -111,6 +111,9 @@ pub(super) fn compute(
             }
             continue;
         };
+        if remat[value] > 1 && value_uses.is_empty() {
+            continue;
+        }
 
         touched.clear();
         touched.push(def_block);

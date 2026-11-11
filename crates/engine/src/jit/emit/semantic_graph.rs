@@ -24,6 +24,7 @@ const HEAP: Types = Types::STRING.union(Types::OBJECT).union(Types::OTHER);
 const NUMERIC: Types = Types::NUMBER.union(Types::UNDEFINED);
 
 struct Context<'a> {
+    graph: &'a Graph,
     osr_buffers: RefCell<std::collections::HashMap<GraphValue, (ClifValue, usize)>>,
     values: &'a [Variable],
     direct: Option<RefCell<SecondaryMap<GraphValue, Option<ClifValue>>>>,
@@ -326,6 +327,7 @@ impl FunctionCompiler<'_, '_> {
             }
         }
         let cx = Context {
+            graph,
             osr_buffers: RefCell::new(std::collections::HashMap::new()),
             values: &values,
             direct: (!suspends).then(|| RefCell::new(SecondaryMap::new())),
@@ -1738,7 +1740,11 @@ impl FunctionCompiler<'_, '_> {
             Some(direct) => direct.borrow()[value].expect("semantic value used before definition"),
             None => self.b.use_var(cx.values[value.index()]),
         };
-        Operand::new(clif, cx.reprs[value])
+        let operand = Operand::new(clif, cx.reprs[value]);
+        match cx.graph.defining_op(value) {
+            Some(Op::Constant(Constant::Number(number))) => operand.with_constant(*number),
+            _ => operand,
+        }
     }
 
     fn typed_op(
@@ -1987,14 +1993,20 @@ impl FunctionCompiler<'_, '_> {
                 boolean(self.b.ins().icmp_imm_s(IntCC::Equal, kind, expected as i64))
             }
             Op::ArrayLoad(object, position, holey) => {
-                let object = self.operand(cx, *object);
-                let object = self.convert(object, Repr::Boxed);
+                let view = match graph.views.get(&inst) {
+                    Some(&view) => self.operand(cx, view).value,
+                    None => {
+                        let object = self.operand(cx, *object);
+                        let object = self.convert(object, Repr::Boxed);
+                        self.view(object)
+                    }
+                };
                 let position = self.operand(cx, *position);
                 let retain = data.result.is_none_or(|value| {
                     !graph.borrowed.contains(&value) && !self.slot_owned(graph, cx, value)
                 });
                 Some(Some(Operand::new(
-                    self.array_load(object, position, *holey, retain),
+                    self.array_load(view, position, *holey, retain),
                     Repr::Boxed,
                 )))
             }

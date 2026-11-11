@@ -1,6 +1,6 @@
 use cranelift_codegen::binemit::Reloc;
 use cranelift_codegen::entity::SecondaryMap;
-use cranelift_codegen::ir::condcodes::{CondCode, FloatCC, IntCC};
+use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{
     ArgumentExtension, Block, BlockCall, ExternalName, FuncRef, Function, Inst, InstructionData,
     Opcode, SigRef, Type, Value, types,
@@ -13,9 +13,11 @@ use super::abi::{self, Location};
 use super::alloc::TARGET;
 use super::asm::{Assembler, Label};
 use super::encode::{
-    self as e, Alu, Cond, Extend, Float, FloatOp, FloatUnary, Index, Logical, Mem, Shift, Width,
+    self as e, Alu, Cond, Extend, Float, FloatOp, FloatUnary, Index, Mem, Shift, Width,
 };
-use super::select::{Address, Selection};
+use super::select::{
+    self, Address, Binary, CompareImmediate, Comparison, Immediate, Selection, remat_bits,
+};
 use crate::jit::alloc::moves::{self, Loc, Move};
 use crate::jit::alloc::{self, Allocation, Frame, Hint, Place, RegClass};
 use crate::jit::machine::{MachineCode, SourceRange};
@@ -29,13 +31,17 @@ const F0: u8 = 16;
 const F1: u8 = 17;
 
 pub(super) fn lower(func: &Function) -> Result<MachineCode, Unsupported> {
-    check_types(func)?;
+    check_function(func)?;
     let order = block_order(func);
     let hints = hints(func)?;
     let selection = Selection::new(func);
     let operands = |inst, out: &mut Vec<Value>| selection.operands(func, inst, out);
+    let mut remat = SecondaryMap::new();
+    for value in func.dfg.values() {
+        remat[value] = select::remat_cost(func, value);
+    }
     let allocation =
-        alloc::allocate(func, &order, &TARGET, &hints, &operands).map_err(Unsupported)?;
+        alloc::allocate(func, &order, &TARGET, &hints, &operands, &remat).map_err(Unsupported)?;
     match lower_with(func, &order, &allocation, &selection, false)? {
         Some(machine) => Ok(machine),
         None => lower_with(func, &order, &allocation, &selection, true)?
@@ -89,10 +95,11 @@ fn lower_with(
         let next = order.get(index + 1).copied();
         lower.block(block, next)?;
     }
-    for (label, block, call) in std::mem::take(&mut lower.stubs) {
+    for (label, moves, target) in std::mem::take(&mut lower.stubs) {
         lower.asm.bind(label);
-        lower.block = block;
-        lower.edge(call, None)?;
+        lower.parallel(moves);
+        let target = lower.label(target);
+        lower.asm.jump(e::B, target);
     }
     let Lower {
         asm,
@@ -114,7 +121,21 @@ fn lower_with(
     }))
 }
 
-fn check_types(func: &Function) -> Result<(), Unsupported> {
+fn check_function(func: &Function) -> Result<(), Unsupported> {
+    if func.stack_limit.is_some() {
+        return Err(Unsupported("stack limit".into()));
+    }
+    if !func.dynamic_stack_slots.is_empty() {
+        return Err(Unsupported("dynamic stack slots".into()));
+    }
+    if let Some(param) = func
+        .signature
+        .returns
+        .iter()
+        .find(|param| param.extension != ArgumentExtension::None)
+    {
+        return Err(Unsupported(format!("extended return {param}")));
+    }
     for value in func.dfg.values() {
         let ty = func.dfg.value_type(value);
         if RegClass::of(ty).is_none() {
@@ -200,7 +221,7 @@ fn block_order(func: &Function) -> Vec<Block> {
     hot
 }
 
-fn width(ty: Type) -> Width {
+pub(super) fn width(ty: Type) -> Width {
     if ty == types::I64 { Width::X } else { Width::W }
 }
 
@@ -312,7 +333,7 @@ struct Lower<'a> {
     func: &'a Function,
     allocation: &'a Allocation,
     selection: &'a Selection,
-    stubs: Vec<(Label, Block, BlockCall)>,
+    stubs: Vec<(Label, Vec<Move>, Block)>,
     block: Block,
     frame: Frame,
     incoming: u32,
@@ -339,22 +360,16 @@ impl Lower<'_> {
     }
 
     fn constant(&self, value: Value) -> Option<u64> {
-        let bits = alloc::constant(self.func, value)? as u64;
-        let width = self.ty(value).bits();
-        Some(if width >= 64 {
-            bits
-        } else {
-            bits & ((1 << width) - 1)
-        })
+        alloc::constant(self.func, value)
     }
 
     fn loc_in(&self, value: Value, block: Block) -> Loc {
-        if let Some(bits) = self.constant(value) {
-            return Loc::Imm(bits);
-        }
         match self.allocation.place(value, block) {
             Place::Reg(reg) => Loc::Reg(self.class(value), reg),
             Place::Slot(index) => Loc::Slot(self.frame.slot(index)),
+            Place::Remat => {
+                Loc::Imm(remat_bits(self.func, value).expect("rematerialized values are constants"))
+            }
         }
     }
 
@@ -363,106 +378,55 @@ impl Lower<'_> {
     }
 
     fn mov_imm(&mut self, width: Width, rd: u8, value: u64) {
-        let count = if width == Width::X { 4 } else { 2 };
-        let chunks: Vec<u16> = (0..count).map(|i| (value >> (16 * i)) as u16).collect();
-        let ones = chunks.iter().filter(|&&chunk| chunk == 0xFFFF).count();
-        let zeros = chunks.iter().filter(|&&chunk| chunk == 0).count();
-        let (skip, first) = if ones > zeros {
-            (0xFFFF, e::Wide::Movn)
-        } else {
-            (0, e::Wide::Movz)
-        };
-        let mut started = false;
-        for (hw, &chunk) in chunks.iter().enumerate() {
-            if chunk == skip {
-                continue;
-            }
-            let word = if started {
-                e::mov_wide(e::Wide::Movk, width, rd, chunk, hw as u8)
-            } else if first == e::Wide::Movn {
-                e::mov_wide(first, width, rd, !chunk, hw as u8)
-            } else {
-                e::mov_wide(first, width, rd, chunk, hw as u8)
-            };
-            self.asm.emit(word);
-            started = true;
-        }
-        if !started {
-            self.asm.emit(e::mov_wide(first, width, rd, 0, 0));
-        }
+        let asm = &mut self.asm;
+        e::mov_imm(width, rd, value, |word| asm.emit(word));
     }
 
     fn load_imm(&mut self, rd: u8, value: u64) {
-        let width = if value >> 32 == 0 { Width::W } else { Width::X };
-        self.mov_imm(width, rd, value);
+        let asm = &mut self.asm;
+        e::load_imm(rd, value, |word| asm.emit(word));
     }
 
-    fn signed_constant(&self, value: Value) -> Option<i64> {
-        let bits = self.constant(value)?;
-        let width = self.ty(value).bits();
-        Some(if width >= 64 {
-            bits as i64
-        } else {
-            ((bits << (64 - width)) as i64) >> (64 - width)
-        })
-    }
-
-    fn binary_imm(&mut self, opcode: Opcode, result: Value, args: &[Value]) -> bool {
-        let width = width(self.ty(result));
-        let commutative = opcode != Opcode::Isub;
-        let (x, constant) = match self.signed_constant(args[1]) {
-            Some(constant) => (args[0], constant),
-            None => match self.signed_constant(args[0]) {
-                Some(constant) if commutative => (args[1], constant),
-                _ => return false,
+    fn materialize(&mut self, class: RegClass, rd: u8, bits: u64) {
+        match class {
+            RegClass::Int => self.load_imm(rd, bits),
+            RegClass::Float if bits == 0 => self.asm.emit(e::move_to_float(Width::X, rd, e::ZR)),
+            RegClass::Float => match e::float_imm8(bits) {
+                Some(imm8) => self.asm.emit(e::fmov_imm(rd, imm8)),
+                None => {
+                    self.load_imm(ADDRESS, bits);
+                    self.asm.emit(e::move_to_float(Width::X, rd, ADDRESS));
+                }
             },
+        }
+    }
+
+    fn binary_imm(&mut self, inst: Inst, result: Value) -> bool {
+        let Some(Binary { x, immediate, .. }) = select::binary(self.func, inst) else {
+            return false;
         };
-        let encode: Box<dyn Fn(u8, u8) -> u32> = match opcode {
-            Opcode::Iadd | Opcode::Isub => {
-                let Some(amount) = (if opcode == Opcode::Isub {
-                    constant.checked_neg()
-                } else {
-                    Some(constant)
-                }) else {
-                    return false;
-                };
-                if let Some((imm, shift)) = e::arith_imm(amount) {
-                    Box::new(move |d, a| e::add_imm(width, d, a, imm, shift))
-                } else if let Some((imm, shift)) = amount.checked_neg().and_then(e::arith_imm) {
-                    Box::new(move |d, a| e::sub_imm(width, d, a, imm, shift))
-                } else {
-                    return false;
-                }
-            }
-            _ => {
-                let op = match opcode {
-                    Opcode::Band => Logical::And,
-                    Opcode::Bor => Logical::Orr,
-                    _ => Logical::Eor,
-                };
-                let bits = match width {
-                    Width::X => constant as u64,
-                    Width::W => constant as u64 & 0xFFFF_FFFF,
-                };
-                if e::logical_imm(op, width, 0, 0, bits).is_none() {
-                    return false;
-                }
-                Box::new(move |d, a| e::logical_imm(op, width, d, a, bits).unwrap())
-            }
-        };
+        let width = width(self.ty(result));
         let a = self.use_reg(x, T0);
         let d = self.def_reg(result, T0);
-        self.asm.emit(encode(d, a));
+        let word = match immediate {
+            Immediate::Add(imm, shift) => e::add_imm(width, d, a, imm, shift),
+            Immediate::Sub(imm, shift) => e::sub_imm(width, d, a, imm, shift),
+            Immediate::Logical(op, bits) => {
+                e::logical_imm(op, width, d, a, bits).expect("logical immediates are validated")
+            }
+        };
+        self.asm.emit(word);
         self.commit(result, d);
         true
     }
 
     fn compare(&mut self, cond: IntCC, x: Value, y: Value) -> Cond {
-        let (cond, x, y) = if self.constant(x).is_some() && self.constant(y).is_none() {
-            (cond.swap_args(), y, x)
-        } else {
-            (cond, x, y)
-        };
+        let Comparison {
+            cond,
+            x,
+            y,
+            immediate,
+        } = select::comparison(self.func, cond, x, y);
         let ty = self.ty(x);
         let signed = matches!(
             cond,
@@ -484,27 +448,21 @@ impl Lower<'_> {
             self.asm.emit(e::extend(extend, Width::W, T0, a));
             a = T0;
         }
-        let unsigned = self.constant(y).map(|bits| bits as i64);
-        let sign_extended = self.signed_constant(y);
-        let negatable =
-            signed || (extend.is_none() && matches!(cond, IntCC::Equal | IntCC::NotEqual));
-        if let Some((imm, shift)) =
-            (if signed { sign_extended } else { unsigned }).and_then(e::arith_imm)
-        {
-            self.asm.emit(e::subs_imm(width, e::ZR, a, imm, shift));
-        } else if let Some((imm, shift)) = sign_extended
-            .filter(|_| negatable)
-            .and_then(i64::checked_neg)
-            .and_then(e::arith_imm)
-        {
-            self.asm.emit(e::adds_imm(width, e::ZR, a, imm, shift));
-        } else {
-            let mut b = self.use_reg(y, T1);
-            if let Some(extend) = extend {
-                self.asm.emit(e::extend(extend, Width::W, T1, b));
-                b = T1;
+        match immediate {
+            Some(CompareImmediate::Subs(imm, shift)) => {
+                self.asm.emit(e::subs_imm(width, e::ZR, a, imm, shift));
             }
-            self.asm.emit(e::alu(Alu::Subs, width, e::ZR, a, b));
+            Some(CompareImmediate::Adds(imm, shift)) => {
+                self.asm.emit(e::adds_imm(width, e::ZR, a, imm, shift));
+            }
+            None => {
+                let mut b = self.use_reg(y, T1);
+                if let Some(extend) = extend {
+                    self.asm.emit(e::extend(extend, Width::W, T1, b));
+                    b = T1;
+                }
+                self.asm.emit(e::alu(Alu::Subs, width, e::ZR, a, b));
+            }
         }
         int_cond(cond)
     }
@@ -568,7 +526,7 @@ impl Lower<'_> {
                 scratch
             }
             Loc::Imm(bits) => {
-                self.load_imm(scratch, bits);
+                self.materialize(self.class(value), scratch, bits);
                 scratch
             }
         }
@@ -608,7 +566,7 @@ impl Lower<'_> {
             (Loc::Slot(offset), Loc::Reg(_, to)) => {
                 self.memory(Self::spill_op(m.class, true), to, e::SP, i64::from(offset));
             }
-            (Loc::Imm(bits), Loc::Reg(_, to)) => self.load_imm(to, bits),
+            (Loc::Imm(bits), Loc::Reg(_, to)) => self.materialize(m.class, to, bits),
             (Loc::Imm(bits), Loc::Slot(offset)) => {
                 self.load_imm(T0, bits);
                 self.memory(Mem::StrX, T0, e::SP, i64::from(offset));
@@ -767,10 +725,14 @@ impl Lower<'_> {
         }
         if self.allocation.is_cold(self.block) != self.allocation.is_cold(target) {
             for &value in self.allocation.boundary(target) {
+                let to = self.loc_in(value, target);
+                if matches!(to, Loc::Imm(_)) {
+                    continue;
+                }
                 pending.push(Move {
                     class: self.class(value),
                     from: self.loc(value),
-                    to: self.loc_in(value, target),
+                    to,
                 });
             }
         }
@@ -787,10 +749,6 @@ impl Lower<'_> {
             self.asm.jump(e::B, label);
         }
         Ok(())
-    }
-
-    fn needs_stub(&self, call: BlockCall) -> Result<bool, Unsupported> {
-        Ok(!self.edge_moves(call)?.is_empty())
     }
 
     fn condition(&mut self, value: Value) -> Cond {
@@ -1006,13 +964,18 @@ impl Lower<'_> {
     }
 
     fn edge_target(&mut self, call: BlockCall) -> Result<Label, Unsupported> {
+        let moves = self.edge_moves(call)?;
+        Ok(self.stub(call, moves))
+    }
+
+    fn stub(&mut self, call: BlockCall, moves: Vec<Move>) -> Label {
         let target = call.block(&self.func.dfg.value_lists);
-        if !self.needs_stub(call)? {
-            return Ok(self.label(target));
+        if moves.is_empty() {
+            return self.label(target);
         }
         let label = self.asm.label();
-        self.stubs.push((label, self.block, call));
-        Ok(label)
+        self.stubs.push((label, moves, target));
+        label
     }
 
     fn inst(&mut self, inst: Inst, next: Option<Block>) -> Result<(), Unsupported> {
@@ -1027,20 +990,12 @@ impl Lower<'_> {
         let result = dfg.inst_results(inst).first().copied();
         let result_ty = result.map(|result| self.ty(result));
         match (opcode, data) {
-            (Opcode::Iconst, _) => {}
-            (Opcode::F64const, InstructionData::UnaryIeee64 { imm, .. }) => {
+            (Opcode::Iconst | Opcode::F64const | Opcode::F32const, _) => {
                 let result = result.unwrap();
-                self.mov_imm(Width::X, T0, imm.bits());
-                let d = self.def_reg(result, F0);
-                self.asm.emit(e::move_to_float(Width::X, d, T0));
-                self.commit(result, d);
-            }
-            (Opcode::F32const, InstructionData::UnaryIeee32 { imm, .. }) => {
-                let result = result.unwrap();
-                self.mov_imm(Width::W, T0, u64::from(imm.bits()));
-                let d = self.def_reg(result, F0);
-                self.asm.emit(e::move_to_float(Width::W, d, T0));
-                self.commit(result, d);
+                if let Loc::Reg(class, reg) = self.loc(result) {
+                    let bits = remat_bits(func, result).expect("constants have bits");
+                    self.materialize(class, reg, bits);
+                }
             }
             (
                 Opcode::Iadd
@@ -1052,7 +1007,7 @@ impl Lower<'_> {
                 _,
             ) => {
                 let result = result.unwrap();
-                if opcode != Opcode::Imul && self.binary_imm(opcode, result, args) {
+                if self.binary_imm(inst, result) {
                     return Ok(());
                 }
                 let width = width(result_ty.unwrap());
@@ -1156,8 +1111,7 @@ impl Lower<'_> {
                     let a = self.use_reg(args[1], T1);
                     let b = self.use_reg(args[2], T2);
                     let d = self.def_reg(result, T0);
-                    let width = if ty == types::I64 { Width::X } else { Width::W };
-                    self.asm.emit(e::csel(width, d, a, b, cond));
+                    self.asm.emit(e::csel(width(ty), d, a, b, cond));
                     self.commit(result, d);
                 }
             }
@@ -1240,6 +1194,9 @@ impl Lower<'_> {
                 self.commit(result, d);
             }
             (Opcode::AtomicLoad, _) => {
+                if data.memflags_trap_code(dfg).is_some() {
+                    return Err(Unsupported("trapping atomic load".into()));
+                }
                 let result = result.unwrap();
                 let ty = result_ty.unwrap();
                 if RegClass::of(ty) != Some(RegClass::Int) {
@@ -1280,7 +1237,7 @@ impl Lower<'_> {
                 let offset =
                     i64::from(self.frame.stack_slot(*stack_slot)) + i64::from(i32::from(*offset));
                 let d = self.def_reg(result, T0);
-                if offset < 4096 {
+                if (0..4096).contains(&offset) {
                     self.asm
                         .emit(e::add_imm(Width::X, d, e::SP, offset as u32, false));
                 } else {
@@ -1457,11 +1414,12 @@ impl Lower<'_> {
                 let [then_call, else_call] = *blocks;
                 let test = self.branch_test(*arg, inst);
                 let then_block = then_call.block(&dfg.value_lists);
-                if next == Some(then_block) && !self.needs_stub(then_call)? {
+                let then_moves = self.edge_moves(then_call)?;
+                if next == Some(then_block) && then_moves.is_empty() {
                     let target = self.edge_target(else_call)?;
                     self.branch_if(test.invert(), target);
                 } else {
-                    let target = self.edge_target(then_call)?;
+                    let target = self.stub(then_call, then_moves);
                     self.branch_if(test, target);
                     self.edge(else_call, next)?;
                 }

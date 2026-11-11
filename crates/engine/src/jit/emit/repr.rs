@@ -48,11 +48,23 @@ impl Repr {
 pub(super) struct Operand {
     pub(super) value: ClifValue,
     pub(super) repr: Repr,
+    constant: Option<f64>,
 }
 
 impl Operand {
     pub(super) fn new(value: ClifValue, repr: Repr) -> Self {
-        Self { value, repr }
+        Self {
+            value,
+            repr,
+            constant: None,
+        }
+    }
+
+    pub(super) fn with_constant(self, number: f64) -> Self {
+        Self {
+            constant: Some(number),
+            ..self
+        }
     }
 }
 
@@ -67,8 +79,36 @@ impl FunctionCompiler<'_, '_> {
         }
     }
 
+    fn fold(&mut self, operand: Operand, to: Repr) -> Option<ClifValue> {
+        let number = operand.constant?;
+        let integer = match operand.repr {
+            Repr::Int32 => Some(i64::from(number as i32)),
+            Repr::Int64 => Some(number as i64),
+            Repr::Float => None,
+            Repr::Boxed | Repr::Bool => return None,
+        };
+        Some(match (integer, to) {
+            (Some(integer), Repr::Int64) => self.b.ins().iconst(types::I64, integer),
+            (Some(integer), Repr::Int32) => {
+                self.b.ins().iconst(types::I32, i64::from(integer as i32))
+            }
+            (Some(integer), Repr::Float) => self.b.ins().f64const(integer as f64),
+            (None, Repr::Int64) => self.b.ins().iconst(types::I64, number as i64),
+            (None, Repr::Int32) => self
+                .b
+                .ins()
+                .iconst(types::I32, i64::from(crate::jit::helpers::to_int32(number))),
+            _ => return None,
+        })
+    }
+
     pub(super) fn convert(&mut self, operand: Operand, to: Repr) -> ClifValue {
         let value = operand.value;
+        if operand.repr != to
+            && let Some(folded) = self.fold(operand, to)
+        {
+            return folded;
+        }
         match (operand.repr, to) {
             (from, to) if from == to => value,
             (Repr::Boxed, Repr::Float) => {

@@ -70,7 +70,10 @@ impl Default for EngineOptions {
         let jitdump = std::env::var("JS_JIT_JITDUMP").ok();
         let jitdump = jitdump.as_deref();
         Self {
-            opt_level: OptLevel::default(),
+            opt_level: match std::env::var("JS_JIT_OPT").as_deref() {
+                Ok("none") => OptLevel::None,
+                _ => OptLevel::default(),
+            },
             jitdump: matches!(jitdump, Some("1" | "2")),
             jitdump_ir: jitdump == Some("2"),
             ssa_opt: std::env::var("JS_JIT_SSA").as_deref() != Ok("0"),

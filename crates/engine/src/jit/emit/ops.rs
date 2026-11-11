@@ -1020,12 +1020,11 @@ impl FunctionCompiler<'_, '_> {
 
     pub(super) fn array_load(
         &mut self,
-        object: ClifValue,
+        view: ClifValue,
         position: Operand,
         holey: bool,
         retain: bool,
     ) -> ClifValue {
-        let view = self.view(object);
         let position = self.convert(position, Repr::Int64);
         let flags = MemFlagsData::trusted();
         let data = self.b.ins().load(self.pointer, flags, view, DATA_OFFSET);

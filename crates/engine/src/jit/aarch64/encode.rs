@@ -250,6 +250,42 @@ pub(super) fn mov_wide(op: Wide, width: Width, rd: u8, imm16: u16, hw: u8) -> u3
     base | width.sf() | (u32::from(hw) << 21) | (u32::from(imm16) << 5) | u32::from(rd)
 }
 
+pub(super) fn mov_imm(width: Width, rd: u8, value: u64, mut emit: impl FnMut(u32)) {
+    let count = if width == Width::X { 4 } else { 2 };
+    let all: [u16; 4] = std::array::from_fn(|i| (value >> (16 * i)) as u16);
+    let chunks = &all[..count];
+    let ones = chunks.iter().filter(|&&chunk| chunk == 0xFFFF).count();
+    let zeros = chunks.iter().filter(|&&chunk| chunk == 0).count();
+    let (skip, first) = if ones > zeros {
+        (0xFFFF, Wide::Movn)
+    } else {
+        (0, Wide::Movz)
+    };
+    let mut started = false;
+    for (hw, &chunk) in chunks.iter().enumerate() {
+        if chunk == skip {
+            continue;
+        }
+        let word = if started {
+            mov_wide(Wide::Movk, width, rd, chunk, hw as u8)
+        } else if first == Wide::Movn {
+            mov_wide(first, width, rd, !chunk, hw as u8)
+        } else {
+            mov_wide(first, width, rd, chunk, hw as u8)
+        };
+        emit(word);
+        started = true;
+    }
+    if !started {
+        emit(mov_wide(first, width, rd, 0, 0));
+    }
+}
+
+pub(super) fn load_imm(rd: u8, value: u64, emit: impl FnMut(u32)) {
+    let width = if value >> 32 == 0 { Width::W } else { Width::X };
+    mov_imm(width, rd, value, emit);
+}
+
 pub(super) fn mul(width: Width, rd: u8, rn: u8, rm: u8) -> u32 {
     0x1B00_7C00 | width.sf() | rd_rn_rm(rd, rn, rm)
 }
@@ -542,4 +578,24 @@ pub(super) fn demote(rd: u8, rn: u8) -> u32 {
 
 pub(super) fn promote(rd: u8, rn: u8) -> u32 {
     0x1E22_C000 | rd_rn(rd, rn)
+}
+
+pub(super) fn float_imm8(bits: u64) -> Option<u32> {
+    if bits & 0xFFFF_FFFF_FFFF != 0 {
+        return None;
+    }
+    let replicated = match (bits >> 54) & 0xFF {
+        0 => 0,
+        0xFF => 1,
+        _ => return None,
+    };
+    if (bits >> 62) & 1 == replicated {
+        return None;
+    }
+    let sign = bits >> 63;
+    Some(((sign << 7) | (replicated << 6) | ((bits >> 48) & 0x3F)) as u32)
+}
+
+pub(super) fn fmov_imm(rd: u8, imm8: u32) -> u32 {
+    0x1E60_1000 | (imm8 << 13) | u32::from(rd)
 }
