@@ -365,6 +365,40 @@ pub(super) extern "C" fn js_property_get_cached(
     js_property_get(ctx, object, cache.name.as_ptr(), cache.name.len() as u64)
 }
 
+pub(super) extern "C" fn js_property_get_baseline(
+    ctx: *mut JitCtx,
+    object: Value,
+    cache: *mut PropertyCache,
+) -> Value {
+    let cache = unsafe { &mut *cache };
+    if cache.megamorphic == 0 {
+        let context = unsafe { &mut *ctx };
+        let entries = std::iter::once(&cache.entry)
+            .take(cache.len.min(1) as usize)
+            .chain(
+                cache
+                    .overflow
+                    .iter()
+                    .flat_map(|entries| entries.iter().take(cache.len.saturating_sub(1) as usize)),
+            );
+        for entry in entries {
+            if entry.builtin_kind != 0 {
+                continue;
+            }
+            if let Some(value) = context.global.heap().cached_property_hit(
+                object,
+                entry.shape,
+                entry.holder,
+                entry.holder_shape,
+                entry.index,
+            ) {
+                return context.retain(value);
+            }
+        }
+    }
+    js_property_get_cached(ctx, object, cache)
+}
+
 pub(super) extern "C" fn js_property_cache_prime(
     ctx: *mut JitCtx,
     object: Value,

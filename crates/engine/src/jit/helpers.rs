@@ -155,7 +155,9 @@ define_helpers! {
     TypedIndexGet => Binary, js_typed_index_get;
     IndexSet => IndexSet, js_index_set;
     PropertyGet => PropertyGet, js_property_get, reference;
+    PropertySet => PropertySet, js_property_set;
     PropertyGetCached => Binary, js_property_get_cached, reference;
+    PropertyGetBaseline => Binary, js_property_get_baseline, reference;
     PropertyCachePrime => Binary, js_property_cache_prime;
     PropertySetCached => PropertySetCached, js_property_set_cached;
     PropertyDefineHidden => PropertySet, js_property_define_hidden;

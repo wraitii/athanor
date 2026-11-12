@@ -120,6 +120,7 @@ impl CompileOptions {
         body: &Inspection,
         function: &Function,
         annotations: &Annotations,
+        direct: bool,
     ) {
         let label = body.label.as_deref().unwrap_or(name);
         if let Some(ast) = &body.ast {
@@ -132,6 +133,10 @@ impl CompileOptions {
             println!("[{name}] planner {label}\n{planner}");
         }
         if self.clif {
+            if direct {
+                println!("[{name}] Cranelift IR unavailable for direct baseline code");
+                return;
+            }
             println!(
                 "[{name}] Cranelift IR before optimization\n{}",
                 function.display()
@@ -150,8 +155,9 @@ impl CompileOptions {
         context: &Context,
         machine: &MachineCode,
         module: &JITModule,
+        direct: bool,
     ) -> Result<(), Error> {
-        if self.clif {
+        if self.clif && !direct {
             println!(
                 "[{name}] Cranelift IR after optimization\n{}",
                 context.func.display()

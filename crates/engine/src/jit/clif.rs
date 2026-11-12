@@ -88,6 +88,7 @@ pub(super) struct Annotations {
 #[derive(Clone)]
 pub(super) struct FunctionBody {
     pub function: Function,
+    pub baseline: Option<std::sync::Arc<super::machine::MachineCode>>,
     pub annotations: Annotations,
     pub listing: Option<Vec<super::semantic::ListingLine>>,
     pub inspection: super::inspect::Inspection,

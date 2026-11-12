@@ -141,6 +141,8 @@ unsafe impl Send for Unpublished {}
 #[derive(Default)]
 struct CompileStats {
     functions: usize,
+    baseline: usize,
+    baseline_refusals: BTreeMap<String, usize>,
     blocks: usize,
     insts: usize,
     bytes: usize,
@@ -156,6 +158,16 @@ impl Drop for Compiler {
             );
             if self.backend != crate::Backend::Cranelift {
                 eprintln!("js jit stats: {} native functions", stats.native);
+            }
+            if std::env::var_os("JS_JIT_BASELINE").is_some() {
+                eprintln!(
+                    "js jit stats: {} direct baseline functions, {} other functions",
+                    stats.baseline,
+                    stats.functions - stats.baseline
+                );
+                for (reason, count) in &stats.baseline_refusals {
+                    eprintln!("js jit baseline refusal: {count} functions: {reason}");
+                }
             }
         }
     }
@@ -840,14 +852,49 @@ impl Compiler {
                 (&label, line),
                 None,
             )?;
-            let (function, annotations) =
+            let mut baseline_data = super::function_data::FunctionData::new();
+            let baseline = if !self.ssa_opt
+                && self.module.isa().name() == "aarch64"
+                && std::env::var_os("JS_JIT_BASELINE").is_some()
+            {
+                super::aarch64::compile_baseline(
+                    &graph.graph,
+                    self.source_name,
+                    self.dump_ir || self.inspection.is_some(),
+                    &mut self.names,
+                    &mut baseline_data,
+                )
+                .map_err(|reason| {
+                    if let Some(stats) = &mut self.stats {
+                        *stats.baseline_refusals.entry(reason.0).or_default() += 1;
+                    }
+                })
+                .ok()
+                .map(Arc::new)
+            } else {
+                None
+            };
+            let (function, annotations) = if baseline.is_some() {
+                self.data.push(baseline_data);
+                let mut function = cranelift_codegen::ir::Function::new();
+                function.signature = self.signature.clone();
+                (
+                    function,
+                    Annotations {
+                        semantic_locations: self.dump_ir || self.inspection.is_some(),
+                        ..Annotations::default()
+                    },
+                )
+            } else {
                 self.emit_body(self.signature.clone(), self.source_name, |out| {
                     emit::build_global(out, &graph.graph, &graph.facts, &continuations)
-                })?;
+                })?
+            };
             pending.push((
                 id,
                 FunctionBody {
                     function,
+                    baseline,
                     annotations,
                     inspection: super::inspect::Inspection::new(
                         self.inspection.as_deref(),
@@ -917,6 +964,7 @@ impl Compiler {
         continuations.append(&mut pending);
         let mut dumped = Vec::new();
         for (id, code) in continuations {
+            let direct = code.baseline.is_some();
             let mut listing = None;
             self.context.clear();
             self.context.func = code.function;
@@ -942,10 +990,12 @@ impl Compiler {
                     &code.inspection,
                     &self.context.func,
                     &code.annotations,
+                    direct,
                 );
             }
             if let Some(stats) = &mut self.stats {
                 stats.functions += 1;
+                stats.baseline += usize::from(direct);
                 stats.blocks += self.context.func.layout.blocks().count();
                 stats.insts += self
                     .context
@@ -961,13 +1011,16 @@ impl Compiler {
             } else {
                 self.fixed.remove(&id);
             }
-            let machine = self.machine_code(id, &name)?;
+            let machine = match code.baseline {
+                Some(machine) => machine,
+                None => Arc::new(self.machine_code(id, &name)?),
+            };
             machine.define(&mut self.module, id)?;
             if let Some(stats) = &mut self.stats {
                 stats.bytes += machine.bytes.len();
             }
             if let Some(options) = self.inspection.as_deref().filter(|o| o.matches(&name)) {
-                options.print_compiled(&name, &self.context, &machine, &self.module)?;
+                options.print_compiled(&name, &self.context, &machine, &self.module, direct)?;
             }
             if self.dump.is_some() {
                 let size = machine.bytes.len();
@@ -1471,19 +1524,59 @@ impl Compiler {
         )?;
         let signature = self.graph_signature(Some(&graph.graph));
         let feedback = self.ssa_opt.then(|| self.feedback(code, region.is_none()));
-        let (function, annotations) = self.emit_body(signature, emission.source_name, |out| {
-            emit::build_function(
-                out,
-                emission.params,
-                emit::FunctionKind::Ordinary,
+        let mut baseline_data = super::function_data::FunctionData::new();
+        let baseline = if initial
+            && region.is_none()
+            && !self.ssa_opt
+            && self.module.isa().name() == "aarch64"
+            && std::env::var_os("JS_JIT_BASELINE").is_some()
+        {
+            super::aarch64::compile_baseline(
                 &graph.graph,
-                &graph.facts,
-                &continuations,
-                feedback,
+                emission.source_name,
+                self.dump_ir || self.inspection.is_some(),
+                &mut self.names,
+                &mut baseline_data,
             )
-        })?;
+            .map_err(|reason| {
+                if let Some(stats) = &mut self.stats {
+                    *stats.baseline_refusals.entry(reason.0).or_default() += 1;
+                }
+            })
+            .ok()
+            .map(Arc::new)
+        } else {
+            None
+        };
+        if baseline.is_some() {
+            self.data.push(baseline_data);
+        }
+        let (function, annotations) = if baseline.is_some() {
+            let mut function = cranelift_codegen::ir::Function::new();
+            function.signature = signature;
+            (
+                function,
+                Annotations {
+                    semantic_locations: self.dump_ir || self.inspection.is_some(),
+                    ..Annotations::default()
+                },
+            )
+        } else {
+            self.emit_body(signature, emission.source_name, |out| {
+                emit::build_function(
+                    out,
+                    emission.params,
+                    emit::FunctionKind::Ordinary,
+                    &graph.graph,
+                    &graph.facts,
+                    &continuations,
+                    feedback,
+                )
+            })?
+        };
         let body = FunctionBody {
             function,
+            baseline,
             annotations,
             listing: self.listing().then(|| graph.listing_lines()),
             inspection: super::inspect::Inspection::new(
@@ -1700,6 +1793,7 @@ impl Compiler {
                 id,
                 FunctionBody {
                     function,
+                    baseline: None,
                     annotations,
                     inspection: super::inspect::Inspection::from_graph(
                         self.inspection.as_deref(),
@@ -1882,6 +1976,36 @@ impl Compiler {
                 },
             );
         }
+        let mut baseline_data = super::function_data::FunctionData::new();
+        let baseline = if std::env::var_os("JS_JIT_BASELINE").is_some()
+            && self.module.isa().name() == "aarch64"
+            && !self.ssa_opt
+            && matches!(kind, emit::FunctionKind::Ordinary)
+        {
+            graph
+                .as_ref()
+                .and_then(|graph| {
+                    super::aarch64::compile_baseline(
+                        &graph.graph,
+                        self.source_name,
+                        self.dump_ir || self.inspection.is_some(),
+                        &mut self.names,
+                        &mut baseline_data,
+                    )
+                    .map_err(|reason| {
+                        if let Some(stats) = &mut self.stats {
+                            *stats.baseline_refusals.entry(reason.0).or_default() += 1;
+                        }
+                    })
+                    .ok()
+                })
+                .map(Arc::new)
+        } else {
+            None
+        };
+        if baseline.is_some() {
+            self.data.push(baseline_data);
+        }
         let continuations = match &graph {
             Some(graph) => self.compile_continuations(
                 &graph.graph,
@@ -1894,7 +2018,17 @@ impl Compiler {
         };
         let signature = self.graph_signature(graph.as_ref().map(|graph| &graph.graph));
         let feedback = feedback.map(|owner| self.feedback(owner, true));
-        let (function, annotations) =
+        let (function, annotations) = if baseline.is_some() {
+            let mut function = cranelift_codegen::ir::Function::new();
+            function.signature = signature;
+            (
+                function,
+                Annotations {
+                    semantic_locations: self.dump_ir || self.inspection.is_some(),
+                    ..Annotations::default()
+                },
+            )
+        } else {
             self.emit_body(signature, self.source_name, |out| match &graph {
                 Some(graph) => emit::build_function(
                     out,
@@ -1911,9 +2045,11 @@ impl Compiler {
                     }
                     _ => Ok(()),
                 },
-            })?;
+            })?
+        };
         Ok(FunctionBody {
             function,
+            baseline,
             annotations,
             inspection: graph.as_ref().map_or_else(Default::default, |graph| {
                 super::inspect::Inspection::new(

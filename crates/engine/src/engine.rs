@@ -333,6 +333,7 @@ impl Engine {
         source: &str,
         filename: &str,
     ) -> Result<Option<usize>, Error> {
+        let started = std::env::var_os("JS_JIT_STATS").map(|_| std::time::Instant::now());
         let allocator = Allocator::default();
         let program = parse::parse(&allocator, source, filename)?;
         let analysis = SemanticBuilder::new_compiler()
@@ -440,6 +441,12 @@ impl Engine {
             self.global.define(name, Value::UNDEFINED);
         }
         self.tiering.queue_unlazification();
+        if let Some(started) = started {
+            eprintln!(
+                "js jit script compile: {:.3} ms: {filename}",
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         Ok(initializer)
     }
 

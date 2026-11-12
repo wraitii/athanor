@@ -177,6 +177,29 @@ impl Heap {
         })
     }
 
+    pub(crate) fn cached_property_hit(
+        &self,
+        receiver: Value,
+        shape: u32,
+        holder: u64,
+        holder_shape: u32,
+        index: u32,
+    ) -> Option<Value> {
+        let data = self.0.borrow();
+        let id = heap_id(receiver)?;
+        if data.cacheable_shape(id)? != shape {
+            return None;
+        }
+        let owner = if holder == 0 { id } else { holder };
+        if data.cacheable_shape(owner)? != holder_shape {
+            return None;
+        }
+        let PropertyView::Shaped { values, .. } = data.properties(owner)? else {
+            return None;
+        };
+        values.get(index as usize).copied()
+    }
+
     pub(crate) fn builtin_property(
         &self,
         receiver: Value,
