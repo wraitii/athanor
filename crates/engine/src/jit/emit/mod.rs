@@ -102,6 +102,7 @@ fn data_base(b: &mut FunctionBuilder<'_>, pointer: Type, data: &FunctionData) ->
 }
 
 pub(super) struct Output<'a, 'f> {
+    pub(super) cranelift: bool,
     pub(super) b: &'a mut FunctionBuilder<'f>,
     pub(super) module: &'a mut JITModule,
     pub(super) stubs: Stubs,
@@ -171,7 +172,33 @@ fn build_callable(
     continuations: &HashMap<usize, FuncId>,
     feedback: Option<Feedback>,
 ) -> Result<(), Error> {
+    let lowered;
+    let lowered_facts;
+    let body = if out.cranelift {
+        match body {
+            CallableBody::Graph(graph, _)
+                if graph.insts.values().any(|data| {
+                    matches!(
+                        data.op,
+                        super::semantic::Op::Memory(super::semantic::MemoryOp::IndexedLoad { .. })
+                    )
+                }) =>
+            {
+                lowered = {
+                    let mut graph = graph.clone();
+                    super::semantic::lower_memory_for_cranelift(&mut graph);
+                    graph
+                };
+                lowered_facts = super::semantic::Facts::compute(&lowered);
+                CallableBody::Graph(&lowered, &lowered_facts)
+            }
+            other => other,
+        }
+    } else {
+        body
+    };
     let Output {
+        cranelift: _,
         b,
         module,
         stubs,

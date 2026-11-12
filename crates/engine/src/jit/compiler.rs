@@ -366,6 +366,41 @@ impl Compiler {
         &mut self,
         signature: Signature,
         source_name: (usize, usize),
+        mut build: impl FnMut(emit::Output<'_, '_>) -> Result<(), Error>,
+    ) -> Result<
+        (
+            cranelift_codegen::ir::Function,
+            Annotations,
+            Option<cranelift_codegen::ir::Function>,
+        ),
+        Error,
+    > {
+        let native =
+            self.backend != crate::Backend::Cranelift && self.module.isa().name() == "aarch64";
+        let (function, annotations) =
+            self.emit_body_for(signature.clone(), source_name, !native, &mut build)?;
+        let fallback = if native
+            && self.backend != crate::Backend::NativeOnly
+            && !annotations.indexed_loads.is_empty()
+        {
+            let (fallback, expanded) =
+                self.emit_body_for(signature, source_name, true, &mut build)?;
+            assert!(expanded.indexed_loads.is_empty());
+            Some(fallback)
+        } else {
+            None
+        };
+        if !native {
+            assert!(annotations.indexed_loads.is_empty());
+        }
+        Ok((function, annotations, fallback))
+    }
+
+    fn emit_body_for(
+        &mut self,
+        signature: Signature,
+        source_name: (usize, usize),
+        cranelift: bool,
         build: impl FnOnce(emit::Output<'_, '_>) -> Result<(), Error>,
     ) -> Result<(cranelift_codegen::ir::Function, Annotations), Error> {
         let mut annotations = Annotations {
@@ -388,6 +423,7 @@ impl Compiler {
             cells: &mut self.cells,
             data: &mut data,
             source_name,
+            cranelift,
         })?;
         builder.seal_all_blocks();
         builder.finalize(self.module.target_config());
@@ -400,14 +436,21 @@ impl Compiler {
         Ok((function, annotations))
     }
 
-    fn machine_code(&mut self, id: FuncId, name: &str) -> Result<MachineCode, Error> {
+    fn machine_code(
+        &mut self,
+        id: FuncId,
+        name: &str,
+        annotations: &Annotations,
+        fallback: Option<cranelift_codegen::ir::Function>,
+    ) -> Result<MachineCode, Error> {
         let native =
             self.backend != crate::Backend::Cranelift && self.module.isa().name() == "aarch64";
         if !native {
+            assert!(annotations.indexed_loads.is_empty());
             return MachineCode::from_cranelift(&mut self.context, &self.module, id);
         }
-        super::clif::canonicalize_parameters(&mut self.context.func);
-        let reason = match super::aarch64::compile(&self.context.func) {
+        super::semantic::canonicalize_parameters(&mut self.context.func);
+        let reason = match super::aarch64::compile(&self.context.func, &annotations.indexed_loads) {
             Ok(machine) => {
                 if let Some(stats) = &mut self.stats {
                     stats.native += 1;
@@ -423,6 +466,12 @@ impl Compiler {
         }
         if self.inspection.as_deref().is_some_and(|o| o.matches(name)) {
             println!("[{name}] native backend fallback: {reason}");
+        }
+        if let Some(fallback) = fallback {
+            self.context.clear();
+            self.context.func = fallback;
+        } else {
+            assert!(annotations.indexed_loads.is_empty());
         }
         MachineCode::from_cranelift(&mut self.context, &self.module, id)
     }
@@ -830,7 +879,7 @@ impl Compiler {
                 .unwrap_or("module");
             let label = format!("{module}.module");
             let id = self.declare_js(&label, line)?;
-            let graph = super::semantic::lower_global(
+            let mut graph = super::semantic::lower_global(
                 &program.body,
                 program.span,
                 scoping,
@@ -842,6 +891,9 @@ impl Compiler {
                 self.report_regions(),
             )
             .map_err(Error::Unsupported)?;
+            if self.ssa_opt {
+                graph.lower_memory().map_err(Error::Unsupported)?;
+            }
             let continuations = self.compile_continuations(
                 &graph.graph,
                 self.source_name,
@@ -871,7 +923,7 @@ impl Compiler {
             } else {
                 None
             };
-            let (function, annotations) = if baseline.is_some() {
+            let (function, annotations, cranelift) = if baseline.is_some() {
                 self.data.push(baseline_data);
                 let mut function = cranelift_codegen::ir::Function::new();
                 function.signature = self.signature.clone();
@@ -881,6 +933,7 @@ impl Compiler {
                         semantic_locations: self.dump_ir || self.inspection.is_some(),
                         ..Annotations::default()
                     },
+                    None,
                 )
             } else {
                 self.emit_body(self.signature.clone(), self.source_name, |out| {
@@ -891,6 +944,7 @@ impl Compiler {
                 id,
                 FunctionBody {
                     function,
+                    cranelift,
                     baseline,
                     annotations,
                     inspection: super::inspect::Inspection::new(
@@ -1011,7 +1065,9 @@ impl Compiler {
             }
             let machine = match code.baseline {
                 Some(machine) => machine,
-                None => Arc::new(self.machine_code(id, &name)?),
+                None => {
+                    Arc::new(self.machine_code(id, &name, &code.annotations, code.cranelift)?)
+                }
             };
             machine.define(&mut self.module, id)?;
             if let Some(stats) = &mut self.stats {
@@ -1513,6 +1569,9 @@ impl Compiler {
         if self.osr && region.is_none() && !self.canonical.is_region(code) {
             graph.prepare_osr(source).map_err(Error::Unsupported)?;
         }
+        if self.ssa_opt {
+            graph.lower_memory().map_err(Error::Unsupported)?;
+        }
         let continuations = self.compile_continuations(
             &graph.graph,
             emission.source_name,
@@ -1550,7 +1609,7 @@ impl Compiler {
         if baseline.is_some() {
             self.data.push(baseline_data);
         }
-        let (function, annotations) = if baseline.is_some() {
+        let (function, annotations, cranelift) = if baseline.is_some() {
             let mut function = cranelift_codegen::ir::Function::new();
             function.signature = signature;
             (
@@ -1559,6 +1618,7 @@ impl Compiler {
                     semantic_locations: self.dump_ir || self.inspection.is_some(),
                     ..Annotations::default()
                 },
+                None,
             )
         } else {
             self.emit_body(signature, emission.source_name, |out| {
@@ -1574,6 +1634,7 @@ impl Compiler {
         };
         let body = FunctionBody {
             function,
+            cranelift,
             baseline,
             annotations,
             listing: self.listing().then(|| graph.listing_lines()),
@@ -1791,6 +1852,14 @@ impl Compiler {
         continuations: &HashMap<usize, FuncId>,
         feedback: Option<emit::Feedback>,
     ) -> Result<FunctionBody, Error> {
+        let lowered = if self.ssa_opt {
+            let mut lowered = super::semantic::FunctionState::from_graph(graph.clone());
+            lowered.lower_memory().map_err(Error::Unsupported)?;
+            Some(lowered)
+        } else {
+            None
+        };
+        let graph = lowered.as_ref().map_or(graph, |lowered| &lowered.graph);
         let facts = super::semantic::Facts::compute(graph);
         let mut data = FunctionData::new();
         let baseline = if !self.ssa_opt
@@ -1814,7 +1883,7 @@ impl Compiler {
         } else {
             None
         };
-        let (function, annotations) = if baseline.is_some() {
+        let (function, annotations, cranelift) = if baseline.is_some() {
             self.data.push(data);
             let mut function = cranelift_codegen::ir::Function::new();
             function.signature = self.signature.clone();
@@ -1824,6 +1893,7 @@ impl Compiler {
                     semantic_locations: self.dump_ir || self.inspection.is_some(),
                     ..Annotations::default()
                 },
+                None,
             )
         } else {
             self.emit_body(self.signature.clone(), source_name, |out| {
@@ -1832,6 +1902,7 @@ impl Compiler {
         };
         Ok(FunctionBody {
             function,
+            cranelift,
             annotations,
             baseline,
             inspection: super::inspect::Inspection::from_graph(self.inspection.as_deref(), graph),
@@ -2034,6 +2105,11 @@ impl Compiler {
                 .prepare_osr(self.source_name.0)
                 .map_err(Error::Unsupported)?;
         }
+        if self.ssa_opt
+            && let Some(graph) = &mut graph
+        {
+            graph.lower_memory().map_err(Error::Unsupported)?;
+        }
         let feedback = if self.ssa_opt && matches!(kind, emit::FunctionKind::Ordinary) {
             semantic_function.and_then(|span| self.canonical.code(self.source_name.0, span.start))
         } else {
@@ -2106,7 +2182,7 @@ impl Compiler {
         };
         let signature = self.graph_signature(graph.as_ref().map(|graph| &graph.graph));
         let feedback = feedback.map(|owner| self.feedback(owner, true));
-        let (function, annotations) = if baseline.is_some() {
+        let (function, annotations, cranelift) = if baseline.is_some() {
             let mut function = cranelift_codegen::ir::Function::new();
             function.signature = signature;
             (
@@ -2115,6 +2191,7 @@ impl Compiler {
                     semantic_locations: self.dump_ir || self.inspection.is_some(),
                     ..Annotations::default()
                 },
+                None,
             )
         } else {
             self.emit_body(signature, self.source_name, |out| match &graph {
@@ -2126,9 +2203,9 @@ impl Compiler {
                     &continuations,
                     feedback,
                 ),
-                None => match kind {
+                None => match &kind {
                     emit::FunctionKind::Factory(resume) => {
-                        emit::build_factory(out, params.span, resume)
+                        emit::build_factory(out, params.span, resume.clone())
                     }
                     _ => Ok(()),
                 },
@@ -2136,6 +2213,7 @@ impl Compiler {
         };
         Ok(FunctionBody {
             function,
+            cranelift,
             baseline,
             annotations,
             inspection: graph.as_ref().map_or_else(Default::default, |graph| {
@@ -2421,5 +2499,93 @@ mod listing_tests {
                 .iter()
                 .any(|(_, line)| line.contains("JS     2 | return x;"))
         );
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+mod indexed_fallback_tests {
+    use super::*;
+    use cranelift_codegen::ir::{
+        AbiParam, ExtFuncData, ExternalName, InstBuilder, MemFlagsData, Signature, types,
+    };
+    use cranelift_module::{Linkage, Module};
+
+    #[test]
+    fn unsupported_native_operation_uses_expanded_indexed_load() {
+        let mut compiler = Compiler::new(
+            EngineOptions {
+                backend: crate::Backend::Native,
+                ..Default::default()
+            },
+            CompilationTier::Optimized,
+            std::ptr::null(),
+            0,
+            super::super::recompile::Log::new(false),
+        )
+        .unwrap();
+        let mut signature = Signature::new(compiler.module.target_config().default_call_conv);
+        signature
+            .params
+            .extend([AbiParam::new(types::I64), AbiParam::new(types::I64)]);
+        signature.returns.push(AbiParam::new(types::I32));
+        let id = compiler
+            .module
+            .declare_function("indexed_fallback_test", Linkage::Local, &signature)
+            .unwrap();
+        let (primary, annotations, fallback) = compiler
+            .emit_body(signature, (0, 0), |out| {
+                let b = out.b;
+                let entry = b.create_block();
+                b.append_block_params_for_function_params(entry);
+                b.switch_to_block(entry);
+                let params = b.block_params(entry).to_vec();
+                let value = if out.cranelift {
+                    let offset = b.ins().ishl_imm_s(params[1], 2);
+                    let address = b.ins().iadd(params[0], offset);
+                    b.ins()
+                        .load(types::I32, MemFlagsData::trusted(), address, 0)
+                } else {
+                    let mut marker_sig =
+                        Signature::new(out.module.target_config().default_call_conv);
+                    marker_sig
+                        .params
+                        .extend([AbiParam::new(types::I64), AbiParam::new(types::I64)]);
+                    marker_sig.returns.push(AbiParam::new(types::I32));
+                    let signature = b.import_signature(marker_sig);
+                    let marker = b.import_function(ExtFuncData {
+                        name: ExternalName::testcase("semantic_indexed_load"),
+                        signature,
+                        colocated: false,
+                        patchable: false,
+                    });
+                    let call = b.ins().call(marker, &params);
+                    out.annotations
+                        .indexed_loads
+                        .insert(call, super::super::semantic::MemoryFormat::U32);
+                    let value = b.inst_results(call)[0];
+                    b.ins().popcnt(params[1]);
+                    value
+                };
+                b.ins().return_(&[value]);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(annotations.indexed_loads.len(), 1);
+        assert!(fallback.is_some());
+        match super::super::aarch64::compile(&primary, &annotations.indexed_loads) {
+            Err(reason) => assert!(reason.0.contains("popcnt"), "{}", reason.0),
+            Ok(_) => panic!("native backend unexpectedly accepted popcnt"),
+        }
+        compiler.context.func = primary;
+        let machine = compiler
+            .machine_code(id, "indexed_fallback_test", &annotations, fallback)
+            .unwrap();
+        assert!(compiler.context.compiled_code().is_some());
+        machine.define(&mut compiler.module, id).unwrap();
+        compiler.module.finalize_definitions().unwrap();
+        let entry = compiler.module.get_finalized_function(id);
+        let load: extern "C" fn(*const u32, u64) -> u32 = unsafe { std::mem::transmute(entry) };
+        let array = [17, 257, u32::MAX];
+        assert_eq!(load(array.as_ptr(), 2), u32::MAX);
     }
 }

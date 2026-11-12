@@ -30,18 +30,23 @@ const ADDRESS: u8 = 17;
 const F0: u8 = 16;
 const F1: u8 = 17;
 
-pub(super) fn lower(func: &Function) -> Result<MachineCode, Unsupported> {
+pub(super) fn lower(
+    func: &Function,
+    indexed_loads: &rustc_hash::FxHashMap<Inst, crate::jit::semantic::MemoryFormat>,
+) -> Result<MachineCode, Unsupported> {
     check_function(func)?;
     let order = block_order(func);
-    let hints = hints(func)?;
-    let selection = Selection::new(func);
+    let hints = hints(func, indexed_loads)?;
+    let selection = Selection::new(func, indexed_loads);
     let operands = |inst, out: &mut Vec<Value>| selection.operands(func, inst, out);
     let mut remat = SecondaryMap::new();
     for value in func.dfg.values() {
         remat[value] = select::remat_cost(func, value);
     }
-    let allocation =
-        alloc::allocate(func, &order, &TARGET, &hints, &operands, &remat).map_err(Unsupported)?;
+    let allocation = alloc::allocate(func, &order, &TARGET, &hints, &operands, &remat, &|inst| {
+        !indexed_loads.contains_key(&inst)
+    })
+    .map_err(Unsupported)?;
     match lower_with(func, &order, &allocation, &selection, false)? {
         Some(machine) => Ok(machine),
         None => lower_with(func, &order, &allocation, &selection, true)?
@@ -58,7 +63,7 @@ fn lower_with(
 ) -> Result<Option<MachineCode>, Unsupported> {
     let conv = func.signature.call_conv;
     let incoming = abi::assign(conv, &func.signature.params)?.stack_size;
-    let (outgoing, tail_calls) = call_stack_sizes(func)?;
+    let (outgoing, tail_calls) = call_stack_sizes(func, selection)?;
     if tail_calls > 0 && conv != CallConv::Tail {
         return Err(Unsupported(format!("tail call from {conv}")));
     }
@@ -145,11 +150,14 @@ fn check_function(func: &Function) -> Result<(), Unsupported> {
     Ok(())
 }
 
-fn call_stack_sizes(func: &Function) -> Result<(u32, u32), Unsupported> {
+fn call_stack_sizes(func: &Function, selection: &Selection) -> Result<(u32, u32), Unsupported> {
     let mut outgoing = 0;
     let mut tail = 0;
     for block in func.layout.blocks() {
         for inst in func.layout.block_insts(block) {
+            if selection.indexed_load(inst).is_some() {
+                continue;
+            }
             let Some(sig_ref) = func.dfg.call_signature(inst) else {
                 continue;
             };
@@ -166,7 +174,10 @@ fn call_stack_sizes(func: &Function) -> Result<(u32, u32), Unsupported> {
     Ok((outgoing, tail))
 }
 
-fn hints(func: &Function) -> Result<Vec<Hint>, Unsupported> {
+fn hints(
+    func: &Function,
+    indexed_loads: &rustc_hash::FxHashMap<Inst, crate::jit::semantic::MemoryFormat>,
+) -> Result<Vec<Hint>, Unsupported> {
     let dfg = &func.dfg;
     let mut hints = Vec::new();
     let mut add = |values: &[Value], locations: &[Location], block: Block| {
@@ -193,6 +204,9 @@ fn hints(func: &Function) -> Result<Vec<Hint>, Unsupported> {
             if opcode == Opcode::Return {
                 let locations = abi::assign_returns(signature.call_conv, &signature.returns)?;
                 add(args, &locations, block);
+                continue;
+            }
+            if indexed_loads.contains_key(&inst) {
                 continue;
             }
             let Some(sig_ref) = dfg.call_signature(inst) else {
@@ -989,6 +1003,35 @@ impl Lower<'_> {
         let args = dfg.inst_args(inst);
         let result = dfg.inst_results(inst).first().copied();
         let result_ty = result.map(|result| self.ty(result));
+        if let Some(format) = self.selection.indexed_load(inst) {
+            use crate::jit::semantic::MemoryFormat;
+            let op = match format {
+                MemoryFormat::U8 | MemoryFormat::I8 => Mem::Ldrb,
+                MemoryFormat::U16 | MemoryFormat::I16 => Mem::Ldrh,
+                MemoryFormat::U32 | MemoryFormat::I32 => Mem::LdrW,
+                MemoryFormat::F32 => Mem::LdrS,
+                MemoryFormat::F64 => Mem::LdrD,
+            };
+            let result = result.unwrap();
+            let scratch = if matches!(op, Mem::LdrS | Mem::LdrD) {
+                F0
+            } else {
+                T0
+            };
+            let d = self.def_reg(result, scratch);
+            let base = self.use_reg(args[0], T1);
+            let index = self.use_reg(args[1], T2);
+            self.asm.emit(e::mem_indexed(
+                op,
+                d,
+                base,
+                index,
+                Index::Lsl,
+                format.bytes() != 1,
+            ));
+            self.commit(result, d);
+            return Ok(());
+        }
         match (opcode, data) {
             (Opcode::Iconst | Opcode::F64const | Opcode::F32const, _) => {
                 let result = result.unwrap();
@@ -1445,5 +1488,112 @@ impl Lower<'_> {
             _ => return Err(Unsupported(format!("opcode {opcode}"))),
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod indexed_load_tests {
+    use super::*;
+    use crate::jit::semantic::MemoryFormat;
+    use cranelift_codegen::ir::{AbiParam, ExtFuncData, ExternalName, InstBuilder, Signature};
+    use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+
+    #[test]
+    fn marked_loads_select_indexed_instructions() {
+        for (format, ty, op) in [
+            (MemoryFormat::U8, types::I8, Mem::Ldrb),
+            (MemoryFormat::I8, types::I8, Mem::Ldrb),
+            (MemoryFormat::U16, types::I16, Mem::Ldrh),
+            (MemoryFormat::I16, types::I16, Mem::Ldrh),
+            (MemoryFormat::U32, types::I32, Mem::LdrW),
+            (MemoryFormat::I32, types::I32, Mem::LdrW),
+            (MemoryFormat::F32, types::F32, Mem::LdrS),
+            (MemoryFormat::F64, types::F64, Mem::LdrD),
+        ] {
+            let mut function = Function::new();
+            function.signature = Signature::new(CallConv::AppleAarch64);
+            function
+                .signature
+                .params
+                .extend([AbiParam::new(types::I64), AbiParam::new(types::I64)]);
+            function.signature.returns.push(AbiParam::new(ty));
+            let mut context = FunctionBuilderContext::new();
+            let mut builder = FunctionBuilder::new(&mut function, &mut context);
+            let block = builder.create_block();
+            builder.append_block_params_for_function_params(block);
+            builder.switch_to_block(block);
+            let args = builder.block_params(block).to_vec();
+            let mut signature = Signature::new(CallConv::AppleAarch64);
+            signature
+                .params
+                .extend([AbiParam::new(types::I64), AbiParam::new(types::I64)]);
+            signature.returns.push(AbiParam::new(ty));
+            let signature = builder.import_signature(signature);
+            let marker = builder.import_function(ExtFuncData {
+                name: ExternalName::testcase("semantic_indexed_load"),
+                signature,
+                colocated: false,
+                patchable: false,
+            });
+            let call = builder.ins().call(marker, &args);
+            let value = builder.inst_results(call)[0];
+            builder.ins().return_(&[value]);
+            builder.seal_all_blocks();
+            drop(builder);
+            let machine = lower(&function, &[(call, format)].into_iter().collect()).unwrap();
+            let expected = e::mem_indexed(op, 0, 0, 0, Index::Lsl, format.bytes() != 1);
+            assert!(
+                machine.bytes.chunks_exact(4).any(|bytes| {
+                    let word = u32::from_le_bytes(bytes.try_into().unwrap());
+                    word & 0xffe0fc00 == expected & 0xffe0fc00
+                }),
+                "missing {format:?} indexed load"
+            );
+            assert!(machine.relocs.is_empty());
+            #[cfg(target_arch = "aarch64")]
+            {
+                use cranelift_jit::{JITBuilder, JITModule};
+                use cranelift_module::{Linkage, Module, default_libcall_names};
+
+                let mut module = JITModule::new(JITBuilder::new(default_libcall_names()).unwrap());
+                let id = module
+                    .declare_function("indexed_load_test", Linkage::Local, &function.signature)
+                    .unwrap();
+                machine.define(&mut module, id).unwrap();
+                module.finalize_definitions().unwrap();
+                let entry = module.get_finalized_function(id);
+                let storage = [0x400000003f800000u64, 0x3ff0000000000000u64];
+                let ptr = storage.as_ptr().cast::<u8>();
+                unsafe {
+                    match format {
+                        MemoryFormat::U8 | MemoryFormat::I8 => {
+                            let load: extern "C" fn(*const u8, u64) -> u8 =
+                                std::mem::transmute(entry);
+                            assert_eq!(load(ptr, 2), *ptr.add(2));
+                        }
+                        MemoryFormat::U16 | MemoryFormat::I16 => {
+                            let load: extern "C" fn(*const u8, u64) -> u16 =
+                                std::mem::transmute(entry);
+                            assert_eq!(load(ptr, 1), *(ptr.add(2).cast::<u16>()));
+                        }
+                        MemoryFormat::U32 | MemoryFormat::I32 => {
+                            let load: extern "C" fn(*const u8, u64) -> u32 =
+                                std::mem::transmute(entry);
+                            assert_eq!(load(ptr, 1), *(ptr.add(4).cast::<u32>()));
+                        }
+                        MemoryFormat::F32 => {
+                            let load: extern "C" fn(*const u8, u64) -> f32 =
+                                std::mem::transmute(entry);
+                            assert_eq!(load(ptr, 0).to_bits(), 0x3f800000);
+                        }
+                        MemoryFormat::F64 => {
+                            let load: extern "C" fn(*const u8, u64) -> f64 =
+                                std::mem::transmute(entry);
+                            assert_eq!(load(ptr, 1).to_bits(), storage[1]);
+                        }
+                    }
+                }
+            }
+        }
     }
 }

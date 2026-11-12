@@ -15,6 +15,12 @@ pub(super) enum Repr {
     Int32,
     Int64,
     Bool,
+    Pointer,
+    RawI8,
+    RawI16,
+    RawI32,
+    RawF32,
+    RawF64,
 }
 
 impl Repr {
@@ -39,7 +45,12 @@ impl Repr {
             Self::Boxed | Self::Int64 => types::I64,
             Self::Float => types::F64,
             Self::Int32 => types::I32,
-            Self::Bool => types::I8,
+            Self::Bool | Self::RawI8 => types::I8,
+            Self::Pointer => types::I64,
+            Self::RawI16 => types::I16,
+            Self::RawI32 => types::I32,
+            Self::RawF32 => types::F32,
+            Self::RawF64 => types::F64,
         }
     }
 }
@@ -75,7 +86,14 @@ impl FunctionCompiler<'_, '_> {
             Repr::Int32 => Some(i64::from(number as i32)),
             Repr::Int64 => Some(number as i64),
             Repr::Float => None,
-            Repr::Boxed | Repr::Bool => return None,
+            Repr::Boxed
+            | Repr::Bool
+            | Repr::Pointer
+            | Repr::RawI8
+            | Repr::RawI16
+            | Repr::RawI32
+            | Repr::RawF32
+            | Repr::RawF64 => return None,
         };
         Some(match (integer, to) {
             (Some(integer), Repr::Int64) => self.b.ins().iconst(types::I64, integer),

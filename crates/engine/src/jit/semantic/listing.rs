@@ -379,6 +379,10 @@ impl Graph {
             Op::GuardValid(guard) => format!("guard_valid {guard}"),
             Op::GuardCommit(guard) => format!("guard_commit {guard}"),
             Op::View(value) => format!("view {value}"),
+            Op::TypedData(value) => format!("typed_data {value}"),
+            Op::Memory(op) => format!("memory {op:?}"),
+            Op::MemoryNumber(value, format) => format!("memory_number {value} {format:?}"),
+            Op::KeepAlive(value) => format!("keep_alive {value}"),
             Op::IsTyped(value, None) => format!("is_typed {value}"),
             Op::IsTyped(value, Some(element)) => format!("is_typed {value}, {element:?}"),
             Op::TypedIndex(object, key, read) => {

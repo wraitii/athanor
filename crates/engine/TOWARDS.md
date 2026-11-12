@@ -18,15 +18,19 @@ Regions make the scope of reasoning explicit. They record entry guarantees, effe
 
 A guarantee applies only where every incoming execution path establishes it and execution has not invalidated it. Entry guards establish facts on their successful edges; guard failures and fallback paths do not inherit those facts. Exceptional exits and joins need their own valid incoming facts. Facts about immutable SSA values can survive effects that invalidate facts about mutable storage. Region membership alone is never sufficient evidence for a guarantee.
 
-The design is data-oriented: indexed entities, associated data and systems that analyze or transform it. Typical operations and generic graph algorithms form a common core. Frontend, runtime and target extensions provide additional operation families, contracts and rules. JS coercion semantics, this engine's NaN boxing and a target's register constraints belong to different layers, but can participate in the same infrastructure. Extensibility can begin with statically compiled Rust code; it does not require a dynamic plugin system.
+The design is data-oriented: indexed entities, associated data and systems that analyze or transform it. The ECS analogy is a mental model, not a requirement for an ECS implementation or a new framework for declaring pass contracts. An enum of operation families, existing Facts and ordinary pass functions are enough to start. A pass acts on the operations and information it understands; lowering replaces some operations while keeping their replacements in the same graph. Simplification, parameter cleanup and applicable load/motion analyses can then operate on the exposed work. Their applicability still depends on the operations' semantics and on valid analysis data.
+
+There is no universal sequence of operation families that every frontend must traverse. A frontend using our runtime can produce runtime operations; another can produce memory or arithmetic operations directly, without sharing any JS operations. Likewise, a backend can consume a mixture of compound and primitive operations. Further lowering is necessary only for operations that its chosen implementation cannot consume. Enum boundaries organize the data; pass boundaries express concrete transformations.
+
+The common infrastructure uses indexed entities and associated analyses. Typical operations and generic graph algorithms form a common core. Frontend, runtime and target extensions provide additional operation families, contracts and rules. JS coercion semantics, this engine's NaN boxing and a target's register constraints belong to different layers, but can participate in the same infrastructure. Extensibility can begin with statically compiled Rust code; it does not require a dynamic plugin system.
 
 There are two useful kinds of explicit effects. Program operations describe what execution reads, writes or invalidates. Compiler passes describe which graph data they read and change, allowing affected analyses to be invalidated and recomputed. The ECS-like aspect is composing behavior around explicit data access; the Salsa-like aspect is tracking dependencies of derived information. Neither requires making every algorithm a rewrite rule or every mutation a fine-grained incremental query.
 
 Semantic rules establish legal alternatives; target constraints and costs help choose between them. Sharing a computation, hoisting it or choosing a representation should remain revisable when its register pressure becomes apparent. The longer-term ambition is to carry this continuity through scheduling and allocation, progressively adding placement constraints and committing decisions where enough is known. E-graph alternatives and compiled rule matching could support this, but are optional mechanisms rather than the foundation.
 
-Cranelift remains the working backend during migration. The immediate goal is to make more of the emitted program visible and optimizable in our graph. Whether taking ownership of machine lowering and allocation is worthwhile is a later, measurable decision.
+Cranelift and our AArch64 backend currently share CLIF storage for the optimized path. The experimental AArch64 baseline instead consumes the semantic graph directly. The immediate goal is to make more emitted work visible in the graph and let each backend consume the operations it supports, without introducing a parallel semantic operation model at the CLIF boundary.
 
-While Cranelift owns allocation, our graph can use target constraints and pressure estimates before emission, but cannot assume feedback from its allocator or revise choices during allocation. Achieving that part of the end-state requires an additional backend interface or ownership of those later decisions.
+On the Cranelift path, our graph can use target constraints and pressure estimates before emission, but cannot assume feedback from its allocator or revise choices during allocation. The native path owns allocation, although its current CLIF input still separates those decisions from the semantic graph.
 
 **Examples of the intended benefits**
 
@@ -62,7 +66,7 @@ needed it. The retained refactor gives existing regions identities, block sets
 and fallback links. It does not establish a region hierarchy or persistent
 proofs, and does not complete the stages below.
 
-Treat these stages as architectural options, not a prerequisite checklist.
+Treat these stages as architectural options, not a prerequisite checklist. In particular, the explicit pass contracts and dependency framework outlined below are optional future mechanisms, not requirements for the current operation-family migration. Ordinary pass ordering and existing analysis invalidation are sufficient for its first slices.
 Experiments should start with a concrete optimization interaction, identify
 which proof or effect information is lost, and introduce only the representation
 needed to improve that example. Shape specialization and hoisting remain one
@@ -137,7 +141,9 @@ The intended distinction is between an operation's semantics and its implementat
 
 This also makes baseline and optimized compilation policies of the same compiler. A baseline policy can select general call implementations and perform only the lowering needed to emit executable code. An optimized policy can spend more time establishing assumptions, expanding operations, inlining callbacks and choosing specialized implementations. Both share operation semantics, correctness contracts and lowering machinery; feedback changes the available facts and the budget for exploiting them. Every policy must still discharge the guards, ownership and error-handling obligations of the implementations it selects.
 
-The current tiers already share substantial machinery. The intended architecture makes that continuity more explicit rather than introducing a separate semantic implementation for each tier. It does not by itself make baseline code generation cheap: Cranelift's allocation and emission costs remain, and a cheaper terminal lowering path would be a separate implementation choice.
+The experimental [AArch64 baseline](src/jit/aarch64/baseline.rs) already implements a cheaper terminal path: it consumes Graph directly, uses boxed stack slots and runtime helpers, and emits machine code without CLIF construction or general register allocation. It demonstrates that higher-level operations can be valid backend input. Its implementation selection, ownership bookkeeping and target emission remain fused; extracting shared lowering must not force baseline through expensive expansion or analysis that it does not need.
+
+[Generator suspension lowering](src/jit/semantic/suspension.rs) provides an existing graph-to-graph example. It turns yields into resume-region graphs with explicit saved values and binding restoration. Those ordinary graphs can use either baseline or CLIF emission. The transformation changes what the backend must implement while retaining the graph vocabulary and infrastructure.
 
 Retain a statically defined operation vocabulary initially. No plugin loader or dynamic ECS is necessary.
 
@@ -171,10 +177,13 @@ proven numeric keys into position conversion, exactness and bounds checks,
 a bounded read, and an undefined result on failure. Existing region membership
 is extended to the generated blocks. Load reuse can share position conversion
 and exactness checks for the same SSA key; each receiver keeps its own bounds
-check. This runs after hoisting and before view placement. Bounded reads remain
-runtime operations, and boxing, storage addressing and scalar loads remain in
-the emitter. This does not establish persistent guard proofs or complete this
-stage.
+check. This runs after hoisting and before view placement. A subsequent late
+lowering now exposes storage extraction, runtime-agnostic indexed loads and
+numeric result conversions in the graph. The native backend retains indexed
+loads; a separate graph expansion supplies addresses and scalar loads for
+Cranelift. Raw values currently stay within their block, and a keepalive protects
+the runtime receiver. This does not establish persistent guard proofs or complete
+this stage.
 
 The next small interaction exposes strict undefined comparisons as the existing
 `IsUndefined` predicate. Fact analysis carries its edge restrictions through
@@ -196,11 +205,13 @@ JS operation
   → CLIF
 ```
 
-Allow these operation levels to coexist. Keep Cranelift as the backend, with emission becoming mechanical for the migrated subset. Other operations continue through the existing emitter.
+Allow these operation families to coexist. The indexed-load slice lowers the runtime-specific `TypedIndex` into explicit storage extraction and a runtime-agnostic indexed load, with numeric conversions separate. The load takes a base pointer, integer element index and scalar format; the producing lowering establishes access validity and storage lifetime. It does not know typed-array headers or JS indexing semantics.
+
+The AArch64 backend consumes this indexed load directly. The Cranelift path expands it into address arithmetic and a scalar load. Both forms belong to the same operation vocabulary, and another frontend can produce the memory operation without using our runtime. Baseline can retain its direct higher-level implementation. This is a bounded migration of emission decisions into graph passes, not a requirement to rewrite every emitter at once.
 
 Run existing simplification and applicable load/motion passes after lowering. Preserve region identities where they remain meaningful, and update or invalidate their summaries.
 
-**Result:** a concrete test of whether the architecture improves optimization visibility and code quality before undertaking backend work.
+**Result:** a concrete test of shared graph lowering with different backend operation sets.
 
 **6. Expand progressive lowering**
 
@@ -217,11 +228,11 @@ Use the same operation storage rather than nesting generated instructions under 
 
 **Result:** the graph increasingly represents the actual program delivered to Cranelift, including its costs and lifetime pressure.
 
-**7. Add target feedback before replacing the backend**
+**7. Extend target feedback**
 
 Introduce register classes, fixed-register constraints, rematerialization candidates and pressure estimates where useful. Use those to inform hoisting, sharing and representation choices.
 
-Then evaluate whether Cranelift remains sufficient. A custom machine lowering/allocation path should be a separate decision supported by evidence, not a prerequisite for the architectural migration.
+The AArch64 backend already owns machine lowering and allocation. Extend its connection to graph decisions only where measurements justify it, while preserving the Cranelift path. Shared graph lowering should not depend on completing that deeper integration.
 
 Likewise, compiled rule dispatch, e-graph alternatives and fine-grained incremental queries can come later. None is required to establish the model.
 

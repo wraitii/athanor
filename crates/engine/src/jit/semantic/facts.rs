@@ -9,7 +9,9 @@ use super::access::Access;
 use super::available;
 use super::fresh::Fresh;
 use super::guards;
-use super::{Block, Cfg, Constant, Graph, Inst, Op, TerminatorKind, UnaryOp, Value};
+use super::{
+    Block, Cfg, Constant, Graph, Inst, MemoryFormat, MemoryOp, Op, TerminatorKind, UnaryOp, Value,
+};
 use crate::heap::TypedKind;
 use cranelift_module::FuncId;
 
@@ -29,6 +31,8 @@ impl Types {
     pub(in crate::jit) const OTHER: Self = Self(128);
     pub(in crate::jit) const UNINITIALIZED: Self = Self(256);
     pub(in crate::jit) const PACK: Self = Self(1024);
+    pub(in crate::jit) const POINTER: Self = Self(4096);
+    pub(in crate::jit) const RAW: Self = Self(8192);
     pub(in crate::jit) const VIEW: Self = Self(512);
     pub(in crate::jit) const NUMBER: Self = Self(1 | 2 | 2048);
     pub(in crate::jit) const PRIMITIVE: Self = Self(1 | 2 | 4 | 8 | 16 | 32 | 2048);
@@ -81,6 +85,8 @@ impl fmt::Display for Types {
             (Self::OTHER, "other"),
             (Self::UNINITIALIZED, "uninit"),
             (Self::VIEW, "view"),
+            (Self::POINTER, "pointer"),
+            (Self::RAW, "raw"),
             (Self::PACK, "pack"),
         ] {
             if self.intersects(types) {
@@ -756,6 +762,13 @@ fn result_types(graph: &Graph, op: &Op, facts: &Facts) -> Types {
         | Op::ShapedGet(..)
         | Op::FillPropertyCache(..) => Types::ALL,
         Op::View(_) => Types::VIEW,
+        Op::TypedData(_) | Op::Memory(MemoryOp::Address { .. }) => Types::POINTER,
+        Op::Memory(MemoryOp::IndexedLoad { .. } | MemoryOp::Load { .. }) => Types::RAW,
+        Op::MemoryNumber(_, format) => match format {
+            MemoryFormat::U32 | MemoryFormat::F32 | MemoryFormat::F64 => Types::NUMBER,
+            _ => Types::INT32,
+        },
+        Op::KeepAlive(_) => Types::default(),
         Op::TypedIndex(.., read) if read.bounded => match read.element {
             Some(TypedKind::Float32 | TypedKind::Float64 | TypedKind::Uint32) | None => {
                 Types::NUMBER

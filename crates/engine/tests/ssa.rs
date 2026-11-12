@@ -1043,3 +1043,55 @@ fn native_bitwise_lowering_preserves_numeric_and_primitive_coercions() {
         );
     }
 }
+
+#[test]
+fn typed_indexed_loads_preserve_scalar_formats_and_bounds() {
+    let cases = [
+        ("Uint8Array", "255", "255"),
+        ("Uint16Array", "65535", "65535"),
+        ("Uint32Array", "4294967295", "4294967295"),
+        ("Int8Array", "-128", "-128"),
+        ("Int16Array", "-32768", "-32768"),
+        ("Int32Array", "-2147483648", "-2147483648"),
+        ("Float32Array", "-0", "-0"),
+        ("Float64Array", "-0", "-0"),
+        ("Float32Array", "NaN", "NaN"),
+    ];
+    let mut backends = vec![js_engine::Backend::Cranelift];
+    if cfg!(target_arch = "aarch64") {
+        backends.push(js_engine::Backend::NativeOnly);
+    }
+    for backend in backends {
+        for (kind, value, expected) in cases {
+            let source = format!(
+                r#"
+                function read(a, k) {{ return a[k]; }}
+                function make() {{ const a = new {kind}(1); a[0] = {value}; return a; }}
+                function main() {{
+                    let result;
+                    for (let i = 0; i < 200; ++i) result = read(make(), 0);
+                    const expected = {expected};
+                    return (result === expected || (result !== result && expected !== expected)) &&
+                        (expected !== 0 || 1 / result === 1 / expected) &&
+                        read(make(), -1) === undefined && read(make(), 0.5) === undefined &&
+                        read(make(), 1) === undefined;
+                }}
+            "#
+            );
+            let mut engine = Engine::with_options(EngineOptions {
+                backend,
+                background_compile: false,
+                ..Default::default()
+            })
+            .unwrap();
+            engine.compile(&source, "typed-load-formats.js").unwrap();
+            for _ in 0..4 {
+                assert_eq!(
+                    engine.call("main", &[]).unwrap().value(),
+                    Value::TRUE,
+                    "{backend:?} {kind} {value}"
+                );
+            }
+        }
+    }
+}

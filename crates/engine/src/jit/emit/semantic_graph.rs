@@ -10,8 +10,8 @@ use crate::error::Error;
 use crate::heap::kind;
 use crate::jit::helpers::Helper;
 use crate::jit::semantic::{
-    Constant, Facts, Graph, Op, ScopeKind, TerminatorKind, TypedRead, Types, UnaryOp,
-    Value as GraphValue,
+    Constant, Facts, Graph, MemoryFormat, MemoryOp, Op, ScopeKind, TerminatorKind, TypedRead,
+    Types, UnaryOp, Value as GraphValue,
 };
 use crate::value::{TAG_SHIFT, TAG_STRING, Value};
 
@@ -210,7 +210,23 @@ impl FunctionCompiler<'_, '_> {
             .collect();
         let mut reprs: SecondaryMap<GraphValue, Repr> = SecondaryMap::with_default(Repr::Boxed);
         for value in graph.values.keys() {
-            reprs[value] = if matches!(graph.defining_op(value), Some(Op::SaturatingInteger(_))) {
+            reprs[value] = if matches!(
+                graph.defining_op(value),
+                Some(Op::TypedData(_) | Op::Memory(MemoryOp::Address { .. }))
+            ) {
+                Repr::Pointer
+            } else if let Some(Op::Memory(
+                MemoryOp::IndexedLoad { format, .. } | MemoryOp::Load { format, .. },
+            )) = graph.defining_op(value)
+            {
+                match format {
+                    MemoryFormat::U8 | MemoryFormat::I8 => Repr::RawI8,
+                    MemoryFormat::U16 | MemoryFormat::I16 => Repr::RawI16,
+                    MemoryFormat::U32 | MemoryFormat::I32 => Repr::RawI32,
+                    MemoryFormat::F32 => Repr::RawF32,
+                    MemoryFormat::F64 => Repr::RawF64,
+                }
+            } else if matches!(graph.defining_op(value), Some(Op::SaturatingInteger(_))) {
                 Repr::Int64
             } else {
                 Repr::of(facts.of(value))
@@ -1098,6 +1114,10 @@ impl FunctionCompiler<'_, '_> {
                             );
                             None
                         }
+                        Op::TypedData(..)
+                        | Op::Memory(..)
+                        | Op::MemoryNumber(..)
+                        | Op::KeepAlive(..) => unreachable!(),
                         Op::View(object) => {
                             let object = get(self, *object);
                             Some(self.view(object))
@@ -1823,6 +1843,81 @@ impl FunctionCompiler<'_, '_> {
                 let float = self.convert(operand, Repr::Float);
                 Some(Some(Operand::new(self.b.ins().fneg(float), Repr::Float)))
             }
+            Op::TypedData(view) => {
+                let view = self.operand(cx, *view).value;
+                let data = self.b.ins().load(
+                    self.pointer,
+                    MemFlagsData::trusted(),
+                    view,
+                    crate::heap::DATA_OFFSET,
+                );
+                Some(Some(Operand::new(data, Repr::Pointer)))
+            }
+            Op::Memory(MemoryOp::Address {
+                base,
+                index,
+                format,
+            }) => {
+                let base = self.operand(cx, *base).value;
+                let index = self.operand(cx, *index).value;
+                let offset = self.b.ins().imul_imm_s(index, format.bytes() as i64);
+                let address = self.b.ins().iadd(base, offset);
+                Some(Some(Operand::new(address, Repr::Pointer)))
+            }
+            Op::Memory(MemoryOp::Load { address, .. }) => {
+                let address = self.operand(cx, *address).value;
+                let repr = target.unwrap();
+                let value = self
+                    .b
+                    .ins()
+                    .load(repr.clif(), MemFlagsData::trusted(), address, 0);
+                Some(Some(Operand::new(value, repr)))
+            }
+            Op::Memory(MemoryOp::IndexedLoad {
+                base,
+                index,
+                format,
+            }) => {
+                use cranelift_codegen::ir::{AbiParam, Signature};
+                let base = self.operand(cx, *base).value;
+                let index = self.operand(cx, *index).value;
+                let repr = target.unwrap();
+                let mut signature = Signature::new(self.module.target_config().default_call_conv);
+                signature
+                    .params
+                    .extend([AbiParam::new(self.pointer), AbiParam::new(types::I64)]);
+                signature.returns.push(AbiParam::new(repr.clif()));
+                let signature = self.b.import_signature(signature);
+                let marker = self.b.import_function(cranelift_codegen::ir::ExtFuncData {
+                    name: cranelift_codegen::ir::ExternalName::testcase("semantic_indexed_load"),
+                    signature,
+                    colocated: false,
+                    patchable: false,
+                });
+                let call = self.b.ins().call(marker, &[base, index]);
+                self.annotations.indexed_loads.insert(call, *format);
+                let value = self.b.inst_results(call)[0];
+                Some(Some(Operand::new(value, repr)))
+            }
+            Op::MemoryNumber(value, format) => {
+                let raw = self.operand(cx, *value).value;
+                let (value, repr) = match format {
+                    MemoryFormat::U8 | MemoryFormat::U16 => {
+                        (self.b.ins().uextend(types::I32, raw), Repr::Int32)
+                    }
+                    MemoryFormat::I8 | MemoryFormat::I16 => {
+                        (self.b.ins().sextend(types::I32, raw), Repr::Int32)
+                    }
+                    MemoryFormat::I32 => (raw, Repr::Int32),
+                    MemoryFormat::U32 => {
+                        (self.b.ins().fcvt_from_uint(types::F64, raw), Repr::Float)
+                    }
+                    MemoryFormat::F32 => (self.b.ins().fpromote(types::F64, raw), Repr::Float),
+                    MemoryFormat::F64 => (raw, Repr::Float),
+                };
+                Some(Some(Operand::new(value, repr)))
+            }
+            Op::KeepAlive(_) => Some(None),
             Op::NumericFloat(value) => {
                 let operand = self.operand(cx, *value);
                 Some(Some(Operand::new(

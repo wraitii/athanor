@@ -2102,3 +2102,70 @@ fn continuation_exit_stubs_preserve_cold_paths() {
         }
     }
 }
+
+#[test]
+fn typed_loads_lower_to_explicit_memory_operations() {
+    use crate::heap::TypedKind;
+    for (kind, format) in [
+        (TypedKind::Uint8, MemoryFormat::U8),
+        (TypedKind::Uint16, MemoryFormat::U16),
+        (TypedKind::Uint32, MemoryFormat::U32),
+        (TypedKind::Int8, MemoryFormat::I8),
+        (TypedKind::Int16, MemoryFormat::I16),
+        (TypedKind::Int32, MemoryFormat::I32),
+        (TypedKind::Float32, MemoryFormat::F32),
+        (TypedKind::Float64, MemoryFormat::F64),
+    ] {
+        let mut graph =
+            canonicalize_graph(lower_source("function f(a,k){return a[k];}").unwrap(), true)
+                .unwrap()
+                .graph;
+        let inst = graph
+            .insts
+            .iter()
+            .find_map(|(inst, data)| matches!(data.op, Op::GetIndex(..)).then_some(inst))
+            .unwrap();
+        let Op::GetIndex(object, key) = graph.insts[inst].op else {
+            unreachable!()
+        };
+        graph.insts[inst].op = Op::TypedIndex(
+            object,
+            key,
+            TypedRead {
+                element: Some(kind),
+                bounded: true,
+            },
+        );
+        let mut function = FunctionState::new(graph, Vec::new(), true);
+        assert!(typed_lowering::lower_memory(&mut function));
+        let graph = function.graph;
+        graph.verify().unwrap();
+        let Op::MemoryNumber(raw, actual) = graph.insts[inst].op else {
+            panic!()
+        };
+        assert_eq!(actual, format);
+        assert!(
+            matches!(graph.defining_op(raw), Some(Op::Memory(MemoryOp::IndexedLoad { format: actual, .. })) if *actual == format)
+        );
+        assert!(
+            graph.blocks[graph.insts[inst].block]
+                .insts
+                .iter()
+                .any(|&i| matches!(graph.insts[i].op, Op::KeepAlive(value) if value == object))
+        );
+        let mut fallback = graph.clone();
+        lower_memory_for_cranelift(&mut fallback);
+        fallback.verify().unwrap();
+        assert!(
+            matches!(fallback.defining_op(raw), Some(Op::Memory(MemoryOp::Load { format: actual, .. })) if *actual == format)
+        );
+        assert!(matches!(
+            graph.defining_op(raw),
+            Some(Op::Memory(MemoryOp::IndexedLoad { .. }))
+        ));
+        let mut invalid = graph.clone();
+        let block = invalid.def_block(raw);
+        invalid.blocks[block].terminator.as_mut().unwrap().kind = TerminatorKind::Return(raw);
+        assert!(invalid.verify().is_err());
+    }
+}

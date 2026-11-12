@@ -82,9 +82,31 @@ Oxc AST -> semantic optimization -> typed CLIF + annotations
 ```
 
 `jit/clif.rs` pairs a CLIF `Function` with emission annotations for helper calls,
-invocation roots and frame stores. Annotations refer to that exact body and are
-consumed before Cranelift rewrites it. Source locations remain available
+invocation roots, frame stores and retained indexed loads. Annotations refer to
+that exact body and are consumed before Cranelift rewrites it. Source locations remain available
 separately for profiling.
+
+Known-kind bounded typed reads receive a final graph lowering after OSR
+preparation, followed by refreshed facts and borrow analysis. Reusable OSR
+graphs retain the earlier runtime operations. Runtime storage extraction
+(`TypedData`) produces a pointer, then
+`Op::Memory(MemoryOp::IndexedLoad)` reads a scalar at an integer element index.
+`MemoryNumber` expresses extension or floating-point conversion separately;
+`KeepAlive` keeps the receiver live through the access. Pointer and raw scalar
+facts are distinct from JS values. This first slice keeps raw values within a
+block, with verifier checks on their consumers; it does not yet support raw
+block parameters or moving these accesses across effects.
+
+AArch64 consumes the indexed load directly. Because its allocator still uses
+CLIF storage, emission carries the load in a named, annotated call instruction
+with real base/index operands. Native selection implements that marker as a
+load, and ABI/liveness analysis excludes it from calls. It is never an executable
+call. The Cranelift path clones the graph and expands indexed loads into address
+operations and scalar loads before emission. When native fallback is enabled,
+functions containing indexed loads currently prepare both emitted forms;
+native-only compilation prepares only the retained form. This deliberately favors a simple
+transition over minimizing fallback preparation cost. The baseline path keeps
+its existing direct implementation.
 
 Helpers listed by `Helper::returns_reference` return heap results with a
 reference the generated code owns; inline fast paths take the same reference by
@@ -1132,7 +1154,7 @@ and optimized normally; the shared CLIF optimization passes also apply.
 Oxc AST -> build -> promote -> simplify -> canonical graph
         -> plan specialization -> inline -> simplify -> plan regions -> version
         -> reuse loads -> hoist -> coercions and bit tests -> reuse loads -> hoist
-        -> views -> simplify -> borrow
+        -> views -> simplify -> numeric lowering -> memory lowering -> borrow
 ```
 
 Canonicalization, planning and optimization operate on the same `FunctionState`,

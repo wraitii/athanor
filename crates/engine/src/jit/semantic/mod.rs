@@ -16,6 +16,8 @@ mod guards;
 mod inlining;
 mod js;
 mod listing;
+mod memory_lowering;
+pub(in crate::jit) use memory_lowering::lower_memory_for_cranelift;
 mod numeric_lowering;
 mod observations;
 mod optimize;
@@ -26,6 +28,7 @@ pub(super) mod specialize;
 mod string_split;
 pub(in crate::jit) mod suspension;
 mod transforms;
+pub(in crate::jit) use transforms::canonicalize_parameters;
 mod typed_lowering;
 
 use std::collections::{HashMap, HashSet};
@@ -250,6 +253,47 @@ pub(in crate::jit) struct DirectTarget {
     pub(in crate::jit) lexical_this: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(in crate::jit) enum MemoryFormat {
+    U8,
+    U16,
+    U32,
+    I8,
+    I16,
+    I32,
+    F32,
+    F64,
+}
+
+impl MemoryFormat {
+    pub(in crate::jit) fn bytes(self) -> u32 {
+        match self {
+            Self::U8 | Self::I8 => 1,
+            Self::U16 | Self::I16 => 2,
+            Self::U32 | Self::I32 | Self::F32 => 4,
+            Self::F64 => 8,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::jit) enum MemoryOp {
+    IndexedLoad {
+        base: Value,
+        index: Value,
+        format: MemoryFormat,
+    },
+    Address {
+        base: Value,
+        index: Value,
+        format: MemoryFormat,
+    },
+    Load {
+        address: Value,
+        format: MemoryFormat,
+    },
+}
+
 #[derive(Clone, Debug)]
 pub(super) enum Op {
     Observe(Value, super::profile::Observation, super::profile::Site),
@@ -397,6 +441,10 @@ pub(super) enum Op {
     View(Value),
     IsTyped(Value, Option<TypedKind>),
     TypedIndex(Value, Value, TypedRead),
+    TypedData(Value),
+    Memory(MemoryOp),
+    MemoryNumber(Value, MemoryFormat),
+    KeepAlive(Value),
     IsNumber(Value),
     IsInteger(Value),
     AsInteger(Value),
@@ -543,6 +591,10 @@ impl Op {
             | Op::ConstructorPrototype(value)
             | Op::IsCode(value, _)
             | Op::View(value)
+            | Op::TypedData(value)
+            | Op::MemoryNumber(value, _)
+            | Op::KeepAlive(value)
+            | Op::Memory(MemoryOp::Load { address: value, .. })
             | Op::IsArray(value, _)
             | Op::IsTyped(value, _)
             | Op::IsNumber(value)
@@ -559,7 +611,17 @@ impl Op {
             | Op::DefineHidden(object, _, value)
             | Op::ShapedSet(object, _, _, value)
             | Op::Set(object, _, value) => ([Some(*object), Some(*value), None], &[]),
-            Op::MapElement(object, key)
+            Op::Memory(MemoryOp::IndexedLoad {
+                base: object,
+                index: key,
+                ..
+            })
+            | Op::Memory(MemoryOp::Address {
+                base: object,
+                index: key,
+                ..
+            })
+            | Op::MapElement(object, key)
             | Op::IsArrayIteration(object, key, _)
             | Op::GetIndex(object, key)
             | Op::TypedIndex(object, key, _)
@@ -690,6 +752,10 @@ impl Op {
             | Op::ConstructorPrototype(value)
             | Op::IsCode(value, _)
             | Op::View(value)
+            | Op::TypedData(value)
+            | Op::MemoryNumber(value, _)
+            | Op::KeepAlive(value)
+            | Op::Memory(MemoryOp::Load { address: value, .. })
             | Op::IsArray(value, _)
             | Op::IsTyped(value, _)
             | Op::IsNumber(value)
@@ -706,7 +772,17 @@ impl Op {
             | Op::DefineHidden(object, _, value)
             | Op::ShapedSet(object, _, _, value)
             | Op::Set(object, _, value) => ([Some(object), Some(value), None], &mut []),
-            Op::MapElement(object, key)
+            Op::Memory(MemoryOp::IndexedLoad {
+                base: object,
+                index: key,
+                ..
+            })
+            | Op::Memory(MemoryOp::Address {
+                base: object,
+                index: key,
+                ..
+            })
+            | Op::MapElement(object, key)
             | Op::IsArrayIteration(object, key, _)
             | Op::GetIndex(object, key)
             | Op::TypedIndex(object, key, _)
@@ -1383,7 +1459,13 @@ impl Graph {
             Op::ProbeShapeProperty(..) => closed(HEAP_READ | CODE_READ, Borrowed),
             Op::GuardValid(_) => closed(GLOBAL_READ, Unowned),
             Op::GuardCommit(_) => closed(INTERNAL, None),
-            Op::View(_) => closed(HEAP_READ, Unowned),
+            Op::View(_)
+            | Op::TypedData(_)
+            | Op::Memory(MemoryOp::IndexedLoad { .. } | MemoryOp::Load { .. }) => {
+                closed(HEAP_READ, Unowned)
+            }
+            Op::Memory(MemoryOp::Address { .. }) | Op::MemoryNumber(..) => closed(0, Unowned),
+            Op::KeepAlive(_) => closed(INTERNAL, None),
             Op::IsTyped(..) | Op::IsIndexed(_) => closed(0, Unowned),
             Op::IsArrayIndex(..) | Op::IsArray(..) => closed(HEAP_READ, Unowned),
             Op::ArrayPosition(_) => closed(INTERNAL, Unowned),
@@ -1462,6 +1544,14 @@ impl Graph {
             {
                 return Err(format!("{block} returns with open scopes"));
             }
+            for value in terminator.kind.operands() {
+                if matches!(
+                    self.defining_op(value),
+                    Some(Op::TypedData(_) | Op::Memory(_))
+                ) {
+                    return Err(format!("raw value {value} escapes {block}"));
+                }
+            }
             for target in terminator.kind.targets() {
                 if target.args.len() != self.blocks[target.block].params.len() {
                     return Err(format!("{block} passes wrong arity to {}", target.block));
@@ -1527,6 +1617,42 @@ impl Graph {
             for (index, &inst) in data.insts.iter().enumerate() {
                 for value in self.insts[inst].op.operands_iter() {
                     check(value, index)?;
+                    let Some(def) = self.defining_op(value) else {
+                        continue;
+                    };
+                    let raw = matches!(def, Op::TypedData(_) | Op::Memory(_));
+                    if !raw {
+                        continue;
+                    }
+                    if self.def_block(value) != block {
+                        return Err(format!("{value} crosses a block boundary"));
+                    }
+                    let valid = match (&self.insts[inst].op, def) {
+                        (
+                            Op::Memory(
+                                MemoryOp::IndexedLoad { base, .. } | MemoryOp::Address { base, .. },
+                            ),
+                            Op::TypedData(_) | Op::Memory(MemoryOp::Address { .. }),
+                        ) => *base == value,
+                        (
+                            Op::Memory(MemoryOp::Load { address, .. }),
+                            Op::Memory(MemoryOp::Address { .. }),
+                        ) => *address == value,
+                        (
+                            Op::MemoryNumber(input, format),
+                            Op::Memory(
+                                MemoryOp::IndexedLoad { format: source, .. }
+                                | MemoryOp::Load { format: source, .. },
+                            ),
+                        ) => *input == value && format == source,
+                        _ => false,
+                    };
+                    if !valid {
+                        return Err(format!(
+                            "{inst} {:?} has invalid raw operand {value} from {def:?}",
+                            self.insts[inst].op
+                        ));
+                    }
                 }
                 if let Some(&view) = self.views.get(&inst) {
                     check(view, index)?;
@@ -1630,6 +1756,15 @@ impl FunctionState {
 
     fn invalidate_effects(&mut self) {
         self.facts_level = self.facts_level.min(FactsLevel::Values);
+    }
+
+    pub(in crate::jit) fn lower_memory(&mut self) -> Result<()> {
+        if typed_lowering::lower_memory(self) {
+            self.graph.verify()?;
+            self.ensure_facts();
+            borrow::borrows(&mut self.graph, &self.facts, &mut self.notes);
+        }
+        Ok(())
     }
 
     pub(in crate::jit) fn prepare_osr(&mut self, source: usize) -> Result<()> {

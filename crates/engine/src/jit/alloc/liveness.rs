@@ -41,6 +41,7 @@ pub(super) fn compute(
     cold: &SecondaryMap<Block, bool>,
     remat: &SecondaryMap<Value, u32>,
     operands: super::Operands,
+    is_call: &dyn Fn(cranelift_codegen::ir::Inst) -> bool,
 ) -> Result<Liveness, String> {
     let mut header = SecondaryMap::<Block, u32>::new();
     let mut last = SecondaryMap::<Block, u32>::new();
@@ -76,7 +77,7 @@ pub(super) fn compute(
                 }
             }
             let opcode = func.dfg.insts[inst].opcode();
-            if opcode.is_call() && !opcode.is_return() {
+            if opcode.is_call() && !opcode.is_return() && is_call(inst) {
                 calls.push(call_position(index));
             }
             for &result in func.dfg.inst_results(inst) {

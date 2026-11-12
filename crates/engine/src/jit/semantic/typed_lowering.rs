@@ -324,3 +324,68 @@ mod tests {
         }
     }
 }
+
+pub(super) fn lower_memory(function: &mut FunctionState) -> bool {
+    use super::{MemoryFormat, MemoryOp};
+    use crate::heap::TypedKind;
+
+    let graph = &mut function.graph;
+    let mut changed = false;
+    for block in super::Cfg::new(graph).rpo {
+        for inst in graph.blocks[block].insts.clone() {
+            let data = graph.insts[inst].clone();
+            if data.block != block {
+                continue;
+            }
+            let Op::TypedIndex(
+                object,
+                key,
+                TypedRead {
+                    element: Some(element),
+                    bounded: true,
+                },
+            ) = data.op
+            else {
+                continue;
+            };
+            let format = match element {
+                TypedKind::Uint8 => MemoryFormat::U8,
+                TypedKind::Uint16 => MemoryFormat::U16,
+                TypedKind::Uint32 => MemoryFormat::U32,
+                TypedKind::Int8 => MemoryFormat::I8,
+                TypedKind::Int16 => MemoryFormat::I16,
+                TypedKind::Int32 => MemoryFormat::I32,
+                TypedKind::Float32 => MemoryFormat::F32,
+                TypedKind::Float64 => MemoryFormat::F64,
+            };
+            let existing_view = graph.views.remove(&inst);
+            let mut at = graph.blocks[block]
+                .insts
+                .iter()
+                .position(|&i| i == inst)
+                .unwrap();
+            let mut insert = |op| {
+                let (inserted, value) = graph.insert(block, at, data.span, op, true);
+                graph.insts[inserted].source_name = data.source_name;
+                at += 1;
+                value.unwrap()
+            };
+            let view = existing_view.unwrap_or_else(|| insert(Op::View(object)));
+            let base = insert(Op::TypedData(view));
+            let index = insert(Op::ArrayPosition(key));
+            let raw = insert(Op::Memory(MemoryOp::IndexedLoad {
+                base,
+                index,
+                format,
+            }));
+            graph.insts[inst].op = Op::MemoryNumber(raw, format);
+            let (keep, _) = graph.insert(block, at + 1, data.span, Op::KeepAlive(object), false);
+            graph.insts[keep].source_name = data.source_name;
+            changed = true;
+        }
+    }
+    if changed {
+        function.invalidate_values();
+    }
+    changed
+}

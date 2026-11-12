@@ -13,8 +13,14 @@ use super::machine::MachineCode;
 #[derive(Debug)]
 pub(super) struct Unsupported(pub String);
 
-pub(super) fn compile(func: &Function) -> Result<MachineCode, Unsupported> {
-    lower::lower(func)
+pub(super) fn compile(
+    func: &Function,
+    indexed_loads: &rustc_hash::FxHashMap<
+        cranelift_codegen::ir::Inst,
+        super::semantic::MemoryFormat,
+    >,
+) -> Result<MachineCode, Unsupported> {
+    lower::lower(func, indexed_loads)
 }
 
 pub(super) fn compile_baseline(

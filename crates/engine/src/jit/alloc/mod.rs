@@ -315,6 +315,7 @@ pub(crate) fn allocate(
     hints: &[Hint],
     operands: Operands,
     remat: &SecondaryMap<Value, u32>,
+    is_call: &dyn Fn(Inst) -> bool,
 ) -> Result<Allocation, String> {
     let cfg = ControlFlowGraph::with_function(func);
     let domtree = DominatorTree::with_function(func, &cfg);
@@ -323,7 +324,7 @@ pub(crate) fn allocate(
     for block in func.layout.blocks() {
         cold[block] = func.layout.is_cold(block) && Some(block) != entry;
     }
-    let liveness = liveness::compute(func, order, &cfg, &cold, remat, operands)?;
+    let liveness = liveness::compute(func, order, &cfg, &cold, remat, operands, is_call)?;
     let blocks = block_weights(func, &cfg, &domtree, &cold);
     let mut weights = value_weights(func, &blocks, operands);
     for value in func.dfg.values() {

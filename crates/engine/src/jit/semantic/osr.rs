@@ -488,6 +488,56 @@ mod tests {
     }
 
     #[test]
+    fn osr_plan_keeps_typed_reads_before_memory_lowering() {
+        use super::super::{FunctionState, MemoryOp, TypedRead};
+        use crate::heap::TypedKind;
+
+        let mut graph =
+            graph("function f(xs,n){let sum=0;for(let i=0;i<n;++i)sum+=xs[i];return sum;}");
+        let inst = graph
+            .insts
+            .iter()
+            .find_map(|(inst, data)| matches!(data.op, Op::GetIndex(..)).then_some(inst))
+            .unwrap();
+        let Op::GetIndex(object, index) = graph.insts[inst].op else {
+            unreachable!()
+        };
+        graph.insts[inst].op = Op::TypedIndex(
+            object,
+            index,
+            TypedRead {
+                element: Some(TypedKind::Uint16),
+                bounded: true,
+            },
+        );
+        let mut function = FunctionState::from_graph(graph);
+        function.prepare_osr(0).unwrap();
+        function.lower_memory().unwrap();
+        let plan = function.osr.as_ref().unwrap();
+        assert!(
+            plan.graph
+                .insts
+                .values()
+                .any(|data| matches!(data.op, Op::TypedIndex(..)))
+        );
+        assert!(
+            !plan
+                .graph
+                .insts
+                .values()
+                .any(|data| matches!(data.op, Op::Memory(..)))
+        );
+        assert!(
+            function
+                .graph
+                .insts
+                .values()
+                .any(|data| matches!(data.op, Op::Memory(MemoryOp::IndexedLoad { .. })))
+        );
+        plan.extract(0).unwrap().verify().unwrap();
+    }
+
+    #[test]
     fn arithmetic_only_loops_have_no_opportunities() {
         let graph = graph("function f(n){let sum=0;for(let i=0;i<n;++i)sum+=i;return sum;}");
         assert!(Plan::discover(&graph, 0).is_none());
