@@ -29,7 +29,6 @@ pub(super) mod specialize;
 mod string_split;
 pub(in crate::jit) mod suspension;
 mod transforms;
-pub(in crate::jit) use transforms::canonicalize_parameters;
 mod typed_lowering;
 
 use std::collections::{HashMap, HashSet};
@@ -1114,16 +1113,16 @@ impl Cfg {
         let mut visited = vec![false; graph.blocks.len()];
         visited[entry.index()] = true;
         let mut postorder = Vec::new();
-        let mut stack = vec![(entry, 0)];
-        while let Some((block, index)) = stack.pop() {
-            if let Some(next) = graph.successors(block).nth(index) {
-                stack.push((block, index + 1));
+        let mut stack = vec![(entry, graph.successors(entry))];
+        while let Some((block, successors)) = stack.last_mut() {
+            if let Some(next) = successors.next() {
                 if !visited[next.index()] {
                     visited[next.index()] = true;
-                    stack.push((next, 0));
+                    stack.push((next, graph.successors(next)));
                 }
             } else {
-                postorder.push(block);
+                postorder.push(*block);
+                stack.pop();
             }
         }
         let rpo: Vec<Block> = postorder.into_iter().rev().collect();

@@ -4,7 +4,6 @@ use std::collections::VecDeque;
 pub(super) enum Input<T> {
     Parameter(usize),
     Value(T),
-    Varying,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -30,7 +29,6 @@ impl<T: Copy + Eq> State<T> {
     }
 }
 
-// Values identify SSA definitions, not literal constants. Unseeded cycles stay unresolved.
 pub(super) fn solve<T: Copy + Eq>(incoming: &[Vec<Input<T>>]) -> Vec<Option<T>> {
     let mut states = vec![State::Empty; incoming.len()];
     let mut users = vec![Vec::new(); incoming.len()];
@@ -41,9 +39,6 @@ pub(super) fn solve<T: Copy + Eq>(incoming: &[Vec<Input<T>>]) -> Vec<Option<T>> 
                 Input::Parameter(source) => users[source].push(parameter),
                 Input::Value(value) => {
                     states[parameter].merge(State::One(value));
-                }
-                Input::Varying => {
-                    states[parameter].merge(State::Many);
                 }
             }
         }
@@ -70,7 +65,7 @@ pub(super) fn solve<T: Copy + Eq>(incoming: &[Vec<Input<T>>]) -> Vec<Option<T>> 
 
 #[cfg(test)]
 mod tests {
-    use super::Input::{Parameter, Value, Varying};
+    use super::Input::{Parameter, Value};
     use super::solve;
 
     #[test]
@@ -95,9 +90,8 @@ mod tests {
                 vec![Parameter(1), Parameter(3)],
                 vec![Value(2)],
                 vec![Parameter(0), Value(1)],
-                vec![Value(1), Varying],
             ]),
-            vec![None, None, None, Some(2), None, None]
+            vec![None, None, None, Some(2), None]
         );
     }
 }

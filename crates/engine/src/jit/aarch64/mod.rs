@@ -6,15 +6,13 @@ mod encode;
 mod lower;
 mod select;
 
-use cranelift_codegen::ir::Function;
-
 use super::machine::MachineCode;
 
 #[derive(Debug)]
 pub(super) struct Unsupported(pub String);
 
-pub(super) fn compile(func: &Function) -> Result<MachineCode, Unsupported> {
-    lower::lower(func)
+pub(super) fn compile_graph(graph: &super::semantic::Graph) -> Result<MachineCode, Unsupported> {
+    lower::lower(graph)
 }
 
 pub(super) fn compile_baseline(

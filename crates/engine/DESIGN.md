@@ -77,9 +77,9 @@ operands are strings.
 
 ```text
 Oxc AST -> semantic optimization -> runtime lowering into graph operations
-        -> Cranelift memory expansion -> CLIF + annotations
-        -> our phi cleanup, instruction selection and allocation
-        or Cranelift optimization and code generation
+        -> native AArch64 selection, allocation and emission
+        or Cranelift memory expansion -> CLIF + annotations
+           -> Cranelift optimization and code generation
 ```
 
 Shared runtime lowering builds `Op::LowLevel` operations and retained memory
@@ -101,16 +101,16 @@ graphs retain the earlier runtime operations. Runtime storage extraction
 facts are distinct from JS values. This runtime memory pass keeps extracted
 storage accesses within a block, with verifier checks on their consumers.
 The subsequent low-level graph supports scalar block parameters for the
-control flow introduced by runtime lowering.
+control flow introduced by runtime lowering. After resolving its mutable temporaries, runtime
+lowering removes trivial and cyclic forwarding block parameters on the graph,
+while preserving function-entry ABI parameters and unresolved cycles.
 
-Indexed loads survive shared runtime lowering. Their Cranelift-specific
-expansion into address operations and scalar loads runs afterward. At this
-intermediate migration stage, both optimized backends still receive the
-resulting CLIF; the production path no longer transports indexed loads as
-synthetic calls. Switching optimized AArch64 selection and allocation to the
-lowered graph is a separate next step. The baseline path keeps its existing
-direct implementation, and `JITModule` still handles symbols, relocation and
-executable memory.
+Indexed loads survive shared runtime lowering and are selected directly by the
+native AArch64 backend. The Cranelift path expands them into address operations
+and scalar loads, including when native emission falls back. CLIF inspection
+also constructs an expanded view. The baseline path keeps its existing direct
+implementation, and `JITModule` still handles symbols, relocation and executable
+memory.
 
 Helpers listed by `Helper::returns_reference` return heap results with a
 reference the generated code owns; inline fast paths take the same reference by
@@ -1139,15 +1139,15 @@ those paths do not inflate the common getter's register saves and stack frame.
 ## Semantic graph
 
 The compiler lowers supported functions, nested callables, generator resumes,
-and script initializers through `jit/semantic/` before emitting Cranelift IR.
+and script initializers through `jit/semantic/` before shared runtime lowering.
 `--compile` prints the graph actually passed to emission by default, with
 inferred types and semantic-location IDs. `--planner` prints specialization
 plans, available feedback, the region tree and per-region assumptions, and pass
 notes separately. Detailed region snapshots are captured before versioning and
 after replanning each emitted region, only when requested. `jit/inspect.rs` formats
 the function views; `--filter NAME` restricts their output by name substring.
-`--clif` adds dumps before and after backend preparation (our phi cleanup on the
-native path, or Cranelift optimization on its path), and assembly includes
+`--clif` adds Cranelift IR dumps before and after backend preparation; the native
+path constructs this view for inspection. Assembly includes
 byte offsets and semantic-location IDs. The graph verifier checks scope and
 control-flow invariants. Semantic
 optimization is disabled by `JS_JIT_SSA=0`, for graphs with exception handlers and

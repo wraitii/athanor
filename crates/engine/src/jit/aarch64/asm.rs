@@ -8,7 +8,6 @@ pub(super) struct Label(u32);
 enum Fixup {
     Imm26,
     Imm19,
-    Adr,
 }
 
 #[derive(Default)]
@@ -75,12 +74,6 @@ impl Assembler {
         })
     }
 
-    pub(super) fn address(&mut self, word: u32, target: Label) {
-        self.fixups
-            .push((self.words.len() as u32, target, Fixup::Adr));
-        self.emit(word);
-    }
-
     pub(super) fn finish(mut self) -> Result<Vec<u8>, Unsupported> {
         for &(at, target, fixup) in &self.fixups {
             let Some(position) = self.labels[target.0 as usize] else {
@@ -100,14 +93,6 @@ impl Assembler {
                         return Err(Unsupported("conditional branch out of range".into()));
                     }
                     *word |= ((distance as u32) & 0x7_FFFF) << 5;
-                }
-                Fixup::Adr => {
-                    let bytes = distance * 4;
-                    if !(-(1 << 20)..(1 << 20)).contains(&bytes) {
-                        return Err(Unsupported("address out of range".into()));
-                    }
-                    let bytes = bytes as u32;
-                    *word |= ((bytes & 3) << 29) | (((bytes >> 2) & 0x7_FFFF) << 5);
                 }
             }
         }

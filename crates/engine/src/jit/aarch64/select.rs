@@ -1,10 +1,13 @@
 use cranelift_codegen::entity::SecondaryMap;
 use cranelift_codegen::ir::condcodes::{CondCode, IntCC};
-use cranelift_codegen::ir::{Function, Inst, InstructionData, Opcode, Value, ValueDef, types};
+use cranelift_codegen::ir::types;
 
-use super::encode::{self as e, Index, Logical, Width};
-use super::lower::{float_conds, load_op, store_op, width};
-use crate::jit::alloc::{self, RegClass};
+use super::encode::{self as e, Index, Logical, Mem, Width};
+use super::lower::{float_conds, width};
+use crate::jit::alloc::{RegClass, graph as alloc};
+use crate::jit::semantic::{
+    Block, Graph, Inst, MemoryFormat, MemoryOp, Op, TerminatorKind, Value, ValueDef, low_level,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Address {
@@ -20,7 +23,7 @@ pub(super) enum Address {
     },
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub(super) struct Operand {
     pub position: usize,
     pub value: Value,
@@ -37,7 +40,6 @@ pub(super) enum Immediate {
 
 pub(super) struct Binary {
     pub x: Value,
-    pub constant: Value,
     pub immediate: Immediate,
 }
 
@@ -54,17 +56,9 @@ pub(super) struct Comparison {
     pub immediate: Option<CompareImmediate>,
 }
 
-pub(super) struct Selection {
-    address: SecondaryMap<Inst, Option<Address>>,
-    operand: SecondaryMap<Inst, Option<Operand>>,
-    compare: SecondaryMap<Inst, Option<Inst>>,
-    folded: SecondaryMap<Inst, Option<Value>>,
-    skip: SecondaryMap<Inst, bool>,
-}
-
-pub(super) fn signed_constant(func: &Function, value: Value) -> Option<i64> {
-    let bits = alloc::constant(func, value)?;
-    let width = func.dfg.value_type(value).bits();
+pub(super) fn signed_constant(graph: &Graph, value: Value) -> Option<i64> {
+    let bits = alloc::constant(graph, value)?;
+    let width = graph.low_level_types[value]?.bits();
     Some(if width >= 64 {
         bits as i64
     } else {
@@ -72,56 +66,51 @@ pub(super) fn signed_constant(func: &Function, value: Value) -> Option<i64> {
     })
 }
 
-fn immediate(opcode: Opcode, width: Width, constant: i64) -> Option<Immediate> {
-    if matches!(opcode, Opcode::Iadd | Opcode::Isub) {
-        let amount = if opcode == Opcode::Isub {
-            constant.checked_neg()?
-        } else {
-            constant
-        };
-        if let Some((imm, shift)) = e::arith_imm(amount) {
-            return Some(Immediate::Add(imm, shift));
-        }
-        let (imm, shift) = amount.checked_neg().and_then(e::arith_imm)?;
-        return Some(Immediate::Sub(imm, shift));
-    }
-    let op = match opcode {
-        Opcode::Band => Logical::And,
-        Opcode::Bor => Logical::Orr,
-        _ => Logical::Eor,
+pub(super) fn binary(graph: &Graph, inst: Inst) -> Option<Binary> {
+    let Op::LowLevel(low_level::Op::Binary { op, left, right }) = graph.insts[inst].op else {
+        return None;
     };
-    let bits = match width {
-        Width::X => constant as u64,
-        Width::W => constant as u64 & 0xFFFF_FFFF,
-    };
-    e::logical_imm(op, width, 0, 0, bits)?;
-    Some(Immediate::Logical(op, bits))
-}
-
-pub(super) fn binary(func: &Function, inst: Inst) -> Option<Binary> {
-    let opcode = func.dfg.insts[inst].opcode();
-    if !matches!(
-        opcode,
-        Opcode::Iadd | Opcode::Isub | Opcode::Band | Opcode::Bor | Opcode::Bxor
-    ) {
+    use low_level::Binary as B;
+    if !matches!(op, B::Add | B::Subtract | B::And | B::Or | B::Xor) {
         return None;
     }
-    let args = func.dfg.inst_args(inst);
-    let (x, constant, value) = match signed_constant(func, args[1]) {
-        Some(value) => (args[0], args[1], value),
-        None if opcode != Opcode::Isub => (args[1], args[0], signed_constant(func, args[0])?),
+    let (x, value) = match signed_constant(graph, right) {
+        Some(value) => (left, value),
+        None if !matches!(op, B::Subtract) => (right, signed_constant(graph, left)?),
         None => return None,
     };
-    let width = width(func.dfg.value_type(func.dfg.first_result(inst)));
-    Some(Binary {
-        x,
-        constant,
-        immediate: immediate(opcode, width, value)?,
-    })
+    let ty = graph.low_level_types[graph.insts[inst].results[0]]?;
+    let width = width(ty);
+    let immediate = if matches!(op, B::Add | B::Subtract) {
+        let amount = if matches!(op, B::Subtract) {
+            value.checked_neg()?
+        } else {
+            value
+        };
+        if let Some((imm, shift)) = e::arith_imm(amount) {
+            Immediate::Add(imm, shift)
+        } else {
+            let (imm, shift) = amount.checked_neg().and_then(e::arith_imm)?;
+            Immediate::Sub(imm, shift)
+        }
+    } else {
+        let logical = match op {
+            B::And => Logical::And,
+            B::Or => Logical::Orr,
+            _ => Logical::Eor,
+        };
+        let bits = match width {
+            Width::X => value as u64,
+            Width::W => value as u64 & 0xffff_ffff,
+        };
+        e::logical_imm(logical, width, 0, 0, bits)?;
+        Immediate::Logical(logical, bits)
+    };
+    Some(Binary { x, immediate })
 }
 
-pub(super) fn comparison(func: &Function, cond: IntCC, x: Value, y: Value) -> Comparison {
-    let is_constant = |value| alloc::constant(func, value).is_some();
+pub(super) fn comparison(graph: &Graph, cond: IntCC, x: Value, y: Value) -> Comparison {
+    let is_constant = |value| alloc::constant(graph, value).is_some();
     let (cond, x, y) = if is_constant(x) && !is_constant(y) {
         (cond.swap_args(), y, x)
     } else {
@@ -134,9 +123,9 @@ pub(super) fn comparison(func: &Function, cond: IntCC, x: Value, y: Value) -> Co
             | IntCC::SignedGreaterThan
             | IntCC::SignedGreaterThanOrEqual
     );
-    let extended = matches!(func.dfg.value_type(x), types::I8 | types::I16);
-    let unsigned = alloc::constant(func, y).map(|bits| bits as i64);
-    let sign_extended = signed_constant(func, y);
+    let extended = matches!(graph.low_level_types[x], Some(types::I8 | types::I16));
+    let unsigned = alloc::constant(graph, y).map(|bits| bits as i64);
+    let sign_extended = signed_constant(graph, y);
     let negatable = signed || (!extended && matches!(cond, IntCC::Equal | IntCC::NotEqual));
     let immediate = (if signed { sign_extended } else { unsigned })
         .and_then(e::arith_imm)
@@ -156,31 +145,24 @@ pub(super) fn comparison(func: &Function, cond: IntCC, x: Value, y: Value) -> Co
     }
 }
 
-pub(super) fn remat_bits(func: &Function, value: Value) -> Option<u64> {
-    if let Some(bits) = alloc::constant(func, value) {
+pub(super) fn remat_bits(graph: &Graph, value: Value) -> Option<u64> {
+    if let Some(bits) = alloc::constant(graph, value) {
         return Some(bits);
     }
-    let ValueDef::Result(inst, _) = func.dfg.value_def(value) else {
+    let ValueDef::Result(inst, _) = graph.values[value] else {
         return None;
     };
-    match func.dfg.insts[inst] {
-        InstructionData::UnaryIeee64 {
-            opcode: Opcode::F64const,
-            imm,
-        } => Some(imm.bits()),
-        InstructionData::UnaryIeee32 {
-            opcode: Opcode::F32const,
-            imm,
-        } => Some(u64::from(imm.bits())),
+    match graph.insts[inst].op {
+        Op::LowLevel(low_level::Op::Float64(bits)) => Some(bits),
         _ => None,
     }
 }
 
-pub(super) fn remat_cost(func: &Function, value: Value) -> u32 {
-    let Some(bits) = remat_bits(func, value) else {
+pub(super) fn remat_cost(graph: &Graph, value: Value) -> u32 {
+    let Some(bits) = remat_bits(graph, value) else {
         return 0;
     };
-    let class = RegClass::of(func.dfg.value_type(value));
+    let class = graph.low_level_types[value].and_then(RegClass::of);
     if class == Some(RegClass::Float) && (bits == 0 || e::float_imm8(bits).is_some()) {
         return 1;
     }
@@ -192,230 +174,329 @@ pub(super) fn remat_cost(func: &Function, value: Value) -> u32 {
     count
 }
 
-fn defined_by(func: &Function, value: Value, opcode: Opcode) -> Option<Inst> {
-    let ValueDef::Result(inst, 0) = func.dfg.value_def(value) else {
-        return None;
-    };
-    (func.dfg.insts[inst].opcode() == opcode).then_some(inst)
-}
-
-fn extension(func: &Function, value: Value) -> Option<(Value, Index)> {
-    for (opcode, kind) in [
-        (Opcode::Uextend, Index::Uxtw),
-        (Opcode::Sextend, Index::Sxtw),
-    ] {
-        if let Some(inst) = defined_by(func, value, opcode) {
-            let arg = func.dfg.inst_args(inst)[0];
-            if func.dfg.value_type(arg) == types::I32 {
-                return Some((arg, kind));
-            }
-        }
-    }
-    None
-}
-
-fn shift_amount(func: &Function, value: Value) -> Option<(Value, u32)> {
-    let inst = defined_by(func, value, Opcode::Ishl)?;
-    let args = func.dfg.inst_args(inst);
-    let bits = func.dfg.value_type(value).bits();
-    let amount = alloc::constant(func, args[1])? as u32 & (bits - 1);
-    Some((args[0], amount))
-}
-
-fn index(func: &Function, value: Value, size: u32) -> (Value, Index, bool) {
-    if size > 1
-        && let Some((shifted, amount)) = shift_amount(func, value)
-        && amount == size.trailing_zeros()
-    {
-        let (leaf, kind) = extension(func, shifted).unwrap_or((shifted, Index::Lsl));
-        return (leaf, kind, true);
-    }
-    let (leaf, kind) = extension(func, value).unwrap_or((value, Index::Lsl));
-    (leaf, kind, false)
-}
-
-fn address(func: &Function, value: Value, offset: i64, size: u32) -> Option<Address> {
-    let inst = defined_by(func, value, Opcode::Iadd)?;
-    if func.dfg.value_type(value) != types::I64 {
-        return None;
-    }
-    let [a, b] = [func.dfg.inst_args(inst)[0], func.dfg.inst_args(inst)[1]];
-    if let Some(constant) = alloc::constant(func, b) {
-        return Some(Address::Offset {
-            base: a,
-            offset: offset.wrapping_add(constant as i64),
-        });
-    }
-    if let Some(constant) = alloc::constant(func, a) {
-        return Some(Address::Offset {
-            base: b,
-            offset: offset.wrapping_add(constant as i64),
-        });
-    }
-    if offset != 0 {
-        return None;
-    }
-    let composite = |v: Value| shift_amount(func, v).is_some() || extension(func, v).is_some();
-    let (base, index_value) = if !composite(b) && composite(a) {
-        (b, a)
-    } else {
-        (a, b)
-    };
-    let (index, kind, scaled) = index(func, index_value, size);
-    Some(Address::Indexed {
+pub(super) fn indexed_load(graph: &Graph, inst: Inst) -> Option<(Address, Mem)> {
+    let Op::Memory(MemoryOp::IndexedLoad {
         base,
         index,
-        kind,
-        scaled,
-    })
+        format,
+    }) = graph.insts[inst].op
+    else {
+        return None;
+    };
+    let mem = match format {
+        MemoryFormat::U8 | MemoryFormat::I8 => Mem::Ldrb,
+        MemoryFormat::U16 | MemoryFormat::I16 => Mem::Ldrh,
+        MemoryFormat::U32 | MemoryFormat::I32 => Mem::LdrW,
+        MemoryFormat::F32 => Mem::LdrS,
+        MemoryFormat::F64 => Mem::LdrD,
+    };
+    let kind = match graph.low_level_types[index]? {
+        types::I64 => Index::Lsl,
+        types::I32 => Index::Uxtw,
+        _ => return None,
+    };
+    Some((
+        Address::Indexed {
+            base,
+            index,
+            kind,
+            scaled: format.bytes() > 1,
+        },
+        mem,
+    ))
 }
 
-fn operand(func: &Function, value: Value, position: usize) -> Option<Operand> {
-    let wide = func.dfg.value_type(value) == types::I64;
-    if let Some((shifted, amount)) = shift_amount(func, value) {
-        if wide
-            && amount <= 4
-            && let Some((leaf, kind)) = extension(func, shifted)
-        {
-            return Some(Operand {
-                position,
-                value: leaf,
-                kind,
-                shift: amount,
-            });
-        }
-        return Some(Operand {
-            position,
-            value: shifted,
-            kind: Index::Lsl,
-            shift: amount,
-        });
-    }
-    let (leaf, kind) = extension(func, value).filter(|_| wide)?;
-    Some(Operand {
-        position,
-        value: leaf,
-        kind,
-        shift: 0,
-    })
+pub(super) struct Selection {
+    select_compare: SecondaryMap<Inst, Option<Inst>>,
+    branch_compare: SecondaryMap<Block, Option<Inst>>,
+    skip: SecondaryMap<Inst, bool>,
+    address: SecondaryMap<Inst, Option<Address>>,
+    operand: SecondaryMap<Inst, Option<Operand>>,
 }
 
-fn compare(func: &Function, value: Value, uses: &SecondaryMap<Value, u32>) -> Option<Inst> {
+fn fused_compare(graph: &Graph, value: Value, uses: &SecondaryMap<Value, u32>) -> Option<Inst> {
     if uses[value] != 1 {
         return None;
     }
-    let ValueDef::Result(inst, 0) = func.dfg.value_def(value) else {
+    let ValueDef::Result(inst, 0) = graph.values[value] else {
         return None;
     };
-    match func.dfg.insts[inst] {
-        InstructionData::IntCompare { .. } => Some(inst),
-        InstructionData::FloatCompare { cond, .. } if float_conds(cond).1.is_none() => Some(inst),
+    match graph.insts[inst].op {
+        Op::LowLevel(low_level::Op::IntCompare { .. }) => Some(inst),
+        Op::LowLevel(low_level::Op::FloatCompare { condition, .. })
+            if float_conds(condition).1.is_none() =>
+        {
+            Some(inst)
+        }
         _ => None,
     }
 }
 
-fn absorbable(func: &Function, value: Value) -> Option<Inst> {
-    let ValueDef::Result(inst, 0) = func.dfg.value_def(value) else {
-        return None;
-    };
-    if func.layout.inst_block(inst).is_none() {
+fn memory_address(
+    graph: &Graph,
+    value: Value,
+    offset: i32,
+    size: u32,
+) -> Option<(Address, Vec<Inst>)> {
+    if graph.low_level_types[value] != Some(types::I64) {
         return None;
     }
-    matches!(
-        func.dfg.insts[inst].opcode(),
-        Opcode::Iadd
-            | Opcode::Ishl
-            | Opcode::Uextend
-            | Opcode::Sextend
-            | Opcode::Icmp
-            | Opcode::Fcmp
-    )
-    .then_some(inst)
+    let ValueDef::Result(add, 0) = graph.values[value] else {
+        return None;
+    };
+    let Op::LowLevel(low_level::Op::Binary {
+        op: low_level::Binary::Add,
+        left,
+        right,
+    }) = graph.insts[add].op
+    else {
+        return None;
+    };
+    if let Some(constant) = alloc::constant(graph, right) {
+        return Some((
+            Address::Offset {
+                base: left,
+                offset: i64::from(offset).wrapping_add(constant as i64),
+            },
+            vec![add],
+        ));
+    }
+    if let Some(constant) = alloc::constant(graph, left) {
+        return Some((
+            Address::Offset {
+                base: right,
+                offset: i64::from(offset).wrapping_add(constant as i64),
+            },
+            vec![add],
+        ));
+    }
+    if offset != 0 {
+        return None;
+    }
+    let mut index = right;
+    let mut skip = vec![add];
+    let mut scaled = false;
+    if let ValueDef::Result(inst, 0) = graph.values[index]
+        && let Op::LowLevel(low_level::Op::Binary {
+            op: low_level::Binary::ShiftLeft,
+            left,
+            right,
+        }) = graph.insts[inst].op
+        && alloc::constant(graph, right) == Some(u64::from(size.trailing_zeros()))
+        && size > 1
+    {
+        index = left;
+        skip.push(inst);
+        scaled = true;
+    }
+    let mut kind = Index::Lsl;
+    if let ValueDef::Result(inst, 0) = graph.values[index]
+        && let Op::LowLevel(low_level::Op::Unary { op, value, .. }) = graph.insts[inst].op
+        && graph.low_level_types[value] == Some(types::I32)
+    {
+        kind = match op {
+            low_level::Unary::ZeroExtend => Index::Uxtw,
+            low_level::Unary::SignExtend => Index::Sxtw,
+            _ => Index::Lsl,
+        };
+        if !matches!(kind, Index::Lsl) {
+            index = value;
+            skip.push(inst);
+        }
+    }
+    Some((
+        Address::Indexed {
+            base: left,
+            index,
+            kind,
+            scaled,
+        },
+        skip,
+    ))
+}
+
+fn shifted_operand(
+    graph: &Graph,
+    value: Value,
+    position: usize,
+    uses: &SecondaryMap<Value, u32>,
+) -> Option<(Operand, Vec<Inst>)> {
+    if uses[value] != 1 {
+        return None;
+    }
+    let wide = graph.low_level_types[value] == Some(types::I64);
+    let ValueDef::Result(inst, 0) = graph.values[value] else {
+        return None;
+    };
+    let (mut leaf, shift, mut skip) = match graph.insts[inst].op {
+        Op::LowLevel(low_level::Op::Binary {
+            op: low_level::Binary::ShiftLeft,
+            left,
+            right,
+        }) => {
+            let bits = graph.low_level_types[value]?.bits();
+            (
+                left,
+                alloc::constant(graph, right)? as u32 & (bits - 1),
+                vec![inst],
+            )
+        }
+        _ => (value, 0, Vec::new()),
+    };
+    let mut kind = Index::Lsl;
+    if wide && shift <= 4 && uses[leaf] == 1 {
+        if let ValueDef::Result(def, 0) = graph.values[leaf] {
+            if let Op::LowLevel(low_level::Op::Unary { op, value, .. }) = graph.insts[def].op {
+                if graph.low_level_types[value] == Some(types::I32) {
+                    kind = match op {
+                        low_level::Unary::ZeroExtend => Index::Uxtw,
+                        low_level::Unary::SignExtend => Index::Sxtw,
+                        _ => Index::Lsl,
+                    };
+                    if !matches!(kind, Index::Lsl) {
+                        leaf = value;
+                        skip.push(def);
+                    }
+                }
+            }
+        }
+    }
+    if skip.is_empty() {
+        return None;
+    }
+    Some((
+        Operand {
+            position,
+            value: leaf,
+            kind,
+            shift,
+        },
+        skip,
+    ))
 }
 
 impl Selection {
-    pub(super) fn new(func: &Function) -> Self {
-        let dfg = &func.dfg;
+    pub(super) fn new(graph: &Graph, order: &[Block]) -> Self {
         let mut uses = SecondaryMap::<Value, u32>::new();
-        for block in func.layout.blocks() {
-            for inst in func.layout.block_insts(block) {
-                for value in dfg.inst_values(inst) {
+        for &block in order {
+            for &inst in &graph.blocks[block].insts {
+                for value in graph.insts[inst].op.operands_iter() {
+                    uses[value] += 1;
+                }
+            }
+            if let Some(term) = &graph.blocks[block].terminator {
+                for value in term.kind.operands_iter() {
                     uses[value] += 1;
                 }
             }
         }
-
         let mut selection = Self {
+            select_compare: SecondaryMap::new(),
+            branch_compare: SecondaryMap::new(),
+            skip: SecondaryMap::new(),
             address: SecondaryMap::new(),
             operand: SecondaryMap::new(),
-            compare: SecondaryMap::new(),
-            folded: SecondaryMap::new(),
-            skip: SecondaryMap::new(),
         };
-        for block in func.layout.blocks() {
-            for inst in func.layout.block_insts(block) {
-                let data = &dfg.insts[inst];
-                let opcode = data.opcode();
-                let args = dfg.inst_args(inst);
-                let offset = data.load_store_offset().map(i64::from);
-                if let Some(ty) = dfg.inst_results(inst).first().map(|&r| dfg.value_type(r))
-                    && let Some(op) = load_op(opcode, ty)
-                    && data.memflags_trap_code(dfg).is_none()
-                {
-                    selection.address[inst] = address(func, args[0], offset.unwrap(), op.size());
-                } else if let Some(op) = args
-                    .first()
-                    .and_then(|&v| store_op(opcode, dfg.value_type(v)))
-                    && data.memflags_trap_code(dfg).is_none()
-                {
-                    selection.address[inst] = address(func, args[1], offset.unwrap(), op.size());
-                } else if let Some(binary) = binary(func, inst) {
-                    selection.folded[inst] = Some(binary.constant);
-                } else if let InstructionData::IntCompare { cond, .. } = *data {
-                    let comparison = comparison(func, cond, args[0], args[1]);
-                    if comparison.immediate.is_some() {
-                        selection.folded[inst] = Some(comparison.y);
+        let mut candidates = SecondaryMap::<Inst, bool>::new();
+        for &block in order {
+            for &inst in &graph.blocks[block].insts {
+                let memory = match &graph.insts[inst].op {
+                    Op::LowLevel(low_level::Op::Load {
+                        ty,
+                        address,
+                        offset,
+                        flags,
+                    }) if flags.trap_code().is_none() => Some((*address, *offset, ty.bytes())),
+                    Op::LowLevel(low_level::Op::Store {
+                        value,
+                        address,
+                        offset,
+                        flags,
+                    }) if flags.trap_code().is_none() => {
+                        graph.low_level_types[*value].map(|ty| (*address, *offset, ty.bytes()))
                     }
-                } else if matches!(opcode, Opcode::Iadd | Opcode::Isub)
-                    && alloc::constant(func, args[0]).is_none()
-                    && alloc::constant(func, args[1]).is_none()
+                    _ => None,
+                };
+                if let Some((address, offset, size)) = memory {
+                    if let Some((address, skip)) = memory_address(graph, address, offset, size) {
+                        selection.address[inst] = Some(address);
+                        for def in skip {
+                            candidates[def] = true;
+                        }
+                    }
+                }
+                if let Op::LowLevel(low_level::Op::Binary {
+                    op: operation @ (low_level::Binary::Add | low_level::Binary::Subtract),
+                    left,
+                    right,
+                }) = graph.insts[inst].op
                 {
-                    selection.operand[inst] = operand(func, args[1], 1).or_else(|| {
-                        (opcode == Opcode::Iadd)
-                            .then(|| operand(func, args[0], 0))
-                            .flatten()
-                    });
-                } else if matches!(opcode, Opcode::Brif | Opcode::Select) {
-                    selection.compare[inst] = compare(func, args[0], &uses);
+                    if alloc::constant(graph, left).is_none()
+                        && alloc::constant(graph, right).is_none()
+                    {
+                        let selected = shifted_operand(graph, right, 1, &uses).or_else(|| {
+                            if matches!(operation, low_level::Binary::Add) {
+                                shifted_operand(graph, left, 0, &uses)
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some((operand, skip)) = selected {
+                            selection.operand[inst] = Some(operand);
+                            for def in skip {
+                                candidates[def] = true;
+                            }
+                        }
+                    }
+                }
+                if let Op::LowLevel(low_level::Op::Select { condition, .. }) = graph.insts[inst].op
+                {
+                    if let Some(def) = fused_compare(graph, condition, &uses) {
+                        selection.select_compare[inst] = Some(def);
+                        candidates[def] = true;
+                    }
+                }
+            }
+            if let Some(term) = &graph.blocks[block].terminator {
+                if let TerminatorKind::Branch(condition, ..) = term.kind {
+                    if let Some(def) = fused_compare(graph, condition, &uses) {
+                        selection.branch_compare[block] = Some(def);
+                        candidates[def] = true;
+                    }
                 }
             }
         }
-
         let mut references = SecondaryMap::<Value, u32>::new();
         let mut operands = Vec::new();
-        for block in func.layout.blocks() {
-            for inst in func.layout.block_insts(block) {
-                selection.operands(func, inst, &mut operands);
+        for &block in order {
+            for &inst in &graph.blocks[block].insts {
+                selection.operands(graph, inst, &mut operands);
                 for &value in &operands {
                     references[value] += 1;
                 }
             }
+            selection.terminator_operands(graph, block, &mut operands);
+            for &value in &operands {
+                references[value] += 1;
+            }
         }
-        let mut work: Vec<Inst> = dfg
-            .values()
-            .filter(|&value| references[value] == 0)
-            .filter_map(|value| absorbable(func, value))
+        let mut work: Vec<_> = candidates
+            .iter()
+            .filter_map(|(inst, &candidate)| {
+                (candidate && references[graph.insts[inst].results[0]] == 0).then_some(inst)
+            })
             .collect();
         while let Some(inst) = work.pop() {
-            if selection.skip[inst] || references[dfg.first_result(inst)] != 0 {
+            if selection.skip[inst] {
                 continue;
             }
-            selection.operands(func, inst, &mut operands);
+            selection.operands(graph, inst, &mut operands);
             selection.skip[inst] = true;
             for &value in &operands {
                 references[value] -= 1;
                 if references[value] == 0
-                    && let Some(def) = absorbable(func, value)
+                    && let ValueDef::Result(def, 0) = graph.values[value]
+                    && candidates[def]
                 {
                     work.push(def);
                 }
@@ -424,58 +505,198 @@ impl Selection {
         selection
     }
 
-    pub(super) fn operands(&self, func: &Function, inst: Inst, out: &mut Vec<Value>) {
+    pub(super) fn operands(&self, graph: &Graph, inst: Inst, out: &mut Vec<Value>) {
         out.clear();
         if self.skip[inst] {
             return;
         }
-        let dfg = &func.dfg;
-        out.extend(dfg.inst_values(inst));
+        out.extend(graph.insts[inst].op.operands_iter());
         if let Some(address) = self.address[inst] {
-            let position = if dfg.insts[inst].opcode().can_load() {
+            let position = if matches!(
+                graph.insts[inst].op,
+                Op::LowLevel(low_level::Op::Load { .. })
+            ) {
                 0
             } else {
                 1
             };
-            out.swap_remove(position);
+            out.remove(position);
             match address {
                 Address::Offset { base, .. } => out.push(base),
                 Address::Indexed { base, index, .. } => out.extend([base, index]),
             }
-        } else if let Some(operand) = self.operand[inst] {
-            out.swap_remove(operand.position);
+        }
+        if let Some(operand) = self.operand[inst] {
+            out.remove(operand.position);
             out.push(operand.value);
-        } else if let Some(compare) = self.compare[inst] {
-            out.swap_remove(0);
-            out.extend_from_slice(dfg.inst_args(compare));
-            self.unfold(compare, out);
         }
-        self.unfold(inst, out);
-    }
-
-    // A folded constant is not live at this use, so lowering must encode it as an immediate
-    // too: reading it via `use_reg` could hit a register that belongs to another value here.
-    fn unfold(&self, inst: Inst, out: &mut Vec<Value>) {
-        if let Some(folded) = self.folded[inst]
-            && let Some(position) = out.iter().position(|&value| value == folded)
-        {
-            out.swap_remove(position);
+        if let Some(def) = self.select_compare[inst] {
+            out.remove(0);
+            out.extend(graph.insts[def].op.operands_iter());
         }
     }
 
-    pub(super) fn skips(&self, inst: Inst) -> bool {
-        self.skip[inst]
-    }
-
-    pub(super) fn address(&self, inst: Inst) -> Option<Address> {
-        self.address[inst]
+    pub(super) fn terminator_operands(&self, graph: &Graph, block: Block, out: &mut Vec<Value>) {
+        out.clear();
+        let Some(term) = &graph.blocks[block].terminator else {
+            return;
+        };
+        out.extend(term.kind.operands_iter());
+        if let Some(def) = self.branch_compare[block] {
+            out.remove(0);
+            out.extend(graph.insts[def].op.operands_iter());
+        }
     }
 
     pub(super) fn operand(&self, inst: Inst) -> Option<Operand> {
         self.operand[inst]
     }
 
-    pub(super) fn compare(&self, inst: Inst) -> Option<Inst> {
-        self.compare[inst]
+    pub(super) fn address(&self, inst: Inst) -> Option<Address> {
+        self.address[inst]
+    }
+
+    pub(super) fn skips(&self, inst: Inst) -> bool {
+        self.skip[inst]
+    }
+    pub(super) fn select_compare(&self, inst: Inst) -> Option<Inst> {
+        self.select_compare[inst]
+    }
+    pub(super) fn branch_compare(&self, block: Block) -> Option<Inst> {
+        self.branch_compare[block]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jit::semantic::low_level::Builder;
+    use cranelift_codegen::ir::{AbiParam, Signature};
+    use cranelift_codegen::isa::CallConv;
+    use oxc_span::Span;
+
+    #[test]
+    fn selected_shift_and_compare_keep_their_inputs_live() {
+        let mut signature = Signature::new(CallConv::SystemV);
+        signature
+            .params
+            .extend([AbiParam::new(types::I64), AbiParam::new(types::I32)]);
+        let mut graph = Graph::new_low_level("test".into(), Span::new(0, 0), signature);
+        let entry = graph.entry;
+        let mut builder = Builder::new(&mut graph);
+        builder.switch_to_block(entry);
+        builder.append_block_params_for_function_params(entry);
+        let base = builder.block_params(entry)[0];
+        let index = builder.block_params(entry)[1];
+        let wide = builder.ins().uextend(types::I64, index);
+        let shift = builder.ins().ishl_imm_s(wide, 2);
+        let sum = builder.ins().iadd(base, shift);
+        let compare = builder.ins().icmp_imm_s(IntCC::NotEqual, sum, 0);
+        let yes = builder.create_block();
+        let no = builder.create_block();
+        builder.ins().brif(compare, yes, &[], no, &[]);
+        builder.switch_to_block(yes);
+        builder.ins().return_(&[]);
+        builder.switch_to_block(no);
+        builder.ins().return_(&[]);
+        let wide_inst = builder.defining_inst(wide);
+        let shift_inst = builder.defining_inst(shift);
+        let sum_inst = builder.defining_inst(sum);
+        let compare_inst = builder.defining_inst(compare);
+        drop(builder);
+        let selection = Selection::new(&graph, &crate::jit::semantic::Cfg::new(&graph).rpo);
+        assert!(selection.skips(wide_inst));
+        assert!(selection.skips(shift_inst));
+        assert!(selection.skips(compare_inst));
+        let operand = selection.operand(sum_inst).unwrap();
+        assert_eq!(operand.value, index);
+        assert_eq!(operand.kind, Index::Uxtw);
+        assert_eq!(operand.shift, 2);
+        let mut operands = Vec::new();
+        selection.operands(&graph, sum_inst, &mut operands);
+        assert_eq!(operands, vec![base, index]);
+        selection.terminator_operands(&graph, entry, &mut operands);
+        assert!(operands.contains(&sum));
+    }
+
+    #[test]
+    fn shared_addresses_fold_without_discarding_other_uses() {
+        for returned in 0..4 {
+            let mut signature = Signature::new(CallConv::SystemV);
+            signature
+                .params
+                .extend([AbiParam::new(types::I64), AbiParam::new(types::I32)]);
+            signature.returns.push(AbiParam::new(types::I64));
+            let mut graph =
+                Graph::new_low_level("shared_address".into(), Span::new(0, 0), signature);
+            let entry = graph.entry;
+            let mut builder = Builder::new(&mut graph);
+            builder.switch_to_block(entry);
+            builder.append_block_params_for_function_params(entry);
+            let base = builder.block_params(entry)[0];
+            let index = builder.block_params(entry)[1];
+            let wide = builder.ins().uextend(types::I64, index);
+            let shift = builder.ins().ishl_imm_s(wide, 3);
+            let address = builder.ins().iadd(base, shift);
+            let flags = cranelift_codegen::ir::MemFlagsData::trusted();
+            let loaded = builder.ins().load(types::I64, flags, address, 0);
+            let store = builder.ins().store(flags, loaded, address, 0);
+            builder
+                .ins()
+                .return_(&[[loaded, address, shift, wide][returned]]);
+            let load = builder.defining_inst(loaded);
+            let address_inst = builder.defining_inst(address);
+            let shift_inst = builder.defining_inst(shift);
+            let wide_inst = builder.defining_inst(wide);
+            builder.finish().unwrap();
+            graph.verify().unwrap();
+            let selection = Selection::new(&graph, &crate::jit::semantic::Cfg::new(&graph).rpo);
+            for inst in [load, store] {
+                assert!(matches!(selection.address(inst), Some(Address::Indexed {
+                    base: b, index: i, kind: Index::Uxtw, scaled: true
+                }) if b == base && i == index));
+            }
+            assert_eq!(selection.skips(address_inst), returned != 1);
+            assert_eq!(selection.skips(shift_inst), returned != 2);
+            assert_eq!(selection.skips(wide_inst), returned < 2);
+            let mut operands = Vec::new();
+            selection.operands(&graph, load, &mut operands);
+            assert_eq!(operands, vec![base, index]);
+            selection.operands(&graph, store, &mut operands);
+            assert_eq!(operands, vec![loaded, base, index]);
+        }
+    }
+
+    #[test]
+    fn indexed_loads_select_raw_format_and_scale() {
+        let mut signature = Signature::new(CallConv::SystemV);
+        signature
+            .params
+            .extend([AbiParam::new(types::I64), AbiParam::new(types::I64)]);
+        let mut graph = Graph::new_low_level("test".into(), Span::new(0, 0), signature);
+        let entry = graph.entry;
+        let mut builder = Builder::new(&mut graph);
+        builder.switch_to_block(entry);
+        builder.append_block_params_for_function_params(entry);
+        let base = builder.block_params(entry)[0];
+        let index = builder.block_params(entry)[1];
+        for (format, ty, expected) in [
+            (MemoryFormat::U8, types::I8, Mem::Ldrb),
+            (MemoryFormat::I8, types::I8, Mem::Ldrb),
+            (MemoryFormat::U16, types::I16, Mem::Ldrh),
+            (MemoryFormat::I16, types::I16, Mem::Ldrh),
+            (MemoryFormat::U32, types::I32, Mem::LdrW),
+            (MemoryFormat::I32, types::I32, Mem::LdrW),
+            (MemoryFormat::F32, types::F32, Mem::LdrS),
+            (MemoryFormat::F64, types::F64, Mem::LdrD),
+        ] {
+            let value = builder.indexed_load(base, index, format, ty);
+            let inst = builder.defining_inst(value);
+            let (address, mem) = indexed_load(builder.graph, inst).unwrap();
+            assert_eq!(mem, expected);
+            assert!(
+                matches!(address, Address::Indexed { base: b, index: i, kind: Index::Lsl, scaled } if b == base && i == index && scaled == (format.bytes() > 1))
+            );
+        }
     }
 }

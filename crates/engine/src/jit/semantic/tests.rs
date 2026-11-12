@@ -2171,6 +2171,84 @@ fn typed_loads_lower_to_explicit_memory_operations() {
 }
 
 #[test]
+fn low_level_variables_forward_through_chains_and_loop() {
+    use cranelift_codegen::ir::{AbiParam, Signature, types};
+    use cranelift_codegen::isa::CallConv;
+    let mut signature = Signature::new(CallConv::SystemV);
+    signature
+        .params
+        .extend([AbiParam::new(types::I64), AbiParam::new(types::I8)]);
+    signature
+        .returns
+        .extend([AbiParam::new(types::I64), AbiParam::new(types::I64)]);
+    let mut graph = Graph::new_low_level("chain-loop".into(), Span::new(0, 0), signature);
+    let entry = graph.entry;
+    let span = graph.span;
+    let mut builder = low_level::Builder::new(&mut graph);
+    builder.switch_to_block(entry);
+    builder.append_block_params_for_function_params(entry);
+    let input = builder.block_params(entry)[0];
+    let condition = builder.block_params(entry)[1];
+    let first = builder.create_block();
+    let second = builder.create_block();
+    let header = builder.create_block();
+    let body = builder.create_block();
+    let backedge = builder.create_block();
+    let exit = builder.create_block();
+    builder.write(entry, 0, input, types::I64);
+    builder.write(entry, 1, input, types::I64);
+    builder.terminate(entry, span, TerminatorKind::Jump(Target::new(first)));
+    builder.terminate(first, span, TerminatorKind::Jump(Target::new(second)));
+    builder.terminate(second, span, TerminatorKind::Jump(Target::new(header)));
+    let invariant = builder.read(header, 0, types::I64, span);
+    let induction = builder.read(header, 1, types::I64, span);
+    builder.terminate(
+        header,
+        span,
+        TerminatorKind::Branch(condition, Target::new(body), Target::new(exit)),
+    );
+    builder.terminate(body, span, TerminatorKind::Jump(Target::new(backedge)));
+    let prior = builder.read(backedge, 1, types::I64, span);
+    let one = builder.value(
+        backedge,
+        span,
+        low_level::Op::Integer {
+            ty: types::I64,
+            bits: 1,
+        },
+        types::I64,
+    );
+    let next = builder.value(
+        backedge,
+        span,
+        low_level::Op::Binary {
+            op: low_level::Binary::Add,
+            left: prior,
+            right: one,
+        },
+        types::I64,
+    );
+    builder.write(backedge, 1, next, types::I64);
+    builder.terminate(backedge, span, TerminatorKind::Jump(Target::new(header)));
+    builder.terminate(
+        exit,
+        span,
+        TerminatorKind::ReturnValues(vec![invariant, induction]),
+    );
+    builder.finish().unwrap();
+    graph.verify().unwrap();
+    assert_eq!(graph.blocks[entry].params.len(), 2);
+    assert_eq!(graph.blocks[header].params.len(), 1);
+    for block in [first, second, body, backedge, exit] {
+        assert!(graph.blocks[block].params.is_empty());
+    }
+    let result = &graph.blocks[exit].terminator.as_ref().unwrap().kind;
+    assert!(
+        matches!(result, TerminatorKind::ReturnValues(values) if values == &[input, graph.blocks[header].params[0]])
+    );
+}
+
+#[test]
 fn low_level_variables_resolve_diamond_and_loop() {
     let mut graph = lower_source("function f(a){return a;}").unwrap();
     let entry = graph.entry;
@@ -2604,4 +2682,34 @@ fn switch_cfg_visits_every_distinct_destination() {
         assert_eq!(cfg.preds[block], [entry]);
     }
     graph.verify().unwrap();
+}
+
+#[test]
+fn low_level_variables_resolve_long_forwarding_chain() {
+    use cranelift_codegen::ir::{AbiParam, Signature, types};
+    use cranelift_codegen::isa::CallConv;
+    let mut signature = Signature::new(CallConv::SystemV);
+    signature.params.push(AbiParam::new(types::I64));
+    signature.returns.push(AbiParam::new(types::I64));
+    let span = Span::new(0, 0);
+    let mut graph = Graph::new_low_level("long-chain".into(), span, signature);
+    let entry = graph.entry;
+    let mut builder = low_level::Builder::new(&mut graph);
+    builder.append_block_params_for_function_params(entry);
+    let input = builder.block_params(entry)[0];
+    builder.write(entry, 0, input, types::I64);
+    let mut block = entry;
+    for _ in 0..10_000 {
+        let next = builder.create_block();
+        builder.terminate(block, span, TerminatorKind::Jump(Target::new(next)));
+        block = next;
+    }
+    let result = builder.read(block, 0, types::I64, span);
+    builder.terminate(block, span, TerminatorKind::ReturnValues(vec![result]));
+    builder.finish().unwrap();
+    graph.verify().unwrap();
+    assert!(matches!(
+        &graph.blocks[block].terminator.as_ref().unwrap().kind,
+        TerminatorKind::ReturnValues(values) if values == &[input]
+    ));
 }

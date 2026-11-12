@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 
+use cranelift_codegen::entity::SecondaryMap;
 use cranelift_codegen::ir::{
     MemFlagsData, Signature, Type,
     condcodes::{FloatCC, IntCC},
 };
 use cranelift_module::FuncId;
 use oxc_span::Span;
+use rustc_hash::FxHashMap;
 
 use super::{Block, Cfg, Graph, Inst, Op as GraphOp, Value};
 use crate::jit::helpers::Helper;
@@ -158,9 +160,9 @@ pub(in crate::jit) struct FunctionRef(usize);
 
 pub(in crate::jit) struct Builder<'a> {
     pub(in crate::jit) graph: &'a mut Graph,
-    definitions: HashMap<(Block, usize), Value>,
+    definitions: FxHashMap<(Block, usize), Value>,
     reads: Vec<(Block, usize, Inst, Value)>,
-    types: HashMap<usize, Type>,
+    types: FxHashMap<usize, Type>,
     location: Option<u32>,
     source_name: Option<(usize, usize)>,
     current: Option<Block>,
@@ -175,9 +177,9 @@ impl<'a> Builder<'a> {
         let span = graph.span;
         Self {
             graph,
-            definitions: HashMap::new(),
+            definitions: FxHashMap::default(),
             reads: Vec::new(),
-            types: HashMap::new(),
+            types: FxHashMap::default(),
             location: None,
             source_name: None,
             current: None,
@@ -489,53 +491,81 @@ impl<'a> Builder<'a> {
 
     pub(in crate::jit) fn finish(mut self) -> Result<(), String> {
         let cfg = Cfg::new(self.graph);
-        let mut entries = HashMap::new();
+        let mut reachable = SecondaryMap::<Block, bool>::new();
+        for &block in &cfg.rpo {
+            reachable[block] = true;
+        }
+        let mut entries = FxHashMap::default();
         let mut aliases = HashMap::new();
+        let mut work = Vec::new();
         for (block, variable, inst, value) in std::mem::take(&mut self.reads) {
-            if !cfg.rpo.contains(&block) {
+            if !reachable[block] {
                 self.graph.remove_inst(inst);
                 continue;
             }
-            let definition = self.entry_value(&cfg, &mut entries, block, variable)?;
+            let definition = self.entry_value(&cfg, &mut entries, &mut work, block, variable)?;
             aliases.insert(value, definition);
             self.graph.remove_inst(inst);
         }
         self.graph.replace_uses(&aliases);
-        super::transforms::remove_trivial_params(self.graph);
+        super::transforms::canonicalize_parameters(self.graph, &cfg.rpo);
+        super::transforms::remove_trivial_params_in(self.graph, &cfg.rpo);
         Ok(())
     }
 
     fn entry_value(
         &mut self,
         cfg: &Cfg,
-        entries: &mut HashMap<(Block, usize), Value>,
+        entries: &mut FxHashMap<(Block, usize), Value>,
+        work: &mut Vec<(Block, Option<usize>)>,
         block: Block,
         variable: usize,
     ) -> Result<Value, String> {
         if let Some(&value) = entries.get(&(block, variable)) {
             return Ok(value);
         }
-        if block == self.graph.entry || cfg.preds[block].is_empty() {
-            return Err(format!(
-                "variable {variable} has no definition at entry to {block}"
-            ));
-        }
-        let param = self.graph.add_param(block);
-        entries.insert((block, variable), param);
-        self.graph.low_level_types[param] = Some(self.types[&variable]);
-        let mut seen = std::collections::HashSet::new();
-        for pred in cfg.preds[block]
-            .iter()
-            .copied()
-            .filter(|pred| seen.insert(*pred))
-        {
-            let value = match self.definitions.get(&(pred, variable)) {
-                Some(&value) => value,
-                None => self.entry_value(cfg, entries, pred, variable)?,
+        work.push((block, None));
+        while let Some(&(current, next)) = work.last() {
+            let next = match next {
+                Some(next) => next,
+                None => {
+                    if current == self.graph.entry || cfg.preds[current].is_empty() {
+                        return Err(format!(
+                            "variable {variable} has no definition at entry to {current}"
+                        ));
+                    }
+                    if cfg.preds[current].len() > 1 {
+                        // Backedges must find this phi before its inputs are resolved.
+                        let param = self.graph.add_param(current);
+                        entries.insert((current, variable), param);
+                        self.graph.low_level_types[param] = Some(self.types[&variable]);
+                    }
+                    work.last_mut().unwrap().1 = Some(0);
+                    0
+                }
             };
-            self.graph.push_edge_arg(pred, block, value);
+            let pred = cfg.preds[current][next];
+            let value = self
+                .definitions
+                .get(&(pred, variable))
+                .or_else(|| entries.get(&(pred, variable)))
+                .copied();
+            let Some(value) = value else {
+                work.push((pred, None));
+                continue;
+            };
+            if cfg.preds[current].len() == 1 {
+                entries.insert((current, variable), value);
+            } else {
+                self.graph.push_edge_arg(pred, current, value);
+            }
+            if next + 1 == cfg.preds[current].len() {
+                work.pop();
+            } else {
+                work.last_mut().unwrap().1 = Some(next + 1);
+            }
         }
-        Ok(param)
+        Ok(entries[&(block, variable)])
     }
 }
 

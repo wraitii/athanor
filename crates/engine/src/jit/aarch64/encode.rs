@@ -481,10 +481,6 @@ pub(super) fn br(rn: u8) -> u32 {
     0xD61F_0000 | (u32::from(rn) << 5)
 }
 
-pub(super) fn adr(rd: u8) -> u32 {
-    0x1000_0000 | u32::from(rd)
-}
-
 pub(super) const B: u32 = 0x1400_0000;
 pub(super) const BL: u32 = 0x9400_0000;
 

@@ -1,18 +1,18 @@
+use std::collections::HashMap;
+
 use cranelift_codegen::entity::SecondaryMap;
-use cranelift_codegen::ir::{Block, Function, Value};
 
 use super::phis::{self, Input};
+use crate::jit::semantic::{Block, Graph, Value, ValueDef};
 
-pub(in crate::jit) fn canonicalize_parameters(func: &mut Function) {
-    let func = &mut func.stencil;
-    func.dfg.resolve_all_aliases();
-    let mut parameters = Vec::new();
+pub(in crate::jit::semantic) fn canonicalize_parameters(graph: &mut Graph, blocks: &[Block]) {
     let mut indices = SecondaryMap::<Value, Option<usize>>::new();
-    for block in func.layout.blocks() {
-        if Some(block) == func.layout.entry_block() {
+    let mut parameters = Vec::new();
+    for &block in blocks {
+        if block == graph.entry {
             continue;
         }
-        for &value in func.dfg.block_params(block) {
+        for &value in &graph.blocks[block].params {
             indices[value] = Some(parameters.len());
             parameters.push(value);
         }
@@ -21,127 +21,247 @@ pub(in crate::jit) fn canonicalize_parameters(func: &mut Function) {
         return;
     }
     let mut incoming = vec![Vec::new(); parameters.len()];
-    for block in func.layout.blocks() {
-        for inst in func.layout.block_insts(block) {
-            for call in func.dfg.insts[inst]
-                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
-            {
-                let destination = call.block(&func.dfg.value_lists);
-                for (&parameter, argument) in func
-                    .dfg
-                    .block_params(destination)
-                    .iter()
-                    .zip(call.args(&func.dfg.value_lists))
-                {
-                    let Some(index) = indices[parameter] else {
+    for &block in blocks {
+        if let Some(terminator) = &graph.blocks[block].terminator {
+            for target in terminator.kind.targets() {
+                for (&param, &arg) in graph.blocks[target.block].params.iter().zip(&target.args) {
+                    let Some(index) = indices[param] else {
                         continue;
                     };
-                    let input = match argument.as_value() {
-                        Some(value) => match indices[value] {
-                            Some(source) => Input::Parameter(source),
-                            None => Input::Value(value),
-                        },
-                        None => Input::Varying,
-                    };
-                    incoming[index].push(input);
+                    incoming[index].push(match indices[arg] {
+                        Some(source) => Input::Parameter(source),
+                        None => Input::Value(arg),
+                    });
                 }
             }
         }
     }
     let replacements = phis::solve(&incoming);
+    let aliases: HashMap<_, _> = parameters
+        .into_iter()
+        .zip(replacements)
+        .filter_map(|(value, replacement)| replacement.map(|replacement| (value, replacement)))
+        .collect();
+    if aliases.is_empty() {
+        return;
+    }
+    graph.replace_uses(&aliases);
     let mut removed = SecondaryMap::<Block, Vec<usize>>::new();
-    for block in func.layout.blocks() {
-        let params = func.dfg.block_params(block).to_vec();
-        for (position, &value) in params.iter().enumerate().rev() {
-            let Some(replacement) = indices[value].and_then(|index| replacements[index]) else {
-                continue;
-            };
-            func.dfg.remove_block_param(value);
-            func.dfg.change_to_alias(value, replacement);
-            removed[block].push(position);
+    for &block in blocks {
+        for (index, param) in graph.blocks[block].params.iter().enumerate().rev() {
+            if aliases.contains_key(param) {
+                removed[block].push(index);
+            }
         }
     }
-    for block in func.layout.blocks() {
-        for inst in func.layout.block_insts(block) {
-            for call in func.dfg.insts[inst]
-                .branch_destination_mut(&mut func.dfg.jump_tables, &mut func.dfg.exception_tables)
-            {
-                let destination = call.block(&func.dfg.value_lists);
-                for &position in &removed[destination] {
-                    call.remove(position, &mut func.dfg.value_lists);
+    for &block in blocks {
+        if let Some(terminator) = &mut graph.blocks[block].terminator {
+            for target in terminator.kind.targets_mut() {
+                for &index in &removed[target.block] {
+                    target.args.remove(index);
                 }
             }
         }
     }
-    func.dfg.resolve_all_aliases();
+    for &block in blocks {
+        let params = &mut graph.blocks[block].params;
+        params.retain(|param| !aliases.contains_key(param));
+        for (index, &param) in params.iter().enumerate() {
+            graph.values[param] = ValueDef::Param(block, index);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use cranelift_codegen::ir::{AbiParam, InstBuilder, types};
-    use cranelift_codegen::{settings, verify_function};
-    use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-
     use super::*;
+    use crate::jit::semantic::{
+        Target, TerminatorKind,
+        low_level::{Builder, CallTarget},
+    };
+    use cranelift_codegen::ir::{AbiParam, Signature, types};
+    use cranelift_codegen::isa::CallConv;
+    use oxc_span::Span;
+
+    fn cycle(conflicting: bool) -> (Graph, Block, Block, Value, Value) {
+        let span = Span::new(0, 0);
+        let mut signature = Signature::new(CallConv::SystemV);
+        signature
+            .params
+            .extend([AbiParam::new(types::I64), AbiParam::new(types::I8)]);
+        signature
+            .returns
+            .extend([AbiParam::new(types::I64), AbiParam::new(types::I64)]);
+        let mut graph = Graph::new_low_level("cycle".into(), span, signature);
+        let entry = graph.entry;
+        let mut builder = Builder::new(&mut graph);
+        builder.switch_to_block(entry);
+        builder.append_block_params_for_function_params(entry);
+        let address = builder.block_params(entry)[0];
+        let condition = builder.block_params(entry)[1];
+        let mut called = Signature::new(CallConv::SystemV);
+        called
+            .returns
+            .extend([AbiParam::new(types::I64), AbiParam::new(types::I64)]);
+        let results = builder.call(entry, span, CallTarget::Indirect(address), called, vec![]);
+        let header = builder.create_block();
+        let body = builder.create_block();
+        let exit = builder.create_block();
+        let x = builder.append_block_param(header, types::I64);
+        let y = builder.append_block_param(header, types::I64);
+        let a = builder.append_block_param(body, types::I64);
+        let b = builder.append_block_param(body, types::I64);
+        builder.terminate(
+            entry,
+            span,
+            TerminatorKind::Jump(Target {
+                block: header,
+                args: vec![results[0], results[usize::from(conflicting)]],
+            }),
+        );
+        builder.terminate(
+            header,
+            span,
+            TerminatorKind::Branch(
+                condition,
+                Target {
+                    block: body,
+                    args: vec![x, y],
+                },
+                Target::new(exit),
+            ),
+        );
+        builder.terminate(
+            body,
+            span,
+            TerminatorKind::Jump(Target {
+                block: header,
+                args: vec![b, a],
+            }),
+        );
+        builder.terminate(exit, span, TerminatorKind::ReturnValues(vec![x, y]));
+        builder.finish().unwrap();
+        (graph, header, entry, results[0], results[1])
+    }
 
     #[test]
-    fn parameter_removal_preserves_loop_arguments_and_entry_signature() {
-        let mut func = Function::new();
-        func.signature.params.extend([
+    fn removes_seeded_forwarding_cycle_and_preserves_entry_and_results() {
+        let (graph, header, entry, first, second) = cycle(false);
+        graph.verify().unwrap();
+        assert_eq!(graph.blocks[entry].params.len(), 2);
+        assert!(graph.blocks[header].params.is_empty());
+        assert_eq!(graph.low_level_types[first], Some(types::I64));
+        assert_eq!(graph.low_level_types[second], Some(types::I64));
+        assert!(graph.blocks.iter().any(|(_, data)| data.terminator.as_ref().is_some_and(|term| matches!(&term.kind, TerminatorKind::ReturnValues(values) if values == &[first, first]))));
+    }
+
+    #[test]
+    fn keeps_cycles_with_conflicting_origins() {
+        let (graph, header, entry, _, _) = cycle(true);
+        graph.verify().unwrap();
+        assert_eq!(graph.blocks[entry].params.len(), 2);
+        assert_eq!(graph.blocks[header].params.len(), 2);
+    }
+
+    #[test]
+    fn forwards_a_parameter_with_multiple_origins() {
+        let span = Span::new(0, 0);
+        let mut signature = Signature::new(CallConv::SystemV);
+        signature.params.extend([
             AbiParam::new(types::I64),
             AbiParam::new(types::I64),
             AbiParam::new(types::I8),
         ]);
-        func.signature.returns.push(AbiParam::new(types::I64));
-        let mut context = FunctionBuilderContext::new();
-        let mut builder = FunctionBuilder::new(&mut func, &mut context);
-        let entry = builder.create_block();
-        let header = builder.create_block();
-        let exit = builder.create_block();
-        builder.append_block_params_for_function_params(entry);
-        for block in [header, exit] {
-            for _ in 0..3 {
-                builder.append_block_param(block, types::I64);
-            }
-        }
+        signature.returns.push(AbiParam::new(types::I64));
+        let mut graph = Graph::new_low_level("diamond".into(), span, signature);
+        let entry = graph.entry;
+        let mut builder = Builder::new(&mut graph);
         builder.switch_to_block(entry);
-        let inputs = builder.block_params(entry).to_vec();
-        let zero = builder.ins().iconst(types::I64, 0);
-        builder
-            .ins()
-            .jump(header, &[inputs[0].into(), zero.into(), inputs[1].into()]);
-        builder.switch_to_block(header);
-        let params = builder.block_params(header).to_vec();
-        let next = builder.ins().iadd_imm_s(params[1], 1);
-        builder.ins().brif(
-            inputs[2],
-            header,
-            &[params[0].into(), next.into(), params[2].into()],
-            exit,
-            &[params[0].into(), params[1].into(), params[2].into()],
+        builder.append_block_params_for_function_params(entry);
+        let args = builder.block_params(entry).to_vec();
+        let left = builder.create_block();
+        let right = builder.create_block();
+        let join = builder.create_block();
+        let exit = builder.create_block();
+        let varying = builder.append_block_param(join, types::I64);
+        let forwarded = builder.append_block_param(exit, types::I64);
+        builder.terminate(
+            entry,
+            span,
+            TerminatorKind::Branch(args[2], Target::new(left), Target::new(right)),
         );
-        builder.switch_to_block(exit);
-        let outputs = builder.block_params(exit).to_vec();
-        let sum = builder.ins().iadd(outputs[0], outputs[1]);
-        let first_sum = builder.func.layout.last_inst(exit).unwrap();
-        let sum = builder.ins().iadd(sum, outputs[2]);
-        let second_sum = builder.func.layout.last_inst(exit).unwrap();
-        builder.ins().return_(&[sum]);
-        builder.seal_all_blocks();
-        drop(builder);
-        let flags = settings::Flags::new(settings::builder());
-        verify_function(&func, &flags).unwrap();
+        builder.terminate(
+            left,
+            span,
+            TerminatorKind::Jump(Target {
+                block: join,
+                args: vec![args[0]],
+            }),
+        );
+        builder.terminate(
+            right,
+            span,
+            TerminatorKind::Jump(Target {
+                block: join,
+                args: vec![args[1]],
+            }),
+        );
+        builder.terminate(
+            join,
+            span,
+            TerminatorKind::Jump(Target {
+                block: exit,
+                args: vec![varying],
+            }),
+        );
+        builder.terminate(exit, span, TerminatorKind::ReturnValues(vec![forwarded]));
+        builder.finish().unwrap();
+        graph.verify().unwrap();
+        assert_eq!(graph.blocks[join].params, vec![varying]);
+        assert!(graph.blocks[exit].params.is_empty());
+        assert!(
+            matches!(&graph.blocks[exit].terminator.as_ref().unwrap().kind, TerminatorKind::ReturnValues(values) if values == &[varying])
+        );
+    }
 
-        canonicalize_parameters(&mut func);
+    #[test]
+    fn ignores_incomplete_edges_from_unreachable_blocks() {
+        let span = Span::new(0, 0);
+        let mut signature = Signature::new(CallConv::SystemV);
+        signature.params.push(AbiParam::new(types::I64));
+        signature.returns.push(AbiParam::new(types::I64));
+        let mut graph = Graph::new_low_level("unreachable".into(), span, signature);
+        let entry = graph.entry;
+        let mut builder = Builder::new(&mut graph);
+        builder.switch_to_block(entry);
+        builder.append_block_params_for_function_params(entry);
+        let input = builder.block_params(entry)[0];
+        let join = builder.create_block();
+        let unreachable = builder.create_block();
+        let param = builder.append_block_param(join, types::I64);
+        builder.terminate(
+            entry,
+            span,
+            TerminatorKind::Jump(Target {
+                block: join,
+                args: vec![input],
+            }),
+        );
+        builder.terminate(unreachable, span, TerminatorKind::Jump(Target::new(join)));
+        builder.terminate(join, span, TerminatorKind::ReturnValues(vec![param]));
+        builder.finish().unwrap();
+        graph.verify().unwrap();
+        assert!(graph.blocks[join].params.is_empty());
+        assert!(
+            matches!(&graph.blocks[join].terminator.as_ref().unwrap().kind, TerminatorKind::ReturnValues(values) if values == &[input])
+        );
+    }
 
-        verify_function(&func, &flags).unwrap();
-        assert_eq!(func.dfg.block_params(entry), inputs);
-        assert_eq!(func.dfg.block_params(header), &[params[1]]);
-        assert_eq!(func.dfg.block_params(exit), &[outputs[1]]);
-        assert_eq!(func.dfg.inst_args(first_sum), &[inputs[0], outputs[1]]);
-        assert_eq!(func.dfg.inst_args(second_sum)[1], inputs[1]);
-        let before = func.display().to_string();
-        canonicalize_parameters(&mut func);
-        assert_eq!(func.display().to_string(), before);
+    #[test]
+    fn leaves_unseeded_cycles_unresolved() {
+        assert_eq!(
+            phis::solve::<Value>(&[vec![Input::Parameter(1)], vec![Input::Parameter(0)]]),
+            vec![None, None]
+        );
     }
 }

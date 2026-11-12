@@ -1150,14 +1150,14 @@ impl FunctionCompiler<'_, '_> {
             .filter(|_| value.is_some())
             .map(|&element| (element, self.b.create_block()))
             .collect();
-        for (element, block) in &kinds {
-            switch.set_entry(element.kind() as u128, *block);
-        }
         let overwrite = value.map(|_| {
             let block = self.b.create_block();
             switch.set_entry(kind::ARRAY as u128, block);
             block
         });
+        for (element, block) in &kinds {
+            switch.set_entry(element.kind() as u128, *block);
+        }
         let elements = value.is_none().then(|| {
             let packed = self.b.create_block();
             let holey = self.b.create_block();

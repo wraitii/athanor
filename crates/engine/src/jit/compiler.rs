@@ -367,7 +367,14 @@ impl Compiler {
         signature: Signature,
         source_name: (usize, usize),
         build: impl FnOnce(emit::Output<'_, '_>) -> Result<(), Error>,
-    ) -> Result<(cranelift_codegen::ir::Function, Annotations), Error> {
+    ) -> Result<
+        (
+            cranelift_codegen::ir::Function,
+            Annotations,
+            Option<super::semantic::Graph>,
+        ),
+        Error,
+    > {
         let mut annotations = Annotations {
             semantic_locations: self.dump_ir || self.inspection.is_some(),
             ..Annotations::default()
@@ -379,8 +386,15 @@ impl Compiler {
             &mut self.context.func,
             &mut self.builder_context,
         );
+        let mut lowered = None;
+        let native =
+            self.backend != crate::Backend::Cranelift && self.module.isa().name() == "aarch64";
+        let clif = !native || self.inspection.as_ref().is_some_and(|options| options.clif);
         build(emit::Output {
             b: &mut builder,
+            clif,
+            native,
+            lowered: &mut lowered,
             module: &mut self.module,
             stubs: self.stubs,
             annotations: &mut annotations,
@@ -397,17 +411,26 @@ impl Compiler {
             &mut self.context.func,
             cranelift_codegen::ir::Function::new(),
         );
-        Ok((function, annotations))
+        Ok((function, annotations, lowered))
     }
 
-    fn machine_code(&mut self, id: FuncId, name: &str) -> Result<MachineCode, Error> {
+    fn machine_code(
+        &mut self,
+        id: FuncId,
+        name: &str,
+        annotations: &mut Annotations,
+        graph: Option<&super::semantic::Graph>,
+    ) -> Result<MachineCode, Error> {
         let native =
             self.backend != crate::Backend::Cranelift && self.module.isa().name() == "aarch64";
         if !native {
             return MachineCode::from_cranelift(&mut self.context, &self.module, id);
         }
-        super::semantic::canonicalize_parameters(&mut self.context.func);
-        let reason = match super::aarch64::compile(&self.context.func) {
+        let Some(graph) = graph else {
+            return MachineCode::from_cranelift(&mut self.context, &self.module, id);
+        };
+        let result = super::aarch64::compile_graph(graph);
+        let reason = match result {
             Ok(machine) => {
                 if let Some(stats) = &mut self.stats {
                     stats.native += 1;
@@ -423,6 +446,18 @@ impl Compiler {
         }
         if self.inspection.as_deref().is_some_and(|o| o.matches(name)) {
             println!("[{name}] native backend fallback: {reason}");
+        }
+        if self.context.func.layout.entry_block().is_none() {
+            let mut graph = graph.clone();
+            super::semantic::lower_memory_for_cranelift(&mut graph);
+            graph.verify().map_err(Error::Compile)?;
+            let mut builder = cranelift_frontend::FunctionBuilder::new(
+                &mut self.context.func,
+                &mut self.builder_context,
+            );
+            emit::cranelift::emit(&mut builder, &mut self.module, &graph, Some(annotations))?;
+            builder.seal_all_blocks();
+            builder.finalize(self.module.target_config());
         }
         MachineCode::from_cranelift(&mut self.context, &self.module, id)
     }
@@ -874,7 +909,7 @@ impl Compiler {
             } else {
                 None
             };
-            let (function, annotations) = if baseline.is_some() {
+            let (function, annotations, lowered) = if baseline.is_some() {
                 self.data.push(baseline_data);
                 let mut function = cranelift_codegen::ir::Function::new();
                 function.signature = self.signature.clone();
@@ -884,6 +919,7 @@ impl Compiler {
                         semantic_locations: self.dump_ir || self.inspection.is_some(),
                         ..Annotations::default()
                     },
+                    None,
                 )
             } else {
                 self.emit_body(self.signature.clone(), self.source_name, |out| {
@@ -894,6 +930,7 @@ impl Compiler {
                 id,
                 FunctionBody {
                     function,
+                    lowered,
                     baseline,
                     annotations,
                     inspection: super::inspect::Inspection::new(
@@ -964,7 +1001,7 @@ impl Compiler {
         let mut continuations = std::mem::take(&mut self.continuations);
         continuations.append(&mut pending);
         let mut dumped = Vec::new();
-        for (id, code) in continuations {
+        for (id, mut code) in continuations {
             let direct = code.baseline.is_some();
             let mut listing = None;
             self.context.clear();
@@ -997,14 +1034,29 @@ impl Compiler {
             if let Some(stats) = &mut self.stats {
                 stats.functions += 1;
                 stats.baseline += usize::from(direct);
-                stats.blocks += self.context.func.layout.blocks().count();
-                stats.insts += self
-                    .context
-                    .func
-                    .layout
-                    .blocks()
-                    .map(|block| self.context.func.layout.block_insts(block).count())
-                    .sum::<usize>();
+                if let Some(graph) = code.lowered.as_ref().filter(|_| {
+                    self.backend != crate::Backend::Cranelift
+                        && self.module.isa().name() == "aarch64"
+                }) {
+                    let blocks = super::semantic::Cfg::new(graph).rpo;
+                    stats.blocks += blocks.len();
+                    stats.insts += blocks
+                        .iter()
+                        .map(|&block| {
+                            graph.blocks[block].insts.len()
+                                + usize::from(graph.blocks[block].terminator.is_some())
+                        })
+                        .sum::<usize>();
+                } else {
+                    stats.blocks += self.context.func.layout.blocks().count();
+                    stats.insts += self
+                        .context
+                        .func
+                        .layout
+                        .blocks()
+                        .map(|block| self.context.func.layout.block_insts(block).count())
+                        .sum::<usize>();
+                }
             }
             if self.context.func.signature.call_conv == CallConv::Tail {
                 let arity = self.context.func.signature.params.len() - 3;
@@ -1014,7 +1066,12 @@ impl Compiler {
             }
             let machine = match code.baseline {
                 Some(machine) => machine,
-                None => Arc::new(self.machine_code(id, &name)?),
+                None => Arc::new(self.machine_code(
+                    id,
+                    &name,
+                    &mut code.annotations,
+                    code.lowered.as_ref(),
+                )?),
             };
             machine.define(&mut self.module, id)?;
             if let Some(stats) = &mut self.stats {
@@ -1556,7 +1613,7 @@ impl Compiler {
         if baseline.is_some() {
             self.data.push(baseline_data);
         }
-        let (function, annotations) = if baseline.is_some() {
+        let (function, annotations, lowered) = if baseline.is_some() {
             let mut function = cranelift_codegen::ir::Function::new();
             function.signature = signature;
             (
@@ -1565,6 +1622,7 @@ impl Compiler {
                     semantic_locations: self.dump_ir || self.inspection.is_some(),
                     ..Annotations::default()
                 },
+                None,
             )
         } else {
             self.emit_body(signature, emission.source_name, |out| {
@@ -1580,6 +1638,7 @@ impl Compiler {
         };
         let body = FunctionBody {
             function,
+            lowered,
             baseline,
             annotations,
             listing: self.listing().then(|| graph.listing_lines()),
@@ -1828,7 +1887,7 @@ impl Compiler {
         } else {
             None
         };
-        let (function, annotations) = if baseline.is_some() {
+        let (function, annotations, lowered) = if baseline.is_some() {
             self.data.push(data);
             let mut function = cranelift_codegen::ir::Function::new();
             function.signature = self.signature.clone();
@@ -1838,6 +1897,7 @@ impl Compiler {
                     semantic_locations: self.dump_ir || self.inspection.is_some(),
                     ..Annotations::default()
                 },
+                None,
             )
         } else {
             self.emit_body(self.signature.clone(), source_name, |out| {
@@ -1846,6 +1906,7 @@ impl Compiler {
         };
         Ok(FunctionBody {
             function,
+            lowered,
             annotations,
             baseline,
             inspection: super::inspect::Inspection::from_graph(self.inspection.as_deref(), graph),
@@ -2125,7 +2186,7 @@ impl Compiler {
         };
         let signature = self.graph_signature(graph.as_ref().map(|graph| &graph.graph));
         let feedback = feedback.map(|owner| self.feedback(owner, true));
-        let (function, annotations) = if baseline.is_some() {
+        let (function, annotations, lowered) = if baseline.is_some() {
             let mut function = cranelift_codegen::ir::Function::new();
             function.signature = signature;
             (
@@ -2134,6 +2195,7 @@ impl Compiler {
                     semantic_locations: self.dump_ir || self.inspection.is_some(),
                     ..Annotations::default()
                 },
+                None,
             )
         } else {
             self.emit_body(signature, self.source_name, |out| match &graph {
@@ -2155,6 +2217,7 @@ impl Compiler {
         };
         Ok(FunctionBody {
             function,
+            lowered,
             baseline,
             annotations,
             inspection: graph.as_ref().map_or_else(Default::default, |graph| {
@@ -2445,12 +2508,13 @@ mod listing_tests {
 
 #[cfg(all(test, target_arch = "aarch64"))]
 mod native_fallback_tests {
+    use super::super::semantic::{Graph, low_level::Builder};
     use super::*;
-    use cranelift_codegen::ir::{AbiParam, InstBuilder, MemFlagsData, Signature, types};
+    use cranelift_codegen::ir::{AbiParam, MemFlagsData, Signature, TrapCode, types};
     use cranelift_module::{Linkage, Module};
 
     #[test]
-    fn unsupported_native_operation_falls_back_to_cranelift() {
+    fn unsupported_graph_operation_falls_back_to_cranelift() {
         let mut compiler = Compiler::new(
             EngineOptions {
                 backend: crate::Backend::Native,
@@ -2463,43 +2527,39 @@ mod native_fallback_tests {
         )
         .unwrap();
         let mut signature = Signature::new(compiler.module.target_config().default_call_conv);
-        signature
-            .params
-            .extend([AbiParam::new(types::I64), AbiParam::new(types::I64)]);
+        signature.params.push(AbiParam::new(types::I64));
         signature.returns.push(AbiParam::new(types::I32));
         let id = compiler
             .module
             .declare_function("fallback_test", Linkage::Local, &signature)
             .unwrap();
-        let (function, _) = compiler
-            .emit_body(signature, (0, 0), |out| {
-                let b = out.b;
-                let entry = b.create_block();
-                b.append_block_params_for_function_params(entry);
-                b.switch_to_block(entry);
-                let params = b.block_params(entry).to_vec();
-                let offset = b.ins().ishl_imm_s(params[1], 2);
-                let address = b.ins().iadd(params[0], offset);
-                let value = b
-                    .ins()
-                    .load(types::I32, MemFlagsData::trusted(), address, 0);
-                b.ins().popcnt(params[1]);
-                b.ins().return_(&[value]);
-                Ok(())
-            })
+        let mut graph =
+            Graph::new_low_level("test".into(), oxc_span::Span::new(0, 0), signature.clone());
+        let entry = graph.entry;
+        let mut builder = Builder::new(&mut graph);
+        builder.switch_to_block(entry);
+        builder.append_block_params_for_function_params(entry);
+        let pointer = builder.block_params(entry)[0];
+        let flags = MemFlagsData::new().with_trap_code(Some(TrapCode::HEAP_OUT_OF_BOUNDS));
+        let value = builder.ins().load(types::I32, flags, pointer, 0);
+        builder.ins().return_(&[value]);
+        builder.finish().unwrap();
+        assert!(super::super::aarch64::compile_graph(&graph).is_err());
+        compiler.context.func.signature = signature;
+        let machine = compiler
+            .machine_code(
+                id,
+                "fallback_test",
+                &mut Annotations::default(),
+                Some(&graph),
+            )
             .unwrap();
-        match super::super::aarch64::compile(&function) {
-            Err(reason) => assert!(reason.0.contains("popcnt"), "{}", reason.0),
-            Ok(_) => panic!("native backend unexpectedly accepted popcnt"),
-        }
-        compiler.context.func = function;
-        let machine = compiler.machine_code(id, "fallback_test").unwrap();
         assert!(compiler.context.compiled_code().is_some());
         machine.define(&mut compiler.module, id).unwrap();
         compiler.module.finalize_definitions().unwrap();
-        let load: extern "C" fn(*const u32, u64) -> u32 =
+        let load: extern "C" fn(*const u32) -> u32 =
             unsafe { std::mem::transmute(compiler.module.get_finalized_function(id)) };
-        let array = [17, 257, u32::MAX];
-        assert_eq!(load(array.as_ptr(), 2), u32::MAX);
+        let value = 257;
+        assert_eq!(load(&value), value);
     }
 }

@@ -173,12 +173,19 @@ pub(in crate::jit::semantic) fn promote(graph: &mut Graph, notes: &mut Vec<Strin
 
 pub(in crate::jit::semantic) fn remove_trivial_params(graph: &mut Graph) {
     let blocks = Cfg::new(graph).rpo;
+    remove_trivial_params_in(graph, &blocks);
+}
+
+pub(in crate::jit::semantic) fn remove_trivial_params_in(graph: &mut Graph, blocks: &[Block]) {
     loop {
         let mut incoming: HashMap<Value, Vec<Value>> = HashMap::new();
-        for &block in &blocks {
+        for &block in blocks {
             let data = &graph.blocks[block];
             if let Some(terminator) = &data.terminator {
                 for target in terminator.kind.targets() {
+                    if target.block == graph.entry {
+                        continue;
+                    }
                     for (&param, &arg) in graph.blocks[target.block].params.iter().zip(&target.args)
                     {
                         incoming.entry(param).or_default().push(arg);
@@ -223,7 +230,7 @@ pub(in crate::jit::semantic) fn remove_trivial_params(graph: &mut Graph) {
                 )
             })
             .collect();
-        for &block in &blocks {
+        for &block in blocks {
             let data = &mut graph.blocks[block];
             if let Some(terminator) = &mut data.terminator {
                 for target in terminator.kind.targets_mut() {

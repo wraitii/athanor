@@ -35,14 +35,14 @@ remain available for specialization and inlining. A filter with no matches is an
 error. Compilation options cannot be combined with `--load`, `--function`,
 `--arg`, `--map`, or `--repl`.
 
-- Semantic IR is the default: the actual graph passed to CLIF emission, including
+- Semantic IR is the default: the graph passed to runtime lowering, including
   OSR instrumentation when enabled. `--no-semantic-ir` (also `--no-ir`) suppresses
   it; `--semantic-ir` enables it again. `JS_JIT_SSA=0` selects the unoptimized
-  semantic graph and disables engine CLIF cleanup; Cranelift still uses its normal
-  optimization level.
-- `--clif` adds Cranelift IR before and after backend preparation: our block-parameter
-  cleanup for the native backend, or Cranelift optimization for its backend.
-  The first view includes a helper-call legend; neither view includes register allocation.
+  semantic graph; Cranelift still uses its normal optimization level.
+- `--clif` adds a Cranelift IR view before and after backend preparation. For
+  native code this view is constructed for inspection; the native backend consumes
+  the lowered graph. The first view includes a helper-call legend; neither view
+  includes register allocation.
 - `--planner` prints the inline budget, available call/read feedback, selected
   inlines, read refinements, conditional effects/identity guards, OSR plans, and
   optimization notes. It also shows the region tree before versioning and the
@@ -258,9 +258,9 @@ the optimized tier. The former `JS_JIT_SYNC_OPT_LEVEL` and
 `JS_JIT_SYNC_SINGLE_PASS` settings and their `EngineOptions` fields were removed.
 
 The native AArch64 path skips Cranelift optimization, including during background
-recompilation. It runs our redundant block-parameter elimination before native
-instruction selection and allocation. Cranelift optimization still runs for its
-own backend, including native backend fallbacks.
+recompilation. It selects and allocates directly from the graph produced by shared
+runtime lowering. Cranelift optimization still runs for its own backend, including
+native backend fallbacks.
 
 Set `JS_JIT_RECOMPILE_LOG=1` (`EngineOptions::recompile_log`) to trace recompilation
 to stderr in either mode. Events include feedback sites and types, requests,

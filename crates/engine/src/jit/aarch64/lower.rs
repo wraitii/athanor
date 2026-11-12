@@ -1,10 +1,7 @@
 use cranelift_codegen::binemit::Reloc;
 use cranelift_codegen::entity::SecondaryMap;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
-use cranelift_codegen::ir::{
-    ArgumentExtension, Block, BlockCall, ExternalName, FuncRef, Function, Inst, InstructionData,
-    Opcode, SigRef, Type, Value, types,
-};
+use cranelift_codegen::ir::{ArgumentExtension, Opcode, Signature, Type, types};
 use cranelift_codegen::isa::CallConv;
 use cranelift_module::{ModuleReloc, ModuleRelocTarget};
 
@@ -16,11 +13,15 @@ use super::encode::{
     self as e, Alu, Cond, Extend, Float, FloatOp, FloatUnary, Index, Mem, Shift, Width,
 };
 use super::select::{
-    self, Address, Binary, CompareImmediate, Comparison, Immediate, Selection, remat_bits,
+    self as select, Address, Binary, CompareImmediate, Comparison, Immediate, Selection, remat_bits,
 };
 use crate::jit::alloc::moves::{self, Loc, Move};
-use crate::jit::alloc::{self, Allocation, Frame, Hint, Place, RegClass};
+use crate::jit::alloc::{
+    RegClass,
+    graph::{self as alloc, Allocation, Frame, Hint, Place},
+};
 use crate::jit::machine::{MachineCode, SourceRange};
+use crate::jit::semantic::{Block, Cfg, Graph, Inst, Op, Target, TerminatorKind, Value, low_level};
 
 const T0: u8 = 9;
 const T1: u8 = 10;
@@ -30,18 +31,31 @@ const ADDRESS: u8 = 17;
 const F0: u8 = 16;
 const F1: u8 = 17;
 
-pub(super) fn lower(func: &Function) -> Result<MachineCode, Unsupported> {
-    check_function(func)?;
-    let order = block_order(func);
-    let hints = hints(func)?;
-    let selection = Selection::new(func);
+pub(super) fn lower(func: &Graph) -> Result<MachineCode, Unsupported> {
+    let cfg = Cfg::new(func);
+    check_function(func, &cfg.rpo)?;
+    let order = block_order(func, &cfg.rpo);
+    let hints = hints(func, &cfg.rpo)?;
+    let selection = Selection::new(func, &cfg.rpo);
     let operands = |inst, out: &mut Vec<Value>| selection.operands(func, inst, out);
+    let terminator_operands =
+        |block, out: &mut Vec<Value>| selection.terminator_operands(func, block, out);
     let mut remat = SecondaryMap::new();
-    for value in func.dfg.values() {
+    for value in func.values.keys() {
         remat[value] = select::remat_cost(func, value);
     }
-    let allocation = alloc::allocate(func, &order, &TARGET, &hints, &operands, &remat, &|_| true)
-        .map_err(Unsupported)?;
+    let allocation = alloc::allocate(
+        func,
+        &cfg,
+        &order,
+        &TARGET,
+        &hints,
+        &operands,
+        &terminator_operands,
+        &remat,
+        &|_| true,
+    )
+    .map_err(Unsupported)?;
     match lower_with(func, &order, &allocation, &selection, false)? {
         Some(machine) => Ok(machine),
         None => lower_with(func, &order, &allocation, &selection, true)?
@@ -50,15 +64,16 @@ pub(super) fn lower(func: &Function) -> Result<MachineCode, Unsupported> {
 }
 
 fn lower_with(
-    func: &Function,
+    func: &Graph,
     order: &[Block],
     allocation: &Allocation,
     selection: &Selection,
     far: bool,
 ) -> Result<Option<MachineCode>, Unsupported> {
-    let conv = func.signature.call_conv;
-    let incoming = abi::assign(conv, &func.signature.params)?.stack_size;
-    let (outgoing, tail_calls) = call_stack_sizes(func)?;
+    let conv = func.low_level_signature.as_ref().unwrap().call_conv;
+    let incoming =
+        abi::assign(conv, &func.low_level_signature.as_ref().unwrap().params)?.stack_size;
+    let (outgoing, tail_calls) = call_stack_sizes(func, order)?;
     if tail_calls > 0 && conv != CallConv::Tail {
         return Err(Unsupported(format!("tail call from {conv}")));
     }
@@ -67,10 +82,7 @@ fn lower_with(
     if frame.size >= 1 << 24 || tail_args >= 1 << 24 {
         return Err(Unsupported("frame too large".into()));
     }
-    let entry = func
-        .layout
-        .entry_block()
-        .ok_or_else(|| Unsupported("no entry block".into()))?;
+    let entry = func.entry;
     let mut lower = Lower {
         func,
         allocation,
@@ -87,7 +99,7 @@ fn lower_with(
         locations: Vec::new(),
         block_starts: Vec::new(),
     };
-    for block in func.layout.blocks() {
+    for block in func.blocks.keys() {
         lower.labels[block] = Some(lower.asm.label());
     }
     lower.prologue()?;
@@ -121,53 +133,58 @@ fn lower_with(
     }))
 }
 
-fn check_function(func: &Function) -> Result<(), Unsupported> {
-    if func.stack_limit.is_some() {
-        return Err(Unsupported("stack limit".into()));
-    }
-    if !func.dynamic_stack_slots.is_empty() {
-        return Err(Unsupported("dynamic stack slots".into()));
-    }
-    if let Some(param) = func
-        .signature
+fn check_function(graph: &Graph, order: &[Block]) -> Result<(), Unsupported> {
+    let signature = graph
+        .low_level_signature
+        .as_ref()
+        .ok_or_else(|| Unsupported("missing signature".into()))?;
+    if let Some(param) = signature
         .returns
         .iter()
-        .find(|param| param.extension != ArgumentExtension::None)
+        .find(|p| p.extension != ArgumentExtension::None)
     {
         return Err(Unsupported(format!("extended return {param}")));
     }
-    for value in func.dfg.values() {
-        let ty = func.dfg.value_type(value);
-        if RegClass::of(ty).is_none() {
-            return Err(Unsupported(format!("value type {ty}")));
+    for &block in order {
+        for &value in &graph.blocks[block].params {
+            let ty = graph.low_level_types[value]
+                .ok_or_else(|| Unsupported(format!("missing type for {value}")))?;
+            if RegClass::of(ty).is_none() {
+                return Err(Unsupported(format!("value type {ty}")));
+            }
+        }
+        for &inst in &graph.blocks[block].insts {
+            for &value in &graph.insts[inst].results {
+                let ty = graph.low_level_types[value]
+                    .ok_or_else(|| Unsupported(format!("missing type for {value}")))?;
+                if RegClass::of(ty).is_none() {
+                    return Err(Unsupported(format!("value type {ty}")));
+                }
+            }
         }
     }
     Ok(())
 }
 
-fn call_stack_sizes(func: &Function) -> Result<(u32, u32), Unsupported> {
-    let mut outgoing = 0;
-    let mut tail = 0;
-    for block in func.layout.blocks() {
-        for inst in func.layout.block_insts(block) {
-            let Some(sig_ref) = func.dfg.call_signature(inst) else {
-                continue;
-            };
-            let signature = &func.dfg.signatures[sig_ref];
-            let size = abi::assign(signature.call_conv, &signature.params)?.stack_size;
-            let target = if func.dfg.insts[inst].opcode().is_return() {
-                &mut tail
-            } else {
-                &mut outgoing
-            };
-            *target = size.max(*target);
+fn call_stack_sizes(graph: &Graph, order: &[Block]) -> Result<(u32, u32), Unsupported> {
+    let (mut outgoing, mut tail) = (0, 0);
+    for &block in order {
+        for &inst in &graph.blocks[block].insts {
+            if let Op::LowLevel(low_level::Op::Call { signature, .. }) = &graph.insts[inst].op {
+                outgoing =
+                    outgoing.max(abi::assign(signature.call_conv, &signature.params)?.stack_size);
+            }
+        }
+        if let Some(term) = &graph.blocks[block].terminator {
+            if let TerminatorKind::TailCall { signature, .. } = &term.kind {
+                tail = tail.max(abi::assign(signature.call_conv, &signature.params)?.stack_size);
+            }
         }
     }
     Ok((outgoing, tail))
 }
 
-fn hints(func: &Function) -> Result<Vec<Hint>, Unsupported> {
-    let dfg = &func.dfg;
+fn hints(graph: &Graph, order: &[Block]) -> Result<Vec<Hint>, Unsupported> {
     let mut hints = Vec::new();
     let mut add = |values: &[Value], locations: &[Location], block: Block| {
         for (&value, location) in values.iter().zip(locations) {
@@ -181,42 +198,45 @@ fn hints(func: &Function) -> Result<Vec<Hint>, Unsupported> {
             }
         }
     };
-    let signature = &func.signature;
-    if let Some(entry) = func.layout.entry_block() {
-        let locations = abi::assign(signature.call_conv, &signature.params)?.locations;
-        add(dfg.block_params(entry), &locations, entry);
-    }
-    for block in func.layout.blocks() {
-        for inst in func.layout.block_insts(block) {
-            let opcode = dfg.insts[inst].opcode();
-            let args = dfg.inst_args(inst);
-            if opcode == Opcode::Return {
-                let locations = abi::assign_returns(signature.call_conv, &signature.returns)?;
+    let signature = graph.low_level_signature.as_ref().unwrap();
+    let locations = abi::assign(signature.call_conv, &signature.params)?.locations;
+    add(&graph.blocks[graph.entry].params, &locations, graph.entry);
+    for &block in order {
+        for &inst in &graph.blocks[block].insts {
+            if let Op::LowLevel(low_level::Op::Call {
+                signature, args, ..
+            }) = &graph.insts[inst].op
+            {
+                let locations = abi::assign(signature.call_conv, &signature.params)?.locations;
                 add(args, &locations, block);
-                continue;
+                let locations = abi::assign_returns(signature.call_conv, &signature.returns)?;
+                add(&graph.insts[inst].results, &locations, block);
             }
-            let Some(sig_ref) = dfg.call_signature(inst) else {
-                continue;
-            };
-            let callee = &dfg.signatures[sig_ref];
-            let args = match opcode {
-                Opcode::CallIndirect | Opcode::ReturnCallIndirect => &args[1..],
-                _ => args,
-            };
-            let locations = abi::assign(callee.call_conv, &callee.params)?.locations;
-            add(args, &locations, block);
-            let locations = abi::assign_returns(callee.call_conv, &callee.returns)?;
-            add(dfg.inst_results(inst), &locations, block);
+        }
+        if let Some(term) = &graph.blocks[block].terminator {
+            match &term.kind {
+                TerminatorKind::ReturnValues(values) => {
+                    let locations = abi::assign_returns(signature.call_conv, &signature.returns)?;
+                    add(values, &locations, block);
+                }
+                TerminatorKind::TailCall {
+                    signature, args, ..
+                } => {
+                    let locations = abi::assign(signature.call_conv, &signature.params)?.locations;
+                    add(args, &locations, block);
+                }
+                _ => {}
+            }
         }
     }
     Ok(hints)
 }
 
-fn block_order(func: &Function) -> Vec<Block> {
-    let (cold, mut hot): (Vec<_>, Vec<_>) = func
-        .layout
-        .blocks()
-        .partition(|&block| func.layout.is_cold(block) && Some(block) != func.layout.entry_block());
+fn block_order(graph: &Graph, order: &[Block]) -> Vec<Block> {
+    let (cold, mut hot): (Vec<_>, Vec<_>) = order
+        .iter()
+        .copied()
+        .partition(|&block| graph.cold.contains(&block) && block != graph.entry);
     hot.extend(cold);
     hot
 }
@@ -330,7 +350,7 @@ impl Test {
 }
 
 struct Lower<'a> {
-    func: &'a Function,
+    func: &'a Graph,
     allocation: &'a Allocation,
     selection: &'a Selection,
     stubs: Vec<(Label, Vec<Move>, Block)>,
@@ -352,7 +372,7 @@ impl Lower<'_> {
     }
 
     fn ty(&self, value: Value) -> Type {
-        self.func.dfg.value_type(value)
+        self.func.low_level_types[value].unwrap()
     }
 
     fn class(&self, value: Value) -> RegClass {
@@ -641,7 +661,7 @@ impl Lower<'_> {
 
     fn prologue(&mut self) -> Result<(), Unsupported> {
         let func = self.func;
-        let signature = &func.signature;
+        let signature = &func.low_level_signature.as_ref().unwrap();
         let locations = abi::assign(signature.call_conv, &signature.params)?.locations;
         abi::assign_returns(signature.call_conv, &signature.returns)?;
         self.adjust_sp(self.tail_args - self.incoming, true);
@@ -649,7 +669,7 @@ impl Lower<'_> {
         self.asm.emit(e::mov_sp(e::FP, e::SP));
         self.adjust_sp(self.frame.size, true);
         self.callee_saves(false);
-        let params = func.dfg.block_params(self.block);
+        let params = &func.blocks[self.block].params;
         let moves = params
             .iter()
             .zip(&locations)
@@ -692,63 +712,81 @@ impl Lower<'_> {
         self.block_starts.push(self.asm.offset());
         let label = self.label(block);
         self.asm.bind(label);
-        for inst in self.func.layout.block_insts(block) {
+        for &inst in &self.func.blocks[block].insts {
             let start = self.asm.offset();
-            self.inst(inst, next)?;
+            self.inst(inst)?;
             let end = self.asm.offset();
-            let location = self.func.srcloc(inst);
             if end > start {
                 self.locations.push(SourceRange {
                     start,
                     end,
-                    location: (!location.is_default()).then(|| location.bits()),
+                    location: self.func.insts[inst].emission_location,
                 });
             }
+        }
+        let terminator = self.func.blocks[block]
+            .terminator
+            .as_ref()
+            .ok_or_else(|| Unsupported(format!("missing terminator for {block}")))?;
+        let start = self.asm.offset();
+        self.terminator(&terminator.kind, next)?;
+        let end = self.asm.offset();
+        if end > start {
+            self.locations.push(SourceRange {
+                start,
+                end,
+                location: terminator.emission_location,
+            });
         }
         Ok(())
     }
 
-    fn edge_moves(&self, call: BlockCall) -> Result<Vec<Move>, Unsupported> {
-        let dfg = &self.func.dfg;
-        let target = call.block(&dfg.value_lists);
-        let params = dfg.block_params(target);
-        let mut pending = Vec::with_capacity(params.len());
-        for (arg, &param) in call.args(&dfg.value_lists).zip(params) {
-            let arg = arg
-                .as_value()
-                .ok_or_else(|| Unsupported("non-value block argument".into()))?;
+    fn edge_moves(&self, target: &Target) -> Vec<Move> {
+        let mut pending = Vec::new();
+        for (&arg, &param) in target
+            .args
+            .iter()
+            .zip(&self.func.blocks[target.block].params)
+        {
             pending.push(Move {
                 class: self.class(param),
                 from: self.loc(arg),
-                to: self.loc_in(param, target),
+                to: self.loc_in(param, target.block),
             });
         }
-        if self.allocation.is_cold(self.block) != self.allocation.is_cold(target) {
-            for &value in self.allocation.boundary(target) {
-                let to = self.loc_in(value, target);
-                if matches!(to, Loc::Imm(_)) {
-                    continue;
+        if self.allocation.is_cold(self.block) != self.allocation.is_cold(target.block) {
+            for &value in self.allocation.boundary(target.block) {
+                let to = self.loc_in(value, target.block);
+                if !matches!(to, Loc::Imm(_)) {
+                    pending.push(Move {
+                        class: self.class(value),
+                        from: self.loc(value),
+                        to,
+                    });
                 }
-                pending.push(Move {
-                    class: self.class(value),
-                    from: self.loc(value),
-                    to,
-                });
             }
         }
         pending.retain(|m| m.from != m.to);
-        Ok(pending)
+        pending
     }
 
-    fn edge(&mut self, call: BlockCall, next: Option<Block>) -> Result<(), Unsupported> {
-        let moves = self.edge_moves(call)?;
+    fn edge(&mut self, target: &Target, next: Option<Block>) {
+        let moves = self.edge_moves(target);
         self.parallel(moves);
-        let target = call.block(&self.func.dfg.value_lists);
-        if next != Some(target) {
-            let label = self.label(target);
+        if next != Some(target.block) {
+            let label = self.label(target.block);
             self.asm.jump(e::B, label);
         }
-        Ok(())
+    }
+
+    fn edge_target(&mut self, target: &Target) -> Label {
+        let moves = self.edge_moves(target);
+        if moves.is_empty() {
+            return self.label(target.block);
+        }
+        let label = self.asm.label();
+        self.stubs.push((label, moves, target.block));
+        label
     }
 
     fn condition(&mut self, value: Value) -> Cond {
@@ -767,69 +805,69 @@ impl Lower<'_> {
         Cond::Ne
     }
 
-    fn fused_flags(&mut self, def: Inst) -> Cond {
-        let dfg = &self.func.dfg;
-        let args = dfg.inst_args(def);
-        match dfg.insts[def] {
-            InstructionData::IntCompare { cond, .. } => self.compare(cond, args[0], args[1]),
-            InstructionData::FloatCompare { cond, .. } => {
-                let ty = float(self.ty(args[0]));
-                let a = self.use_reg(args[0], F0);
-                let b = self.use_reg(args[1], F1);
+    fn fused_flags(&mut self, inst: Inst) -> Cond {
+        match self.func.insts[inst].op {
+            Op::LowLevel(low_level::Op::IntCompare {
+                condition,
+                left,
+                right,
+            }) => self.compare(condition, left, right),
+            Op::LowLevel(low_level::Op::FloatCompare {
+                condition,
+                left,
+                right,
+            }) => {
+                let ty = float(self.ty(left));
+                let a = self.use_reg(left, F0);
+                let b = self.use_reg(right, F1);
                 self.asm.emit(e::fcmp(ty, a, b));
-                float_conds(cond).0
+                float_conds(condition).0
             }
-            _ => unreachable!("only compares are fused"),
+            _ => unreachable!(),
         }
     }
 
-    fn select_condition(&mut self, value: Value, user: Inst) -> Cond {
-        match self.selection.compare(user) {
-            Some(def) => self.fused_flags(def),
-            None => self.condition(value),
-        }
-    }
-
-    fn zero_test(&mut self, value: Value, nonzero: bool) -> Option<Test> {
-        let ty = self.ty(value);
-        if !matches!(ty, types::I32 | types::I64) {
-            return None;
-        }
-        let reg = self.use_reg(value, T0);
-        Some(Test::Zero {
-            nonzero,
-            width: width(ty),
-            reg,
-        })
-    }
-
-    fn branch_test(&mut self, value: Value, user: Inst) -> Test {
-        let dfg = &self.func.dfg;
-        let Some(def) = self.selection.compare(user) else {
-            return self
-                .zero_test(value, true)
-                .unwrap_or_else(|| Test::Flags(self.condition(value)));
-        };
-        if let InstructionData::IntCompare {
-            cond: cond @ (IntCC::Equal | IntCC::NotEqual),
-            ..
-        } = dfg.insts[def]
+    fn fused_branch_test(&mut self, inst: Inst) -> Test {
+        if let Op::LowLevel(low_level::Op::IntCompare {
+            condition: cond @ (IntCC::Equal | IntCC::NotEqual),
+            left,
+            right,
+        }) = self.func.insts[inst].op
         {
-            let args = dfg.inst_args(def);
-            let operand = if self.constant(args[1]) == Some(0) {
-                Some(args[0])
-            } else if self.constant(args[0]) == Some(0) {
-                Some(args[1])
+            let value = if self.constant(right) == Some(0) {
+                Some(left)
+            } else if self.constant(left) == Some(0) {
+                Some(right)
             } else {
                 None
             };
-            if let Some(test) =
-                operand.and_then(|operand| self.zero_test(operand, cond == IntCC::NotEqual))
-            {
-                return test;
+            if let Some(value) = value {
+                let ty = self.ty(value);
+                if matches!(ty, types::I32 | types::I64) {
+                    let reg = self.use_reg(value, T0);
+                    return Test::Zero {
+                        nonzero: cond == IntCC::NotEqual,
+                        width: width(ty),
+                        reg,
+                    };
+                }
             }
         }
-        Test::Flags(self.fused_flags(def))
+        Test::Flags(self.fused_flags(inst))
+    }
+
+    fn branch_test(&mut self, value: Value) -> Test {
+        let ty = self.ty(value);
+        if matches!(ty, types::I32 | types::I64) {
+            let reg = self.use_reg(value, T0);
+            Test::Zero {
+                nonzero: true,
+                width: width(ty),
+                reg,
+            }
+        } else {
+            Test::Flags(self.condition(value))
+        }
     }
 
     fn branch_if(&mut self, test: Test, target: Label) {
@@ -849,17 +887,15 @@ impl Lower<'_> {
 
     fn call(
         &mut self,
-        inst: Inst,
-        sig_ref: SigRef,
+        signature: &Signature,
         args: &[Value],
+        results: &[Value],
         callee: Option<Value>,
+        tail: bool,
         emit: impl FnOnce(&mut Self),
     ) -> Result<(), Unsupported> {
-        let func = self.func;
-        let signature = &func.dfg.signatures[sig_ref];
         let conv = signature.call_conv;
         let assignment = abi::assign(conv, &signature.params)?;
-        let tail = func.dfg.insts[inst].opcode().is_return();
         let (base, area) = if tail {
             (
                 e::FP,
@@ -918,32 +954,18 @@ impl Lower<'_> {
             self.adjust_sp(assignment.stack_size, true);
         }
         let locations = abi::assign_returns(conv, &signature.returns)?;
-        let results = func.dfg.inst_results(inst);
-        let mut pending = Vec::with_capacity(results.len());
+        let mut pending = Vec::new();
         for (&result, location) in results.iter().zip(locations) {
-            let Location::Reg { class, reg } = location else {
-                continue;
-            };
-            pending.push(Move {
-                class,
-                from: Loc::Reg(class, reg),
-                to: self.loc(result),
-            });
+            if let Location::Reg { class, reg } = location {
+                pending.push(Move {
+                    class,
+                    from: Loc::Reg(class, reg),
+                    to: self.loc(result),
+                });
+            }
         }
         self.parallel(pending);
         Ok(())
-    }
-
-    fn direct_target(&self, func_ref: FuncRef) -> Result<ModuleRelocTarget, Unsupported> {
-        let external = &self.func.dfg.ext_funcs[func_ref];
-        if !external.colocated {
-            return Err(Unsupported("non-colocated call".into()));
-        }
-        let ExternalName::User(name) = &external.name else {
-            return Err(Unsupported("non-user call target".into()));
-        };
-        let name = &self.func.params.user_named_funcs()[*name];
-        Ok(ModuleRelocTarget::user(name.namespace, name.index))
     }
 
     fn emit_call(&mut self, word: u32, target: ModuleRelocTarget) {
@@ -956,56 +978,266 @@ impl Lower<'_> {
         self.asm.emit(word);
     }
 
-    fn tail_jump(&mut self, sig_ref: SigRef) -> Result<(), Unsupported> {
-        let signature = &self.func.dfg.signatures[sig_ref];
-        let stack_size = abi::assign(signature.call_conv, &signature.params)?.stack_size;
-        self.epilogue(self.tail_args - stack_size);
+    fn terminator(
+        &mut self,
+        kind: &TerminatorKind,
+        next: Option<Block>,
+    ) -> Result<(), Unsupported> {
+        match kind {
+            TerminatorKind::Jump(target) => self.edge(target, next),
+            TerminatorKind::Branch(value, yes, no) => {
+                let test = match self.selection.branch_compare(self.block) {
+                    Some(def) => self.fused_branch_test(def),
+                    None => self.branch_test(*value),
+                };
+                let then_block = yes.block;
+                let then_moves = self.edge_moves(yes);
+                if next == Some(then_block) && then_moves.is_empty() {
+                    let target = self.edge_target(no);
+                    self.branch_if(test.invert(), target);
+                } else {
+                    let target = self.edge_target(yes);
+                    self.branch_if(test, target);
+                    self.edge(no, next);
+                }
+            }
+            TerminatorKind::Switch(value, cases, default) => {
+                let ty = self.ty(*value);
+                let mut reg = self.use_reg(*value, T0);
+                let extension = match ty {
+                    types::I8 => Some(Extend::Uxtb),
+                    types::I16 => Some(Extend::Uxth),
+                    _ => None,
+                };
+                if let Some(extension) = extension {
+                    self.asm.emit(e::extend(extension, Width::W, T0, reg));
+                    reg = T0;
+                }
+                for (key, target) in cases {
+                    if *key >= (1u128 << ty.bits()) {
+                        continue;
+                    }
+                    if let Some((imm, shift)) = e::arith_imm(*key as i64) {
+                        self.asm.emit(e::subs_imm(width(ty), e::ZR, reg, imm, shift));
+                    } else {
+                        self.mov_imm(Width::X, T1, *key as u64);
+                        self.asm.emit(e::alu(Alu::Subs, width(ty), e::ZR, reg, T1));
+                    }
+                    let label = self.edge_target(target);
+                    self.asm.branch(Cond::Eq, label);
+                }
+                self.edge(default, next);
+            }
+            TerminatorKind::ReturnValues(values) => {
+                let signature = self.func.low_level_signature.as_ref().unwrap();
+                let locations = abi::assign_returns(signature.call_conv, &signature.returns)?;
+                let mut pending = Vec::with_capacity(values.len());
+                for (&value, location) in values.iter().zip(locations) {
+                    if let Location::Reg { class, reg } = location {
+                        pending.push(Move {
+                            class,
+                            from: self.loc(value),
+                            to: Loc::Reg(class, reg),
+                        });
+                    }
+                }
+                self.parallel(pending);
+                self.epilogue(self.pop);
+                self.asm.emit(e::RET);
+            }
+            TerminatorKind::TailCall {
+                target,
+                signature,
+                args,
+            } => match target {
+                low_level::CallTarget::Direct(id) => {
+                    self.call(signature, args, &[], None, true, |_| {})?;
+                    let size = abi::assign(signature.call_conv, &signature.params)?.stack_size;
+                    self.epilogue(self.tail_args - size);
+                    self.emit_call(e::B, ModuleRelocTarget::user(0, id.as_u32()));
+                }
+                low_level::CallTarget::Indirect(value) => {
+                    self.call(signature, args, &[], Some(*value), true, |_| {})?;
+                    let size = abi::assign(signature.call_conv, &signature.params)?.stack_size;
+                    self.epilogue(self.tail_args - size);
+                    self.asm.emit(e::br(CALLEE));
+                }
+            },
+            _ => return Err(Unsupported("non-low-level terminator".into())),
+        }
         Ok(())
     }
 
-    fn edge_target(&mut self, call: BlockCall) -> Result<Label, Unsupported> {
-        let moves = self.edge_moves(call)?;
-        Ok(self.stub(call, moves))
-    }
-
-    fn stub(&mut self, call: BlockCall, moves: Vec<Move>) -> Label {
-        let target = call.block(&self.func.dfg.value_lists);
-        if moves.is_empty() {
-            return self.label(target);
-        }
-        let label = self.asm.label();
-        self.stubs.push((label, moves, target));
-        label
-    }
-
-    fn inst(&mut self, inst: Inst, next: Option<Block>) -> Result<(), Unsupported> {
+    fn inst(&mut self, inst: Inst) -> Result<(), Unsupported> {
         if self.selection.skips(inst) {
             return Ok(());
         }
-        let func = self.func;
-        let dfg = &func.dfg;
-        let data = &dfg.insts[inst];
-        let opcode = data.opcode();
-        let args = dfg.inst_args(inst);
-        let result = dfg.inst_results(inst).first().copied();
+        let data = &self.func.insts[inst];
+        let result = data.results.first().copied();
         let result_ty = result.map(|result| self.ty(result));
-        match (opcode, data) {
-            (Opcode::Iconst | Opcode::F64const | Opcode::F32const, _) => {
+        if let Op::Memory(low_level_memory) = &data.op {
+            use crate::jit::semantic::{MemoryFormat as F, MemoryOp as M};
+            let result = result.ok_or_else(|| Unsupported("memory result".into()))?;
+            match *low_level_memory {
+                M::IndexedLoad { .. } => {
+                    let (address, op) = select::indexed_load(self.func, inst)
+                        .ok_or_else(|| Unsupported("indexed load".into()))?;
+                    let Address::Indexed {
+                        base,
+                        index,
+                        kind,
+                        scaled,
+                    } = address
+                    else {
+                        unreachable!()
+                    };
+                    let base = self.use_reg(base, T1);
+                    let index = self.use_reg(index, T2);
+                    let scratch = if matches!(op, Mem::LdrS | Mem::LdrD) {
+                        F0
+                    } else {
+                        T0
+                    };
+                    let d = self.def_reg(result, scratch);
+                    self.asm
+                        .emit(e::mem_indexed(op, d, base, index, kind, scaled));
+                    self.commit(result, d);
+                }
+                M::Address {
+                    base,
+                    index,
+                    format,
+                } => {
+                    if self.ty(index) != types::I64 {
+                        return Err(Unsupported("memory address index type".into()));
+                    }
+                    let base = self.use_reg(base, T0);
+                    let index = self.use_reg(index, T1);
+                    let d = self.def_reg(result, T0);
+                    self.asm.emit(e::add_lsl(
+                        Width::X,
+                        d,
+                        base,
+                        index,
+                        format.bytes().trailing_zeros(),
+                    ));
+                    self.commit(result, d);
+                }
+                M::Load { address, format } => {
+                    let op = match format {
+                        F::U8 | F::I8 => Mem::Ldrb,
+                        F::U16 | F::I16 => Mem::Ldrh,
+                        F::U32 | F::I32 => Mem::LdrW,
+                        F::F32 => Mem::LdrS,
+                        F::F64 => Mem::LdrD,
+                    };
+                    let scratch = if matches!(op, Mem::LdrS | Mem::LdrD) {
+                        F0
+                    } else {
+                        T0
+                    };
+                    let d = self.def_reg(result, scratch);
+                    self.access(inst, op, d, address, 0);
+                    self.commit(result, d);
+                }
+            }
+            return Ok(());
+        }
+        let Op::LowLevel(op) = &data.op else {
+            return Err(Unsupported("non-low-level operation".into()));
+        };
+        if let low_level::Op::Call {
+            target,
+            signature,
+            args,
+            ..
+        } = op
+        {
+            match target {
+                low_level::CallTarget::Direct(id) => {
+                    let target = ModuleRelocTarget::user(0, id.as_u32());
+                    self.call(signature, args, &data.results, None, false, |this| {
+                        this.emit_call(e::BL, target)
+                    })?;
+                }
+                low_level::CallTarget::Indirect(callee) => {
+                    self.call(
+                        signature,
+                        args,
+                        &data.results,
+                        Some(*callee),
+                        false,
+                        |this| this.asm.emit(e::blr(CALLEE)),
+                    )?;
+                }
+            }
+            return Ok(());
+        }
+        let args = data.op.operands();
+        use low_level::{Binary as B, Op as L, Unary as U};
+        let opcode = match op {
+            L::Integer { .. } => Opcode::Iconst,
+            L::Float64(_) => Opcode::F64const,
+            L::Unary { op, .. } => match op {
+                U::BitNot => Opcode::Bnot,
+                U::FloatNeg => Opcode::Fneg,
+                U::FloatAbs => Opcode::Fabs,
+                U::Ceil => Opcode::Ceil,
+                U::Floor => Opcode::Floor,
+                U::Trunc => Opcode::Trunc,
+                U::Sqrt => Opcode::Sqrt,
+                U::Reduce => Opcode::Ireduce,
+                U::SignExtend => Opcode::Sextend,
+                U::ZeroExtend => Opcode::Uextend,
+                U::Bitcast => Opcode::Bitcast,
+                U::FloatPromote => Opcode::Fpromote,
+                U::FloatDemote => Opcode::Fdemote,
+                U::FloatFromSigned => Opcode::FcvtFromSint,
+                U::FloatFromUnsigned => Opcode::FcvtFromUint,
+                U::SignedSaturatingFromFloat => Opcode::FcvtToSintSat,
+            },
+            L::Binary { op, .. } => match op {
+                B::Add => Opcode::Iadd,
+                B::Subtract => Opcode::Isub,
+                B::Multiply => Opcode::Imul,
+                B::And => Opcode::Band,
+                B::Or => Opcode::Bor,
+                B::Xor => Opcode::Bxor,
+                B::ShiftLeft => Opcode::Ishl,
+                B::ShiftRightSigned => Opcode::Sshr,
+                B::ShiftRightUnsigned => Opcode::Ushr,
+                B::FloatAdd => Opcode::Fadd,
+                B::FloatSubtract => Opcode::Fsub,
+                B::FloatMultiply => Opcode::Fmul,
+                B::FloatDivide => Opcode::Fdiv,
+                B::FloatMin => Opcode::Fmin,
+                B::FloatMax => Opcode::Fmax,
+            },
+            L::IntCompare { .. } => Opcode::Icmp,
+            L::FloatCompare { .. } => Opcode::Fcmp,
+            L::Select { .. } => Opcode::Select,
+            L::Load { .. } => Opcode::Load,
+            L::AtomicLoad { .. } => Opcode::AtomicLoad,
+            L::Store { .. } => Opcode::Store,
+            L::StackAddress { .. } => Opcode::StackAddr,
+            L::StackPointer { .. } => Opcode::GetStackPointer,
+            L::VariableRead => return Err(Unsupported("unresolved variable".into())),
+            L::Call { .. } => unreachable!(),
+        };
+        match opcode {
+            Opcode::Iconst | Opcode::F64const | Opcode::F32const => {
                 let result = result.unwrap();
                 if let Loc::Reg(class, reg) = self.loc(result) {
-                    let bits = remat_bits(func, result).expect("constants have bits");
+                    let bits = remat_bits(self.func, result).expect("constants have bits");
                     self.materialize(class, reg, bits);
                 }
             }
-            (
-                Opcode::Iadd
-                | Opcode::Isub
-                | Opcode::Imul
-                | Opcode::Band
-                | Opcode::Bor
-                | Opcode::Bxor,
-                _,
-            ) => {
+            Opcode::Iadd
+            | Opcode::Isub
+            | Opcode::Imul
+            | Opcode::Band
+            | Opcode::Bor
+            | Opcode::Bxor => {
                 let result = result.unwrap();
                 if self.binary_imm(inst, result) {
                     return Ok(());
@@ -1038,7 +1270,7 @@ impl Lower<'_> {
                 self.asm.emit(word);
                 self.commit(result, d);
             }
-            (Opcode::Bnot | Opcode::Ineg, _) => {
+            Opcode::Bnot | Opcode::Ineg => {
                 let result = result.unwrap();
                 let width = width(result_ty.unwrap());
                 let a = self.use_reg(args[0], T0);
@@ -1051,7 +1283,7 @@ impl Lower<'_> {
                 self.asm.emit(word);
                 self.commit(result, d);
             }
-            (Opcode::Ishl | Opcode::Ushr | Opcode::Sshr, _) => {
+            Opcode::Ishl | Opcode::Ushr | Opcode::Sshr => {
                 let result = result.unwrap();
                 let ty = result_ty.unwrap();
                 if !matches!(ty, types::I32 | types::I64) {
@@ -1075,16 +1307,26 @@ impl Lower<'_> {
                 self.asm.emit(e::shift(op, width(ty), d, a, b));
                 self.commit(result, d);
             }
-            (Opcode::Icmp, _) => {
+            Opcode::Icmp => {
                 let result = result.unwrap();
-                let cond = self.compare(data.cond_code().unwrap(), args[0], args[1]);
+                let cond = self.compare(
+                    match op {
+                        L::IntCompare { condition, .. } => *condition,
+                        _ => unreachable!(),
+                    },
+                    args[0],
+                    args[1],
+                );
                 let d = self.def_reg(result, T0);
                 self.asm.emit(e::cset(d, cond));
                 self.commit(result, d);
             }
-            (Opcode::Fcmp, _) => {
+            Opcode::Fcmp => {
                 let result = result.unwrap();
-                let (first, second) = float_conds(data.fp_cond_code().unwrap());
+                let (first, second) = float_conds(match op {
+                    L::FloatCompare { condition, .. } => *condition,
+                    _ => unreachable!(),
+                });
                 let ty = float(self.ty(args[0]));
                 let a = self.use_reg(args[0], F0);
                 let b = self.use_reg(args[1], F1);
@@ -1097,10 +1339,13 @@ impl Lower<'_> {
                 }
                 self.commit(result, d);
             }
-            (Opcode::Select, _) => {
+            Opcode::Select => {
                 let result = result.unwrap();
                 let ty = result_ty.unwrap();
-                let cond = self.select_condition(args[0], inst);
+                let cond = match self.selection.select_compare(inst) {
+                    Some(def) => self.fused_flags(def),
+                    None => self.condition(args[0]),
+                };
                 if self.class(result) == RegClass::Float {
                     let a = self.use_reg(args[1], F0);
                     let b = self.use_reg(args[2], F1);
@@ -1115,7 +1360,7 @@ impl Lower<'_> {
                     self.commit(result, d);
                 }
             }
-            (Opcode::Bitcast | Opcode::Ireduce, _) => {
+            Opcode::Bitcast | Opcode::Ireduce => {
                 let result = result.unwrap();
                 let from = self.class(args[0]);
                 let to = self.class(result);
@@ -1147,7 +1392,7 @@ impl Lower<'_> {
                     }
                 }
             }
-            (Opcode::Uextend | Opcode::Sextend, _) => {
+            Opcode::Uextend | Opcode::Sextend => {
                 let result = result.unwrap();
                 let from = self.ty(args[0]);
                 let signed = opcode == Opcode::Sextend;
@@ -1166,24 +1411,31 @@ impl Lower<'_> {
                     .emit(e::extend(extend, width(result_ty.unwrap()), d, a));
                 self.commit(result, d);
             }
-            (
-                Opcode::Load
-                | Opcode::Uload8
-                | Opcode::Sload8
-                | Opcode::Uload16
-                | Opcode::Sload16
-                | Opcode::Uload32
-                | Opcode::Sload32,
-                _,
-            ) => {
-                if data.memflags_trap_code(dfg).is_some() {
+            Opcode::Load
+            | Opcode::Uload8
+            | Opcode::Sload8
+            | Opcode::Uload16
+            | Opcode::Sload16
+            | Opcode::Uload32
+            | Opcode::Sload32 => {
+                if match op {
+                    L::Load { flags, .. }
+                    | L::AtomicLoad { flags, .. }
+                    | L::Store { flags, .. } => flags.trap_code().is_some(),
+                    _ => false,
+                } {
                     return Err(Unsupported("trapping load".into()));
                 }
                 let result = result.unwrap();
                 let ty = result_ty.unwrap();
                 let op =
                     load_op(opcode, ty).ok_or_else(|| Unsupported(format!("{opcode}.{ty}")))?;
-                let offset = i64::from(data.load_store_offset().unwrap());
+                let offset = match &data.op {
+                    Op::LowLevel(L::Load { offset, .. } | L::Store { offset, .. }) => {
+                        i64::from(*offset)
+                    }
+                    _ => 0,
+                };
                 let scratch = if matches!(op, Mem::LdrS | Mem::LdrD) {
                     F0
                 } else {
@@ -1193,8 +1445,13 @@ impl Lower<'_> {
                 self.access(inst, op, d, args[0], offset);
                 self.commit(result, d);
             }
-            (Opcode::AtomicLoad, _) => {
-                if data.memflags_trap_code(dfg).is_some() {
+            Opcode::AtomicLoad => {
+                if match op {
+                    L::Load { flags, .. }
+                    | L::AtomicLoad { flags, .. }
+                    | L::Store { flags, .. } => flags.trap_code().is_some(),
+                    _ => false,
+                } {
                     return Err(Unsupported("trapping atomic load".into()));
                 }
                 let result = result.unwrap();
@@ -1207,14 +1464,24 @@ impl Lower<'_> {
                 self.asm.emit(e::load_acquire(ty.bytes(), d, base));
                 self.commit(result, d);
             }
-            (Opcode::Store | Opcode::Istore8 | Opcode::Istore16 | Opcode::Istore32, _) => {
-                if data.memflags_trap_code(dfg).is_some() {
+            Opcode::Store | Opcode::Istore8 | Opcode::Istore16 | Opcode::Istore32 => {
+                if match op {
+                    L::Load { flags, .. }
+                    | L::AtomicLoad { flags, .. }
+                    | L::Store { flags, .. } => flags.trap_code().is_some(),
+                    _ => false,
+                } {
                     return Err(Unsupported("trapping store".into()));
                 }
                 let ty = self.ty(args[0]);
                 let op =
                     store_op(opcode, ty).ok_or_else(|| Unsupported(format!("{opcode}.{ty}")))?;
-                let offset = i64::from(data.load_store_offset().unwrap());
+                let offset = match &data.op {
+                    Op::LowLevel(L::Load { offset, .. } | L::Store { offset, .. }) => {
+                        i64::from(*offset)
+                    }
+                    _ => 0,
+                };
                 let scratch = if matches!(op, Mem::StrS | Mem::StrD) {
                     F0
                 } else {
@@ -1227,15 +1494,12 @@ impl Lower<'_> {
                 };
                 self.access(inst, op, value, args[1], offset);
             }
-            (
-                Opcode::StackAddr,
-                InstructionData::StackAddr {
-                    stack_slot, offset, ..
-                },
-            ) => {
+            Opcode::StackAddr => {
                 let result = result.unwrap();
-                let offset =
-                    i64::from(self.frame.stack_slot(*stack_slot)) + i64::from(i32::from(*offset));
+                let L::StackAddress { slot, offset, .. } = op else {
+                    unreachable!()
+                };
+                let offset = i64::from(self.frame.stack_slot(*slot)) + i64::from(*offset);
                 let d = self.def_reg(result, T0);
                 if (0..4096).contains(&offset) {
                     self.asm
@@ -1247,21 +1511,18 @@ impl Lower<'_> {
                 }
                 self.commit(result, d);
             }
-            (Opcode::GetStackPointer, _) => {
+            Opcode::GetStackPointer => {
                 let result = result.unwrap();
                 let d = self.def_reg(result, T0);
                 self.asm.emit(e::mov_sp(d, e::SP));
                 self.commit(result, d);
             }
-            (
-                Opcode::Fadd
-                | Opcode::Fsub
-                | Opcode::Fmul
-                | Opcode::Fdiv
-                | Opcode::Fmin
-                | Opcode::Fmax,
-                _,
-            ) => {
+            Opcode::Fadd
+            | Opcode::Fsub
+            | Opcode::Fmul
+            | Opcode::Fdiv
+            | Opcode::Fmin
+            | Opcode::Fmax => {
                 let result = result.unwrap();
                 let op = match opcode {
                     Opcode::Fadd => FloatOp::Add,
@@ -1278,16 +1539,13 @@ impl Lower<'_> {
                     .emit(e::float_binary(op, float(result_ty.unwrap()), d, a, b));
                 self.commit(result, d);
             }
-            (
-                Opcode::Fneg
-                | Opcode::Fabs
-                | Opcode::Sqrt
-                | Opcode::Ceil
-                | Opcode::Floor
-                | Opcode::Trunc
-                | Opcode::Nearest,
-                _,
-            ) => {
+            Opcode::Fneg
+            | Opcode::Fabs
+            | Opcode::Sqrt
+            | Opcode::Ceil
+            | Opcode::Floor
+            | Opcode::Trunc
+            | Opcode::Nearest => {
                 let result = result.unwrap();
                 let op = match opcode {
                     Opcode::Fneg => FloatUnary::Neg,
@@ -1304,7 +1562,7 @@ impl Lower<'_> {
                     .emit(e::float_unary(op, float(result_ty.unwrap()), d, a));
                 self.commit(result, d);
             }
-            (Opcode::FcvtFromSint | Opcode::FcvtFromUint, _) => {
+            Opcode::FcvtFromSint | Opcode::FcvtFromUint => {
                 let result = result.unwrap();
                 let from = self.ty(args[0]);
                 if !matches!(from, types::I32 | types::I64) {
@@ -1321,7 +1579,7 @@ impl Lower<'_> {
                 ));
                 self.commit(result, d);
             }
-            (Opcode::FcvtToSintSat | Opcode::FcvtToUintSat, _) => {
+            Opcode::FcvtToSintSat | Opcode::FcvtToUintSat => {
                 let result = result.unwrap();
                 let ty = result_ty.unwrap();
                 if !matches!(ty, types::I32 | types::I64) {
@@ -1338,7 +1596,7 @@ impl Lower<'_> {
                 ));
                 self.commit(result, d);
             }
-            (Opcode::Fdemote | Opcode::Fpromote, _) => {
+            Opcode::Fdemote | Opcode::Fpromote => {
                 let result = result.unwrap();
                 let a = self.use_reg(args[0], F0);
                 let d = self.def_reg(result, F0);
@@ -1349,98 +1607,6 @@ impl Lower<'_> {
                 };
                 self.asm.emit(word);
                 self.commit(result, d);
-            }
-            (Opcode::CallIndirect, InstructionData::CallIndirect { sig_ref, .. }) => {
-                self.call(inst, *sig_ref, &args[1..], Some(args[0]), |this| {
-                    this.asm.emit(e::blr(CALLEE));
-                })?;
-            }
-            (Opcode::ReturnCallIndirect, InstructionData::CallIndirect { sig_ref, .. }) => {
-                self.call(inst, *sig_ref, &args[1..], Some(args[0]), |_| {})?;
-                self.tail_jump(*sig_ref)?;
-                self.asm.emit(e::br(CALLEE));
-            }
-            (Opcode::Call, InstructionData::Call { func_ref, .. }) => {
-                let target = self.direct_target(*func_ref)?;
-                let sig_ref = dfg.ext_funcs[*func_ref].signature;
-                self.call(inst, sig_ref, args, None, |this| {
-                    this.emit_call(e::BL, target)
-                })?;
-            }
-            (Opcode::ReturnCall, InstructionData::Call { func_ref, .. }) => {
-                let target = self.direct_target(*func_ref)?;
-                let sig_ref = dfg.ext_funcs[*func_ref].signature;
-                self.call(inst, sig_ref, args, None, |_| {})?;
-                self.tail_jump(sig_ref)?;
-                self.emit_call(e::B, target);
-            }
-            (Opcode::BrTable, InstructionData::BranchTable { arg, table, .. }) => {
-                let table = &dfg.jump_tables[*table];
-                let entries = table.as_slice();
-                let reg = self.use_reg(*arg, T0);
-                let index = match self.ty(*arg) {
-                    types::I8 => {
-                        self.asm.emit(e::extend(Extend::Uxtb, Width::W, T0, reg));
-                        T0
-                    }
-                    types::I16 => {
-                        self.asm.emit(e::extend(Extend::Uxth, Width::W, T0, reg));
-                        T0
-                    }
-                    types::I32 => {
-                        self.asm.emit(e::extend(Extend::Uxtw, Width::X, T0, reg));
-                        T0
-                    }
-                    _ => reg,
-                };
-                self.mov_imm(Width::X, T1, entries.len() as u64);
-                self.asm.emit(e::alu(Alu::Subs, Width::X, e::ZR, index, T1));
-                let default = self.edge_target(table.default_block())?;
-                self.asm.branch(Cond::Hs, default);
-                let start = self.asm.label();
-                self.asm.address(e::adr(T1), start);
-                self.asm.emit(e::add_lsl(Width::X, T1, T1, index, 2));
-                self.asm.emit(e::br(T1));
-                self.asm.bind(start);
-                for &entry in entries {
-                    let target = self.edge_target(entry)?;
-                    self.asm.jump(e::B, target);
-                }
-            }
-            (Opcode::Jump, InstructionData::Jump { destination, .. }) => {
-                self.edge(*destination, next)?;
-            }
-            (Opcode::Brif, InstructionData::Brif { arg, blocks, .. }) => {
-                let [then_call, else_call] = *blocks;
-                let test = self.branch_test(*arg, inst);
-                let then_block = then_call.block(&dfg.value_lists);
-                let then_moves = self.edge_moves(then_call)?;
-                if next == Some(then_block) && then_moves.is_empty() {
-                    let target = self.edge_target(else_call)?;
-                    self.branch_if(test.invert(), target);
-                } else {
-                    let target = self.stub(then_call, then_moves);
-                    self.branch_if(test, target);
-                    self.edge(else_call, next)?;
-                }
-            }
-            (Opcode::Return, _) => {
-                let signature = &func.signature;
-                let locations = abi::assign_returns(signature.call_conv, &signature.returns)?;
-                let mut pending = Vec::with_capacity(args.len());
-                for (&value, location) in args.iter().zip(locations) {
-                    let Location::Reg { class, reg } = location else {
-                        continue;
-                    };
-                    pending.push(Move {
-                        class,
-                        from: self.loc(value),
-                        to: Loc::Reg(class, reg),
-                    });
-                }
-                self.parallel(pending);
-                self.epilogue(self.pop);
-                self.asm.emit(e::RET);
             }
             _ => return Err(Unsupported(format!("opcode {opcode}"))),
         }

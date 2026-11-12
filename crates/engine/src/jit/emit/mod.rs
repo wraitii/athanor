@@ -110,6 +110,9 @@ fn data_base(b: &mut GraphBuilder<'_>, pointer: Type, data: &FunctionData) -> Lo
 
 pub(super) struct Output<'a, 'f> {
     pub(super) b: &'a mut FunctionBuilder<'f>,
+    pub(super) clif: bool,
+    pub(super) native: bool,
+    pub(super) lowered: &'a mut Option<super::semantic::Graph>,
     pub(super) module: &'a mut JITModule,
     pub(super) stubs: Stubs,
     pub(super) annotations: &'a mut Annotations,
@@ -180,6 +183,9 @@ fn build_callable(
 ) -> Result<(), Error> {
     let Output {
         b: clif_builder,
+        clif,
+        native,
+        lowered: output_graph,
         module,
         stubs,
         annotations,
@@ -188,11 +194,48 @@ fn build_callable(
         data,
         source_name,
     } = out;
-    let mut lowered = super::semantic::Graph::new_low_level(
-        "<lowered>".into(),
+    let mut lowered = lower_callable(
         params,
+        body,
+        continuations,
+        feedback,
         clif_builder.func.signature.clone(),
-    );
+        module,
+        stubs,
+        annotations,
+        names,
+        cells,
+        data,
+        source_name,
+    )?;
+    if !clif {
+        *output_graph = Some(lowered);
+        return Ok(());
+    }
+    if native {
+        *output_graph = Some(lowered.clone());
+    }
+    super::semantic::lower_memory_for_cranelift(&mut lowered);
+    lowered.verify().map_err(Error::Compile)?;
+    cranelift::emit(clif_builder, module, &lowered, Some(annotations))?;
+    Ok(())
+}
+
+fn lower_callable(
+    params: Span,
+    body: CallableBody<'_>,
+    continuations: &HashMap<usize, FuncId>,
+    feedback: Option<Feedback>,
+    signature: cranelift_codegen::ir::Signature,
+    module: &mut JITModule,
+    stubs: Stubs,
+    annotations: &mut Annotations,
+    names: &mut Vec<Box<str>>,
+    cells: &mut Vec<Box<u64>>,
+    data: &mut FunctionData,
+    source_name: (usize, usize),
+) -> Result<super::semantic::Graph, Error> {
+    let mut lowered = super::semantic::Graph::new_low_level("<lowered>".into(), params, signature);
     let mut graph_builder = GraphBuilder::new(&mut lowered);
     let b = &mut graph_builder;
     b.set_source_name(Some(source_name));
@@ -281,10 +324,7 @@ fn build_callable(
     drop(compiler);
     graph_builder.finish().map_err(Error::Compile)?;
     lowered.verify().map_err(Error::Compile)?;
-    super::semantic::lower_memory_for_cranelift(&mut lowered);
-    lowered.verify().map_err(Error::Compile)?;
-    cranelift::emit(clif_builder, module, &lowered, Some(annotations))?;
-    Ok(())
+    Ok(lowered)
 }
 
 impl FunctionCompiler<'_, '_> {
