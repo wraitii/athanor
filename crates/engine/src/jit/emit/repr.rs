@@ -69,16 +69,6 @@ impl Operand {
 }
 
 impl FunctionCompiler<'_, '_> {
-    pub(super) fn zero(&mut self, repr: Repr) -> ClifValue {
-        match repr {
-            Repr::Boxed => self.constant(Value::UNDEFINED),
-            Repr::Float => self.b.ins().f64const(0.0),
-            Repr::Int32 => self.b.ins().iconst(types::I32, 0),
-            Repr::Int64 => self.b.ins().iconst(types::I64, 0),
-            Repr::Bool => self.b.ins().iconst(types::I8, 0),
-        }
-    }
-
     fn fold(&mut self, operand: Operand, to: Repr) -> Option<ClifValue> {
         let number = operand.constant?;
         let integer = match operand.repr {

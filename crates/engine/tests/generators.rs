@@ -12,7 +12,13 @@ fn check(source: &str, expected: Value) {
         })
         .unwrap();
         engine.compile(source, "generators.js").unwrap();
-        assert_eq!(engine.call("main", &[]).unwrap().value(), expected);
+        assert_eq!(
+            engine
+                .call("main", &[])
+                .unwrap_or_else(|error| panic!("{opt_level:?}, ssa={ssa_opt}: {error}"))
+                .value(),
+            expected
+        );
     }
 }
 
@@ -158,7 +164,7 @@ fn generator_resume_preserves_tdz_and_arguments() {
         })
         .unwrap();
         engine.compile("function* f(){ yield 1; return x; let x=2; } function main(){ let g=f(); g.next(); return g.next(); }", "generator-tdz.js").unwrap();
-        assert!(engine.call("main", &[]).is_err());
+        assert!(engine.call("main", &[]).is_err(), "ssa={ssa_opt}");
     }
 }
 
@@ -172,4 +178,23 @@ fn spread_arguments_work_before_and_after_suspension() {
         "function* gen(){let a=[...'a,b'.split(',')];yield a;return [...a,'c'];} function main(){let g=gen();g.next();let r=g.next();return r.done && r.value.join('')==='abc';}",
         Value::TRUE,
     );
+}
+
+#[test]
+fn generator_region_local_scopes_keep_initialization_checks() {
+    for ssa_opt in [false, true] {
+        for source in [
+            "function* gen(){return x;let x=42;} function main(){return gen().next();}",
+            "function* gen(){yield 1;{let x=x;return x;}} function main(){let g=gen();g.next();return g.next();}",
+        ] {
+            let mut engine = Engine::with_options(EngineOptions {
+                ssa_opt,
+                background_compile: false,
+                ..Default::default()
+            })
+            .unwrap();
+            engine.compile(source, "generator-local-tdz.js").unwrap();
+            assert!(engine.call("main", &[]).is_err(), "ssa={ssa_opt}: {source}");
+        }
+    }
 }

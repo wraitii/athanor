@@ -205,7 +205,11 @@ pub(super) fn apply(graph: &mut Graph, body: &Graph, plan: &Inline) {
                         *binding = bindings[binding];
                     }
                 }
-                Op::Read(binding) | Op::Write(binding, _) | Op::Initialize(binding, _) => {
+                Op::Read(binding)
+                | Op::Write(binding, _)
+                | Op::Initialize(binding, _)
+                | Op::BindingLoad(binding)
+                | Op::BindingRestore(binding, _) => {
                     *binding = bindings[binding];
                 }
                 Op::EnterScope(scope) if body.scopes[*scope].kind == ScopeKind::Captures => {

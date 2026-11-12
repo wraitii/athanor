@@ -9,11 +9,9 @@ use crate::environment::Environment;
 use crate::error::Error;
 use crate::value::Value;
 
-/// A frame entered through the runtime rather than by generated code: generator resumption
-/// and tests. Generated frames keep the caller's state in their own SSA values instead.
+#[cfg(test)]
 struct Frame {
     caller_start: usize,
-    resume_state: usize,
 }
 
 pub(crate) const LOCAL_STACK_SIZE: usize = 1 << 20;
@@ -65,19 +63,17 @@ impl LocalStack {
         }
     }
 
-    fn values(&self) -> &[Value] {
-        unsafe { std::slice::from_raw_parts(self.storage, self.len) }
-    }
-
     fn values_mut(&mut self) -> &mut [Value] {
         unsafe { std::slice::from_raw_parts_mut(self.storage, self.len) }
     }
 
+    #[cfg(test)]
     fn set_start(&mut self, start: usize) {
         self.start = start;
         self.base = self.storage.wrapping_add(start);
     }
 
+    #[cfg(test)]
     fn grow(&mut self, len: usize) -> bool {
         if len > self.limit {
             return false;
@@ -86,15 +82,6 @@ impl LocalStack {
         self.len = len;
         self.values_mut()[old..].fill(Value::UNDEFINED);
         true
-    }
-
-    fn frame(&self) -> &[Value] {
-        &self.values()[self.start..]
-    }
-
-    fn reset_frame(&mut self) {
-        let start = self.start;
-        self.values_mut()[start..].fill(Value::UNDEFINED);
     }
 }
 
@@ -143,6 +130,7 @@ pub(crate) struct JitCtx<'a> {
     pub(crate) error: Option<Box<Error>>,
     pub(crate) error_origin: Option<(String, u32, u32)>,
     exception: Value,
+    #[cfg(test)]
     frames: Vec<Frame>,
     locals: LocalStack,
     stack_limit: usize,
@@ -203,6 +191,7 @@ impl<'a> JitCtx<'a> {
             error: None,
             error_origin: None,
             exception: Value::UNINITIALIZED,
+            #[cfg(test)]
             frames: Vec::new(),
             locals: LocalStack::new(engine.locals.enter()),
             stack_limit: stack_pointer.saturating_sub(NATIVE_STACK_BUDGET),
@@ -278,26 +267,15 @@ impl<'a> JitCtx<'a> {
         self.engine.tiering.entry(code)
     }
 
-    pub(crate) fn resume(&mut self, locals: Vec<Value>, state: usize) -> Result<(), Vec<Value>> {
-        self.push_frame(state);
-        let start = self.locals.len;
-        if !self.locals.grow(start + locals.len()) {
-            self.pop_frame();
-            self.overflow();
-            return Err(locals);
-        }
-        self.locals.values_mut()[start..].copy_from_slice(&locals);
-        Ok(())
-    }
-
-    fn push_frame(&mut self, resume_state: usize) {
+    #[cfg(test)]
+    fn push_frame(&mut self) {
         self.frames.push(Frame {
             caller_start: self.locals.start,
-            resume_state,
         });
         self.locals.set_start(self.locals.len);
     }
 
+    #[cfg(test)]
     fn pop_frame(&mut self) {
         let frame = self.frames.pop().unwrap();
         self.locals.len = self.locals.start;
@@ -308,37 +286,9 @@ impl<'a> JitCtx<'a> {
         self.error = Some(Box::new(Error::Runtime("too much recursion".into())));
     }
 
-    pub(crate) fn resume_state(&self) -> usize {
-        self.frames.last().unwrap().resume_state
-    }
-
-    pub(crate) fn local_get(&mut self, slot: usize) -> Value {
-        let value = self
-            .locals
-            .frame()
-            .get(slot)
-            .copied()
-            .unwrap_or(Value::UNDEFINED);
-        self.retain(value)
-    }
-
-    pub(crate) fn suspend(&mut self, generator: Value, value: Value, state: usize) -> Value {
-        if !self.global.heap().retain(value) {
-            self.error = Some(Box::new(Error::Runtime("invalid yielded value".into())));
-            return self.exit(Value::UNDEFINED);
-        }
-        let locals = self.locals.frame().to_vec();
-        self.locals.reset_frame();
-        self.pop_frame();
-        self.global
-            .heap()
-            .generator_suspend(generator, state, locals);
-        value
-    }
-
     #[cfg(test)]
     pub(crate) fn enter(&mut self, size: usize) {
-        self.push_frame(0);
+        self.push_frame();
         if !self.locals.grow(self.locals.len + size) {
             self.overflow();
         }
@@ -376,21 +326,7 @@ impl<'a> JitCtx<'a> {
         value
     }
 
-    pub(crate) fn local_set(&mut self, slot: usize, value: Value) -> Value {
-        if !self.take_reference(value) {
-            return Value::UNDEFINED;
-        }
-        let index = self.locals.start + slot;
-        if index >= self.locals.len && !self.locals.grow(index + 1) {
-            self.global.heap().release(value);
-            self.overflow();
-            return Value::UNDEFINED;
-        }
-        let old = std::mem::replace(&mut self.locals.values_mut()[index], value);
-        self.global.heap().release(old);
-        value
-    }
-
+    #[cfg(test)]
     pub(crate) fn exit(&mut self, value: Value) -> Value {
         let value = if self.global.heap().retain(value) {
             value

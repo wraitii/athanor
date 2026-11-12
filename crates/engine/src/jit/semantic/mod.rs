@@ -2,6 +2,7 @@ mod access;
 mod arrays;
 mod available;
 mod borrow;
+pub(in crate::jit) mod boundary;
 mod build;
 mod caches;
 pub(in crate::jit) mod call_variants;
@@ -23,6 +24,7 @@ pub(super) mod reads;
 mod shapes;
 pub(super) mod specialize;
 mod string_split;
+pub(in crate::jit) mod suspension;
 mod transforms;
 mod typed_lowering;
 
@@ -154,6 +156,8 @@ pub(super) struct BindingData {
     pub(super) kind: BindingKind,
     pub(super) scope: Scope,
     pub(super) captured: bool,
+    // Region boundaries preserve this binding's representation, including capture cells.
+    pub(super) persistent: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -286,6 +290,8 @@ pub(super) enum Op {
     GlobalWrite(String, Value),
     GlobalInitialize(String, Value),
     Read(Binding),
+    BindingLoad(Binding),
+    BindingRestore(Binding, Value),
     Initialize(Binding, Value),
     Write(Binding, Value),
     CheckInitialized(Value),
@@ -483,6 +489,7 @@ impl Op {
             | Op::GlobalReadOptional(_)
             | Op::RegExp(_, _)
             | Op::Read(_)
+            | Op::BindingLoad(_)
             | Op::NewPack
             | Op::NewObject
             | Op::ProbeGlobal(_)
@@ -500,6 +507,7 @@ impl Op {
             | Op::GlobalInitialize(_, value)
             | Op::GlobalWrite(_, value)
             | Op::Initialize(_, value)
+            | Op::BindingRestore(_, value)
             | Op::Write(_, value)
             | Op::CheckInitialized(value)
             | Op::PackRelease(value)
@@ -628,6 +636,7 @@ impl Op {
             | Op::GlobalReadOptional(_)
             | Op::RegExp(_, _)
             | Op::Read(_)
+            | Op::BindingLoad(_)
             | Op::NewPack
             | Op::NewObject
             | Op::ProbeGlobal(_)
@@ -645,6 +654,7 @@ impl Op {
             | Op::GlobalInitialize(_, value)
             | Op::GlobalWrite(_, value)
             | Op::Initialize(_, value)
+            | Op::BindingRestore(_, value)
             | Op::Write(_, value)
             | Op::CheckInitialized(value)
             | Op::PackRelease(value)
@@ -1149,11 +1159,9 @@ impl Graph {
 
     pub(super) fn materialized(&self, scope: Scope) -> bool {
         self.scopes.iter().any(|(candidate, data)| {
-            if !data
-                .bindings
-                .iter()
-                .any(|&binding| self.bindings[binding].captured)
-            {
+            if !data.bindings.iter().any(|&binding| {
+                self.bindings[binding].captured || self.bindings[binding].persistent
+            }) {
                 return false;
             }
             let mut current = Some(candidate);
@@ -1250,6 +1258,8 @@ impl Graph {
             Op::GlobalWrite(..) | Op::GlobalInitialize(..) => {
                 closed(GLOBAL_WRITE | INTERNAL | ERROR, None)
             }
+            Op::BindingLoad(_) => closed(INTERNAL, Borrowed),
+            Op::BindingRestore(..) => closed(INTERNAL, None),
             Op::Read(binding) => closed(
                 if self.bindings[*binding].captured {
                     HEAP_READ | INTERNAL | ERROR
@@ -1716,8 +1726,7 @@ fn canonicalize(function: &mut FunctionState) -> Result<()> {
     function.graph.verify()
 }
 
-#[cfg(test)]
-fn canonicalize_graph(graph: Graph, ssa_opt: bool) -> Result<FunctionState> {
+pub(in crate::jit) fn canonicalize_graph(graph: Graph, ssa_opt: bool) -> Result<FunctionState> {
     let mut function = FunctionState::new(graph, Vec::new(), ssa_opt);
     canonicalize(&mut function)?;
     Ok(function)

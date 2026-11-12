@@ -463,3 +463,39 @@ fn direct_baseline_propagates_script_initializer_errors() {
         );
     }
 }
+
+#[test]
+fn direct_baseline_resumes_generator_regions_with_normal_frames() {
+    let source = "function* gen(x){let a=[x];let read=()=>a[0];yield read;a[0]+=2;yield a[0];return x;} function main(){let g=gen(40);let read=g.next().value;let n=g.next().value;let end=g.next();return read()===42 && n===42 && end.value===40 && end.done && g.next().done;}";
+    let inspection = run(&[
+        "--compile",
+        "--clif",
+        "--filter",
+        ".resume.",
+        "--eval",
+        source,
+    ]);
+    assert_eq!(
+        inspection
+            .matches("Cranelift IR unavailable for direct baseline code")
+            .count(),
+        3,
+        "{inspection}"
+    );
+    assert_eq!(run(&["--eval", source]).trim(), "true");
+}
+
+#[test]
+fn direct_baseline_generator_regions_preserve_tdz() {
+    let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
+        .env("JS_JIT_BASELINE", "1").env("JS_JIT_SSA", "0")
+        .env("JS_JIT_BACKGROUND", "0").env("JS_JIT_OSR", "0")
+        .args(["--eval", "function* gen(){yield 1;return x;let x=2;} function main(){let g=gen();g.next();return g.next();}"])
+        .output().unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("before initialization"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

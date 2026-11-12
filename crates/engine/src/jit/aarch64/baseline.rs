@@ -73,7 +73,9 @@ fn emit(
     let receiver_offset = context_offset.checked_add(8)?;
     let closure_offset = receiver_offset.checked_add(8)?;
     let span_offset = closure_offset.checked_add(8)?;
-    let arguments_offset = span_offset.checked_add(8)?;
+    let argv_offset = span_offset.checked_add(8)?;
+    let argc_offset = argv_offset.checked_add(8)?;
+    let arguments_offset = argc_offset.checked_add(8)?;
     let call_offset = arguments_offset.checked_add(arity.checked_mul(8)?)?;
     let max_call_args = graph
         .insts
@@ -103,6 +105,8 @@ fn emit(
     }
     asm.emit(e::STP_FP_LR_PRE);
     if !fixed {
+        asm.emit(e::mov(Width::X, 11, 3));
+        asm.emit(e::mov(Width::X, 12, 4));
         asm.emit(e::mov(Width::X, 4, 2));
         asm.emit(e::mov(Width::X, 3, 1));
         asm.emit(e::mov(Width::X, 2, 0));
@@ -143,6 +147,10 @@ fn emit(
     asm.emit(e::mem_scaled(Mem::StrX, 3, e::SP, closure_offset as u32)?);
     asm.emit(e::mem_scaled(Mem::StrX, 2, e::SP, context_offset as u32)?);
     asm.emit(e::mem_scaled(Mem::StrX, 4, e::SP, receiver_offset as u32)?);
+    if !fixed {
+        asm.emit(e::mem_scaled(Mem::StrX, 11, e::SP, argv_offset as u32)?);
+        asm.emit(e::mem_scaled(Mem::StrX, 12, e::SP, argc_offset as u32)?);
+    }
     for index in 0..arity {
         let reg = if index < 3 {
             5 + index as u8
@@ -640,6 +648,79 @@ fn emit(
                         },
                     );
                     check_error(&mut asm, context_offset as u32, failed)?;
+                }
+                Op::Argument(index) if !fixed => {
+                    let missing = asm.label();
+                    let loaded = asm.label();
+                    asm.emit(e::mem_scaled(Mem::LdrX, 10, e::SP, argc_offset as u32)?);
+                    e::mov_imm(Width::X, 9, *index as u64, |word| asm.emit(word));
+                    asm.emit(e::alu(Alu::Subs, Width::X, e::ZR, 10, 9));
+                    asm.branch(Cond::Ls, missing);
+                    asm.emit(e::mem_scaled(Mem::LdrX, 10, e::SP, argv_offset as u32)?);
+                    asm.emit(e::mem_scaled(
+                        Mem::LdrX,
+                        9,
+                        10,
+                        index.checked_mul(8)? as u32,
+                    )?);
+                    asm.jump(e::B, loaded);
+                    asm.bind(missing);
+                    e::mov_imm(Width::X, 9, Value::UNDEFINED.bits(), |word| asm.emit(word));
+                    asm.bind(loaded);
+                    store(
+                        &mut asm,
+                        context_offset as u32,
+                        (data.result?.index() * 8) as u32,
+                        9,
+                        false,
+                        failed,
+                    )?;
+                }
+                Op::BindingLoad(binding) => {
+                    asm.emit(e::mem_scaled(
+                        Mem::LdrX,
+                        9,
+                        e::SP,
+                        (values_size + binding.index() * 8) as u32,
+                    )?);
+                    store(
+                        &mut asm,
+                        context_offset as u32,
+                        (data.result?.index() * 8) as u32,
+                        9,
+                        false,
+                        failed,
+                    )?;
+                }
+                Op::BindingRestore(binding, value) => {
+                    asm.emit(e::mem_scaled(
+                        Mem::LdrX,
+                        9,
+                        e::SP,
+                        (value.index() * 8) as u32,
+                    )?);
+                    store(
+                        &mut asm,
+                        context_offset as u32,
+                        (values_size + binding.index() * 8) as u32,
+                        9,
+                        false,
+                        failed,
+                    )?;
+                }
+                Op::ContinuationStore(values) if !fixed => {
+                    for (index, value) in values.iter().enumerate() {
+                        asm.emit(e::mem_scaled(Mem::LdrX, 0, e::SP, context_offset as u32)?);
+                        asm.emit(e::mem_scaled(Mem::LdrX, 1, e::SP, argv_offset as u32)?);
+                        e::mov_imm(Width::X, 2, index as u64, |word| asm.emit(word));
+                        asm.emit(e::mem_scaled(
+                            Mem::LdrX,
+                            3,
+                            e::SP,
+                            (value.index() * 8) as u32,
+                        )?);
+                        call_address(&mut asm, output as *const () as u64);
+                    }
                 }
                 Op::Argument(index) if *index < arity => {
                     let source = (arguments_offset + index * 8) as u32;
@@ -1376,4 +1457,10 @@ fn check_error(asm: &mut Assembler, context_offset: u32, failed: super::asm::Lab
     asm.emit(e::alu(Alu::Subs, Width::X, e::ZR, 9, 10));
     asm.branch(Cond::Ne, failed);
     Some(())
+}
+
+extern "C" fn output(ctx: *mut JitCtx, buffer: *mut Value, index: usize, value: Value) {
+    let ctx = unsafe { &mut *ctx };
+    ctx.global.heap().retain(value);
+    unsafe { buffer.add(index).write(value) };
 }

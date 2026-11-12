@@ -223,6 +223,10 @@ impl Graph {
             Op::PropertyKey(value) => format!("property_key {value}"),
             Op::GlobalWrite(name, value) => format!("global_write {name}, {value}"),
             Op::GlobalInitialize(name, value) => format!("global_initialize {name}, {value}"),
+            Op::BindingLoad(binding) => format!("binding_load {}", self.binding_name(*binding)),
+            Op::BindingRestore(binding, value) => {
+                format!("binding_restore {}, {value}", self.binding_name(*binding))
+            }
             Op::Read(binding) => format!("read {}", self.binding_name(*binding)),
             Op::Initialize(binding, value) => {
                 format!("initialize {}, {value}", self.binding_name(*binding))

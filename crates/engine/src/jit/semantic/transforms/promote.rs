@@ -81,7 +81,7 @@ pub(in crate::jit::semantic) fn promote(graph: &mut Graph, notes: &mut Vec<Strin
     let promoted: HashSet<Binding> = graph
         .bindings
         .iter()
-        .filter(|(_, data)| !data.captured)
+        .filter(|(_, data)| !data.captured && !data.persistent)
         .map(|(binding, _)| binding)
         .collect();
     if promoted.is_empty() {

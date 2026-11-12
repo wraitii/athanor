@@ -262,6 +262,7 @@ impl<'a> Builder<'a> {
                 return unsupported("unresolved binding", id.span);
             };
             let binding = self.graph.bindings.push(BindingData {
+                persistent: false,
                 name: id.name.to_string(),
                 kind: binding_kind,
                 scope,
@@ -1291,6 +1292,7 @@ impl<'a> Builder<'a> {
             bindings: Vec::new(),
         });
         let binding = self.graph.bindings.push(BindingData {
+            persistent: false,
             name: name.to_owned(),
             kind: BindingKind::Let,
             scope,
@@ -1767,6 +1769,7 @@ pub(super) fn lower_parts(
         });
         for &symbol in captures {
             let binding = builder.graph.bindings.push(BindingData {
+                persistent: false,
                 name: if symbol.index() >= scoping.symbols_len() {
                     "arguments".into()
                 } else {
@@ -1796,6 +1799,7 @@ pub(super) fn lower_parts(
             bindings: Vec::new(),
         });
         let binding = builder.graph.bindings.push(BindingData {
+            persistent: false,
             name: "arguments".into(),
             kind: BindingKind::Var,
             scope,
@@ -1874,6 +1878,7 @@ pub(super) fn lower_parts(
         });
         for symbol in var_symbols {
             let binding = builder.graph.bindings.push(BindingData {
+                persistent: false,
                 name: scoping.symbol_name(symbol).to_string(),
                 kind: BindingKind::Var,
                 scope,

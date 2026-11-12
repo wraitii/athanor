@@ -5,6 +5,7 @@ pub(crate) mod bailouts;
 mod builtins;
 mod clif;
 mod compiler;
+mod continuation;
 mod conversion;
 mod effects;
 mod emit;

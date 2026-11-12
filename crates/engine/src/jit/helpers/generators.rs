@@ -5,54 +5,21 @@ pub(super) extern "C" fn js_generator_new(
     closure: Value,
     receiver: Value,
     arguments: Value,
-    code: u64,
+    plan: u64,
 ) -> Value {
     let ctx = unsafe { &mut *ctx };
-    match ctx
-        .global
-        .heap()
-        .generator(crate::heap::CodeId(code), closure, arguments, receiver)
-    {
+    match ctx.global.heap().generator(
+        unsafe { &*(plan as *const std::sync::Arc<crate::continuation::Plan>) }.clone(),
+        closure,
+        arguments,
+        receiver,
+    ) {
         Some(value) => value,
         None => {
             ctx.error = Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
             Value::UNDEFINED
         }
     }
-}
-
-pub(super) extern "C" fn js_generator_closure(ctx: *mut JitCtx, generator: Value) -> Value {
-    let ctx = unsafe { &mut *ctx };
-    let closure = ctx.global.heap().generator_parts(generator).unwrap().1;
-    ctx.retain(closure)
-}
-
-pub(super) extern "C" fn js_generator_state(ctx: *mut JitCtx) -> u64 {
-    unsafe { &*ctx }.resume_state() as u64
-}
-
-pub(super) extern "C" fn js_local_get(ctx: *mut JitCtx, slot: u64) -> Value {
-    unsafe { &mut *ctx }.local_get(slot as usize)
-}
-
-pub(super) extern "C" fn js_generator_suspend(
-    ctx: *mut JitCtx,
-    generator: Value,
-    value: Value,
-    state: u64,
-) -> Value {
-    unsafe { &mut *ctx }.suspend(generator, value, state as usize)
-}
-
-pub(super) extern "C" fn js_generator_complete(
-    ctx: *mut JitCtx,
-    generator: Value,
-    value: Value,
-) -> Value {
-    let ctx = unsafe { &mut *ctx };
-    let value = ctx.exit(value);
-    ctx.global.heap().generator_complete(generator);
-    value
 }
 
 pub(super) fn generator_result(ctx: &mut JitCtx, value: Value, done: bool) -> Value {
@@ -87,38 +54,39 @@ pub(super) fn generator_next(ctx: *mut JitCtx, generator: Value) -> Value {
         )));
         return Value::UNDEFINED;
     }
-    let (code, _, arguments) = context.global.heap().generator_parts(generator).unwrap();
-    let entry = match context.entry(code.0) {
-        Ok(entry) => entry,
-        Err(error) => {
-            context.error = Some(Box::new(error));
-            return Value::UNDEFINED;
+    let (plan, closure, arguments) = context.global.heap().generator_parts(generator).unwrap();
+    let region = &plan.entries[state];
+    let receiver = context.global.heap().generator_receiver(generator).unwrap();
+    let (_, locals) = context.global.heap().generator_begin(generator).unwrap();
+    let args: Vec<_> = if state == 0 {
+        (0..context.global.heap().len(arguments).unwrap())
+            .map(|index| context.global.heap().get(arguments, index).unwrap())
+            .collect()
+    } else {
+        locals.clone()
+    };
+    let result = super::super::continuation::run(ctx, region, closure, receiver, &args);
+    let context = unsafe { &mut *ctx };
+    context.global.heap().release_all(&locals);
+    let Some((exit, mut output)) = result else {
+        context.global.heap().generator_complete(generator);
+        return Value::UNDEFINED;
+    };
+    let done = match exit {
+        crate::continuation::Exit::Complete => {
+            output.truncate(1);
+            context.global.heap().generator_complete(generator);
+            true
+        }
+        crate::continuation::Exit::Suspend(target) => {
+            output.truncate(1 + plan.entries[target].inputs);
+            let locals = output.split_off(1);
+            context
+                .global
+                .heap()
+                .generator_suspend(generator, target, locals);
+            false
         }
     };
-    let Some(entry) = entry else {
-        context.error = Some(Box::new(crate::Error::Runtime(
-            "generator code is unavailable".into(),
-        )));
-        return Value::UNDEFINED;
-    };
-    let args: Vec<_> = (0..context.global.heap().len(arguments).unwrap())
-        .map(|index| context.global.heap().get(arguments, index).unwrap())
-        .collect();
-    let receiver = context.global.heap().generator_receiver(generator).unwrap();
-    let (state, locals) = context.global.heap().generator_begin(generator).unwrap();
-    if let Err(locals) = context.resume(locals, state) {
-        context
-            .global
-            .heap()
-            .generator_suspend(generator, state, locals);
-        return Value::UNDEFINED;
-    }
-    let value = entry.call(ctx, generator, receiver, args.as_ptr(), args.len() as u64);
-    let context = unsafe { &mut *ctx };
-    if context.error.is_some() || context.exception_pending() {
-        context.global.heap().release(value);
-        return Value::UNDEFINED;
-    }
-    let done = context.global.heap().generator_state(generator) == Some(GENERATOR_DONE);
-    generator_result(context, value, done)
+    generator_result(context, output[0], done)
 }

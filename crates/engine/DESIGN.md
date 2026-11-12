@@ -103,12 +103,9 @@ Cleanup code therefore grows with the deepest live set, not with the number of
 sites, and live ranges end at a reference's last use. The result of a helper
 that has just failed owns nothing and is left out.
 
-Generators keep these references in pooled stack slots instead. Their values are
-never slotted in the frame, so every heap value is a temporary, many of them
-live across calls; as SSA values they dominated register allocation. Each slot
-holds `undefined` outside the span using it: slots are cleared on entry and reset
-on release. A generator's ladder ends in one cleanup per target and semantic
-block, filled at the block's end, which releases every slot the block used.
+Generator resume regions use the same frame slots, temporary ownership and early
+exit cleanup as ordinary functions. Values crossing a suspension boundary take
+references in the continuation output buffer before the region releases its frame.
 
 String literals are created on first execution and cached in the function's
 data, which keeps their reference for the lifetime of the compiled code. A
@@ -463,29 +460,42 @@ and participate in incremental disposal; cycles retain the existing limitation. 
 ## Limited synchronous generators
 
 Generator declarations and anonymous generator expressions lower after Oxc
-binding and capture analysis. `jit/generator.rs` constructs a resume plan with
-numbered suspension points. Initially only direct yield statements in the
-function body are accepted; delegated yields and yields inside expressions,
-blocks, loops, or exception handlers are rejected explicitly. Ordinary loops and
-try/catch can run between suspension points. Async functions remain unsupported.
+binding and capture analysis. `jit/generator.rs` validates the supported syntax:
+only direct yield statements in the function body are accepted. Delegated yields
+and yields inside expressions, blocks, loops, or exception handlers are rejected
+explicitly. Ordinary loops and try/catch can run between suspension points.
+Async functions remain unsupported.
 
-Compilation produces a factory and a native resume function. Calling the factory
-copies and retains arguments and the original closure into a heap generator;
-it does not execute the body. Next enters an execution frame and dispatches to
-the saved state. Initialization runs only for state zero. Resume blocks reload
-bindings from owned frame slots, including shared cells for captured bindings.
-The initial implementation preserves all local slots rather than computing
-liveness across suspension points.
+`semantic/boundary.rs` provides shared liveness, entry reconstruction, boxed
+output stores and graph compaction. Continuation extraction and OSR use its live
+value analysis and boundary protocol. `semantic/suspension.rs` cuts generator
+graphs at yields into ordinary functions. Each exit stores its owned outputs in
+the caller's vector buffer and returns a numeric exit index. The entry descriptor
+maps that index to completion or suspension at another entry. Region graphs keep
+only reachable blocks, instructions and values; they have ordinary frames and
+can use either Cranelift or direct baseline emission.
 
-Yield retains its result, clears expression temporaries, and transfers the
-frame's local ownership to the generator without ordinary return cleanup. Next
-returns an object containing value and done. Normal return or an uncaught
-exception exits the frame and marks the generator completed, releasing its
-arguments and original closure. Subsequent next calls return undefined with
-done true. Suspended frame disposal releases locals incrementally if the
-generator is abandoned. Generator cycles share the heap's collection limitation.
-Resume state belongs to each execution frame, so nested generator calls do not
-replace the caller's saved state.
+Cross-boundary graph values are selected by liveness. Active bindings are saved
+conservatively, including uninitialized values and shared capture cells. Persistent
+binding metadata prevents promotion or capture demotion from changing their
+representation independently in different regions. Raw binding load/restore
+operations transfer that representation without performing a JavaScript read or
+write. Resume entries reconstruct the active lexical scopes before restoring it.
+
+Compilation produces a small factory and independently compilable resume regions.
+The regions use the existing lazy compilation scheduler; inspection compiles them
+eagerly. Calling the factory retains the arguments, original closure and receiver
+in a heap generator without executing the body. Next invokes the selected region
+with caller-owned input/output storage through `jit/continuation.rs`. Inputs stay
+rooted independently while outputs overwrite the buffer. Each region exits through
+ordinary frame cleanup. The generator driver takes ownership of suspended outputs
+or marks the generator completed on return or an uncaught exception.
+
+Next returns an object containing value and done. Subsequent calls to a completed
+generator return undefined with done true. Abandoning a generator releases its
+suspended state incrementally through normal heap disposal. Generator cycles share
+the heap's collection limitation. The descriptor and suspended state belong to the
+generator, so nested resumptions cannot replace the caller's state.
 
 The native next method requires a generator receiver. Non-undefined resume
 arguments and reentrant next calls report explicit engine errors. Return and
@@ -1114,8 +1124,9 @@ the function views; `--filter NAME` restricts their output by name substring.
 native path, or Cranelift optimization on its path), and assembly includes
 byte offsets and semantic-location IDs. The graph verifier checks scope and
 control-flow invariants. Semantic
-optimization is disabled by `JS_JIT_SSA=0`, for graphs with exception handlers and for
-generator graphs; the shared CLIF optimization passes still apply.
+optimization is disabled by `JS_JIT_SSA=0`, for graphs with exception handlers and
+for generator source graphs. Extracted ordinary resume regions are canonicalized
+and optimized normally; the shared CLIF optimization passes also apply.
 
 ```text
 Oxc AST -> build -> promote -> simplify -> canonical graph
@@ -1169,8 +1180,8 @@ scope.
 
 Exception handlers have explicit exceptional successors that unwind lexical
 scopes before entering a catch block; runtime errors bypass JavaScript catches.
-Generator yields have resume successors and restore graph values and bindings
-from the generator frame. The supported subset includes closures, `var`, `this`,
+Generator yields initially have resume successors; suspension lowering replaces
+them with ordinary region exits and explicit state restoration. The supported subset includes closures, `var`, `this`,
 construction, classes, switch, do-while, and selected destructuring forms.
 Labels, templates, `finally`, and more general destructuring remain unsupported.
 

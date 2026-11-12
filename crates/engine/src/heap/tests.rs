@@ -475,7 +475,7 @@ fn arrow_and_generator_receivers_are_owned_and_released() {
     let closure = heap.closure(CodeId(2), &[]).unwrap();
     let arguments = heap.array(&[]).unwrap();
     let generator = heap
-        .generator(CodeId(3), closure, arguments, receiver)
+        .generator(generator_plan(3), closure, arguments, receiver)
         .unwrap();
     heap.release(receiver);
     heap.release(closure);
@@ -500,7 +500,7 @@ fn abandoned_generators_release_suspended_frames_incrementally() {
     let argument = heap.string("argument").unwrap();
     let arguments = heap.array(&[argument]).unwrap();
     let generator = heap
-        .generator(CodeId(2), closure, arguments, Value::UNDEFINED)
+        .generator(generator_plan(2), closure, arguments, Value::UNDEFINED)
         .unwrap();
     heap.release(closure);
     heap.release(argument);
@@ -1042,4 +1042,16 @@ fn jit_cached_additions_guard_representation_and_errors() {
         heap.drain(1000);
         assert!(!heap.valid(child));
     }
+}
+
+fn generator_plan(code: u64) -> std::sync::Arc<crate::continuation::Plan> {
+    std::sync::Arc::new(crate::continuation::Plan {
+        entries: vec![crate::continuation::Entry {
+            code: CodeId(code),
+            inputs: 0,
+            outputs: 1,
+            exits: vec![crate::continuation::Exit::Complete].into_boxed_slice(),
+        }]
+        .into_boxed_slice(),
+    })
 }

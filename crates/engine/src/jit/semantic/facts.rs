@@ -720,10 +720,12 @@ fn result_types(graph: &Graph, op: &Op, facts: &Facts) -> Types {
     match op {
         Op::OsrStart(..) => Types::INT32,
         Op::Continuation(body, _) => body.result,
-        Op::ContinuationOutput(..) => Types::ALL,
-        Op::ContinuationStore(..) | Op::Observe(..) | Op::ReadHint(..) | Op::Assume(..) => {
-            Types::default()
-        }
+        Op::ContinuationOutput(..) | Op::BindingLoad(_) => Types::ALL,
+        Op::BindingRestore(..)
+        | Op::ContinuationStore(..)
+        | Op::Observe(..)
+        | Op::ReadHint(..)
+        | Op::Assume(..) => Types::default(),
         Op::Constant(constant) => match constant {
             Constant::Undefined => Types::UNDEFINED,
             Constant::Null => Types::NULL,

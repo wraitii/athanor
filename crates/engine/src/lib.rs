@@ -1,3 +1,4 @@
+mod continuation;
 mod engine;
 mod environment;
 mod error;

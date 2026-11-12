@@ -312,3 +312,29 @@ fn fresh_array_push_is_lowered_without_execution_or_identity_guards() {
             .any(|line| line == "true")
     );
 }
+
+#[test]
+fn generator_regions_are_inspectable_and_published_for_execution() {
+    let output = compile(
+        &[
+            "--filter",
+            ".resume.",
+            "--clif",
+            "--execute",
+            "const g=gen(40);print(g.next().value+g.next().value);",
+        ],
+        "function* gen(x){yield x;return x+2;}",
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(
+        text.matches("Cranelift IR after optimization").count(),
+        2,
+        "{text}"
+    );
+    assert!(text.lines().any(|line| line == "82"), "{text}");
+}

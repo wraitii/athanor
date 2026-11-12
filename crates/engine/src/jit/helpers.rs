@@ -81,11 +81,6 @@ define_helpers! {
     Instanceof => Binary, js_instanceof;
     In => Binary, js_in;
     GeneratorNew => Quaternary, js_generator_new, reference;
-    GeneratorClosure => Unary, js_generator_closure, reference;
-    GeneratorState => Nullary, js_generator_state;
-    GeneratorSuspend => IndexSet, js_generator_suspend;
-    GeneratorComplete => Binary, js_generator_complete;
-    LocalGet => Unary, js_local_get, reference;
     CellNew => Unary, js_cell_new, reference;
     CellGet => Unary, js_cell_get, reference;
     CellSet => Binary, js_cell_set;
@@ -130,7 +125,6 @@ define_helpers! {
     MathDirect => MethodCallable, js_math_direct;
     FrameOverflow => Nullary, js_frame_overflow;
     FrameRelease => Nullary, js_frame_release;
-    LocalSet => Binary, js_local_set;
     LocalReplace => IndexSet, js_local_replace;
     Release => Unary, js_release;
     Bailout => Unary, js_bailout;
@@ -423,9 +417,6 @@ extern "C" fn js_frame_overflow(ctx: *mut JitCtx) -> Value {
 extern "C" fn js_frame_release(ctx: *mut JitCtx) -> Value {
     unsafe { &mut *ctx }.release_frame_locals();
     Value::UNDEFINED
-}
-extern "C" fn js_local_set(ctx: *mut JitCtx, slot: u64, value: Value) -> Value {
-    unsafe { &mut *ctx }.local_set(slot as usize, value)
 }
 extern "C" fn js_bailout(_: *mut JitCtx, site: Value) -> Value {
     crate::jit::bailouts::hit(site.bits());

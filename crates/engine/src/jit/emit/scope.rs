@@ -3,10 +3,7 @@ use crate::heap::REFERENCES_OFFSET;
 use crate::jit::helpers::Helper;
 use crate::value::{TAG_OBJECT, TAG_SHIFT, TAG_STRING, Value};
 use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::{
-    Block, BlockArg, Inst, InstBuilder, MemFlagsData, StackSlot, StackSlotData, StackSlotKind,
-    types,
-};
+use cranelift_codegen::ir::{Block, BlockArg, Inst, InstBuilder, MemFlagsData, types};
 use cranelift_frontend::{FunctionBuilder, Variable};
 use oxc_ast::ast::{
     BindingPattern, ForStatementInit, ForStatementLeft, Statement, VariableDeclaration,
@@ -56,12 +53,6 @@ impl FunctionCompiler<'_, '_> {
         value: ClifValue,
         known_old: Option<ClifValue>,
     ) {
-        if self.frame_size.is_none() {
-            let slot = self.b.ins().iconst(types::I64, variable.as_u32() as i64);
-            self.call_helper(Helper::LocalSet, &[slot, value]);
-            self.b.def_var(variable, value);
-            return;
-        }
         let (index, stored) = self.store_local(variable, value);
         let old = known_old.unwrap_or(stored);
         let new_heap = self.is_heap(value);
@@ -143,93 +134,23 @@ impl FunctionCompiler<'_, '_> {
         self.track(value)
     }
 
-    /// Holds a reference in a variable of its own. Every variable is `undefined` outside the
-    /// span that owns it, so paths that never took the reference release nothing. Paths on which
-    /// a variable was never defined read Cranelift's zero default instead, which is not
-    /// heap-tagged either. Generators keep
-    /// their references in stack slots instead: nothing in a generator is slotted in the frame,
-    /// so its temporaries are numerous and long-lived, and in memory they cost the register
-    /// allocator nothing.
     pub(super) fn track(&mut self, value: ClifValue) -> ClifValue {
         let variable = match self.free_owned.pop() {
             Some(variable) => variable,
             None => self.b.declare_var(types::I64),
         };
-        if self.generator.is_some() {
-            let slot = self.stack_slot();
-            self.b.ins().stack_store(self.pointer, value, slot, 0);
-            self.spilled.insert(variable.as_u32(), slot);
-        } else {
-            self.b.def_var(variable, value);
-        }
+        self.b.def_var(variable, value);
         self.owned.push(variable);
         value
     }
 
-    /// A slot that holds `undefined` whenever it does not own a reference: every slot is cleared
-    /// on entry and again on release, so a block's cleanup can release all of its slots.
-    fn stack_slot(&mut self) -> StackSlot {
-        let slot = match self.free_slots.pop() {
-            Some(slot) => slot,
-            None => {
-                let slot = self.b.create_sized_stack_slot(StackSlotData::new(
-                    StackSlotKind::ExplicitSlot,
-                    8,
-                    3,
-                ));
-                self.owned_slots.push(slot);
-                slot
-            }
-        };
-        if !self.block_slots.contains(&slot) {
-            self.block_slots.push(slot);
-        }
-        slot
-    }
-
-    /// Releases every reference the block took, then fills the block's cleanups, which release
-    /// whatever its slots hold on the way to their targets.
     pub(super) fn release_owned(&mut self) {
         let owned = std::mem::take(&mut self.owned);
         self.release_variables(&owned);
         self.free_owned.extend(owned);
         self.unchecked = None;
-        if self.generator.is_none() {
-            return;
-        }
-        let slots = std::mem::take(&mut self.block_slots);
-        let cleanups: Vec<(Block, Block)> = self
-            .unwinds
-            .drain()
-            .map(|(target, (_, cleanup))| (target, cleanup))
-            .collect();
-        if cleanups.is_empty() {
-            return;
-        }
-        let rest = self.b.create_block();
-        self.jump(rest, &[]);
-        for (target, cleanup) in cleanups {
-            let created = self.b.func.dfg.num_blocks();
-            self.switch(cleanup);
-            let args: Vec<BlockArg> = self
-                .b
-                .block_params(cleanup)
-                .iter()
-                .map(|&value| BlockArg::Value(value))
-                .collect();
-            for &slot in slots.iter().rev() {
-                let value = self.b.ins().stack_load(self.pointer, types::I64, slot, 0);
-                self.release_heap(value, true);
-            }
-            self.jump(target, &args);
-            for index in created..self.b.func.dfg.num_blocks() {
-                self.b.set_cold_block(Block::from_u32(index as u32));
-            }
-        }
-        self.switch(rest);
     }
 
-    /// Releases some of the block's references before its end.
     pub(super) fn release_tracked(&mut self, variables: &[Variable]) {
         let unchecked = self
             .unchecked
@@ -247,43 +168,26 @@ impl FunctionCompiler<'_, '_> {
             .iter()
             .copied()
             .filter(|&variable| Some(variable) != self.unchecked)
-            .filter(|variable| !self.spilled.contains_key(&variable.as_u32()))
             .collect()
     }
 
     /// Whether leaving the block here has anything to release.
     pub(super) fn unwind_releases(&self) -> bool {
-        !self.live_temporaries().is_empty() || !self.block_slots.is_empty()
+        !self.live_temporaries().is_empty()
     }
 
     /// Leaves the block early through `target`, releasing the references live here on the way.
     /// Each target has a ladder of cold exits: the exit taking `depth` references releases the
     /// last one and continues to the exit below, so cleanup code grows with the deepest live set
-    /// rather than with the number of sites. In generators the ladder ends in the block's cleanup
-    /// for the target, which releases its slots; elsewhere it ends at the target itself.
+    /// rather than with the number of sites.
     pub(super) fn unwind(&mut self, target: Block, args: &[BlockArg]) {
-        if let Some(unchecked) = self.unchecked
-            && let Some(&slot) = self.spilled.get(&unchecked.as_u32())
-        {
-            let undefined = self.constant(Value::UNDEFINED);
-            self.b.ins().stack_store(self.pointer, undefined, slot, 0);
-        }
         let live = self.live_temporaries();
         let mut exit_args = args.to_vec();
         for &variable in &live {
             exit_args.push(BlockArg::Value(self.b.use_var(variable)));
         }
         if !self.unwinds.contains_key(&target) {
-            let cleanup = match self.generator {
-                Some(_) => {
-                    let cleanup = self.b.create_block();
-                    for _ in 0..args.len() {
-                        self.b.append_block_param(cleanup, types::I64);
-                    }
-                    cleanup
-                }
-                None => target,
-            };
+            let cleanup = target;
             self.unwinds.insert(target, (Vec::new(), cleanup));
         }
         let (ladder, cleanup) = self.unwinds.get_mut(&target).unwrap();
@@ -326,40 +230,14 @@ impl FunctionCompiler<'_, '_> {
         }
     }
 
-    /// Clears every slot on entry, before anything can read one.
-    pub(super) fn finish_owned_slots(&mut self) {
-        let Some((init, body)) = self.owned_entry else {
-            return;
-        };
-        self.switch(init);
-        if !self.owned_slots.is_empty() {
-            let undefined = self.constant(Value::UNDEFINED);
-            for &slot in &self.owned_slots {
-                self.b.ins().stack_store(self.pointer, undefined, slot, 0);
-            }
-        }
-        self.jump(body, &[]);
-    }
-
     fn release_variables(&mut self, variables: &[Variable]) {
         if variables.is_empty() {
             return;
         }
         let undefined = self.constant(Value::UNDEFINED);
         for &variable in variables.iter().rev() {
-            let value = match self.spilled.remove(&variable.as_u32()) {
-                Some(slot) => {
-                    let value = self.b.ins().stack_load(self.pointer, types::I64, slot, 0);
-                    self.b.ins().stack_store(self.pointer, undefined, slot, 0);
-                    self.free_slots.push(slot);
-                    value
-                }
-                None => {
-                    let value = self.b.use_var(variable);
-                    self.b.def_var(variable, undefined);
-                    value
-                }
-            };
+            let value = self.b.use_var(variable);
+            self.b.def_var(variable, undefined);
             self.release_heap(value, true);
         }
     }

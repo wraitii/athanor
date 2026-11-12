@@ -62,38 +62,7 @@ impl std::fmt::Debug for Body {
     }
 }
 
-pub(super) fn liveness(graph: &Graph, rpo: &[Block]) -> SecondaryMap<Block, HashSet<Value>> {
-    let mut live_in: SecondaryMap<_, HashSet<Value>> = SecondaryMap::new();
-    loop {
-        let mut changed = false;
-        for &block in rpo.iter().rev() {
-            let data = &graph.blocks[block];
-            let mut live: HashSet<_> = graph
-                .successors(block)
-                .into_iter()
-                .flat_map(|next| live_in[next].iter().copied())
-                .collect();
-            live.extend(data.terminator.as_ref().unwrap().kind.operands_iter());
-            for &inst in data.insts.iter().rev() {
-                let data = &graph.insts[inst];
-                if let Some(result) = data.result {
-                    live.remove(&result);
-                }
-                live.extend(data.op.operands_iter());
-            }
-            for param in &data.params {
-                live.remove(param);
-            }
-            if live != live_in[block] {
-                live_in[block] = live;
-                changed = true;
-            }
-        }
-        if !changed {
-            return live_in;
-        }
-    }
-}
+pub(super) use super::boundary::liveness;
 
 fn append(graph: &mut Graph, block: Block, op: Op) -> Value {
     let span = graph.span;
@@ -104,15 +73,7 @@ fn terminate(graph: &mut Graph, block: Block, kind: TerminatorKind) {
     graph.terminate(block, graph.span, kind);
 }
 
-pub(super) fn unbox(graph: &mut Graph, block: Block, value: Value, types: Types) -> Value {
-    if types.intersects(Types::INTEGER) && types.within(Types::INTEGER) {
-        append(graph, block, Op::AsInteger(value))
-    } else if types.intersects(Types::NUMBER) && types.within(Types::NUMBER) {
-        append(graph, block, Op::AsNumber(value))
-    } else {
-        value
-    }
-}
+pub(super) use super::boundary::unbox;
 
 fn extract(graph: &Graph, target: Target, facts: &Facts) -> super::Result<(Graph, Vec<Value>)> {
     if graph.generator || graph.has_handlers {
@@ -123,34 +84,10 @@ fn extract(graph: &Graph, target: Target, facts: &Facts) -> super::Result<(Graph
     }
     let cfg = Cfg::from_entry(graph, target.block);
     let live_in = liveness(graph, &cfg.rpo);
-    let mut inputs: Vec<_> = live_in[target.block]
-        .iter()
-        .copied()
-        .chain(target.args.iter().copied())
-        .collect();
-    inputs.sort();
-    inputs.dedup();
+    let inputs = super::boundary::inputs(&target, &live_in);
     let mut result = graph.clone();
-    result.arity = None;
     result.borrowed.clear();
-    let entry = result.blocks.push(BlockData::default());
-    result.entry = entry;
-    let mut aliases = HashMap::new();
-    for (index, &value) in inputs.iter().enumerate() {
-        let argument = append(&mut result, entry, Op::Argument(index));
-        let argument = unbox(&mut result, entry, argument, facts.of(value));
-        aliases.insert(value, argument);
-    }
-    let args = target.args.iter().map(|value| aliases[value]).collect();
-    terminate(
-        &mut result,
-        entry,
-        TerminatorKind::Jump(Target {
-            block: target.block,
-            args,
-        }),
-    );
-    let reachable: HashSet<_> = Cfg::new(&result).rpo.into_iter().collect();
+    let reachable: HashSet<_> = cfg.rpo.into_iter().collect();
     for &block in &reachable {
         let data = &result.blocks[block];
         if matches!(
@@ -171,8 +108,8 @@ fn extract(graph: &Graph, target: Target, facts: &Facts) -> super::Result<(Graph
                 | Op::Arguments
                 | Op::Rest(_)
                 | Op::OsrStart(..)
-                    if block != entry =>
-                {
+                | Op::BindingLoad(..)
+                | Op::BindingRestore(..) => {
                     return Err("continuation requires SSA frame state".into());
                 }
                 Op::EnterScope(scope)
@@ -205,20 +142,7 @@ fn extract(graph: &Graph, target: Target, facts: &Facts) -> super::Result<(Graph
     }
     result.has_assumes = false;
     result.views.clear();
-    let definitions = aliases
-        .into_iter()
-        .map(|(value, alias)| (value, vec![alias]))
-        .collect();
-    super::optimize::repair(&mut result, &definitions);
-    let reachable: HashSet<_> = Cfg::new(&result).rpo.into_iter().collect();
-    for (block, data) in result.blocks.iter_mut() {
-        if !reachable.contains(&block) {
-            data.insts.clear();
-            data.params.clear();
-            data.terminator = None;
-        }
-    }
-    result.cold.retain(|block| reachable.contains(block));
+    super::boundary::enter(&mut result, &target, &inputs, &[], &[], Some(facts));
     result.verify()?;
     Ok((result, inputs))
 }
@@ -368,16 +292,13 @@ impl Shape {
 
     pub(super) fn store_exits(&self, graph: &Graph, result: &mut Graph, entry: Block) -> usize {
         let outside = |block: Block| graph.blocks.is_valid(block) && !self.body.contains(&block);
-        let index = |constant: usize| Op::Constant(Constant::Number(constant as f64));
         for block in Cfg::from_entry(result, entry).rpo {
             if outside(block) {
                 continue;
             }
             let kind = &result.blocks[block].terminator.as_ref().unwrap().kind;
             if let TerminatorKind::Return(value) = *kind {
-                result.append(block, graph.span, Op::ContinuationStore(vec![value]), false);
-                let exit = append(result, block, index(self.exits.len()));
-                terminate(result, block, TerminatorKind::Return(exit));
+                super::boundary::store_exit(result, block, vec![value], self.exits.len());
                 continue;
             }
             let edges: Vec<_> = kind
@@ -404,9 +325,7 @@ impl Shape {
                 if result.cold.contains(&block) || graph.cold.contains(&target.block) {
                     result.cold.insert(stub);
                 }
-                result.append(stub, graph.span, Op::ContinuationStore(values), false);
-                let value = append(result, stub, index(position));
-                terminate(result, stub, TerminatorKind::Return(value));
+                super::boundary::store_exit(result, stub, values, position);
                 *result.blocks[block]
                     .terminator
                     .as_mut()

@@ -89,11 +89,6 @@ impl Inspection {
         }
     }
 
-    pub(super) fn with_ast(mut self, other: Self) -> Self {
-        self.ast = other.ast;
-        self
-    }
-
     pub(super) fn named(mut self, label: &str) -> Self {
         self.label = Some(label.to_owned());
         self

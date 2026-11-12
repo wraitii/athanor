@@ -5,39 +5,30 @@ use oxc_ast_visit::{Visit, walk};
 
 use crate::error::{Error, unsupported_at};
 
-#[derive(Debug)]
-pub(super) struct ResumePlan {
-    pub(super) suspensions: Vec<u32>,
-}
-
-impl ResumePlan {
-    pub(super) fn lower(statements: &[Statement<'_>]) -> Result<Self, Error> {
-        let yields: Vec<_> = statements
-            .iter()
-            .filter_map(|statement| {
-                let Statement::ExpressionStatement(statement) = statement else {
-                    return None;
-                };
-                let Expression::YieldExpression(expression) = &statement.expression else {
-                    return None;
-                };
-                Some(expression.span.start)
-            })
-            .collect();
-        let mut validation = Validate {
-            allowed: yields.iter().copied().collect(),
-            error: None,
-        };
-        for statement in statements {
-            validation.visit_statement(statement);
-        }
-        if let Some(error) = validation.error {
-            return Err(error);
-        }
-        Ok(Self {
-            suspensions: yields,
+pub(super) fn validate(statements: &[Statement<'_>]) -> Result<(), Error> {
+    let yields: Vec<_> = statements
+        .iter()
+        .filter_map(|statement| {
+            let Statement::ExpressionStatement(statement) = statement else {
+                return None;
+            };
+            let Expression::YieldExpression(expression) = &statement.expression else {
+                return None;
+            };
+            Some(expression.span.start)
         })
+        .collect();
+    let mut validation = Validate {
+        allowed: yields.iter().copied().collect(),
+        error: None,
+    };
+    for statement in statements {
+        validation.visit_statement(statement);
     }
+    if let Some(error) = validation.error {
+        return Err(error);
+    }
+    Ok(())
 }
 
 struct Validate {

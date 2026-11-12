@@ -1,7 +1,7 @@
 use super::*;
 
 pub(super) struct Generator {
-    pub(super) code: CodeId,
+    pub(super) plan: std::sync::Arc<crate::continuation::Plan>,
     pub(super) closure: Value,
     pub(super) arguments: Value,
     pub(super) receiver: Value,
@@ -12,7 +12,7 @@ pub(super) struct Generator {
 impl Heap {
     pub(crate) fn generator(
         &self,
-        code: CodeId,
+        plan: std::sync::Arc<crate::continuation::Plan>,
         closure: Value,
         arguments: Value,
         receiver: Value,
@@ -29,7 +29,7 @@ impl Heap {
         data.store(
             id,
             Payload::Generator(Box::new(Generator {
-                code,
+                plan,
                 closure,
                 arguments,
                 receiver,
@@ -52,10 +52,17 @@ impl Heap {
         Some(generator.state)
     }
 
-    pub(crate) fn generator_parts(&self, value: Value) -> Option<(CodeId, Value, Value)> {
+    pub(crate) fn generator_parts(
+        &self,
+        value: Value,
+    ) -> Option<(std::sync::Arc<crate::continuation::Plan>, Value, Value)> {
         let data = self.0.borrow();
         let generator = data.generator(heap_id(value)?)?;
-        Some((generator.code, generator.closure, generator.arguments))
+        Some((
+            generator.plan.clone(),
+            generator.closure,
+            generator.arguments,
+        ))
     }
 
     pub(crate) fn generator_begin(&self, value: Value) -> Option<(usize, Vec<Value>)> {

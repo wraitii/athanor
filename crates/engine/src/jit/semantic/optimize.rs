@@ -918,6 +918,7 @@ pub(super) fn lazy_captures(function: &mut FunctionState) -> bool {
     }
     for (binding, data) in &mut graph.bindings {
         if data.captured
+            && !data.persistent
             && graph.scopes[data.scope].kind != super::ScopeKind::Captures
             && !eager.contains(&binding)
         {

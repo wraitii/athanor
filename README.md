@@ -54,8 +54,7 @@ error. Compilation options cannot be combined with `--load`, `--function`,
   before subsequent simplification; they do not describe every side exit.
   Detailed region reports are collected only with this flag.
   Feedback is empty until code has executed.
-- `--ast` prints each function's analyzed Oxc parameters/body and generator resume
-  plan, or the module AST for its initializer.
+- `--ast` prints each function's analyzed Oxc parameters/body, or the module AST for its initializer.
 - `--asm` prints native code with function-relative byte offsets, relocations,
   trap information, and semantic-location IDs. Instructions without a semantic
   location are explicitly marked `unattributed`.

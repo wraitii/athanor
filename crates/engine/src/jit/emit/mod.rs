@@ -13,10 +13,9 @@ use std::collections::HashMap;
 
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
-    Block, BlockArg, Inst, InstBuilder, MemFlagsData, SigRef, StackSlot, Type, Value as ClifValue,
-    types,
+    Block, BlockArg, Inst, InstBuilder, MemFlagsData, SigRef, Type, Value as ClifValue, types,
 };
-use cranelift_frontend::{FunctionBuilder, Switch, Variable};
+use cranelift_frontend::{FunctionBuilder, Variable};
 use cranelift_jit::JITModule;
 use cranelift_module::{FuncId, Module};
 use oxc_span::Span;
@@ -32,8 +31,7 @@ pub(super) use stubs::Stubs;
 
 pub(super) enum FunctionKind {
     Ordinary,
-    Generator(super::generator::ResumePlan),
-    Factory(FuncId),
+    Factory(std::sync::Arc<crate::continuation::Plan>),
 }
 
 #[derive(Clone, Copy)]
@@ -65,9 +63,6 @@ pub(super) struct FunctionCompiler<'a, 'f> {
     failed_exit: Option<Block>,
     error_origin: Option<Block>,
     handlers: Vec<Block>,
-    generator: Option<ClifValue>,
-    resume_blocks: Vec<Block>,
-    suspensions: HashMap<u32, (usize, Block)>,
     terminated: bool,
     frame_size: Option<Inst>,
     frame_roots: Option<Variable>,
@@ -80,11 +75,6 @@ pub(super) struct FunctionCompiler<'a, 'f> {
     owned: Vec<Variable>,
     free_owned: Vec<Variable>,
     unchecked: Option<Variable>,
-    spilled: HashMap<u32, StackSlot>,
-    free_slots: Vec<StackSlot>,
-    block_slots: Vec<StackSlot>,
-    owned_slots: Vec<StackSlot>,
-    owned_entry: Option<(Block, Block)>,
     unwinds: HashMap<Block, (Vec<Block>, Block)>,
 }
 
@@ -125,7 +115,6 @@ pub(super) struct Output<'a, 'f> {
 pub(super) fn build_function(
     out: Output<'_, '_>,
     params: Span,
-    kind: FunctionKind,
     graph: &super::semantic::Graph,
     facts: &super::semantic::Facts,
     continuations: &HashMap<usize, FuncId>,
@@ -134,7 +123,6 @@ pub(super) fn build_function(
     build_callable(
         out,
         params,
-        kind,
         CallableBody::Graph(graph, facts),
         continuations,
         feedback,
@@ -144,12 +132,11 @@ pub(super) fn build_function(
 pub(super) fn build_factory(
     out: Output<'_, '_>,
     params: Span,
-    resume: FuncId,
+    resume: std::sync::Arc<crate::continuation::Plan>,
 ) -> Result<(), Error> {
     build_callable(
         out,
         params,
-        FunctionKind::Factory(resume),
         CallableBody::Factory(resume),
         &HashMap::new(),
         None,
@@ -166,7 +153,6 @@ pub(super) fn build_global(
     build_callable(
         out,
         Span::new(0, 0),
-        FunctionKind::Ordinary,
         CallableBody::Graph(graph, facts),
         continuations,
         None,
@@ -175,13 +161,12 @@ pub(super) fn build_global(
 
 enum CallableBody<'g> {
     Graph(&'g super::semantic::Graph, &'g super::semantic::Facts),
-    Factory(FuncId),
+    Factory(std::sync::Arc<crate::continuation::Plan>),
 }
 
 fn build_callable(
     out: Output<'_, '_>,
     params: Span,
-    kind: FunctionKind,
     body: CallableBody<'_>,
     continuations: &HashMap<usize, FuncId>,
     feedback: Option<Feedback>,
@@ -240,9 +225,6 @@ fn build_callable(
         failed_exit: None,
         error_origin: None,
         handlers: Vec::new(),
-        generator: None,
-        resume_blocks: Vec::new(),
-        suspensions: HashMap::new(),
         terminated: false,
         frame_size: None,
         frame_roots: None,
@@ -255,44 +237,17 @@ fn build_callable(
         owned: Vec::new(),
         free_owned: Vec::new(),
         unchecked: None,
-        spilled: HashMap::new(),
-        free_slots: Vec::new(),
-        block_slots: Vec::new(),
-        owned_slots: Vec::new(),
-        owned_entry: None,
         unwinds: HashMap::new(),
     };
 
-    if matches!(kind, FunctionKind::Generator(_)) {
-        let init = compiler.b.create_block();
-        let start = compiler.b.create_block();
-        compiler.jump(init, &[]);
-        compiler.switch(start);
-        compiler.owned_entry = Some((init, start));
-    }
-
-    let dispatch = if let FunctionKind::Generator(plan) = &kind {
-        compiler.generator = Some(closure);
-        let dispatch = compiler.b.create_block();
-        let start = compiler.b.create_block();
-        compiler.jump(dispatch, &[]);
-        compiler.resume_blocks.push(start);
-        for (index, span) in plan.suspensions.iter().enumerate() {
-            let block = compiler.b.create_block();
-            compiler.suspensions.insert(*span, (index + 1, block));
-        }
-        compiler.switch(start);
-        Some(dispatch)
-    } else {
-        compiler.enter_frame();
-        None
-    };
+    compiler.enter_frame();
     if let CallableBody::Factory(resume) = body {
         let (argv, argc) = compiler.argument_vector()?;
         let args = compiler.call_helper(Helper::ArrayNew, &[argv, argc]);
         let arguments = *compiler.owned.last().unwrap();
         compiler.check_error();
-        let code = compiler.b.ins().iconst(types::I64, resume.as_u32() as i64);
+        let plan = compiler.data.pin(resume);
+        let code = compiler.b.ins().iconst(types::I64, plan as i64);
         let generator =
             compiler.call_helper(Helper::GeneratorNew, &[closure, receiver, args, code]);
         compiler.release_tracked(&[arguments]);
@@ -306,28 +261,8 @@ fn build_callable(
         return Ok(());
     }
     if let CallableBody::Graph(graph, facts) = body {
-        let graph_closure = if compiler.generator.is_some() {
-            compiler.call_helper(Helper::GeneratorClosure, &[closure])
-        } else {
-            closure
-        };
-        compiler.emit_semantic_graph(graph, facts, graph_closure, continuations)?;
+        compiler.emit_semantic_graph(graph, facts, closure, continuations)?;
         compiler.patch_frame_size();
-        if let Some(dispatch) = dispatch {
-            compiler.switch(dispatch);
-            let state = compiler.call_helper(Helper::GeneratorState, &[]);
-            let mut switch = Switch::new();
-            for (state, block) in compiler.resume_blocks.iter().enumerate() {
-                switch.set_entry(state as u128, *block);
-            }
-            let invalid = compiler.b.create_block();
-            switch.emit(compiler.b, state, invalid);
-            compiler.switch(invalid);
-            let undefined = compiler.constant(Value::UNDEFINED);
-            let args = compiler.return_args(undefined, false);
-            compiler.jump(return_block, &args);
-        }
-        compiler.finish_owned_slots();
         return Ok(());
     }
     Ok(())
@@ -451,13 +386,7 @@ impl FunctionCompiler<'_, '_> {
             self.b.ins().jump(done, &[]);
             self.b.switch_to_block(done);
         }
-        let value = match self.generator {
-            Some(generator) => self.call_helper(Helper::GeneratorComplete, &[generator, value]),
-            None => {
-                self.exit_frame(value);
-                value
-            }
-        };
+        self.exit_frame(value);
         let mut results = vec![value];
         if matches!(self.arguments, Arguments::Fixed(_)) {
             results.push(self.b.block_params(self.return_block)[1]);

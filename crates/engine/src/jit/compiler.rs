@@ -721,7 +721,7 @@ impl Compiler {
                 let label = format!("{}.constructor", class.id.as_ref().unwrap().name.as_str());
                 let line = line_at(&lines, class.span.start);
                 let id = self.declare_js(&label, line)?;
-                let (code, _) = self.compile_callable(
+                let code = self.compile_callable(
                     &params,
                     &[],
                     None,
@@ -795,7 +795,7 @@ impl Compiler {
                 );
                 continue;
             }
-            let (code, resume) = self.compile_callable(
+            let code = self.compile_callable(
                 callable.params,
                 callable.statements,
                 callable.expression,
@@ -813,9 +813,6 @@ impl Compiler {
                 callable.line,
                 Some(callable.span),
             )?;
-            if let Some(resume) = resume {
-                pending.push(resume);
-            }
             pending.push((callable.id, code));
         }
         let initializer = if program.body.iter().all(|s| {
@@ -912,13 +909,14 @@ impl Compiler {
 
         let compiled_ids: Vec<_> = pending
             .iter()
+            .chain(&self.continuations)
             .map(|(id, _)| *id)
             .filter(|id| Some(*id) != initializer)
             .collect();
 
         if let Some(options) = self.inspection.as_deref()
             && let Some(filter) = &options.filter
-            && !pending.iter().any(|(id, _)| {
+            && !pending.iter().chain(&self.continuations).any(|(id, _)| {
                 self.function_names
                     .get(id)
                     .is_some_and(|name| options.matches(name))
@@ -1512,7 +1510,7 @@ impl Compiler {
         let mut graph =
             super::semantic::optimize_planned(planned, versioning, self.report_regions())
                 .map_err(Error::Unsupported)?;
-        if self.osr && region.is_none() {
+        if self.osr && region.is_none() && !self.canonical.is_region(code) {
             graph.prepare_osr(source).map_err(Error::Unsupported)?;
         }
         let continuations = self.compile_continuations(
@@ -1523,7 +1521,8 @@ impl Compiler {
             self.ssa_opt.then(|| self.feedback(code, false)),
         )?;
         let signature = self.graph_signature(Some(&graph.graph));
-        let feedback = self.ssa_opt.then(|| self.feedback(code, region.is_none()));
+        let feedback = (self.ssa_opt && !self.canonical.is_region(code))
+            .then(|| self.feedback(code, region.is_none()));
         let mut baseline_data = super::function_data::FunctionData::new();
         let baseline = if initial
             && region.is_none()
@@ -1566,7 +1565,6 @@ impl Compiler {
                 emit::build_function(
                     out,
                     emission.params,
-                    emit::FunctionKind::Ordinary,
                     &graph.graph,
                     &graph.facts,
                     &continuations,
@@ -1775,36 +1773,70 @@ impl Compiler {
                 feedback,
                 ids,
             )?;
-            let facts = super::semantic::Facts::compute(&target.graph);
-            let (function, annotations) =
-                self.emit_body(self.signature.clone(), source_name, |out| {
-                    emit::build_function(
-                        out,
-                        params,
-                        emit::FunctionKind::Ordinary,
-                        &target.graph,
-                        &facts,
-                        ids,
-                        feedback,
-                    )
-                })?;
-            let listing = self.listing().then(|| target.graph.listing(&facts).lines());
-            self.continuations.push((
-                id,
-                FunctionBody {
-                    function,
-                    baseline: None,
-                    annotations,
-                    inspection: super::inspect::Inspection::from_graph(
-                        self.inspection.as_deref(),
-                        &target.graph,
-                    )
-                    .named(&format!("continuation of {}", name.0)),
-                    listing,
-                },
-            ));
+            let mut body =
+                self.compile_region(&target.graph, source_name, params, ids, feedback)?;
+            body.inspection = body
+                .inspection
+                .named(&format!("continuation of {}", name.0));
+            self.continuations.push((id, body));
         }
         Ok(())
+    }
+
+    fn compile_region(
+        &mut self,
+        graph: &super::semantic::Graph,
+        source_name: (usize, usize),
+        params: oxc_span::Span,
+        continuations: &HashMap<usize, FuncId>,
+        feedback: Option<emit::Feedback>,
+    ) -> Result<FunctionBody, Error> {
+        let facts = super::semantic::Facts::compute(graph);
+        let mut data = FunctionData::new();
+        let baseline = if !self.ssa_opt
+            && self.module.isa().name() == "aarch64"
+            && std::env::var_os("JS_JIT_BASELINE").is_some()
+        {
+            super::aarch64::compile_baseline(
+                graph,
+                source_name,
+                self.dump_ir || self.inspection.is_some(),
+                &mut self.names,
+                &mut data,
+            )
+            .map_err(|reason| {
+                if let Some(stats) = &mut self.stats {
+                    *stats.baseline_refusals.entry(reason.0).or_default() += 1;
+                }
+            })
+            .ok()
+            .map(Arc::new)
+        } else {
+            None
+        };
+        let (function, annotations) = if baseline.is_some() {
+            self.data.push(data);
+            let mut function = cranelift_codegen::ir::Function::new();
+            function.signature = self.signature.clone();
+            (
+                function,
+                Annotations {
+                    semantic_locations: self.dump_ir || self.inspection.is_some(),
+                    ..Annotations::default()
+                },
+            )
+        } else {
+            self.emit_body(self.signature.clone(), source_name, |out| {
+                emit::build_function(out, params, graph, &facts, continuations, feedback)
+            })?
+        };
+        Ok(FunctionBody {
+            function,
+            annotations,
+            baseline,
+            inspection: super::inspect::Inspection::from_graph(self.inspection.as_deref(), graph),
+            listing: self.listing().then(|| graph.listing(&facts).lines()),
+        })
     }
 
     fn compile_callable(
@@ -1822,7 +1854,7 @@ impl Compiler {
         label: &str,
         line: u32,
         semantic_function: Option<oxc_span::Span>,
-    ) -> Result<(FunctionBody, Option<(FuncId, FunctionBody)>), Error> {
+    ) -> Result<FunctionBody, Error> {
         if !generator {
             let mut body = self.compile_function(
                 params,
@@ -1842,29 +1874,82 @@ impl Compiler {
                 self.inspection.as_deref(),
                 &(params, statements, expression),
             );
-            return Ok((body, None));
+            return Ok(body);
         }
-        let plan = super::generator::ResumePlan::lower(statements)?;
-        let inspection = super::inspect::Inspection::default()
-            .ast(self.inspection.as_deref(), &(params, statements, &plan));
-        let internal = format!("{label}.resume");
-        let id = self.declare_js(&internal, line)?;
-        let mut resume = self.compile_function(
+        super::generator::validate(statements)?;
+        let canonical = super::semantic::canonical_for_emission(
             params,
             statements,
-            None,
+            expression,
+            semantic_function.unwrap(),
+            scoping,
+            captured,
+            captures,
+            closures,
             arguments_binding,
             arguments_references,
-            captures,
-            captured,
-            closures,
-            scoping,
-            emit::FunctionKind::Generator(plan),
-            (&internal, line),
-            semantic_function,
-        )?;
-        resume.inspection = resume.inspection.named(&internal).with_ast(inspection);
-        let factory = self.compile_function(
+            true,
+            false,
+        )
+        .map_err(Error::Unsupported)?;
+        let plan = super::semantic::suspension::Plan::lower(&canonical.graph)
+            .map_err(Error::Unsupported)?;
+        let mut ids = Vec::new();
+        for (index, _) in plan.regions.iter().enumerate() {
+            ids.push(self.declare_js(&format!("{label}.resume.{index}"), line)?);
+        }
+        let exits: Vec<_> = std::iter::once(crate::continuation::Exit::Complete)
+            .chain((1..ids.len()).map(crate::continuation::Exit::Suspend))
+            .collect();
+        let layout = Arc::new(crate::continuation::Plan {
+            entries: plan
+                .regions
+                .iter()
+                .zip(&ids)
+                .map(|(region, id)| crate::continuation::Entry {
+                    code: crate::heap::CodeId(u64::from(id.as_u32())),
+                    inputs: region.inputs,
+                    outputs: region.outputs,
+                    exits: exits.clone().into_boxed_slice(),
+                })
+                .collect(),
+        });
+        for (region, &id) in plan.regions.into_iter().zip(&ids) {
+            let region = super::semantic::canonicalize_graph(region.graph, self.ssa_opt)
+                .map_err(Error::Unsupported)?;
+            Arc::make_mut(&mut self.canonical).insert_region(self.source_name.0, id, region.graph);
+        }
+        for &id in &ids {
+            if self.inspection.is_none() {
+                self.lazy.insert(
+                    id,
+                    (
+                        Emission {
+                            tier: CompilationTier::Optimized,
+                            specialized: false,
+                            callees: Vec::new(),
+                            plan: Default::default(),
+                            specialization: None,
+                            osr: None,
+                            source_name: self.source_name,
+                            params: params.span,
+                        },
+                        self.canonical.clone(),
+                    ),
+                );
+                continue;
+            }
+            let (_, region) = self.canonical.emission(id).unwrap();
+            let body = self.compile_region(
+                &region.graph,
+                self.source_name,
+                params.span,
+                &HashMap::new(),
+                None,
+            )?;
+            self.continuations.push((id, body));
+        }
+        let mut factory = self.compile_function(
             params,
             &[],
             None,
@@ -1874,11 +1959,14 @@ impl Compiler {
             captured,
             closures,
             scoping,
-            emit::FunctionKind::Factory(id),
+            emit::FunctionKind::Factory(layout),
             (label, line),
             None,
         )?;
-        Ok((factory, Some((id, resume))))
+        factory.inspection = factory
+            .inspection
+            .ast(self.inspection.as_deref(), &(params, statements));
+        Ok(factory)
     }
 
     fn compile_function(
@@ -1912,7 +2000,7 @@ impl Compiler {
                         closures,
                         arguments_binding,
                         arguments_references,
-                        matches!(kind, emit::FunctionKind::Generator(_)),
+                        false,
                         self.ssa_opt,
                     ),
                 }?;
@@ -2033,7 +2121,6 @@ impl Compiler {
                 Some(graph) => emit::build_function(
                     out,
                     params.span,
-                    kind,
                     &graph.graph,
                     &graph.facts,
                     &continuations,

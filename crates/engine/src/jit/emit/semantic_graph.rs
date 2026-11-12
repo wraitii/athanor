@@ -26,8 +26,7 @@ const NUMERIC: Types = Types::NUMBER.union(Types::UNDEFINED);
 struct Context<'a> {
     graph: &'a Graph,
     osr_buffers: RefCell<std::collections::HashMap<GraphValue, (ClifValue, usize)>>,
-    values: &'a [Variable],
-    direct: Option<RefCell<SecondaryMap<GraphValue, Option<ClifValue>>>>,
+    direct: RefCell<SecondaryMap<GraphValue, Option<ClifValue>>>,
     reprs: &'a SecondaryMap<GraphValue, Repr>,
     facts: &'a Facts,
     slots: Slots,
@@ -35,9 +34,7 @@ struct Context<'a> {
 
 impl Context<'_> {
     fn define(&self, value: GraphValue, clif: ClifValue) {
-        if let Some(direct) = &self.direct {
-            direct.borrow_mut()[value] = Some(clif);
-        }
+        self.direct.borrow_mut()[value] = Some(clif);
     }
 
     fn numeric(&self, value: GraphValue) -> bool {
@@ -211,18 +208,13 @@ impl FunctionCompiler<'_, '_> {
             .values()
             .map(|_| self.b.create_block())
             .collect();
-        let suspends = self.generator.is_some();
         let mut reprs: SecondaryMap<GraphValue, Repr> = SecondaryMap::with_default(Repr::Boxed);
-        if !suspends {
-            for value in graph.values.keys() {
-                // Saturation can exceed the safe integer range, so its facts remain broad.
-                reprs[value] = if matches!(graph.defining_op(value), Some(Op::SaturatingInteger(_)))
-                {
-                    Repr::Int64
-                } else {
-                    Repr::of(facts.of(value))
-                };
-            }
+        for value in graph.values.keys() {
+            reprs[value] = if matches!(graph.defining_op(value), Some(Op::SaturatingInteger(_))) {
+                Repr::Int64
+            } else {
+                Repr::of(facts.of(value))
+            };
         }
         let values: Vec<Variable> = graph
             .values
@@ -253,7 +245,7 @@ impl FunctionCompiler<'_, '_> {
             })
             .collect();
         let rooted = |value: crate::jit::semantic::Value| {
-            suspends || facts.of(value).intersects(HEAP) && !graph.borrowed.contains(&value)
+            facts.of(value).intersects(HEAP) && !graph.borrowed.contains(&value)
         };
         let cfg = &facts.cfg;
         let reachable = cfg.rpo.clone();
@@ -265,9 +257,6 @@ impl FunctionCompiler<'_, '_> {
                     graph.insts[inst].op,
                     Op::NewPack | Op::Spread(_) | Op::StringSplitParts(..)
                 ) {
-                    continue;
-                }
-                if suspends {
                     continue;
                 }
                 let address = {
@@ -312,9 +301,8 @@ impl FunctionCompiler<'_, '_> {
         let early: std::collections::HashSet<GraphValue> =
             releases.values().flatten().copied().collect();
         let mut result_tokens = std::collections::HashMap::<GraphValue, Vec<Variable>>::new();
-        let repeated = |block: crate::jit::semantic::Block| {
-            suspends || graph.has_handlers || cyclic.contains(&block)
-        };
+        let repeated =
+            |block: crate::jit::semantic::Block| graph.has_handlers || cyclic.contains(&block);
         let mut pending: SecondaryMap<crate::jit::semantic::Block, usize> = SecondaryMap::new();
         for &block in &reachable {
             pending[block] = cfg.preds[block].len();
@@ -330,20 +318,13 @@ impl FunctionCompiler<'_, '_> {
         for &variable in bindings.iter().chain(lazy_cells.iter().flatten()) {
             self.b.def_var(variable, undefined);
         }
-        if suspends {
-            for value in graph.values.keys() {
-                let zero = self.zero(reprs[value]);
-                self.b.def_var(values[value.index()], zero);
-            }
-        }
         let cx = Context {
             graph,
             osr_buffers: RefCell::new(std::collections::HashMap::new()),
-            values: &values,
-            direct: (!suspends).then(|| RefCell::new(SecondaryMap::new())),
+            direct: RefCell::new(SecondaryMap::new()),
             reprs: &reprs,
             facts,
-            slots: if suspends || self.frame_size.is_none() {
+            slots: if self.frame_size.is_none() {
                 Slots::none()
             } else {
                 slots::assign(
@@ -439,8 +420,6 @@ impl FunctionCompiler<'_, '_> {
                     }
                 } else if rooted(value) {
                     self.initialize_local(values[value.index()], param);
-                } else if suspends {
-                    self.b.def_var(values[value.index()], param);
                 }
                 cx.define(value, param);
             }
@@ -652,6 +631,12 @@ impl FunctionCompiler<'_, '_> {
                                     (index * 8) as i32,
                                 );
                             }
+                            None
+                        }
+                        Op::BindingLoad(binding) => Some(self.b.use_var(bindings[binding.index()])),
+                        Op::BindingRestore(binding, value) => {
+                            let value = get(self, *value);
+                            self.initialize_binding(bindings[binding.index()], value);
                             None
                         }
                         Op::Argument(index) => Some(self.load_arg(*index)),
@@ -1577,8 +1562,7 @@ impl FunctionCompiler<'_, '_> {
                 };
                 if let (Some(value), Some(result)) = (data.result, result) {
                     let result = self.convert(result, reprs[value]);
-                    let borrowed = (graph.caller_rooted(value) || graph.borrowed.contains(&value))
-                        && !suspends;
+                    let borrowed = graph.caller_rooted(value) || graph.borrowed.contains(&value);
                     if owned {
                         let repeated = repeated(block) || cx.slots.shared(value);
                         self.replace_local(values[value.index()], result, repeated);
@@ -1587,8 +1571,6 @@ impl FunctionCompiler<'_, '_> {
                         self.own_local(values[value.index()], result, repeated);
                     } else if rooted(value) && !borrowed && !slotted {
                         self.initialize_local(values[value.index()], result);
-                    } else if suspends {
-                        self.b.def_var(values[value.index()], result);
                     }
                     cx.define(value, result);
                 }
@@ -1667,25 +1649,8 @@ impl FunctionCompiler<'_, '_> {
                         self.jump(block, &args);
                     }
                 }
-                TerminatorKind::Yield(span, value, target_) => {
-                    let generator = self.generator.unwrap();
-                    let operand = self.operand(&cx, *value);
-                    let value = self.convert(operand, Repr::Boxed);
-                    let (state, resume) = self.suspensions[&span.start];
-                    let state = self.b.ins().iconst(types::I64, state as i64);
-                    let result =
-                        self.call_helper(Helper::GeneratorSuspend, &[generator, value, state]);
-                    self.b.ins().return_(&[result]);
-                    self.resume_blocks.push(resume);
-                    self.switch(resume);
-                    for &variable in values.iter().chain(&bindings) {
-                        let slot = self.b.ins().iconst(types::I64, variable.as_u32() as i64);
-                        let value = self.call_helper(Helper::LocalGet, &[slot]);
-                        self.b.def_var(variable, value);
-                    }
-                    self.release_owned();
-                    let (block, args) = target(self, target_);
-                    self.jump(block, &args);
+                TerminatorKind::Yield(..) => {
+                    return Err(Error::Compile("suspension reached native emission".into()));
                 }
                 TerminatorKind::Fallback(previous) => {
                     let mut args = vec![self.ctx, closure, self.receiver];
@@ -1747,17 +1712,13 @@ impl FunctionCompiler<'_, '_> {
     /// Values that die within their block stay owned by their temporary instead.
     fn slot_owned(&self, graph: &Graph, cx: &Context<'_>, value: GraphValue) -> bool {
         self.frame_size.is_some()
-            && self.generator.is_none()
             && cx.facts.of(value).intersects(HEAP)
             && !graph.borrowed.contains(&value)
             && cx.slots.of(value).is_some()
     }
 
     fn operand(&mut self, cx: &Context<'_>, value: GraphValue) -> Operand {
-        let clif = match &cx.direct {
-            Some(direct) => direct.borrow()[value].expect("semantic value used before definition"),
-            None => self.b.use_var(cx.values[value.index()]),
-        };
+        let clif = cx.direct.borrow()[value].expect("semantic value used before definition");
         let operand = Operand::new(clif, cx.reprs[value]);
         match cx.graph.defining_op(value) {
             Some(Op::Constant(Constant::Number(number))) => operand.with_constant(*number),

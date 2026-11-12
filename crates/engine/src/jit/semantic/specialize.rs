@@ -23,6 +23,7 @@ pub(in crate::jit) struct Repository {
     pub(in crate::jit) call_specialization: bool,
     pub(in crate::jit) variants: crate::jit::variants::Registry,
     bodies: HashMap<FuncId, Arc<Body>>,
+    regions: HashSet<FuncId>,
     pub(in crate::jit) number_first: HashSet<FuncId>,
     pub(in crate::jit) feedback: HashMap<crate::jit::profile::Site, Vec<FuncId>>,
     pub(in crate::jit) native_feedback:
@@ -50,6 +51,7 @@ impl Default for Repository {
             call_specialization: true,
             variants: Default::default(),
             bodies: Default::default(),
+            regions: Default::default(),
             number_first: Default::default(),
             feedback: Default::default(),
             native_feedback: Default::default(),
@@ -175,6 +177,24 @@ impl Repository {
                 arrow,
             }),
         );
+    }
+
+    pub(in crate::jit) fn insert_region(&mut self, source: usize, code: FuncId, graph: Graph) {
+        self.regions.insert(code);
+        self.bodies.insert(
+            code,
+            Arc::new(Body {
+                name: graph.name.clone(),
+                source,
+                graph,
+                notes: Vec::new(),
+                arrow: false,
+            }),
+        );
+    }
+
+    pub(in crate::jit) fn is_region(&self, code: FuncId) -> bool {
+        self.regions.contains(&code)
     }
 
     pub(in crate::jit) fn code(&self, source: usize, start: u32) -> Option<FuncId> {
