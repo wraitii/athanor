@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use crate::{FxHashMap, FxHashSet};
 
 use cranelift_codegen::entity::SecondaryMap;
 
@@ -26,7 +26,7 @@ pub(in crate::jit::semantic) fn simplify(function: &mut FunctionState, folder: &
         let FunctionState { graph, facts, .. } = function;
         let cfg = &facts.cfg;
         let uses = graph.use_counts();
-        let mut aliases = HashMap::new();
+        let mut aliases = FxHashMap::default();
         let mut dead = Vec::new();
         let mut cfg_changed = folder.refine(graph, cfg);
         let mut changed = cfg_changed;
@@ -108,7 +108,7 @@ fn branch_condition(graph: &Graph, condition: Value) -> (Value, bool) {
 }
 
 fn fold_dominated_branches(graph: &mut Graph, cfg: &Cfg) -> bool {
-    let mut decided: HashMap<Value, Vec<(Block, bool)>> = HashMap::new();
+    let mut decided: FxHashMap<Value, Vec<(Block, bool)>> = FxHashMap::default();
     for &block in &cfg.rpo {
         let Some(Terminator {
             kind: TerminatorKind::Branch(condition, yes, no),
@@ -162,7 +162,7 @@ fn thread_branches(graph: &mut Graph) -> bool {
             .iter()
             .any(|&pred| cfg.dominates(block, pred))
     };
-    let mut touched = HashSet::new();
+    let mut touched = FxHashSet::default();
     for &block in &cfg.rpo {
         let Some(Terminator {
             kind: TerminatorKind::Branch(condition, yes, no),

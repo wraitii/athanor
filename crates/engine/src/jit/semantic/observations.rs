@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use crate::{FxHashMap, FxHashSet};
 
 use crate::jit::profile::{Observation, ReadKind, ReadType, Site};
 
@@ -10,7 +10,7 @@ pub(super) fn plan(
 ) -> Vec<(Site, ReadType)> {
     let number_first = specialization
         .is_some_and(|(repository, source)| repository.number_first(source, graph.span.start));
-    let mut carried: HashMap<_, Vec<_>> = HashMap::new();
+    let mut carried: FxHashMap<_, Vec<_>> = FxHashMap::default();
     for block in Cfg::new(graph).rpo {
         for &inst in &graph.blocks[block].insts {
             if let Op::Observe(value, Observation::Read(kind), site)
@@ -30,7 +30,7 @@ pub(super) fn plan(
     }
     let cfg = Cfg::new(graph);
     let facts = Facts::compute(graph);
-    let receivers: HashSet<_> = cfg
+    let receivers: FxHashSet<_> = cfg
         .rpo
         .iter()
         .filter(|block| !graph.cold.contains(block))
@@ -200,7 +200,7 @@ pub(super) fn plan(
     numbers
 }
 
-pub(super) fn numeric_hints(graph: &Graph) -> HashMap<super::Value, ReadType> {
+pub(super) fn numeric_hints(graph: &Graph) -> FxHashMap<super::Value, ReadType> {
     graph
         .blocks
         .iter()
@@ -238,7 +238,7 @@ pub(super) fn numeric_site(graph: &Graph, value: super::Value) -> Option<Site> {
     })
 }
 
-pub(super) fn read_hints(graph: &Graph) -> HashMap<super::Value, ReadType> {
+pub(super) fn read_hints(graph: &Graph) -> FxHashMap<super::Value, ReadType> {
     graph
         .blocks
         .iter()

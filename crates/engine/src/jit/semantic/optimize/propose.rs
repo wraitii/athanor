@@ -3,17 +3,18 @@ use super::super::specialize::ConditionalPlan;
 use super::placement::{Reach, place_assumes};
 use super::*;
 use crate::jit::profile::ReadType;
+use crate::{FxHashMap, FxHashSet};
 
 pub(super) fn numbers(graph: &mut Graph) -> Vec<(Value, Fact)> {
     let cfg = Cfg::new(graph);
     let facts = Facts::compute(graph);
     let hints = super::super::observations::numeric_hints(graph);
-    let native_calls: HashSet<Inst> = requirements(graph, &cfg.rpo)
+    let native_calls: FxHashSet<Inst> = requirements(graph, &cfg.rpo)
         .into_iter()
         .map(|requirement| requirement.call)
         .collect();
     let mut proposals: Vec<(Inst, Value, Fact, Option<crate::jit::profile::Site>)> = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = FxHashSet::default();
     for &block in &cfg.rpo {
         for &inst in &graph.blocks[block].insts {
             let op = &graph.insts[inst].op;
@@ -72,8 +73,8 @@ pub(super) fn typed(graph: &mut Graph, numbers: &[(Value, Fact)]) {
     let cfg = Cfg::new(graph);
     let under = Facts::assuming(graph, numbers);
     let mut proposals: Vec<(Block, Value, Fact, Kind)> = Vec::new();
-    let mut seen = HashSet::new();
-    let mut objects = HashSet::new();
+    let mut seen = FxHashSet::default();
+    let mut objects = FxHashSet::default();
     for &block in &cfg.rpo {
         for &inst in &graph.blocks[block].insts {
             if let Op::GetIndex(object, key) | Op::TypedIndex(object, key, _) = graph.insts[inst].op
@@ -89,9 +90,9 @@ pub(super) fn typed(graph: &mut Graph, numbers: &[(Value, Fact)]) {
     }
     let mut objects: Vec<Value> = objects.into_iter().collect();
     objects.sort();
-    let everything: HashSet<Value> = graph.values.keys().collect();
-    let body: HashSet<Block> = cfg.rpo.iter().copied().collect();
-    let mut bounds_seen = HashSet::new();
+    let everything: FxHashSet<Value> = graph.values.keys().collect();
+    let body: FxHashSet<Block> = cfg.rpo.iter().copied().collect();
+    let mut bounds_seen = FxHashSet::default();
     let mut reads: Vec<_> = bounded_reads(graph, &cfg, &body, &objects, &everything, &under)
         .into_iter()
         .collect();
@@ -116,7 +117,7 @@ pub(super) fn typed(graph: &mut Graph, numbers: &[(Value, Fact)]) {
 pub(super) fn natives(graph: &mut Graph) {
     let blocks = Cfg::new(graph).rpo;
     let mut proposals = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = FxHashSet::default();
     for requirement in requirements(graph, &blocks) {
         let Op::Call { callee, .. } = graph.insts[requirement.call].op else {
             continue;
@@ -144,7 +145,7 @@ pub(super) fn natives(graph: &mut Graph) {
 
 pub(super) fn identities(graph: &mut Graph, conditional: &ConditionalPlan) -> Vec<Inst> {
     let mut proposals = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = FxHashSet::default();
     for call in &conditional.calls {
         let block = graph.insts[call.inst].block;
         if graph.cold.contains(&block) {
@@ -179,7 +180,7 @@ pub(super) fn identities(graph: &mut Graph, conditional: &ConditionalPlan) -> Ve
 pub(super) fn assumed_calls(
     graph: &Graph,
     conditional: &ConditionalPlan,
-) -> HashMap<Value, cranelift_module::FuncId> {
+) -> FxHashMap<Value, cranelift_module::FuncId> {
     conditional
         .calls
         .iter()

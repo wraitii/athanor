@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use std::ptr::NonNull;
 use std::rc::Rc;
 
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use crate::FxHashMap;
 
 use crate::value::{TAG_OBJECT, TAG_STRING, Value};
 
@@ -61,7 +61,7 @@ struct HeapData {
     shapes: Shapes,
     natives: Vec<(NativeFunction, u64)>,
     interned: Vec<(&'static str, u64)>,
-    regexp_cache: HashMap<(String, u8), Rc<regress::Regex>>,
+    regexp_cache: FxHashMap<(String, u8), Rc<regress::Regex>>,
     pending: VecDeque<u64>,
     epoch: u64,
 }

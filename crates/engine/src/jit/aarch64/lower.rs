@@ -1018,7 +1018,8 @@ impl Lower<'_> {
                         continue;
                     }
                     if let Some((imm, shift)) = e::arith_imm(*key as i64) {
-                        self.asm.emit(e::subs_imm(width(ty), e::ZR, reg, imm, shift));
+                        self.asm
+                            .emit(e::subs_imm(width(ty), e::ZR, reg, imm, shift));
                     } else {
                         self.mov_imm(Width::X, T1, *key as u64);
                         self.asm.emit(e::alu(Alu::Subs, width(ty), e::ZR, reg, T1));

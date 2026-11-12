@@ -1,4 +1,5 @@
 use super::*;
+use crate::FxHashMap;
 
 #[derive(Debug, Default)]
 pub(crate) struct CycleStats {
@@ -81,7 +82,7 @@ impl Heap {
             .slots()
             .filter(|slot| slot.references > 0)
             .collect();
-        let indices: HashMap<_, _> = slots
+        let indices: FxHashMap<_, _> = slots
             .iter()
             .enumerate()
             .map(|(index, slot)| (*slot as *const Slot as u64, index))

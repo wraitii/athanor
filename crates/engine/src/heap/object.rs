@@ -1,10 +1,11 @@
 use super::*;
+use crate::FxHashSet;
 
 pub(super) struct Enumerator {
     pub(super) current: Option<Value>,
     pub(super) keys: Vec<String>,
     pub(super) cursor: usize,
-    pub(super) visited: HashSet<String>,
+    pub(super) visited: FxHashSet<String>,
 }
 
 pub(super) struct Object {
@@ -488,7 +489,7 @@ impl Heap {
                 current,
                 keys,
                 cursor: 0,
-                visited: HashSet::default(),
+                visited: FxHashSet::default(),
             })),
         );
         Some(Value::from_bits(TAG_OBJECT | id))

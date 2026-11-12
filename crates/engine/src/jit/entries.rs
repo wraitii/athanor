@@ -1,3 +1,4 @@
+use crate::FxHashMap;
 use std::cell::Cell;
 
 use crate::jit::session::JitCtx;
@@ -26,10 +27,7 @@ impl VariantId {
 }
 
 #[derive(Default)]
-pub(crate) struct Variants(
-    Vec<Option<Entry>>,
-    std::collections::HashMap<VariantId, Entry>,
-);
+pub(crate) struct Variants(Vec<Option<Entry>>, FxHashMap<VariantId, Entry>);
 
 impl Variants {
     pub(crate) fn get(&self, variant: VariantId) -> Option<Entry> {

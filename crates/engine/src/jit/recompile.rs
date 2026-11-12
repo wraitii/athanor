@@ -2,7 +2,7 @@ mod scheduler;
 
 pub(crate) use scheduler::{Priority, Ticket};
 
-use std::collections::HashMap;
+use crate::FxHashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex};
@@ -102,7 +102,7 @@ pub(crate) struct Service {
     buffered: Option<Completion>,
     threads: Vec<JoinHandle<()>>,
     log: Log,
-    pub(crate) in_flight: HashMap<Key, Ticket>,
+    pub(crate) in_flight: FxHashMap<Key, Ticket>,
 }
 
 impl Service {
@@ -126,7 +126,7 @@ impl Service {
             buffered: None,
             threads: Vec::new(),
             log,
-            in_flight: HashMap::new(),
+            in_flight: FxHashMap::default(),
         };
         for index in 0..options.compiler_threads {
             service.threads.push(spawn_worker(
@@ -277,7 +277,7 @@ fn spawn_worker(
                 shared: shared.clone(),
             };
             log.event(format_args!("worker {name} started"));
-            let mut compilers = HashMap::new();
+            let mut compilers = FxHashMap::default();
             loop {
                 let next = {
                     let mut work = shared.work.lock().unwrap();

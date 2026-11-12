@@ -144,26 +144,35 @@ fn block_weights(
     cfg: &Cfg,
     cold: &SecondaryMap<Block, bool>,
 ) -> SecondaryMap<Block, f64> {
-    let mut depth = SecondaryMap::<Block, u32>::new();
-    let mut latches = std::collections::HashMap::<Block, Vec<Block>>::new();
+    let mut position = SecondaryMap::<Block, u32>::with_default(u32::MAX);
+    for (index, &block) in cfg.rpo.iter().enumerate() {
+        position[block] = index as u32;
+    }
+    let mut latches = Vec::new();
     for &block in &cfg.rpo {
         for successor in graph.successors(block) {
-            if cfg.dominates(successor, block) {
-                latches.entry(successor).or_default().push(block);
+            if position[successor] <= position[block] && cfg.dominates(successor, block) {
+                latches.push((successor, block));
             }
         }
     }
-    for (header, mut pending) in latches {
-        let mut seen = std::collections::HashSet::new();
-        seen.insert(header);
+    latches.sort_by_key(|&(header, _)| header);
+    let mut depth = SecondaryMap::<Block, u32>::new();
+    let mut seen = SecondaryMap::<Block, u32>::new();
+    let mut pending = Vec::new();
+    for (stamp, group) in latches.chunk_by(|a, b| a.0 == b.0).enumerate() {
+        let stamp = stamp as u32 + 1;
+        let header = group[0].0;
+        seen[header] = stamp;
+        depth[header] += 1;
+        pending.extend(group.iter().map(|&(_, latch)| latch));
         while let Some(current) = pending.pop() {
-            if !seen.insert(current) {
+            if seen[current] == stamp {
                 continue;
             }
+            seen[current] = stamp;
+            depth[current] += 1;
             pending.extend(cfg.preds[current].iter().copied());
-        }
-        for member in seen {
-            depth[member] += 1;
         }
     }
     let mut weights = SecondaryMap::new();
@@ -240,9 +249,37 @@ fn copies(graph: &Graph, blocks: &SecondaryMap<Block, f64>) -> Vec<(Value, Value
 
 struct Bundle {
     class: RegClass,
-    members: Vec<Value>,
-    segments: Vec<Segment>,
+    first: Value,
+    last: Value,
+    size: u32,
+    merged: Option<Vec<Segment>>,
     weight: f64,
+}
+
+impl Bundle {
+    fn single(class: RegClass, value: Value, weight: f64) -> Self {
+        Self {
+            class,
+            first: value,
+            last: value,
+            size: 1,
+            merged: None,
+            weight,
+        }
+    }
+
+    fn segments<'a>(&'a self, liveness: &'a liveness::Liveness) -> &'a [Segment] {
+        self.merged
+            .as_deref()
+            .unwrap_or_else(|| liveness.of(self.first))
+    }
+
+    fn members<'a>(
+        &self,
+        next: &'a SecondaryMap<Value, Option<Value>>,
+    ) -> impl Iterator<Item = Value> + 'a {
+        std::iter::successors((self.size > 0).then_some(self.first), |&value| next[value])
+    }
 }
 
 struct Candidate {
@@ -255,7 +292,7 @@ impl Candidate {
     fn new(index: usize, bundle: &Bundle) -> Self {
         Self {
             weight: bundle.weight,
-            first: bundle.members[0],
+            first: bundle.first,
             index,
         }
     }
@@ -326,22 +363,18 @@ pub(crate) fn allocate(
 
     let mut bundles = Vec::new();
     let mut bundle_of = SecondaryMap::<Value, Option<usize>>::new();
-    for (value, segments) in liveness.segments.iter() {
-        if segments.is_empty() {
+    let mut next = SecondaryMap::<Value, Option<Value>>::new();
+    for value in graph.values.keys() {
+        if liveness.of(value).is_empty() {
             continue;
         }
         let ty = graph.low_level_types[value].ok_or_else(|| format!("missing type for {value}"))?;
         let class = RegClass::of(ty).ok_or_else(|| format!("value type {ty}"))?;
         bundle_of[value] = Some(bundles.len());
-        bundles.push(Bundle {
-            class,
-            members: vec![value],
-            segments: segments.clone(),
-            weight: weights[value],
-        });
+        bundles.push(Bundle::single(class, value, weights[value]));
     }
 
-    let mut partners = SecondaryMap::<Value, Vec<(Value, f64)>>::new();
+    let mut partners = Vec::new();
     for (a, b, weight) in copies(graph, &blocks) {
         let (Some(x), Some(y)) = (bundle_of[a], bundle_of[b]) else {
             continue;
@@ -349,26 +382,48 @@ pub(crate) fn allocate(
         if bundles[x].class != bundles[y].class {
             continue;
         }
-        partners[a].push((b, weight));
-        partners[b].push((a, weight));
-        if x == y || overlap(&bundles[x].segments, &bundles[y].segments) {
+        partners.push((a, b, weight));
+        partners.push((b, a, weight));
+        if x == y
+            || overlap(
+                bundles[x].segments(&liveness),
+                bundles[y].segments(&liveness),
+            )
+        {
             continue;
         }
-        let (keep, gone) = if bundles[x].members.len() >= bundles[y].members.len() {
+        let (keep, gone) = if bundles[x].size >= bundles[y].size {
             (x, y)
         } else {
             (y, x)
         };
-        let moved = std::mem::take(&mut bundles[gone].members);
-        let segments = std::mem::take(&mut bundles[gone].segments);
-        let weight = std::mem::take(&mut bundles[gone].weight);
-        for &member in &moved {
+        let segments = merge_segments(
+            bundles[keep].segments(&liveness),
+            bundles[gone].segments(&liveness),
+        );
+        let empty = Bundle {
+            size: 0,
+            ..Bundle::single(bundles[gone].class, bundles[gone].first, 0.0)
+        };
+        let moved = std::mem::replace(&mut bundles[gone], empty);
+        for member in moved.members(&next) {
             bundle_of[member] = Some(keep);
         }
         let bundle = &mut bundles[keep];
-        bundle.members.extend(moved);
-        bundle.segments = merge_segments(&bundle.segments, &segments);
-        bundle.weight += weight;
+        next[bundle.last] = Some(moved.first);
+        bundle.last = moved.last;
+        bundle.size += moved.size;
+        bundle.merged = Some(segments);
+        bundle.weight += moved.weight;
+    }
+    partners.sort_by_key(|&(value, _, _)| value);
+    let mut partner_range = SecondaryMap::<Value, (u32, u32)>::new();
+    for (index, &(value, _, _)) in partners.iter().enumerate() {
+        let range = &mut partner_range[value];
+        if range.0 == range.1 {
+            range.0 = index as u32;
+        }
+        range.1 = index as u32 + 1;
     }
 
     let mut hinted = SecondaryMap::<Value, Vec<(u8, f64)>>::new();
@@ -382,64 +437,61 @@ pub(crate) fn allocate(
     }
 
     let mut occupied = vec![BTreeMap::<u32, u32>::new(); 2 * REGISTERS];
-    for class in [RegClass::Int, RegClass::Float] {
-        for &reg in target.registers(class).caller_saved {
-            let map = &mut occupied[occupancy_index(class, reg)];
-            for &call in &liveness.calls {
-                map.insert(call, call);
-            }
-        }
-    }
-
     let mut queue: BinaryHeap<Candidate> = bundles
         .iter()
         .enumerate()
-        .filter(|(_, bundle)| !bundle.members.is_empty())
+        .filter(|(_, bundle)| bundle.size > 0)
         .map(|(index, bundle)| Candidate::new(index, bundle))
         .collect();
     let mut assigned = vec![None; bundles.len()];
     let mut callee_saved = Vec::new();
+    let mut preferences = Vec::new();
+    let mut occupy = Vec::new();
     while let Some(Candidate { index, .. }) = queue.pop() {
         let class = bundles[index].class;
-        let mut preferences = Vec::new();
-        for &member in &bundles[index].members {
+        preferences.clear();
+        for member in bundles[index].members(&next) {
             for &(reg, weight) in &hinted[member] {
                 prefer(&mut preferences, reg, weight);
             }
-            for &(other, weight) in &partners[member] {
+            let (start, end) = partner_range[member];
+            for &(_, other, weight) in &partners[start as usize..end as usize] {
                 if let Some(reg) = bundle_of[other].and_then(|other| assigned[other]) {
                     prefer(&mut preferences, reg, weight);
                 }
             }
         }
         preferences.sort_by(|a, b| b.1.total_cmp(&a.1));
-        let segments = &bundles[index].segments;
-        let hot: Vec<Segment> = segments.iter().filter(|s| !s.cold).copied().collect();
-        let occupy = if hot.is_empty() {
-            segments.clone()
-        } else {
-            hot
-        };
+        let segments = bundles[index].segments(&liveness);
+        occupy.clear();
+        occupy.extend(segments.iter().filter(|s| !s.cold));
+        if occupy.is_empty() {
+            occupy.extend_from_slice(segments);
+        }
+        let crosses_call = occupy.iter().any(|segment| liveness.crosses_call(segment));
         let available = target.registers(class);
         let allocatable =
             |reg: &u8| available.caller_saved.contains(reg) || available.callee_saved.contains(reg);
+        let usable = |reg: u8| {
+            !(crosses_call && available.caller_saved.contains(&reg))
+                && free(&occupied[occupancy_index(class, reg)], &occupy)
+        };
         let choice = preferences
             .iter()
             .map(|&(reg, _)| reg)
             .filter(allocatable)
             .chain(available.caller_saved.iter().copied())
             .chain(available.callee_saved.iter().copied())
-            .find(|&reg| free(&occupied[occupancy_index(class, reg)], &occupy));
+            .find(|&reg| usable(reg));
         let Some(reg) = choice else {
-            if bundles[index].members.len() > 1 {
-                for member in std::mem::take(&mut bundles[index].members) {
-                    let single = Bundle {
-                        class,
-                        members: vec![member],
-                        segments: liveness.segments[member].clone(),
-                        weight: weights[member],
-                    };
-                    bundle_of[member] = Some(bundles.len());
+            if bundles[index].size > 1 {
+                let mut member = Some(bundles[index].first);
+                bundles[index].size = 0;
+                bundles[index].merged = None;
+                while let Some(current) = member {
+                    member = next[current].take();
+                    let single = Bundle::single(class, current, weights[current]);
+                    bundle_of[current] = Some(bundles.len());
                     queue.push(Candidate::new(bundles.len(), &single));
                     bundles.push(single);
                     assigned.push(None);
@@ -463,30 +515,28 @@ pub(crate) fn allocate(
     let mut split = SecondaryMap::new();
     let mut slot_bundles = Vec::new();
     for (index, (bundle, &reg)) in bundles.iter().zip(&assigned).enumerate() {
-        if bundle.members.is_empty() {
+        if bundle.size == 0 {
             continue;
         }
-        let has_hot = bundle.segments.iter().any(|s| !s.cold);
-        let has_cold = bundle.segments.iter().any(|s| s.cold);
-        let spillable = bundle.members.iter().any(|&member| remat[member] == 0);
+        let segments = bundle.segments(&liveness);
+        let has_hot = segments.iter().any(|s| !s.cold);
+        let has_cold = segments.iter().any(|s| s.cold);
+        let spillable = bundle.members(&next).any(|member| remat[member] == 0);
         if (reg.is_none() || has_hot && has_cold) && spillable {
-            slot_bundles.push((
-                bundle.segments[0].start,
-                bundle.segments.last().unwrap().end,
-                index,
-            ));
+            slot_bundles.push((segments[0].start, segments.last().unwrap().end, index));
         }
     }
     let (bundle_slots, slot_count) = assign_slots(slot_bundles, bundles.len());
     for (index, (bundle, &reg)) in bundles.iter().zip(&assigned).enumerate() {
-        if bundle.members.is_empty() {
+        if bundle.size == 0 {
             continue;
         }
-        let has_hot = bundle.segments.iter().any(|s| !s.cold);
-        let has_cold = bundle.segments.iter().any(|s| s.cold);
+        let segments = bundle.segments(&liveness);
+        let has_hot = segments.iter().any(|s| !s.cold);
+        let has_cold = segments.iter().any(|s| s.cold);
         let divided = reg.is_some() && has_hot && has_cold;
         let slot = bundle_slots[index];
-        for &member in &bundle.members {
+        for member in bundle.members(&next) {
             registers[member] = reg;
             slots[member] = slot;
             split[member] = divided;
@@ -500,11 +550,11 @@ pub(crate) fn allocate(
             .any(|&pred| cold[pred] != cold[block]);
     }
     let mut boundary = SecondaryMap::<Block, Vec<Value>>::new();
-    for (value, segments) in liveness.segments.iter() {
+    for value in graph.values.keys() {
         if !split[value] {
             continue;
         }
-        for segment in segments {
+        for segment in liveness.of(value) {
             if segment.live_in && crossing[segment.block] {
                 boundary[segment.block].push(value);
             }

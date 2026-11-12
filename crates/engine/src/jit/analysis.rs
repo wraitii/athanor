@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use crate::{FxHashMap, FxHashSet};
 
 use oxc_ast::ast::{
     ArrowFunctionExpression, Class, Function, IdentifierReference, Program, ThisExpression,
@@ -13,11 +13,11 @@ use oxc_syntax::{
 
 #[derive(Default)]
 pub(super) struct CaptureAnalysis {
-    pub(super) functions: HashMap<u32, FunctionCaptures>,
-    pub(super) captured: HashSet<SymbolId>,
+    pub(super) functions: FxHashMap<u32, FunctionCaptures>,
+    pub(super) captured: FxHashSet<SymbolId>,
     pub(super) class_name_write: Option<Span>,
-    pub(super) arguments_bindings: HashMap<u32, SymbolId>,
-    pub(super) arguments_references: HashMap<u32, SymbolId>,
+    pub(super) arguments_bindings: FxHashMap<u32, SymbolId>,
+    pub(super) arguments_references: FxHashMap<u32, SymbolId>,
 }
 
 pub(super) struct FunctionCaptures {
@@ -55,7 +55,7 @@ impl CaptureAnalysis {
             result: Self::default(),
         };
         analyzer.visit_program(program);
-        let used: HashSet<_> = analyzer
+        let used: FxHashSet<_> = analyzer
             .result
             .arguments_references
             .values()

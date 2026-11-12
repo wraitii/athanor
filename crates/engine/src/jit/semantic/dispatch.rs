@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use crate::FxHashMap;
 
 use super::guards::Fact;
 use super::{Block, BlockData, Graph, Inst, Target, Terminator, TerminatorKind, Value};
@@ -19,7 +19,7 @@ pub(super) fn split(graph: &mut Graph, inst: Inst) -> (Block, Block, Block) {
     let continuation = graph.blocks.push(BlockData::default());
     if let Some(original) = call.result() {
         let result = graph.add_param(continuation);
-        graph.replace_uses(&HashMap::from([(original, result)]));
+        graph.replace_uses(&FxHashMap::from_iter([(original, result)]));
     }
     let tail = graph.blocks[block].insts.split_off(position + 1);
     graph.blocks[continuation].insts = tail;

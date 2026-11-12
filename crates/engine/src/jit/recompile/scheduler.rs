@@ -1,5 +1,6 @@
+use crate::{FxHashMap, FxHashSet};
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::BinaryHeap;
 use std::hash::Hash;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -16,15 +17,15 @@ pub(crate) struct Ticket(u64);
 struct Pending<K, T> {
     key: K,
     priority: Priority,
-    dependencies: HashSet<Ticket>,
+    dependencies: FxHashSet<Ticket>,
     value: T,
 }
 
 pub(super) struct Queue<K, T> {
     next: u64,
-    keys: HashMap<K, Ticket>,
-    outstanding: HashSet<Ticket>,
-    pending: HashMap<Ticket, Pending<K, T>>,
+    keys: FxHashMap<K, Ticket>,
+    outstanding: FxHashSet<Ticket>,
+    pending: FxHashMap<Ticket, Pending<K, T>>,
     ready: [BinaryHeap<Reverse<(Priority, Ticket)>>; 2],
 }
 
@@ -32,9 +33,9 @@ impl<K: Copy + Eq + Hash, T> Queue<K, T> {
     pub(super) fn new() -> Self {
         Self {
             next: 0,
-            keys: HashMap::new(),
-            outstanding: HashSet::new(),
-            pending: HashMap::new(),
+            keys: FxHashMap::default(),
+            outstanding: FxHashSet::default(),
+            pending: FxHashMap::default(),
             ready: std::array::from_fn(|_| BinaryHeap::new()),
         }
     }
@@ -55,7 +56,7 @@ impl<K: Copy + Eq + Hash, T> Queue<K, T> {
             .next
             .checked_add(1)
             .expect("compilation ticket overflow");
-        let dependencies: HashSet<_> = dependencies
+        let dependencies: FxHashSet<_> = dependencies
             .iter()
             .copied()
             .filter(|dependency| self.outstanding.contains(dependency))

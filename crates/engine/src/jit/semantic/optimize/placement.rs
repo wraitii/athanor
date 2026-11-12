@@ -1,5 +1,6 @@
 use super::super::guards::{Fact, Origin};
 use super::*;
+use crate::{FxHashMap, FxHashSet};
 
 #[derive(Clone)]
 pub(super) struct Placed {
@@ -12,7 +13,7 @@ pub(super) struct Placed {
 pub(super) struct Point {
     pub(super) block: Block,
     pub(super) header: Option<Block>,
-    pub(super) body: HashSet<Block>,
+    pub(super) body: FxHashSet<Block>,
     pub(super) assumes: Vec<Placed>,
 }
 
@@ -55,9 +56,9 @@ fn as_read(op: &Op) -> Op {
 struct Hoister<'a> {
     graph: &'a Graph,
     cfg: &'a Cfg,
-    assumed: &'a HashMap<Value, cranelift_module::FuncId>,
-    writes: HashMap<usize, Writes>,
-    memo: HashMap<(usize, Value), Result<()>>,
+    assumed: &'a FxHashMap<Value, cranelift_module::FuncId>,
+    writes: FxHashMap<usize, Writes>,
+    memo: FxHashMap<(usize, Value), Result<()>>,
 }
 
 impl Hoister<'_> {
@@ -102,7 +103,7 @@ impl Hoister<'_> {
         let graph = self.graph;
         let assumed = self.assumed;
         let writes = self.writes.entry(point).or_insert_with(|| {
-            let written: HashSet<Block> = target
+            let written: FxHashSet<Block> = target
                 .body
                 .iter()
                 .copied()
@@ -135,7 +136,7 @@ impl Hoister<'_> {
 
 pub(super) fn representative(
     graph: &Graph,
-    reps: &mut HashMap<String, Value>,
+    reps: &mut FxHashMap<String, Value>,
     value: Value,
     depth: usize,
 ) -> Value {
@@ -154,7 +155,7 @@ pub(super) fn representative(
 }
 
 fn merge(graph: &mut Graph, point: &mut Point) {
-    let mut reps = HashMap::new();
+    let mut reps = FxHashMap::default();
     let mut kept: Vec<(Value, Fact, Placed)> = Vec::new();
     for placed in std::mem::take(&mut point.assumes) {
         let value = representative(graph, &mut reps, placed.value, 0);
@@ -185,7 +186,7 @@ fn merge(graph: &mut Graph, point: &mut Point) {
 
 pub(super) fn place_assumes(
     graph: &mut Graph,
-    assumed: &HashMap<Value, cranelift_module::FuncId>,
+    assumed: &FxHashMap<Value, cranelift_module::FuncId>,
 ) -> Vec<Reach> {
     if !graph.has_assumes {
         return Vec::new();
@@ -230,8 +231,8 @@ pub(super) fn place_assumes(
         graph: &planning,
         cfg: &cfg,
         assumed,
-        writes: HashMap::new(),
-        memo: HashMap::new(),
+        writes: FxHashMap::default(),
+        memo: FxHashMap::default(),
     };
     let mut moves = Vec::new();
     let mut reached = Vec::new();
@@ -324,7 +325,7 @@ mod tests {
             .build(&parsed.program)
             .semantic;
         let graph =
-            super::super::super::build::lower(function, semantic.scoping(), &HashSet::new())
+            super::super::super::build::lower(function, semantic.scoping(), &FxHashSet::default())
                 .unwrap();
         super::super::super::canonicalize_graph(graph, true)
             .unwrap()
@@ -370,7 +371,7 @@ mod tests {
         );
         let load = find(&graph, |op| matches!(op, Op::Get(_, name) if name == "v"));
         assume(&mut graph, load, number());
-        let reached = place_assumes(&mut graph, &HashMap::new());
+        let reached = place_assumes(&mut graph, &FxHashMap::default());
         let cfg = Cfg::new(&graph);
         let inner = natural_loops(&graph, &cfg)
             .into_iter()
@@ -388,7 +389,7 @@ mod tests {
         let load = find(&graph, |op| matches!(op, Op::Get(_, name) if name == "x"));
         let moved = assume(&mut graph, limit, number());
         assume(&mut graph, load, number());
-        let reached = place_assumes(&mut graph, &HashMap::new());
+        let reached = place_assumes(&mut graph, &FxHashMap::default());
         assert_eq!(reached.len(), 2);
         assert!(reached.iter().all(|reach| reach.header.is_none()));
         assert_eq!(graph.insts[moved].block, graph.entry);
@@ -401,13 +402,13 @@ mod tests {
             graph("function f(o,n){let s=0;for(let i=0;i<n;++i){o.x=i;s+=o.x;}return s;}");
         let load = find(&graph, |op| matches!(op, Op::Get(_, name) if name == "x"));
         assume(&mut graph, load, number());
-        assert!(place_assumes(&mut graph, &HashMap::new()).is_empty());
+        assert!(place_assumes(&mut graph, &FxHashMap::default()).is_empty());
 
         let mut graph =
             self::graph("function f(o,n){let s=0;for(let i=0;i<n;++i){o.z=i;s+=o.x;}return s;}");
         let load = find(&graph, |op| matches!(op, Op::Get(_, name) if name == "x"));
         assume(&mut graph, load, number());
-        assert_eq!(place_assumes(&mut graph, &HashMap::new()).len(), 1);
+        assert_eq!(place_assumes(&mut graph, &FxHashMap::default()).len(), 1);
     }
 
     #[test]
@@ -417,7 +418,7 @@ mod tests {
         let weak = assume(&mut graph, argument, number());
         let strong = assume(&mut graph, argument, Fact::Type(Types::INTEGER));
         let again = assume(&mut graph, argument, number());
-        place_assumes(&mut graph, &HashMap::new());
+        place_assumes(&mut graph, &FxHashMap::default());
         let Op::Assume(_, _, origin) = graph.insts[strong].op else {
             panic!()
         };

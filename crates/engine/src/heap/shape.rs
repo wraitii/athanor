@@ -1,4 +1,5 @@
 use super::*;
+use crate::FxHashMap;
 
 pub(super) type Atom = u32;
 pub(super) type ShapeId = u32;
@@ -10,7 +11,7 @@ const INDEXED_KEYS: usize = 8;
 #[derive(Default)]
 pub(super) struct Atoms {
     names: Vec<Rc<str>>,
-    index: HashMap<Rc<str>, Atom>,
+    index: FxHashMap<Rc<str>, Atom>,
 }
 
 impl Atoms {
@@ -43,7 +44,7 @@ pub(super) struct Key {
 pub(super) struct Shape {
     prototype: u64,
     keys: Vec<Key>,
-    index: HashMap<Atom, usize>,
+    index: FxHashMap<Atom, usize>,
 }
 
 impl Shape {
@@ -65,7 +66,7 @@ impl Shape {
                 .map(|(slot, key)| (key.atom, slot))
                 .collect()
         } else {
-            HashMap::default()
+            FxHashMap::default()
         };
         Self {
             prototype,
@@ -77,16 +78,16 @@ impl Shape {
 
 pub(super) struct Shapes {
     shapes: Vec<Shape>,
-    roots: HashMap<u64, ShapeId>,
-    transitions: HashMap<(ShapeId, Key), ShapeId>,
+    roots: FxHashMap<u64, ShapeId>,
+    transitions: FxHashMap<(ShapeId, Key), ShapeId>,
 }
 
 impl Default for Shapes {
     fn default() -> Self {
         Self {
             shapes: vec![Shape::with(0, Vec::new())],
-            roots: HashMap::default(),
-            transitions: HashMap::default(),
+            roots: FxHashMap::default(),
+            transitions: FxHashMap::default(),
         }
     }
 }

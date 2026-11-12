@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use crate::{FxHashMap, FxHashSet};
 
 use cranelift_codegen::entity::PrimaryMap;
 use oxc_ast::ast::{
@@ -43,12 +43,12 @@ struct Loop {
 
 struct Builder<'a> {
     scoping: &'a Scoping,
-    captured: &'a HashSet<SymbolId>,
-    closures: &'a HashMap<u32, (cranelift_module::FuncId, Vec<SymbolId>, bool)>,
-    arguments_references: &'a HashMap<u32, SymbolId>,
+    captured: &'a FxHashSet<SymbolId>,
+    closures: &'a FxHashMap<u32, (cranelift_module::FuncId, Vec<SymbolId>, bool)>,
+    arguments_references: &'a FxHashMap<u32, SymbolId>,
     graph: Graph,
     current: Option<Block>,
-    symbols: HashMap<SymbolId, Binding>,
+    symbols: FxHashMap<SymbolId, Binding>,
     open: Vec<Scope>,
     loops: Vec<Loop>,
     handlers: Vec<(Block, usize)>,
@@ -1595,7 +1595,7 @@ impl<'a> Builder<'a> {
 pub(super) fn lower(
     function: &oxc_ast::ast::Function<'_>,
     scoping: &Scoping,
-    captured: &HashSet<SymbolId>,
+    captured: &FxHashSet<SymbolId>,
 ) -> Result<Graph> {
     if function.generator || function.r#async {
         return unsupported("function kind", function.span);
@@ -1611,9 +1611,9 @@ pub(super) fn lower(
         scoping,
         captured,
         &[],
-        &HashMap::new(),
+        &FxHashMap::default(),
         None,
-        &HashMap::new(),
+        &FxHashMap::default(),
         false,
     )?;
     graph.name = function
@@ -1627,9 +1627,9 @@ pub(super) fn lower_global(
     statements: &[Statement<'_>],
     span: Span,
     scoping: &Scoping,
-    captured: &HashSet<SymbolId>,
-    closures: &HashMap<u32, (cranelift_module::FuncId, Vec<SymbolId>, bool)>,
-    arguments_references: &HashMap<u32, SymbolId>,
+    captured: &FxHashSet<SymbolId>,
+    closures: &FxHashMap<u32, (cranelift_module::FuncId, Vec<SymbolId>, bool)>,
+    arguments_references: &FxHashMap<u32, SymbolId>,
 ) -> Result<Graph> {
     let mut builder = Builder {
         scoping,
@@ -1642,11 +1642,11 @@ pub(super) fn lower_global(
             entry: Block::from_u32(0),
             has_handlers: false,
             guards: 0,
-            views: HashMap::new(),
-            borrowed: HashSet::new(),
+            views: FxHashMap::default(),
+            borrowed: FxHashSet::default(),
             summaries: Default::default(),
-            lazy_captures: HashSet::new(),
-            cold: HashSet::new(),
+            lazy_captures: FxHashSet::default(),
+            cold: FxHashSet::default(),
             generator: false,
             has_assumes: false,
             entry_guards: Vec::new(),
@@ -1663,7 +1663,7 @@ pub(super) fn lower_global(
             scopes: PrimaryMap::new(),
         },
         current: None,
-        symbols: HashMap::new(),
+        symbols: FxHashMap::default(),
         open: Vec::new(),
         loops: Vec::new(),
         handlers: Vec::new(),
@@ -1721,11 +1721,11 @@ pub(super) fn lower_parts(
     expression: Option<&Expression<'_>>,
     span: Span,
     scoping: &Scoping,
-    captured: &HashSet<SymbolId>,
+    captured: &FxHashSet<SymbolId>,
     captures: &[SymbolId],
-    closures: &HashMap<u32, (cranelift_module::FuncId, Vec<SymbolId>, bool)>,
+    closures: &FxHashMap<u32, (cranelift_module::FuncId, Vec<SymbolId>, bool)>,
     arguments_binding: Option<SymbolId>,
-    arguments_references: &HashMap<u32, SymbolId>,
+    arguments_references: &FxHashMap<u32, SymbolId>,
     generator: bool,
 ) -> Result<Graph> {
     let mut builder = Builder {
@@ -1739,11 +1739,11 @@ pub(super) fn lower_parts(
             entry: Block::from_u32(0),
             has_handlers: false,
             guards: 0,
-            views: HashMap::new(),
-            borrowed: HashSet::new(),
+            views: FxHashMap::default(),
+            borrowed: FxHashSet::default(),
             summaries: Default::default(),
-            lazy_captures: HashSet::new(),
-            cold: HashSet::new(),
+            lazy_captures: FxHashSet::default(),
+            cold: FxHashSet::default(),
             generator,
             has_assumes: false,
             entry_guards: Vec::new(),
@@ -1760,7 +1760,7 @@ pub(super) fn lower_parts(
             scopes: PrimaryMap::new(),
         },
         current: None,
-        symbols: HashMap::new(),
+        symbols: FxHashMap::default(),
         open: Vec::new(),
         loops: Vec::new(),
         handlers: Vec::new(),

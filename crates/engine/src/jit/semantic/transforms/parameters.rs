@@ -1,71 +1,131 @@
-use std::collections::HashMap;
-
 use cranelift_codegen::entity::SecondaryMap;
 
 use super::phis::{self, Input};
-use crate::jit::semantic::{Block, Graph, Value, ValueDef};
+use crate::jit::semantic::{Block, Graph, Value, ValueDef, resolve};
 
-pub(in crate::jit::semantic) fn canonicalize_parameters(graph: &mut Graph, blocks: &[Block]) {
-    let mut indices = SecondaryMap::<Value, Option<usize>>::new();
+pub(in crate::jit::semantic) fn simplify_parameters(
+    graph: &mut Graph,
+    blocks: &[Block],
+    aliases: &mut SecondaryMap<Value, Option<Value>>,
+    mut changed: bool,
+) {
+    let mut indices = SecondaryMap::<Value, Option<u32>>::new();
     let mut parameters = Vec::new();
     for &block in blocks {
         if block == graph.entry {
             continue;
         }
         for &value in &graph.blocks[block].params {
-            indices[value] = Some(parameters.len());
+            indices[value] = Some(parameters.len() as u32);
             parameters.push(value);
         }
     }
-    if parameters.is_empty() {
-        return;
-    }
-    let mut incoming = vec![Vec::new(); parameters.len()];
-    for &block in blocks {
-        if let Some(terminator) = &graph.blocks[block].terminator {
-            for target in terminator.kind.targets() {
-                for (&param, &arg) in graph.blocks[target.block].params.iter().zip(&target.args) {
-                    let Some(index) = indices[param] else {
-                        continue;
-                    };
-                    incoming[index].push(match indices[arg] {
-                        Some(source) => Input::Parameter(source),
-                        None => Input::Value(arg),
-                    });
+    if !parameters.is_empty() {
+        let mut edges = Vec::new();
+        for &block in blocks {
+            if let Some(terminator) = &graph.blocks[block].terminator {
+                for target in terminator.kind.targets() {
+                    for (&param, &arg) in graph.blocks[target.block].params.iter().zip(&target.args)
+                    {
+                        if let Some(index) = indices[param] {
+                            edges.push((index, resolve(&*aliases, arg)));
+                        }
+                    }
                 }
             }
         }
+        edges.sort_by_key(|&(index, _)| index);
+        let mut starts = Vec::with_capacity(parameters.len() + 1);
+        let mut edge = 0;
+        for index in 0..=parameters.len() as u32 {
+            while edge < edges.len() && edges[edge].0 < index {
+                edge += 1;
+            }
+            starts.push(edge);
+        }
+        let inputs: Vec<_> = edges
+            .iter()
+            .map(|&(_, arg)| match indices[arg] {
+                Some(source) => Input::Parameter(source as usize),
+                None => Input::Value(arg),
+            })
+            .collect();
+        for (&param, replacement) in parameters.iter().zip(phis::solve(&starts, &inputs)) {
+            if let Some(replacement) = replacement {
+                aliases[param] = Some(replacement);
+                changed = true;
+            }
+        }
+        loop {
+            let mut progress = false;
+            for (index, &param) in parameters.iter().enumerate() {
+                if aliases[param].is_some() {
+                    continue;
+                }
+                let mut unique = None;
+                let mut trivial = true;
+                for &(_, arg) in &edges[starts[index]..starts[index + 1]] {
+                    let value = resolve(&*aliases, arg);
+                    if value == param || unique == Some(value) {
+                        continue;
+                    }
+                    if unique.is_some() {
+                        trivial = false;
+                        break;
+                    }
+                    unique = Some(value);
+                }
+                if trivial && let Some(value) = unique {
+                    aliases[param] = Some(value);
+                    progress = true;
+                }
+            }
+            if !progress {
+                break;
+            }
+            changed = true;
+        }
     }
-    let replacements = phis::solve(&incoming);
-    let aliases: HashMap<_, _> = parameters
-        .into_iter()
-        .zip(replacements)
-        .filter_map(|(value, replacement)| replacement.map(|replacement| (value, replacement)))
-        .collect();
-    if aliases.is_empty() {
+    if !changed {
         return;
     }
-    graph.replace_uses(&aliases);
-    let mut removed = SecondaryMap::<Block, Vec<usize>>::new();
+    for value in graph.values.keys() {
+        if aliases[value].is_some() {
+            aliases[value] = Some(resolve(&*aliases, value));
+        }
+    }
+    graph.replace_uses(&*aliases);
+    let mut kept = SecondaryMap::<Block, Vec<bool>>::new();
     for &block in blocks {
-        for (index, param) in graph.blocks[block].params.iter().enumerate().rev() {
-            if aliases.contains_key(param) {
-                removed[block].push(index);
-            }
+        let params = &graph.blocks[block].params;
+        if params.iter().any(|&param| aliases[param].is_some()) {
+            kept[block] = params
+                .iter()
+                .map(|&param| aliases[param].is_none())
+                .collect();
         }
     }
     for &block in blocks {
         if let Some(terminator) = &mut graph.blocks[block].terminator {
             for target in terminator.kind.targets_mut() {
-                for &index in &removed[target.block] {
-                    target.args.remove(index);
+                let mask = &kept[target.block];
+                if mask.is_empty() {
+                    continue;
                 }
+                let mut index = 0;
+                target.args.retain(|_| {
+                    index += 1;
+                    mask.get(index - 1).copied().unwrap_or(true)
+                });
             }
         }
     }
     for &block in blocks {
+        if kept[block].is_empty() {
+            continue;
+        }
         let params = &mut graph.blocks[block].params;
-        params.retain(|param| !aliases.contains_key(param));
+        params.retain(|&param| aliases[param].is_none());
         for (index, &param) in params.iter().enumerate() {
             graph.values[param] = ValueDef::Param(block, index);
         }
@@ -260,7 +320,7 @@ mod tests {
     #[test]
     fn leaves_unseeded_cycles_unresolved() {
         assert_eq!(
-            phis::solve::<Value>(&[vec![Input::Parameter(1)], vec![Input::Parameter(0)]]),
+            phis::solve::<Value>(&[0, 1, 2], &[Input::Parameter(1), Input::Parameter(0)]),
             vec![None, None]
         );
     }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use crate::FxHashMap;
 
 use oxc_syntax::operator::BinaryOperator;
 
@@ -10,8 +10,8 @@ pub(super) fn expose(function: &mut super::FunctionState) {
     let graph = &mut function.graph;
     let facts = &function.facts;
     let cfg = &facts.cfg;
-    let mut checks: HashMap<Value, Vec<(Block, Value)>> = HashMap::new();
-    let mut aliases = HashMap::new();
+    let mut checks: FxHashMap<Value, Vec<(Block, Value)>> = FxHashMap::default();
+    let mut aliases = FxHashMap::default();
     let mut removed = Vec::new();
     for &block in &cfg.rpo {
         for inst in graph.blocks[block].insts.clone() {

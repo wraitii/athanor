@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use crate::{FxHashMap, FxHashSet};
 use std::sync::Arc;
 
 use cranelift_codegen::entity::SecondaryMap;
@@ -26,7 +26,7 @@ pub(in crate::jit) struct Plan {
 
 pub(in crate::jit) struct Loop {
     pub(in crate::jit) header: Block,
-    pub(in crate::jit) body: HashSet<Block>,
+    pub(in crate::jit) body: FxHashSet<Block>,
     pub(in crate::jit) opportunities: Vec<Opportunity>,
     pub(in crate::jit) transfer: Result<Transfer, String>,
 }
@@ -123,7 +123,7 @@ impl Plan {
     }
 
     pub(in crate::jit) fn instrument(self: &Arc<Self>, graph: &mut Graph) -> super::Result<()> {
-        let mut definitions = HashMap::new();
+        let mut definitions = FxHashMap::default();
         for (index, candidate) in self.loops.iter().enumerate() {
             let Ok(transfer) = &candidate.transfer else {
                 continue;
@@ -209,7 +209,7 @@ impl Plan {
             let argument = graph.append_value(entry, span, Op::Argument(index));
             unbox(graph, entry, argument, facts.of(value))
         };
-        let aliases: HashMap<_, _> = transfer
+        let aliases: FxHashMap<_, _> = transfer
             .inputs
             .iter()
             .enumerate()
@@ -260,7 +260,7 @@ impl Plan {
                 args,
             }),
         );
-        let reachable: HashSet<_> = Cfg::new(&graph).rpo.into_iter().collect();
+        let reachable: FxHashSet<_> = Cfg::new(&graph).rpo.into_iter().collect();
         for (block, data) in graph.blocks.iter_mut() {
             if !reachable.contains(&block) {
                 data.insts.clear();
@@ -341,11 +341,11 @@ fn transfer(
     graph: &Graph,
     cfg: &Cfg,
     facts: &Facts,
-    live: &SecondaryMap<Block, HashSet<Value>>,
+    live: &SecondaryMap<Block, FxHashSet<Value>>,
     header: Block,
-    body: &HashSet<Block>,
+    body: &FxHashSet<Block>,
 ) -> Result<Transfer, String> {
-    let mut inputs = HashSet::new();
+    let mut inputs = FxHashSet::default();
     for &block in &cfg.rpo {
         let inside = body.contains(&block);
         for &inst in &graph.blocks[block].insts {
@@ -455,8 +455,8 @@ mod tests {
         let semantic = oxc_semantic::SemanticBuilder::new_compiler()
             .build(&parsed.program)
             .semantic;
-        let graph =
-            super::super::build::lower(function, semantic.scoping(), &HashSet::new()).unwrap();
+        let graph = super::super::build::lower(function, semantic.scoping(), &FxHashSet::default())
+            .unwrap();
         let mut graph = super::super::canonicalize_graph(graph, true).unwrap().graph;
         super::super::observations::plan(&mut graph, None);
         graph

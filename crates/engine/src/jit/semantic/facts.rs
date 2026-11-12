@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use crate::{FxHashMap, FxHashSet};
 use std::fmt;
 
 use cranelift_codegen::entity::SecondaryMap;
@@ -127,13 +127,13 @@ struct Refinement {
 
 pub(in crate::jit) struct Facts {
     pub(in crate::jit) cfg: Cfg,
-    refinements: HashMap<Value, Vec<Refinement>>,
+    refinements: FxHashMap<Value, Vec<Refinement>>,
     probes: Vec<(String, Value, Block, FuncId)>,
-    rejected: HashSet<Inst>,
+    rejected: FxHashSet<Inst>,
     identities: SecondaryMap<Value, Identity>,
-    assumed: HashMap<Value, FuncId>,
+    assumed: FxHashMap<Value, FuncId>,
     types: SecondaryMap<Value, Types>,
-    indexed: HashSet<Value>,
+    indexed: FxHashSet<Value>,
     known: bool,
     fresh: std::cell::OnceCell<std::rc::Rc<Fresh>>,
     memory: SecondaryMap<Inst, Memory>,
@@ -144,13 +144,13 @@ impl Default for Facts {
     fn default() -> Self {
         Self {
             cfg: Cfg::default(),
-            refinements: HashMap::new(),
+            refinements: FxHashMap::default(),
             probes: Vec::new(),
-            rejected: HashSet::new(),
+            rejected: FxHashSet::default(),
             identities: SecondaryMap::new(),
-            assumed: HashMap::new(),
+            assumed: FxHashMap::default(),
             types: SecondaryMap::new(),
-            indexed: HashSet::new(),
+            indexed: FxHashSet::default(),
             known: false,
             fresh: Default::default(),
             memory: SecondaryMap::with_default(Memory::UNKNOWN),
@@ -237,7 +237,8 @@ impl Facts {
         if pending.is_empty() {
             return pending;
         }
-        let Some(solved) = available::solve(graph, self, &self.cfg, HashSet::new(), true) else {
+        let Some(solved) = available::solve(graph, self, &self.cfg, FxHashSet::default(), true)
+        else {
             return pending;
         };
         pending
@@ -316,18 +317,18 @@ impl Facts {
             .chain(candidates.iter().copied())
             .collect();
         let candidates = &entry_facts;
-        let assumptions: HashMap<Value, Types> = candidates
+        let assumptions: FxHashMap<Value, Types> = candidates
             .iter()
             .filter_map(|&(value, fact)| Some((value, fact.mask()?)))
             .collect();
-        let identities: HashMap<Value, FuncId> = candidates
+        let identities: FxHashMap<Value, FuncId> = candidates
             .iter()
             .filter_map(|&(value, fact)| Some((value, fact.code()?)))
             .collect();
         let assumptions = &assumptions;
         let identities = &identities;
         let steps = steps(graph, &cfg);
-        let mut refinements: HashMap<Value, Vec<Refinement>> = HashMap::new();
+        let mut refinements: FxHashMap<Value, Vec<Refinement>> = FxHashMap::default();
         for &block in &cfg.rpo {
             let Some(terminator) = &graph.blocks[block].terminator else {
                 continue;
@@ -354,7 +355,7 @@ impl Facts {
                 }
             }
         }
-        let mut edge_facts: HashMap<(Block, Value), Vec<(Types, bool)>> = HashMap::new();
+        let mut edge_facts: FxHashMap<(Block, Value), Vec<(Types, bool)>> = FxHashMap::default();
         for &block in &cfg.rpo {
             let Some(terminator) = &graph.blocks[block].terminator else {
                 continue;
@@ -391,7 +392,7 @@ impl Facts {
             }
         }
         let rpo = cfg.rpo.clone();
-        let marked: HashSet<Value> = graph
+        let marked: FxHashSet<Value> = graph
             .insts
             .values()
             .filter_map(|data| match data.op {
@@ -403,7 +404,7 @@ impl Facts {
             cfg,
             refinements,
             probes,
-            rejected: HashSet::new(),
+            rejected: FxHashSet::default(),
             identities: SecondaryMap::new(),
             assumed: identities.clone(),
             types: SecondaryMap::new(),
@@ -587,8 +588,8 @@ fn step(op: &Op) -> Option<(Value, bool)> {
     }
 }
 
-fn steps(graph: &Graph, cfg: &Cfg) -> HashMap<Inst, Vec<Value>> {
-    let mut incoming: HashMap<Value, Vec<Value>> = HashMap::new();
+fn steps(graph: &Graph, cfg: &Cfg) -> FxHashMap<Inst, Vec<Value>> {
+    let mut incoming: FxHashMap<Value, Vec<Value>> = FxHashMap::default();
     let mut relations: Vec<(Block, Value, Relation, Value)> = Vec::new();
     for &block in &cfg.rpo {
         let Some(terminator) = &graph.blocks[block].terminator else {
@@ -627,7 +628,7 @@ fn steps(graph: &Graph, cfg: &Cfg) -> HashMap<Inst, Vec<Value>> {
             }
         }
     }
-    let mut steps = HashMap::new();
+    let mut steps = FxHashMap::default();
     for &block in &cfg.rpo {
         for &inst in &graph.blocks[block].insts {
             let op = &graph.insts[inst].op;
@@ -663,7 +664,7 @@ fn steps(graph: &Graph, cfg: &Cfg) -> HashMap<Inst, Vec<Value>> {
 
 fn range(
     graph: &Graph,
-    incoming: &HashMap<Value, Vec<Value>>,
+    incoming: &FxHashMap<Value, Vec<Value>>,
     value: Value,
     depth: usize,
 ) -> (i64, i64) {

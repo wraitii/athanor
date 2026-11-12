@@ -16,4 +16,6 @@ pub use host::Host;
 pub use jit::CompileOptions;
 pub use value::Value;
 
+pub(crate) use rustc_hash::{FxHashMap, FxHashSet};
+
 pub type Result<T> = std::result::Result<T, Error>;

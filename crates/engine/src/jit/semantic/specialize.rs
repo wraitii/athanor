@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use crate::{FxHashMap, FxHashSet};
 use std::sync::Arc;
 
 use cranelift_module::FuncId;
@@ -22,26 +22,26 @@ pub(in crate::jit) struct Repository {
     pub(in crate::jit) call_variants: bool,
     pub(in crate::jit) call_specialization: bool,
     pub(in crate::jit) variants: crate::jit::variants::Registry,
-    bodies: HashMap<FuncId, Arc<Body>>,
-    regions: HashSet<FuncId>,
-    pub(in crate::jit) number_first: HashSet<FuncId>,
-    pub(in crate::jit) feedback: HashMap<crate::jit::profile::Site, Vec<FuncId>>,
+    bodies: FxHashMap<FuncId, Arc<Body>>,
+    regions: FxHashSet<FuncId>,
+    pub(in crate::jit) number_first: FxHashSet<FuncId>,
+    pub(in crate::jit) feedback: FxHashMap<crate::jit::profile::Site, Vec<FuncId>>,
     pub(in crate::jit) native_feedback:
-        HashMap<crate::jit::profile::Site, crate::heap::NativeFunction>,
-    pub(in crate::jit) read_feedback: HashMap<
+        FxHashMap<crate::jit::profile::Site, crate::heap::NativeFunction>,
+    pub(in crate::jit) read_feedback: FxHashMap<
         (crate::jit::profile::Site, crate::jit::profile::ReadKind),
         crate::jit::profile::ReadType,
     >,
-    pub(in crate::jit) shape_feedback: HashMap<
+    pub(in crate::jit) shape_feedback: FxHashMap<
         (
             crate::jit::profile::Site,
             crate::jit::profile::PropertyAccess,
         ),
         crate::jit::profile::ShapeAccess,
     >,
-    locations: HashMap<(usize, u32), FuncId>,
-    globals: HashMap<String, FuncId>,
-    pub(in crate::jit) sources: HashMap<usize, usize>,
+    locations: FxHashMap<(usize, u32), FuncId>,
+    globals: FxHashMap<String, FuncId>,
+    pub(in crate::jit) sources: FxHashMap<usize, usize>,
 }
 
 impl Default for Repository {
@@ -239,11 +239,11 @@ impl Repository {
 struct SummaryEffects {
     memory: Memory,
     control: Control,
-    globals_read: HashSet<String>,
-    globals_written: HashSet<String>,
-    properties_read: HashSet<String>,
-    properties_written: HashSet<String>,
-    unresolved: HashSet<(FuncId, Inst)>,
+    globals_read: FxHashSet<String>,
+    globals_written: FxHashSet<String>,
+    properties_read: FxHashSet<String>,
+    properties_written: FxHashSet<String>,
+    unresolved: FxHashSet<(FuncId, Inst)>,
     unsupported: bool,
 }
 
@@ -329,10 +329,10 @@ fn assumptions(op: &Op, facts: &Facts) -> &'static [Assumption] {
 
 #[derive(Clone, Default, PartialEq, Eq)]
 struct Requirements {
-    assumptions: HashSet<Assumption>,
-    identities: HashSet<(String, FuncId)>,
-    natives: HashSet<Native>,
-    string_splits: HashSet<(FuncId, Inst)>,
+    assumptions: FxHashSet<Assumption>,
+    identities: FxHashSet<(String, FuncId)>,
+    natives: FxHashSet<Native>,
+    string_splits: FxHashSet<(FuncId, Inst)>,
 }
 
 impl Requirements {
@@ -471,8 +471,8 @@ impl Repository {
     fn effect_summaries(
         &self,
         roots: impl IntoIterator<Item = FuncId>,
-    ) -> HashMap<FuncId, Summary> {
-        let mut local = HashMap::new();
+    ) -> FxHashMap<FuncId, Summary> {
+        let mut local = FxHashMap::default();
         let mut pending: Vec<_> = roots.into_iter().collect();
         while let Some(code) = pending.pop() {
             if local.contains_key(&code) {
@@ -484,7 +484,7 @@ impl Repository {
             pending.extend(body.calls.iter().map(|&(_, target)| target));
             local.insert(code, body);
         }
-        let mut summaries: HashMap<_, _> = local
+        let mut summaries: FxHashMap<_, _> = local
             .iter()
             .map(|(&code, body)| (code, body.summary.clone()))
             .collect();
@@ -516,7 +516,7 @@ impl Repository {
             )
         };
         let mut pending = vec![(root, label(root))];
-        let mut visited = HashSet::new();
+        let mut visited = FxHashSet::default();
         while let Some((code, path)) = pending.pop() {
             if !visited.insert(code) {
                 continue;
@@ -596,7 +596,7 @@ fn unresolved_operation(graph: &Graph, op: &Op) -> String {
 }
 
 pub(super) fn install_summaries(graph: &mut Graph, bodies: &Repository, notes: &mut Vec<String>) {
-    let marked: HashSet<Value> = graph
+    let marked: FxHashSet<Value> = graph
         .insts
         .values()
         .filter_map(|data| match data.op {
@@ -627,7 +627,7 @@ pub(super) fn install_summaries(graph: &mut Graph, bodies: &Repository, notes: &
         return;
     }
     let summaries = bodies.effect_summaries(roots);
-    let mut installed = HashMap::new();
+    let mut installed = FxHashMap::default();
     for (&target, Summary { effects, requires }) in &summaries {
         if effects.unsupported
             || !effects.unresolved.is_empty()
@@ -764,7 +764,7 @@ pub(super) struct Plan {
 pub(super) struct Budget {
     remaining: usize,
     body_limit: usize,
-    sites: HashSet<Inst>,
+    sites: FxHashSet<Inst>,
     pub(super) inlines: Vec<Inline>,
 }
 
@@ -779,7 +779,7 @@ impl Budget {
         Self {
             remaining: SPECIALIZATION_BUDGET.saturating_mul(multiplier),
             body_limit: SPECIALIZATION_BODY_INSTS.saturating_mul(multiplier),
-            sites: HashSet::new(),
+            sites: FxHashSet::default(),
             inlines: Vec::new(),
         }
     }
@@ -1033,7 +1033,8 @@ mod tests {
                 panic!()
             };
             let graph =
-                super::super::build::lower(function, semantic.scoping(), &HashSet::new()).unwrap();
+                super::super::build::lower(function, semantic.scoping(), &FxHashSet::default())
+                    .unwrap();
             let canonical = super::super::canonicalize_graph(graph, true).unwrap();
             let name = function.id.as_ref().unwrap().name.as_str();
             if name == "main" {
@@ -1829,7 +1830,7 @@ mod tests {
         );
         let mut graph = canonical.graph;
         super::super::construction::resolve(&mut graph);
-        super::super::construction::expand(&mut graph, &mut HashSet::new());
+        super::super::construction::expand(&mut graph, &mut FxHashSet::default());
         let requests = requests(&graph, &bodies, 1, &Budget::default());
         assert_eq!(requests.len(), 2);
         let plan = plan(&graph, &bodies, 1, &requests);

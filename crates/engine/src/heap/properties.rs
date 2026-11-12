@@ -1,4 +1,5 @@
 use super::*;
+use crate::FxHashMap;
 
 const SHAPED_LIMIT: usize = 64;
 
@@ -360,7 +361,7 @@ impl HeapData {
 #[derive(Default)]
 pub(super) struct PropertyTable {
     slots: Vec<PropertySlot>,
-    index: HashMap<String, usize>,
+    index: FxHashMap<String, usize>,
 }
 
 struct PropertySlot {

@@ -1,9 +1,9 @@
-use std::collections::HashSet;
+use crate::FxHashSet;
 
 use super::{BlockData, Cfg, Graph, Op, Target, Terminator, TerminatorKind};
 
 pub(super) fn apply(graph: &mut Graph, shapes: &super::shapes::Plan) -> super::Result<()> {
-    let guarded: HashSet<_> = graph
+    let guarded: FxHashSet<_> = graph
         .insts
         .values()
         .filter_map(|data| match data.op {

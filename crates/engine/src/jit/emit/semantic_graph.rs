@@ -1,3 +1,4 @@
+use crate::{FxHashMap, FxHashSet};
 use std::cell::RefCell;
 
 use super::{BlockArg, LoweredValue};
@@ -26,7 +27,7 @@ const NUMERIC: Types = Types::NUMBER.union(Types::UNDEFINED);
 
 struct Context<'a> {
     graph: &'a Graph,
-    osr_buffers: RefCell<std::collections::HashMap<GraphValue, (LoweredValue, usize)>>,
+    osr_buffers: RefCell<FxHashMap<GraphValue, (LoweredValue, usize)>>,
     direct: RefCell<SecondaryMap<GraphValue, Option<LoweredValue>>>,
     reprs: &'a SecondaryMap<GraphValue, Repr>,
     facts: &'a Facts,
@@ -201,7 +202,7 @@ impl FunctionCompiler<'_, '_> {
         graph: &Graph,
         facts: &Facts,
         closure: LoweredValue,
-        continuations: &std::collections::HashMap<usize, FuncId>,
+        continuations: &FxHashMap<usize, FuncId>,
     ) -> Result<(), Error> {
         let source_name = self.source_name;
         let blocks: Vec<_> = graph
@@ -315,9 +316,8 @@ impl FunctionCompiler<'_, '_> {
 
         let cyclic = cyclic_blocks(graph, cfg);
         let releases = super::slots::releases(graph, facts, cfg);
-        let early: std::collections::HashSet<GraphValue> =
-            releases.values().flatten().copied().collect();
-        let mut result_tokens = std::collections::HashMap::<GraphValue, Vec<Variable>>::new();
+        let early: FxHashSet<GraphValue> = releases.values().flatten().copied().collect();
+        let mut result_tokens = FxHashMap::<GraphValue, Vec<Variable>>::default();
         let repeated =
             |block: crate::jit::semantic::Block| graph.has_handlers || cyclic.contains(&block);
         for &block in &reachable {
@@ -333,7 +333,7 @@ impl FunctionCompiler<'_, '_> {
         }
         let cx = Context {
             graph,
-            osr_buffers: RefCell::new(std::collections::HashMap::new()),
+            osr_buffers: RefCell::new(FxHashMap::default()),
             direct: RefCell::new(SecondaryMap::new()),
             reprs: &reprs,
             facts,
@@ -2221,9 +2221,9 @@ impl FunctionCompiler<'_, '_> {
 fn cyclic_blocks(
     graph: &Graph,
     cfg: &crate::jit::semantic::Cfg,
-) -> std::collections::HashSet<crate::jit::semantic::Block> {
+) -> FxHashSet<crate::jit::semantic::Block> {
     let mut finished = Vec::new();
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = FxHashSet::default();
     for &root in &cfg.rpo {
         if !seen.insert(root) {
             continue;
@@ -2240,8 +2240,8 @@ fn cyclic_blocks(
             }
         }
     }
-    let mut cyclic = std::collections::HashSet::new();
-    let mut assigned = std::collections::HashSet::new();
+    let mut cyclic = FxHashSet::default();
+    let mut assigned = FxHashSet::default();
     for &root in finished.iter().rev() {
         if !assigned.insert(root) {
             continue;

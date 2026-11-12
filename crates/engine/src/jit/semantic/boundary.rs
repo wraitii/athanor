@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use crate::{FxHashMap, FxHashSet};
 
 use cranelift_codegen::entity::SecondaryMap;
 
@@ -6,13 +6,13 @@ use super::{
     Binding, Block, BlockData, Cfg, Constant, Graph, Op, Scope, Target, TerminatorKind, Value,
 };
 
-pub(super) fn liveness(graph: &Graph, rpo: &[Block]) -> SecondaryMap<Block, HashSet<Value>> {
-    let mut live_in: SecondaryMap<_, HashSet<Value>> = SecondaryMap::new();
+pub(super) fn liveness(graph: &Graph, rpo: &[Block]) -> SecondaryMap<Block, FxHashSet<Value>> {
+    let mut live_in: SecondaryMap<_, FxHashSet<Value>> = SecondaryMap::new();
     loop {
         let mut changed = false;
         for &block in rpo.iter().rev() {
             let data = &graph.blocks[block];
-            let mut live: HashSet<_> = graph
+            let mut live: FxHashSet<_> = graph
                 .successors(block)
                 .into_iter()
                 .flat_map(|next| live_in[next].iter().copied())
@@ -39,7 +39,7 @@ pub(super) fn liveness(graph: &Graph, rpo: &[Block]) -> SecondaryMap<Block, Hash
     }
 }
 
-pub(super) fn inputs(target: &Target, live: &SecondaryMap<Block, HashSet<Value>>) -> Vec<Value> {
+pub(super) fn inputs(target: &Target, live: &SecondaryMap<Block, FxHashSet<Value>>) -> Vec<Value> {
     let mut values: Vec<_> = live[target.block]
         .iter()
         .copied()
@@ -105,7 +105,7 @@ pub(super) fn enter(
     let entry = graph.blocks.push(BlockData::default());
     graph.entry = entry;
     graph.arity = None;
-    let mut definitions = HashMap::new();
+    let mut definitions = FxHashMap::default();
     for (index, &value) in values.iter().enumerate() {
         let argument = graph.append_value(entry, graph.span, Op::Argument(index));
         let argument = facts.map_or(argument, |facts| {
@@ -131,7 +131,7 @@ pub(super) fn enter(
     }
     graph.terminate(entry, graph.span, TerminatorKind::Jump(target));
     super::optimize::repair(graph, &definitions);
-    let reachable: HashSet<_> = Cfg::new(graph).rpo.into_iter().collect();
+    let reachable: FxHashSet<_> = Cfg::new(graph).rpo.into_iter().collect();
     for (block, data) in graph.blocks.iter_mut() {
         if !reachable.contains(&block) {
             *data = BlockData::default();
@@ -146,9 +146,9 @@ pub(super) fn compact(graph: &mut Graph) {
     let old_insts = std::mem::take(&mut graph.insts);
     graph.values.clear();
     let old_types = std::mem::take(&mut graph.low_level_types);
-    let mut blocks = HashMap::new();
-    let mut insts = HashMap::new();
-    let mut values = HashMap::new();
+    let mut blocks = FxHashMap::default();
+    let mut insts = FxHashMap::default();
+    let mut values = FxHashMap::default();
     for &block in &reachable {
         let copy = graph.blocks.push(BlockData::default());
         blocks.insert(block, copy);

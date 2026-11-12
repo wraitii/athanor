@@ -1,5 +1,6 @@
 use super::super::fresh::Fresh;
 use super::*;
+use crate::{FxHashMap, FxHashSet};
 
 pub(super) struct Writes<F = Facts> {
     writes: Vec<(Inst, Access)>,
@@ -9,22 +10,22 @@ pub(super) struct Writes<F = Facts> {
 
 impl Writes {
     #[cfg(test)]
-    pub(super) fn collect(graph: &Graph, blocks: &HashSet<Block>) -> Self {
-        Self::collect_assuming(graph, blocks, &HashMap::new())
+    pub(super) fn collect(graph: &Graph, blocks: &FxHashSet<Block>) -> Self {
+        Self::collect_assuming(graph, blocks, &FxHashMap::default())
     }
 
     pub(super) fn collect_assuming(
         graph: &Graph,
-        blocks: &HashSet<Block>,
-        assumed: &HashMap<Value, cranelift_module::FuncId>,
+        blocks: &FxHashSet<Block>,
+        assumed: &FxHashMap<Value, cranelift_module::FuncId>,
     ) -> Self {
-        let facts = Facts::assuming(graph, &guards::assumed(&HashMap::new(), assumed));
+        let facts = Facts::assuming(graph, &guards::assumed(&FxHashMap::default(), assumed));
         Self::with_facts(graph, blocks, facts)
     }
 }
 
 impl<F: std::borrow::Borrow<Facts>> Writes<F> {
-    pub(super) fn with_facts(graph: &Graph, blocks: &HashSet<Block>, facts: F) -> Self {
+    pub(super) fn with_facts(graph: &Graph, blocks: &FxHashSet<Block>, facts: F) -> Self {
         let known = facts.borrow();
         let mut writes = Vec::new();
         let fresh = known.fresh(graph);
@@ -113,14 +114,22 @@ pub(super) fn guarded_accesses(
 
 pub(super) fn closure_failure(
     graph: &Graph,
-    blocks: &HashSet<Block>,
+    blocks: &FxHashSet<Block>,
     guards: &[Access],
-    assumed: &HashMap<Value, cranelift_module::FuncId>,
+    assumed: &FxHashMap<Value, cranelift_module::FuncId>,
 ) -> Option<String> {
-    let writes = Writes::collect_assuming(graph, blocks, assumed);
-    let facts = &writes.facts;
-    let cfg = Cfg::new(graph);
-    for &block in cfg.rpo.iter().filter(|block| blocks.contains(block)) {
+    let facts = Facts::assuming(graph, &guards::assumed(&FxHashMap::default(), assumed));
+    closure_failure_with(graph, blocks, guards, &facts)
+}
+
+pub(super) fn closure_failure_with(
+    graph: &Graph,
+    blocks: &FxHashSet<Block>,
+    guards: &[Access],
+    facts: &Facts,
+) -> Option<String> {
+    let writes = Writes::with_facts(graph, blocks, facts);
+    for &block in facts.cfg.rpo.iter().filter(|block| blocks.contains(block)) {
         for &inst in &graph.blocks[block].insts {
             let op = &graph.insts[inst].op;
             let memory = facts.memory(inst);
@@ -164,12 +173,13 @@ impl Conflicts {
 
 pub(super) fn conflicts(
     graph: &Graph,
-    blocks: &HashSet<Block>,
-    assumed: &HashMap<Value, cranelift_module::FuncId>,
+    blocks: &FxHashSet<Block>,
+    assumed: &FxHashMap<Value, cranelift_module::FuncId>,
 ) -> Conflicts {
     let writes = Writes::collect_assuming(graph, blocks, assumed);
-    let cfg = Cfg::new(graph);
-    let reentry = cfg
+    let reentry = writes
+        .facts
+        .cfg
         .rpo
         .iter()
         .filter(|block| blocks.contains(block))
@@ -195,7 +205,7 @@ pub(super) struct Requirement {
 
 pub(super) fn requirements(graph: &Graph, blocks: &[Block]) -> Vec<Requirement> {
     let mut requirements = Vec::new();
-    let inside: HashSet<Block> = blocks.iter().copied().collect();
+    let inside: FxHashSet<Block> = blocks.iter().copied().collect();
     for &block in blocks {
         for &inst in &graph.blocks[block].insts {
             let Op::Call { callee, .. } = graph.insts[inst].op else {

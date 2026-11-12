@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use crate::{FxHashMap, FxHashSet};
 
 use oxc_syntax::operator::BinaryOperator;
 
@@ -36,14 +36,14 @@ pub(super) struct Available {
     truth: Option<bool>,
 }
 
-pub(super) type AvailableLoads = HashMap<LoadKey, Available>;
+pub(super) type AvailableLoads = FxHashMap<LoadKey, Available>;
 
 pub(super) struct Solved {
-    exits: HashMap<Block, AvailableLoads>,
-    aliases: HashMap<Value, Value>,
+    exits: FxHashMap<Block, AvailableLoads>,
+    aliases: FxHashMap<Value, Value>,
     pub(super) reused: Vec<(Inst, Value)>,
     pub(super) folded: Vec<(Inst, bool)>,
-    cold: HashSet<Block>,
+    cold: FxHashSet<Block>,
     probes: bool,
 }
 
@@ -57,7 +57,7 @@ fn load_key(
     op: &Op,
     pure: bool,
     probes: bool,
-    aliases: &HashMap<Value, Value>,
+    aliases: &FxHashMap<Value, Value>,
 ) -> Option<LoadKey> {
     let at = |value: &Value| resolve(aliases, *value);
     Some(match op {
@@ -123,7 +123,7 @@ fn step(
     inst: Inst,
     cold: bool,
     probes: bool,
-    aliases: &HashMap<Value, Value>,
+    aliases: &FxHashMap<Value, Value>,
     state: &mut AvailableLoads,
 ) -> Option<Reuse> {
     let data = &graph.insts[inst];
@@ -191,12 +191,12 @@ fn step(
 fn entering(
     graph: &Graph,
     cfg: &Cfg,
-    exits: &HashMap<Block, AvailableLoads>,
+    exits: &FxHashMap<Block, AvailableLoads>,
     block: Block,
-    aliases: &HashMap<Value, Value>,
+    aliases: &FxHashMap<Value, Value>,
 ) -> AvailableLoads {
     if block == graph.entry {
-        return AvailableLoads::new();
+        return AvailableLoads::default();
     }
     let mut incoming = cfg.preds[block].iter().filter_map(|pred| {
         let mut state = exits.get(pred)?.clone();
@@ -218,7 +218,7 @@ fn entering(
         Some(state)
     });
     let Some(first) = incoming.next() else {
-        return AvailableLoads::new();
+        return AvailableLoads::default();
     };
     let mut state = first;
     for other in incoming {
@@ -242,14 +242,14 @@ pub(super) fn solve(
     graph: &Graph,
     facts: &Facts,
     cfg: &Cfg,
-    cold: HashSet<Block>,
+    cold: FxHashSet<Block>,
     probes: bool,
 ) -> Option<Solved> {
-    let mut exits: HashMap<Block, AvailableLoads> = HashMap::new();
-    let mut previous = HashMap::new();
+    let mut exits: FxHashMap<Block, AvailableLoads> = FxHashMap::default();
+    let mut previous = FxHashMap::default();
     for _ in 0..16 {
         let mut changed = false;
-        let mut aliases = HashMap::new();
+        let mut aliases = FxHashMap::default();
         let mut reused = Vec::new();
         let mut folded = Vec::new();
         for &block in &cfg.rpo {

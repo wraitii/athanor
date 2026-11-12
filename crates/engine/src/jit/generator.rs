@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use crate::FxHashSet;
 
 use oxc_ast::ast::{ArrowFunctionExpression, Expression, Function, Statement, YieldExpression};
 use oxc_ast_visit::{Visit, walk};
@@ -32,7 +32,7 @@ pub(super) fn validate(statements: &[Statement<'_>]) -> Result<(), Error> {
 }
 
 struct Validate {
-    allowed: HashSet<u32>,
+    allowed: FxHashSet<u32>,
     error: Option<Error>,
 }
 

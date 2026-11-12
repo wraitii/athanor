@@ -1,6 +1,6 @@
+use crate::FxHashMap;
 use crate::host::Host;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use oxc_allocator::Allocator;
@@ -207,7 +207,7 @@ pub struct Engine {
     pub(crate) tiering: jit::Tiering,
     random_state: Cell<u64>,
     global: Environment,
-    functions: RefCell<HashMap<String, Function>>,
+    functions: RefCell<FxHashMap<String, Function>>,
     pub(crate) locals: jit::LocalSlots,
     pub(crate) host: Option<Box<dyn Host>>,
 }
@@ -253,7 +253,7 @@ impl Engine {
             tiering: jit::Tiering::new(options)?,
             random_state: Cell::new(0x330e),
             global,
-            functions: RefCell::new(HashMap::new()),
+            functions: RefCell::new(FxHashMap::default()),
             locals: jit::LocalSlots::new(),
             host: None,
         })

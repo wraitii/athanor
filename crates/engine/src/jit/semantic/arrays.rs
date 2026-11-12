@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use crate::FxHashSet;
 
 use oxc_syntax::operator::BinaryOperator;
 
@@ -37,7 +37,7 @@ pub(super) fn expand(
     graph: &mut Graph,
     _source: usize,
     notes: &mut Vec<String>,
-    expanded: &mut HashSet<Inst>,
+    expanded: &mut FxHashSet<Inst>,
 ) -> Result<()> {
     let facts = Facts::compute(graph);
     let mut sites = Vec::new();

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use crate::FxHashMap;
 use std::sync::{Mutex, OnceLock};
 
 struct Site {
@@ -7,7 +7,7 @@ struct Site {
 }
 
 static SITES: Mutex<Vec<Site>> = Mutex::new(Vec::new());
-static GUARDS: Mutex<Option<HashMap<(u32, u32), String>>> = Mutex::new(None);
+static GUARDS: Mutex<Option<FxHashMap<(u32, u32), String>>> = Mutex::new(None);
 
 pub(crate) fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -18,7 +18,7 @@ pub(crate) fn note_guard(span: oxc_span::Span, text: String) {
     GUARDS
         .lock()
         .unwrap()
-        .get_or_insert_with(HashMap::new)
+        .get_or_insert_with(FxHashMap::default)
         .insert((span.start, span.end), text);
 }
 

@@ -1,4 +1,5 @@
 use super::*;
+use crate::FxHashMap;
 
 #[derive(Hash, PartialEq, Eq)]
 pub(super) enum SetKey {
@@ -7,7 +8,7 @@ pub(super) enum SetKey {
 }
 
 pub(super) struct Set {
-    pub(super) entries: HashMap<SetKey, Value>,
+    pub(super) entries: FxHashMap<SetKey, Value>,
 }
 
 impl Heap {
@@ -18,7 +19,7 @@ impl Heap {
         data.store(
             id,
             Payload::Set(Box::new(Set {
-                entries: HashMap::default(),
+                entries: FxHashMap::default(),
             })),
         );
         Some(Value::from_bits(TAG_OBJECT | id))

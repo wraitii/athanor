@@ -1,4 +1,5 @@
 use super::*;
+use crate::FxHashSet;
 use std::fmt;
 
 #[derive(Clone, Copy)]
@@ -31,7 +32,7 @@ impl Graph {
                 end: data.span.end,
             }
         };
-        let mut sites = HashSet::new();
+        let mut sites = FxHashSet::default();
         for block in Cfg::new(self).rpo {
             for &inst in &self.blocks[block].insts {
                 sites.insert(site(inst));

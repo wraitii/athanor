@@ -11,8 +11,23 @@ pub(super) struct Segment {
 }
 
 pub(super) struct Liveness {
-    pub segments: SecondaryMap<Value, Vec<Segment>>,
+    segments: Vec<Segment>,
+    ranges: SecondaryMap<Value, (u32, u32)>,
     pub calls: Vec<u32>,
+}
+
+impl Liveness {
+    pub(super) fn of(&self, value: Value) -> &[Segment] {
+        let (start, end) = self.ranges[value];
+        &self.segments[start as usize..end as usize]
+    }
+
+    pub(super) fn crosses_call(&self, segment: &Segment) -> bool {
+        let index = self.calls.partition_point(|&call| call < segment.start);
+        self.calls
+            .get(index)
+            .is_some_and(|&call| call <= segment.end)
+    }
 }
 
 fn use_position(index: u32) -> u32 {
@@ -121,7 +136,8 @@ pub(super) fn compute(
     let mut used_at = SecondaryMap::<Block, (u32, u32)>::new();
     let mut touched = Vec::new();
     let mut worklist = Vec::new();
-    let mut segments = SecondaryMap::<Value, Vec<Segment>>::new();
+    let mut segments = Vec::new();
+    let mut ranges = SecondaryMap::<Value, (u32, u32)>::new();
     let mut cursor = 0;
     for index in 0..graph.values.len() {
         let value = Value::new(index);
@@ -165,7 +181,7 @@ pub(super) fn compute(
             return Err(format!("{value} used before definition"));
         }
 
-        let list = &mut segments[value];
+        let first_segment = segments.len();
         for &block in &touched {
             let entering = live_in[block] == stamp;
             let start = if entering {
@@ -181,7 +197,7 @@ pub(super) fn compute(
                     _ => start,
                 }
             };
-            list.push(Segment {
+            segments.push(Segment {
                 start,
                 end,
                 block,
@@ -189,9 +205,14 @@ pub(super) fn compute(
                 live_in: entering,
             });
         }
-        list.sort_unstable_by_key(|segment| segment.start);
+        segments[first_segment..].sort_unstable_by_key(|segment| segment.start);
+        ranges[value] = (first_segment as u32, segments.len() as u32);
     }
-    Ok(Liveness { segments, calls })
+    Ok(Liveness {
+        segments,
+        ranges,
+        calls,
+    })
 }
 
 #[cfg(test)]
@@ -279,14 +300,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(live.calls.len(), 1);
-        assert!(live.segments[results[0]].iter().any(|s| s.block == entry));
+        assert!(live.of(results[0]).iter().any(|s| s.block == entry));
         assert!(
-            live.segments[results[1]]
+            live.of(results[1])
                 .iter()
                 .any(|s| s.block == loop_block && s.live_in)
         );
         assert!(
-            live.segments[carried]
+            live.of(carried)
                 .iter()
                 .any(|s| s.block == exit && s.live_in)
         );

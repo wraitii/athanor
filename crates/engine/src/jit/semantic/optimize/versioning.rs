@@ -1,11 +1,12 @@
 use crate::jit::profile::{Observation, ReadKind};
+use crate::{FxHashMap, FxHashSet};
 
 use super::super::available::LoadKey;
 use super::super::guards::{Fact, edge_of, implies};
 use super::*;
 
-fn retarget(graph: &mut Graph, blocks: &HashSet<Block>, from: Value, to: Value) {
-    let aliases = HashMap::from([(from, to)]);
+fn retarget(graph: &mut Graph, blocks: &FxHashSet<Block>, from: Value, to: Value) {
+    let aliases = FxHashMap::from_iter([(from, to)]);
     for &block in blocks {
         for inst in graph.blocks[block].insts.clone() {
             if !matches!(
@@ -66,7 +67,7 @@ impl EntryGuard {
         Some(Self::Fact(value, fact))
     }
 
-    fn tested_by(&self, known: &HashSet<Self>) -> bool {
+    fn tested_by(&self, known: &FxHashSet<Self>) -> bool {
         known.contains(self)
             || matches!(self, Self::Fact(value, fact) if known.iter().any(|other| {
                 matches!(other, Self::Fact(known_value, known_fact)
@@ -74,7 +75,7 @@ impl EntryGuard {
             }))
     }
 
-    fn at_entry(graph: &Graph, entry: Block) -> HashSet<Self> {
+    fn at_entry(graph: &Graph, entry: Block) -> FxHashSet<Self> {
         // These predicates describe SSA values, so their proofs survive writes and reentry.
         let cfg = Cfg::new(graph);
         cfg.rpo
@@ -91,18 +92,18 @@ impl EntryGuard {
 }
 
 pub(super) struct Version {
-    pub(super) body: HashSet<Block>,
+    pub(super) body: FxHashSet<Block>,
     pub(super) notes: Vec<String>,
-    pub(super) blocks: HashMap<Block, Block>,
-    pub(super) insts: HashMap<Inst, Inst>,
-    pub(super) values: HashMap<Value, Value>,
-    pub(super) aliases: HashMap<Value, Value>,
+    pub(super) blocks: FxHashMap<Block, Block>,
+    pub(super) insts: FxHashMap<Inst, Inst>,
+    pub(super) values: FxHashMap<Value, Value>,
+    pub(super) aliases: FxHashMap<Value, Value>,
 }
 
 pub(super) struct Canonical<'a> {
     pub(super) graph: &'a Graph,
-    pub(super) blocks: HashMap<Block, Block>,
-    pub(super) values: HashMap<Value, Value>,
+    pub(super) blocks: FxHashMap<Block, Block>,
+    pub(super) values: FxHashMap<Value, Value>,
     pieces: std::rc::Rc<std::cell::RefCell<super::super::continuation::Pieces>>,
 }
 
@@ -160,7 +161,7 @@ pub(super) fn apply_version(
         assumes,
         ..
     } = *speculation;
-    let region_blocks: HashSet<Block> = region.iter().copied().collect();
+    let region_blocks: FxHashSet<Block> = region.iter().copied().collect();
     let requirements: Vec<NativeCheck> = assumes
         .iter()
         .filter_map(|&(callee, fact)| {
@@ -239,8 +240,8 @@ pub(super) fn apply_version(
             }
         }
     }
-    let inside: HashSet<Block> = region.iter().chain(&copies).copied().collect();
-    let mut outside = HashSet::new();
+    let inside: FxHashSet<Block> = region.iter().chain(&copies).copied().collect();
+    let mut outside = FxHashSet::default();
     for (block, data) in graph.blocks.iter() {
         if inside.contains(&block) {
             continue;
@@ -252,7 +253,7 @@ pub(super) fn apply_version(
             outside.extend(terminator.kind.operands_iter());
         }
     }
-    let pinned: HashSet<Value> = values
+    let pinned: FxHashSet<Value> = values
         .iter()
         .filter(|(original, _)| outside.contains(*original))
         .map(|(_, &copy)| copy)
@@ -277,7 +278,7 @@ pub(super) fn apply_version(
         graph.remove_inst(inst);
     }
     if !reuse {
-        let definitions: HashMap<Value, Vec<Value>> = values
+        let definitions: FxHashMap<Value, Vec<Value>> = values
             .iter()
             .map(|(&original, &copy)| {
                 let live = uses[copy] != u32::MAX;
@@ -319,16 +320,16 @@ pub(super) fn apply_version(
 }
 
 struct Copy {
-    blocks: HashMap<Block, Block>,
-    values: HashMap<Value, Value>,
-    insts: HashMap<Inst, Inst>,
-    copies: HashSet<Block>,
+    blocks: FxHashMap<Block, Block>,
+    values: FxHashMap<Value, Value>,
+    insts: FxHashMap<Inst, Inst>,
+    copies: FxHashSet<Block>,
 }
 
 struct Entry {
     start: Block,
     previous: Option<Target>,
-    aliases: HashMap<Value, Value>,
+    aliases: FxHashMap<Value, Value>,
 }
 
 fn duplicate(
@@ -344,9 +345,9 @@ fn duplicate(
         typed_reads,
         ..
     } = *speculation;
-    let mut blocks = HashMap::new();
-    let mut values = HashMap::new();
-    let mut insts = HashMap::new();
+    let mut blocks = FxHashMap::default();
+    let mut values = FxHashMap::default();
+    let mut insts = FxHashMap::default();
     for &block in region {
         let copy = if reuse {
             block
@@ -397,7 +398,7 @@ fn duplicate(
         }
         graph.blocks[blocks[&block]].terminator = Some(terminator);
     }
-    let copies: HashSet<Block> = blocks.values().copied().collect();
+    let copies: FxHashSet<Block> = blocks.values().copied().collect();
     // A varying guard leaves the copy before reentry; SSA repair carries its current values.
     for &block in exits {
         if guards.contains(&block) {
@@ -450,10 +451,10 @@ fn entry_checks(
     entry: Option<(Block, Block)>,
     speculation: &Speculation<'_>,
     requirements: &[NativeCheck],
-    hints: &HashMap<Value, crate::jit::profile::ReadType>,
+    hints: &FxHashMap<Value, crate::jit::profile::ReadType>,
     head: Block,
     reuse: bool,
-    mut tested: HashSet<EntryGuard>,
+    mut tested: FxHashSet<EntryGuard>,
     copy: &mut Copy,
 ) -> Entry {
     let Speculation {
@@ -504,7 +505,7 @@ fn entry_checks(
     };
     let start = graph.blocks.push(BlockData::default());
     let mut current = start;
-    let mut guarded_probes = HashMap::new();
+    let mut guarded_probes = FxHashMap::default();
     for (name, code) in code_guards {
         let global = graph.append_value(current, span, Op::ProbeGlobal(name.clone()));
         guarded_probes.insert(name.clone(), global);
@@ -527,8 +528,8 @@ fn entry_checks(
             span,
             TerminatorKind::Branch(valid, Target::new(validated), Target::new(probes)),
         );
-        let mut globals: HashMap<String, Value> = HashMap::new();
-        let mut methods = HashSet::new();
+        let mut globals: FxHashMap<String, Value> = FxHashMap::default();
+        let mut methods = FxHashSet::default();
         let mut probed = Vec::new();
         for requirement in requirements
             .iter()
@@ -586,9 +587,9 @@ fn entry_checks(
         let check = graph.append_value(current, span, Op::IsNative(method, requirement.native));
         current = continue_if(graph, current, check, &original);
     }
-    let mut probes = HashMap::new();
-    let mut replacements = HashMap::new();
-    let mut available: HashMap<LoadKey, Value> = guarded_probes
+    let mut probes = FxHashMap::default();
+    let mut replacements = FxHashMap::default();
+    let mut available: FxHashMap<LoadKey, Value> = guarded_probes
         .into_iter()
         .map(|(name, value)| (LoadKey::Global(name), value))
         .collect();
@@ -656,8 +657,8 @@ fn entry_checks(
         probes.insert(result, value);
     }
     graph.replace_uses(&replacements);
-    let copied: HashSet<Block> = region.iter().copied().collect();
-    let mut objects: HashMap<Value, Value> = HashMap::new();
+    let copied: FxHashSet<Block> = region.iter().copied().collect();
+    let mut objects: FxHashMap<Value, Value> = FxHashMap::default();
     for &block in guards {
         let Some(Terminator {
             source_name,
@@ -786,8 +787,8 @@ fn entry_checks(
         );
         current = continue_if(graph, current, check, &failure);
     }
-    let mut numbers = HashMap::new();
-    let mut aliases = HashMap::new();
+    let mut numbers = FxHashMap::default();
+    let mut aliases = FxHashMap::default();
     for (value, fact) in numeric() {
         let checked = values.get(&value).copied().unwrap_or(value);
         let number = *numbers.entry(checked).or_insert_with(|| {
@@ -908,7 +909,7 @@ fn local_checks(
     copy: &Copy,
     notes: &mut Vec<String>,
 ) {
-    let reverse: HashMap<_, _> = canonical
+    let reverse: FxHashMap<_, _> = canonical
         .blocks
         .iter()
         .map(|(&old, &current)| (current, old))
@@ -1034,15 +1035,15 @@ fn wire_failures(
     let generic = canonical.graph;
     let span = graph.span;
     let Copy { blocks, values, .. } = copy;
-    let region: HashSet<_> = region.iter().copied().collect();
-    let reverse: HashMap<_, _> = canonical
+    let region: FxHashSet<_> = region.iter().copied().collect();
+    let reverse: FxHashMap<_, _> = canonical
         .blocks
         .iter()
         .map(|(&old, &current)| (current, old))
         .collect();
     let cfg = Cfg::new(graph);
     let facts = Facts::compute(graph);
-    let order: HashMap<Block, usize> = cfg
+    let order: FxHashMap<Block, usize> = cfg
         .rpo
         .iter()
         .enumerate()
@@ -1056,8 +1057,8 @@ fn wire_failures(
         .collect();
     exits.sort_by_key(|(block, _)| order.get(&blocks[block]).copied().unwrap_or(usize::MAX));
     let mut pieces = canonical.pieces.borrow_mut();
-    let mut stubs: HashMap<(usize, Vec<Value>, Option<Inst>), Block> = HashMap::new();
-    let mut resumed: HashMap<Block, Block> = HashMap::new();
+    let mut stubs: FxHashMap<(usize, Vec<Value>, Option<Inst>), Block> = FxHashMap::default();
+    let mut resumed: FxHashMap<Block, Block> = FxHashMap::default();
     for &(block, taken) in &exits {
         if let Some(stub) = shared_resume(graph, &cfg, &facts, blocks[&block], &resumed) {
             let TerminatorKind::Branch(_, yes, no) = &mut graph.blocks[blocks[&block]]
@@ -1243,7 +1244,7 @@ fn shared_resume(
     cfg: &Cfg,
     facts: &Facts,
     block: Block,
-    resumed: &HashMap<Block, Block>,
+    resumed: &FxHashMap<Block, Block>,
 ) -> Option<Block> {
     let mut current = block;
     loop {
@@ -1281,12 +1282,12 @@ fn value_available(graph: &Graph, cfg: &Cfg, value: Value, block: Block) -> bool
     defined && cfg.dominates(graph.def_block(value), block)
 }
 
-pub(in crate::jit::semantic) fn repair(graph: &mut Graph, values: &HashMap<Value, Vec<Value>>) {
+pub(in crate::jit::semantic) fn repair(graph: &mut Graph, values: &FxHashMap<Value, Vec<Value>>) {
     let cfg = Cfg::new(graph);
     let mut repair = Repair {
         cfg: &cfg,
         values,
-        reaching: HashMap::new(),
+        reaching: FxHashMap::default(),
     };
     for &block in &cfg.rpo {
         for inst in graph.blocks[block].insts.clone() {
@@ -1298,7 +1299,7 @@ pub(in crate::jit::semantic) fn repair(graph: &mut Graph, values: &HashMap<Value
             }
             graph.insts[inst].op = op;
         }
-        let mut reaching = HashMap::new();
+        let mut reaching = FxHashMap::default();
         for value in graph.blocks[block]
             .terminator
             .as_ref()
@@ -1323,8 +1324,8 @@ pub(in crate::jit::semantic) fn repair(graph: &mut Graph, values: &HashMap<Value
 
 struct Repair<'a> {
     cfg: &'a Cfg,
-    values: &'a HashMap<Value, Vec<Value>>,
-    reaching: HashMap<(Block, Value), Value>,
+    values: &'a FxHashMap<Value, Vec<Value>>,
+    reaching: FxHashMap<(Block, Value), Value>,
 }
 
 impl Repair<'_> {
@@ -1348,7 +1349,7 @@ impl Repair<'_> {
         if let Some(&reaching) = self.reaching.get(&(block, value)) {
             return reaching;
         }
-        let preds = self.cfg.preds[block].clone();
+        let preds = self.cfg.preds[block].to_vec();
         if let [pred] = preds[..] {
             let reaching = self.leaving(graph, pred, value);
             self.reaching.insert((block, value), reaching);
@@ -1414,7 +1415,7 @@ mod tests {
             .build(&parsed.program)
             .semantic;
         let mut graph =
-            super::super::super::build::lower(function, semantic.scoping(), &HashSet::new())
+            super::super::super::build::lower(function, semantic.scoping(), &FxHashSet::default())
                 .unwrap();
         let xs = graph
             .insts

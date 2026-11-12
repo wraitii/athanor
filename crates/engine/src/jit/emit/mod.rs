@@ -11,7 +11,7 @@ mod slots;
 mod statement;
 pub(super) mod stubs;
 
-use std::collections::HashMap;
+use crate::FxHashMap;
 
 use super::semantic::low_level::{
     BlockArg, Builder as GraphBuilder, SignatureRef as SigRef, Variable,
@@ -55,8 +55,8 @@ pub(super) struct FunctionCompiler<'a, 'f> {
     source_span: Span,
     b: &'a mut GraphBuilder<'f>,
     module: &'a mut JITModule,
-    helper_signatures: HashMap<Helper, SigRef>,
-    source_names: HashMap<usize, i64>,
+    helper_signatures: FxHashMap<Helper, SigRef>,
+    source_names: FxHashMap<usize, i64>,
     stubs: Stubs,
     annotations: &'a mut Annotations,
     pointer: Type,
@@ -71,15 +71,15 @@ pub(super) struct FunctionCompiler<'a, 'f> {
     frame_size: Option<Inst>,
     frame_roots: Option<Variable>,
     frame: Option<CallerFrame>,
-    fixed_signatures: HashMap<u16, SigRef>,
-    property_caches: HashMap<super::semantic::Inst, i64>,
-    slots: HashMap<u32, u32>,
+    fixed_signatures: FxHashMap<u16, SigRef>,
+    property_caches: FxHashMap<super::semantic::Inst, i64>,
+    slots: FxHashMap<u32, u32>,
     slot_count: u32,
     empty_owned: LoweredValue,
     owned: Vec<Variable>,
     free_owned: Vec<Variable>,
     unchecked: Option<Variable>,
-    unwinds: HashMap<Block, (Vec<Block>, Block)>,
+    unwinds: FxHashMap<Block, (Vec<Block>, Block)>,
 }
 
 enum Arguments {
@@ -127,7 +127,7 @@ pub(super) fn build_function(
     params: Span,
     graph: &super::semantic::Graph,
     facts: &super::semantic::Facts,
-    continuations: &HashMap<usize, FuncId>,
+    continuations: &FxHashMap<usize, FuncId>,
     feedback: Option<Feedback>,
 ) -> Result<(), Error> {
     build_callable(
@@ -148,7 +148,7 @@ pub(super) fn build_factory(
         out,
         params,
         CallableBody::Factory(resume),
-        &HashMap::new(),
+        &FxHashMap::default(),
         None,
     )
 }
@@ -157,7 +157,7 @@ pub(super) fn build_global(
     out: Output<'_, '_>,
     graph: &super::semantic::Graph,
     facts: &super::semantic::Facts,
-    continuations: &HashMap<usize, FuncId>,
+    continuations: &FxHashMap<usize, FuncId>,
 ) -> Result<(), Error> {
     debug_assert!(graph.arity.is_none());
     build_callable(
@@ -178,7 +178,7 @@ fn build_callable(
     out: Output<'_, '_>,
     params: Span,
     body: CallableBody<'_>,
-    continuations: &HashMap<usize, FuncId>,
+    continuations: &FxHashMap<usize, FuncId>,
     feedback: Option<Feedback>,
 ) -> Result<(), Error> {
     let Output {
@@ -224,7 +224,7 @@ fn build_callable(
 fn lower_callable(
     params: Span,
     body: CallableBody<'_>,
-    continuations: &HashMap<usize, FuncId>,
+    continuations: &FxHashMap<usize, FuncId>,
     feedback: Option<Feedback>,
     signature: cranelift_codegen::ir::Signature,
     module: &mut JITModule,
@@ -272,8 +272,8 @@ fn lower_callable(
         source_span: params,
         b,
         module,
-        helper_signatures: HashMap::new(),
-        source_names: HashMap::new(),
+        helper_signatures: FxHashMap::default(),
+        source_names: FxHashMap::default(),
         stubs,
         annotations,
         pointer,
@@ -288,15 +288,15 @@ fn lower_callable(
         frame_size: None,
         frame_roots: None,
         frame: None,
-        fixed_signatures: HashMap::new(),
-        property_caches: HashMap::new(),
-        slots: HashMap::new(),
+        fixed_signatures: FxHashMap::default(),
+        property_caches: FxHashMap::default(),
+        slots: FxHashMap::default(),
         slot_count: 0,
         empty_owned,
         owned: Vec::new(),
         free_owned: Vec::new(),
         unchecked: None,
-        unwinds: HashMap::new(),
+        unwinds: FxHashMap::default(),
     };
 
     compiler.enter_frame();

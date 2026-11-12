@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use crate::FxHashMap;
 
 use oxc_syntax::operator::BinaryOperator;
 
@@ -109,7 +109,7 @@ fn known(types: Types, kind: Types) -> Option<bool> {
 }
 
 fn refine_string_guards(graph: &mut Graph, cfg: &Cfg) -> bool {
-    let mut checks: HashMap<(bool, Value), Vec<(Block, bool)>> = HashMap::new();
+    let mut checks: FxHashMap<(bool, Value), Vec<(Block, bool)>> = FxHashMap::default();
     for &block in &cfg.rpo {
         let Some(Terminator {
             kind: TerminatorKind::Branch(condition, yes, no),

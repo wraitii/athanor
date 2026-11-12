@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use crate::{FxHashMap, FxHashSet};
 
 use oxc_syntax::operator::BinaryOperator;
 
@@ -23,7 +23,10 @@ mod planning;
 mod propose;
 mod versioning;
 
-use analysis::{Requirement, Writes, closure_failure, conflicts, guarded_accesses, requirements};
+use analysis::{
+    Requirement, Writes, closure_failure, closure_failure_with, conflicts, guarded_accesses,
+    requirements,
+};
 #[cfg(test)]
 pub(super) use planning::version;
 pub(super) use planning::version_with_report;
@@ -162,9 +165,9 @@ pub(super) fn version_string_leaves(
         super::js::simplify(&mut function);
         let mut candidate = function.graph;
         candidate.verify()?;
-        let reachable: HashSet<_> = Cfg::new(&candidate).rpo.into_iter().collect();
-        let copy: HashSet<_> = copy.intersection(&reachable).copied().collect();
-        if let Some(reason) = closure_failure(&candidate, &copy, &[], &HashMap::new()) {
+        let reachable: FxHashSet<_> = Cfg::new(&candidate).rpo.into_iter().collect();
+        let copy: FxHashSet<_> = copy.intersection(&reachable).copied().collect();
+        if let Some(reason) = closure_failure(&candidate, &copy, &[], &FxHashMap::default()) {
             notes.push(format!(
                 "string split continuation not versioned: guarded copy {reason}"
             ));
@@ -204,11 +207,11 @@ fn cold_exit(graph: &Graph, block: Block) -> Option<Block> {
 
 fn invariant_guards(
     graph: &Graph,
-    inside: &HashSet<Block>,
+    inside: &FxHashSet<Block>,
     scan: &[Block],
     probes: &[Inst],
 ) -> Vec<Block> {
-    let probed: HashSet<Value> = probes
+    let probed: FxHashSet<Value> = probes
         .iter()
         .filter_map(|inst| graph.insts[*inst].result())
         .collect();
@@ -230,12 +233,12 @@ fn invariant_guards(
 
 fn typed_entry(
     graph: &Graph,
-    body: &HashSet<Block>,
-    available: &HashSet<Value>,
+    body: &FxHashSet<Block>,
+    available: &FxHashSet<Value>,
     facts: &Facts,
     candidates: &[(Value, guards::Fact)],
 ) -> Vec<(Value, Option<TypedKind>)> {
-    let mut typed = HashMap::new();
+    let mut typed = FxHashMap::default();
     for &block in body {
         for &inst in &graph.blocks[block].insts {
             if let Op::GetIndex(object, key) | Op::TypedIndex(object, key, _) = graph.insts[inst].op
@@ -319,12 +322,12 @@ fn element_guess_at(graph: &Graph, object: Value, depth: usize) -> Option<TypedK
 fn bounded_reads(
     graph: &Graph,
     cfg: &Cfg,
-    region: &HashSet<Block>,
+    region: &FxHashSet<Block>,
     objects: &[Value],
-    available: &HashSet<Value>,
+    available: &FxHashSet<Value>,
     facts: &Facts,
-) -> HashMap<Inst, (Value, Value)> {
-    let mut counters = HashMap::new();
+) -> FxHashMap<Inst, (Value, Value)> {
+    let mut counters = FxHashMap::default();
     for (header, body) in natural_loops(graph, cfg) {
         if !region.contains(&header) {
             continue;
@@ -358,7 +361,7 @@ fn bounded_reads(
         }
         counters.insert(counter, (inside.block, bound));
     }
-    let mut reads = HashMap::new();
+    let mut reads = FxHashMap::default();
     for &block in region {
         for &inst in &graph.blocks[block].insts {
             if let Op::GetIndex(object, key) | Op::TypedIndex(object, key, _) = graph.insts[inst].op
@@ -377,7 +380,7 @@ fn counts_up(
     graph: &Graph,
     cfg: &Cfg,
     header: Block,
-    body: &HashSet<Block>,
+    body: &FxHashSet<Block>,
     counter: Value,
 ) -> bool {
     let Some(index) = graph.blocks[header]
@@ -417,7 +420,7 @@ pub(super) fn preheader(
     graph: &Graph,
     cfg: &Cfg,
     header: Block,
-    body: &HashSet<Block>,
+    body: &FxHashSet<Block>,
 ) -> Option<Block> {
     let outside: Vec<Block> = cfg.preds[header]
         .iter()
@@ -462,13 +465,12 @@ fn numeric_use(op: &Op, index: usize) -> bool {
 
 fn entry_assumes(
     graph: &Graph,
-    inside: &HashSet<Block>,
+    inside: &FxHashSet<Block>,
     probes: &[Inst],
-    assumed: &HashMap<Value, cranelift_module::FuncId>,
+    facts: &Facts,
     candidates: &[(Value, guards::Fact)],
 ) -> Vec<(Value, guards::Fact)> {
-    let facts = Facts::assuming(graph, &guards::assumed(&HashMap::new(), assumed));
-    let probed: HashSet<Value> = probes
+    let probed: FxHashSet<Value> = probes
         .iter()
         .filter_map(|inst| graph.insts[*inst].result())
         .collect();
@@ -509,7 +511,7 @@ pub(super) fn reuse_loads(function: &mut FunctionState) {
     let Some(solved) = available::solve(graph, facts, cfg, graph.cold.clone(), false) else {
         return;
     };
-    let aliases: HashMap<Value, Value> = solved
+    let aliases: FxHashMap<Value, Value> = solved
         .reused
         .iter()
         .map(|&(inst, value)| (graph.insts[inst].result().unwrap(), value))
@@ -527,8 +529,8 @@ pub(super) fn reuse_loads(function: &mut FunctionState) {
     }
 }
 
-pub(super) fn natural_loops(graph: &Graph, cfg: &Cfg) -> Vec<(Block, HashSet<Block>)> {
-    let mut loops: HashMap<Block, HashSet<Block>> = HashMap::new();
+pub(super) fn natural_loops(graph: &Graph, cfg: &Cfg) -> Vec<(Block, FxHashSet<Block>)> {
+    let mut loops: FxHashMap<Block, FxHashSet<Block>> = FxHashMap::default();
     for &block in &cfg.rpo {
         for header in graph.successors(block) {
             if !cfg.dominates(header, block) {
@@ -536,7 +538,7 @@ pub(super) fn natural_loops(graph: &Graph, cfg: &Cfg) -> Vec<(Block, HashSet<Blo
             }
             let body = loops
                 .entry(header)
-                .or_insert_with(|| HashSet::from([header]));
+                .or_insert_with(|| FxHashSet::from_iter([header]));
             let mut stack = vec![block];
             while let Some(node) = stack.pop() {
                 if body.insert(node) {
@@ -638,15 +640,15 @@ pub(super) fn hoist(function: &mut FunctionState, region: RegionId) {
 
 fn probe_reads(
     graph: &Graph,
-    inside: &HashSet<Block>,
-    written: &HashSet<Block>,
+    inside: &FxHashSet<Block>,
+    written: &FxHashSet<Block>,
     scan: &[Block],
     inputs: bool,
-    assumed: &HashMap<Value, cranelift_module::FuncId>,
+    facts: &Facts,
 ) -> Vec<Inst> {
-    let writes = Writes::collect_assuming(graph, written, assumed);
+    let writes = Writes::with_facts(graph, written, facts);
     let mut reads = Vec::new();
-    let mut probed = HashSet::new();
+    let mut probed = FxHashSet::default();
     for &block in scan {
         for &inst in &graph.blocks[block].insts {
             let data = &graph.insts[inst];
@@ -686,7 +688,7 @@ pub(super) fn views(function: &mut FunctionState) {
     let cfg = &facts.cfg;
     let mut loops = natural_loops(graph, cfg);
     loops.reverse();
-    let mut placed: HashMap<(Block, Value), Value> = HashMap::new();
+    let mut placed: FxHashMap<(Block, Value), Value> = FxHashMap::default();
     for &block in &cfg.rpo {
         for inst in graph.blocks[block].insts.clone() {
             let object = match graph.insts[inst].op {
@@ -743,7 +745,7 @@ pub(super) fn sink_closures(function: &mut FunctionState) {
     let cfg = &facts.cfg;
     let loops = natural_loops(graph, cfg);
     let mut changed = false;
-    let mut uses: HashMap<Value, HashSet<Block>> = HashMap::new();
+    let mut uses: FxHashMap<Value, FxHashSet<Block>> = FxHashMap::default();
     let mut closures = Vec::new();
     for &block in &cfg.rpo {
         for &inst in &graph.blocks[block].insts {
@@ -832,7 +834,7 @@ pub(super) fn forward_captured_parameters(function: &mut FunctionState) {
         ..
     } = function;
     let cfg = &facts.cfg;
-    let mut aliases = HashMap::new();
+    let mut aliases = FxHashMap::default();
     let mut removed = Vec::new();
     for &binding in &graph.lazy_captures {
         if graph.scopes[graph.bindings[binding].scope].kind != super::ScopeKind::Parameters {
@@ -840,7 +842,7 @@ pub(super) fn forward_captured_parameters(function: &mut FunctionState) {
         }
         let mut initializers = Vec::new();
         let mut writes = false;
-        let mut escaped = HashSet::new();
+        let mut escaped = FxHashSet::default();
         let mut pending = Vec::new();
         for &block in &cfg.rpo {
             for &inst in &graph.blocks[block].insts {
@@ -907,8 +909,8 @@ pub(super) fn lazy_captures(function: &mut FunctionState) -> bool {
     } = function;
     let mut demoted = false;
     let mut changed = false;
-    let mut candidates = HashSet::new();
-    let mut eager = HashSet::new();
+    let mut candidates = FxHashSet::default();
+    let mut eager = FxHashSet::default();
     for &block in &facts.cfg.rpo {
         for &inst in &graph.blocks[block].insts {
             match &graph.insts[inst].op {
@@ -966,7 +968,7 @@ mod tests {
         let semantic = oxc_semantic::SemanticBuilder::new_compiler()
             .build(&parsed.program)
             .semantic;
-        super::super::build::lower(function, semantic.scoping(), &HashSet::new()).unwrap()
+        super::super::build::lower(function, semantic.scoping(), &FxHashSet::default()).unwrap()
     }
 
     fn heap(base: Value, field: Field) -> Access {
@@ -1033,7 +1035,7 @@ mod tests {
             let facts = Facts::compute(&graph);
             let cfg = Cfg::new(&graph);
             let solved =
-                super::super::available::solve(&graph, &facts, &cfg, HashSet::new(), false)
+                super::super::available::solve(&graph, &facts, &cfg, FxHashSet::default(), false)
                     .unwrap();
             assert_eq!(solved.folded.contains(&(positive, false)), !writes_shape);
             assert!(
@@ -1067,7 +1069,8 @@ mod tests {
         let facts = Facts::compute(&graph);
         let cfg = Cfg::new(&graph);
         let solved =
-            super::super::available::solve(&graph, &facts, &cfg, HashSet::new(), false).unwrap();
+            super::super::available::solve(&graph, &facts, &cfg, FxHashSet::default(), false)
+                .unwrap();
         let reused: Vec<Inst> = solved.reused.iter().map(|&(inst, _)| inst).collect();
         assert!(reused.contains(&second));
         assert!(!reused.contains(&third));
@@ -1181,7 +1184,7 @@ mod tests {
             let mut function = FunctionState::new(graph, Vec::new(), true);
             super::super::js::simplify(&mut function);
             let graph = function.graph;
-            let reachable: HashSet<Block> = Cfg::new(&graph).rpo.into_iter().collect();
+            let reachable: FxHashSet<Block> = Cfg::new(&graph).rpo.into_iter().collect();
             assert_eq!(reachable.contains(&inner_yes), !inverted);
             assert_eq!(reachable.contains(&inner_no), inverted);
         }
@@ -1193,7 +1196,7 @@ mod tests {
         let code = cranelift_module::FuncId::from_u32(0);
         for written in [false, true] {
             let mut graph = empty_graph();
-            graph.summaries = std::sync::Arc::new(HashMap::from([(
+            graph.summaries = std::sync::Arc::new(FxHashMap::from_iter([(
                 code,
                 super::super::CallSummary {
                     memory: Memory::default(),
@@ -1264,7 +1267,7 @@ mod tests {
         let one = graph.append_value(header, span, Op::Constant(Constant::Number(1.0)));
         graph.append(header, span, Op::Set(receiver, "x".into(), one), false);
         graph.verify().unwrap();
-        let scope = HashSet::from([entry, header]);
+        let scope = FxHashSet::from_iter([entry, header]);
         let writes = Writes::collect(&graph, &scope);
         assert!(writes.clobbers(&heap(object, Field::Named("x".into()))));
         assert!(writes.clobbers(&heap(receiver, Field::Named("x".into()))));
@@ -1291,7 +1294,7 @@ mod tests {
             .build(&parsed.program)
             .semantic;
         let analysis =
-            super::super::analyze(function, semantic.scoping(), &HashSet::new()).unwrap();
+            super::super::analyze(function, semantic.scoping(), &FxHashSet::default()).unwrap();
         let graph = &analysis.graph;
         let loops = natural_loops(graph, &Cfg::new(graph));
         let outer = loops
@@ -1338,7 +1341,8 @@ mod tests {
             .build(&parsed.program)
             .semantic;
         let mut graph =
-            super::super::build::lower(function, semantic.scoping(), &HashSet::new()).unwrap();
+            super::super::build::lower(function, semantic.scoping(), &FxHashSet::default())
+                .unwrap();
         let block = graph.entry;
         let span = graph.span;
         let prototype = graph.append_value(block, span, Op::Constant(Constant::Null));
@@ -1349,7 +1353,7 @@ mod tests {
         let other = graph.append_value(block, span, Op::NewObject);
         let one = graph.append_value(block, span, Op::Constant(Constant::Number(1.0)));
         graph.append(block, span, Op::Set(object, "x".into(), one), false);
-        let scope = HashSet::from([block]);
+        let scope = FxHashSet::from_iter([block]);
         let writes = Writes::collect(&graph, &scope);
         assert!(!writes.clobbers(&heap(other, Field::Named("x".into()))));
         let position = graph.blocks[block]

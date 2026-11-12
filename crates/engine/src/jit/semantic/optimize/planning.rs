@@ -4,6 +4,7 @@ use super::cost::{Candidate, Verdict, worth};
 use super::placement::Reach;
 use super::versioning::{Canonical, Version};
 use super::*;
+use crate::{FxHashMap, FxHashSet};
 
 fn pure_guard(graph: &Graph, block: Block) -> bool {
     let Some(Terminator {
@@ -37,7 +38,7 @@ pub(super) struct Candidates {
 
 struct RegionPlan {
     locals: Vec<Inst>,
-    body: HashSet<Block>,
+    body: FxHashSet<Block>,
     entry: Option<(Block, Block)>,
     requirements: Vec<Requirement>,
     calls: Vec<ConditionalCall>,
@@ -270,7 +271,7 @@ impl RegionPlan {
         shapes: &super::super::shapes::Plan,
     ) -> Result<()> {
         let known = Facts::values(graph);
-        let live: HashSet<_> = known.cfg.rpo.iter().copied().collect();
+        let live: FxHashSet<_> = known.cfg.rpo.iter().copied().collect();
         self.body.retain(|block| live.contains(block));
         if self.body.is_empty() {
             return Ok(());
@@ -358,7 +359,7 @@ impl RegionPlan {
                 graph,
                 &version.body,
                 &guarded_accesses(&self.requirements, &self.identities),
-                &HashMap::new(),
+                &FxHashMap::default(),
             )
             .filter(|_| probe_like)
             {
@@ -411,7 +412,7 @@ impl RegionPlan {
 fn plan_region(
     graph: &Graph,
     known: &Facts,
-    body: HashSet<Block>,
+    body: FxHashSet<Block>,
     entry: Option<(Block, Block)>,
     conditional: &[ConditionalCall],
     candidates: &Candidates,
@@ -440,11 +441,11 @@ fn plan_region(
         .copied()
         .filter(|&block| cold_exit(graph, block).is_some())
         .collect();
-    let fallbacks: HashSet<_> = exits
+    let fallbacks: FxHashSet<_> = exits
         .iter()
         .filter_map(|&block| cold_exit(graph, block))
         .collect();
-    let written: HashSet<_> = body.difference(&fallbacks).copied().collect();
+    let written: FxHashSet<_> = body.difference(&fallbacks).copied().collect();
     let mut requirements = requirements(graph, &blocks);
     let native_of = |requirement: &Requirement| match graph.insts[requirement.call].op {
         Op::Call { callee, .. } => (callee, Fact::Native(requirement.native)),
@@ -477,14 +478,14 @@ fn plan_region(
             };
             planning.insts[requirement.call].op = Op::CallNative(requirement.native, args.clone());
         }
-        let assumed: HashMap<Value, cranelift_module::FuncId> = calls
+        let assumed: FxHashMap<Value, cranelift_module::FuncId> = calls
             .iter()
             .map(|call| (call.callee, call.target))
             .collect();
         (planning, assumed)
     };
     let identities_of = |calls: &[ConditionalCall]| {
-        let mut identities = HashMap::new();
+        let mut identities = FxHashMap::default();
         for call in calls {
             for (name, code) in &call.identities {
                 if identities
@@ -503,7 +504,7 @@ fn plan_region(
         let identities = identities_of(&calls)?;
         let (planning, assumed) = build(&requirements, &calls);
         let found = conflicts(&planning, &written, &assumed);
-        let dead_identities: HashSet<&String> = identities
+        let dead_identities: FxHashSet<&String> = identities
             .iter()
             .filter(|identity| {
                 found.invalidates(&guarded_accesses(&[], std::slice::from_ref(identity)))
@@ -566,20 +567,21 @@ fn plan_region(
         }
         planning.remove_inst(inst);
     }
+    let shared = Facts::assuming(&planning, &guards::assumed(&FxHashMap::default(), &assumed));
     let reads = probe_reads(
         &planning,
         &body,
         &written,
         &blocks,
         entry.is_none(),
-        &assumed,
+        &shared,
     );
-    let available: HashSet<_> = reads
+    let available: FxHashSet<_> = reads
         .iter()
         .filter_map(|&inst| planning.insts[inst].result())
         .collect();
     let assumes = candidates.facts.clone();
-    let numbers = entry_assumes(&planning, &body, &reads, &assumed, &assumes);
+    let numbers = entry_assumes(&planning, &body, &reads, &shared, &assumes);
     let mut guards = invariant_guards(&planning, &body, &blocks, &reads);
     if reentry.is_some() {
         guards.retain(|&block| pure_guard(&planning, block));
@@ -647,7 +649,7 @@ fn plan_region(
         && requirements.is_empty()
         && checks.is_empty()
         && guards.is_empty()
-        && closure_failure(&planning, &body, &guarded, &assumed).is_some()
+        && closure_failure_with(&planning, &body, &guarded, &shared).is_some()
     {
         return Err(
             reentry.unwrap_or_else(|| "no invariant entry guards for reentrant fallbacks".into())
@@ -711,7 +713,7 @@ fn plan(
         })
         .collect();
     candidates.push((cfg.rpo.iter().copied().collect(), None));
-    let bodies: HashMap<Option<Block>, HashSet<Block>> = candidates
+    let bodies: FxHashMap<Option<Block>, FxHashSet<Block>> = candidates
         .iter()
         .map(|(body, entry)| (entry.map(|(_, header)| header), body.clone()))
         .collect();
@@ -864,7 +866,7 @@ mod tests {
             .build(&parsed.program)
             .semantic;
         let graph =
-            super::super::super::build::lower(function, semantic.scoping(), &HashSet::new())
+            super::super::super::build::lower(function, semantic.scoping(), &FxHashSet::default())
                 .unwrap();
         let graph = super::super::super::canonicalize_graph(graph, true)
             .unwrap()

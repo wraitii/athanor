@@ -1,14 +1,14 @@
-use std::collections::{HashMap, HashSet};
+use crate::{FxHashMap, FxHashSet};
 
 use cranelift_codegen::entity::SecondaryMap;
 
-use super::super::{Binding, Block, Cfg, Constant, Graph, Op, Value, ValueDef, resolve};
+use super::super::{Binding, Block, Cfg, Constant, Graph, Op, Value};
 
 struct Promoter<'g> {
     graph: &'g mut Graph,
-    preds: SecondaryMap<Block, Vec<Block>>,
-    entry_defs: HashMap<(Block, Binding), Value>,
-    end_defs: HashMap<(Block, Binding), Value>,
+    preds: super::super::Preds,
+    entry_defs: FxHashMap<(Block, Binding), Value>,
+    end_defs: FxHashMap<(Block, Binding), Value>,
     uninitialized: Value,
 }
 
@@ -42,7 +42,7 @@ impl Promoter<'_> {
             }
             return value;
         }
-        let preds = self.preds[block].clone();
+        let preds = self.preds[block].to_vec();
         let value = if block == self.graph.entry {
             self.uninitialized
         } else if let [pred] = preds[..] {
@@ -78,7 +78,7 @@ enum Access {
 }
 
 pub(in crate::jit::semantic) fn promote(graph: &mut Graph, notes: &mut Vec<String>) {
-    let promoted: HashSet<Binding> = graph
+    let promoted: FxHashSet<Binding> = graph
         .bindings
         .iter()
         .filter(|(_, data)| !data.captured && !data.persistent)
@@ -93,7 +93,7 @@ pub(in crate::jit::semantic) fn promote(graph: &mut Graph, notes: &mut Vec<Strin
     let (_, uninitialized) =
         graph.insert(entry, 0, span, Op::Constant(Constant::Uninitialized), true);
     let uninitialized = uninitialized.unwrap();
-    let mut end_defs = HashMap::new();
+    let mut end_defs = FxHashMap::default();
     for &block in &cfg.rpo {
         for &inst in &graph.blocks[block].insts {
             match graph.insts[inst].op {
@@ -116,13 +116,13 @@ pub(in crate::jit::semantic) fn promote(graph: &mut Graph, notes: &mut Vec<Strin
     let mut promoter = Promoter {
         graph,
         preds: cfg.preds.clone(),
-        entry_defs: HashMap::new(),
+        entry_defs: FxHashMap::default(),
         end_defs,
         uninitialized,
     };
-    let mut aliases = HashMap::new();
+    let mut aliases = FxHashMap::default();
     for &block in &cfg.rpo {
-        let mut current: HashMap<Binding, Value> = HashMap::new();
+        let mut current: FxHashMap<Binding, Value> = FxHashMap::default();
         for inst in promoter.graph.blocks[block].insts.clone() {
             let (binding, access) = match promoter.graph.insts[inst].op {
                 Op::EnterScope(scope) => {
@@ -173,78 +173,5 @@ pub(in crate::jit::semantic) fn promote(graph: &mut Graph, notes: &mut Vec<Strin
 
 pub(in crate::jit::semantic) fn remove_trivial_params(graph: &mut Graph) {
     let blocks = Cfg::new(graph).rpo;
-    remove_trivial_params_in(graph, &blocks);
-}
-
-pub(in crate::jit::semantic) fn remove_trivial_params_in(graph: &mut Graph, blocks: &[Block]) {
-    loop {
-        let mut incoming: HashMap<Value, Vec<Value>> = HashMap::new();
-        for &block in blocks {
-            let data = &graph.blocks[block];
-            if let Some(terminator) = &data.terminator {
-                for target in terminator.kind.targets() {
-                    if target.block == graph.entry {
-                        continue;
-                    }
-                    for (&param, &arg) in graph.blocks[target.block].params.iter().zip(&target.args)
-                    {
-                        incoming.entry(param).or_default().push(arg);
-                    }
-                }
-            }
-        }
-        let mut aliases = HashMap::new();
-        for (param, args) in incoming {
-            let mut unique = None;
-            let mut trivial = true;
-            for value in args {
-                let value = resolve(&aliases, value);
-                if value == param || unique == Some(value) {
-                    continue;
-                }
-                if unique.is_some() {
-                    trivial = false;
-                    break;
-                }
-                unique = Some(value);
-            }
-            if trivial && let Some(value) = unique {
-                aliases.insert(param, value);
-            }
-        }
-        if aliases.is_empty() {
-            return;
-        }
-        graph.replace_uses(&aliases);
-        let removed: HashMap<Block, Vec<usize>> = graph
-            .blocks
-            .iter()
-            .map(|(block, data)| {
-                (
-                    block,
-                    data.params
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(index, param)| aliases.contains_key(param).then_some(index))
-                        .collect(),
-                )
-            })
-            .collect();
-        for &block in blocks {
-            let data = &mut graph.blocks[block];
-            if let Some(terminator) = &mut data.terminator {
-                for target in terminator.kind.targets_mut() {
-                    for &index in removed[&target.block].iter().rev() {
-                        target.args.remove(index);
-                    }
-                }
-            }
-        }
-        for (block, data) in graph.blocks.iter_mut() {
-            data.params.retain(|param| !aliases.contains_key(param));
-            for (index, &param) in data.params.iter().enumerate() {
-                graph.values[param] = ValueDef::Param(block, index);
-            }
-        }
-    }
+    super::simplify_parameters(graph, &blocks, &mut SecondaryMap::new(), false);
 }

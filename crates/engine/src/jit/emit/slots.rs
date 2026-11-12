@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use crate::{FxHashMap, FxHashSet};
 
 use cranelift_codegen::entity::SecondaryMap;
 
@@ -13,7 +13,7 @@ const HEAP: Types = Types::STRING.union(Types::OBJECT).union(Types::OTHER);
 pub(super) struct Slots {
     slot: SecondaryMap<Value, Option<u32>>,
     shared: Vec<bool>,
-    forwarded: HashSet<Value>,
+    forwarded: FxHashSet<Value>,
 }
 
 impl Slots {
@@ -21,7 +21,7 @@ impl Slots {
         Self {
             slot: SecondaryMap::new(),
             shared: Vec::new(),
-            forwarded: HashSet::new(),
+            forwarded: FxHashSet::default(),
         }
     }
 
@@ -82,7 +82,7 @@ pub(super) fn assign(
     owned: impl Fn(Value) -> bool,
     prefers: impl Fn(Value) -> bool,
 ) -> Slots {
-    let mut receivers = HashMap::new();
+    let mut receivers = FxHashMap::default();
     for (_, data) in graph.insts.iter() {
         if let Some(result) = data.result()
             && graph.borrowed.contains(&result)
@@ -111,9 +111,9 @@ pub(super) fn assign(
             }
         }
     }
-    let anchored = |value: Value, live: &mut HashSet<Value>| {
+    let anchored = |value: Value, live: &mut FxHashSet<Value>| {
         let mut pending = vec![value];
-        let mut visited = HashSet::new();
+        let mut visited = FxHashSet::default();
         while let Some(current) = pending.pop() {
             if !visited.insert(current) {
                 continue;
@@ -127,7 +127,7 @@ pub(super) fn assign(
         }
     };
     let terminator_uses = |block: Block| {
-        let mut uses = HashSet::new();
+        let mut uses = FxHashSet::default();
         if let Some(terminator) = &graph.blocks[block].terminator {
             for value in terminator.kind.operands_iter() {
                 anchored(value, &mut uses);
@@ -135,14 +135,14 @@ pub(super) fn assign(
         }
         uses
     };
-    let mut live_in: SecondaryMap<Block, HashSet<Value>> = SecondaryMap::new();
-    let mut live_out: SecondaryMap<Block, HashSet<Value>> = SecondaryMap::new();
+    let mut live_in: SecondaryMap<Block, FxHashSet<Value>> = SecondaryMap::new();
+    let mut live_out: SecondaryMap<Block, FxHashSet<Value>> = SecondaryMap::new();
     let mut changed = true;
     while changed {
         changed = false;
         for &block in cfg.rpo.iter().rev() {
             let data = &graph.blocks[block];
-            let mut live: HashSet<Value> = graph
+            let mut live: FxHashSet<Value> = graph
                 .successors(block)
                 .into_iter()
                 .flat_map(|successor| live_in[successor].iter().copied())
@@ -174,7 +174,7 @@ pub(super) fn assign(
         let mut live = live_out[block].clone();
         live.extend(terminator_uses(block));
         let mut dying = vec![Vec::new(); data.insts.len()];
-        let mut used = HashSet::new();
+        let mut used = FxHashSet::default();
         for (index, &inst) in data.insts.iter().enumerate().rev() {
             let data = &graph.insts[inst];
             if let Some(result) = data.result()
@@ -182,7 +182,7 @@ pub(super) fn assign(
             {
                 used.insert(result);
             }
-            let mut uses = HashSet::new();
+            let mut uses = FxHashSet::default();
             for value in data.op.operands_iter() {
                 anchored(value, &mut uses);
             }
@@ -253,8 +253,8 @@ pub(super) fn assign(
 /// For each instruction, the results whose references can be released right after it: their
 /// last use within their own block, counting the uses of every borrowed value that may alias them.
 /// Results used by a terminator or another block keep their references until the block's end.
-pub(super) fn releases(graph: &Graph, facts: &Facts, cfg: &Cfg) -> HashMap<Inst, Vec<Value>> {
-    let mut aliases: HashMap<Value, Vec<Value>> = HashMap::new();
+pub(super) fn releases(graph: &Graph, facts: &Facts, cfg: &Cfg) -> FxHashMap<Inst, Vec<Value>> {
+    let mut aliases: FxHashMap<Value, Vec<Value>> = FxHashMap::default();
     for &block in &cfg.rpo {
         for &inst in &graph.blocks[block].insts {
             let data = &graph.insts[inst];
@@ -270,11 +270,11 @@ pub(super) fn releases(graph: &Graph, facts: &Facts, cfg: &Cfg) -> HashMap<Inst,
             aliases.insert(result, data.op.operands_iter().collect());
         }
     }
-    let anchors: HashMap<Value, Vec<Value>> = aliases
+    let anchors: FxHashMap<Value, Vec<Value>> = aliases
         .keys()
         .map(|&value| {
             let mut pending = vec![value];
-            let mut visited = HashSet::new();
+            let mut visited = FxHashSet::default();
             while let Some(current) = pending.pop() {
                 if !visited.insert(current) {
                     continue;
@@ -286,7 +286,7 @@ pub(super) fn releases(graph: &Graph, facts: &Facts, cfg: &Cfg) -> HashMap<Inst,
             (value, visited.into_iter().collect())
         })
         .collect();
-    let mut defined: HashMap<Value, (Block, usize, Inst)> = HashMap::new();
+    let mut defined: FxHashMap<Value, (Block, usize, Inst)> = FxHashMap::default();
     for &block in &cfg.rpo {
         for (index, &inst) in graph.blocks[block].insts.iter().enumerate() {
             if let Some(result) = graph.insts[inst].result() {
@@ -294,10 +294,10 @@ pub(super) fn releases(graph: &Graph, facts: &Facts, cfg: &Cfg) -> HashMap<Inst,
             }
         }
     }
-    let mut last: HashMap<Value, Option<usize>> = HashMap::new();
+    let mut last: FxHashMap<Value, Option<usize>> = FxHashMap::default();
     for &block in &cfg.rpo {
         let data = &graph.blocks[block];
-        let escape = |value: Value, last: &mut HashMap<Value, Option<usize>>| {
+        let escape = |value: Value, last: &mut FxHashMap<Value, Option<usize>>| {
             for &value in anchored(&anchors, &value) {
                 last.insert(value, None);
             }
@@ -325,7 +325,7 @@ pub(super) fn releases(graph: &Graph, facts: &Facts, cfg: &Cfg) -> HashMap<Inst,
             }
         }
     }
-    let mut releases: HashMap<Inst, Vec<Value>> = HashMap::new();
+    let mut releases: FxHashMap<Inst, Vec<Value>> = FxHashMap::default();
     for (&value, &(block, index, inst)) in &defined {
         let position = match last.get(&value) {
             Some(None) => continue,
@@ -343,7 +343,7 @@ pub(super) fn releases(graph: &Graph, facts: &Facts, cfg: &Cfg) -> HashMap<Inst,
 }
 
 /// A value together with every value it borrows from, directly or not.
-fn anchored<'a>(anchors: &'a HashMap<Value, Vec<Value>>, value: &'a Value) -> &'a [Value] {
+fn anchored<'a>(anchors: &'a FxHashMap<Value, Vec<Value>>, value: &'a Value) -> &'a [Value] {
     match anchors.get(value) {
         Some(values) => values,
         None => std::slice::from_ref(value),

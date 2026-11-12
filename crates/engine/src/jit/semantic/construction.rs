@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use crate::FxHashSet;
 
 use super::{BlockData, Cfg, Graph, Inst, Op, Target, Terminator, TerminatorKind};
 
@@ -39,7 +39,7 @@ pub(super) fn resolve(graph: &mut Graph) {
     }
 }
 
-pub(super) fn expand(graph: &mut Graph, expanded: &mut HashSet<Inst>) {
+pub(super) fn expand(graph: &mut Graph, expanded: &mut FxHashSet<Inst>) {
     let sites: Vec<_> = Cfg::new(graph)
         .rpo
         .into_iter()

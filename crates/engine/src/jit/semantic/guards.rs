@@ -1,3 +1,4 @@
+use crate::FxHashMap;
 use cranelift_module::FuncId;
 
 use super::facts::Types;
@@ -33,8 +34,8 @@ pub(in crate::jit) struct Origin {
 }
 
 pub(super) fn assumed(
-    types: &std::collections::HashMap<Value, Types>,
-    code: &std::collections::HashMap<Value, FuncId>,
+    types: &FxHashMap<Value, Types>,
+    code: &FxHashMap<Value, FuncId>,
 ) -> Vec<(Value, Fact)> {
     let mut facts: Vec<_> = types
         .iter()

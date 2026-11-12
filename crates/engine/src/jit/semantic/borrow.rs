@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use crate::{FxHashMap, FxHashSet};
 
 use cranelift_codegen::entity::SecondaryMap;
 
@@ -36,8 +36,8 @@ fn stores(op: &Op) -> bool {
 struct Borrows<'g> {
     graph: &'g Graph,
     facts: &'g Facts,
-    chains: HashMap<Value, Vec<Value>>,
-    rejected: HashSet<Value>,
+    chains: FxHashMap<Value, Vec<Value>>,
+    rejected: FxHashSet<Value>,
 }
 
 impl Borrows<'_> {
@@ -46,13 +46,13 @@ impl Borrows<'_> {
         (memory.reenters(), memory.writes_data())
     }
 
-    fn redefined(&mut self, live: &HashSet<Value>, defined: Value) {
+    fn redefined(&mut self, live: &FxHashSet<Value>, defined: Value) {
         for &value in live {
             if value == defined {
                 continue;
             }
             let mut pending = self.chains[&value].clone();
-            let mut visited = HashSet::new();
+            let mut visited = FxHashSet::default();
             while let Some(receiver) = pending.pop() {
                 if receiver == defined {
                     self.rejected.insert(value);
@@ -87,8 +87,8 @@ impl Borrows<'_> {
 // Indexed iteration reads only run on arrays and typed arrays, so their receiver always holds them.
 pub(super) fn borrows(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>) {
     graph.borrowed.clear();
-    let mut reads = HashMap::new();
-    let mut held = HashSet::new();
+    let mut reads = FxHashMap::default();
+    let mut held = FxHashSet::default();
     for (_, data) in graph.insts.iter() {
         if let (Some(object), Some(result)) = (receiver(&data.op), data.result())
             && facts.of(result).intersects(HEAP)
@@ -107,8 +107,8 @@ pub(super) fn borrows(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>)
             }
         }
     }
-    let mut chains = HashMap::new();
-    let mut objects = HashSet::new();
+    let mut chains = FxHashMap::default();
+    let mut objects = FxHashSet::default();
     for (&value, &object) in &reads {
         let mut chain = vec![object];
         while let Some(&next) = reads.get(chain.last().unwrap()) {
@@ -120,7 +120,7 @@ pub(super) fn borrows(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>)
         chains.insert(value, chain);
     }
     let cfg = Cfg::new(graph);
-    let mut merged = HashMap::new();
+    let mut merged = FxHashMap::default();
     loop {
         let mut changed = false;
         for &block in &cfg.rpo {
@@ -180,7 +180,7 @@ pub(super) fn borrows(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>)
     if chains.is_empty() {
         return;
     }
-    let mut local: HashSet<Value> = chains.keys().copied().collect();
+    let mut local: FxHashSet<Value> = chains.keys().copied().collect();
     for (block, data) in graph.blocks.iter() {
         for &inst in &data.insts {
             for value in graph.insts[inst].op.operands() {
@@ -199,9 +199,9 @@ pub(super) fn borrows(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>)
         graph,
         facts,
         chains,
-        rejected: HashSet::new(),
+        rejected: FxHashSet::default(),
     };
-    let mut live_in: SecondaryMap<Block, HashSet<Value>> = SecondaryMap::new();
+    let mut live_in: SecondaryMap<Block, FxHashSet<Value>> = SecondaryMap::new();
     let mut changed = true;
     while changed {
         changed = false;
@@ -216,7 +216,7 @@ pub(super) fn borrows(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>)
     for &block in &cfg.rpo {
         scan(&mut borrows, block, &live_in, true);
     }
-    let mut accepted: HashSet<Value> = borrows
+    let mut accepted: FxHashSet<Value> = borrows
         .chains
         .keys()
         .filter(|value| {
@@ -268,12 +268,12 @@ pub(super) fn borrows(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>)
 fn scan(
     borrows: &mut Borrows<'_>,
     block: Block,
-    live_in: &SecondaryMap<Block, HashSet<Value>>,
+    live_in: &SecondaryMap<Block, FxHashSet<Value>>,
     check: bool,
-) -> HashSet<Value> {
+) -> FxHashSet<Value> {
     let graph = borrows.graph;
     let data = &graph.blocks[block];
-    let mut live: HashSet<Value> = graph
+    let mut live: FxHashSet<Value> = graph
         .successors(block)
         .into_iter()
         .flat_map(|successor| live_in[successor].iter().copied())

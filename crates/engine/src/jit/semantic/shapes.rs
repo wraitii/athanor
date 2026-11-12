@@ -1,7 +1,7 @@
 use crate::jit::effects::Locations;
 use crate::jit::profile::{PropertyAccess, ShapeAccess, Site};
 
-use std::collections::{HashMap, HashSet};
+use crate::{FxHashMap, FxHashSet};
 
 use super::{
     Block, BlockData, Cfg, Facts, Graph, Inst, Op, Target, Terminator, TerminatorKind, Value,
@@ -70,7 +70,7 @@ fn site(graph: &Graph, inst: Inst, source: usize) -> Site {
 
 pub(super) fn plan(graph: &Graph, bodies: &super::specialize::Repository, source: usize) -> Plan {
     let callees = graph.callees();
-    let assumed: HashMap<_, _> = graph.blocks[graph.entry]
+    let assumed: FxHashMap<_, _> = graph.blocks[graph.entry]
         .insts
         .iter()
         .filter_map(|&inst| match graph.insts[inst].op {
@@ -151,7 +151,7 @@ pub(super) fn plan(graph: &Graph, bodies: &super::specialize::Repository, source
     }
 }
 
-fn planned(graph: &Graph, plan: &Plan) -> HashMap<Inst, (Value, u32, u32)> {
+fn planned(graph: &Graph, plan: &Plan) -> FxHashMap<Inst, (Value, u32, u32)> {
     let callees = graph.callees();
     let cfg = Cfg::new(graph);
     let loops = super::optimize::natural_loops(graph, &cfg);
@@ -160,7 +160,7 @@ fn planned(graph: &Graph, plan: &Plan) -> HashMap<Inst, (Value, u32, u32)> {
             .iter()
             .any(|(_, body)| body.contains(&block) && !body.contains(&graph.def_block(object)))
     };
-    let mut planned = HashMap::new();
+    let mut planned = FxHashMap::default();
     for &block in &cfg.rpo {
         if graph.cold.contains(&block) {
             continue;
@@ -218,9 +218,9 @@ fn shape_preserving(graph: &Graph, facts: &Facts, op: &Op) -> bool {
         .intersects(Locations::CODE)
 }
 
-fn segments(graph: &Graph, planned: &HashMap<Inst, (Value, u32, u32)>) -> Vec<Segment> {
+fn segments(graph: &Graph, planned: &FxHashMap<Inst, (Value, u32, u32)>) -> Vec<Segment> {
     let facts = Facts::compute(graph);
-    let blocks: HashSet<Block> = planned
+    let blocks: FxHashSet<Block> = planned
         .keys()
         .map(|&inst| graph.insts[inst].block)
         .collect();
@@ -228,7 +228,7 @@ fn segments(graph: &Graph, planned: &HashMap<Inst, (Value, u32, u32)>) -> Vec<Se
     for block in blocks {
         let mut current: Option<Segment> = None;
         let mut pending = Vec::new();
-        let mut defined = HashSet::new();
+        let mut defined = FxHashSet::default();
         for &inst in &graph.blocks[block].insts {
             let data = &graph.insts[inst];
             if let Some(&(object, shape, _)) = planned.get(&inst) {
@@ -278,13 +278,13 @@ pub(super) fn apply(graph: &mut Graph, plan: &Plan, notes: &mut Vec<String>) -> 
         return Ok(());
     }
     let planned = planned(graph, plan);
-    let accesses: HashMap<Inst, (u32, u32)> = planned
+    let accesses: FxHashMap<Inst, (u32, u32)> = planned
         .iter()
         .map(|(&inst, &(_, shape, index))| (inst, (shape, index)))
         .collect();
     let segments = segments(graph, &planned);
     let mut guards = 0;
-    let mut aliases = HashMap::new();
+    let mut aliases = FxHashMap::default();
     for segment in &segments {
         guard_segment(graph, segment, &accesses, &mut aliases);
         guards += segment.guards.len();
@@ -339,8 +339,8 @@ pub(super) fn apply(graph: &mut Graph, plan: &Plan, notes: &mut Vec<String>) -> 
 fn guard_segment(
     graph: &mut Graph,
     segment: &Segment,
-    accesses: &HashMap<Inst, (u32, u32)>,
-    aliases: &mut HashMap<Value, Value>,
+    accesses: &FxHashMap<Inst, (u32, u32)>,
+    aliases: &mut FxHashMap<Value, Value>,
 ) {
     let first = graph.insts[segment.insts[0]].clone();
     let block = first.block;
@@ -369,7 +369,7 @@ fn guard_segment(
     let fast = graph.blocks.push(BlockData::default());
     let fallback = graph.blocks.push(BlockData::default());
     graph.cold.insert(fallback);
-    let mut clones = HashMap::new();
+    let mut clones = FxHashMap::default();
     for &inst in &segment.insts {
         let data = graph.insts[inst].clone();
         let mut op = data.op.clone();
@@ -393,7 +393,7 @@ fn guard_segment(
     }
 
     let counts = graph.use_counts();
-    let mut inner: HashMap<Value, u32> = HashMap::new();
+    let mut inner: FxHashMap<Value, u32> = FxHashMap::default();
     for &inst in &segment.insts {
         for value in graph.insts[inst].op.operands_iter() {
             *inner.entry(value).or_default() += 1;
@@ -405,13 +405,13 @@ fn guard_segment(
         .filter_map(|&inst| graph.insts[inst].result())
         .filter(|value| counts[*value] > inner.get(value).copied().unwrap_or(0))
         .collect();
-    let params: HashMap<Value, Value> = outputs
+    let params: FxHashMap<Value, Value> = outputs
         .iter()
         .map(|&value| (value, graph.add_param(continuation)))
         .collect();
     graph.replace_uses(&params);
     aliases.extend(params.iter().map(|(&value, &param)| (value, param)));
-    let originals: HashMap<Value, Value> = params.iter().map(|(&k, &v)| (v, k)).collect();
+    let originals: FxHashMap<Value, Value> = params.iter().map(|(&k, &v)| (v, k)).collect();
     for &inst in &segment.insts {
         for value in graph.insts[inst].op.operands_mut() {
             *value = originals.get(value).copied().unwrap_or(*value);

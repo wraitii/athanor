@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use crate::FxHashSet;
 
 use super::{arg, fail};
 use crate::heap::NativeFunction;
@@ -26,7 +26,7 @@ pub(in crate::jit) fn call(ctx: &mut JitCtx, function: NativeFunction, args: &[V
             if !arg(args, 1).is_undefined() || !arg(args, 2).is_undefined() {
                 return fail(ctx, "JSON.stringify replacer and space are unsupported");
             }
-            let mut active = HashSet::new();
+            let mut active = FxHashSet::default();
             let result = stringify(ctx, arg(args, 0), &mut active, 0);
             match result {
                 Ok(None) => Value::UNDEFINED,
@@ -75,7 +75,7 @@ fn parse_value(ctx: &mut JitCtx, json: serde_json::Value) -> Option<Value> {
 fn stringify(
     ctx: &JitCtx,
     value: Value,
-    active: &mut HashSet<u64>,
+    active: &mut FxHashSet<u64>,
     depth: usize,
 ) -> Result<Option<String>, &'static str> {
     if value.is_undefined() {

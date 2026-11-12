@@ -1,12 +1,12 @@
-use std::collections::{HashMap, HashSet};
+use crate::{FxHashMap, FxHashSet};
 
 use super::{
     Block, BlockData, Cfg, Constant, Graph, Inst, Op, Target, Terminator, TerminatorKind, Types,
     Value,
 };
 
-pub(super) fn result_facts(graph: &Graph, cfg: &Cfg) -> (HashSet<Value>, HashMap<Inst, Types>) {
-    let mut arrays = HashMap::new();
+pub(super) fn result_facts(graph: &Graph, cfg: &Cfg) -> (FxHashSet<Value>, FxHashMap<Inst, Types>) {
+    let mut arrays = FxHashMap::default();
     for &block in &cfg.rpo {
         for &inst in &graph.blocks[block].insts {
             let data = &graph.insts[inst];
@@ -21,9 +21,9 @@ pub(super) fn result_facts(graph: &Graph, cfg: &Cfg) -> (HashSet<Value>, HashMap
         }
     }
     if arrays.is_empty() {
-        return (HashSet::new(), HashMap::new());
+        return (FxHashSet::default(), FxHashMap::default());
     }
-    let mut incoming: HashMap<Value, Vec<Value>> = HashMap::new();
+    let mut incoming: FxHashMap<Value, Vec<Value>> = FxHashMap::default();
     for &block in &cfg.rpo {
         if let Some(term) = &graph.blocks[block].terminator {
             for target in term.kind.targets() {
@@ -53,15 +53,15 @@ pub(super) fn result_facts(graph: &Graph, cfg: &Cfg) -> (HashSet<Value>, HashMap
             break;
         }
     }
-    let mut aliases: HashMap<Value, Vec<Value>> = HashMap::new();
+    let mut aliases: FxHashMap<Value, Vec<Value>> = FxHashMap::default();
     for (&param, args) in &incoming {
         for &arg in args {
             aliases.entry(param).or_default().push(arg);
             aliases.entry(arg).or_default().push(param);
         }
     }
-    let mut hazards: HashMap<Value, Vec<Inst>> = HashMap::new();
-    let mut positions = HashMap::new();
+    let mut hazards: FxHashMap<Value, Vec<Inst>> = FxHashMap::default();
+    let mut positions = FxHashMap::default();
     for &block in &cfg.rpo {
         for (position, &inst) in graph.blocks[block].insts.iter().enumerate() {
             positions.insert(inst, position);
@@ -98,9 +98,9 @@ pub(super) fn result_facts(graph: &Graph, cfg: &Cfg) -> (HashSet<Value>, HashMap
             }
         }
     }
-    let mut reachable = HashMap::<Block, HashSet<Block>>::new();
-    let mut array_hazards = HashMap::<Value, Vec<Inst>>::new();
-    let mut reads = HashMap::new();
+    let mut reachable = FxHashMap::<Block, FxHashSet<Block>>::default();
+    let mut array_hazards = FxHashMap::<Value, Vec<Inst>>::default();
+    let mut reads = FxHashMap::default();
     for &block in &cfg.rpo {
         for &inst in &graph.blocks[block].insts {
             let (array, key) = match graph.insts[inst].op {
@@ -124,7 +124,7 @@ pub(super) fn result_facts(graph: &Graph, cfg: &Cfg) -> (HashSet<Value>, HashMap
             }
             let hazards = array_hazards.entry(array).or_insert_with(|| {
                 let mut pending = vec![array];
-                let mut visited = HashSet::new();
+                let mut visited = FxHashSet::default();
                 let mut result = Vec::new();
                 while let Some(value) = pending.pop() {
                     if !visited.insert(value) {
@@ -148,7 +148,7 @@ pub(super) fn result_facts(graph: &Graph, cfg: &Cfg) -> (HashSet<Value>, HashMap
                 reachable
                     .entry(source)
                     .or_insert_with(|| {
-                        let mut seen = HashSet::new();
+                        let mut seen = FxHashSet::default();
                         let mut pending: Vec<_> = graph.blocks[source]
                             .terminator
                             .as_ref()
@@ -185,7 +185,7 @@ pub(super) fn result_facts(graph: &Graph, cfg: &Cfg) -> (HashSet<Value>, HashMap
     (arrays.into_keys().collect(), reads)
 }
 
-pub(super) fn expand(graph: &mut Graph, expanded: &mut HashSet<Inst>) {
+pub(super) fn expand(graph: &mut Graph, expanded: &mut FxHashSet<Inst>) {
     let sites: Vec<_> = Cfg::new(graph)
         .rpo
         .into_iter()
@@ -243,7 +243,7 @@ pub(super) fn expand(graph: &mut Graph, expanded: &mut HashSet<Inst>) {
 
 pub(super) fn forward_packs(graph: &mut Graph) {
     let cfg = Cfg::new(graph);
-    let mut uses = HashMap::<Value, usize>::new();
+    let mut uses = FxHashMap::<Value, usize>::default();
     for &block in &cfg.rpo {
         for &inst in &graph.blocks[block].insts {
             for value in graph.insts[inst].op.operands() {
@@ -256,7 +256,7 @@ pub(super) fn forward_packs(graph: &mut Graph) {
             }
         }
     }
-    let mut aliases = HashMap::new();
+    let mut aliases = FxHashMap::default();
     for &block in &cfg.rpo {
         for inst in graph.blocks[block].insts.clone() {
             let Op::Spread(array) = graph.insts[inst].op else {
@@ -266,7 +266,7 @@ pub(super) fn forward_packs(graph: &mut Graph) {
                 continue;
             }
             let mut source = array;
-            let mut seen = HashSet::new();
+            let mut seen = FxHashSet::default();
             let producer = loop {
                 if !seen.insert(source) || uses.get(&source) != Some(&1) {
                     break None;
@@ -329,8 +329,8 @@ mod tests {
         let semantic = oxc_semantic::SemanticBuilder::new_compiler()
             .build(&parsed.program)
             .semantic;
-        let graph =
-            super::super::build::lower(function, semantic.scoping(), &HashSet::new()).unwrap();
+        let graph = super::super::build::lower(function, semantic.scoping(), &FxHashSet::default())
+            .unwrap();
         let mut graph = super::super::canonicalize_graph(graph, true).unwrap().graph;
         for block in Cfg::new(&graph).rpo {
             for inst in graph.blocks[block].insts.clone() {

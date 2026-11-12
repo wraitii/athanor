@@ -1,4 +1,4 @@
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use crate::{FxHashMap, FxHashSet};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
@@ -14,9 +14,9 @@ pub struct Environment {
 
 struct EnvironmentData {
     // JIT binding locations must survive map growth; Cell permits reads through cached pointers.
-    bindings: HashMap<String, Box<Cell<Value>>>,
-    lexical: HashMap<String, (Box<Cell<Value>>, bool)>,
-    readonly: HashSet<String>,
+    bindings: FxHashMap<String, Box<Cell<Value>>>,
+    lexical: FxHashMap<String, (Box<Cell<Value>>, bool)>,
+    readonly: FxHashSet<String>,
     parent: Option<Environment>,
     heap: Heap,
 }
@@ -26,9 +26,9 @@ impl Default for Environment {
         let heap = Heap::default();
         Self {
             data: Rc::new(RefCell::new(EnvironmentData {
-                bindings: HashMap::default(),
-                lexical: HashMap::default(),
-                readonly: HashSet::default(),
+                bindings: FxHashMap::default(),
+                lexical: FxHashMap::default(),
+                readonly: FxHashSet::default(),
                 parent: None,
                 heap: heap.clone(),
             })),
@@ -57,9 +57,9 @@ impl Environment {
     pub fn child(&self) -> Self {
         Self {
             data: Rc::new(RefCell::new(EnvironmentData {
-                bindings: HashMap::default(),
-                lexical: HashMap::default(),
-                readonly: HashSet::default(),
+                bindings: FxHashMap::default(),
+                lexical: FxHashMap::default(),
+                readonly: FxHashSet::default(),
                 parent: Some(self.clone()),
                 heap: self.heap.clone(),
             })),

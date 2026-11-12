@@ -242,11 +242,11 @@ pub(super) fn lower_array_kinds(function: &mut FunctionState) -> bool {
 mod tests {
     use super::super::Cfg;
     use super::*;
+    use crate::FxHashSet;
     use oxc_allocator::Allocator;
     use oxc_ast::ast::Statement;
     use oxc_parser::Parser;
     use oxc_span::SourceType;
-    use std::collections::HashSet;
 
     #[test]
     fn array_checks_share_validity_until_a_mutation() {
@@ -265,7 +265,8 @@ mod tests {
                 .build(&parsed.program)
                 .semantic;
             let graph =
-                super::super::build::lower(function, semantic.scoping(), &HashSet::new()).unwrap();
+                super::super::build::lower(function, semantic.scoping(), &FxHashSet::default())
+                    .unwrap();
             let mut graph = super::super::canonicalize_graph(graph, true).unwrap().graph;
             let inst = graph
                 .insts

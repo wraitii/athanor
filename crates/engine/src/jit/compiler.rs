@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use crate::{FxHashMap, FxHashSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -82,7 +83,7 @@ pub(crate) struct RecompileJob {
     previous: Entry,
     emission: Emission,
     canonical: Arc<super::semantic::specialize::Repository>,
-    sources: Arc<HashMap<usize, Arc<(String, String)>>>,
+    sources: Arc<FxHashMap<usize, Arc<(String, String)>>>,
     pub(super) label: String,
     pub(super) queued_at: Option<Instant>,
     region: Option<OsrRequest>,
@@ -176,9 +177,9 @@ impl Drop for Compiler {
 pub(crate) struct Compiler {
     continuations: Vec<(FuncId, FunctionBody)>,
     log: super::recompile::Log,
-    emissions: HashMap<VariantId, Emission>,
-    lazy: HashMap<FuncId, (Emission, Arc<super::semantic::specialize::Repository>)>,
-    sources: Arc<HashMap<usize, Arc<(String, String)>>>,
+    emissions: FxHashMap<VariantId, Emission>,
+    lazy: FxHashMap<FuncId, (Emission, Arc<super::semantic::specialize::Repository>)>,
+    sources: Arc<FxHashMap<usize, Arc<(String, String)>>>,
     names: Vec<Box<str>>,
     cells: Vec<Box<u64>>,
     data: Vec<Box<FunctionData>>,
@@ -186,12 +187,12 @@ pub(crate) struct Compiler {
     canonical: Arc<super::semantic::specialize::Repository>,
     module: JITModule,
     signature: Signature,
-    fixed: HashMap<FuncId, u16>,
-    adapters: HashMap<u16, usize>,
+    fixed: FxHashMap<FuncId, u16>,
+    adapters: FxHashMap<u16, usize>,
     stats: Option<CompileStats>,
     stubs: emit::Stubs,
-    functions: HashMap<String, FuncId>,
-    function_names: HashMap<FuncId, String>,
+    functions: FxHashMap<String, FuncId>,
+    function_names: FxHashMap<FuncId, String>,
     dump: Option<jitdump::Writer>,
     dump_ir: bool,
     ssa_opt: bool,
@@ -298,8 +299,8 @@ impl Compiler {
             osr: options.osr,
             speculative_continuations: options.continuations,
             generic_first: options.generic_first && options.background_compile,
-            emissions: HashMap::new(),
-            lazy: HashMap::new(),
+            emissions: FxHashMap::default(),
+            lazy: FxHashMap::default(),
             sources: Arc::default(),
             names: Vec::new(),
             cells: Vec::new(),
@@ -312,12 +313,12 @@ impl Compiler {
             )),
             module,
             signature,
-            fixed: HashMap::new(),
-            adapters: HashMap::new(),
+            fixed: FxHashMap::default(),
+            adapters: FxHashMap::default(),
             stats: std::env::var_os("JS_JIT_STATS").map(|_| CompileStats::default()),
             stubs,
-            functions: HashMap::new(),
-            function_names: HashMap::new(),
+            functions: FxHashMap::default(),
+            function_names: FxHashMap::default(),
             dump,
             dump_ir,
             ssa_opt: options.ssa_opt,
@@ -661,7 +662,7 @@ impl Compiler {
         if let Some(span) = analysis.class_name_write {
             return Err(unsupported_at(span, "assignment to inner class name"));
         }
-        let mut closures = HashMap::new();
+        let mut closures = FxHashMap::default();
         for node in nodes.iter() {
             let (span, params, statements, expression, generator) = match node.kind() {
                 AstKind::ArrowFunctionExpression(function) => {
@@ -1095,7 +1096,7 @@ impl Compiler {
                         locations.insert(range.start, range.location.unwrap_or(0));
                     }
                 } else {
-                    let source_locations: HashMap<_, _> = code
+                    let source_locations: FxHashMap<_, _> = code
                         .listing
                         .iter()
                         .flatten()
@@ -1804,8 +1805,8 @@ impl Compiler {
         params: oxc_span::Span,
         name: (&str, u32),
         feedback: Option<emit::Feedback>,
-    ) -> Result<HashMap<usize, FuncId>, Error> {
-        let mut ids = HashMap::new();
+    ) -> Result<FxHashMap<usize, FuncId>, Error> {
+        let mut ids = FxHashMap::default();
         self.compile_continuations_inner(graph, source_name, params, name, feedback, &mut ids)?;
         Ok(ids)
     }
@@ -1817,7 +1818,7 @@ impl Compiler {
         params: oxc_span::Span,
         name: (&str, u32),
         feedback: Option<emit::Feedback>,
-        ids: &mut HashMap<usize, FuncId>,
+        ids: &mut FxHashMap<usize, FuncId>,
     ) -> Result<(), Error> {
         let cfg = super::semantic::Cfg::new(graph);
         for &inst in cfg.rpo.iter().flat_map(|&block| &graph.blocks[block].insts) {
@@ -1853,7 +1854,7 @@ impl Compiler {
         graph: &super::semantic::Graph,
         source_name: (usize, usize),
         params: oxc_span::Span,
-        continuations: &HashMap<usize, FuncId>,
+        continuations: &FxHashMap<usize, FuncId>,
         feedback: Option<emit::Feedback>,
     ) -> Result<FunctionBody, Error> {
         let lowered = if self.ssa_opt {
@@ -1920,10 +1921,10 @@ impl Compiler {
         statements: &[Statement<'_>],
         expression: Option<&Expression<'_>>,
         arguments_binding: Option<SymbolId>,
-        arguments_references: &HashMap<u32, SymbolId>,
+        arguments_references: &FxHashMap<u32, SymbolId>,
         captures: &[SymbolId],
-        captured: &HashSet<SymbolId>,
-        closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
+        captured: &FxHashSet<SymbolId>,
+        closures: &FxHashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
         scoping: &Scoping,
         generator: bool,
         label: &str,
@@ -2019,7 +2020,7 @@ impl Compiler {
                 &region.graph,
                 self.source_name,
                 params.span,
-                &HashMap::new(),
+                &FxHashMap::default(),
                 None,
             )?;
             self.continuations.push((id, body));
@@ -2050,10 +2051,10 @@ impl Compiler {
         statements: &[Statement<'_>],
         expression: Option<&Expression<'_>>,
         arguments_binding: Option<SymbolId>,
-        arguments_references: &HashMap<u32, SymbolId>,
+        arguments_references: &FxHashMap<u32, SymbolId>,
         captures: &[SymbolId],
-        captured: &HashSet<SymbolId>,
-        closures: &HashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
+        captured: &FxHashSet<SymbolId>,
+        closures: &FxHashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
         scoping: &Scoping,
         kind: emit::FunctionKind,
         name: (&str, u32),
@@ -2182,7 +2183,7 @@ impl Compiler {
                 name,
                 feedback.map(|owner| self.feedback(owner, false)),
             )?,
-            None => HashMap::new(),
+            None => FxHashMap::default(),
         };
         let signature = self.graph_signature(graph.as_ref().map(|graph| &graph.graph));
         let feedback = feedback.map(|owner| self.feedback(owner, true));
@@ -2337,11 +2338,11 @@ fn ir_lines(
     source: &str,
     filename: &str,
     starts: &[u32],
-    sources: &HashMap<usize, Arc<(String, String)>>,
+    sources: &FxHashMap<usize, Arc<(String, String)>>,
 ) -> Vec<(u32, String)> {
     let mut result = Vec::new();
     let mut last_location = None;
-    let mut source_lines = HashMap::new();
+    let mut source_lines = FxHashMap::default();
     for (id, location, text) in semantic {
         if let Some(location) = location {
             let origin = match location.source {
@@ -2442,9 +2443,9 @@ fn validate_params(
 #[cfg(test)]
 mod listing_tests {
     use super::{ir_lines, line_starts};
+    use crate::FxHashMap;
     use crate::jit::semantic::SourceLocation;
     use oxc_span::Span;
-    use std::collections::HashMap;
 
     #[test]
     fn semantic_listing_interleaves_source_and_keeps_ids() {
@@ -2481,7 +2482,7 @@ mod listing_tests {
             source,
             "caller.js",
             &line_starts(source),
-            &HashMap::new(),
+            &FxHashMap::default(),
         );
         assert_eq!(
             lines

@@ -189,12 +189,12 @@ pub(super) fn apply(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::FxHashSet;
     use crate::heap::TypedKind;
     use oxc_allocator::Allocator;
     use oxc_ast::ast::Statement;
     use oxc_parser::Parser;
     use oxc_span::SourceType;
-    use std::collections::HashSet;
 
     #[test]
     fn nested_gets_select_indexed_and_typed_reads_independently() {
@@ -212,8 +212,8 @@ mod tests {
         let semantic = oxc_semantic::SemanticBuilder::new_compiler()
             .build(&parsed.program)
             .semantic;
-        let graph =
-            super::super::build::lower(function, semantic.scoping(), &HashSet::new()).unwrap();
+        let graph = super::super::build::lower(function, semantic.scoping(), &FxHashSet::default())
+            .unwrap();
         let mut graph = super::super::canonicalize_graph(graph, true).unwrap().graph;
         let mut bodies = super::super::specialize::Repository::default();
         for data in graph.insts.values() {

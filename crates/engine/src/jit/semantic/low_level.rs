@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-
+use crate::FxHashMap;
 use cranelift_codegen::entity::SecondaryMap;
 use cranelift_codegen::ir::{
     MemFlagsData, Signature, Type,
@@ -7,7 +6,6 @@ use cranelift_codegen::ir::{
 };
 use cranelift_module::FuncId;
 use oxc_span::Span;
-use rustc_hash::FxHashMap;
 
 use super::{Block, Cfg, Graph, Inst, Op as GraphOp, Value};
 use crate::jit::helpers::Helper;
@@ -496,20 +494,20 @@ impl<'a> Builder<'a> {
             reachable[block] = true;
         }
         let mut entries = FxHashMap::default();
-        let mut aliases = HashMap::new();
+        let mut aliases = SecondaryMap::new();
         let mut work = Vec::new();
+        let mut changed = false;
         for (block, variable, inst, value) in std::mem::take(&mut self.reads) {
             if !reachable[block] {
                 self.graph.remove_inst(inst);
                 continue;
             }
             let definition = self.entry_value(&cfg, &mut entries, &mut work, block, variable)?;
-            aliases.insert(value, definition);
+            aliases[value] = Some(definition);
             self.graph.remove_inst(inst);
+            changed = true;
         }
-        self.graph.replace_uses(&aliases);
-        super::transforms::canonicalize_parameters(self.graph, &cfg.rpo);
-        super::transforms::remove_trivial_params_in(self.graph, &cfg.rpo);
+        super::transforms::simplify_parameters(self.graph, &cfg.rpo, &mut aliases, changed);
         Ok(())
     }
 

@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, HashMap};
+use crate::FxHashMap;
+use std::collections::BTreeMap;
 
 use super::dispatch::{self, Alternative};
 use super::guards::Fact;
@@ -49,9 +50,9 @@ pub(super) fn contextual_requirements(
         .collect())
 }
 
-fn shape_hints(graph: &Graph, bodies: &Repository, source: usize) -> HashMap<Value, u32> {
+fn shape_hints(graph: &Graph, bodies: &Repository, source: usize) -> FxHashMap<Value, u32> {
     // These are candidates, not live facts; dispatch guards them at the call.
-    let mut hints = HashMap::new();
+    let mut hints = FxHashMap::default();
     for block in Cfg::new(graph).rpo {
         if graph.cold.contains(&block) {
             continue;
@@ -93,7 +94,7 @@ pub(in crate::jit) fn assume(graph: &mut Graph, requirements: &Requirements) {
         };
         let (_, value) = graph.insert(graph.entry, index * 2, graph.span, op, true);
         let value = value.unwrap();
-        let aliases = graph
+        let aliases: FxHashMap<_, _> = graph
             .insts
             .values()
             .filter_map(|data| {
@@ -127,11 +128,11 @@ pub(super) fn apply(
         return Ok(Vec::new());
     }
     let mut selected = Vec::new();
-    let mut contracts: HashMap<_, Requirements> = HashMap::new();
+    let mut contracts: FxHashMap<_, Requirements> = FxHashMap::default();
     let hints = if bodies.call_specialization {
         shape_hints(graph, bodies, source)
     } else {
-        HashMap::new()
+        FxHashMap::default()
     };
     let calls: Vec<_> = Cfg::new(graph)
         .rpo

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use crate::FxHashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -39,7 +39,7 @@ impl Variant {
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct Registry(Arc<Mutex<HashMap<(u64, Requirements), Arc<Variant>>>>);
+pub(crate) struct Registry(Arc<Mutex<FxHashMap<(u64, Requirements), Arc<Variant>>>>);
 
 impl Registry {
     pub(crate) fn intern(&self, function: u64, requirements: Requirements) -> Option<Arc<Variant>> {

@@ -1,5 +1,5 @@
+use crate::{FxHashMap, FxHashSet};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
@@ -14,7 +14,7 @@ use crate::jit::{self, Compiler};
 
 #[derive(Default)]
 struct PrefetchStats {
-    unused: HashSet<u64>,
+    unused: FxHashSet<u64>,
     installed: usize,
     used: usize,
     discarded: usize,
@@ -30,8 +30,8 @@ struct LazyWaitStats {
 pub(crate) struct Tiering {
     // Stop the workers first; in-flight compiles finish detached on their own snapshots.
     worker: RefCell<Option<jit::recompile::Service>>,
-    unlazify_seen: RefCell<HashSet<u64>>,
-    compilation_errors: RefCell<HashMap<u64, Error>>,
+    unlazify_seen: RefCell<FxHashSet<u64>>,
+    compilation_errors: RefCell<FxHashMap<u64, Error>>,
     lazy_wait_stats: RefCell<LazyWaitStats>,
     compilation_state: Arc<AtomicU8>,
     options: EngineOptions,
@@ -42,7 +42,7 @@ pub(crate) struct Tiering {
     recompiles: RefCell<jit::Recompiles>,
     variants: RefCell<Variants>,
     direct: jit::DirectEntries,
-    overflow_calls: RefCell<HashMap<u64, usize>>,
+    overflow_calls: RefCell<FxHashMap<u64, usize>>,
 }
 
 impl Tiering {
@@ -57,8 +57,8 @@ impl Tiering {
         };
         Ok(Self {
             worker: RefCell::new(None),
-            unlazify_seen: RefCell::new(HashSet::new()),
-            compilation_errors: RefCell::new(HashMap::new()),
+            unlazify_seen: RefCell::new(FxHashSet::default()),
+            compilation_errors: RefCell::new(FxHashMap::default()),
             lazy_wait_stats: RefCell::new(LazyWaitStats::default()),
             compilation_state,
             options: options.clone(),
@@ -75,7 +75,7 @@ impl Tiering {
             recompiles: RefCell::new(jit::Recompiles::default()),
             variants: RefCell::new(Variants::default()),
             direct,
-            overflow_calls: RefCell::new(HashMap::new()),
+            overflow_calls: RefCell::new(FxHashMap::default()),
         })
     }
 

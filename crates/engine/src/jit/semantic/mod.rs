@@ -31,7 +31,7 @@ pub(in crate::jit) mod suspension;
 mod transforms;
 mod typed_lowering;
 
-use std::collections::{HashMap, HashSet};
+use crate::{FxHashMap, FxHashSet};
 use std::fmt;
 
 use cranelift_codegen::entity::{EntityRef, PrimaryMap, SecondaryMap};
@@ -98,12 +98,12 @@ pub(super) struct Graph {
     pub(super) entry: Block,
     pub(super) has_handlers: bool,
     pub(in crate::jit) guards: usize,
-    pub(in crate::jit) views: HashMap<Inst, Value>,
-    pub(in crate::jit) borrowed: HashSet<Value>,
-    pub(in crate::jit) summaries: std::sync::Arc<HashMap<cranelift_module::FuncId, CallSummary>>,
-    pub(in crate::jit) cold: HashSet<Block>,
-    pub(in crate::jit) megamorphic_gets: HashSet<super::profile::Site>,
-    pub(super) lazy_captures: HashSet<Binding>,
+    pub(in crate::jit) views: FxHashMap<Inst, Value>,
+    pub(in crate::jit) borrowed: FxHashSet<Value>,
+    pub(in crate::jit) summaries: std::sync::Arc<FxHashMap<cranelift_module::FuncId, CallSummary>>,
+    pub(in crate::jit) cold: FxHashSet<Block>,
+    pub(in crate::jit) megamorphic_gets: FxHashSet<super::profile::Site>,
+    pub(super) lazy_captures: FxHashSet<Binding>,
     pub(super) generator: bool,
     pub(super) has_assumes: bool,
     // Input checks reported by the shared guard emitters for call specialization.
@@ -124,7 +124,7 @@ pub(super) struct Graph {
 
 #[derive(Clone)]
 pub(super) struct Region {
-    pub(super) blocks: HashSet<Block>,
+    pub(super) blocks: FxHashSet<Block>,
     pub(super) fallback: Option<RegionFallback>,
 }
 
@@ -1062,25 +1062,57 @@ impl TerminatorKind {
         )
     }
 
-    pub(super) fn targets_mut(&mut self) -> Vec<&mut Target> {
-        match self {
-            TerminatorKind::Jump(target) => vec![target],
-            TerminatorKind::CheckException(normal, error) => vec![normal, error],
-            TerminatorKind::Branch(_, yes, no) => vec![yes, no],
-            TerminatorKind::Switch(_, cases, default) => std::iter::once(default)
-                .chain(cases.iter_mut().map(|(_, target)| target))
-                .collect(),
-            TerminatorKind::Yield(_, _, target) => vec![target],
+    pub(super) fn targets_mut(&mut self) -> impl Iterator<Item = &mut Target> {
+        let (first, second, cases): (
+            Option<&mut Target>,
+            Option<&mut Target>,
+            Option<&mut [(u128, Target)]>,
+        ) = match self {
+            TerminatorKind::Jump(target) => (Some(target), None, None),
+            TerminatorKind::CheckException(normal, error) => (Some(normal), Some(error), None),
+            TerminatorKind::Branch(_, yes, no) => (Some(yes), Some(no), None),
+            TerminatorKind::Switch(_, cases, default) => (Some(default), None, Some(cases)),
+            TerminatorKind::Yield(_, _, target) => (Some(target), None, None),
             TerminatorKind::Return(_)
             | TerminatorKind::ReturnValues(_)
             | TerminatorKind::TailCall { .. }
-            | TerminatorKind::Fallback(_) => Vec::new(),
-        }
+            | TerminatorKind::Fallback(_) => (None, None, None),
+        };
+        first.into_iter().chain(second).chain(
+            cases
+                .into_iter()
+                .flat_map(|cases| cases.iter_mut().map(|(_, target)| target)),
+        )
     }
 }
 
-pub(super) fn resolve(aliases: &HashMap<Value, Value>, mut value: Value) -> Value {
-    while let Some(&next) = aliases.get(&value) {
+pub(super) trait Aliases {
+    fn alias(&self, value: Value) -> Option<Value>;
+    fn is_empty(&self) -> bool;
+}
+
+impl Aliases for FxHashMap<Value, Value> {
+    fn alias(&self, value: Value) -> Option<Value> {
+        self.get(&value).copied()
+    }
+
+    fn is_empty(&self) -> bool {
+        FxHashMap::is_empty(self)
+    }
+}
+
+impl Aliases for SecondaryMap<Value, Option<Value>> {
+    fn alias(&self, value: Value) -> Option<Value> {
+        self[value]
+    }
+
+    fn is_empty(&self) -> bool {
+        false
+    }
+}
+
+pub(super) fn resolve(aliases: &(impl Aliases + ?Sized), mut value: Value) -> Value {
+    while let Some(next) = aliases.alias(value) {
         if next == value {
             break;
         }
@@ -1098,10 +1130,32 @@ pub(in crate::jit) struct TypedRead {
 }
 
 #[derive(Clone, Default)]
+pub(super) struct Preds {
+    ranges: SecondaryMap<Block, (u32, u32)>,
+    list: Vec<Block>,
+}
+
+impl std::ops::Index<Block> for Preds {
+    type Output = [Block];
+
+    fn index(&self, block: Block) -> &[Block] {
+        let (start, end) = self.ranges[block];
+        &self.list[start as usize..end as usize]
+    }
+}
+
+impl std::ops::IndexMut<Block> for Preds {
+    fn index_mut(&mut self, block: Block) -> &mut [Block] {
+        let (start, end) = self.ranges[block];
+        &mut self.list[start as usize..end as usize]
+    }
+}
+
+#[derive(Clone, Default)]
 pub(super) struct Cfg {
     pub(super) rpo: Vec<Block>,
-    pub(super) preds: SecondaryMap<Block, Vec<Block>>,
-    dominators: SecondaryMap<Block, Option<Block>>,
+    pub(super) preds: Preds,
+    dominance: SecondaryMap<Block, (u32, u32)>,
 }
 
 impl Cfg {
@@ -1126,12 +1180,25 @@ impl Cfg {
             }
         }
         let rpo: Vec<Block> = postorder.into_iter().rev().collect();
-        let mut preds: SecondaryMap<Block, Vec<Block>> = SecondaryMap::new();
+        let mut edges = Vec::new();
         for &block in &rpo {
             for successor in graph.successors(block) {
-                preds[successor].push(block);
+                edges.push((successor, block));
             }
         }
+        edges.sort_by_key(|&(successor, _)| successor);
+        let mut ranges = SecondaryMap::<Block, (u32, u32)>::new();
+        for (index, &(successor, _)) in edges.iter().enumerate() {
+            let range = &mut ranges[successor];
+            if range.0 == range.1 {
+                range.0 = index as u32;
+            }
+            range.1 = index as u32 + 1;
+        }
+        let preds = Preds {
+            ranges,
+            list: edges.into_iter().map(|(_, pred)| pred).collect(),
+        };
         let mut ranks = SecondaryMap::<Block, usize>::new();
         for (index, &block) in rpo.iter().enumerate() {
             ranks[block] = index;
@@ -1164,25 +1231,35 @@ impl Cfg {
                 }
             }
         }
+        let mut size = vec![1u32; rpo.len()];
+        for index in (1..rpo.len()).rev() {
+            let parent = ranks[dominators[rpo[index]].unwrap()];
+            size[parent] += size[index];
+        }
+        let mut dominance = SecondaryMap::with_default((u32::MAX, 0));
+        let mut next = vec![0u32; rpo.len()];
+        if !rpo.is_empty() {
+            dominance[entry] = (0, size[0]);
+            next[0] = 1;
+        }
+        for index in 1..rpo.len() {
+            let parent = ranks[dominators[rpo[index]].unwrap()];
+            let start = next[parent];
+            next[parent] += size[index];
+            next[index] = start + 1;
+            dominance[rpo[index]] = (start, size[index]);
+        }
         Self {
             rpo,
             preds,
-            dominators,
+            dominance,
         }
     }
 
     pub(super) fn dominates(&self, dominator: Block, block: Block) -> bool {
-        let mut current = block;
-        while let Some(parent) = self.dominators[current] {
-            if current == dominator {
-                return true;
-            }
-            if parent == current {
-                break;
-            }
-            current = parent;
-        }
-        false
+        let (position, _) = self.dominance[block];
+        let (start, size) = self.dominance[dominator];
+        position != u32::MAX && start <= position && position - start < size
     }
 }
 
@@ -1200,12 +1277,12 @@ impl Graph {
             entry,
             has_handlers: false,
             guards: 0,
-            views: HashMap::new(),
-            borrowed: HashSet::new(),
+            views: FxHashMap::default(),
+            borrowed: FxHashSet::default(),
             summaries: Default::default(),
-            cold: HashSet::new(),
-            megamorphic_gets: HashSet::new(),
-            lazy_captures: HashSet::new(),
+            cold: FxHashSet::default(),
+            megamorphic_gets: FxHashSet::default(),
+            lazy_captures: FxHashSet::default(),
             generator: false,
             has_assumes: false,
             entry_guards: Vec::new(),
@@ -1256,7 +1333,7 @@ impl Graph {
         }
     }
 
-    pub(in crate::jit) fn callees(&self) -> HashSet<Value> {
+    pub(in crate::jit) fn callees(&self) -> FxHashSet<Value> {
         self.insts
             .values()
             .filter_map(|data| match data.op {
@@ -1418,7 +1495,7 @@ impl Graph {
         self.insts[inst].block = block;
     }
 
-    pub(super) fn replace_uses(&mut self, aliases: &HashMap<Value, Value>) {
+    pub(super) fn replace_uses(&mut self, aliases: &impl Aliases) {
         if aliases.is_empty() {
             return;
         }
@@ -2111,9 +2188,9 @@ pub(super) fn lower_global(
     statements: &[Statement<'_>],
     span: Span,
     scoping: &Scoping,
-    captured: &HashSet<SymbolId>,
-    closures: &std::collections::HashMap<u32, (cranelift_module::FuncId, Vec<SymbolId>, bool)>,
-    arguments_references: &std::collections::HashMap<u32, SymbolId>,
+    captured: &FxHashSet<SymbolId>,
+    closures: &FxHashMap<u32, (cranelift_module::FuncId, Vec<SymbolId>, bool)>,
+    arguments_references: &FxHashMap<u32, SymbolId>,
     ssa_opt: bool,
     continuations: bool,
     report_regions: bool,
@@ -2142,11 +2219,11 @@ pub(super) fn canonical_for_emission(
     expression: Option<&Expression<'_>>,
     span: Span,
     scoping: &Scoping,
-    captured: &HashSet<SymbolId>,
+    captured: &FxHashSet<SymbolId>,
     captures: &[SymbolId],
-    closures: &std::collections::HashMap<u32, (cranelift_module::FuncId, Vec<SymbolId>, bool)>,
+    closures: &FxHashMap<u32, (cranelift_module::FuncId, Vec<SymbolId>, bool)>,
     arguments_binding: Option<SymbolId>,
-    arguments_references: &std::collections::HashMap<u32, SymbolId>,
+    arguments_references: &FxHashMap<u32, SymbolId>,
     generator: bool,
     ssa_opt: bool,
 ) -> Result<FunctionState> {
@@ -2172,7 +2249,7 @@ pub(super) fn canonical_for_emission(
 pub(super) fn analyze(
     function: &oxc_ast::ast::Function<'_>,
     scoping: &Scoping,
-    captured: &HashSet<SymbolId>,
+    captured: &FxHashSet<SymbolId>,
 ) -> Result<FunctionState> {
     optimize_graph(build::lower(function, scoping, captured)?, true)
 }
@@ -2218,9 +2295,9 @@ pub(super) fn optimize_canonical(
 
 #[derive(Default)]
 struct Expansions {
-    arrays: HashSet<Inst>,
-    constructors: HashSet<Inst>,
-    splits: HashSet<Inst>,
+    arrays: FxHashSet<Inst>,
+    constructors: FxHashSet<Inst>,
+    splits: FxHashSet<Inst>,
 }
 
 impl Expansions {

@@ -1,4 +1,5 @@
 use super::{Binding, Block, Cfg, Graph, Op, Scope, Target, TerminatorKind, boundary};
+use crate::{FxHashMap, FxHashSet};
 
 pub(in crate::jit) struct Plan {
     pub(in crate::jit) regions: Vec<Region>,
@@ -29,7 +30,7 @@ impl Plan {
             bindings: Vec::new(),
             scopes: Vec::new(),
         }];
-        let mut exits = std::collections::HashMap::new();
+        let mut exits = FxHashMap::default();
         for &block in &cfg.rpo {
             if let TerminatorKind::Yield(_, _, target) =
                 &graph.blocks[block].terminator.as_ref().unwrap().kind
@@ -103,8 +104,7 @@ impl Plan {
                 );
             } else {
                 region.arity = None;
-                let reachable: std::collections::HashSet<Block> =
-                    Cfg::new(&region).rpo.into_iter().collect();
+                let reachable: FxHashSet<Block> = Cfg::new(&region).rpo.into_iter().collect();
                 for (block, data) in region.blocks.iter_mut() {
                     if !reachable.contains(&block) {
                         *data = Default::default();

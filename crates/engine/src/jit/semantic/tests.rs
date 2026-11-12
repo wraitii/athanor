@@ -1,4 +1,5 @@
 use super::*;
+use crate::FxHashSet;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::Statement;
 use oxc_parser::Parser;
@@ -22,13 +23,13 @@ fn with_function<T>(
 
 fn lower_source(source: &str) -> Result<Graph> {
     with_function(source, |function, scoping| {
-        build::lower(function, scoping, &HashSet::new())
+        build::lower(function, scoping, &FxHashSet::default())
     })
 }
 
 fn analyze_source(source: &str) -> FunctionState {
     with_function(source, |function, scoping| {
-        analyze(function, scoping, &HashSet::new())
+        analyze(function, scoping, &FxHashSet::default())
     })
     .unwrap()
 }
@@ -2069,7 +2070,7 @@ fn continuation_exit_stubs_preserve_cold_paths() {
             graph.cold.insert(entry);
         }
         let shape = continuation::Shape {
-            body: HashSet::from([entry]),
+            body: FxHashSet::from_iter([entry]),
             exits: [hot, cold]
                 .into_iter()
                 .map(|block| continuation::Exit {

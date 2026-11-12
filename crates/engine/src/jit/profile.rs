@@ -1,6 +1,4 @@
-use std::collections::{HashMap, HashSet};
-
-use rustc_hash::FxHashMap;
+use crate::{FxHashMap, FxHashSet};
 
 use crate::heap::TypedKind;
 
@@ -173,15 +171,15 @@ impl CallProfile {
 #[derive(Default)]
 pub(crate) struct Profile {
     calls: FxHashMap<*const CallSite, (Site, CallProfile)>,
-    targets: HashMap<Site, Vec<u64>>,
-    call_versions: HashMap<(u64, Site), usize>,
-    natives: HashMap<Site, crate::heap::NativeFunction>,
-    observed: HashSet<(u64, Site)>,
-    reads: HashMap<(Site, ReadKind), ReadType>,
-    observed_reads: HashSet<(u64, Site, ReadKind)>,
-    shapes: HashMap<(Site, PropertyAccess), ShapeAccess>,
-    shape_versions: HashMap<(u64, Site, PropertyAccess), ShapeAccess>,
-    number_first: HashSet<u64>,
+    targets: FxHashMap<Site, Vec<u64>>,
+    call_versions: FxHashMap<(u64, Site), usize>,
+    natives: FxHashMap<Site, crate::heap::NativeFunction>,
+    observed: FxHashSet<(u64, Site)>,
+    reads: FxHashMap<(Site, ReadKind), ReadType>,
+    observed_reads: FxHashSet<(u64, Site, ReadKind)>,
+    shapes: FxHashMap<(Site, PropertyAccess), ShapeAccess>,
+    shape_versions: FxHashMap<(u64, Site, PropertyAccess), ShapeAccess>,
+    number_first: FxHashSet<u64>,
 }
 
 #[derive(Default)]
@@ -302,7 +300,7 @@ impl Profile {
     }
 
     pub(crate) fn calls(&self) -> Vec<(Site, CallProfile)> {
-        let mut merged: HashMap<Site, CallProfile> = HashMap::new();
+        let mut merged: FxHashMap<Site, CallProfile> = FxHashMap::default();
         for (site, profile) in self.calls.values() {
             merged
                 .entry(*site)

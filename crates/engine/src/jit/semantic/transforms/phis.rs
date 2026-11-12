@@ -29,12 +29,13 @@ impl<T: Copy + Eq> State<T> {
     }
 }
 
-pub(super) fn solve<T: Copy + Eq>(incoming: &[Vec<Input<T>>]) -> Vec<Option<T>> {
-    let mut states = vec![State::Empty; incoming.len()];
-    let mut users = vec![Vec::new(); incoming.len()];
+pub(super) fn solve<T: Copy + Eq>(starts: &[usize], inputs: &[Input<T>]) -> Vec<Option<T>> {
+    let count = starts.len() - 1;
+    let mut states = vec![State::Empty; count];
+    let mut users = vec![Vec::new(); count];
     let mut work = VecDeque::new();
-    for (parameter, inputs) in incoming.iter().enumerate() {
-        for input in inputs {
+    for parameter in 0..count {
+        for input in &inputs[starts[parameter]..starts[parameter + 1]] {
             match *input {
                 Input::Parameter(source) => users[source].push(parameter),
                 Input::Value(value) => {
@@ -65,8 +66,16 @@ pub(super) fn solve<T: Copy + Eq>(incoming: &[Vec<Input<T>>]) -> Vec<Option<T>> 
 
 #[cfg(test)]
 mod tests {
-    use super::Input::{Parameter, Value};
-    use super::solve;
+    use super::Input::{self, Parameter, Value};
+
+    fn solve(incoming: &[Vec<Input<i32>>]) -> Vec<Option<i32>> {
+        let mut starts = vec![0];
+        for inputs in incoming {
+            starts.push(starts.last().unwrap() + inputs.len());
+        }
+        let inputs: Vec<_> = incoming.iter().flatten().copied().collect();
+        super::solve(&starts, &inputs)
+    }
 
     #[test]
     fn forwarding_cycles_share_their_single_origin() {

@@ -1,5 +1,5 @@
 use super::super::{Cfg, Graph, TerminatorKind, Value};
-use std::collections::HashMap;
+use crate::FxHashMap;
 
 pub(in crate::jit::semantic) fn trim(graph: &mut Graph) {
     if graph.generator || graph.has_handlers {
@@ -7,7 +7,7 @@ pub(in crate::jit::semantic) fn trim(graph: &mut Graph) {
     }
     let cfg = Cfg::new(graph);
     let mut preds = cfg.preds;
-    let mut aliases: HashMap<Value, Value> = HashMap::new();
+    let mut aliases: FxHashMap<Value, Value> = FxHashMap::default();
     for &block in &cfg.rpo {
         if graph.blocks[block].terminator.is_none() {
             continue;

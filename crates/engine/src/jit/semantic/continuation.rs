@@ -1,9 +1,10 @@
 use super::{
     Block, BlockData, Cfg, Constant, Facts, Graph, Op, Target, TerminatorKind, Types, Value,
 };
+use crate::{FxHashMap, FxHashSet};
 use cranelift_codegen::entity::SecondaryMap;
 use oxc_syntax::operator::BinaryOperator;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 pub(in crate::jit) struct Body {
@@ -87,7 +88,7 @@ fn extract(graph: &Graph, target: Target, facts: &Facts) -> super::Result<(Graph
     let inputs = super::boundary::inputs(&target, &live_in);
     let mut result = graph.clone();
     result.borrowed.clear();
-    let reachable: HashSet<_> = cfg.rpo.into_iter().collect();
+    let reachable: FxHashSet<_> = cfg.rpo.into_iter().collect();
     for &block in &reachable {
         let data = &result.blocks[block];
         if matches!(
@@ -166,7 +167,7 @@ impl Exit {
 }
 
 pub(super) struct Shape {
-    pub(super) body: HashSet<Block>,
+    pub(super) body: FxHashSet<Block>,
     pub(super) exits: Vec<Exit>,
     pub(super) returns: Option<Types>,
 }
@@ -175,8 +176,8 @@ impl Shape {
     pub(super) fn new(
         graph: &Graph,
         facts: &Facts,
-        live: &SecondaryMap<Block, HashSet<Value>>,
-        body: HashSet<Block>,
+        live: &SecondaryMap<Block, FxHashSet<Value>>,
+        body: FxHashSet<Block>,
     ) -> Self {
         let mut targets = BTreeSet::new();
         let mut returns: Option<Types> = None;
@@ -231,7 +232,7 @@ impl Shape {
         result: &mut Graph,
         block: Block,
         call: Value,
-        definitions: &mut HashMap<Value, Vec<Value>>,
+        definitions: &mut FxHashMap<Value, Vec<Value>>,
     ) {
         let count = self.count();
         let mut current = block;
@@ -331,7 +332,9 @@ impl Shape {
                     .as_mut()
                     .unwrap()
                     .kind
-                    .targets_mut()[edge] = Target::new(stub);
+                    .targets_mut()
+                    .nth(edge)
+                    .unwrap() = Target::new(stub);
             }
         }
         self.words()
@@ -349,11 +352,11 @@ impl Shape {
 
 #[derive(Default)]
 pub(super) struct Pieces {
-    shapes: Option<HashMap<Block, Shape>>,
+    shapes: Option<FxHashMap<Block, Shape>>,
     facts: Option<Facts>,
-    loops: HashMap<Block, super::Result<Piece>>,
-    drivers: HashMap<Block, super::Result<Piece>>,
-    resumes: HashMap<(Block, Vec<Value>), super::Result<Piece>>,
+    loops: FxHashMap<Block, super::Result<Piece>>,
+    drivers: FxHashMap<Block, super::Result<Piece>>,
+    resumes: FxHashMap<(Block, Vec<Value>), super::Result<Piece>>,
 }
 
 impl Pieces {
@@ -407,7 +410,7 @@ impl Pieces {
         piece
     }
 
-    fn shapes(&mut self, graph: &Graph) -> &HashMap<Block, Shape> {
+    fn shapes(&mut self, graph: &Graph) -> &FxHashMap<Block, Shape> {
         let facts = self.facts.get_or_insert_with(|| Facts::compute(graph));
         self.shapes.get_or_insert_with(|| {
             let cfg = Cfg::new(graph);
@@ -441,8 +444,8 @@ impl Pieces {
         self.shapes(graph);
         let mut entry = entry;
         let mut result = graph.clone();
-        let mut definitions = HashMap::new();
-        let mut seen = HashSet::new();
+        let mut definitions = FxHashMap::default();
+        let mut seen = FxHashSet::default();
         let mut work = vec![entry.block];
         while let Some(block) = work.pop() {
             if !seen.insert(block) {
@@ -485,12 +488,12 @@ impl Pieces {
         graph: &Graph,
         result: &mut Graph,
         header: Block,
-        definitions: &mut HashMap<Value, Vec<Value>>,
+        definitions: &mut FxHashMap<Value, Vec<Value>>,
     ) -> super::Result<(Block, Vec<Block>)> {
         let piece = self.body(graph, header)?;
         let shape = &self.shapes.as_ref().unwrap()[&header];
         let block = result.blocks.push(BlockData::default());
-        let renamed: HashMap<_, _> = graph.blocks[header]
+        let renamed: FxHashMap<_, _> = graph.blocks[header]
             .params
             .iter()
             .map(|&param| (param, result.add_param(block)))
@@ -581,8 +584,8 @@ mod tests {
         let semantic = oxc_semantic::SemanticBuilder::new_compiler()
             .build(&parsed.program)
             .semantic;
-        let graph =
-            super::super::build::lower(function, semantic.scoping(), &HashSet::new()).unwrap();
+        let graph = super::super::build::lower(function, semantic.scoping(), &FxHashSet::default())
+            .unwrap();
         let graph = super::super::canonicalize_graph(graph, true).unwrap().graph;
         let cfg = Cfg::new(&graph);
         let (header, body) = super::super::optimize::natural_loops(&graph, &cfg).remove(0);

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use crate::{FxHashMap, FxHashSet};
 
 use super::specialize::Inline;
 use super::{
@@ -7,7 +7,7 @@ use super::{
 
 fn scope_at(graph: &Graph, inst: Inst) -> Option<Scope> {
     let mut pending = vec![(graph.entry, Vec::new())];
-    let mut visited = HashSet::new();
+    let mut visited = FxHashSet::default();
     while let Some((block, mut scopes)) = pending.pop() {
         if !visited.insert(block) {
             continue;
@@ -43,7 +43,7 @@ pub(super) fn direct_captures(
     let target = graph.insts[call].block;
     let cfg = Cfg::new(graph);
     let mut pending = vec![target];
-    let mut blocks = HashSet::new();
+    let mut blocks = FxHashSet::default();
     while let Some(block) = pending.pop() {
         if !blocks.insert(block) || block == origin {
             continue;
@@ -51,7 +51,7 @@ pub(super) fn direct_captures(
         pending.extend(cfg.preds[block].iter().copied());
     }
     // A closure can retain an earlier iteration even while the binding name stays in scope.
-    let scopes: HashSet<_> = captures.iter().map(|&b| graph.bindings[b].scope).collect();
+    let scopes: FxHashSet<_> = captures.iter().map(|&b| graph.bindings[b].scope).collect();
     for block in blocks {
         let mut after = block != origin;
         for &inst in &graph.blocks[block].insts {
@@ -128,12 +128,12 @@ pub(super) fn apply(graph: &mut Graph, body: &Graph, plan: &Inline) {
     } else {
         receiver.unwrap_or(undefined)
     };
-    let mut scopes = HashMap::new();
-    let mut bindings = HashMap::new();
+    let mut scopes = FxHashMap::default();
+    let mut bindings = FxHashMap::default();
     for (scope, data) in &body.scopes {
         scopes.insert(scope, graph.scopes.push(data.clone()));
     }
-    let aliases: HashMap<_, _> = captures
+    let aliases: FxHashMap<_, _> = captures
         .as_ref()
         .map(|captures| {
             body.scopes
@@ -167,10 +167,10 @@ pub(super) fn apply(graph: &mut Graph, body: &Graph, plan: &Inline) {
     graph
         .low_level_slots
         .extend_from_slice(&body.low_level_slots);
-    let mut blocks = HashMap::new();
-    let mut values = HashMap::new();
+    let mut blocks = FxHashMap::default();
+    let mut values = FxHashMap::default();
     let mut insts = Vec::new();
-    let mut spread_args = HashMap::new();
+    let mut spread_args = FxHashMap::default();
     let mut lexical_closures = Vec::new();
     let reachable = Cfg::new(body).rpo;
     for &block in &reachable {
