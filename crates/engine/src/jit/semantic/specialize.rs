@@ -1332,7 +1332,7 @@ mod tests {
         );
         let mut graph = canonical.graph;
         let plan = conditional_plan(&graph, &bodies, &mut Vec::new());
-        let super::super::ValueDef::Result(inst) = graph.values[plan.calls[0].callee] else {
+        let super::super::ValueDef::Result(inst, _) = graph.values[plan.calls[0].callee] else {
             panic!();
         };
         graph.insts[inst].op = Op::GlobalRead("other".into());
@@ -1366,7 +1366,7 @@ mod tests {
         let Op::Call { callee, .. } = graph.insts[request.call].op else {
             panic!()
         };
-        let super::super::ValueDef::Result(def) = graph.values[callee] else {
+        let super::super::ValueDef::Result(def, _) = graph.values[callee] else {
             panic!()
         };
         graph.insts[def].op = Op::Closure(
@@ -1393,7 +1393,7 @@ mod tests {
         let Op::Call { callee, .. } = graph.insts[request.call].op else {
             panic!()
         };
-        let super::super::ValueDef::Result(def) = graph.values[callee] else {
+        let super::super::ValueDef::Result(def, _) = graph.values[callee] else {
             panic!()
         };
         graph.insts[def].op = Op::Closure(

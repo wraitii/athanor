@@ -84,7 +84,7 @@ pub(super) fn assign(
 ) -> Slots {
     let mut receivers = HashMap::new();
     for (_, data) in graph.insts.iter() {
-        if let Some(result) = data.result
+        if let Some(result) = data.result()
             && graph.borrowed.contains(&result)
             && let Some(receiver) = borrowed_receiver(&data.op)
         {
@@ -151,7 +151,7 @@ pub(super) fn assign(
             live.extend(terminator_uses(block));
             for &inst in data.insts.iter().rev() {
                 let data = &graph.insts[inst];
-                if let Some(result) = data.result {
+                if let Some(result) = data.result() {
                     live.remove(&result);
                 }
                 for value in data.op.operands_iter() {
@@ -177,7 +177,7 @@ pub(super) fn assign(
         let mut used = HashSet::new();
         for (index, &inst) in data.insts.iter().enumerate().rev() {
             let data = &graph.insts[inst];
-            if let Some(result) = data.result
+            if let Some(result) = data.result()
                 && live.remove(&result)
             {
                 used.insert(result);
@@ -214,7 +214,7 @@ pub(super) fn assign(
             for &value in &dying[index] {
                 slots.free(&mut in_use, value);
             }
-            if let Some(result) = graph.insts[inst].result
+            if let Some(result) = graph.insts[inst].result()
                 && owned(result)
                 && (escaping.contains(&result)
                     || terminator.contains(&result)
@@ -258,7 +258,7 @@ pub(super) fn releases(graph: &Graph, facts: &Facts, cfg: &Cfg) -> HashMap<Inst,
     for &block in &cfg.rpo {
         for &inst in &graph.blocks[block].insts {
             let data = &graph.insts[inst];
-            let Some(result) = data.result else {
+            let Some(result) = data.result() else {
                 continue;
             };
             if !facts.of(result).intersects(HEAP) {
@@ -289,7 +289,7 @@ pub(super) fn releases(graph: &Graph, facts: &Facts, cfg: &Cfg) -> HashMap<Inst,
     let mut defined: HashMap<Value, (Block, usize, Inst)> = HashMap::new();
     for &block in &cfg.rpo {
         for (index, &inst) in graph.blocks[block].insts.iter().enumerate() {
-            if let Some(result) = graph.insts[inst].result {
+            if let Some(result) = graph.insts[inst].result() {
                 defined.insert(result, (block, index, inst));
             }
         }

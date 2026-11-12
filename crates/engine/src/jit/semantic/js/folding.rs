@@ -77,11 +77,11 @@ impl Folder for Rules {
             Op::IsNumber(value) if facts.of(value).within(Types::NUMBER) => boolean(true),
             Op::IsNumber(value) if !facts.of(value).intersects(Types::NUMBER) => boolean(false),
             Op::ToNumeric(value) | Op::Unary(UnaryOp::Plus, value) | Op::AsNumber(value)
-                if data.result.is_some() && facts.of(value).within(Types::NUMBER) =>
+                if data.result().is_some() && facts.of(value).within(Types::NUMBER) =>
             {
                 Some(Fold::Alias(value))
             }
-            Op::ConstructorResult(returned, instance) if data.result.is_some() => {
+            Op::ConstructorResult(returned, instance) if data.result().is_some() => {
                 let types = facts.of(returned);
                 if types == Types::default() {
                     None

@@ -116,6 +116,7 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
     let check = graph.append_value(block, span, Op::IsArrayIteration(callee, receiver, method));
     graph.blocks[block].terminator = Some(Terminator {
         source_name: call.source_name,
+        emission_location: None,
         span,
         kind: TerminatorKind::Branch(check, Target::new(start), Target::new(fallback)),
     });
@@ -135,6 +136,7 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
     let index = graph.add_param(header);
     graph.blocks[start].terminator = Some(Terminator {
         source_name: call.source_name,
+        emission_location: None,
         span,
         kind: TerminatorKind::Jump(Target {
             block: header,
@@ -148,6 +150,7 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
     );
     graph.blocks[header].terminator = Some(Terminator {
         source_name: call.source_name,
+        emission_location: None,
         span,
         kind: TerminatorKind::Branch(more, Target::new(read), Target::new(exit)),
     });
@@ -167,6 +170,7 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
     };
     graph.blocks[read].terminator = Some(Terminator {
         source_name: call.source_name,
+        emission_location: None,
         span,
         kind: TerminatorKind::Branch(absent, hole, present),
     });
@@ -185,6 +189,7 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
         ArrayMethod::ForEach => {
             graph.blocks[invoke].terminator = Some(Terminator {
                 source_name: call.source_name,
+                emission_location: None,
                 span,
                 kind: TerminatorKind::Jump(Target::new(advance)),
             });
@@ -193,11 +198,13 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
             let found = graph.blocks.push(BlockData::default());
             graph.blocks[invoke].terminator = Some(Terminator {
                 source_name: call.source_name,
+                emission_location: None,
                 span,
                 kind: TerminatorKind::Branch(mapped, Target::new(found), Target::new(advance)),
             });
             graph.blocks[found].terminator = Some(Terminator {
                 source_name: call.source_name,
+                emission_location: None,
                 span,
                 kind: TerminatorKind::Jump(Target {
                     block: continuation,
@@ -209,6 +216,7 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
             graph.append(invoke, span, Op::SetIndex(result, index, mapped), false);
             graph.blocks[invoke].terminator = Some(Terminator {
                 source_name: call.source_name,
+                emission_location: None,
                 span,
                 kind: TerminatorKind::Jump(Target::new(advance)),
             });
@@ -217,12 +225,14 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
             let keep = graph.blocks.push(BlockData::default());
             graph.blocks[invoke].terminator = Some(Terminator {
                 source_name: call.source_name,
+                emission_location: None,
                 span,
                 kind: TerminatorKind::Branch(mapped, Target::new(keep), Target::new(advance)),
             });
             graph.append(keep, span, Op::ArrayAppend(result, value, false), false);
             graph.blocks[keep].terminator = Some(Terminator {
                 source_name: call.source_name,
+                emission_location: None,
                 span,
                 kind: TerminatorKind::Jump(Target::new(advance)),
             });
@@ -236,6 +246,7 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
             };
             graph.blocks[invoke].terminator = Some(Terminator {
                 source_name: call.source_name,
+                emission_location: None,
                 span,
                 kind: TerminatorKind::Branch(mapped, targets.0, targets.1),
             });
@@ -246,6 +257,7 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
             );
             graph.blocks[stop].terminator = Some(Terminator {
                 source_name: call.source_name,
+                emission_location: None,
                 span,
                 kind: TerminatorKind::Jump(Target {
                     block: continuation,
@@ -262,6 +274,7 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
     );
     graph.blocks[advance].terminator = Some(Terminator {
         source_name: call.source_name,
+        emission_location: None,
         span,
         kind: TerminatorKind::Jump(Target {
             block: header,
@@ -270,6 +283,7 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
     });
     graph.blocks[exit].terminator = Some(Terminator {
         source_name: call.source_name,
+        emission_location: None,
         span,
         kind: TerminatorKind::Jump(Target {
             block: continuation,
@@ -343,6 +357,7 @@ pub(super) fn push_calls(
         };
         graph.blocks[block].terminator = Some(Terminator {
             source_name: call.source_name,
+            emission_location: None,
             span: call.span,
             kind,
         });
@@ -357,6 +372,7 @@ pub(super) fn push_calls(
         let length = graph.append_value(fast, call.span, Op::IndexedLength(receiver));
         graph.blocks[fast].terminator = Some(Terminator {
             source_name: call.source_name,
+            emission_location: None,
             span: call.span,
             kind: TerminatorKind::Jump(Target {
                 block: continuation,

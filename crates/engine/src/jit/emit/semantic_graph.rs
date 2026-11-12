@@ -1,9 +1,10 @@
 use std::cell::RefCell;
 
+use super::{BlockArg, LoweredValue};
+use crate::jit::semantic::low_level::Variable;
 use cranelift_codegen::entity::{EntityRef, SecondaryMap};
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
-use cranelift_codegen::ir::{BlockArg, InstBuilder, MemFlagsData, Value as ClifValue, types};
-use cranelift_frontend::Variable;
+use cranelift_codegen::ir::{MemFlagsData, types};
 use cranelift_module::{FuncId, Module};
 
 use crate::error::Error;
@@ -25,15 +26,15 @@ const NUMERIC: Types = Types::NUMBER.union(Types::UNDEFINED);
 
 struct Context<'a> {
     graph: &'a Graph,
-    osr_buffers: RefCell<std::collections::HashMap<GraphValue, (ClifValue, usize)>>,
-    direct: RefCell<SecondaryMap<GraphValue, Option<ClifValue>>>,
+    osr_buffers: RefCell<std::collections::HashMap<GraphValue, (LoweredValue, usize)>>,
+    direct: RefCell<SecondaryMap<GraphValue, Option<LoweredValue>>>,
     reprs: &'a SecondaryMap<GraphValue, Repr>,
     facts: &'a Facts,
     slots: Slots,
 }
 
 impl Context<'_> {
-    fn define(&self, value: GraphValue, clif: ClifValue) {
+    fn define(&self, value: GraphValue, clif: LoweredValue) {
         self.direct.borrow_mut()[value] = Some(clif);
     }
 
@@ -49,7 +50,7 @@ impl Context<'_> {
 impl FunctionCompiler<'_, '_> {
     fn observe(
         &mut self,
-        value: ClifValue,
+        value: LoweredValue,
         mut site: crate::jit::profile::Site,
         kind: crate::jit::profile::Observation,
     ) {
@@ -118,7 +119,7 @@ impl FunctionCompiler<'_, '_> {
         ))
     }
 
-    fn epoch(&mut self) -> ClifValue {
+    fn epoch(&mut self) -> LoweredValue {
         let address = self.b.ins().load(
             self.pointer,
             MemFlagsData::trusted(),
@@ -130,7 +131,7 @@ impl FunctionCompiler<'_, '_> {
             .load(types::I64, MemFlagsData::trusted(), address, 0)
     }
 
-    fn lazy_capture_read(&mut self, local: Variable, cell: Variable) -> ClifValue {
+    fn lazy_capture_read(&mut self, local: Variable, cell: Variable) -> LoweredValue {
         let raw = self.b.use_var(local);
         let cell = self.b.use_var(cell);
         let boxed = self
@@ -153,7 +154,7 @@ impl FunctionCompiler<'_, '_> {
         self.b.block_params(done)[0]
     }
 
-    fn lazy_capture_write(&mut self, local: Variable, cell: Variable, value: ClifValue) {
+    fn lazy_capture_write(&mut self, local: Variable, cell: Variable, value: LoweredValue) {
         let cell = self.b.use_var(cell);
         let boxed = self
             .b
@@ -173,7 +174,7 @@ impl FunctionCompiler<'_, '_> {
         self.switch(done);
     }
 
-    fn materialize_capture(&mut self, local: Variable, cell: Variable) -> ClifValue {
+    fn materialize_capture(&mut self, local: Variable, cell: Variable) -> LoweredValue {
         let current = self.b.use_var(cell);
         let boxed =
             self.b
@@ -199,7 +200,7 @@ impl FunctionCompiler<'_, '_> {
         &mut self,
         graph: &Graph,
         facts: &Facts,
-        closure: ClifValue,
+        closure: LoweredValue,
         continuations: &std::collections::HashMap<usize, FuncId>,
     ) -> Result<(), Error> {
         let source_name = self.source_name;
@@ -235,7 +236,7 @@ impl FunctionCompiler<'_, '_> {
         let values: Vec<Variable> = graph
             .values
             .keys()
-            .map(|value| self.b.declare_var(reprs[value].clif()))
+            .map(|value| self.b.declare_var(reprs[value].scalar_type()))
             .collect();
         let bindings: Vec<Variable> = graph
             .bindings
@@ -319,15 +320,11 @@ impl FunctionCompiler<'_, '_> {
         let mut result_tokens = std::collections::HashMap::<GraphValue, Vec<Variable>>::new();
         let repeated =
             |block: crate::jit::semantic::Block| graph.has_handlers || cyclic.contains(&block);
-        let mut pending: SecondaryMap<crate::jit::semantic::Block, usize> = SecondaryMap::new();
-        for &block in &reachable {
-            pending[block] = cfg.preds[block].len();
-        }
         for &block in &reachable {
             let data = &graph.blocks[block];
             for &param in &data.params {
                 self.b
-                    .append_block_param(blocks[block.index()], reprs[param].clif());
+                    .append_block_param(blocks[block.index()], reprs[param].scalar_type());
             }
         }
         let undefined = self.constant(Value::UNDEFINED);
@@ -384,9 +381,6 @@ impl FunctionCompiler<'_, '_> {
         }
         self.slot_count = cx.slots.count();
         self.jump(blocks[graph.entry.index()], &[]);
-        if pending[graph.entry] == 0 {
-            self.b.seal_block(blocks[graph.entry.index()]);
-        }
         for &block in &reachable {
             let data = &graph.blocks[block];
             if self.annotations.semantic_locations {
@@ -395,7 +389,7 @@ impl FunctionCompiler<'_, '_> {
             }
             self.switch(blocks[block.index()]);
             let cold = graph.cold.contains(&block);
-            let created = self.b.func.dfg.num_blocks();
+            let created = self.b.num_blocks();
             let params = self.b.block_params(blocks[block.index()]).to_vec();
             let undefined = self.constant(Value::UNDEFINED);
             let slotted = self.frame_size.is_some();
@@ -453,7 +447,9 @@ impl FunctionCompiler<'_, '_> {
                 }
                 let data = &graph.insts[inst];
                 self.source_span = data.span;
+                self.b.set_span(data.span);
                 self.source_name = data.source_name.unwrap_or(source_name);
+                self.b.set_source_name(Some(self.source_name));
                 let location = if self.annotations.semantic_locations {
                     cranelift_codegen::ir::SourceLoc::new(graph.inst_location(inst))
                 } else if self.source_name == source_name {
@@ -472,6 +468,11 @@ impl FunctionCompiler<'_, '_> {
                     typed
                 } else {
                     let result = match &data.op {
+                        Op::LowLevel(_) => {
+                            return Err(Error::Compile(
+                                "low-level operation reached semantic emission".into(),
+                            ));
+                        }
                         Op::Continuation(target, inputs) => {
                             if crate::jit::bailouts::enabled() {
                                 let site = crate::jit::bailouts::register(format!(
@@ -488,7 +489,13 @@ impl FunctionCompiler<'_, '_> {
                                 self.call_helper(Helper::Bailout, &[site]);
                             }
                             let id = continuations[&(std::sync::Arc::as_ptr(target) as usize)];
-                            let function = self.module.declare_func_in_func(id, self.b.func);
+                            let signature = self
+                                .module
+                                .declarations()
+                                .get_function_decl(id)
+                                .signature
+                                .clone();
+                            let function = self.b.import_function(id, signature);
                             let argv = if target.outputs == 0 {
                                 continuation_buffer.unwrap()
                             } else {
@@ -503,7 +510,7 @@ impl FunctionCompiler<'_, '_> {
                                 let address = self.b.ins().stack_addr(self.pointer, slot, 0);
                                 cx.osr_buffers
                                     .borrow_mut()
-                                    .insert(data.result.unwrap(), (address, 0));
+                                    .insert(data.result().unwrap(), (address, 0));
                                 address
                             };
                             for (index, &input) in inputs.iter().enumerate() {
@@ -545,7 +552,7 @@ impl FunctionCompiler<'_, '_> {
                             let address = self.b.ins().stack_addr(self.pointer, slot, 0);
                             cx.osr_buffers
                                 .borrow_mut()
-                                .insert(data.result.unwrap(), (address, 0));
+                                .insert(data.result().unwrap(), (address, 0));
                             if let Some(feedback) = self.feedback {
                                 let site = self.data.pin(crate::jit::osr::Site::new(
                                     feedback.owner,
@@ -686,7 +693,7 @@ impl FunctionCompiler<'_, '_> {
                         Op::NewHoleyArray(length) => {
                             let length = get(self, *length);
                             owned = data
-                                .result
+                                .result()
                                 .is_some_and(|value| self.slot_owned(graph, &cx, value));
                             let helper = if owned {
                                 Helper::ArrayMapNewOwned
@@ -768,13 +775,13 @@ impl FunctionCompiler<'_, '_> {
                         }),
                         Op::GlobalRead(name) => {
                             let retain = data
-                                .result
+                                .result()
                                 .is_none_or(|value| !self.slot_owned(graph, &cx, value));
                             Some(self.cached_global_get(name, false, retain))
                         }
                         Op::GlobalReadOptional(name) => {
                             let retain = data
-                                .result
+                                .result()
                                 .is_none_or(|value| !self.slot_owned(graph, &cx, value));
                             Some(self.global_get_optional(name, retain))
                         }
@@ -830,7 +837,7 @@ impl FunctionCompiler<'_, '_> {
                                 value
                             } else {
                                 let retain = data
-                                    .result
+                                    .result()
                                     .is_none_or(|value| !self.slot_owned(graph, &cx, value));
                                 self.checked_temporary(value, retain)
                             };
@@ -922,7 +929,7 @@ impl FunctionCompiler<'_, '_> {
                         Op::NewObject => {
                             let dummy = self.constant(Value::UNDEFINED);
                             owned = data
-                                .result
+                                .result()
                                 .is_some_and(|value| self.slot_owned(graph, &cx, value));
                             let helper = if owned {
                                 Helper::ObjectNewOwned
@@ -938,7 +945,7 @@ impl FunctionCompiler<'_, '_> {
                             let ptr = self.stack_values(&args, data.span)?;
                             let len = self.b.ins().iconst(types::I64, args.len() as i64);
                             owned = data
-                                .result
+                                .result()
                                 .is_some_and(|value| self.slot_owned(graph, &cx, value));
                             let helper = if owned {
                                 Helper::ArrayNewOwned
@@ -981,7 +988,7 @@ impl FunctionCompiler<'_, '_> {
                             let object = get(self, *object);
                             let offset = self.property_caches[site];
                             let address = self.data_address(offset);
-                            let retain = data.result.is_none_or(|value| {
+                            let retain = data.result().is_none_or(|value| {
                                 !graph.borrowed.contains(&value)
                                     && !self.slot_owned(graph, &cx, value)
                             });
@@ -995,7 +1002,7 @@ impl FunctionCompiler<'_, '_> {
                         }
                         Op::ShapedGet(object, _, index) => {
                             let object = get(self, *object);
-                            let retain = data.result.is_none_or(|value| {
+                            let retain = data.result().is_none_or(|value| {
                                 !graph.borrowed.contains(&value)
                                     && !self.slot_owned(graph, &cx, value)
                             });
@@ -1022,7 +1029,7 @@ impl FunctionCompiler<'_, '_> {
                         }
                         Op::Get(object, name) => {
                             let object = get(self, *object);
-                            let retain = data.result.is_none_or(|value| {
+                            let retain = data.result().is_none_or(|value| {
                                 !graph.borrowed.contains(&value)
                                     && !self.slot_owned(graph, &cx, value)
                             });
@@ -1046,7 +1053,7 @@ impl FunctionCompiler<'_, '_> {
                         | Op::IndexedGet(object, index) => {
                             let object = get(self, *object);
                             let index = get(self, *index);
-                            let retain = data.result.is_none_or(|value| {
+                            let retain = data.result().is_none_or(|value| {
                                 !graph.borrowed.contains(&value)
                                     && !self.slot_owned(graph, &cx, value)
                             });
@@ -1094,7 +1101,7 @@ impl FunctionCompiler<'_, '_> {
                             let pack = get(self, *pack);
                             let index = get(self, *index);
                             owned = data
-                                .result
+                                .result()
                                 .is_some_and(|value| self.slot_owned(graph, &cx, value));
                             let helper = if owned {
                                 Helper::PackTakeOwned
@@ -1280,7 +1287,7 @@ impl FunctionCompiler<'_, '_> {
                                         ),
                                     };
                                     owned = data
-                                        .result
+                                        .result()
                                         .is_some_and(|value| self.slot_owned(graph, &cx, value));
                                     self.direct_call(
                                         *target,
@@ -1300,7 +1307,7 @@ impl FunctionCompiler<'_, '_> {
                         Op::NewInstance(prototype) => {
                             let prototype = get(self, *prototype);
                             owned = data
-                                .result
+                                .result()
                                 .is_some_and(|value| self.slot_owned(graph, &cx, value));
                             let helper = if owned {
                                 Helper::NewInstanceOwned
@@ -1430,7 +1437,7 @@ impl FunctionCompiler<'_, '_> {
                             };
                             let argc = self.b.ins().iconst(types::I64, args.len() as i64);
                             owned = data
-                                .result
+                                .result()
                                 .is_some_and(|value| self.slot_owned(graph, &cx, value));
                             let helper = if matches!(data.op, Op::StringSplitParts(..)) {
                                 if owned {
@@ -1580,7 +1587,7 @@ impl FunctionCompiler<'_, '_> {
                     };
                     result.map(|value| Operand::new(value, Repr::Boxed))
                 };
-                if let (Some(value), Some(result)) = (data.result, result) {
+                if let (Some(value), Some(result)) = (data.result(), result) {
                     let result = self.convert(result, reprs[value]);
                     let borrowed = graph.caller_rooted(value) || graph.borrowed.contains(&value);
                     if owned {
@@ -1596,7 +1603,7 @@ impl FunctionCompiler<'_, '_> {
                 }
                 if self.owned.len() > tracked {
                     let created = self.owned[tracked..].to_vec();
-                    if let Some(value) = data.result
+                    if let Some(value) = data.result()
                         && early.contains(&value)
                     {
                         result_tokens.insert(value, created);
@@ -1614,7 +1621,9 @@ impl FunctionCompiler<'_, '_> {
             self.release_owned();
             let terminator = data.terminator.as_ref().unwrap();
             self.source_span = terminator.span;
+            self.b.set_span(terminator.span);
             self.source_name = terminator.source_name.unwrap_or(source_name);
+            self.b.set_source_name(Some(self.source_name));
             let location = if self.annotations.semantic_locations {
                 cranelift_codegen::ir::SourceLoc::new(graph.terminator_location(block))
             } else if self.source_name == source_name {
@@ -1669,6 +1678,13 @@ impl FunctionCompiler<'_, '_> {
                         self.jump(block, &args);
                     }
                 }
+                TerminatorKind::Switch(..)
+                | TerminatorKind::ReturnValues(..)
+                | TerminatorKind::TailCall { .. } => {
+                    return Err(Error::Compile(
+                        "low-level terminator reached semantic emission".into(),
+                    ));
+                }
                 TerminatorKind::Yield(..) => {
                     return Err(Error::Compile("suspension reached native emission".into()));
                 }
@@ -1680,7 +1696,9 @@ impl FunctionCompiler<'_, '_> {
                     }
                     let undefined = self.constant(Value::UNDEFINED);
                     self.exit_frame(undefined);
-                    let signature = self.b.import_signature(self.b.func.signature.clone());
+                    let signature = self.b.import_signature(
+                        self.b.graph.low_level_signature.as_ref().unwrap().clone(),
+                    );
                     let address = self.b.ins().iconst(self.pointer, *previous as i64);
                     if matches!(self.arguments, super::Arguments::Fixed(_)) {
                         self.b.ins().return_call_indirect(signature, address, &args);
@@ -1698,17 +1716,11 @@ impl FunctionCompiler<'_, '_> {
                     self.jump(self.return_block, &args);
                 }
             }
-            for successor in graph.successors(block) {
-                pending[successor] -= 1;
-                if pending[successor] == 0 {
-                    self.b.seal_block(blocks[successor.index()]);
-                }
-            }
             if cold {
                 self.b.set_cold_block(blocks[block.index()]);
-                for index in created..self.b.func.dfg.num_blocks() {
+                for index in created..self.b.num_blocks() {
                     self.b
-                        .set_cold_block(cranelift_codegen::ir::Block::from_u32(index as u32));
+                        .set_cold_block(crate::jit::semantic::Block::from_u32(index as u32));
                 }
             }
         }
@@ -1753,8 +1765,8 @@ impl FunctionCompiler<'_, '_> {
         inst: crate::jit::semantic::Inst,
     ) -> Result<Option<Option<Operand>>, Error> {
         let data = &graph.insts[inst];
-        let target = data.result.map(|value| cx.reprs[value]);
-        let boolean = |condition: ClifValue| Some(Some(Operand::new(condition, Repr::Bool)));
+        let target = data.result().map(|value| cx.reprs[value]);
+        let boolean = |condition: LoweredValue| Some(Some(Operand::new(condition, Repr::Bool)));
         Ok(match &data.op {
             Op::Constant(Constant::Number(number)) => match target {
                 Some(Repr::Float) => Some(Some(Operand::new(
@@ -1867,10 +1879,10 @@ impl FunctionCompiler<'_, '_> {
             Op::Memory(MemoryOp::Load { address, .. }) => {
                 let address = self.operand(cx, *address).value;
                 let repr = target.unwrap();
-                let value = self
-                    .b
-                    .ins()
-                    .load(repr.clif(), MemFlagsData::trusted(), address, 0);
+                let value =
+                    self.b
+                        .ins()
+                        .load(repr.scalar_type(), MemFlagsData::trusted(), address, 0);
                 Some(Some(Operand::new(value, repr)))
             }
             Op::Memory(MemoryOp::IndexedLoad {
@@ -1878,25 +1890,12 @@ impl FunctionCompiler<'_, '_> {
                 index,
                 format,
             }) => {
-                use cranelift_codegen::ir::{AbiParam, Signature};
                 let base = self.operand(cx, *base).value;
                 let index = self.operand(cx, *index).value;
                 let repr = target.unwrap();
-                let mut signature = Signature::new(self.module.target_config().default_call_conv);
-                signature
-                    .params
-                    .extend([AbiParam::new(self.pointer), AbiParam::new(types::I64)]);
-                signature.returns.push(AbiParam::new(repr.clif()));
-                let signature = self.b.import_signature(signature);
-                let marker = self.b.import_function(cranelift_codegen::ir::ExtFuncData {
-                    name: cranelift_codegen::ir::ExternalName::testcase("semantic_indexed_load"),
-                    signature,
-                    colocated: false,
-                    patchable: false,
-                });
-                let call = self.b.ins().call(marker, &[base, index]);
-                self.annotations.indexed_loads.insert(call, *format);
-                let value = self.b.inst_results(call)[0];
+                let value = self
+                    .b
+                    .indexed_load(base, index, *format, repr.scalar_type());
                 Some(Some(Operand::new(value, repr)))
             }
             Op::MemoryNumber(value, format) => {
@@ -2125,7 +2124,7 @@ impl FunctionCompiler<'_, '_> {
                     }
                 };
                 let position = self.operand(cx, *position);
-                let retain = data.result.is_none_or(|value| {
+                let retain = data.result().is_none_or(|value| {
                     !graph.borrowed.contains(&value) && !self.slot_owned(graph, cx, value)
                 });
                 Some(Some(Operand::new(
@@ -2189,7 +2188,7 @@ impl FunctionCompiler<'_, '_> {
                     }
                     key => key,
                 };
-                let retain = data.result.is_none_or(|value| {
+                let retain = data.result().is_none_or(|value| {
                     !graph.borrowed.contains(&value) && !self.slot_owned(graph, cx, value)
                 });
                 let result =

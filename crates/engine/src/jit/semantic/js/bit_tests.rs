@@ -39,7 +39,7 @@ pub(in crate::jit::semantic) fn bit_tests(function: &mut super::super::FunctionS
         let Some((word, index, one)) = test else {
             continue;
         };
-        let ValueDef::Result(inst) = graph.values[condition] else {
+        let ValueDef::Result(inst, _) = graph.values[condition] else {
             unreachable!();
         };
         let data = &graph.insts[inst];

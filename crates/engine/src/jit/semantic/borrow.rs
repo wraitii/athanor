@@ -90,7 +90,7 @@ pub(super) fn borrows(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>)
     let mut reads = HashMap::new();
     let mut held = HashSet::new();
     for (_, data) in graph.insts.iter() {
-        if let (Some(object), Some(result)) = (receiver(&data.op), data.result)
+        if let (Some(object), Some(result)) = (receiver(&data.op), data.result())
             && facts.of(result).intersects(HEAP)
         {
             reads.insert(result, object);
@@ -171,7 +171,7 @@ pub(super) fn borrows(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>)
     for block in graph.blocks.values() {
         for &inst in &block.insts {
             let data = &graph.insts[inst];
-            if let (Op::ProbeGlobal(_), Some(value)) = (&data.op, data.result) {
+            if let (Op::ProbeGlobal(_), Some(value)) = (&data.op, data.result()) {
                 chains.insert(value, Vec::new());
                 objects.insert(value);
             }
@@ -288,7 +288,7 @@ fn scan(
         );
     }
     for &inst in data.insts.iter().rev() {
-        let result = graph.insts[inst].result;
+        let result = graph.insts[inst].result();
         if check {
             if let Some(result) = result {
                 borrows.redefined(&live, result);

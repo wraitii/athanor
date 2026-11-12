@@ -17,7 +17,7 @@ pub(super) fn split(graph: &mut Graph, inst: Inst) -> (Block, Block, Block) {
         .position(|&current| current == inst)
         .unwrap();
     let continuation = graph.blocks.push(BlockData::default());
-    if let Some(original) = call.result {
+    if let Some(original) = call.result() {
         let result = graph.add_param(continuation);
         graph.replace_uses(&HashMap::from([(original, result)]));
     }
@@ -31,10 +31,11 @@ pub(super) fn split(graph: &mut Graph, inst: Inst) -> (Block, Block, Block) {
     graph.move_inst(inst, fallback);
     graph.blocks[fallback].terminator = Some(Terminator {
         source_name: call.source_name,
+        emission_location: None,
         span: call.span,
         kind: TerminatorKind::Jump(Target {
             block: continuation,
-            args: call.result.into_iter().collect(),
+            args: call.result().into_iter().collect(),
         }),
     });
     graph.cold.insert(fallback);

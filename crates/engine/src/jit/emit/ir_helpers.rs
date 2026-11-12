@@ -1,5 +1,6 @@
-use cranelift_codegen::ir::{InstBuilder, MemFlagsData, Value, condcodes::IntCC, types};
-use cranelift_frontend::FunctionBuilder;
+use crate::jit::semantic::Value;
+use crate::jit::semantic::low_level::Builder as FunctionBuilder;
+use cranelift_codegen::ir::{MemFlagsData, condcodes::IntCC, types};
 
 pub(super) fn unbox_int32(b: &mut FunctionBuilder<'_>, value: Value) -> (Value, Value) {
     // Saturation keeps every boxed bit pattern safe; only exact round trips pass.

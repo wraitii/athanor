@@ -262,7 +262,7 @@ pub(super) fn apply_version(
         if uses[value] != 0 || pinned.contains(&value) {
             continue;
         }
-        let ValueDef::Result(inst) = graph.values[value] else {
+        let ValueDef::Result(inst, _) = graph.values[value] else {
             continue;
         };
         match graph.insts[inst].op {
@@ -356,13 +356,14 @@ fn duplicate(
         blocks.insert(block, copy);
         for param in graph.blocks[block].params.clone() {
             let mapped = if reuse { param } else { graph.add_param(copy) };
+            graph.low_level_types[mapped] = graph.low_level_types[param];
             values.insert(param, mapped);
         }
     }
     for &block in region {
         for inst in graph.blocks[block].insts.clone() {
             let data = graph.insts[inst].clone();
-            let mut op = data.op;
+            let mut op = data.op.clone();
             if let Some((_, read)) = typed_reads.iter().find(|(original, _)| *original == inst)
                 && let Op::GetIndex(object, key) | Op::TypedIndex(object, key, _) = op
             {
@@ -371,14 +372,16 @@ fn duplicate(
             for value in op.operands_mut() {
                 *value = values.get(value).copied().unwrap_or(*value);
             }
-            let (copy, result) = if reuse {
+            let (copy, results) = if reuse {
                 graph.insts[inst].op = op;
-                (inst, data.result)
+                (inst, data.results.clone())
             } else {
-                graph.append(blocks[&block], data.span, op, data.result.is_some())
+                graph.append_results(blocks[&block], data.span, op, data.results.len())
             };
             graph.insts[copy].source_name = data.source_name;
-            if let (Some(old), Some(new)) = (data.result, result) {
+            graph.insts[copy].emission_location = data.emission_location;
+            for (&old, &new) in data.results.iter().zip(&results) {
+                graph.low_level_types[new] = graph.low_level_types[old];
                 values.insert(old, new);
             }
             insts.insert(inst, copy);
@@ -482,6 +485,7 @@ fn entry_checks(
         let block = graph.blocks.push(BlockData {
             terminator: Some(Terminator {
                 source_name: None,
+                emission_location: None,
                 span,
                 kind: TerminatorKind::Fallback(address),
             }),
@@ -590,7 +594,7 @@ fn entry_checks(
         .collect();
     for &inst in reads {
         let data = graph.insts[inst].clone();
-        let mut op = match data.op {
+        let mut op = match data.op.clone() {
             Op::Get(object, name)
             | Op::ShapedGet(object, name, _)
             | Op::ProbeProperty(object, name) => {
@@ -603,7 +607,7 @@ fn entry_checks(
                     None => Op::ProbeProperty(object, name),
                 }
             }
-            Op::ProbeShapeProperty(..) => data.op,
+            Op::ProbeShapeProperty(..) => data.op.clone(),
             Op::GetIndex(object, key) | Op::IndexedGet(object, key) => Op::ProbeIndex(object, key),
             Op::GlobalRead(name) => Op::ProbeGlobal(name),
             Op::Argument(index) => Op::Argument(index),
@@ -635,6 +639,7 @@ fn entry_checks(
                     let next = graph.blocks.push(BlockData::default());
                     graph.blocks[current].terminator = Some(Terminator {
                         source_name: data.source_name,
+                        emission_location: None,
                         span: data.span,
                         kind: TerminatorKind::Branch(failed, original.clone(), Target::new(next)),
                     });
@@ -644,7 +649,7 @@ fn entry_checks(
                 value
             }
         };
-        let result = data.result.unwrap();
+        let result = data.result().unwrap();
         replacements.insert(values[&result], value);
         graph.detach_inst(insts[&inst]);
         values.insert(result, value);
@@ -656,6 +661,7 @@ fn entry_checks(
     for &block in guards {
         let Some(Terminator {
             source_name,
+            emission_location,
             span,
             kind: TerminatorKind::Branch(condition, _, _),
         }) = graph.blocks[block].terminator.clone()
@@ -676,7 +682,7 @@ fn entry_checks(
                 }
             }
             let key = EntryGuard::of(&op);
-            let ValueDef::Result(inst) = graph.values[condition] else {
+            let ValueDef::Result(inst, _) = graph.values[condition] else {
                 unreachable!();
             };
             graph.insts[insts[&inst]].op = Op::Constant(Constant::Boolean(true));
@@ -710,6 +716,7 @@ fn entry_checks(
                 graph.append(prime, span, op, false);
                 graph.blocks[prime].terminator = Some(Terminator {
                     source_name,
+                    emission_location,
                     span,
                     kind: TerminatorKind::Jump(original.clone()),
                 });
@@ -730,6 +737,7 @@ fn entry_checks(
         let next = graph.blocks.push(BlockData::default());
         graph.blocks[current].terminator = Some(Terminator {
             source_name,
+            emission_location,
             span,
             kind: TerminatorKind::Branch(condition, Target::new(next), otherwise),
         });
@@ -1267,7 +1275,7 @@ fn shared_resume(
 
 fn value_available(graph: &Graph, cfg: &Cfg, value: Value, block: Block) -> bool {
     let defined = match graph.values[value] {
-        ValueDef::Result(inst) => graph.blocks[graph.insts[inst].block].insts.contains(&inst),
+        ValueDef::Result(inst, _) => graph.blocks[graph.insts[inst].block].insts.contains(&inst),
         ValueDef::Param(block, _) => graph.blocks[block].params.contains(&value),
     };
     defined && cfg.dominates(graph.def_block(value), block)
@@ -1413,7 +1421,7 @@ mod tests {
             .values()
             .find_map(|data| {
                 matches!(data.op, Op::Argument(0))
-                    .then_some(data.result)
+                    .then_some(data.result())
                     .flatten()
             })
             .unwrap();

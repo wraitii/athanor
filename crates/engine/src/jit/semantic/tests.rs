@@ -220,7 +220,7 @@ fn comparisons_share_number_checks_with_refined_reads_without_splitting() {
         .values()
         .find_map(|data| {
             matches!(data.op, Op::Argument(1))
-                .then_some(data.result)
+                .then_some(data.result())
                 .flatten()
         })
         .unwrap();
@@ -274,7 +274,7 @@ fn late_number_facts_remove_refinement_guards_and_assertions() {
         .values()
         .find_map(|data| {
             matches!(data.op, Op::Binary(BinaryOperator::Addition, ..))
-                .then_some(data.result)
+                .then_some(data.result())
                 .flatten()
         })
         .unwrap();
@@ -803,7 +803,7 @@ fn small_constant_products_preserve_integer_types() {
                 .values()
                 .find_map(|data| {
                     matches!(data.op, Op::Binary(BinaryOperator::Multiplication, ..))
-                        .then(|| data.result.unwrap())
+                        .then(|| data.result().unwrap())
                 })
                 .unwrap();
             assert_eq!(facts.of(result), expected, "{expression}");
@@ -831,7 +831,7 @@ fn integer_coercions_are_reused_and_hoisted_out_of_bit_loops() {
         .collect();
     assert_eq!(conversions.len(), 1);
     let conversion = &graph.insts[conversions[0]];
-    let converted = conversion.result.unwrap();
+    let converted = conversion.result().unwrap();
     let users: Vec<_> = cfg
         .rpo
         .iter()
@@ -946,7 +946,7 @@ fn verifier_rejects_missing_late_and_mismatched_definitions() {
         .find_map(|(block, data)| {
             data.insts.iter().find_map(|&user| {
                 graph.insts[user].op.operands_iter().find_map(|value| {
-                    let ValueDef::Result(def) = graph.values[value] else {
+                    let ValueDef::Result(def, _) = graph.values[value] else {
                         return None;
                     };
                     (graph.insts[def].block == block).then_some((block, user, value, def))
@@ -970,8 +970,8 @@ fn verifier_rejects_missing_late_and_mismatched_definitions() {
     assert!(late.verify().is_err());
 
     let mut mismatch = graph;
-    assert_eq!(mismatch.insts[def].result, Some(value));
-    mismatch.insts[def].result = None;
+    assert_eq!(mismatch.insts[def].result(), Some(value));
+    mismatch.insts[def].results.clear();
     assert!(mismatch.verify().is_err());
 }
 
@@ -1030,7 +1030,7 @@ fn integer_facts_survive_loop_backedges_without_length_bounds() {
                 Op::Unary(UnaryOp::Increment | UnaryOp::Decrement, _)
                     | Op::Binary(BinaryOperator::Addition | BinaryOperator::Subtraction, ..)
             ) {
-                assert!(facts.of(data.result.unwrap()).within(Types::INTEGER));
+                assert!(facts.of(data.result().unwrap()).within(Types::INTEGER));
                 steps += 1;
             }
         }
@@ -1202,7 +1202,7 @@ fn checked_typed_reads_expose_shared_numeric_checks() {
     for &inst in &reads {
         assert!(
             facts
-                .of(graph.insts[inst].result.unwrap())
+                .of(graph.insts[inst].result().unwrap())
                 .within(Types::NUMBER)
         );
     }
@@ -1401,7 +1401,7 @@ fn facts_refresh_after_instruction_and_control_flow_changes() {
         .iter()
         .find_map(|(inst, data)| {
             matches!(data.op, Op::Constant(Constant::Number(1.0)))
-                .then_some((inst, data.result.unwrap()))
+                .then_some((inst, data.result().unwrap()))
         })
         .unwrap();
     let cfg_storage = function.facts.cfg.rpo.as_ptr();
@@ -2168,4 +2168,440 @@ fn typed_loads_lower_to_explicit_memory_operations() {
         invalid.blocks[block].terminator.as_mut().unwrap().kind = TerminatorKind::Return(raw);
         assert!(invalid.verify().is_err());
     }
+}
+
+#[test]
+fn low_level_variables_resolve_diamond_and_loop() {
+    let mut graph = lower_source("function f(a){return a;}").unwrap();
+    let entry = graph.entry;
+    let span = graph.span;
+    let initial = match graph.blocks[entry].terminator.as_ref().unwrap().kind {
+        TerminatorKind::Return(value) => value,
+        _ => panic!(),
+    };
+    let left = graph.blocks.push(BlockData::default());
+    let right = graph.blocks.push(BlockData::default());
+    let join = graph.blocks.push(BlockData::default());
+    let body = graph.blocks.push(BlockData::default());
+    let exit = graph.blocks.push(BlockData::default());
+    let changed = graph.append_value(left, span, Op::Constant(Constant::Number(7.0)));
+    graph.terminate(
+        entry,
+        span,
+        TerminatorKind::Branch(initial, Target::new(left), Target::new(right)),
+    );
+    graph.terminate(left, span, TerminatorKind::Jump(Target::new(join)));
+    graph.terminate(right, span, TerminatorKind::Jump(Target::new(join)));
+    graph.terminate(
+        join,
+        span,
+        TerminatorKind::Branch(initial, Target::new(body), Target::new(exit)),
+    );
+    graph.terminate(body, span, TerminatorKind::Jump(Target::new(join)));
+    let mut builder = low_level::Builder::new(&mut graph);
+    builder.write(entry, 0, initial, cranelift_codegen::ir::types::I64);
+    builder.write(left, 0, changed, cranelift_codegen::ir::types::I64);
+    let joined = builder.read(join, 0, cranelift_codegen::ir::types::I64, span);
+    builder.write(body, 0, joined, cranelift_codegen::ir::types::I64);
+    let result = builder.read(exit, 0, cranelift_codegen::ir::types::I64, span);
+    builder
+        .graph
+        .terminate(exit, span, TerminatorKind::Return(result));
+    builder.finish().unwrap();
+    let param = graph.blocks[join].params[0];
+    assert_eq!(graph.blocks[join].params.len(), 1);
+    assert!(
+        graph.blocks[left]
+            .terminator
+            .as_ref()
+            .unwrap()
+            .kind
+            .targets()
+            .any(|target| target.args == [changed])
+    );
+    assert!(
+        graph.blocks[right]
+            .terminator
+            .as_ref()
+            .unwrap()
+            .kind
+            .targets()
+            .any(|target| target.args == [initial])
+    );
+    assert!(
+        graph.blocks[body]
+            .terminator
+            .as_ref()
+            .unwrap()
+            .kind
+            .targets()
+            .any(|target| target.args == [param])
+    );
+    assert!(
+        matches!(graph.blocks[exit].terminator.as_ref().unwrap().kind, TerminatorKind::Return(value) if value == param)
+    );
+    assert_ne!(joined, param);
+    graph.verify().unwrap();
+}
+
+#[test]
+fn low_level_call_results_keep_types_and_operands() {
+    use cranelift_codegen::ir::types;
+    let mut graph = lower_source("function f(a){return a;}").unwrap();
+    let block = graph.entry;
+    let span = graph.span;
+    let arg = match graph.blocks[block].terminator.as_ref().unwrap().kind {
+        TerminatorKind::Return(value) => value,
+        _ => panic!(),
+    };
+    let mut signature =
+        cranelift_codegen::ir::Signature::new(cranelift_codegen::isa::CallConv::SystemV);
+    signature
+        .params
+        .push(cranelift_codegen::ir::AbiParam::new(types::I64));
+    signature.returns.extend([
+        cranelift_codegen::ir::AbiParam::new(types::I64),
+        cranelift_codegen::ir::AbiParam::new(types::I8),
+    ]);
+    let mut builder = low_level::Builder::new(&mut graph);
+    let results = builder.call(
+        block,
+        span,
+        low_level::CallTarget::Indirect(arg),
+        signature,
+        vec![arg],
+    );
+    builder.finish().unwrap();
+    let [result, status] = results[..] else {
+        panic!()
+    };
+    let ValueDef::Result(call, 0) = graph.values[result] else {
+        panic!()
+    };
+    assert_eq!(graph.values[status], ValueDef::Result(call, 1));
+    assert_eq!(
+        graph.insts[call].op.operands_iter().collect::<Vec<_>>(),
+        [arg, arg]
+    );
+    assert_eq!(graph.low_level_types[result], Some(types::I64));
+    assert_eq!(graph.low_level_types[status], Some(types::I8));
+    graph.verify().unwrap();
+    let facts = Facts::compute(&graph);
+    assert_eq!(facts.of(result), Types::RAW);
+    assert_eq!(facts.of(status), Types::RAW);
+    let cfg = Cfg::new(&graph);
+    let _ = boundary::liveness(&graph, &cfg.rpo);
+    assert!(
+        graph
+            .listing(&facts)
+            .lines()
+            .iter()
+            .any(|(_, _, line)| line.contains("low_level"))
+    );
+    boundary::compact(&mut graph);
+    graph.verify().unwrap();
+    let call = graph
+        .insts
+        .values()
+        .find(|data| matches!(data.op, Op::LowLevel(low_level::Op::Call { .. })))
+        .unwrap();
+    assert_eq!(call.results.len(), 2);
+    let call = graph
+        .insts
+        .keys()
+        .find(|&inst| {
+            matches!(
+                graph.insts[inst].op,
+                Op::LowLevel(low_level::Op::Call { .. })
+            )
+        })
+        .unwrap();
+    graph.insts[call].results.pop();
+    assert!(graph.verify().is_err());
+}
+
+#[test]
+fn low_level_ssa_rejects_undefined_cycle() {
+    use cranelift_codegen::ir::types;
+    let mut graph = lower_source("function f(a){return a;}").unwrap();
+    let entry = graph.entry;
+    let span = graph.span;
+    let condition = graph.blocks[entry]
+        .terminator
+        .as_ref()
+        .unwrap()
+        .kind
+        .operands_iter()
+        .next()
+        .unwrap();
+    let header = graph.blocks.push(BlockData::default());
+    let body = graph.blocks.push(BlockData::default());
+    graph.terminate(entry, span, TerminatorKind::Jump(Target::new(header)));
+    graph.terminate(
+        header,
+        span,
+        TerminatorKind::Branch(condition, Target::new(body), Target::new(body)),
+    );
+    graph.terminate(body, span, TerminatorKind::Jump(Target::new(header)));
+    let mut builder = low_level::Builder::new(&mut graph);
+    let value = builder.read(header, 0, types::I64, span);
+    builder.write(body, 0, value, types::I64);
+    assert!(builder.finish().is_err());
+}
+
+#[test]
+fn low_level_ssa_same_target_edges_receive_one_argument() {
+    use cranelift_codegen::ir::types;
+    let mut graph = lower_source("function f(a){return a;}").unwrap();
+    let entry = graph.entry;
+    let span = graph.span;
+    let initial = graph.blocks[entry]
+        .terminator
+        .as_ref()
+        .unwrap()
+        .kind
+        .operands_iter()
+        .next()
+        .unwrap();
+    let join = graph.blocks.push(BlockData::default());
+    let body = graph.blocks.push(BlockData::default());
+    let exit = graph.blocks.push(BlockData::default());
+    let changed = graph.append_value(body, span, Op::Constant(Constant::Number(2.0)));
+    graph.terminate(
+        entry,
+        span,
+        TerminatorKind::Branch(initial, Target::new(join), Target::new(join)),
+    );
+    graph.terminate(
+        join,
+        span,
+        TerminatorKind::Branch(initial, Target::new(body), Target::new(exit)),
+    );
+    graph.terminate(body, span, TerminatorKind::Jump(Target::new(join)));
+    let mut builder = low_level::Builder::new(&mut graph);
+    builder.write(entry, 0, initial, types::I64);
+    let value = builder.read(join, 0, types::I64, span);
+    builder.write(body, 0, changed, types::I64);
+    builder
+        .graph
+        .terminate(exit, span, TerminatorKind::Return(value));
+    builder.finish().unwrap();
+    assert!(
+        graph.blocks[entry]
+            .terminator
+            .as_ref()
+            .unwrap()
+            .kind
+            .targets()
+            .all(|edge| edge.args == [initial])
+    );
+    graph.verify().unwrap();
+}
+
+#[test]
+fn low_level_graph_emits_executable_cranelift() {
+    use cranelift_codegen::ir::{AbiParam, types};
+    use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+    use cranelift_jit::{JITBuilder, JITModule};
+    use cranelift_module::{Linkage, Module, default_libcall_names};
+    let mut module = JITModule::new(JITBuilder::new(default_libcall_names()).unwrap());
+    let mut signature = module.make_signature();
+    signature.params.push(AbiParam::new(types::I64));
+    signature.returns.push(AbiParam::new(types::I64));
+    let mut graph = Graph::new_low_level("test".into(), Span::new(0, 0), signature.clone());
+    let entry = graph.entry;
+    let span = graph.span;
+    let input = graph.add_param(entry);
+    graph.low_level_types[input] = Some(types::I64);
+    let header = graph.blocks.push(BlockData::default());
+    let body = graph.blocks.push(BlockData::default());
+    let exit = graph.blocks.push(BlockData::default());
+    let mut builder = low_level::Builder::new(&mut graph);
+    builder.set_location(Some(42));
+    let source = "lowered-loop.js";
+    let source_name = (source.as_ptr() as usize, source.len());
+    builder.set_source_name(Some(source_name));
+    let zero = builder.value(
+        entry,
+        span,
+        low_level::Op::Integer {
+            ty: types::I64,
+            bits: 0,
+        },
+        types::I64,
+    );
+    let one = builder.value(
+        entry,
+        span,
+        low_level::Op::Integer {
+            ty: types::I64,
+            bits: 1,
+        },
+        types::I64,
+    );
+    let three = builder.value(
+        entry,
+        span,
+        low_level::Op::Integer {
+            ty: types::I64,
+            bits: 3,
+        },
+        types::I64,
+    );
+    let eight = builder.value(
+        entry,
+        span,
+        low_level::Op::Integer {
+            ty: types::I64,
+            bits: 8,
+        },
+        types::I64,
+    );
+    builder.write(entry, 0, zero, types::I64);
+    builder.write(entry, 1, zero, types::I64);
+    builder.terminate(entry, span, TerminatorKind::Jump(Target::new(header)));
+    let index = builder.read(header, 0, types::I64, span);
+    let sum = builder.read(header, 1, types::I64, span);
+    let condition = builder.value(
+        header,
+        span,
+        low_level::Op::IntCompare {
+            condition: cranelift_codegen::ir::condcodes::IntCC::UnsignedLessThan,
+            left: index,
+            right: three,
+        },
+        types::I8,
+    );
+    builder.terminate(
+        header,
+        span,
+        TerminatorKind::Branch(condition, Target::new(body), Target::new(exit)),
+    );
+    let offset = builder.value(
+        body,
+        span,
+        low_level::Op::Binary {
+            op: low_level::Binary::Multiply,
+            left: index,
+            right: eight,
+        },
+        types::I64,
+    );
+    let address = builder.value(
+        body,
+        span,
+        low_level::Op::Binary {
+            op: low_level::Binary::Add,
+            left: input,
+            right: offset,
+        },
+        types::I64,
+    );
+    let loaded = builder.value(
+        body,
+        span,
+        low_level::Op::Load {
+            ty: types::I64,
+            address,
+            offset: 0,
+            flags: cranelift_codegen::ir::MemFlagsData::trusted(),
+        },
+        types::I64,
+    );
+    let next_sum = builder.value(
+        body,
+        span,
+        low_level::Op::Binary {
+            op: low_level::Binary::Add,
+            left: sum,
+            right: loaded,
+        },
+        types::I64,
+    );
+    let next_index = builder.value(
+        body,
+        span,
+        low_level::Op::Binary {
+            op: low_level::Binary::Add,
+            left: index,
+            right: one,
+        },
+        types::I64,
+    );
+    builder.write(body, 0, next_index, types::I64);
+    builder.write(body, 1, next_sum, types::I64);
+    builder.terminate(body, span, TerminatorKind::Jump(Target::new(header)));
+    builder.terminate(exit, span, TerminatorKind::ReturnValues(vec![sum]));
+    builder.finish().unwrap();
+    boundary::compact(&mut graph);
+    graph.verify().unwrap();
+    for block in Cfg::new(&graph).rpo {
+        for &inst in &graph.blocks[block].insts {
+            assert_eq!(graph.insts[inst].source_name, Some(source_name));
+            assert_eq!(graph.insts[inst].emission_location, Some(42));
+        }
+        let terminator = graph.blocks[block].terminator.as_ref().unwrap();
+        assert_eq!(terminator.source_name, Some(source_name));
+        assert_eq!(terminator.emission_location, Some(42));
+    }
+    let id = module
+        .declare_function("low_level_graph_test", Linkage::Local, &signature)
+        .unwrap();
+    let mut context = module.make_context();
+    context.func.signature = signature;
+    let mut builder_context = FunctionBuilderContext::new();
+    let mut builder = FunctionBuilder::new(&mut context.func, &mut builder_context);
+    crate::jit::emit::cranelift::emit(&mut builder, &mut module, &graph, None).unwrap();
+    builder.seal_all_blocks();
+    builder.finalize(module.target_config());
+    module.define_function(id, &mut context).unwrap();
+    module.finalize_definitions().unwrap();
+    let entry: extern "C" fn(*const u64) -> u64 =
+        unsafe { std::mem::transmute(module.get_finalized_function(id)) };
+    assert_eq!(entry([10, 20, 12].as_ptr()), 42);
+}
+
+#[test]
+fn switch_cfg_visits_every_distinct_destination() {
+    use cranelift_codegen::ir::{Signature, types};
+    let span = oxc_span::Span::default();
+    let signature = Signature::new(cranelift_codegen::isa::CallConv::SystemV);
+    let mut graph = Graph::new_low_level("switch".into(), span, signature);
+    let entry = graph.entry;
+    let condition = graph.append_value(
+        entry,
+        span,
+        Op::LowLevel(low_level::Op::Integer {
+            ty: types::I64,
+            bits: 2,
+        }),
+    );
+    graph.low_level_types[condition] = Some(types::I64);
+    let destinations: Vec<_> = (0..4)
+        .map(|_| graph.blocks.push(BlockData::default()))
+        .collect();
+    for &block in &destinations {
+        graph.terminate(block, span, TerminatorKind::ReturnValues(Vec::new()));
+    }
+    graph.terminate(
+        entry,
+        span,
+        TerminatorKind::Switch(
+            condition,
+            vec![
+                (1, Target::new(destinations[1])),
+                (2, Target::new(destinations[2])),
+                (3, Target::new(destinations[1])),
+                (4, Target::new(destinations[3])),
+            ],
+            Target::new(destinations[0]),
+        ),
+    );
+    let cfg = Cfg::new(&graph);
+    assert_eq!(cfg.rpo.len(), 5);
+    for block in destinations {
+        assert!(cfg.rpo.contains(&block));
+        assert_eq!(cfg.preds[block], [entry]);
+    }
+    graph.verify().unwrap();
 }

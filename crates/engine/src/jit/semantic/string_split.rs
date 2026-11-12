@@ -17,7 +17,7 @@ pub(super) fn result_facts(graph: &Graph, cfg: &Cfg) -> (HashSet<Value>, HashMap
                 matches!(graph.defining_op(*separator), Some(Op::Constant(Constant::Undefined)))
                     || matches!(graph.defining_op(*separator), Some(Op::Constant(Constant::String(text))) if !text.is_empty())
             });
-            arrays.insert(data.result.unwrap(), nonempty);
+            arrays.insert(data.result().unwrap(), nonempty);
         }
     }
     if arrays.is_empty() {
@@ -36,7 +36,7 @@ pub(super) fn result_facts(graph: &Graph, cfg: &Cfg) -> (HashSet<Value>, HashMap
     for &block in &cfg.rpo {
         for &inst in &graph.blocks[block].insts {
             if let Op::Spread(source) = graph.insts[inst].op {
-                incoming.insert(graph.insts[inst].result.unwrap(), vec![source]);
+                incoming.insert(graph.insts[inst].result().unwrap(), vec![source]);
             }
         }
     }
@@ -84,7 +84,7 @@ pub(super) fn result_facts(graph: &Graph, cfg: &Cfg) -> (HashSet<Value>, HashMap
                     | Op::IsString(_)
                     | Op::IsTypeof(..)
                     | Op::IsUninitialized(_) => true,
-                    Op::CheckInitialized(_) => data.result.is_none(),
+                    Op::CheckInitialized(_) => data.result().is_none(),
                     // Spread passes elements, not the backing array, under direct iteration.
                     Op::ConstructPack(..) => index == 1,
                     Op::ConstructPackResolved(..)
@@ -223,6 +223,7 @@ pub(super) fn expand(graph: &mut Graph, expanded: &mut HashSet<Inst>) {
         graph.insts[guard].source_name = data.source_name;
         graph.blocks[block].terminator = Some(Terminator {
             source_name: data.source_name,
+            emission_location: None,
             span: data.span,
             kind: TerminatorKind::Branch(check.unwrap(), Target::new(fast), Target::new(fallback)),
         });
@@ -230,6 +231,7 @@ pub(super) fn expand(graph: &mut Graph, expanded: &mut HashSet<Inst>) {
         graph.insts[call].source_name = data.source_name;
         graph.blocks[fast].terminator = Some(Terminator {
             source_name: data.source_name,
+            emission_location: None,
             span: data.span,
             kind: TerminatorKind::Jump(Target {
                 block: continuation,
@@ -270,7 +272,7 @@ pub(super) fn forward_packs(graph: &mut Graph) {
                     break None;
                 }
                 match graph.values[source] {
-                    super::ValueDef::Result(inst) => break Some(inst),
+                    super::ValueDef::Result(inst, _) => break Some(inst),
                     super::ValueDef::Param(block, index) => {
                         let mut incoming = cfg.preds[block]
                             .iter()
@@ -301,7 +303,7 @@ pub(super) fn forward_packs(graph: &mut Graph) {
                 continue;
             };
             graph.insts[producer].op = Op::StringSplitParts(receiver, args);
-            aliases.insert(graph.insts[inst].result.unwrap(), array);
+            aliases.insert(graph.insts[inst].result().unwrap(), array);
             graph.remove_inst(inst);
         }
     }
@@ -369,7 +371,7 @@ mod tests {
             graph.insts[read].op = Op::PackTake(array, index);
             let facts = super::super::Facts::compute(&graph);
             assert!(facts.indexed(array));
-            assert_eq!(facts.of(graph.insts[read].result.unwrap()), expected);
+            assert_eq!(facts.of(graph.insts[read].result().unwrap()), expected);
         }
     }
 

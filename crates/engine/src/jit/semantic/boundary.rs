@@ -20,8 +20,8 @@ pub(super) fn liveness(graph: &Graph, rpo: &[Block]) -> SecondaryMap<Block, Hash
             live.extend(data.terminator.as_ref().unwrap().kind.operands_iter());
             for &inst in data.insts.iter().rev() {
                 let data = &graph.insts[inst];
-                if let Some(result) = data.result {
-                    live.remove(&result);
+                for result in &data.results {
+                    live.remove(result);
                 }
                 live.extend(data.op.operands_iter());
             }
@@ -145,6 +145,7 @@ pub(super) fn compact(graph: &mut Graph) {
     let old_blocks = std::mem::take(&mut graph.blocks);
     let old_insts = std::mem::take(&mut graph.insts);
     graph.values.clear();
+    let old_types = std::mem::take(&mut graph.low_level_types);
     let mut blocks = HashMap::new();
     let mut insts = HashMap::new();
     let mut values = HashMap::new();
@@ -152,19 +153,23 @@ pub(super) fn compact(graph: &mut Graph) {
         let copy = graph.blocks.push(BlockData::default());
         blocks.insert(block, copy);
         for &value in &old_blocks[block].params {
-            values.insert(value, graph.add_param(copy));
+            let new = graph.add_param(copy);
+            graph.low_level_types[new] = old_types[value];
+            values.insert(value, new);
         }
     }
     for &block in &reachable {
         let copy = blocks[&block];
         for &inst in &old_blocks[block].insts {
             let data = &old_insts[inst];
-            let (new_inst, result) =
-                graph.append(copy, data.span, data.op.clone(), data.result.is_some());
+            let (new_inst, results) =
+                graph.append_results(copy, data.span, data.op.clone(), data.results.len());
             graph.insts[new_inst].source_name = data.source_name;
+            graph.insts[new_inst].emission_location = data.emission_location;
             insts.insert(inst, new_inst);
-            if let Some(value) = data.result {
-                values.insert(value, result.unwrap());
+            for (&old, &new) in data.results.iter().zip(&results) {
+                graph.low_level_types[new] = old_types[old];
+                values.insert(old, new);
             }
         }
         graph.blocks[copy].terminator = old_blocks[block].terminator.clone();

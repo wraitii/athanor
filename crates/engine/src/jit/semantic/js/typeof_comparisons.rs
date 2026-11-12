@@ -39,14 +39,14 @@ pub(in crate::jit::semantic) fn typeof_comparisons(graph: &mut Graph) {
             let Some((value, literal, operand, kind)) = pair else {
                 continue;
             };
-            let ValueDef::Result(typeof_inst) = graph.values[value] else {
+            let ValueDef::Result(typeof_inst, _) = graph.values[value] else {
                 unreachable!();
             };
             // Keep TDZ errors at the original typeof evaluation point.
             graph.insts[typeof_inst].op = Op::CheckInitialized(operand);
-            graph.insts[typeof_inst].result = None;
+            graph.insts[typeof_inst].results.clear();
             if uses[literal] == 1 {
-                let ValueDef::Result(literal_inst) = graph.values[literal] else {
+                let ValueDef::Result(literal_inst, _) = graph.values[literal] else {
                     unreachable!();
                 };
                 graph.remove_inst(literal_inst);

@@ -595,13 +595,13 @@ mod tests {
             .flat_map(|(_, block)| &block.insts)
             .find_map(|&inst| {
                 matches!(&graph.insts[inst].op, Op::Get(_, name) if name == "row")
-                    .then(|| graph.insts[inst].result.unwrap())
+                    .then(|| graph.insts[inst].result().unwrap())
             })
             .unwrap();
         let x = graph
             .insts
             .values()
-            .find_map(|data| matches!(data.op, Op::Argument(1)).then(|| data.result.unwrap()))
+            .find_map(|data| matches!(data.op, Op::Argument(1)).then(|| data.result().unwrap()))
             .unwrap();
         let site = Site {
             source: 7,

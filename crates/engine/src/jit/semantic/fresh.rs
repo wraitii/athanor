@@ -108,11 +108,11 @@ impl Fresh {
                 let data = &graph.insts[inst];
                 match data.op {
                     Op::NewObject | Op::NewInstance(_) | Op::NewArray(_) | Op::NewHoleyArray(_) => {
-                        allocations.extend(data.result)
+                        allocations.extend(data.result())
                     }
                     Op::IteratorNew(source) | Op::EnumerateNew(source) => {
-                        allocations.extend(data.result);
-                        if let Some(iterator) = data.result {
+                        allocations.extend(data.result());
+                        if let Some(iterator) = data.result() {
                             sources.insert(iterator, source);
                         }
                     }
@@ -181,7 +181,7 @@ impl Fresh {
                     let terminal_constructor = position == 1
                         && matches!(op, Op::ConstructorResult(..))
                         && graph.insts[inst]
-                            .result
+                            .result()
                             .is_some_and(|result| terminal_result(graph, &cfg.rpo, result));
                     if contained_use(op, position) || terminal_constructor {
                         continue;

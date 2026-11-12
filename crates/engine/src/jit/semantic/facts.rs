@@ -422,7 +422,7 @@ impl Facts {
             for &block in &rpo {
                 for &inst in &graph.blocks[block].insts {
                     let data = &graph.insts[inst];
-                    if let Some(result) = data.result {
+                    for &result in &data.results {
                         if let Op::Closure(_, target, _, false, _, _, _) = data.op
                             && !marked.contains(&result)
                         {
@@ -762,6 +762,7 @@ fn result_types(graph: &Graph, op: &Op, facts: &Facts) -> Types {
         | Op::ShapedGet(..)
         | Op::FillPropertyCache(..) => Types::ALL,
         Op::View(_) => Types::VIEW,
+        Op::LowLevel(_) => Types::RAW,
         Op::TypedData(_) | Op::Memory(MemoryOp::Address { .. }) => Types::POINTER,
         Op::Memory(MemoryOp::IndexedLoad { .. } | MemoryOp::Load { .. }) => Types::RAW,
         Op::MemoryNumber(_, format) => match format {

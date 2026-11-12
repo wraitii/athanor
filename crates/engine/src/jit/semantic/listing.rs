@@ -189,6 +189,7 @@ impl Graph {
                 .join(", ")
         };
         match op {
+            Op::LowLevel(op) => format!("low_level {op:?}"),
             Op::Observe(value, kind, site) => {
                 format!("observe {kind:?} {value} site={site}")
             }
@@ -506,8 +507,14 @@ impl Listing<'_> {
             for &inst in &data.insts {
                 let inst_data = &graph.insts[inst];
                 let mut text = graph.op_text(&inst_data.op);
-                if let Some(result) = inst_data.result {
-                    text = format!("{} = {text}", self.value(result));
+                if !inst_data.results.is_empty() {
+                    let results = inst_data
+                        .results
+                        .iter()
+                        .map(|&result| self.value(result))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    text = format!("{results} = {text}");
                 }
                 let effects = graph.contract(&inst_data.op, self.facts).effects;
                 let note = match (effects.memory.reenters(), effects.control.throws) {
@@ -536,6 +543,27 @@ impl Listing<'_> {
                     }
                     TerminatorKind::Yield(_, value, target) => format!("yield {value}, {target}"),
                     TerminatorKind::Return(value) => format!("return {value}"),
+                    TerminatorKind::Switch(value, cases, default) => format!(
+                        "switch {} [{} cases] {}",
+                        self.value(*value),
+                        cases.len(),
+                        default
+                    ),
+                    TerminatorKind::ReturnValues(values) => format!(
+                        "return_values {}",
+                        values
+                            .iter()
+                            .map(|&value| self.value(value))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    TerminatorKind::TailCall { target, args, .. } => format!(
+                        "tail_call {target:?} {}",
+                        args.iter()
+                            .map(|&value| self.value(value))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
                     TerminatorKind::Fallback(entry) => format!("fallback {entry:#x}"),
                 };
                 let span = terminator.span;
@@ -566,9 +594,17 @@ impl Graph {
     pub(super) fn note_inst(&self, inst: Inst) -> String {
         let data = &self.insts[inst];
         let op = self.op_text(&data.op);
-        let op = data
-            .result
-            .map_or(op.clone(), |value| format!("{value} = {op}"));
+        let op = if data.results.is_empty() {
+            op
+        } else {
+            let results = data
+                .results
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{results} = {op}")
+        };
         let source = data.source_name.map_or_else(
             || "source ?".to_owned(),
             |(source, _)| format!("source {source}"),

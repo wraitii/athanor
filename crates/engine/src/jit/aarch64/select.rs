@@ -56,7 +56,6 @@ pub(super) struct Comparison {
 
 pub(super) struct Selection {
     address: SecondaryMap<Inst, Option<Address>>,
-    indexed_load: SecondaryMap<Inst, Option<crate::jit::semantic::MemoryFormat>>,
     operand: SecondaryMap<Inst, Option<Operand>>,
     compare: SecondaryMap<Inst, Option<Inst>>,
     folded: SecondaryMap<Inst, Option<Value>>,
@@ -335,10 +334,7 @@ fn absorbable(func: &Function, value: Value) -> Option<Inst> {
 }
 
 impl Selection {
-    pub(super) fn new(
-        func: &Function,
-        indexed_loads: &rustc_hash::FxHashMap<Inst, crate::jit::semantic::MemoryFormat>,
-    ) -> Self {
+    pub(super) fn new(func: &Function) -> Self {
         let dfg = &func.dfg;
         let mut uses = SecondaryMap::<Value, u32>::new();
         for block in func.layout.blocks() {
@@ -351,15 +347,11 @@ impl Selection {
 
         let mut selection = Self {
             address: SecondaryMap::new(),
-            indexed_load: SecondaryMap::new(),
             operand: SecondaryMap::new(),
             compare: SecondaryMap::new(),
             folded: SecondaryMap::new(),
             skip: SecondaryMap::new(),
         };
-        for (&inst, &format) in indexed_loads {
-            selection.indexed_load[inst] = Some(format);
-        }
         for block in func.layout.blocks() {
             for inst in func.layout.block_insts(block) {
                 let data = &dfg.insts[inst];
@@ -438,10 +430,6 @@ impl Selection {
             return;
         }
         let dfg = &func.dfg;
-        if self.indexed_load[inst].is_some() {
-            out.extend_from_slice(dfg.inst_args(inst));
-            return;
-        }
         out.extend(dfg.inst_values(inst));
         if let Some(address) = self.address[inst] {
             let position = if dfg.insts[inst].opcode().can_load() {
@@ -473,10 +461,6 @@ impl Selection {
         {
             out.swap_remove(position);
         }
-    }
-
-    pub(super) fn indexed_load(&self, inst: Inst) -> Option<crate::jit::semantic::MemoryFormat> {
-        self.indexed_load[inst]
     }
 
     pub(super) fn skips(&self, inst: Inst) -> bool {

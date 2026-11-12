@@ -1,5 +1,6 @@
+use super::LoweredValue;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
-use cranelift_codegen::ir::{InstBuilder, MemFlagsData, Type, Value as ClifValue, types};
+use cranelift_codegen::ir::{MemFlagsData, Type, types};
 
 use crate::heap::MathFunction;
 use crate::jit::semantic::Types;
@@ -40,7 +41,7 @@ impl Repr {
         }
     }
 
-    pub(super) fn clif(self) -> Type {
+    pub(super) fn scalar_type(self) -> Type {
         match self {
             Self::Boxed | Self::Int64 => types::I64,
             Self::Float => types::F64,
@@ -57,13 +58,13 @@ impl Repr {
 
 #[derive(Clone, Copy)]
 pub(super) struct Operand {
-    pub(super) value: ClifValue,
+    pub(super) value: LoweredValue,
     pub(super) repr: Repr,
     constant: Option<f64>,
 }
 
 impl Operand {
-    pub(super) fn new(value: ClifValue, repr: Repr) -> Self {
+    pub(super) fn new(value: LoweredValue, repr: Repr) -> Self {
         Self {
             value,
             repr,
@@ -80,7 +81,7 @@ impl Operand {
 }
 
 impl FunctionCompiler<'_, '_> {
-    fn fold(&mut self, operand: Operand, to: Repr) -> Option<ClifValue> {
+    fn fold(&mut self, operand: Operand, to: Repr) -> Option<LoweredValue> {
         let number = operand.constant?;
         let integer = match operand.repr {
             Repr::Int32 => Some(i64::from(number as i32)),
@@ -110,7 +111,7 @@ impl FunctionCompiler<'_, '_> {
         })
     }
 
-    pub(super) fn convert(&mut self, operand: Operand, to: Repr) -> ClifValue {
+    pub(super) fn convert(&mut self, operand: Operand, to: Repr) -> LoweredValue {
         let value = operand.value;
         if operand.repr != to
             && let Some(folded) = self.fold(operand, to)
@@ -177,7 +178,7 @@ impl FunctionCompiler<'_, '_> {
         }
     }
 
-    pub(super) fn to_int32(&mut self, float: ClifValue) -> ClifValue {
+    pub(super) fn to_int32(&mut self, float: LoweredValue) -> LoweredValue {
         let scale = self.b.ins().f64const(1.0 / 4294967296.0);
         let scaled = self.b.ins().fmul(float, scale);
         let wraps = self.b.ins().trunc(scaled);
@@ -320,7 +321,7 @@ impl FunctionCompiler<'_, '_> {
         Some(Operand::new(result, Repr::Float))
     }
 
-    pub(super) fn condition(&mut self, operand: Operand, numeric: bool) -> ClifValue {
+    pub(super) fn condition(&mut self, operand: Operand, numeric: bool) -> LoweredValue {
         match operand.repr {
             Repr::Boxed if numeric => {
                 let float = self.convert(operand, Repr::Float);

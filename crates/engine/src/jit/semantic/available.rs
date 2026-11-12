@@ -150,8 +150,11 @@ fn step(
     if cold {
         return None;
     }
-    let result = data.result?;
     let key = load_key(graph, &data.op, facts.is_pure(inst), probes, aliases)?;
+    let [result] = data.results.as_slice() else {
+        return None;
+    };
+    let result = *result;
     if let Some(entry) = state.get(&key) {
         return Some(Reuse::Value(entry.value));
     }
@@ -257,7 +260,7 @@ pub(super) fn solve(
                 {
                     match value {
                         Reuse::Value(value) => {
-                            aliases.insert(graph.insts[inst].result.unwrap(), value);
+                            aliases.insert(graph.insts[inst].result().unwrap(), value);
                             reused.push((inst, value));
                         }
                         Reuse::Boolean(value) => folded.push((inst, value)),

@@ -1,10 +1,10 @@
-use super::{ClifValue, FunctionCompiler};
+use super::{Block, BlockArg, GraphBuilder as FunctionBuilder, Inst, Variable};
+use super::{FunctionCompiler, LoweredValue};
 use crate::heap::REFERENCES_OFFSET;
 use crate::jit::helpers::Helper;
 use crate::value::{TAG_OBJECT, TAG_SHIFT, TAG_STRING, Value};
 use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::{Block, BlockArg, Inst, InstBuilder, MemFlagsData, types};
-use cranelift_frontend::{FunctionBuilder, Variable};
+use cranelift_codegen::ir::{MemFlagsData, types};
 use oxc_ast::ast::{
     BindingPattern, ForStatementInit, ForStatementLeft, Statement, VariableDeclaration,
     VariableDeclarationKind,
@@ -15,21 +15,21 @@ const _: () = assert!(TAG_STRING - TAG_OBJECT == 1 << TAG_SHIFT);
 
 pub(super) const ADDRESS_MASK: i64 = (1 << TAG_SHIFT) - 1;
 
-pub(super) fn is_heap(b: &mut FunctionBuilder<'_>, value: ClifValue) -> ClifValue {
+pub(super) fn is_heap(b: &mut FunctionBuilder<'_>, value: LoweredValue) -> LoweredValue {
     let tag = b.ins().ushr_imm_s(value, TAG_SHIFT as i64);
     let first = (TAG_OBJECT >> TAG_SHIFT) as i64;
     let offset = b.ins().iadd_imm_s(tag, -first);
     b.ins().icmp_imm_s(IntCC::UnsignedLessThan, offset, 2)
 }
 
-pub(super) fn heap_address(b: &mut FunctionBuilder<'_>, value: ClifValue) -> ClifValue {
+pub(super) fn heap_address(b: &mut FunctionBuilder<'_>, value: LoweredValue) -> LoweredValue {
     let heap = is_heap(b, value);
     let address = b.ins().band_imm_s(value, ADDRESS_MASK);
     let zero = b.ins().iconst(types::I64, 0);
     b.ins().select(heap, address, zero)
 }
 
-pub(super) fn increment_references(b: &mut FunctionBuilder<'_>, address: ClifValue) -> Inst {
+pub(super) fn increment_references(b: &mut FunctionBuilder<'_>, address: LoweredValue) -> Inst {
     let flags = MemFlagsData::trusted();
     let references = b.ins().load(types::I32, flags, address, REFERENCES_OFFSET);
     let references = b.ins().iadd_imm_s(references, 1);
@@ -38,20 +38,20 @@ pub(super) fn increment_references(b: &mut FunctionBuilder<'_>, address: ClifVal
 
 impl FunctionCompiler<'_, '_> {
     // Binding slots are not reused by SSA temporaries, so the variable tracks their contents.
-    pub(super) fn initialize_binding(&mut self, variable: Variable, value: ClifValue) {
+    pub(super) fn initialize_binding(&mut self, variable: Variable, value: LoweredValue) {
         let old = self.b.use_var(variable);
         self.initialize_local_with_old(variable, value, Some(old));
     }
 
-    pub(super) fn initialize_local(&mut self, variable: Variable, value: ClifValue) {
+    pub(super) fn initialize_local(&mut self, variable: Variable, value: LoweredValue) {
         self.initialize_local_with_old(variable, value, None);
     }
 
     fn initialize_local_with_old(
         &mut self,
         variable: Variable,
-        value: ClifValue,
-        known_old: Option<ClifValue>,
+        value: LoweredValue,
+        known_old: Option<LoweredValue>,
     ) {
         let (index, stored) = self.store_local(variable, value);
         let old = known_old.unwrap_or(stored);
@@ -78,24 +78,23 @@ impl FunctionCompiler<'_, '_> {
     /// Stores a value in its slot under a reference of the slot's own; a temporary keeps any
     /// reference it holds until its block's clear. Only a slot written more than once per call
     /// can hold an old value to release.
-    pub(super) fn own_local(&mut self, variable: Variable, value: ClifValue, repeated: bool) {
+    pub(super) fn own_local(&mut self, variable: Variable, value: LoweredValue, repeated: bool) {
         self.increment(value);
         self.replace_local(variable, value, repeated);
     }
 
-    pub(super) fn increment(&mut self, value: ClifValue) {
+    pub(super) fn increment(&mut self, value: LoweredValue) {
         let address = heap_address(self.b, value);
         let increment = self.b.create_block();
         let done = self.b.create_block();
         self.brif(address, increment, &[], done, &[]);
         self.switch(increment);
-        let store = increment_references(self.b, address);
-        self.mark_frame_store(store);
+        increment_references(self.b, address);
         self.jump(done, &[]);
         self.switch(done);
     }
 
-    pub(super) fn checked_temporary(&mut self, value: ClifValue, retain: bool) -> ClifValue {
+    pub(super) fn checked_temporary(&mut self, value: LoweredValue, retain: bool) -> LoweredValue {
         let missing =
             self.b
                 .ins()
@@ -124,20 +123,22 @@ impl FunctionCompiler<'_, '_> {
     }
 
     /// Takes a reference to a value the block keeps until its end.
-    pub(super) fn retain_temporary(&mut self, value: ClifValue) -> ClifValue {
+    pub(super) fn retain_temporary(&mut self, value: LoweredValue) -> LoweredValue {
         self.increment(value);
         self.track(value)
     }
 
     /// Keeps a reference the generated code already holds until the end of the block.
-    pub(super) fn own_temporary(&mut self, value: ClifValue) -> ClifValue {
+    pub(super) fn own_temporary(&mut self, value: LoweredValue) -> LoweredValue {
         self.track(value)
     }
 
-    pub(super) fn track(&mut self, value: ClifValue) -> ClifValue {
+    pub(super) fn track(&mut self, value: LoweredValue) -> LoweredValue {
         let variable = match self.free_owned.pop() {
             Some(variable) => variable,
-            None => self.b.declare_var(types::I64),
+            None => self
+                .b
+                .declare_var_with_entry_value(types::I64, self.empty_owned),
         };
         self.b.def_var(variable, value);
         self.owned.push(variable);
@@ -215,7 +216,7 @@ impl FunctionCompiler<'_, '_> {
         for _ in 0..params {
             self.b.append_block_param(exit, types::I64);
         }
-        let created = self.b.func.dfg.num_blocks();
+        let created = self.b.num_blocks();
         self.switch(exit);
         let params = self.b.block_params(exit).to_vec();
         let (&released, kept) = params.split_last().unwrap();
@@ -225,7 +226,7 @@ impl FunctionCompiler<'_, '_> {
         let kept: Vec<BlockArg> = kept.iter().map(|&value| BlockArg::Value(value)).collect();
         self.jump(next, &kept);
         self.b.set_cold_block(exit);
-        for index in created..self.b.func.dfg.num_blocks() {
+        for index in created..self.b.num_blocks() {
             self.b.set_cold_block(Block::from_u32(index as u32));
         }
     }
@@ -243,7 +244,7 @@ impl FunctionCompiler<'_, '_> {
     }
 
     /// Releases a value that may or may not be heap-tagged.
-    fn release_heap(&mut self, value: ClifValue, cold_drop: bool) {
+    fn release_heap(&mut self, value: LoweredValue, cold_drop: bool) {
         let heap = self.is_heap(value);
         let release = self.b.create_block();
         let done = self.b.create_block();
@@ -255,7 +256,7 @@ impl FunctionCompiler<'_, '_> {
 
     /// Loads a string literal from its cache in the function's data, creating it on the first
     /// execution. The cache owns the reference, so the value is never tracked.
-    pub(super) fn string_constant(&mut self, value: &str) -> ClifValue {
+    pub(super) fn string_constant(&mut self, value: &str) -> LoweredValue {
         let offset = self.data.push(0u64);
         let cache = self.data_address(offset);
         let cached = self
@@ -279,7 +280,7 @@ impl FunctionCompiler<'_, '_> {
         self.b.block_params(done)[0]
     }
 
-    pub(super) fn load_ctx(&mut self, offset: i32) -> ClifValue {
+    pub(super) fn load_ctx(&mut self, offset: i32) -> LoweredValue {
         self.b
             .ins()
             .load(types::I64, MemFlagsData::trusted(), self.ctx, offset)
@@ -287,7 +288,12 @@ impl FunctionCompiler<'_, '_> {
 
     /// Stores a value whose reference the slot already owns, releasing the value it replaces
     /// when the slot may already hold one.
-    pub(super) fn replace_local(&mut self, variable: Variable, value: ClifValue, repeated: bool) {
+    pub(super) fn replace_local(
+        &mut self,
+        variable: Variable,
+        value: LoweredValue,
+        repeated: bool,
+    ) {
         let (_, old) = self.store_local(variable, value);
         if !repeated {
             self.b.def_var(variable, value);
@@ -303,7 +309,7 @@ impl FunctionCompiler<'_, '_> {
         self.b.def_var(variable, value);
     }
 
-    fn store_local(&mut self, variable: Variable, value: ClifValue) -> (u32, ClifValue) {
+    fn store_local(&mut self, variable: Variable, value: LoweredValue) -> (u32, LoweredValue) {
         // Even scalar stores conservatively require the normal frame cleanup.
         if let Some(roots) = self.frame_roots {
             let dirty = self.b.ins().iconst(types::I8, 1);
@@ -327,7 +333,7 @@ impl FunctionCompiler<'_, '_> {
     }
 
     /// Releases a heap-tagged value, calling the runtime only when its count would reach zero.
-    pub(super) fn release_inline(&mut self, value: ClifValue, done: Block, cold_drop: bool) {
+    pub(super) fn release_inline(&mut self, value: LoweredValue, done: Block, cold_drop: bool) {
         let address = self.b.ins().band_imm_s(value, ADDRESS_MASK);
         let load = self.b.create_block();
         let decrement = self.b.create_block();
@@ -346,11 +352,9 @@ impl FunctionCompiler<'_, '_> {
         self.brif(shared, decrement, &[], last, &[]);
         self.switch(decrement);
         let references = self.b.ins().iadd_imm_s(references, -1);
-        let store = self
-            .b
+        self.b
             .ins()
             .store(flags, references, address, REFERENCES_OFFSET);
-        self.mark_frame_store(store);
         self.jump(done, &[]);
         self.switch(last);
         if cold_drop {
@@ -360,7 +364,7 @@ impl FunctionCompiler<'_, '_> {
         self.jump(done, &[]);
     }
 
-    pub(super) fn is_heap(&mut self, value: ClifValue) -> ClifValue {
+    pub(super) fn is_heap(&mut self, value: LoweredValue) -> LoweredValue {
         is_heap(self.b, value)
     }
 }

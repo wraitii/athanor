@@ -23,7 +23,7 @@ pub(super) fn apply(graph: &mut Graph, shapes: &super::shapes::Plan) -> super::R
                         && !shapes.megamorphic(graph, inst)
                         && shapes.alternatives(graph, inst).is_none()
                         && graph.insts[inst]
-                            .result
+                            .result()
                             .is_some_and(|value| guarded.contains(&value))
             )
         })
@@ -46,6 +46,7 @@ pub(super) fn apply(graph: &mut Graph, shapes: &super::shapes::Plan) -> super::R
         graph.insts[check_inst].source_name = data.source_name;
         graph.blocks[block].terminator = Some(Terminator {
             source_name: data.source_name,
+            emission_location: None,
             span: data.span,
             kind: TerminatorKind::Branch(check.unwrap(), Target::new(fast), Target::new(fallback)),
         });
@@ -53,6 +54,7 @@ pub(super) fn apply(graph: &mut Graph, shapes: &super::shapes::Plan) -> super::R
         graph.insts[read].source_name = data.source_name;
         graph.blocks[fast].terminator = Some(Terminator {
             source_name: data.source_name,
+            emission_location: None,
             span: data.span,
             kind: TerminatorKind::Jump(Target {
                 block: continuation,

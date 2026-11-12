@@ -39,7 +39,7 @@ pub(in crate::jit::semantic) fn simplify(function: &mut FunctionState, folder: &
                         continue;
                     }
                     Some(Fold::Alias(value)) => {
-                        aliases.insert(graph.insts[inst].result.unwrap(), value);
+                        aliases.insert(graph.insts[inst].result().unwrap(), value);
                         dead.push(inst);
                         continue;
                     }
@@ -53,8 +53,9 @@ pub(in crate::jit::semantic) fn simplify(function: &mut FunctionState, folder: &
                 }
                 if facts.removable(inst)
                     && graph.insts[inst]
-                        .result
-                        .is_none_or(|result| uses[result] == 0)
+                        .results
+                        .iter()
+                        .all(|&result| uses[result] == 0)
                 {
                     dead.push(inst);
                 }

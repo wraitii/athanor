@@ -165,12 +165,13 @@ impl<'a> Builder<'a> {
     fn push(&mut self, span: Span, op: Op, has_result: bool) -> Option<Value> {
         let block = self.current.expect("emission into unreachable code");
         let inst = self.graph.insts.next_key();
-        let result = has_result.then(|| self.graph.values.push(ValueDef::Result(inst)));
+        let result = has_result.then(|| self.graph.values.push(ValueDef::Result(inst, 0)));
         self.graph.insts.push(InstData {
             source_name: None,
+            emission_location: None,
             span,
             block,
-            result,
+            results: result.into_iter().collect(),
             op,
         });
         self.graph.blocks[block].insts.push(inst);
@@ -192,9 +193,10 @@ impl<'a> Builder<'a> {
                 let block = self.current.unwrap();
                 let inst = self.graph.insts.push(InstData {
                     source_name: None,
+                    emission_location: None,
                     span,
                     block,
-                    result: None,
+                    results: Vec::new(),
                     op: Op::LeaveScope(scope),
                 });
                 self.graph.blocks[block].insts.push(inst);
@@ -1654,6 +1656,9 @@ pub(super) fn lower_global(
             blocks: PrimaryMap::new(),
             insts: PrimaryMap::new(),
             values: PrimaryMap::new(),
+            low_level_types: Default::default(),
+            low_level_slots: Vec::new(),
+            low_level_signature: None,
             bindings: PrimaryMap::new(),
             scopes: PrimaryMap::new(),
         },
@@ -1748,6 +1753,9 @@ pub(super) fn lower_parts(
             blocks: PrimaryMap::new(),
             insts: PrimaryMap::new(),
             values: PrimaryMap::new(),
+            low_level_types: Default::default(),
+            low_level_slots: Vec::new(),
+            low_level_signature: None,
             bindings: PrimaryMap::new(),
             scopes: PrimaryMap::new(),
         },

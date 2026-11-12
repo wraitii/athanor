@@ -1,15 +1,15 @@
-use super::{ClifValue, FunctionCompiler};
+use super::{FunctionCompiler, LoweredValue};
 use crate::error::{Error, compile_at};
-use cranelift_codegen::ir::{InstBuilder, MemFlagsData, StackSlotData, StackSlotKind};
+use cranelift_codegen::ir::{MemFlagsData, StackSlotData, StackSlotKind};
 use oxc_ast::ast::Expression;
 use oxc_span::Span;
 
 impl FunctionCompiler<'_, '_> {
     pub(super) fn stack_values(
         &mut self,
-        values: &[ClifValue],
+        values: &[LoweredValue],
         span: Span,
-    ) -> Result<ClifValue, Error> {
+    ) -> Result<LoweredValue, Error> {
         if values.is_empty() {
             return Ok(self.b.ins().iconst(self.pointer, 0));
         }

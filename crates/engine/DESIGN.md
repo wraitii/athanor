@@ -76,15 +76,20 @@ coercions inside the fallback helper, preserving string comparison when both
 operands are strings.
 
 ```text
-Oxc AST -> semantic optimization -> typed CLIF + annotations
-                                -> our phi cleanup, instruction selection and allocation
-                                or Cranelift optimization and code generation
+Oxc AST -> semantic optimization -> runtime lowering into graph operations
+        -> Cranelift memory expansion -> CLIF + annotations
+        -> our phi cleanup, instruction selection and allocation
+        or Cranelift optimization and code generation
 ```
 
-`jit/clif.rs` pairs a CLIF `Function` with emission annotations for helper calls,
-invocation roots, frame stores and retained indexed loads. Annotations refer to
-that exact body and are consumed before Cranelift rewrites it. Source locations remain available
-separately for profiling.
+Shared runtime lowering builds `Op::LowLevel` operations and retained memory
+operations using ordinary graph values and block parameters. It owns runtime
+layout, helper-address calculation, representation conversion and reference
+lifetimes. `jit/emit/cranelift.rs` translates the resulting graph to CLIF.
+`jit/clif.rs` pairs that function with emission annotations; source locations
+also remain available for profiling. The current implementation rebuilds the
+graph during runtime lowering. That is an implementation choice, not a separate
+IR or a required semantic boundary.
 
 Known-kind bounded typed reads receive a final graph lowering after OSR
 preparation, followed by refreshed facts and borrow analysis. Reusable OSR
@@ -93,25 +98,24 @@ graphs retain the earlier runtime operations. Runtime storage extraction
 `Op::Memory(MemoryOp::IndexedLoad)` reads a scalar at an integer element index.
 `MemoryNumber` expresses extension or floating-point conversion separately;
 `KeepAlive` keeps the receiver live through the access. Pointer and raw scalar
-facts are distinct from JS values. This first slice keeps raw values within a
-block, with verifier checks on their consumers; it does not yet support raw
-block parameters or moving these accesses across effects.
+facts are distinct from JS values. This runtime memory pass keeps extracted
+storage accesses within a block, with verifier checks on their consumers.
+The subsequent low-level graph supports scalar block parameters for the
+control flow introduced by runtime lowering.
 
-AArch64 consumes the indexed load directly. Because its allocator still uses
-CLIF storage, emission carries the load in a named, annotated call instruction
-with real base/index operands. Native selection implements that marker as a
-load, and ABI/liveness analysis excludes it from calls. It is never an executable
-call. The Cranelift path clones the graph and expands indexed loads into address
-operations and scalar loads before emission. When native fallback is enabled,
-functions containing indexed loads currently prepare both emitted forms;
-native-only compilation prepares only the retained form. This deliberately favors a simple
-transition over minimizing fallback preparation cost. The baseline path keeps
-its existing direct implementation.
+Indexed loads survive shared runtime lowering. Their Cranelift-specific
+expansion into address operations and scalar loads runs afterward. At this
+intermediate migration stage, both optimized backends still receive the
+resulting CLIF; the production path no longer transports indexed loads as
+synthetic calls. Switching optimized AArch64 selection and allocation to the
+lowered graph is a separate next step. The baseline path keeps its existing
+direct implementation, and `JITModule` still handles symbols, relocation and
+executable memory.
 
 Helpers listed by `Helper::returns_reference` return heap results with a
 reference the generated code owns; inline fast paths take the same reference by
-incrementing the count. Emission holds each such reference in a pooled Cranelift
-variable, which is `undefined` on paths that never took it. A result's references
+incrementing the count. Lowering holds each such reference in a pooled graph
+variable, initialized to a non-reference zero on paths that never took it. A result's references
 are released right after its last use in its block, counting the uses of borrowed
 values that may alias it. Maybe-owned results are owned or not heap-tagged, so
 they never alias their operands. Results used by a terminator or another block,
@@ -1176,6 +1180,10 @@ local to their graph and assumptions.
 Values are SSA: each is defined once, by an instruction result or a block
 parameter, and every use is dominated by its definition. Control-flow merges
 (default parameters, `||`, `&&`, `??`, `?:`) pass values as branch arguments.
+Instructions have zero or more results; a result definition identifies both
+its instruction and its position in that instruction's result list. Single-value
+construction remains convenient, while low-level calls can expose value and
+status results directly without introducing projection operations.
 Blocks, instructions, values, bindings and scopes are Cranelift entity IDs, so
 instruction IDs are stable within a graph and could later name operation sites.
 Instructions and terminators carry source byte spans and preserve source

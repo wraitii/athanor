@@ -7,7 +7,6 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::JITModule;
 use cranelift_module::{FuncId, Module};
 
-use super::scope::heap_address;
 use crate::error::Error;
 use crate::heap::CODE_OFFSET;
 use crate::jit::entries::{
@@ -20,9 +19,21 @@ use crate::jit::session::{
     CALL_SAMPLE_CODE_OFFSET, CALL_SAMPLE_SIZE, CALL_SAMPLES, CALL_SAMPLES_LEN_OFFSET,
     CALL_SAMPLES_OFFSET, CALL_SITE_OFFSET, ERROR_OFFSET, EXCEPTION_OFFSET,
 };
-use crate::value::Value;
+use crate::value::{TAG_OBJECT, TAG_SHIFT, Value};
 
 pub(in crate::jit) const STUB_ARITIES: u16 = 8;
+
+fn heap_address(
+    b: &mut FunctionBuilder<'_>,
+    value: cranelift_codegen::ir::Value,
+) -> cranelift_codegen::ir::Value {
+    let tag = b.ins().ushr_imm_s(value, TAG_SHIFT as i64);
+    let offset = b.ins().iadd_imm_s(tag, -((TAG_OBJECT >> TAG_SHIFT) as i64));
+    let heap = b.ins().icmp_imm_s(IntCC::UnsignedLessThan, offset, 2);
+    let address = b.ins().band_imm_s(value, (1 << TAG_SHIFT) - 1);
+    let zero = b.ins().iconst(types::I64, 0);
+    b.ins().select(heap, address, zero)
+}
 
 #[derive(Clone, Copy)]
 pub(in crate::jit) struct Stubs {

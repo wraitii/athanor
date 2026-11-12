@@ -24,13 +24,13 @@ pub(super) fn expose(function: &mut super::FunctionState) {
                 });
                 if let Some(&(_, earlier)) = earlier {
                     changed = true;
-                    aliases.insert(data.result.unwrap(), earlier);
+                    aliases.insert(data.result().unwrap(), earlier);
                     removed.push(inst);
                 } else {
                     checks
                         .entry(value)
                         .or_default()
-                        .push((block, data.result.unwrap()));
+                        .push((block, data.result().unwrap()));
                 }
                 continue;
             }

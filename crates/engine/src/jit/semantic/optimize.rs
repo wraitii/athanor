@@ -210,7 +210,7 @@ fn invariant_guards(
 ) -> Vec<Block> {
     let probed: HashSet<Value> = probes
         .iter()
-        .filter_map(|inst| graph.insts[*inst].result)
+        .filter_map(|inst| graph.insts[*inst].result())
         .collect();
     let invariant =
         |value: Value| !inside.contains(&graph.def_block(value)) || probed.contains(&value);
@@ -470,7 +470,7 @@ fn entry_assumes(
     let facts = Facts::assuming(graph, &guards::assumed(&HashMap::new(), assumed));
     let probed: HashSet<Value> = probes
         .iter()
-        .filter_map(|inst| graph.insts[*inst].result)
+        .filter_map(|inst| graph.insts[*inst].result())
         .collect();
     let mut checks: Vec<_> = candidates
         .iter()
@@ -512,7 +512,7 @@ pub(super) fn reuse_loads(function: &mut FunctionState) {
     let aliases: HashMap<Value, Value> = solved
         .reused
         .iter()
-        .map(|&(inst, value)| (graph.insts[inst].result.unwrap(), value))
+        .map(|&(inst, value)| (graph.insts[inst].result().unwrap(), value))
         .collect();
     graph.replace_uses(&aliases);
     for &(inst, value) in &solved.folded {
@@ -594,7 +594,7 @@ pub(super) fn hoist(function: &mut FunctionState, region: RegionId) {
                 continue;
             }
             let pure = facts.is_pure(inst);
-            if data.result.is_some()
+            if !data.results.is_empty()
                 && invariant(graph, &data.op)
                 && (pure || writes.preserves(graph, inst))
             {
@@ -607,7 +607,7 @@ pub(super) fn hoist(function: &mut FunctionState, region: RegionId) {
         for &block in cfg.rpo.iter().filter(|block| body.contains(block)) {
             for inst in graph.blocks[block].insts.clone() {
                 let data = &graph.insts[inst];
-                if data.result.is_some()
+                if !data.results.is_empty()
                     && (facts.is_pure(inst)
                         || (facts.removable(inst) && writes.preserves(graph, inst)))
                     && invariant(graph, &data.op)
@@ -622,7 +622,11 @@ pub(super) fn hoist(function: &mut FunctionState, region: RegionId) {
             let data = &graph.insts[inst];
             notes.push(format!(
                 "{} = {} hoisted from {header} to {preheader}",
-                data.result.unwrap(),
+                data.results
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
                 graph.op_text(&data.op)
             ));
         }
@@ -664,7 +668,7 @@ fn probe_reads(
                 && (input || writes.preserves(graph, inst))
             {
                 reads.push(inst);
-                probed.extend(data.result);
+                probed.extend(data.result());
             }
         }
     }
@@ -762,7 +766,7 @@ pub(super) fn sink_closures(function: &mut FunctionState) {
         }
     }
     for inst in closures {
-        let value = graph.insts[inst].result.unwrap();
+        let value = graph.insts[inst].result().unwrap();
         let Some(users) = uses.get(&value) else {
             graph.remove_inst(inst);
             changed = true;
@@ -874,7 +878,7 @@ pub(super) fn forward_captured_parameters(function: &mut FunctionState) {
                 if initialized
                     && matches!(graph.insts[inst].op, Op::Read(target) if target == binding)
                 {
-                    aliases.insert(graph.insts[inst].result.unwrap(), value);
+                    aliases.insert(graph.insts[inst].result().unwrap(), value);
                     removed.push(inst);
                 }
             }

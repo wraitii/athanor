@@ -103,7 +103,7 @@ pub(super) fn plan(graph: &Graph, bodies: &super::specialize::Repository, source
                 continue;
             };
             let site = site(graph, inst, source);
-            let callee = data.result.is_some_and(|value| callees.contains(&value));
+            let callee = data.result().is_some_and(|value| callees.contains(&value));
             let object = match data.op {
                 Op::Get(object, _) | Op::ProbeProperty(object, _) | Op::Set(object, ..) => object,
                 _ => continue,
@@ -173,7 +173,8 @@ fn planned(graph: &Graph, plan: &Plan) -> HashMap<Inst, (Value, u32, u32)> {
             let (Op::Get(object, _) | Op::Set(object, ..)) = data.op else {
                 continue;
             };
-            if data.result.is_some_and(|value| callees.contains(&value)) || invariant(block, object)
+            if data.result().is_some_and(|value| callees.contains(&value))
+                || invariant(block, object)
             {
                 continue;
             }
@@ -255,12 +256,12 @@ fn segments(graph: &Graph, planned: &HashMap<Inst, (Value, u32, u32)>) -> Vec<Se
                         guards: vec![(object, shape)],
                     });
                 }
-                defined.extend(data.result);
+                defined.extend(data.result());
                 continue;
             }
             if current.is_some() && shape_preserving(graph, &facts, &data.op) {
                 pending.push(inst);
-                defined.extend(data.result);
+                defined.extend(data.result());
                 continue;
             }
             segments.extend(current.take());
@@ -375,9 +376,9 @@ fn guard_segment(
         for value in op.operands_mut() {
             *value = clones.get(value).copied().unwrap_or(*value);
         }
-        let (clone, result) = graph.append(fallback, data.span, op, data.result.is_some());
+        let (clone, result) = graph.append(fallback, data.span, op, data.result().is_some());
         graph.insts[clone].source_name = data.source_name;
-        if let (Some(original), Some(result)) = (data.result, result) {
+        if let (Some(original), Some(result)) = (data.result(), result) {
             clones.insert(original, result);
         }
         graph.move_inst(inst, fast);
@@ -401,7 +402,7 @@ fn guard_segment(
     let outputs: Vec<Value> = segment
         .insts
         .iter()
-        .filter_map(|&inst| graph.insts[inst].result)
+        .filter_map(|&inst| graph.insts[inst].result())
         .filter(|value| counts[*value] > inner.get(value).copied().unwrap_or(0))
         .collect();
     let params: HashMap<Value, Value> = outputs
@@ -418,6 +419,7 @@ fn guard_segment(
     }
     let jump = |args| Terminator {
         source_name: first.source_name,
+        emission_location: None,
         span: first.span,
         kind: TerminatorKind::Jump(Target {
             block: continuation,
@@ -442,6 +444,7 @@ fn guard_segment(
         let check = graph.append_value(check_block, first.span, Op::IsShape(object, shape));
         graph.blocks[check_block].terminator = Some(Terminator {
             source_name: first.source_name,
+            emission_location: None,
             span: first.span,
             kind: TerminatorKind::Branch(check, Target::new(next), Target::new(fallback)),
         });

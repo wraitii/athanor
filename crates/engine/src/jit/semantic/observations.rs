@@ -58,7 +58,7 @@ pub(super) fn plan(
                 end: data.span.end,
             };
             let mut hints = Vec::new();
-            if let Some(value) = data.result {
+            if let Some(value) = data.result() {
                 let mut origins = carried.get(&value).cloned().unwrap_or_default();
                 if !origins.iter().any(|(kind, _)| *kind == ReadKind::Number) {
                     origins.push((ReadKind::Number, site));
@@ -107,7 +107,7 @@ pub(super) fn plan(
                 data.op,
                 Op::Get(..) | Op::GetIndex(..) | Op::IndexedGet(..) | Op::ArrayLoad(..)
             ) {
-                data.result
+                data.result()
                     .filter(|value| {
                         receivers.contains(value) && facts.of(*value).intersects(Types::OBJECT)
                     })
@@ -119,7 +119,7 @@ pub(super) fn plan(
                 data.op,
                 Op::Get(..) | Op::GetIndex(..) | Op::IndexedGet(..) | Op::ArrayLoad(..)
             ) {
-                data.result
+                data.result()
                     .filter(|value| {
                         facts.of(*value).intersects(Types::NUMBER)
                             && !facts.of(*value).within(Types::INTEGER)
@@ -224,7 +224,7 @@ pub(super) fn numeric_site(graph: &Graph, value: super::Value) -> Option<Site> {
             }
         }
     }
-    let super::ValueDef::Result(inst) = graph.values[value] else {
+    let super::ValueDef::Result(inst, _) = graph.values[value] else {
         return None;
     };
     let data = &graph.insts[inst];

@@ -34,6 +34,8 @@ pub(in crate::jit) fn lower_memory_for_cranelift(graph: &mut Graph) {
                 true,
             );
             graph.insts[address_inst].source_name = data.source_name;
+            graph.insts[address_inst].emission_location = data.emission_location;
+            graph.low_level_types[address.unwrap()] = graph.low_level_types[base];
             graph.insts[inst].op = Op::Memory(MemoryOp::Load {
                 address: address.unwrap(),
                 format,

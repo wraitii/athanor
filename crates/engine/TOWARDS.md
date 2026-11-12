@@ -30,6 +30,10 @@ Semantic rules establish legal alternatives; target constraints and costs help c
 
 Cranelift and our AArch64 backend currently share CLIF storage for the optimized path. The experimental AArch64 baseline instead consumes the semantic graph directly. The immediate goal is to make more emitted work visible in the graph and let each backend consume the operations it supports, without introducing a parallel semantic operation model at the CLIF boundary.
 
+Shared runtime lowering now produces a distinct low-level operation family within `Op`, using the graph's ordinary values and block parameters. It preserves compound operations that a backend can consume directly. Cranelift-specific expansion of `IndexedLoad` follows that shared lowering. At this intermediate migration stage both optimized backends still consume the resulting CLIF; the next step is for AArch64 to consume the lowered graph, including retained indexed loads, directly. Both routes can continue using `JITModule` for symbols, relocation and executable memory. Owning the graph and native allocation does not require replacing that loader.
+
+The semantic graph already has SSA construction and binding promotion. Runtime lowering now builds SSA for its additional control flow and mutable temporaries in the same graph infrastructure, including multiple call results and scalar representations. It builds a replacement graph and preserves source provenance. This rewrite boundary is an implementation choice: earlier lowering passes can progressively shrink it without changing the graph's semantics or introducing a mandatory sequence of operation families.
+
 On the Cranelift path, our graph can use target constraints and pressure estimates before emission, but cannot assume feedback from its allocator or revise choices during allocation. The native path owns allocation, although its current CLIF input still separates those decisions from the semantic graph.
 
 **Examples of the intended benefits**

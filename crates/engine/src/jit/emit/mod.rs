@@ -1,7 +1,9 @@
 pub(super) mod class;
+pub(super) mod cranelift;
 pub(in crate::jit) mod expression;
 mod ir_helpers;
 mod ops;
+mod poll;
 mod repr;
 pub(in crate::jit) mod scope;
 mod semantic_graph;
@@ -11,11 +13,13 @@ pub(super) mod stubs;
 
 use std::collections::HashMap;
 
-use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::{
-    Block, BlockArg, Inst, InstBuilder, MemFlagsData, SigRef, Type, Value as ClifValue, types,
+use super::semantic::low_level::{
+    BlockArg, Builder as GraphBuilder, SignatureRef as SigRef, Variable,
 };
-use cranelift_frontend::{FunctionBuilder, Variable};
+use super::semantic::{Block, Inst, Value as LoweredValue};
+use cranelift_codegen::ir::condcodes::IntCC;
+use cranelift_codegen::ir::{MemFlagsData, Type, types};
+use cranelift_frontend::FunctionBuilder;
 use cranelift_jit::JITModule;
 use cranelift_module::{FuncId, Module};
 use oxc_span::Span;
@@ -46,18 +50,18 @@ pub(super) struct FunctionCompiler<'a, 'f> {
     names: &'a mut Vec<Box<str>>,
     cells: &'a mut Vec<Box<u64>>,
     data: &'a mut FunctionData,
-    data_base: ClifValue,
+    data_base: LoweredValue,
     source_name: (usize, usize),
     source_span: Span,
-    b: &'a mut FunctionBuilder<'f>,
+    b: &'a mut GraphBuilder<'f>,
     module: &'a mut JITModule,
     helper_signatures: HashMap<Helper, SigRef>,
     source_names: HashMap<usize, i64>,
     stubs: Stubs,
     annotations: &'a mut Annotations,
     pointer: Type,
-    ctx: ClifValue,
-    receiver: ClifValue,
+    ctx: LoweredValue,
+    receiver: LoweredValue,
     arguments: Arguments,
     return_block: Block,
     failed_exit: Option<Block>,
@@ -67,11 +71,11 @@ pub(super) struct FunctionCompiler<'a, 'f> {
     frame_size: Option<Inst>,
     frame_roots: Option<Variable>,
     frame: Option<CallerFrame>,
-    frame_code: bool,
     fixed_signatures: HashMap<u16, SigRef>,
     property_caches: HashMap<super::semantic::Inst, i64>,
     slots: HashMap<u32, u32>,
     slot_count: u32,
+    empty_owned: LoweredValue,
     owned: Vec<Variable>,
     free_owned: Vec<Variable>,
     unchecked: Option<Variable>,
@@ -79,19 +83,22 @@ pub(super) struct FunctionCompiler<'a, 'f> {
 }
 
 enum Arguments {
-    Vector { argv: ClifValue, argc: ClifValue },
-    Fixed(Vec<ClifValue>),
+    Vector {
+        argv: LoweredValue,
+        argc: LoweredValue,
+    },
+    Fixed(Vec<LoweredValue>),
 }
 
 #[derive(Clone, Copy)]
 struct CallerFrame {
-    start: ClifValue,
-    base: ClifValue,
+    start: LoweredValue,
+    base: LoweredValue,
 }
 
 const INLINE_FRAME_RELEASES: u32 = 4;
 
-fn data_base(b: &mut FunctionBuilder<'_>, pointer: Type, data: &FunctionData) -> ClifValue {
+fn data_base(b: &mut GraphBuilder<'_>, pointer: Type, data: &FunctionData) -> LoweredValue {
     let holder = b.ins().iconst(pointer, &raw const *data as i64);
     b.ins().load(
         pointer,
@@ -102,7 +109,6 @@ fn data_base(b: &mut FunctionBuilder<'_>, pointer: Type, data: &FunctionData) ->
 }
 
 pub(super) struct Output<'a, 'f> {
-    pub(super) cranelift: bool,
     pub(super) b: &'a mut FunctionBuilder<'f>,
     pub(super) module: &'a mut JITModule,
     pub(super) stubs: Stubs,
@@ -172,34 +178,8 @@ fn build_callable(
     continuations: &HashMap<usize, FuncId>,
     feedback: Option<Feedback>,
 ) -> Result<(), Error> {
-    let lowered;
-    let lowered_facts;
-    let body = if out.cranelift {
-        match body {
-            CallableBody::Graph(graph, _)
-                if graph.insts.values().any(|data| {
-                    matches!(
-                        data.op,
-                        super::semantic::Op::Memory(super::semantic::MemoryOp::IndexedLoad { .. })
-                    )
-                }) =>
-            {
-                lowered = {
-                    let mut graph = graph.clone();
-                    super::semantic::lower_memory_for_cranelift(&mut graph);
-                    graph
-                };
-                lowered_facts = super::semantic::Facts::compute(&lowered);
-                CallableBody::Graph(&lowered, &lowered_facts)
-            }
-            other => other,
-        }
-    } else {
-        body
-    };
     let Output {
-        cranelift: _,
-        b,
+        b: clif_builder,
         module,
         stubs,
         annotations,
@@ -208,7 +188,15 @@ fn build_callable(
         data,
         source_name,
     } = out;
-    let entry = b.create_block();
+    let mut lowered = super::semantic::Graph::new_low_level(
+        "<lowered>".into(),
+        params,
+        clif_builder.func.signature.clone(),
+    );
+    let mut graph_builder = GraphBuilder::new(&mut lowered);
+    let b = &mut graph_builder;
+    b.set_source_name(Some(source_name));
+    let entry = b.graph.entry;
     b.switch_to_block(entry);
     b.append_block_params_for_function_params(entry);
     let values = b.block_params(entry).to_vec();
@@ -230,6 +218,7 @@ fn build_callable(
 
     let pointer = module.target_config().pointer_type();
     let data_base = data_base(b, pointer, data);
+    let empty_owned = b.ins().iconst(types::I64, 0);
     let mut compiler = FunctionCompiler {
         feedback,
         names,
@@ -256,11 +245,11 @@ fn build_callable(
         frame_size: None,
         frame_roots: None,
         frame: None,
-        frame_code: false,
         fixed_signatures: HashMap::new(),
         property_caches: HashMap::new(),
         slots: HashMap::new(),
         slot_count: 0,
+        empty_owned,
         owned: Vec::new(),
         free_owned: Vec::new(),
         unchecked: None,
@@ -285,13 +274,16 @@ fn build_callable(
         compiler.switch(return_block);
         let result = compiler.b.block_params(return_block)[0];
         compiler.return_value(result);
-        return Ok(());
-    }
-    if let CallableBody::Graph(graph, facts) = body {
+    } else if let CallableBody::Graph(graph, facts) = body {
         compiler.emit_semantic_graph(graph, facts, closure, continuations)?;
         compiler.patch_frame_size();
-        return Ok(());
     }
+    drop(compiler);
+    graph_builder.finish().map_err(Error::Compile)?;
+    lowered.verify().map_err(Error::Compile)?;
+    super::semantic::lower_memory_for_cranelift(&mut lowered);
+    lowered.verify().map_err(Error::Compile)?;
+    cranelift::emit(clif_builder, module, &lowered, Some(annotations))?;
     Ok(())
 }
 
@@ -308,7 +300,7 @@ impl FunctionCompiler<'_, '_> {
 
     pub(super) fn brif(
         &mut self,
-        condition: ClifValue,
+        condition: LoweredValue,
         then_block: Block,
         then_args: &[BlockArg],
         else_block: Block,
@@ -322,7 +314,7 @@ impl FunctionCompiler<'_, '_> {
 
     /// Fixed-arity code also returns whether it left with an error or exception pending,
     /// sparing direct callers from checking.
-    pub(super) fn return_args(&mut self, value: ClifValue, failed: bool) -> Vec<BlockArg> {
+    pub(super) fn return_args(&mut self, value: LoweredValue, failed: bool) -> Vec<BlockArg> {
         let mut args = vec![BlockArg::Value(value)];
         if matches!(self.arguments, Arguments::Fixed(_)) {
             let status = self.b.ins().iconst(types::I8, i64::from(failed));
@@ -358,7 +350,7 @@ impl FunctionCompiler<'_, '_> {
         self.jump(self.return_block, &args);
     }
 
-    pub(super) fn return_value(&mut self, value: ClifValue) {
+    pub(super) fn return_value(&mut self, value: LoweredValue) {
         if let Some(feedback) = self.feedback.filter(|feedback| feedback.function_return)
             && self.stubs.compilation_state != 0
             && feedback.owner >= crate::jit::entries::DIRECT_ENTRIES as u64
@@ -401,14 +393,14 @@ impl FunctionCompiler<'_, '_> {
             self.b.ins().brif(warm, poll, &[], done, &[]);
             self.b.switch_to_block(poll);
             let owner = self.b.ins().iconst(types::I64, feedback.owner as i64);
-            if let Some(call) = stubs::poll(
+            if let Some(call) = poll::emit(
                 self.b,
                 self.module,
                 self.stubs.compilation_state,
                 self.ctx,
                 Some(owner),
             ) {
-                self.annotations.helpers.insert(call, Helper::CompileLeave);
+                self.b.mark_helper(call, Helper::CompileLeave);
             }
             self.b.ins().jump(done, &[]);
             self.b.switch_to_block(done);
@@ -422,9 +414,8 @@ impl FunctionCompiler<'_, '_> {
         self.terminated = true;
     }
 
-    fn exit_frame(&mut self, value: ClifValue) {
+    fn exit_frame(&mut self, value: LoweredValue) {
         let caller = self.frame.unwrap();
-        self.frame_code = true;
         self.increment(value);
         if self.slot_count > 0 {
             let release = self.b.create_block();
@@ -447,7 +438,6 @@ impl FunctionCompiler<'_, '_> {
         self.store_ctx(start, crate::jit::session::LOCALS_LEN_OFFSET);
         self.store_ctx(caller.start, crate::jit::session::LOCALS_START_OFFSET);
         self.store_ctx(caller.base, crate::jit::session::LOCALS_OFFSET);
-        self.frame_code = false;
     }
 
     fn release_slot(&mut self, slot: u32) {
@@ -456,8 +446,7 @@ impl FunctionCompiler<'_, '_> {
         let offset = (slot * 8) as i32;
         let value = self.b.ins().load(types::I64, flags, base, offset);
         let empty = self.constant(Value::UNDEFINED);
-        let store = self.b.ins().store(flags, empty, base, offset);
-        self.mark_frame_store(store);
+        self.b.ins().store(flags, empty, base, offset);
         let heap = self.is_heap(value);
         let release = self.b.create_block();
         let done = self.b.create_block();
@@ -477,14 +466,13 @@ impl FunctionCompiler<'_, '_> {
         let clean = self.b.ins().iconst(types::I8, 0);
         self.b.def_var(roots, clean);
         self.frame_roots = Some(roots);
-        self.frame_code = true;
         let caller = CallerFrame {
             start: self.load_ctx(LOCALS_START_OFFSET),
             base: self.load_ctx(LOCALS_OFFSET),
         };
         let start = self.load_ctx(LOCALS_LEN_OFFSET);
         let size = self.b.ins().iconst(types::I64, 0);
-        self.frame_size = Some(self.b.func.dfg.value_def(size).unwrap_inst());
+        self.frame_size = Some(self.b.defining_inst(size));
         let len = self.b.ins().iadd(start, size);
         let limit = self.load_ctx(LOCALS_LIMIT_OFFSET);
         let full = self.b.ins().icmp(IntCC::UnsignedGreaterThan, len, limit);
@@ -515,34 +503,23 @@ impl FunctionCompiler<'_, '_> {
         self.store_ctx(start, LOCALS_START_OFFSET);
         self.store_ctx(len, LOCALS_LEN_OFFSET);
         self.frame = Some(caller);
-        self.frame_code = false;
     }
 
-    fn store_ctx(&mut self, value: ClifValue, offset: i32) -> Inst {
+    fn store_ctx(&mut self, value: LoweredValue, offset: i32) -> Inst {
         let store = self
             .b
             .ins()
             .store(MemFlagsData::trusted(), value, self.ctx, offset);
-        self.mark_frame_store(store);
         store
-    }
-
-    pub(super) fn mark_frame_store(&mut self, store: Inst) {
-        if self.frame_code {
-            self.annotations.frame_stores.insert(store);
-        }
     }
 
     fn patch_frame_size(&mut self) {
         if let Some(inst) = self.frame_size {
-            self.b
-                .func
-                .replace(inst)
-                .iconst(types::I64, self.slot_count as i64);
+            self.b.patch_integer(inst, self.slot_count as u64);
         }
     }
 
-    pub(super) fn argument_vector(&self) -> Result<(ClifValue, ClifValue), Error> {
+    pub(super) fn argument_vector(&self) -> Result<(LoweredValue, LoweredValue), Error> {
         match self.arguments {
             Arguments::Vector { argv, argc } => Ok((argv, argc)),
             Arguments::Fixed(_) => Err(Error::Compile(
@@ -551,7 +528,7 @@ impl FunctionCompiler<'_, '_> {
         }
     }
 
-    pub(super) fn load_arg(&mut self, index: usize) -> ClifValue {
+    pub(super) fn load_arg(&mut self, index: usize) -> LoweredValue {
         let (argv, argc) = match &self.arguments {
             Arguments::Fixed(params) => return params[index],
             Arguments::Vector { argv, argc } => (*argv, *argc),

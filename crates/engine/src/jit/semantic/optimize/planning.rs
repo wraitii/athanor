@@ -553,7 +553,7 @@ fn plan_region(
         if uses[value] != 0 || !body.contains(&planning.def_block(value)) {
             continue;
         }
-        let ValueDef::Result(inst) = planning.values[value] else {
+        let ValueDef::Result(inst, _) = planning.values[value] else {
             continue;
         };
         match planning.insts[inst].op {
@@ -576,7 +576,7 @@ fn plan_region(
     );
     let available: HashSet<_> = reads
         .iter()
-        .filter_map(|&inst| planning.insts[inst].result)
+        .filter_map(|&inst| planning.insts[inst].result())
         .collect();
     let assumes = candidates.facts.clone();
     let numbers = entry_assumes(&planning, &body, &reads, &assumed, &assumes);
@@ -924,7 +924,7 @@ mod tests {
                 .insts
                 .iter()
                 .find_map(|(inst, data)| {
-                    matches!(data.op, Op::Argument(0)).then(|| (inst, data.result.unwrap()))
+                    matches!(data.op, Op::Argument(0)).then(|| (inst, data.result().unwrap()))
                 })
                 .unwrap();
             let data = &graph.insts[inst];
@@ -948,7 +948,7 @@ mod tests {
                 .iter()
                 .flat_map(|&block| &graph.blocks[block].insts)
                 .filter(|&&inst| matches!(graph.insts[inst].op, Op::AsInteger(_)))
-                .map(|&inst| graph.insts[inst].result.unwrap())
+                .map(|&inst| graph.insts[inst].result().unwrap())
                 .collect();
             assert_eq!(!integers.is_empty(), observed == ReadType::Integer);
             for value in integers {
@@ -1010,7 +1010,7 @@ mod tests {
                             bounded: true
                         }
                     ))
-                ) && facts.of(data.result.unwrap()).within(Types::INTEGER)
+                ) && facts.of(data.result().unwrap()).within(Types::INTEGER)
             });
         assert!(integer_add);
         graph.verify().unwrap();
@@ -1255,7 +1255,7 @@ mod tests {
                     graph.insts[inst].op,
                     Op::Binary(BinaryOperator::Addition, ..)
                 )
-                .then(|| graph.insts[inst].result.unwrap())
+                .then(|| graph.insts[inst].result().unwrap())
             })
             .collect();
         assert!(!additions.is_empty());
@@ -1342,7 +1342,7 @@ mod tests {
             .values()
             .find_map(|data| {
                 matches!(data.op, Op::Construct { .. })
-                    .then_some(data.result)
+                    .then_some(data.result())
                     .flatten()
             })
             .unwrap();

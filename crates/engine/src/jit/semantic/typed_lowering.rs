@@ -49,6 +49,7 @@ pub(super) fn lower(function: &mut FunctionState) -> super::Result<bool> {
         );
         graph.blocks[block].terminator = Some(Terminator {
             source_name: data.source_name,
+            emission_location: None,
             span: data.span,
             kind: TerminatorKind::Branch(exact, Target::new(bounds), Target::new(failure)),
         });
@@ -56,6 +57,7 @@ pub(super) fn lower(function: &mut FunctionState) -> super::Result<bool> {
         let inside = append(graph, &data, bounds, Op::IsInBounds(position, length));
         graph.blocks[bounds].terminator = Some(Terminator {
             source_name: data.source_name,
+            emission_location: None,
             span: data.span,
             kind: TerminatorKind::Branch(inside, Target::new(load), Target::new(failure)),
         });
@@ -64,6 +66,7 @@ pub(super) fn lower(function: &mut FunctionState) -> super::Result<bool> {
         let undefined = append(graph, &data, failure, Op::Constant(Constant::Undefined));
         graph.blocks[failure].terminator = Some(Terminator {
             source_name: data.source_name,
+            emission_location: None,
             span: data.span,
             kind: TerminatorKind::Jump(Target {
                 block: continuation,
@@ -273,7 +276,7 @@ mod tests {
                 unreachable!()
             };
             let data = graph.insts[inst].clone();
-            let block = graph.def_block(data.result.unwrap());
+            let block = graph.def_block(data.result().unwrap());
             let at = graph.blocks[block]
                 .insts
                 .iter()
@@ -294,7 +297,7 @@ mod tests {
                 &mut graph,
                 &data,
                 block,
-                Op::NewArray(vec![data.result.unwrap(), second]),
+                Op::NewArray(vec![data.result().unwrap(), second]),
             );
             graph.blocks[block].terminator.as_mut().unwrap().kind = TerminatorKind::Return(result);
             let mut function = FunctionState::new(graph, Vec::new(), true);

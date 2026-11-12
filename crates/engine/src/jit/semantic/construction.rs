@@ -70,6 +70,7 @@ pub(super) fn expand(graph: &mut Graph, expanded: &mut HashSet<Inst>) {
         graph.insts[check].source_name = data.source_name;
         graph.blocks[block].terminator = Some(Terminator {
             source_name: data.source_name,
+            emission_location: None,
             span: data.span,
             kind: TerminatorKind::Branch(unresolved, Target::new(fallback), Target::new(fast)),
         });
@@ -92,6 +93,7 @@ pub(super) fn expand(graph: &mut Graph, expanded: &mut HashSet<Inst>) {
         }
         graph.blocks[fast].terminator = Some(Terminator {
             source_name: data.source_name,
+            emission_location: None,
             span: data.span,
             kind: TerminatorKind::Jump(Target {
                 block: continuation,

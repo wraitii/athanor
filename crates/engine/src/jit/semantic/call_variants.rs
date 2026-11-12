@@ -97,7 +97,7 @@ pub(in crate::jit) fn assume(graph: &mut Graph, requirements: &Requirements) {
             .insts
             .values()
             .filter_map(|data| {
-                let result = data.result?;
+                let result = data.result()?;
                 (result != value && self::input(graph, result) == Some(input))
                     .then_some((result, value))
             })

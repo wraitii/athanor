@@ -29,7 +29,7 @@ pub(super) fn lower(function: &mut FunctionState) -> bool {
                     && facts.of(right).within(Types::NUMBER)
                     && !(operator != BinaryOperator::Division
                         && data
-                            .result
+                            .result()
                             .is_some_and(|result| facts.of(result).within(Types::INTEGER))) =>
                 {
                     let at = graph.blocks[block]

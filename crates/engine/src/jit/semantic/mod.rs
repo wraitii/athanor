@@ -16,6 +16,7 @@ mod guards;
 mod inlining;
 mod js;
 mod listing;
+pub(in crate::jit) mod low_level;
 mod memory_lowering;
 pub(in crate::jit) use memory_lowering::lower_memory_for_cranelift;
 mod numeric_lowering;
@@ -115,6 +116,9 @@ pub(super) struct Graph {
     pub(super) blocks: PrimaryMap<Block, BlockData>,
     pub(super) insts: PrimaryMap<Inst, InstData>,
     pub(super) values: PrimaryMap<Value, ValueDef>,
+    pub(super) low_level_types: SecondaryMap<Value, Option<cranelift_codegen::ir::Type>>,
+    pub(super) low_level_slots: Vec<low_level::StackSlotData>,
+    pub(super) low_level_signature: Option<cranelift_codegen::ir::Signature>,
     pub(super) bindings: PrimaryMap<Binding, BindingData>,
     pub(super) scopes: PrimaryMap<Scope, ScopeData>,
 }
@@ -141,15 +145,29 @@ pub(super) struct BlockData {
 #[derive(Clone)]
 pub(super) struct InstData {
     pub(super) source_name: Option<(usize, usize)>,
+    pub(super) emission_location: Option<u32>,
     pub(super) span: Span,
     pub(super) block: Block,
-    pub(super) result: Option<Value>,
+    pub(super) results: Vec<Value>,
     pub(super) op: Op,
+}
+
+impl InstData {
+    pub(super) fn result_at(&self, index: usize) -> Option<Value> {
+        self.results.get(index).copied()
+    }
+    pub(super) fn result(&self) -> Option<Value> {
+        match self.results.as_slice() {
+            [] => None,
+            [value] => Some(*value),
+            _ => panic!("expected at most one result"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ValueDef {
-    Result(Inst),
+    Result(Inst, usize),
     Param(Block, usize),
 }
 
@@ -296,6 +314,7 @@ pub(in crate::jit) enum MemoryOp {
 
 #[derive(Clone, Debug)]
 pub(super) enum Op {
+    LowLevel(low_level::Op),
     Observe(Value, super::profile::Observation, super::profile::Site),
     ReadHint(
         Value,
@@ -477,13 +496,21 @@ pub(super) enum TerminatorKind {
     CheckException(Target, Target),
     Yield(Span, Value, Target),
     Branch(Value, Target, Target),
+    Switch(Value, Vec<(u128, Target)>, Target),
     Return(Value),
+    ReturnValues(Vec<Value>),
+    TailCall {
+        target: low_level::CallTarget,
+        signature: cranelift_codegen::ir::Signature,
+        args: Vec<Value>,
+    },
     Fallback(usize),
 }
 
 #[derive(Clone)]
 pub(super) struct Terminator {
     pub(super) source_name: Option<(usize, usize)>,
+    pub(super) emission_location: Option<u32>,
     pub(super) span: Span,
     pub(super) kind: TerminatorKind,
 }
@@ -519,6 +546,42 @@ impl Op {
 
     pub(super) fn operands_iter(&self) -> impl Iterator<Item = Value> + '_ {
         let (fixed, rest): ([Option<Value>; 3], &[Value]) = match self {
+            Op::LowLevel(low_level::Op::Call { target, args, .. }) => (
+                [
+                    match target {
+                        low_level::CallTarget::Indirect(value) => Some(*value),
+                        _ => None,
+                    },
+                    None,
+                    None,
+                ],
+                args,
+            ),
+            Op::LowLevel(
+                low_level::Op::Unary { value, .. }
+                | low_level::Op::Load { address: value, .. }
+                | low_level::Op::AtomicLoad { address: value, .. },
+            ) => ([Some(*value), None, None], &[]),
+            Op::LowLevel(
+                low_level::Op::Binary { left, right, .. }
+                | low_level::Op::IntCompare { left, right, .. }
+                | low_level::Op::FloatCompare { left, right, .. }
+                | low_level::Op::Store {
+                    value: left,
+                    address: right,
+                    ..
+                },
+            ) => ([Some(*left), Some(*right), None], &[]),
+            Op::LowLevel(low_level::Op::Select { condition, yes, no }) => {
+                ([Some(*condition), Some(*yes), Some(*no)], &[])
+            }
+            Op::LowLevel(
+                low_level::Op::Integer { .. }
+                | low_level::Op::Float64(_)
+                | low_level::Op::StackAddress { .. }
+                | low_level::Op::StackPointer { .. },
+            ) => ([None; 3], &[]),
+            Op::LowLevel(low_level::Op::VariableRead) => ([None; 3], &[]),
             Op::OsrStart(_, _, values)
             | Op::Continuation(_, values)
             | Op::ContinuationStore(values) => ([None, None, None], values),
@@ -680,6 +743,42 @@ impl Op {
 
     pub(super) fn operands_mut(&mut self) -> impl Iterator<Item = &mut Value> + '_ {
         let (fixed, rest): ([Option<&mut Value>; 3], &mut [Value]) = match self {
+            Op::LowLevel(low_level::Op::Call { target, args, .. }) => (
+                [
+                    match target {
+                        low_level::CallTarget::Indirect(value) => Some(value),
+                        _ => None,
+                    },
+                    None,
+                    None,
+                ],
+                args,
+            ),
+            Op::LowLevel(
+                low_level::Op::Unary { value, .. }
+                | low_level::Op::Load { address: value, .. }
+                | low_level::Op::AtomicLoad { address: value, .. },
+            ) => ([Some(value), None, None], &mut []),
+            Op::LowLevel(
+                low_level::Op::Binary { left, right, .. }
+                | low_level::Op::IntCompare { left, right, .. }
+                | low_level::Op::FloatCompare { left, right, .. }
+                | low_level::Op::Store {
+                    value: left,
+                    address: right,
+                    ..
+                },
+            ) => ([Some(left), Some(right), None], &mut []),
+            Op::LowLevel(low_level::Op::Select { condition, yes, no }) => {
+                ([Some(condition), Some(yes), Some(no)], &mut [])
+            }
+            Op::LowLevel(
+                low_level::Op::Integer { .. }
+                | low_level::Op::Float64(_)
+                | low_level::Op::StackAddress { .. }
+                | low_level::Op::StackPointer { .. },
+            ) => ([None, None, None], &mut []),
+            Op::LowLevel(low_level::Op::VariableRead) => ([None, None, None], &mut []),
             Op::OsrStart(_, _, values)
             | Op::Continuation(_, values)
             | Op::ContinuationStore(values) => ([None, None, None], values),
@@ -855,22 +954,47 @@ impl Op {
 
 impl TerminatorKind {
     pub(super) fn operands_mut(&mut self) -> impl Iterator<Item = &mut Value> + '_ {
-        let (first, rest, tail): (Option<&mut Value>, &mut [Value], &mut [Value]) = match self {
-            TerminatorKind::Jump(target) => (None, &mut target.args, &mut []),
+        let (first, rest, tail, cases): (
+            Option<&mut Value>,
+            &mut [Value],
+            &mut [Value],
+            Option<&mut Vec<(u128, Target)>>,
+        ) = match self {
+            TerminatorKind::Jump(target) => (None, &mut target.args, &mut [], None),
             TerminatorKind::CheckException(normal, error) => {
-                (None, &mut normal.args, &mut error.args)
+                (None, &mut normal.args, &mut error.args, None)
             }
-            TerminatorKind::Branch(condition, then, otherwise) => {
-                (Some(condition), &mut then.args, &mut otherwise.args)
+            TerminatorKind::Branch(condition, yes, no) => {
+                (Some(condition), &mut yes.args, &mut no.args, None)
             }
-            TerminatorKind::Yield(_, value, target) => (Some(value), &mut target.args, &mut []),
-            TerminatorKind::Return(value) => (Some(value), &mut [], &mut []),
-            TerminatorKind::Fallback(_) => (None, &mut [], &mut []),
+            TerminatorKind::Switch(value, cases, default) => {
+                (Some(value), &mut default.args, &mut [], Some(cases))
+            }
+            TerminatorKind::Yield(_, value, target) => {
+                (Some(value), &mut target.args, &mut [], None)
+            }
+            TerminatorKind::Return(value) => (Some(value), &mut [], &mut [], None),
+            TerminatorKind::ReturnValues(values) => (None, values, &mut [], None),
+            TerminatorKind::TailCall { target, args, .. } => (
+                match target {
+                    low_level::CallTarget::Indirect(value) => Some(value),
+                    _ => None,
+                },
+                args,
+                &mut [],
+                None,
+            ),
+            TerminatorKind::Fallback(_) => (None, &mut [], &mut [], None),
         };
         first
             .into_iter()
             .chain(rest.iter_mut())
             .chain(tail.iter_mut())
+            .chain(cases.into_iter().flat_map(|cases| {
+                cases
+                    .iter_mut()
+                    .flat_map(|(_, target)| target.args.iter_mut())
+            }))
     }
 
     pub(super) fn operands(&self) -> Vec<Value> {
@@ -878,40 +1002,80 @@ impl TerminatorKind {
     }
 
     pub(super) fn operands_iter(&self) -> impl Iterator<Item = Value> + '_ {
-        let (first, rest, tail): (Option<Value>, &[Value], &[Value]) = match self {
-            TerminatorKind::Jump(target) => (None, &target.args, &[]),
-            TerminatorKind::CheckException(normal, error) => (None, &normal.args, &error.args),
-            TerminatorKind::Branch(condition, then, otherwise) => {
-                (Some(*condition), &then.args, &otherwise.args)
+        let (first, rest, tail, cases): (
+            Option<Value>,
+            &[Value],
+            &[Value],
+            Option<&[(u128, Target)]>,
+        ) = match self {
+            TerminatorKind::Jump(target) => (None, &target.args, &[], None),
+            TerminatorKind::CheckException(normal, error) => {
+                (None, &normal.args, &error.args, None)
             }
-            TerminatorKind::Yield(_, value, target) => (Some(*value), &target.args, &[]),
-            TerminatorKind::Return(value) => (Some(*value), &[], &[]),
-            TerminatorKind::Fallback(_) => (None, &[], &[]),
+            TerminatorKind::Branch(condition, yes, no) => {
+                (Some(*condition), &yes.args, &no.args, None)
+            }
+            TerminatorKind::Switch(value, cases, default) => {
+                (Some(*value), &default.args, &[], Some(cases))
+            }
+            TerminatorKind::Yield(_, value, target) => (Some(*value), &target.args, &[], None),
+            TerminatorKind::Return(value) => (Some(*value), &[], &[], None),
+            TerminatorKind::ReturnValues(values) => (None, values, &[], None),
+            TerminatorKind::TailCall { target, args, .. } => (
+                match target {
+                    low_level::CallTarget::Indirect(value) => Some(*value),
+                    _ => None,
+                },
+                args,
+                &[],
+                None,
+            ),
+            TerminatorKind::Fallback(_) => (None, &[], &[], None),
         };
         first
             .into_iter()
             .chain(rest.iter().copied())
             .chain(tail.iter().copied())
+            .chain(cases.into_iter().flat_map(|cases| {
+                cases
+                    .iter()
+                    .flat_map(|(_, target)| target.args.iter().copied())
+            }))
     }
 
     pub(super) fn targets(&self) -> impl Iterator<Item = &Target> {
-        let (first, second) = match self {
-            TerminatorKind::Jump(target) => (Some(target), None),
-            TerminatorKind::CheckException(normal, error) => (Some(normal), Some(error)),
-            TerminatorKind::Branch(_, then, otherwise) => (Some(then), Some(otherwise)),
-            TerminatorKind::Yield(_, _, target) => (Some(target), None),
-            TerminatorKind::Return(_) | TerminatorKind::Fallback(_) => (None, None),
-        };
-        first.into_iter().chain(second)
+        let (first, second, cases): (Option<&Target>, Option<&Target>, Option<&[(u128, Target)]>) =
+            match self {
+                TerminatorKind::Jump(target) => (Some(target), None, None),
+                TerminatorKind::CheckException(normal, error) => (Some(normal), Some(error), None),
+                TerminatorKind::Branch(_, yes, no) => (Some(yes), Some(no), None),
+                TerminatorKind::Switch(_, cases, default) => (Some(default), None, Some(cases)),
+                TerminatorKind::Yield(_, _, target) => (Some(target), None, None),
+                TerminatorKind::Return(_)
+                | TerminatorKind::ReturnValues(_)
+                | TerminatorKind::TailCall { .. }
+                | TerminatorKind::Fallback(_) => (None, None, None),
+            };
+        first.into_iter().chain(second).chain(
+            cases
+                .into_iter()
+                .flat_map(|cases| cases.iter().map(|(_, target)| target)),
+        )
     }
 
     pub(super) fn targets_mut(&mut self) -> Vec<&mut Target> {
         match self {
             TerminatorKind::Jump(target) => vec![target],
             TerminatorKind::CheckException(normal, error) => vec![normal, error],
-            TerminatorKind::Branch(_, then, otherwise) => vec![then, otherwise],
+            TerminatorKind::Branch(_, yes, no) => vec![yes, no],
+            TerminatorKind::Switch(_, cases, default) => std::iter::once(default)
+                .chain(cases.iter_mut().map(|(_, target)| target))
+                .collect(),
             TerminatorKind::Yield(_, _, target) => vec![target],
-            TerminatorKind::Return(_) | TerminatorKind::Fallback(_) => Vec::new(),
+            TerminatorKind::Return(_)
+            | TerminatorKind::ReturnValues(_)
+            | TerminatorKind::TailCall { .. }
+            | TerminatorKind::Fallback(_) => Vec::new(),
         }
     }
 }
@@ -1024,6 +1188,41 @@ impl Cfg {
 }
 
 impl Graph {
+    pub(super) fn new_low_level(
+        name: String,
+        span: Span,
+        signature: cranelift_codegen::ir::Signature,
+    ) -> Self {
+        let mut blocks = PrimaryMap::new();
+        let entry = blocks.push(BlockData::default());
+        Self {
+            name,
+            span,
+            entry,
+            has_handlers: false,
+            guards: 0,
+            views: HashMap::new(),
+            borrowed: HashSet::new(),
+            summaries: Default::default(),
+            cold: HashSet::new(),
+            megamorphic_gets: HashSet::new(),
+            lazy_captures: HashSet::new(),
+            generator: false,
+            has_assumes: false,
+            entry_guards: Vec::new(),
+            arity: None,
+            regions: PrimaryMap::new(),
+            blocks,
+            insts: PrimaryMap::new(),
+            values: PrimaryMap::new(),
+            low_level_types: SecondaryMap::new(),
+            low_level_slots: Vec::new(),
+            low_level_signature: Some(signature),
+            bindings: PrimaryMap::new(),
+            scopes: PrimaryMap::new(),
+        }
+    }
+
     pub(super) fn successors(&self, block: Block) -> impl Iterator<Item = Block> + use<> {
         let mut targets = self.blocks[block]
             .terminator
@@ -1031,21 +1230,29 @@ impl Graph {
             .flat_map(|terminator| terminator.kind.targets());
         let first = targets.next().map(|target| target.block);
         let second = targets.next().map(|target| target.block);
+        let mut rest = Vec::new();
+        for target in targets {
+            let block = target.block;
+            if Some(block) != first && Some(block) != second && !rest.contains(&block) {
+                rest.push(block);
+            }
+        }
         first
             .into_iter()
             .chain(second.filter(|block| Some(*block) != first))
+            .chain(rest)
     }
 
     pub(super) fn def_block(&self, value: Value) -> Block {
         match self.values[value] {
-            ValueDef::Result(inst) => self.insts[inst].block,
+            ValueDef::Result(inst, _) => self.insts[inst].block,
             ValueDef::Param(block, _) => block,
         }
     }
 
     pub(super) fn defining_op(&self, value: Value) -> Option<&Op> {
         match self.values[value] {
-            ValueDef::Result(inst) => Some(&self.insts[inst].op),
+            ValueDef::Result(inst, _) => Some(&self.insts[inst].op),
             ValueDef::Param(..) => None,
         }
     }
@@ -1093,7 +1300,7 @@ impl Graph {
         has_result: bool,
     ) -> (Inst, Option<Value>) {
         let inst = self.insts.next_key();
-        let result = has_result.then(|| self.values.push(ValueDef::Result(inst)));
+        let result = has_result.then(|| self.values.push(ValueDef::Result(inst, 0)));
         let source_name = self.blocks[block]
             .insts
             .get(position)
@@ -1101,9 +1308,10 @@ impl Graph {
         self.has_assumes |= matches!(op, Op::Assume(..));
         self.insts.push(InstData {
             source_name,
+            emission_location: None,
             span,
             block,
-            result,
+            results: result.into_iter().collect(),
             op,
         });
         self.blocks[block].insts.insert(position, inst);
@@ -1131,6 +1339,26 @@ impl Graph {
         self.insert(block, position, span, op, true).1.unwrap()
     }
 
+    pub(super) fn append_results(
+        &mut self,
+        block: Block,
+        span: Span,
+        op: Op,
+        count: usize,
+    ) -> (Inst, Vec<Value>) {
+        if count == 0 {
+            return (self.append(block, span, op, false).0, Vec::new());
+        }
+        let (inst, first) = self.append(block, span, op, true);
+        let mut results = vec![first.unwrap()];
+        for index in 1..count {
+            let value = self.values.push(ValueDef::Result(inst, index));
+            self.insts[inst].results.push(value);
+            results.push(value);
+        }
+        (inst, results)
+    }
+
     pub(super) fn append_value(&mut self, block: Block, span: Span, op: Op) -> Value {
         self.append(block, span, op, true).1.unwrap()
     }
@@ -1138,6 +1366,7 @@ impl Graph {
     pub(super) fn terminate(&mut self, block: Block, span: Span, kind: TerminatorKind) {
         self.blocks[block].terminator = Some(Terminator {
             source_name: None,
+            emission_location: None,
             span,
             kind,
         });
@@ -1145,15 +1374,16 @@ impl Graph {
 
     pub(super) fn remove_inst(&mut self, inst: Inst) {
         self.detach_inst(inst);
-        let Some(result) = self.insts[inst].result.filter(|_| self.has_assumes) else {
+        if !self.has_assumes {
             return;
-        };
+        }
+        let results = self.insts[inst].results.clone();
         for block in self.blocks.keys().collect::<Vec<_>>() {
             let insts = std::mem::take(&mut self.blocks[block].insts);
             self.blocks[block].insts = insts
                 .into_iter()
                 .filter(|&other| {
-                    !matches!(self.insts[other].op, Op::Assume(value, ..) if value == result)
+                    !matches!(self.insts[other].op, Op::Assume(value, ..) if results.contains(&value))
                 })
                 .collect();
         }
@@ -1298,6 +1528,21 @@ impl Graph {
             }
         };
         match op {
+            Op::LowLevel(low_level::Op::Call { .. }) => Contract {
+                effects: Effects::UNKNOWN,
+                result: Unowned,
+            },
+            Op::LowLevel(low_level::Op::Load { .. } | low_level::Op::AtomicLoad { .. }) => {
+                Contract {
+                    effects: Effects::UNKNOWN,
+                    result: Unowned,
+                }
+            }
+            Op::LowLevel(low_level::Op::Store { .. }) => Contract {
+                effects: Effects::UNKNOWN,
+                result: None,
+            },
+            Op::LowLevel(_) => closed(0, Unowned),
             Op::OsrStart(..) => Contract {
                 effects: Effects::UNKNOWN,
                 result: Unowned,
@@ -1504,6 +1749,25 @@ impl Graph {
         }
     }
 
+    fn lowered_memory_scalar(&self, value: Value) -> bool {
+        if self.low_level_signature.is_none() {
+            return false;
+        }
+        let Some(Op::Memory(MemoryOp::IndexedLoad { format, .. } | MemoryOp::Load { format, .. })) =
+            self.defining_op(value)
+        else {
+            return false;
+        };
+        let ty = match format {
+            MemoryFormat::U8 | MemoryFormat::I8 => cranelift_codegen::ir::types::I8,
+            MemoryFormat::U16 | MemoryFormat::I16 => cranelift_codegen::ir::types::I16,
+            MemoryFormat::U32 | MemoryFormat::I32 => cranelift_codegen::ir::types::I32,
+            MemoryFormat::F32 => cranelift_codegen::ir::types::F32,
+            MemoryFormat::F64 => cranelift_codegen::ir::types::F64,
+        };
+        self.low_level_types[value] == Some(ty)
+    }
+
     pub(super) fn verify(&self) -> Result<()> {
         let mut stacks: SecondaryMap<Block, Option<Vec<Scope>>> = SecondaryMap::new();
         stacks[self.entry] = Some(Vec::new());
@@ -1539,22 +1803,61 @@ impl Graph {
             };
             if matches!(
                 terminator.kind,
-                TerminatorKind::Return(_) | TerminatorKind::Fallback(_)
+                TerminatorKind::Return(_)
+                    | TerminatorKind::ReturnValues(_)
+                    | TerminatorKind::TailCall { .. }
+                    | TerminatorKind::Fallback(_)
             ) && !stack.is_empty()
             {
                 return Err(format!("{block} returns with open scopes"));
+            }
+            if let TerminatorKind::ReturnValues(values) = &terminator.kind {
+                let Some(signature) = &self.low_level_signature else {
+                    return Err(format!("{block} has no low-level signature"));
+                };
+                if values.len() != signature.returns.len()
+                    || values
+                        .iter()
+                        .zip(&signature.returns)
+                        .any(|(&value, param)| {
+                            self.low_level_types[value] != Some(param.value_type)
+                        })
+                {
+                    return Err(format!("{block} has incompatible return values"));
+                }
+            }
+            if let TerminatorKind::TailCall {
+                signature, args, ..
+            } = &terminator.kind
+            {
+                if args.len() != signature.params.len()
+                    || args.iter().zip(&signature.params).any(|(&value, param)| {
+                        self.low_level_types[value] != Some(param.value_type)
+                    })
+                {
+                    return Err(format!("{block} has incompatible tail-call arguments"));
+                }
             }
             for value in terminator.kind.operands() {
                 if matches!(
                     self.defining_op(value),
                     Some(Op::TypedData(_) | Op::Memory(_))
-                ) {
+                ) && !self.lowered_memory_scalar(value)
+                {
                     return Err(format!("raw value {value} escapes {block}"));
                 }
             }
             for target in terminator.kind.targets() {
                 if target.args.len() != self.blocks[target.block].params.len() {
                     return Err(format!("{block} passes wrong arity to {}", target.block));
+                }
+                for (&arg, &param) in target.args.iter().zip(&self.blocks[target.block].params) {
+                    if self.low_level_types[arg] != self.low_level_types[param] {
+                        return Err(format!(
+                            "{block} passes incompatible scalar type to {}",
+                            target.block
+                        ));
+                    }
                 }
                 match &stacks[target.block] {
                     Some(existing) if *existing != stack => {
@@ -1575,6 +1878,27 @@ impl Graph {
         let mut positions: SecondaryMap<Inst, Option<usize>> = SecondaryMap::new();
         for (block, data) in &self.blocks {
             for (index, &inst) in data.insts.iter().enumerate() {
+                let instruction = &self.insts[inst];
+                for (result_index, &value) in instruction.results.iter().enumerate() {
+                    if self.values[value] != ValueDef::Result(inst, result_index) {
+                        return Err(format!("{value} is not result {result_index} of {inst}"));
+                    }
+                }
+                if let Op::LowLevel(low_level::Op::Call {
+                    signature, args, ..
+                }) = &instruction.op
+                {
+                    if signature.params.len() != args.len()
+                        || signature.returns.len() != instruction.results.len()
+                    {
+                        return Err(format!("{inst} has an invalid call signature"));
+                    }
+                    for (&value, ty) in instruction.results.iter().zip(&signature.returns) {
+                        if self.low_level_types[value] != Some(ty.value_type) {
+                            return Err(format!("{inst} has an invalid call result type"));
+                        }
+                    }
+                }
                 if self.insts[inst].block == block && positions[inst].is_none() {
                     positions[inst] = Some(index);
                 }
@@ -1592,10 +1916,10 @@ impl Graph {
                         self.blocks[definer].params.get(index) == Some(&value)
                             && cfg.dominates(definer, block)
                     }
-                    ValueDef::Result(inst) => {
+                    ValueDef::Result(inst, result_index) => {
                         let definer = self.insts[inst].block;
                         let index = positions[inst];
-                        self.insts[inst].result == Some(value)
+                        self.insts[inst].result_at(result_index) == Some(value)
                             && index.is_some_and(|index| {
                                 if definer == block {
                                     index < position
@@ -1622,6 +1946,11 @@ impl Graph {
                     };
                     let raw = matches!(def, Op::TypedData(_) | Op::Memory(_));
                     if !raw {
+                        continue;
+                    }
+                    if self.lowered_memory_scalar(value)
+                        && matches!(self.insts[inst].op, Op::LowLevel(_))
+                    {
                         continue;
                     }
                     if self.def_block(value) != block {

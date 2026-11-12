@@ -153,7 +153,7 @@ pub(in crate::jit::semantic) fn promote(graph: &mut Graph, notes: &mut Vec<Strin
             let data = &mut promoter.graph.insts[inst];
             match access {
                 Access::Read => {
-                    aliases.insert(data.result.take().unwrap(), old);
+                    aliases.insert(data.results.pop().unwrap(), old);
                 }
                 Access::Write(value) => {
                     current.insert(binding, value);

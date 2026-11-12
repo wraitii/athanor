@@ -58,7 +58,7 @@ pub(super) fn direct_captures(
             if inst == call {
                 break;
             }
-            if graph.insts[inst].result == Some(callee) {
+            if graph.insts[inst].results.contains(&callee) {
                 after = true;
                 continue;
             }
@@ -112,6 +112,7 @@ pub(super) fn apply(graph: &mut Graph, body: &Graph, plan: &Inline) {
     let current = graph.blocks.push(BlockData::default());
     graph.blocks[block].terminator = Some(Terminator {
         source_name: call.source_name,
+        emission_location: None,
         span: call.span,
         kind: if plan.guard_code {
             let check = graph.append_value(block, call.span, Op::IsCode(*callee, plan.target));
@@ -162,6 +163,10 @@ pub(super) fn apply(graph: &mut Graph, body: &Graph, plan: &Inline) {
             .map(|binding| bindings[binding])
             .collect();
     }
+    let slot_base = graph.low_level_slots.len();
+    graph
+        .low_level_slots
+        .extend_from_slice(&body.low_level_slots);
     let mut blocks = HashMap::new();
     let mut values = HashMap::new();
     let mut insts = Vec::new();
@@ -172,7 +177,9 @@ pub(super) fn apply(graph: &mut Graph, body: &Graph, plan: &Inline) {
         let copy = graph.blocks.push(BlockData::default());
         blocks.insert(block, copy);
         for &param in &body.blocks[block].params {
-            values.insert(param, graph.add_param(copy));
+            let new = graph.add_param(copy);
+            graph.low_level_types[new] = body.low_level_types[param];
+            values.insert(param, new);
         }
     }
     for &block in &reachable {
@@ -191,15 +198,18 @@ pub(super) fn apply(graph: &mut Graph, body: &Graph, plan: &Inline) {
                 } else {
                     args.get(index).copied().unwrap_or(undefined)
                 };
-                values.insert(data.result.unwrap(), value);
+                values.insert(data.result().unwrap(), value);
                 continue;
             }
             if matches!(data.op, Op::This) {
-                values.insert(data.result.unwrap(), receiver);
+                values.insert(data.result().unwrap(), receiver);
                 continue;
             }
             let mut op = data.op.clone();
             match &mut op {
+                Op::LowLevel(super::low_level::Op::StackAddress { slot, .. }) => {
+                    slot.0 += slot_base
+                }
                 Op::Closure(_, _, _, _, _, captures, _) => {
                     for binding in captures {
                         *binding = bindings[binding];
@@ -227,13 +237,16 @@ pub(super) fn apply(graph: &mut Graph, body: &Graph, plan: &Inline) {
                 }
                 _ => {}
             }
-            let (copy, result) = graph.append(blocks[&block], data.span, op, data.result.is_some());
+            let count = data.results.len();
+            let (copy, results) = graph.append_results(blocks[&block], data.span, op, count);
             graph.insts[copy].source_name = data.source_name.or(plan.source_name);
+            graph.insts[copy].emission_location = data.emission_location;
             if matches!(data.op, Op::Closure(_, _, true, _, true, _, None)) {
                 lexical_closures.push(copy);
             }
-            if let Some(value) = data.result {
-                values.insert(value, result.unwrap());
+            for (&old, &new) in data.results.iter().zip(&results) {
+                graph.low_level_types[new] = body.low_level_types[old];
+                values.insert(old, new);
             }
             insts.push(copy);
         }
@@ -274,6 +287,7 @@ pub(super) fn apply(graph: &mut Graph, body: &Graph, plan: &Inline) {
     }
     graph.blocks[current].terminator = Some(Terminator {
         source_name: call.source_name,
+        emission_location: None,
         span: call.span,
         kind: TerminatorKind::Jump(Target::new(blocks[&body.entry])),
     });

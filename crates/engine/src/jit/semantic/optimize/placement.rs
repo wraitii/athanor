@@ -82,7 +82,7 @@ impl Hoister<'_> {
                 ))
             };
         }
-        let ValueDef::Result(inst) = self.graph.values[value] else {
+        let ValueDef::Result(inst, _) = self.graph.values[value] else {
             return Err(format!("{value} is a block parameter inside the loop"));
         };
         let op = self.graph.insts[inst].op.clone();
@@ -139,7 +139,7 @@ pub(super) fn representative(
     value: Value,
     depth: usize,
 ) -> Value {
-    let ValueDef::Result(inst) = graph.values[value] else {
+    let ValueDef::Result(inst, _) = graph.values[value] else {
         return value;
     };
     let op = &graph.insts[inst].op;
@@ -353,7 +353,7 @@ mod tests {
             .flat_map(|&block| graph.blocks[block].insts.iter())
             .find_map(|&inst| {
                 predicate(&graph.insts[inst].op)
-                    .then_some(graph.insts[inst].result)
+                    .then_some(graph.insts[inst].result())
                     .flatten()
             })
             .unwrap()
@@ -434,7 +434,7 @@ mod tests {
         let load = find(&graph, |op| matches!(op, Op::Get(_, name) if name == "x"));
         let inst = assume(&mut graph, load, number());
         assert_eq!(graph.use_counts()[load], 1);
-        let ValueDef::Result(def) = graph.values[load] else {
+        let ValueDef::Result(def, _) = graph.values[load] else {
             panic!()
         };
         graph.remove_inst(def);

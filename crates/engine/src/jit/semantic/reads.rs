@@ -42,7 +42,7 @@ pub(super) fn plan(
                 .copied()
                 .or_else(|| hints.get(&object).copied())
                 .or_else(|| {
-                    let ValueDef::Result(producer) = graph.values[object] else {
+                    let ValueDef::Result(producer, _) = graph.values[object] else {
                         return None;
                     };
                     bodies
@@ -92,6 +92,7 @@ pub(super) fn apply(
             let check = graph.append_value(block, data.span, Op::IsTyped(object, read.element));
             graph.blocks[block].terminator = Some(Terminator {
                 source_name: data.source_name,
+                emission_location: None,
                 span: data.span,
                 kind: TerminatorKind::Branch(check, Target::new(fast), Target::new(fallback)),
             });
@@ -104,6 +105,7 @@ pub(super) fn apply(
             let check = graph.append_value(fast, data.span, Op::IsNumber(key));
             graph.blocks[fast].terminator = Some(Terminator {
                 source_name: data.source_name,
+                emission_location: None,
                 span: data.span,
                 kind: TerminatorKind::Branch(check, Target::new(typed), Target::new(fallback)),
             });
@@ -129,6 +131,7 @@ pub(super) fn apply(
                 );
                 graph.blocks[guard].terminator = Some(Terminator {
                     source_name: data.source_name,
+                    emission_location: None,
                     span: data.span,
                     kind: TerminatorKind::Branch(valid, Target::new(load), Target::new(otherwise)),
                 });
@@ -141,6 +144,7 @@ pub(super) fn apply(
                 graph.insts[inst].source_name = data.source_name;
                 graph.blocks[load].terminator = Some(Terminator {
                     source_name: data.source_name,
+                    emission_location: None,
                     span: data.span,
                     kind: TerminatorKind::Jump(Target {
                         block: continuation,
@@ -170,6 +174,7 @@ pub(super) fn apply(
         graph.insts[inst].source_name = data.source_name;
         graph.blocks[fast].terminator = Some(Terminator {
             source_name: data.source_name,
+            emission_location: None,
             span: data.span,
             kind: TerminatorKind::Jump(Target {
                 block: continuation,

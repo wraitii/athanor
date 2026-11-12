@@ -194,7 +194,7 @@ fn emit(
                     store(
                         &mut asm,
                         context_offset as u32,
-                        (data.result?.index() * 8) as u32,
+                        (data.result()?.index() * 8) as u32,
                         9,
                         false,
                         failed,
@@ -208,7 +208,7 @@ fn emit(
                     store(
                         &mut asm,
                         context_offset as u32,
-                        (data.result?.index() * 8) as u32,
+                        (data.result()?.index() * 8) as u32,
                         0,
                         true,
                         failed,
@@ -234,7 +234,7 @@ fn emit(
                     stack_address(&mut asm, 2, call_offset as u32);
                     e::mov_imm(Width::X, 3, captures.len() as u64, |word| asm.emit(word));
                     call(&mut asm, Helper::ClosureNew);
-                    let dest = (data.result?.index() * 8) as u32;
+                    let dest = (data.result()?.index() * 8) as u32;
                     store(&mut asm, context_offset as u32, dest, 0, true, failed)?;
                     if *arrow || *generator {
                         asm.emit(e::mem_scaled(Mem::LdrX, 0, e::SP, context_offset as u32)?);
@@ -293,7 +293,7 @@ fn emit(
                     store(
                         &mut asm,
                         context_offset as u32,
-                        (data.result?.index() * 8) as u32,
+                        (data.result()?.index() * 8) as u32,
                         0,
                         true,
                         failed,
@@ -335,7 +335,7 @@ fn emit(
                     store(
                         &mut asm,
                         context_offset as u32,
-                        (data.result?.index() * 8) as u32,
+                        (data.result()?.index() * 8) as u32,
                         0,
                         true,
                         failed,
@@ -363,7 +363,7 @@ fn emit(
                     store(
                         &mut asm,
                         context_offset as u32,
-                        (data.result?.index() * 8) as u32,
+                        (data.result()?.index() * 8) as u32,
                         0,
                         true,
                         failed,
@@ -387,7 +387,7 @@ fn emit(
                     store(
                         &mut asm,
                         context_offset as u32,
-                        (data.result?.index() * 8) as u32,
+                        (data.result()?.index() * 8) as u32,
                         0,
                         true,
                         failed,
@@ -415,7 +415,7 @@ fn emit(
                     store(
                         &mut asm,
                         context_offset as u32,
-                        (data.result?.index() * 8) as u32,
+                        (data.result()?.index() * 8) as u32,
                         0,
                         true,
                         failed,
@@ -449,7 +449,7 @@ fn emit(
                     store(
                         &mut asm,
                         context_offset as u32,
-                        (data.result?.index() * 8) as u32,
+                        (data.result()?.index() * 8) as u32,
                         0,
                         true,
                         failed,
@@ -498,7 +498,7 @@ fn emit(
                     store(
                         &mut asm,
                         context_offset as u32,
-                        (data.result?.index() * 8) as u32,
+                        (data.result()?.index() * 8) as u32,
                         0,
                         true,
                         failed,
@@ -536,7 +536,7 @@ fn emit(
                     store(
                         &mut asm,
                         context_offset as u32,
-                        (data.result?.index() * 8) as u32,
+                        (data.result()?.index() * 8) as u32,
                         0,
                         true,
                         failed,
@@ -563,7 +563,7 @@ fn emit(
                     store(
                         &mut asm,
                         context_offset as u32,
-                        (data.result?.index() * 8) as u32,
+                        (data.result()?.index() * 8) as u32,
                         0,
                         false,
                         failed,
@@ -595,7 +595,7 @@ fn emit(
                     store(
                         &mut asm,
                         context_offset as u32,
-                        (data.result?.index() * 8) as u32,
+                        (data.result()?.index() * 8) as u32,
                         0,
                         true,
                         failed,
@@ -616,7 +616,7 @@ fn emit(
                     store(
                         &mut asm,
                         context_offset as u32,
-                        (data.result?.index() * 8) as u32,
+                        (data.result()?.index() * 8) as u32,
                         0,
                         true,
                         failed,
@@ -670,7 +670,7 @@ fn emit(
                     store(
                         &mut asm,
                         context_offset as u32,
-                        (data.result?.index() * 8) as u32,
+                        (data.result()?.index() * 8) as u32,
                         9,
                         false,
                         failed,
@@ -686,7 +686,7 @@ fn emit(
                     store(
                         &mut asm,
                         context_offset as u32,
-                        (data.result?.index() * 8) as u32,
+                        (data.result()?.index() * 8) as u32,
                         9,
                         false,
                         failed,
@@ -724,7 +724,7 @@ fn emit(
                 }
                 Op::Argument(index) if *index < arity => {
                     let source = (arguments_offset + index * 8) as u32;
-                    let dest = data.result?.index().checked_mul(8)? as u32;
+                    let dest = data.result()?.index().checked_mul(8)? as u32;
                     asm.emit(e::mem_scaled(Mem::LdrX, 9, e::SP, source)?);
                     store(&mut asm, context_offset as u32, dest, 9, false, failed)?;
                 }
@@ -736,7 +736,7 @@ fn emit(
                         store(
                             &mut asm,
                             context_offset as u32,
-                            (data.result?.index() * 8) as u32,
+                            (data.result()?.index() * 8) as u32,
                             0,
                             true,
                             failed,
@@ -763,7 +763,7 @@ fn emit(
                             return refuse(reason, "unsupported constant");
                         }
                     };
-                    let offset = data.result?.index().checked_mul(8)? as u32;
+                    let offset = data.result()?.index().checked_mul(8)? as u32;
                     e::mov_imm(Width::X, 9, value.bits(), |word| asm.emit(word));
                     store(&mut asm, context_offset as u32, offset, 9, false, failed)?;
                 }
@@ -778,7 +778,7 @@ fn emit(
                 }
                 Op::Read(binding) => {
                     let source = (values_size + binding.index() * 8) as u32;
-                    let dest = data.result?.index().checked_mul(8)? as u32;
+                    let dest = data.result()?.index().checked_mul(8)? as u32;
                     check_initialized(&mut asm, context_offset as u32, source, failed)?;
                     asm.emit(e::mem_scaled(Mem::LdrX, 9, e::SP, source)?);
                     store(&mut asm, context_offset as u32, dest, 9, false, failed)?;
@@ -831,7 +831,7 @@ fn emit(
                     store(
                         &mut asm,
                         context_offset as u32,
-                        (data.result?.index() * 8) as u32,
+                        (data.result()?.index() * 8) as u32,
                         0,
                         *operator == BinaryOperator::Addition,
                         failed,
@@ -855,7 +855,7 @@ fn emit(
                     store(
                         &mut asm,
                         context_offset as u32,
-                        (data.result?.index() * 8) as u32,
+                        (data.result()?.index() * 8) as u32,
                         0,
                         false,
                         failed,
@@ -890,7 +890,7 @@ fn emit(
                     store(
                         &mut asm,
                         context_offset as u32,
-                        (data.result?.index() * 8) as u32,
+                        (data.result()?.index() * 8) as u32,
                         0,
                         true,
                         failed,
@@ -920,7 +920,7 @@ fn emit(
                     store(
                         &mut asm,
                         context_offset as u32,
-                        (data.result?.index() * 8) as u32,
+                        (data.result()?.index() * 8) as u32,
                         0,
                         true,
                         failed,
@@ -1112,6 +1112,11 @@ fn emit(
                 return refuse(reason, "exception check terminator");
             }
             TerminatorKind::Yield(..) => return refuse(reason, "yield terminator"),
+            TerminatorKind::Switch(..)
+            | TerminatorKind::ReturnValues(..)
+            | TerminatorKind::TailCall { .. } => {
+                return refuse(reason, "low-level terminator");
+            }
             TerminatorKind::Fallback(..) => return refuse(reason, "fallback terminator"),
         }
         let end = asm.offset();
@@ -1394,7 +1399,7 @@ fn numeric(graph: &Graph, value: SemanticValue, depth: usize) -> bool {
     if depth > 128 {
         return false;
     }
-    let ValueDef::Result(inst) = graph.values[value] else {
+    let ValueDef::Result(inst, _) = graph.values[value] else {
         return false;
     };
     match graph.insts[inst].op {

@@ -1,8 +1,6 @@
+use crate::jit::semantic::low_level::Switch;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
-use cranelift_codegen::ir::{
-    BlockArg, InstBuilder, MemFlagsData, SigRef, Type, Value as ClifValue, types,
-};
-use cranelift_frontend::Switch;
+use cranelift_codegen::ir::{MemFlagsData, Type, types};
 use cranelift_module::Module;
 use oxc_span::Span;
 use oxc_syntax::operator::BinaryOperator;
@@ -27,7 +25,7 @@ use crate::value::Value;
 use crate::value::{TAG_FIRST, TAG_OBJECT, TAG_SHIFT, TAG_SPAN, TAG_STRING};
 
 use super::repr::{Operand, Repr};
-use super::{FunctionCompiler, ir_helpers};
+use super::{BlockArg, FunctionCompiler, LoweredValue, SigRef, ir_helpers};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Element {
@@ -210,11 +208,11 @@ pub(super) fn binary_operator(operator: BinaryOperator) -> BinaryOp {
 }
 
 impl FunctionCompiler<'_, '_> {
-    pub(super) fn constant(&mut self, value: Value) -> ClifValue {
+    pub(super) fn constant(&mut self, value: Value) -> LoweredValue {
         self.b.ins().iconst(types::I64, value.bits() as i64)
     }
 
-    pub(super) fn is_integer(&mut self, value: ClifValue) -> ClifValue {
+    pub(super) fn is_integer(&mut self, value: LoweredValue) -> LoweredValue {
         let numeric = self.is_number(value);
         let float = self.b.ins().bitcast(types::F64, MemFlagsData::new(), value);
         let integer = self.b.ins().fcvt_to_sint_sat(types::I64, float);
@@ -232,7 +230,7 @@ impl FunctionCompiler<'_, '_> {
         self.b.ins().band(valid, positive_zero)
     }
 
-    pub(super) fn is_number(&mut self, value: ClifValue) -> ClifValue {
+    pub(super) fn is_number(&mut self, value: LoweredValue) -> LoweredValue {
         let top = self.b.ins().ushr_imm_s(value, TAG_SHIFT as i64);
         let offset = self.b.ins().iadd_imm_s(top, -(TAG_FIRST as i64));
 
@@ -241,7 +239,7 @@ impl FunctionCompiler<'_, '_> {
             .icmp_imm_s(IntCC::UnsignedGreaterThan, offset, TAG_SPAN as i64)
     }
 
-    pub(super) fn truthy(&mut self, value: ClifValue) -> ClifValue {
+    pub(super) fn truthy(&mut self, value: LoweredValue) -> LoweredValue {
         let number = self.is_number(value);
         let number_block = self.b.create_block();
         let other_block = self.b.create_block();
@@ -297,7 +295,7 @@ impl FunctionCompiler<'_, '_> {
         self.b.block_params(done)[0]
     }
 
-    pub(super) fn is_nullish(&mut self, value: ClifValue) -> ClifValue {
+    pub(super) fn is_nullish(&mut self, value: LoweredValue) -> LoweredValue {
         let undefined =
             self.b
                 .ins()
@@ -309,7 +307,7 @@ impl FunctionCompiler<'_, '_> {
         self.b.ins().bor(undefined, null)
     }
 
-    pub(super) fn unary_helper(&mut self, op: UnaryOp, value: ClifValue) -> ClifValue {
+    pub(super) fn unary_helper(&mut self, op: UnaryOp, value: LoweredValue) -> LoweredValue {
         let result = self.call_helper(op.helper(), &[value]);
         self.check_error();
         result
@@ -318,15 +316,20 @@ impl FunctionCompiler<'_, '_> {
     pub(super) fn binary_helper(
         &mut self,
         op: BinaryOp,
-        left: ClifValue,
-        right: ClifValue,
-    ) -> ClifValue {
+        left: LoweredValue,
+        right: LoweredValue,
+    ) -> LoweredValue {
         let result = self.call_helper(op.helper(), &[left, right]);
         self.check_error();
         result
     }
 
-    pub(super) fn binary(&mut self, op: BinaryOp, left: ClifValue, right: ClifValue) -> ClifValue {
+    pub(super) fn binary(
+        &mut self,
+        op: BinaryOp,
+        left: LoweredValue,
+        right: LoweredValue,
+    ) -> LoweredValue {
         match op {
             BinaryOp::BitwiseAnd
             | BinaryOp::BitwiseOr
@@ -349,14 +352,14 @@ impl FunctionCompiler<'_, '_> {
         }
     }
 
-    pub(super) fn data_address(&mut self, offset: i64) -> ClifValue {
+    pub(super) fn data_address(&mut self, offset: i64) -> LoweredValue {
         if offset == 0 {
             return self.data_base;
         }
         self.b.ins().iadd_imm_s(self.data_base, offset)
     }
 
-    pub(super) fn function_data<T>(&mut self, value: T) -> ClifValue {
+    pub(super) fn function_data<T>(&mut self, value: T) -> LoweredValue {
         let offset = self.data.push(value);
         self.data_address(offset)
     }
@@ -366,7 +369,7 @@ impl FunctionCompiler<'_, '_> {
         site: crate::jit::semantic::Inst,
         name: &str,
         observer: Option<(u64, crate::jit::profile::Site)>,
-    ) -> ClifValue {
+    ) -> LoweredValue {
         let offset = match self.property_caches.get(&site) {
             Some(&offset) => offset,
             None => {
@@ -378,7 +381,7 @@ impl FunctionCompiler<'_, '_> {
         self.data_address(offset)
     }
 
-    pub(super) fn call_helper(&mut self, helper: Helper, args: &[ClifValue]) -> ClifValue {
+    pub(super) fn call_helper(&mut self, helper: Helper, args: &[LoweredValue]) -> LoweredValue {
         let target = self.module.target_config();
         let signature = *self.helper_signatures.entry(helper).or_insert_with(|| {
             self.b.import_signature(helpers::signature(
@@ -387,12 +390,17 @@ impl FunctionCompiler<'_, '_> {
                 self.pointer,
             ))
         });
-        let callee = helpers::address(self.b.ins(), self.pointer, self.ctx, helper);
+        let offset = crate::jit::session::HELPERS_OFFSET
+            + helper as i32 * std::mem::size_of::<usize>() as i32;
+        let callee = self
+            .b
+            .ins()
+            .load(self.pointer, MemFlagsData::trusted(), self.ctx, offset);
         let mut call_args = Vec::with_capacity(args.len() + 1);
         call_args.push(self.ctx);
         call_args.extend_from_slice(args);
         let call = self.b.ins().call_indirect(signature, callee, &call_args);
-        self.annotations.helpers.insert(call, helper);
+        self.b.mark_helper(call, helper);
         let result = self.b.inst_results(call)[0];
         self.unchecked = None;
         if helper.returns_reference() {
@@ -402,7 +410,12 @@ impl FunctionCompiler<'_, '_> {
         result
     }
 
-    fn integer_binary(&mut self, op: BinaryOp, left: ClifValue, right: ClifValue) -> ClifValue {
+    fn integer_binary(
+        &mut self,
+        op: BinaryOp,
+        left: LoweredValue,
+        right: LoweredValue,
+    ) -> LoweredValue {
         let (left_int, left_guard) = ir_helpers::unbox_int32(self.b, left);
         let (right_int, right_guard) = ir_helpers::unbox_int32(self.b, right);
         let both = self.b.ins().band(left_guard, right_guard);
@@ -441,9 +454,9 @@ impl FunctionCompiler<'_, '_> {
     pub(super) fn native_math(
         &mut self,
         function: MathFunction,
-        args: &[ClifValue],
-        slow: impl FnOnce(&mut Self) -> ClifValue,
-    ) -> ClifValue {
+        args: &[LoweredValue],
+        slow: impl FnOnce(&mut Self) -> LoweredValue,
+    ) -> LoweredValue {
         let inline = matches!(
             (function, args.len()),
             (
@@ -500,12 +513,12 @@ impl FunctionCompiler<'_, '_> {
 
     fn numeric_fast_path(
         &mut self,
-        left: ClifValue,
-        right: ClifValue,
-        guards: Option<(ClifValue, ClifValue)>,
-        fast: impl FnOnce(&mut Self, ClifValue, ClifValue) -> ClifValue,
-        slow: impl FnOnce(&mut Self) -> ClifValue,
-    ) -> ClifValue {
+        left: LoweredValue,
+        right: LoweredValue,
+        guards: Option<(LoweredValue, LoweredValue)>,
+        fast: impl FnOnce(&mut Self, LoweredValue, LoweredValue) -> LoweredValue,
+        slow: impl FnOnce(&mut Self) -> LoweredValue,
+    ) -> LoweredValue {
         let (left_number, right_number) =
             guards.unwrap_or_else(|| (self.is_number(left), self.is_number(right)));
         let both = self.b.ins().band(left_number, right_number);
@@ -527,7 +540,12 @@ impl FunctionCompiler<'_, '_> {
         self.b.block_params(done)[0]
     }
 
-    fn numeric_binary(&mut self, op: BinaryOp, left: ClifValue, right: ClifValue) -> ClifValue {
+    fn numeric_binary(
+        &mut self,
+        op: BinaryOp,
+        left: LoweredValue,
+        right: LoweredValue,
+    ) -> LoweredValue {
         self.numeric_fast_path(
             left,
             right,
@@ -564,10 +582,10 @@ impl FunctionCompiler<'_, '_> {
     pub(super) fn numeric_comparison(
         &mut self,
         op: BinaryOp,
-        left: ClifValue,
-        right: ClifValue,
-        guards: Option<(ClifValue, ClifValue)>,
-    ) -> ClifValue {
+        left: LoweredValue,
+        right: LoweredValue,
+        guards: Option<(LoweredValue, LoweredValue)>,
+    ) -> LoweredValue {
         self.numeric_fast_path(
             left,
             right,
@@ -600,7 +618,10 @@ impl FunctionCompiler<'_, '_> {
     }
 }
 
-pub(super) fn to_number(compiler: &mut FunctionCompiler<'_, '_>, value: ClifValue) -> ClifValue {
+pub(super) fn to_number(
+    compiler: &mut FunctionCompiler<'_, '_>,
+    value: LoweredValue,
+) -> LoweredValue {
     let is_number = compiler.is_number(value);
     let fast_block = compiler.b.create_block();
     let slow_block = compiler.b.create_block();
@@ -623,10 +644,10 @@ pub(super) fn to_number(compiler: &mut FunctionCompiler<'_, '_>, value: ClifValu
 impl FunctionCompiler<'_, '_> {
     pub(super) fn index_access(
         &mut self,
-        object: ClifValue,
+        object: LoweredValue,
         index: Operand,
-        value: Option<ClifValue>,
-    ) -> ClifValue {
+        value: Option<LoweredValue>,
+    ) -> LoweredValue {
         if let Some(value) = value {
             let index = self.convert(index, Repr::Boxed);
             let result = self.call_helper(Helper::IndexSet, &[object, index, value]);
@@ -645,7 +666,7 @@ impl FunctionCompiler<'_, '_> {
 
     // Non-objects and the global object (address zero) see an all-zero slot, so every
     // kind check fails and the length reads as zero.
-    pub(super) fn view(&mut self, object: ClifValue) -> ClifValue {
+    pub(super) fn view(&mut self, object: LoweredValue) -> LoweredValue {
         let tag = self.b.ins().ushr_imm_s(object, TAG_SHIFT as i64);
         let is_object =
             self.b
@@ -663,11 +684,11 @@ impl FunctionCompiler<'_, '_> {
 
     pub(super) fn generic_call(
         &mut self,
-        callee: ClifValue,
-        receiver: ClifValue,
-        args: &[ClifValue],
+        callee: LoweredValue,
+        receiver: LoweredValue,
+        args: &[LoweredValue],
         span: Span,
-    ) -> Result<ClifValue, Error> {
+    ) -> Result<LoweredValue, Error> {
         if let Ok(arity) = u16::try_from(args.len())
             && let Some(miss) = self.stubs.miss(arity)
         {
@@ -682,11 +703,11 @@ impl FunctionCompiler<'_, '_> {
 
     fn unchecked_call(
         &mut self,
-        callee: ClifValue,
-        receiver: ClifValue,
-        args: &[ClifValue],
+        callee: LoweredValue,
+        receiver: LoweredValue,
+        args: &[LoweredValue],
         span: Span,
-    ) -> Result<ClifValue, Error> {
+    ) -> Result<LoweredValue, Error> {
         let argv = self.stack_values(args, span)?;
         let argc = self.b.ins().iconst(types::I64, args.len() as i64);
         Ok(self.call_helper(Helper::Call, &[callee, receiver, argv, argc]))
@@ -697,13 +718,13 @@ impl FunctionCompiler<'_, '_> {
     pub(super) fn direct_call(
         &mut self,
         target: DirectTarget,
-        callee: ClifValue,
-        receiver: ClifValue,
-        args: &[ClifValue],
+        callee: LoweredValue,
+        receiver: LoweredValue,
+        args: &[LoweredValue],
         span: Span,
         owned: bool,
         known_code: bool,
-    ) -> Result<ClifValue, Error> {
+    ) -> Result<LoweredValue, Error> {
         if matches!(target.variant, crate::jit::entries::VariantId::Ordinary(_) if target.variant.index() >= crate::jit::entries::DIRECT_ENTRIES)
         {
             let result = self.generic_call(callee, receiver, args, span)?;
@@ -755,14 +776,14 @@ impl FunctionCompiler<'_, '_> {
     fn selected_call(
         &mut self,
         target: DirectTarget,
-        callee: ClifValue,
-        receiver: ClifValue,
-        args: &[ClifValue],
+        callee: LoweredValue,
+        receiver: LoweredValue,
+        args: &[LoweredValue],
         span: Span,
         miss: usize,
         owned: bool,
         known_code: bool,
-    ) -> ClifValue {
+    ) -> LoweredValue {
         self.mark_call_site(span, true);
         let (entry, direct) = self.direct_entry(target, callee, known_code);
         let miss = self.b.ins().iconst(self.pointer, miss as i64);
@@ -787,13 +808,13 @@ impl FunctionCompiler<'_, '_> {
 
     fn checked_fixed_call(
         &mut self,
-        entry: ClifValue,
+        entry: LoweredValue,
         arity: u16,
-        callee: ClifValue,
-        receiver: ClifValue,
-        args: &[ClifValue],
+        callee: LoweredValue,
+        receiver: LoweredValue,
+        args: &[LoweredValue],
         owned: bool,
-    ) -> ClifValue {
+    ) -> LoweredValue {
         let (result, status) = self.fixed_call(entry, arity, callee, receiver, args);
         let failed = self.b.create_block();
         let succeeded = self.b.create_block();
@@ -808,12 +829,12 @@ impl FunctionCompiler<'_, '_> {
 
     fn fixed_call(
         &mut self,
-        entry: ClifValue,
+        entry: LoweredValue,
         arity: u16,
-        callee: ClifValue,
-        receiver: ClifValue,
-        args: &[ClifValue],
-    ) -> (ClifValue, ClifValue) {
+        callee: LoweredValue,
+        receiver: LoweredValue,
+        args: &[LoweredValue],
+    ) -> (LoweredValue, LoweredValue) {
         let arity = usize::from(arity);
         let signature = self.fixed_signature(arity as u16);
         let mut call_args = vec![self.ctx, callee, receiver];
@@ -827,7 +848,7 @@ impl FunctionCompiler<'_, '_> {
         (result, status)
     }
 
-    fn owned_result(&mut self, result: ClifValue, owned: bool) -> ClifValue {
+    fn owned_result(&mut self, result: LoweredValue, owned: bool) -> LoweredValue {
         if owned {
             return result;
         }
@@ -837,17 +858,17 @@ impl FunctionCompiler<'_, '_> {
     fn direct_entry(
         &mut self,
         target: DirectTarget,
-        callee: ClifValue,
+        callee: LoweredValue,
         known_code: bool,
-    ) -> (ClifValue, ClifValue) {
-        if let Some(call) = super::stubs::poll(
+    ) -> (LoweredValue, LoweredValue) {
+        if let Some(call) = super::poll::emit(
             self.b,
             self.module,
             self.stubs.compilation_state,
             self.ctx,
             None,
         ) {
-            self.annotations.helpers.insert(call, Helper::CompilePoll);
+            self.b.mark_helper(call, Helper::CompilePoll);
         }
         let entry = match target.variant {
             crate::jit::entries::VariantId::Ordinary(_) => {
@@ -908,9 +929,9 @@ impl FunctionCompiler<'_, '_> {
     /// Whether a value is a closure of this code that may be called without `new`.
     pub(super) fn is_code(
         &mut self,
-        value: ClifValue,
+        value: LoweredValue,
         code: cranelift_module::FuncId,
-    ) -> ClifValue {
+    ) -> LoweredValue {
         let view = self.view(value);
         let word = self
             .b
@@ -921,30 +942,30 @@ impl FunctionCompiler<'_, '_> {
             .icmp_imm_s(IntCC::Equal, word, i64::from(code.as_u32()) + 1)
     }
 
-    pub(super) fn view_kind(&mut self, view: ClifValue) -> ClifValue {
+    pub(super) fn view_kind(&mut self, view: LoweredValue) -> LoweredValue {
         self.b
             .ins()
             .load(types::I32, MemFlagsData::trusted(), view, KIND_OFFSET)
     }
 
-    pub(super) fn has_kind(&mut self, view: ClifValue, mask: u32) -> ClifValue {
+    pub(super) fn has_kind(&mut self, view: LoweredValue, mask: u32) -> LoweredValue {
         let kind = self.view_kind(view);
         let masked = self.b.ins().band_imm_s(kind, mask as i64);
         self.b.ins().icmp_imm_s(IntCC::NotEqual, masked, 0)
     }
 
-    pub(super) fn view_length_integer(&mut self, view: ClifValue) -> ClifValue {
+    pub(super) fn view_length_integer(&mut self, view: LoweredValue) -> LoweredValue {
         self.b
             .ins()
             .load(types::I64, MemFlagsData::trusted(), view, LENGTH_OFFSET)
     }
 
-    pub(super) fn view_length(&mut self, view: ClifValue) -> ClifValue {
+    pub(super) fn view_length(&mut self, view: LoweredValue) -> LoweredValue {
         let length = self.view_length_integer(view);
         self.b.ins().fcvt_from_uint(types::F64, length)
     }
 
-    pub(super) fn length_access(&mut self, object: ClifValue) -> ClifValue {
+    pub(super) fn length_access(&mut self, object: LoweredValue) -> LoweredValue {
         let view = self.view(object);
         let indexed = self.has_kind(view, kind::ARRAY | kind::TYPED);
         let inline = self.b.create_block();
@@ -968,15 +989,15 @@ impl FunctionCompiler<'_, '_> {
 
     pub(super) fn element_read(
         &mut self,
-        object: ClifValue,
+        object: LoweredValue,
         key: Operand,
         retain: bool,
-    ) -> ClifValue {
+    ) -> LoweredValue {
         let view = self.view(object);
         self.viewed_index_access(view, object, key, None, true, retain, true)
     }
 
-    pub(super) fn typed_kind_is(&mut self, view: ClifValue, kind: TypedKind) -> ClifValue {
+    pub(super) fn typed_kind_is(&mut self, view: LoweredValue, kind: TypedKind) -> LoweredValue {
         let actual = self.view_kind(view);
         let expected = Element::from(kind).kind();
         self.b
@@ -987,7 +1008,7 @@ impl FunctionCompiler<'_, '_> {
     /// Reads an element of a typed array of known kind at an index known to be in bounds.
     pub(super) fn bounded_element_read(
         &mut self,
-        view: ClifValue,
+        view: LoweredValue,
         key: Operand,
         kind: TypedKind,
     ) -> Operand {
@@ -1022,11 +1043,11 @@ impl FunctionCompiler<'_, '_> {
 
     pub(super) fn array_load(
         &mut self,
-        view: ClifValue,
+        view: LoweredValue,
         position: Operand,
         holey: bool,
         retain: bool,
-    ) -> ClifValue {
+    ) -> LoweredValue {
         let position = self.convert(position, Repr::Int64);
         let flags = MemFlagsData::trusted();
         let data = self.b.ins().load(self.pointer, flags, view, DATA_OFFSET);
@@ -1058,7 +1079,7 @@ impl FunctionCompiler<'_, '_> {
 
     pub(super) fn checked_element_read(
         &mut self,
-        view: ClifValue,
+        view: LoweredValue,
         key: Operand,
         kind: TypedKind,
     ) -> Operand {
@@ -1092,14 +1113,14 @@ impl FunctionCompiler<'_, '_> {
 
     pub(super) fn viewed_index_access(
         &mut self,
-        view: ClifValue,
-        object: ClifValue,
+        view: LoweredValue,
+        object: LoweredValue,
         key: Operand,
         value: Option<Operand>,
         fallback: bool,
         retain: bool,
         typed: bool,
-    ) -> ClifValue {
+    ) -> LoweredValue {
         let flags = MemFlagsData::trusted();
         let length = self.b.ins().load(types::I64, flags, view, LENGTH_OFFSET);
         let (position, fast) = if matches!(key.repr, Repr::Int32 | Repr::Int64) {
@@ -1251,7 +1272,11 @@ impl FunctionCompiler<'_, '_> {
         self.b.block_params(done)[0]
     }
 
-    pub(super) fn global_access(&mut self, name: &str, value: Option<ClifValue>) -> ClifValue {
+    pub(super) fn global_access(
+        &mut self,
+        name: &str,
+        value: Option<LoweredValue>,
+    ) -> LoweredValue {
         let Some(value) = value else {
             return self.cached_global_get(name, false, true);
         };
@@ -1264,7 +1289,7 @@ impl FunctionCompiler<'_, '_> {
         result
     }
 
-    pub(super) fn global_get_optional(&mut self, name: &str, retain: bool) -> ClifValue {
+    pub(super) fn global_get_optional(&mut self, name: &str, retain: bool) -> LoweredValue {
         self.cached_global_get(name, true, retain)
     }
 
@@ -1273,7 +1298,7 @@ impl FunctionCompiler<'_, '_> {
         name: &str,
         optional: bool,
         retain: bool,
-    ) -> ClifValue {
+    ) -> LoweredValue {
         let helper = match (optional, retain) {
             (false, true) => Helper::GlobalGet,
             (true, true) => Helper::GlobalGetOptional,
@@ -1283,11 +1308,11 @@ impl FunctionCompiler<'_, '_> {
         self.cached_global(name, helper, retain)
     }
 
-    pub(super) fn cached_global_probe(&mut self, name: &str) -> ClifValue {
+    pub(super) fn cached_global_probe(&mut self, name: &str) -> LoweredValue {
         self.cached_global(name, Helper::SemanticGlobalProbe, false)
     }
 
-    fn cached_global(&mut self, name: &str, helper: Helper, retain: bool) -> ClifValue {
+    fn cached_global(&mut self, name: &str, helper: Helper, retain: bool) -> LoweredValue {
         use crate::jit::helpers::GlobalCache;
         use crate::jit::session::{GLOBAL_IDENTITY_OFFSET, GLOBAL_REVISION_OFFSET};
 
@@ -1361,7 +1386,7 @@ impl FunctionCompiler<'_, '_> {
         self.b.block_params(done)[0]
     }
 
-    pub(super) fn global_initialize(&mut self, name: &str, value: ClifValue) {
+    pub(super) fn global_initialize(&mut self, name: &str, value: LoweredValue) {
         let name: Box<str> = name.into();
         let ptr = self.b.ins().iconst(self.pointer, name.as_ptr() as i64);
         let len = self.b.ins().iconst(types::I64, name.len() as i64);
@@ -1372,34 +1397,34 @@ impl FunctionCompiler<'_, '_> {
 
     pub(super) fn cached_property_get(
         &mut self,
-        object: ClifValue,
+        object: LoweredValue,
         name: &str,
         retain: bool,
         observer: Option<(u64, crate::jit::profile::Site)>,
         megamorphic: bool,
-    ) -> ClifValue {
+    ) -> LoweredValue {
         self.cached_property_read(object, name, retain, false, observer, megamorphic)
     }
 
     pub(super) fn cached_property_probe(
         &mut self,
-        object: ClifValue,
+        object: LoweredValue,
         name: &str,
         observer: Option<(u64, crate::jit::profile::Site)>,
         megamorphic: bool,
-    ) -> ClifValue {
+    ) -> LoweredValue {
         self.cached_property_read(object, name, false, true, observer, megamorphic)
     }
 
     fn cached_property_read(
         &mut self,
-        object: ClifValue,
+        object: LoweredValue,
         name: &str,
         retain: bool,
         probe: bool,
         observer: Option<(u64, crate::jit::profile::Site)>,
         megamorphic: bool,
-    ) -> ClifValue {
+    ) -> LoweredValue {
         if megamorphic && !probe {
             return self.property_access(object, name, None, None);
         }
@@ -1437,11 +1462,11 @@ impl FunctionCompiler<'_, '_> {
 
     fn property_cache_entry(
         &mut self,
-        object: ClifValue,
-        address: ClifValue,
+        object: LoweredValue,
+        address: LoweredValue,
         builtins: bool,
         validate: bool,
-    ) -> ClifValue {
+    ) -> LoweredValue {
         let flags = MemFlagsData::trusted();
         let miss = self.b.create_block();
         let done = self.b.create_block();
@@ -1556,29 +1581,29 @@ impl FunctionCompiler<'_, '_> {
 
     pub(super) fn property_cache_hit(
         &mut self,
-        object: ClifValue,
-        address: ClifValue,
-    ) -> ClifValue {
+        object: LoweredValue,
+        address: LoweredValue,
+    ) -> LoweredValue {
         let entry = self.property_cache_entry(object, address, true, true);
         self.b.ins().icmp_imm_s(IntCC::NotEqual, entry, 0)
     }
 
     pub(super) fn property_shape_hit(
         &mut self,
-        object: ClifValue,
-        address: ClifValue,
-    ) -> ClifValue {
+        object: LoweredValue,
+        address: LoweredValue,
+    ) -> LoweredValue {
         let entry = self.property_cache_entry(object, address, false, true);
         self.b.ins().icmp_imm_s(IntCC::NotEqual, entry, 0)
     }
 
     pub(super) fn cached_property_load(
         &mut self,
-        object: ClifValue,
-        address: ClifValue,
+        object: LoweredValue,
+        address: LoweredValue,
         retain: bool,
         builtins: bool,
-    ) -> ClifValue {
+    ) -> LoweredValue {
         // A dominating guard validated the holder; reselect without depending on mutable hit state.
         let entry = self.property_cache_entry(object, address, builtins, false);
         self.cached_property_entry_load(object, entry, retain, builtins)
@@ -1586,11 +1611,11 @@ impl FunctionCompiler<'_, '_> {
 
     fn cached_property_entry_load(
         &mut self,
-        object: ClifValue,
-        entry: ClifValue,
+        object: LoweredValue,
+        entry: LoweredValue,
         retain: bool,
         builtins: bool,
-    ) -> ClifValue {
+    ) -> LoweredValue {
         let flags = MemFlagsData::trusted();
         let ready = self.b.create_block();
         let done = self.b.create_block();
@@ -1656,9 +1681,9 @@ impl FunctionCompiler<'_, '_> {
 
     pub(super) fn fill_property_cache(
         &mut self,
-        object: ClifValue,
-        address: ClifValue,
-    ) -> ClifValue {
+        object: LoweredValue,
+        address: LoweredValue,
+    ) -> LoweredValue {
         let result = self.call_helper(Helper::PropertyGetCached, &[object, address]);
         self.check_error();
         result
@@ -1666,11 +1691,11 @@ impl FunctionCompiler<'_, '_> {
 
     fn overwrite_slot(
         &mut self,
-        view: ClifValue,
-        overwrite_index: ClifValue,
-        value: ClifValue,
-        slow: cranelift_codegen::ir::Block,
-        done: cranelift_codegen::ir::Block,
+        view: LoweredValue,
+        overwrite_index: LoweredValue,
+        value: LoweredValue,
+        slow: crate::jit::semantic::Block,
+        done: crate::jit::semantic::Block,
     ) {
         let flags = MemFlagsData::trusted();
         let overwrite_data = self.b.ins().load(self.pointer, flags, view, DATA_OFFSET);
@@ -1711,7 +1736,7 @@ impl FunctionCompiler<'_, '_> {
         self.jump(done, &[BlockArg::Value(value)]);
     }
 
-    pub(super) fn shape_hit(&mut self, object: ClifValue, shape: u32) -> ClifValue {
+    pub(super) fn shape_hit(&mut self, object: LoweredValue, shape: u32) -> LoweredValue {
         let view = self.view(object);
         let actual = self
             .b
@@ -1722,10 +1747,10 @@ impl FunctionCompiler<'_, '_> {
 
     pub(super) fn shaped_property_probe(
         &mut self,
-        object: ClifValue,
+        object: LoweredValue,
         shape: u32,
         index: u32,
-    ) -> ClifValue {
+    ) -> LoweredValue {
         let hit = self.shape_hit(object, shape);
         let fast = self.b.create_block();
         let miss = self.b.create_block();
@@ -1744,10 +1769,10 @@ impl FunctionCompiler<'_, '_> {
 
     pub(super) fn shaped_property_get(
         &mut self,
-        object: ClifValue,
+        object: LoweredValue,
         index: u32,
         retain: bool,
-    ) -> ClifValue {
+    ) -> LoweredValue {
         let flags = MemFlagsData::trusted();
         let view = self.b.ins().band_imm_s(object, ADDRESS_MASK);
         let data = self.b.ins().load(self.pointer, flags, view, DATA_OFFSET);
@@ -1772,10 +1797,10 @@ impl FunctionCompiler<'_, '_> {
 
     pub(super) fn shaped_property_set(
         &mut self,
-        object: ClifValue,
+        object: LoweredValue,
         name: &str,
         index: u32,
-        value: ClifValue,
+        value: LoweredValue,
     ) {
         let view = self.b.ins().band_imm_s(object, ADDRESS_MASK);
         let index = self.b.ins().iconst(types::I64, index as i64);
@@ -1794,11 +1819,11 @@ impl FunctionCompiler<'_, '_> {
 
     fn cached_property_set(
         &mut self,
-        object: ClifValue,
+        object: LoweredValue,
         name: &str,
-        value: ClifValue,
+        value: LoweredValue,
         observer: Option<(u64, crate::jit::profile::Site)>,
-    ) -> ClifValue {
+    ) -> LoweredValue {
         let address = self.function_data(PropertyCache::new(name, observer, false));
         let flags = MemFlagsData::trusted();
         let view = self.view(object);
@@ -1881,11 +1906,11 @@ impl FunctionCompiler<'_, '_> {
 
     pub(super) fn property_access(
         &mut self,
-        object: ClifValue,
+        object: LoweredValue,
         name: &str,
-        value: Option<ClifValue>,
+        value: Option<LoweredValue>,
         observer: Option<(u64, crate::jit::profile::Site)>,
-    ) -> ClifValue {
+    ) -> LoweredValue {
         if let Some(value) = value {
             return self.cached_property_set(object, name, value, observer);
         }
@@ -1900,9 +1925,9 @@ impl FunctionCompiler<'_, '_> {
 
     pub(super) fn define_hidden_property(
         &mut self,
-        object: ClifValue,
+        object: LoweredValue,
         name: &str,
-        value: ClifValue,
+        value: LoweredValue,
     ) {
         let name: Box<str> = name.into();
         let ptr = self.b.ins().iconst(self.pointer, name.as_ptr() as i64);
@@ -1912,7 +1937,7 @@ impl FunctionCompiler<'_, '_> {
         self.check_error();
     }
 
-    fn pending(&mut self, offset: i32, none: i64) -> ClifValue {
+    fn pending(&mut self, offset: i32, none: i64) -> LoweredValue {
         let word = self
             .b
             .ins()
@@ -1925,8 +1950,7 @@ impl FunctionCompiler<'_, '_> {
         let can_throw = self
             .b
             .current_block()
-            .and_then(|block| self.b.func.layout.last_inst(block))
-            .and_then(|inst| self.annotations.helpers.get(&inst))
+            .and_then(|_| self.b.last_helper())
             .is_none_or(|helper| helper.can_throw());
         let condition = self.pending(crate::jit::session::ERROR_OFFSET, 0);
         let failed = self.b.create_block();
