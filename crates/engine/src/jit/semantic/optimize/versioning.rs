@@ -756,6 +756,62 @@ fn entry_checks(
             }
         }
     }
+    for &(value, fact) in assumes {
+        let checked = values.get(&value).copied().unwrap_or(value);
+        let test = match fact {
+            Fact::Indexed => Op::IsIndexed(checked),
+            Fact::Cached(site) => {
+                let Op::Get(_, name) = &graph.insts[site].op else {
+                    unreachable!();
+                };
+                Op::IsPropertyCached(checked, site, name.clone())
+            }
+            _ => continue,
+        };
+        let guard = EntryGuard::Fact(checked, fact);
+        if guard.tested_by(&tested) {
+            continue;
+        }
+        tested.insert(guard);
+        let otherwise = if fallback.is_some() {
+            if let Op::IsPropertyCached(object, site, name) = &test {
+                let prime = graph.blocks.push(BlockData::default());
+                graph.cold.insert(prime);
+                graph.append(
+                    prime,
+                    span,
+                    Op::PrimePropertyCache(*object, *site, name.clone()),
+                    false,
+                );
+                graph.terminate(prime, span, TerminatorKind::Jump(original.clone()));
+                Target::new(prime)
+            } else {
+                original.clone()
+            }
+        } else {
+            original.clone()
+        };
+        let shaped = matches!(&test, Op::IsPropertyCached(object, _, name)
+            if !crate::heap::builtin_method(name) && graph.caller_rooted(*object));
+        let condition = graph.append_value(current, span, test);
+        let next = graph.blocks.push(BlockData::default());
+        graph.terminate(
+            current,
+            span,
+            TerminatorKind::Branch(condition, Target::new(next), otherwise),
+        );
+        current = next;
+        if shaped && !objects.contains_key(&checked) {
+            let alias = graph.append_value(current, span, Op::AsObject(checked));
+            objects.insert(checked, alias);
+            retarget(graph, copies, checked, alias);
+            for arg in &mut args {
+                if *arg == checked {
+                    *arg = alias;
+                }
+            }
+        }
+    }
     let numeric = || {
         assumes
             .iter()
@@ -918,15 +974,18 @@ fn local_checks(
     for &inst in speculation.locals {
         let mapped = copy.insts[&inst];
         let data = graph.insts[mapped].clone();
-        let Op::Assume(value, Fact::Type(types), origin) = data.op else {
+        let Op::Assume(value, fact, origin) = data.op else {
             continue;
         };
+        let types = fact.mask().unwrap_or(ValueType::default());
         let known = match graph.defining_op(value) {
             Some(Op::AsInteger(_)) => ValueType::INTEGER,
             Some(Op::AsNumber(_)) => ValueType::NUMBER,
             _ => facts.of(value),
         };
-        if known.intersects(types) && known.within(types) {
+        if (fact.mask().is_some() && known.intersects(types) && known.within(types))
+            || super::super::guards::holds(graph, &facts.cfg, data.block, value, fact)
+        {
             continue;
         }
         let block = data.block;
@@ -981,11 +1040,7 @@ fn local_checks(
         let (guard, check) = graph.append(
             before,
             data.span,
-            if integer {
-                Op::IsInteger(value)
-            } else {
-                Op::IsNumber(value)
-            },
+            fact.test(value).expect("local assumption test"),
             true,
         );
         graph.insts[guard].source_name = data.source_name;
@@ -995,6 +1050,9 @@ fn local_checks(
             data.span,
             TerminatorKind::Branch(check.unwrap(), Target::new(block), fallback),
         );
+        if fact.mask().is_none() {
+            continue;
+        }
         let (unbox, number) = graph.insert(
             block,
             0,

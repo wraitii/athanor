@@ -498,11 +498,7 @@ fn indexed_rows_borrow_from_owned_receivers_through_guards() {
     }
 }
 
-// Varying read guards alone do not trigger region versioning, so generic reads still
-// merge with the fast path and prevent borrowing. Enabling these regions also requires
-// repairing loop values correctly on guard-failure continuations.
 #[test]
-#[should_panic(expected = "guard-only region should borrow the array row")]
 fn guard_only_region_borrows_rows_without_entry_assumptions() {
     use crate::jit::profile::{ReadKind, ReadType, Site};
 
@@ -2806,4 +2802,135 @@ fn conversion_hoisting_keeps_heap_values_inside_the_loop() {
     assert_eq!(graph.insts[scalar].block, entry);
     assert_eq!(graph.insts[unknown].block, header);
     graph.verify().unwrap();
+}
+
+#[test]
+fn cache_requirements_leave_property_reads_until_lowering() {
+    let mut graph = canonicalize_graph(
+        lower_source("function f(object){return object.method();}").unwrap(),
+        true,
+    )
+    .unwrap()
+    .graph;
+    let (block, span, callee) = graph
+        .insts
+        .values()
+        .find_map(|data| {
+            matches!(data.op, Op::Get(_, ref name) if name == "method")
+                .then(|| (data.block, data.span, data.result().unwrap()))
+        })
+        .unwrap();
+    graph.append_value(
+        block,
+        span,
+        Op::IsCode(callee, cranelift_module::FuncId::from_u32(0)),
+    );
+    let blocks = graph.blocks.len();
+    let reads = caches::assume(&mut graph, &shapes::Plan::default());
+    assert_eq!(reads.len(), 1);
+    assert_eq!(graph.blocks.len(), blocks);
+    assert!(
+        ops(&graph)
+            .iter()
+            .any(|op| matches!(op, Op::Get(_, name) if name == "method"))
+    );
+    assert!(
+        ops(&graph)
+            .iter()
+            .any(|op| matches!(op, Op::Assume(_, guards::Fact::Cached(_), _)))
+    );
+    assert!(!ops(&graph).iter().any(|op| matches!(
+        op,
+        Op::IsPropertyCached(..) | Op::CachedProperty(..) | Op::FillPropertyCache(..)
+    )));
+    graph.strip_assumes();
+    caches::lower(&mut graph, &reads).unwrap();
+    assert!(
+        ops(&graph)
+            .iter()
+            .any(|op| matches!(op, Op::CachedProperty(..)))
+    );
+    assert!(
+        ops(&graph)
+            .iter()
+            .any(|op| matches!(op, Op::FillPropertyCache(..)))
+    );
+    graph.verify().unwrap();
+}
+
+#[test]
+fn cache_entry_guards_preserve_receiver_proofs() {
+    for (name, builtins) in [("method", false), ("push", true)] {
+        let source = format!("function f(object){{return object.{name};}}");
+        let mut graph = canonicalize_graph(lower_source(&source).unwrap(), true)
+            .unwrap()
+            .graph;
+        let (block, span, callee) = graph
+            .insts
+            .values()
+            .find_map(|data| {
+                matches!(data.op, Op::Get(..))
+                    .then(|| (data.block, data.span, data.result().unwrap()))
+            })
+            .unwrap();
+        graph.append_value(
+            block,
+            span,
+            Op::IsCode(callee, cranelift_module::FuncId::from_u32(0)),
+        );
+        let reads = caches::assume(&mut graph, &shapes::Plan::default());
+        let regions =
+            optimize::version(&mut graph, &Default::default(), Some(1), &mut Vec::new()).unwrap();
+        assert!(!regions.is_empty());
+        assert_eq!(
+            ops(&graph).iter().any(|op| matches!(op, Op::AsObject(..))),
+            !builtins
+        );
+        let blocks = graph.blocks.len();
+        caches::lower(&mut graph, &reads).unwrap();
+        assert_eq!(graph.blocks.len(), blocks);
+        boundary::compact(&mut graph);
+        graph.verify().unwrap();
+    }
+}
+
+#[test]
+fn guarded_cache_loads_preserve_their_builtin_mode() {
+    for (name, builtins) in [("method", false), ("push", true)] {
+        let source = format!("function f(object){{return object.{name};}}");
+        let mut graph = canonicalize_graph(lower_source(&source).unwrap(), true)
+            .unwrap()
+            .graph;
+        let (inst, object) = graph
+            .insts
+            .iter()
+            .find_map(|(inst, data)| {
+                if let Op::Get(object, _) = data.op {
+                    Some((inst, object))
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        let span = graph.insts[inst].span;
+        let (before, _, read) = dispatch::split(&mut graph, inst);
+        let failed = graph.blocks.push(BlockData::default());
+        let undefined = graph.append_value(failed, span, Op::Constant(Constant::Undefined));
+        graph.terminate(failed, span, TerminatorKind::Return(undefined));
+        let check = graph.append_value(
+            before,
+            span,
+            Op::IsPropertyCached(object, inst, name.into()),
+        );
+        graph.terminate(
+            before,
+            span,
+            TerminatorKind::Branch(check, Target::new(read), Target::new(failed)),
+        );
+        let blocks = graph.blocks.len();
+        caches::lower(&mut graph, &[inst]).unwrap();
+        assert_eq!(graph.blocks.len(), blocks);
+        assert!(matches!(graph.insts[inst].op, Op::CachedProperty(_, _, mode) if mode == builtins));
+        graph.verify().unwrap();
+    }
 }

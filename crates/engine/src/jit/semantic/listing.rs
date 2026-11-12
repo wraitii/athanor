@@ -310,7 +310,7 @@ impl Graph {
             Op::IsPropertyCached(object, _, name) => {
                 format!("property_cached {object}.{name}")
             }
-            Op::CachedProperty(object, _) => format!("cached_property {object}"),
+            Op::CachedProperty(object, _, _) => format!("cached_property {object}"),
             Op::IsShape(object, shape) => format!("is_shape {object}, {shape}"),
             Op::ShapedGet(object, name, index) => {
                 format!("shaped_get {object}.{name} @{index}")

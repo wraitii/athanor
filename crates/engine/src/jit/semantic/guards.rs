@@ -2,7 +2,7 @@ use crate::FxHashMap;
 use cranelift_module::FuncId;
 
 use super::facts::ValueType;
-use super::{Block, Graph, Native, Op, TerminatorKind, UnaryOp, Value};
+use super::{Block, Graph, Inst, Native, Op, TerminatorKind, UnaryOp, Value};
 use crate::heap::TypedKind;
 use crate::jit::profile::Site;
 
@@ -13,6 +13,8 @@ pub(in crate::jit) enum Fact {
     Shape(u32),
     Typed(Option<TypedKind>),
     Indexed,
+    // The original property-read site identifies one cache across versioned copies.
+    Cached(Inst),
     Native(Native),
     Bound(Value),
 }
@@ -109,6 +111,7 @@ pub(super) fn implies(op: &Op) -> Option<(Value, Fact)> {
         Op::IsShape(value, shape) => (value, Fact::Shape(shape)),
         Op::IsTyped(value, element) => (value, Fact::Typed(element)),
         Op::IsIndexed(value) => (value, Fact::Indexed),
+        Op::IsPropertyCached(value, site, _) => (value, Fact::Cached(site)),
         _ => return None,
     })
 }
@@ -144,4 +147,33 @@ pub(super) fn record_entry(graph: &mut Graph, value: Value, fact: Fact) {
     if !graph.entry_guards.contains(&(input, fact)) {
         graph.entry_guards.push((input, fact));
     }
+}
+
+pub(super) fn holds(
+    graph: &Graph,
+    cfg: &super::Cfg,
+    block: Block,
+    value: Value,
+    fact: Fact,
+) -> bool {
+    let original = |mut value| {
+        while let Some(Op::AsObject(source)) = graph.defining_op(value) {
+            value = *source;
+        }
+        value
+    };
+    let value = original(value);
+    cfg.rpo.iter().any(|&guard| {
+        graph.blocks[guard]
+            .terminator
+            .as_ref()
+            .and_then(|terminator| edge_of(graph, &terminator.kind))
+            .is_some_and(|edge| {
+                original(edge.value) == value
+                    && edge.fact.implies(fact)
+                    && edge.yes != graph.entry
+                    && cfg.preds[edge.yes].len() == 1
+                    && cfg.dominates(edge.yes, block)
+            })
+    })
 }

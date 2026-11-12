@@ -424,7 +424,7 @@ pub(super) enum Op {
     DisableConstructor(Value),
     Get(Value, String),
     IsPropertyCached(Value, Inst, String),
-    CachedProperty(Value, Inst),
+    CachedProperty(Value, Inst, bool),
     IsShape(Value, u32),
     ShapedGet(Value, String, u32),
     ShapedSet(Value, String, u32, Value),
@@ -655,7 +655,7 @@ impl Op {
             | Op::IsUninitialized(value)
             | Op::Get(value, _)
             | Op::IsPropertyCached(value, _, _)
-            | Op::CachedProperty(value, _)
+            | Op::CachedProperty(value, _, _)
             | Op::IsShape(value, _)
             | Op::ShapedGet(value, _, _)
             | Op::FillPropertyCache(value, _, _)
@@ -867,7 +867,7 @@ impl Op {
             | Op::IsUninitialized(value)
             | Op::Get(value, _)
             | Op::IsPropertyCached(value, _, _)
-            | Op::CachedProperty(value, _)
+            | Op::CachedProperty(value, _, _)
             | Op::IsShape(value, _)
             | Op::ShapedGet(value, _, _)
             | Op::FillPropertyCache(value, _, _)
@@ -2538,13 +2538,8 @@ pub(super) fn optimize_planned(
         .iter()
         .copied()
         .collect();
-    caches::apply(&mut function.graph, &function.plan.shapes)?;
-    reads::apply(
-        &mut function.graph,
-        &function.plan.reads,
-        &mut function.notes,
-    )?;
-    comparisons::expose(&mut function);
+    let cached_reads = caches::assume(&mut function.graph, &function.plan.shapes);
+    reads::assume(&mut function.graph, &function.plan.reads);
     optimize::sink_closures(&mut function);
     if optimize::lazy_captures(&mut function) {
         function.invalidate_cfg();
@@ -2602,6 +2597,14 @@ pub(super) fn optimize_planned(
                 .push(format!("{id}: blocks [{blocks}], fallback {fallback}"));
         }
     }
+    function.graph.strip_assumes();
+    caches::lower(&mut function.graph, &cached_reads)?;
+    reads::lower(
+        &mut function.graph,
+        &function.plan.reads,
+        &mut function.notes,
+    )?;
+    function.invalidate_cfg();
     optimize::normalise_regions(&mut function, &regions)?;
     js::coercions(&mut function);
     js::bit_tests(&mut function);

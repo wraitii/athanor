@@ -907,17 +907,11 @@ impl FunctionCompiler<'_, '_> {
                             let object = get(self, *object);
                             Some(self.length_access(object))
                         }
-                        Op::CachedProperty(object, site) => {
+                        Op::CachedProperty(object, site, builtins) => {
                             let object = get(self, *object);
                             let offset = self.property_caches[site];
                             let address = self.data_address(offset);
-                            let builtins = match &graph.insts[*site].op {
-                                Op::Get(_, name) | Op::FillPropertyCache(_, _, name) => {
-                                    crate::heap::builtin_method(name)
-                                }
-                                _ => true,
-                            };
-                            Some(self.cached_property_load(object, address, builtins))
+                            Some(self.cached_property_load(object, address, *builtins))
                         }
                         Op::ShapedGet(object, _, index) => {
                             let object = get(self, *object);

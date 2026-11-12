@@ -73,6 +73,92 @@ pub(super) fn plan(
     reads
 }
 
+pub(super) fn assume(graph: &mut Graph, reads: &[Read]) {
+    use super::guards::{Fact, Kind, Origin};
+    for read in reads {
+        let data = graph.insts[read.inst].clone();
+        let (object, key) = match data.op {
+            Op::GetIndex(object, key) | Op::TypedIndex(object, key, _) => (object, key),
+            _ => unreachable!(),
+        };
+        let at = graph.blocks[data.block]
+            .insts
+            .iter()
+            .position(|&i| i == read.inst)
+            .unwrap();
+        let receiver = if read.typed {
+            Fact::Typed(read.element)
+        } else {
+            Fact::Indexed
+        };
+        graph.insert(
+            data.block,
+            at,
+            data.span,
+            Op::Assume(
+                object,
+                receiver,
+                Origin {
+                    site: None,
+                    kind: Kind::Receiver,
+                    gain: 1,
+                },
+            ),
+            false,
+        );
+        if read.guard_number {
+            graph.insert(
+                data.block,
+                at,
+                data.span,
+                Op::Assume(
+                    key,
+                    Fact::Type(ValueType::NUMBER),
+                    Origin {
+                        site: None,
+                        kind: Kind::Number,
+                        gain: 1,
+                    },
+                ),
+                false,
+            );
+        }
+    }
+}
+
+pub(super) fn lower(
+    graph: &mut Graph,
+    planned: &[Read],
+    notes: &mut Vec<String>,
+) -> super::Result<()> {
+    let reads: Vec<_> = Cfg::new(graph)
+        .rpo
+        .into_iter()
+        .filter(|block| !graph.cold.contains(block))
+        .flat_map(|block| graph.blocks[block].insts.clone())
+        .filter_map(|inst| {
+            let data = &graph.insts[inst];
+            if !matches!(
+                data.op,
+                Op::GetIndex(..) | Op::TypedIndex(_, _, TypedRead { element: None, .. })
+            ) {
+                return None;
+            }
+            planned
+                .iter()
+                .find(|read| {
+                    let original = &graph.insts[read.inst];
+                    original.span == data.span && original.source_name == data.source_name
+                })
+                .map(|read| Read {
+                    inst,
+                    ..read.clone()
+                })
+        })
+        .collect();
+    apply(graph, &reads, notes)
+}
+
 pub(super) fn apply(
     graph: &mut Graph,
     reads: &[Read],
@@ -86,6 +172,37 @@ pub(super) fn apply(
             | Op::TypedIndex(object, key, TypedRead { element: None, .. }) => (object, key),
             _ => unreachable!(),
         };
+        let cfg = Cfg::new(graph);
+        let facts = Facts::compute(graph);
+        let block = data.block;
+        // A guarded indexed receiver owns the result even when the index needs a slow path.
+        if !read.typed
+            && super::guards::holds(graph, &cfg, block, object, super::guards::Fact::Indexed)
+            && facts.of(key).within(ValueType::NUMBER)
+        {
+            graph.insts[read.inst].op = Op::IndexedGet(object, key);
+        }
+        if read.typed
+            && super::guards::holds(
+                graph,
+                &cfg,
+                block,
+                object,
+                super::guards::Fact::Typed(read.element),
+            )
+            && facts.of(key).within(ValueType::NUMBER)
+        {
+            graph.insts[read.inst].op = Op::TypedIndex(
+                object,
+                key,
+                TypedRead {
+                    element: read.element,
+                    bounded: false,
+                },
+            );
+            continue;
+        }
+        let first_block = graph.blocks.len();
         let (block, continuation, fallback) = super::dispatch::split(graph, read.inst);
         let fast = if read.typed {
             let fast = graph.blocks.push(BlockData::default());
@@ -153,6 +270,7 @@ pub(super) fn apply(
                 });
                 guard = otherwise;
             }
+            extend_regions(graph, data.block, first_block);
             notes.push(format!(
                 "read at {site}: packed/holey indexed receiver checks"
             ));
@@ -181,9 +299,19 @@ pub(super) fn apply(
                 args: vec![value.unwrap()],
             }),
         });
+        extend_regions(graph, data.block, first_block);
         notes.push(format!("read at {site}: typed receiver check"));
     }
     graph.verify()
+}
+
+fn extend_regions(graph: &mut Graph, block: super::Block, first: usize) {
+    let added: Vec<_> = graph.blocks.keys().skip(first).collect();
+    for region in graph.regions.values_mut() {
+        if region.blocks.contains(&block) {
+            region.blocks.extend(added.iter().copied());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -241,7 +369,23 @@ mod tests {
         assert_eq!(decisions.len(), 2);
         assert!(!decisions[0].typed);
         assert!(decisions[1].typed);
-        apply(&mut graph, &decisions, &mut Vec::new()).unwrap();
+        let blocks = graph.blocks.len();
+        assume(&mut graph, &decisions);
+        assert_eq!(graph.blocks.len(), blocks);
+        assert!(
+            !graph
+                .insts
+                .values()
+                .any(|data| matches!(data.op, Op::ArrayLoad(..)))
+        );
+        assert!(
+            graph
+                .insts
+                .values()
+                .any(|data| matches!(data.op, Op::Assume(..)))
+        );
+        graph.strip_assumes();
+        lower(&mut graph, &decisions, &mut Vec::new()).unwrap();
         assert_eq!(
             graph
                 .insts

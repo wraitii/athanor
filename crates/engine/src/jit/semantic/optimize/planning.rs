@@ -199,6 +199,15 @@ impl RegionPlan {
                 .filter(|(_, fact)| matches!(fact, Fact::Type(_)))
                 .all(|&(value, fact)| Fact::Type(facts.of(value)).implies(fact))
             && child
+                .checks
+                .iter()
+                .filter(|(_, fact)| matches!(fact, Fact::Indexed | Fact::Cached(_)))
+                .all(|&(value, fact)| {
+                    self.checks
+                        .iter()
+                        .any(|&(parent, known)| parent == value && known.implies(fact))
+                })
+            && child
                 .calls
                 .iter()
                 .all(|call| self.calls.iter().any(|parent| parent == call))
@@ -425,8 +434,11 @@ fn plan_region(
             let block = graph.insts[inst].block;
             body.contains(&block)
                 && graph.blocks[block].insts.contains(&inst)
-                && matches!(graph.insts[inst].op, Op::Assume(value, Fact::Type(types), _)
-                    if !known.of(value).within(types))
+                && match graph.insts[inst].op {
+                    Op::Assume(value, Fact::Type(types), _) => !known.of(value).within(types),
+                    Op::Assume(_, Fact::Typed(_) | Fact::Indexed, _) => true,
+                    _ => false,
+                }
         })
         .collect();
     let blocks: Vec<_> = known
@@ -619,6 +631,23 @@ fn plan_region(
             .map(|&(object, bound)| (object, Fact::Bound(bound))),
     );
     checks.extend(requirements.iter().map(native_of));
+    let writes = Writes::with_facts(&planning, &written, &shared);
+    checks.extend(assumes.iter().copied().filter(|&(value, fact)| {
+        if body.contains(&planning.def_block(value)) && !available.contains(&value) {
+            return false;
+        }
+        match fact {
+            Fact::Indexed => true,
+            Fact::Cached(site) if reentry.is_none() => {
+                let Op::Get(_, name) = &planning.insts[site].op else {
+                    return false;
+                };
+                Access::read(&Op::IsPropertyCached(value, site, name.clone()), &shared)
+                    .is_some_and(|read| !writes.clobbers(&read))
+            }
+            _ => false,
+        }
+    }));
     let mut typed_reads = Vec::new();
     for &block in &blocks {
         for &inst in &planning.blocks[block].insts {

@@ -174,15 +174,16 @@ pub(super) fn compact(graph: &mut Graph) {
         }
         graph.blocks[copy].terminator = old_blocks[block].terminator.clone();
     }
-    for data in graph.insts.values_mut() {
+    let mut caches = FxHashMap::default();
+    for (inst, data) in graph.insts.iter_mut() {
         for value in data.op.operands_mut() {
             *value = values[value];
         }
         match &mut data.op {
-            Op::IsPropertyCached(_, inst, _)
-            | Op::CachedProperty(_, inst)
-            | Op::FillPropertyCache(_, inst, _)
-            | Op::PrimePropertyCache(_, inst, _) => *inst = insts[inst],
+            Op::IsPropertyCached(_, site, _)
+            | Op::CachedProperty(_, site, _)
+            | Op::FillPropertyCache(_, site, _)
+            | Op::PrimePropertyCache(_, site, _) => *site = *caches.entry(*site).or_insert(inst),
             _ => {}
         }
     }

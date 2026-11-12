@@ -204,9 +204,14 @@ pub(super) fn assume(graph: &mut Graph, conditional: &ConditionalPlan) -> Vec<Re
         .iter()
         .flat_map(|&block| graph.blocks[block].insts.iter().copied())
         .filter(|&inst| {
-            matches!(graph.insts[inst].op, Op::Assume(value, Fact::Type(_), _)
-                if matches!(hints.get(&value), Some(ReadType::Integer | ReadType::Number)))
-                && !reached.iter().any(|reach| reach.inst == inst)
+            (match graph.insts[inst].op {
+                Op::Assume(value, Fact::Type(_), _) => matches!(
+                    hints.get(&value),
+                    Some(ReadType::Integer | ReadType::Number)
+                ),
+                Op::Assume(_, Fact::Typed(_) | Fact::Indexed, _) => true,
+                _ => false,
+            }) && !reached.iter().any(|reach| reach.inst == inst)
                 && loops
                     .iter()
                     .any(|(_, body)| body.contains(&graph.insts[inst].block))

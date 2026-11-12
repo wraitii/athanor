@@ -11,7 +11,7 @@ const HEAP: ValueType = ValueType::STRING
 pub(in crate::jit) fn receiver(op: &Op) -> Option<Value> {
     match op {
         Op::Get(object, _)
-        | Op::CachedProperty(object, _)
+        | Op::CachedProperty(object, _, _)
         | Op::ShapedGet(object, ..)
         | Op::ProbeProperty(object, _)
         | Op::ProbeShapeProperty(object, ..)
