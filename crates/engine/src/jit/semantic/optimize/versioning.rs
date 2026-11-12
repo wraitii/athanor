@@ -357,7 +357,7 @@ fn duplicate(
         blocks.insert(block, copy);
         for param in graph.blocks[block].params.clone() {
             let mapped = if reuse { param } else { graph.add_param(copy) };
-            graph.low_level_types[mapped] = graph.low_level_types[param];
+            graph.reprs[mapped] = graph.reprs[param];
             values.insert(param, mapped);
         }
     }
@@ -382,7 +382,7 @@ fn duplicate(
             graph.insts[copy].source_name = data.source_name;
             graph.insts[copy].emission_location = data.emission_location;
             for (&old, &new) in data.results.iter().zip(&results) {
-                graph.low_level_types[new] = graph.low_level_types[old];
+                graph.reprs[new] = graph.reprs[old];
                 values.insert(old, new);
             }
             insts.insert(inst, copy);
@@ -772,7 +772,7 @@ fn entry_checks(
         if entry.is_none() {
             super::super::guards::record_entry(graph, value, fact);
         }
-        let check = if fact == Fact::Type(Types::INTEGER) {
+        let check = if fact == Fact::Type(ValueType::INTEGER) {
             Op::IsInteger(checked)
         } else {
             Op::IsNumber(checked)
@@ -795,7 +795,7 @@ fn entry_checks(
             graph.append_value(
                 current,
                 span,
-                if fact == Fact::Type(Types::INTEGER) {
+                if fact == Fact::Type(ValueType::INTEGER) {
                     Op::AsInteger(checked)
                 } else {
                     Op::AsNumber(checked)
@@ -922,8 +922,8 @@ fn local_checks(
             continue;
         };
         let known = match graph.defining_op(value) {
-            Some(Op::AsInteger(_)) => Types::INTEGER,
-            Some(Op::AsNumber(_)) => Types::NUMBER,
+            Some(Op::AsInteger(_)) => ValueType::INTEGER,
+            Some(Op::AsNumber(_)) => ValueType::NUMBER,
             _ => facts.of(value),
         };
         if known.intersects(types) && known.within(types) {
@@ -977,7 +977,7 @@ fn local_checks(
                 )),
             }
         }
-        let integer = types.within(Types::INTEGER);
+        let integer = types.within(ValueType::INTEGER);
         let (guard, check) = graph.append(
             before,
             data.span,

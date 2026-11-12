@@ -121,7 +121,7 @@ fn constructor_result_facts_and_folding_preserve_object_returns() {
         let returned = graph.append_value(block, span, returned);
         let result = graph.append_value(block, span, Op::ConstructorResult(returned, instance));
         graph.terminate(block, span, TerminatorKind::Return(result));
-        assert_eq!(Facts::compute(&graph).of(result), Types::OBJECT);
+        assert_eq!(Facts::compute(&graph).of(result), ValueType::OBJECT);
         let mut function = FunctionState::new(graph, Vec::new(), true);
         js::simplify(&mut function);
         let graph = function.graph;
@@ -151,11 +151,14 @@ fn block_arguments_retain_type_test_facts_without_narrowing_unrelated_edges() {
         let span = graph.span;
         let value = graph.append_value(entry, span, Op::Argument(0));
         let (op, mask) = match kind {
-            0 => (Op::IsUndefined(value), Types::UNDEFINED),
-            1 => (Op::IsNullish(value), Types::UNDEFINED.union(Types::NULL)),
-            2 => (Op::IsString(value), Types::STRING),
-            3 => (Op::IsNumber(value), Types::NUMBER),
-            _ => (Op::IsUninitialized(value), Types::UNINITIALIZED),
+            0 => (Op::IsUndefined(value), ValueType::UNDEFINED),
+            1 => (
+                Op::IsNullish(value),
+                ValueType::UNDEFINED.union(ValueType::NULL),
+            ),
+            2 => (Op::IsString(value), ValueType::STRING),
+            3 => (Op::IsNumber(value), ValueType::NUMBER),
+            _ => (Op::IsUninitialized(value), ValueType::UNINITIALIZED),
         };
         let condition = graph.append_value(entry, span, op);
         let yes = graph.blocks.push(BlockData::default());
@@ -195,7 +198,11 @@ fn block_arguments_retain_type_test_facts_without_narrowing_unrelated_edges() {
         let original = facts.of(value);
         assert_eq!(
             facts.of(positive),
-            if kind == 4 { Types::default() } else { mask }
+            if kind == 4 {
+                ValueType::default()
+            } else {
+                mask
+            }
         );
         assert_eq!(facts.of(negative), original.without(mask));
         assert_eq!(facts.of(merged), original);
@@ -732,7 +739,7 @@ fn promotes_bindings_and_infers_numbers() {
             _ => None,
         })
         .unwrap();
-    assert!(analysis.facts.of(returned).within(Types::NUMBER));
+    assert!(analysis.facts.of(returned).within(ValueType::NUMBER));
 }
 
 #[test]
@@ -789,12 +796,12 @@ fn global_writes_prevent_versioning_and_load_reuse() {
 #[test]
 fn small_constant_products_preserve_integer_types() {
     for (factor, expected) in [
-        ("3", Types::INT64),
-        ("4194304", Types::INT64),
-        ("4194305", Types::NUMBER),
-        ("0", Types::NUMBER),
-        ("-1", Types::NUMBER),
-        ("0.5", Types::NUMBER),
+        ("3", ValueType::INT64),
+        ("4194304", ValueType::INT64),
+        ("4194305", ValueType::NUMBER),
+        ("0", ValueType::NUMBER),
+        ("-1", ValueType::NUMBER),
+        ("0.5", ValueType::NUMBER),
     ] {
         for expression in [format!("(x|0)*{factor}"), format!("{factor}*(x|0)")] {
             let graph = lower_source(&format!("function f(x){{return {expression};}}")).unwrap();
@@ -1031,7 +1038,7 @@ fn integer_facts_survive_loop_backedges_without_length_bounds() {
                 Op::Unary(UnaryOp::Increment | UnaryOp::Decrement, _)
                     | Op::Binary(BinaryOperator::Addition | BinaryOperator::Subtraction, ..)
             ) {
-                assert!(facts.of(data.result().unwrap()).within(Types::INTEGER));
+                assert!(facts.of(data.result().unwrap()).within(ValueType::INTEGER));
                 steps += 1;
             }
         }
@@ -1041,8 +1048,8 @@ fn integer_facts_survive_loop_backedges_without_length_bounds() {
                 .blocks
                 .values()
                 .flat_map(|block| &block.params)
-                .any(|&value| facts.of(value).within(Types::INTEGER)
-                    && facts.of(value).intersects(Types::INT64))
+                .any(|&value| facts.of(value).within(ValueType::INTEGER)
+                    && facts.of(value).intersects(ValueType::INT64))
         );
     }
 }
@@ -1204,7 +1211,7 @@ fn checked_typed_reads_expose_shared_numeric_checks() {
         assert!(
             facts
                 .of(graph.insts[inst].result().unwrap())
-                .within(Types::NUMBER)
+                .within(ValueType::NUMBER)
         );
     }
 }
@@ -1294,7 +1301,7 @@ fn undefined_comparisons_refine_typed_read_results() {
             .unwrap();
         let types = Facts::compute(&graph).of(result);
         assert!(
-            types.intersects(Types::NUMBER) && types.within(Types::NUMBER),
+            types.intersects(ValueType::NUMBER) && types.within(ValueType::NUMBER),
             "{source}: {types}"
         );
     }
@@ -1367,7 +1374,7 @@ fn forwarded_undefined_facts_stop_at_joins_and_alternate_predecessors() {
     let facts = Facts::compute(&graph);
     assert_eq!(
         facts.of(narrowed),
-        facts.of(value).without(Types::UNDEFINED)
+        facts.of(value).without(ValueType::UNDEFINED)
     );
     assert_eq!(facts.of(parameter), facts.of(value));
     graph.terminate(yes, span, TerminatorKind::Jump(Target::new(no)));
@@ -1406,11 +1413,11 @@ fn facts_refresh_after_instruction_and_control_flow_changes() {
         })
         .unwrap();
     let cfg_storage = function.facts.cfg.rpo.as_ptr();
-    assert_eq!(function.facts.of(value), Types::INT32);
+    assert_eq!(function.facts.of(value), ValueType::INT32);
     function.graph.insts[inst].op = Op::Constant(Constant::String("one".into()));
     function.invalidate_values();
     function.ensure_facts();
-    assert_eq!(function.facts.of(value), Types::STRING);
+    assert_eq!(function.facts.of(value), ValueType::STRING);
     assert_eq!(function.facts.cfg.rpo.as_ptr(), cfg_storage);
     assert!(function.facts.is_pure(inst));
 
@@ -1427,7 +1434,7 @@ fn facts_refresh_after_instruction_and_control_flow_changes() {
     function.graph.verify().unwrap();
     assert!(function.facts.cfg.rpo.contains(&exit));
     assert!(function.facts.cfg.dominates(function.graph.entry, exit));
-    assert_eq!(function.facts.of(value), Types::STRING);
+    assert_eq!(function.facts.of(value), ValueType::STRING);
 }
 
 #[test]
@@ -1836,7 +1843,7 @@ fn numeric_lowering_reuses_guard_conversions_across_calls() {
     optimize::reuse_loads(&mut function);
     function.graph.verify().unwrap();
     function.ensure_values();
-    assert_eq!(function.facts.of(integer), Types::INT64);
+    assert_eq!(function.facts.of(integer), ValueType::INT64);
     let graph = &function.graph;
     let Some(Op::IntegerCheck(_, _, exact)) = graph.defining_op(guard) else {
         panic!()
@@ -2362,12 +2369,12 @@ fn low_level_call_results_keep_types_and_operands() {
         graph.insts[call].op.operands_iter().collect::<Vec<_>>(),
         [arg, arg]
     );
-    assert_eq!(graph.low_level_types[result], Some(types::I64));
-    assert_eq!(graph.low_level_types[status], Some(types::I8));
+    assert_eq!(graph.reprs[result].map(Repr::machine), Some(types::I64));
+    assert_eq!(graph.reprs[status].map(Repr::machine), Some(types::I8));
     graph.verify().unwrap();
     let facts = Facts::compute(&graph);
-    assert_eq!(facts.of(result), Types::RAW);
-    assert_eq!(facts.of(status), Types::RAW);
+    assert_eq!(facts.of(result), ValueType::default());
+    assert_eq!(facts.of(status), ValueType::default());
     let cfg = Cfg::new(&graph);
     let _ = boundary::liveness(&graph, &cfg.rpo);
     assert!(
@@ -2491,7 +2498,7 @@ fn low_level_graph_emits_executable_cranelift() {
     let entry = graph.entry;
     let span = graph.span;
     let input = graph.add_param(entry);
-    graph.low_level_types[input] = Some(types::I64);
+    graph.reprs[input] = Some(Repr::from_machine(types::I64));
     let header = graph.blocks.push(BlockData::default());
     let body = graph.blocks.push(BlockData::default());
     let exit = graph.blocks.push(BlockData::default());
@@ -2655,7 +2662,7 @@ fn switch_cfg_visits_every_distinct_destination() {
             bits: 2,
         }),
     );
-    graph.low_level_types[condition] = Some(types::I64);
+    graph.reprs[condition] = Some(Repr::from_machine(types::I64));
     let destinations: Vec<_> = (0..4)
         .map(|_| graph.blocks.push(BlockData::default()))
         .collect();
@@ -2713,4 +2720,90 @@ fn low_level_variables_resolve_long_forwarding_chain() {
         &graph.blocks[block].terminator.as_ref().unwrap().kind,
         TerminatorKind::ReturnValues(values) if values == &[input]
     ));
+}
+
+#[test]
+fn conversion_round_trips_require_lossless_representations() {
+    for (from, through, boolean, folded) in [
+        (Repr::I32, Repr::I64, Some(false), true),
+        (Repr::I32, Repr::F64, Some(false), true),
+        (Repr::I32, Repr::Boxed, Some(false), true),
+        (Repr::I8, Repr::Boxed, Some(true), true),
+        (Repr::I8, Repr::Boxed, Some(false), false),
+        (Repr::I8, Repr::Boxed, None, false),
+        (Repr::I64, Repr::F64, Some(false), false),
+        (Repr::I64, Repr::Boxed, Some(false), false),
+        (Repr::Boxed, Repr::I32, Some(false), false),
+        (Repr::F64, Repr::I64, Some(false), false),
+    ] {
+        let mut graph = lower_source(if boolean == Some(true) {
+            "function f(){return true;}"
+        } else {
+            "function f(){return 7;}"
+        })
+        .unwrap();
+        let block = graph.entry;
+        let TerminatorKind::Return(original) =
+            graph.blocks[block].terminator.as_ref().unwrap().kind
+        else {
+            panic!()
+        };
+        graph.reprs[original] = Some(from);
+        let (_, intermediate) =
+            graph.append(block, graph.span, Op::Convert(original, through), true);
+        let intermediate = intermediate.unwrap();
+        graph.reprs[intermediate] = Some(through);
+        let (_, result) = graph.append(block, graph.span, Op::Convert(intermediate, from), true);
+        let result = result.unwrap();
+        graph.reprs[result] = Some(from);
+        graph.blocks[block].terminator.as_mut().unwrap().kind = TerminatorKind::Return(result);
+        let mut facts = Facts::compute(&graph);
+        if boolean.is_none() {
+            facts.set(original, ValueType::default());
+        }
+        conversions::simplify(&mut graph, &facts);
+        assert!(
+            matches!(graph.blocks[block].terminator.as_ref().unwrap().kind,
+            TerminatorKind::Return(value) if value == if folded { original } else { result }),
+            "{from:?} through {through:?}"
+        );
+        graph.verify().unwrap();
+    }
+}
+
+#[test]
+fn conversion_hoisting_keeps_heap_values_inside_the_loop() {
+    let mut graph =
+        lower_source("function f(n){let total=0;while(n>0){total++;n--;}return total;}").unwrap();
+    let entry = graph.entry;
+    let argument = graph.blocks[entry]
+        .insts
+        .iter()
+        .find_map(|&inst| {
+            matches!(graph.insts[inst].op, Op::Argument(0))
+                .then(|| graph.insts[inst].result().unwrap())
+        })
+        .unwrap();
+    let constant = graph.blocks[entry]
+        .insts
+        .iter()
+        .find_map(|&inst| {
+            matches!(graph.insts[inst].op, Op::Constant(Constant::Number(_)))
+                .then(|| graph.insts[inst].result().unwrap())
+        })
+        .unwrap();
+    graph.reprs[constant] = Some(Repr::I32);
+    graph.reprs[argument] = Some(Repr::Boxed);
+    let facts = Facts::compute(&graph);
+    let header = optimize::natural_loops(&graph, &facts.cfg)[0].0;
+    let (scalar, scalar_value) =
+        graph.append(header, graph.span, Op::Convert(constant, Repr::F64), true);
+    let (unknown, unknown_value) =
+        graph.append(header, graph.span, Op::Convert(argument, Repr::I32), true);
+    graph.reprs[scalar_value.unwrap()] = Some(Repr::F64);
+    graph.reprs[unknown_value.unwrap()] = Some(Repr::I32);
+    conversions::hoist(&mut graph, &facts);
+    assert_eq!(graph.insts[scalar].block, entry);
+    assert_eq!(graph.insts[unknown].block, header);
+    graph.verify().unwrap();
 }

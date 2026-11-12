@@ -1,5 +1,5 @@
 use super::super::effects::Locations;
-use super::{Facts, Op, Types, Value};
+use super::{Facts, Op, Value, ValueType};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) enum Field {
@@ -43,7 +43,7 @@ impl Field {
             | Op::IndexedGet(_, key)
             | Op::ArrayLoad(_, key, _)
             | Op::SetIndex(_, key, _)
-                if facts.of(*key).within(Types::NUMBER) =>
+                if facts.of(*key).within(ValueType::NUMBER) =>
             {
                 Self::Elements
             }

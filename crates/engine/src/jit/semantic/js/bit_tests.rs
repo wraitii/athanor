@@ -1,6 +1,6 @@
 use oxc_syntax::operator::BinaryOperator;
 
-use super::super::{Constant, Op, TerminatorKind, Types, ValueDef};
+use super::super::{Constant, Op, TerminatorKind, ValueDef, ValueType};
 
 pub(in crate::jit::semantic) fn bit_tests(function: &mut super::super::FunctionState) {
     function.ensure_values();
@@ -32,8 +32,8 @@ pub(in crate::jit::semantic) fn bit_tests(function: &mut super::super::FunctionS
                 (matches!(
                     graph.defining_op(one),
                     Some(Op::Constant(Constant::Number(1.0)))
-                ) && facts.of(word).within(Types::INT32)
-                    && facts.of(index).within(Types::INT32))
+                ) && facts.of(word).within(ValueType::INT32)
+                    && facts.of(index).within(ValueType::INT32))
                 .then_some((word, index, one))
             });
         let Some((word, index, one)) = test else {

@@ -2,9 +2,11 @@ use crate::{FxHashMap, FxHashSet};
 
 use cranelift_codegen::entity::SecondaryMap;
 
-use super::{Block, Cfg, Facts, Graph, Inst, Op, Types, Value};
+use super::{Block, Cfg, Facts, Graph, Inst, Op, Value, ValueType};
 
-const HEAP: Types = Types::STRING.union(Types::OBJECT).union(Types::OTHER);
+const HEAP: ValueType = ValueType::STRING
+    .union(ValueType::OBJECT)
+    .union(ValueType::OTHER);
 
 pub(in crate::jit) fn receiver(op: &Op) -> Option<Value> {
     match op {
@@ -114,7 +116,7 @@ pub(super) fn borrows(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>)
         while let Some(&next) = reads.get(chain.last().unwrap()) {
             chain.push(next);
         }
-        if held.contains(&value) || facts.of(object).within(Types::OBJECT) {
+        if held.contains(&value) || facts.of(object).within(ValueType::OBJECT) {
             objects.insert(value);
         }
         chains.insert(value, chain);
@@ -237,7 +239,7 @@ pub(super) fn borrows(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>)
                 let chain = &borrows.chains[value];
                 let results = std::iter::once(**value).chain(chain.iter().copied());
                 for (result, &object) in results.zip(chain) {
-                    if !held.contains(&result) && !facts.of(object).within(Types::OBJECT) {
+                    if !held.contains(&result) && !facts.of(object).within(ValueType::OBJECT) {
                         return true;
                     }
                     if !accepted.contains(&object) {

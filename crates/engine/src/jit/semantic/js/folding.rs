@@ -4,8 +4,8 @@ use oxc_syntax::operator::BinaryOperator;
 
 use super::super::transforms::{self, Fold, Folder};
 use super::super::{
-    Block, Cfg, Constant, Facts, FunctionState, Graph, Inst, Op, Terminator, TerminatorKind, Types,
-    UnaryOp, Value,
+    Block, Cfg, Constant, Facts, FunctionState, Graph, Inst, Op, Terminator, TerminatorKind,
+    UnaryOp, Value, ValueType,
 };
 use super::NUMERIC;
 
@@ -36,7 +36,7 @@ impl Folder for Rules {
                 Some(Fold::Op(Op::Binary(operator, left, right)))
             }
             Op::IsExactPosition(key, position)
-                if facts.of(key).within(Types::INTEGER)
+                if facts.of(key).within(ValueType::INTEGER)
                     && matches!(graph.defining_op(position), Some(Op::ArrayPosition(value)) if *value == key) =>
             {
                 boolean(true)
@@ -56,38 +56,38 @@ impl Folder for Rules {
                 None
             }
             Op::IsIndexed(value) if facts.indexed(value) => boolean(true),
-            Op::IsString(value) => boolean(known(facts.of(value), Types::STRING)?),
-            Op::IsUndefined(value) => boolean(known(facts.of(value), Types::UNDEFINED)?),
+            Op::IsString(value) => boolean(known(facts.of(value), ValueType::STRING)?),
+            Op::IsUndefined(value) => boolean(known(facts.of(value), ValueType::UNDEFINED)?),
             Op::Binary(
                 operator @ (BinaryOperator::StrictEquality | BinaryOperator::StrictInequality),
                 left,
                 right,
             ) => {
                 let (left, right) = (facts.of(left), facts.of(right));
-                let compared = if known(left, Types::UNDEFINED) == Some(true) {
+                let compared = if known(left, ValueType::UNDEFINED) == Some(true) {
                     right
-                } else if known(right, Types::UNDEFINED) == Some(true) {
+                } else if known(right, ValueType::UNDEFINED) == Some(true) {
                     left
                 } else {
                     return None;
                 };
-                let equal = known(compared, Types::UNDEFINED)?;
+                let equal = known(compared, ValueType::UNDEFINED)?;
                 boolean(equal == (operator == BinaryOperator::StrictEquality))
             }
-            Op::IsNumber(value) if facts.of(value).within(Types::NUMBER) => boolean(true),
-            Op::IsNumber(value) if !facts.of(value).intersects(Types::NUMBER) => boolean(false),
+            Op::IsNumber(value) if facts.of(value).within(ValueType::NUMBER) => boolean(true),
+            Op::IsNumber(value) if !facts.of(value).intersects(ValueType::NUMBER) => boolean(false),
             Op::ToNumeric(value) | Op::Unary(UnaryOp::Plus, value) | Op::AsNumber(value)
-                if data.result().is_some() && facts.of(value).within(Types::NUMBER) =>
+                if data.result().is_some() && facts.of(value).within(ValueType::NUMBER) =>
             {
                 Some(Fold::Alias(value))
             }
             Op::ConstructorResult(returned, instance) if data.result().is_some() => {
                 let types = facts.of(returned);
-                if types == Types::default() {
+                if types == ValueType::default() {
                     None
-                } else if !types.intersects(Types::OBJECT) {
+                } else if !types.intersects(ValueType::OBJECT) {
                     Some(Fold::Alias(instance))
-                } else if types.within(Types::OBJECT) {
+                } else if types.within(ValueType::OBJECT) {
                     Some(Fold::Alias(returned))
                 } else {
                     None
@@ -98,10 +98,10 @@ impl Folder for Rules {
     }
 }
 
-fn known(types: Types, kind: Types) -> Option<bool> {
+fn known(types: ValueType, kind: ValueType) -> Option<bool> {
     if types.within(kind) && types.intersects(kind) {
         Some(true)
-    } else if types != Types::default() && !types.intersects(kind) {
+    } else if types != ValueType::default() && !types.intersects(kind) {
         Some(false)
     } else {
         None

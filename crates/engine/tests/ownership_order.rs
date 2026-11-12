@@ -214,3 +214,101 @@ fn compiler_recovers_after_unsupported_array_syntax() {
         Value::number(6.0)
     );
 }
+
+#[test]
+fn owned_helper_results_survive_slot_moves_and_are_disposed() {
+    for ssa_opt in [false, true] {
+        let mut engine = Engine::with_options(EngineOptions {
+            ssa_opt,
+            background_compile: false,
+            ..Default::default()
+        })
+        .unwrap();
+        engine
+            .compile(
+                "function maker(){ return {answer:42}; }
+             function factory(){ return maker; }
+             function main(make, flag){
+                 const value = make();
+                 if(flag){ return value; }
+                 return [value][0];
+             }
+             function captured(flag){
+                 let value = {answer:42};
+                 function read(){ return value; }
+                 const result = read();
+                 if(flag){ return result; }
+                 return [result][0];
+             }
+             function mapped(flag){
+                 let values = [{answer:42}].map(value => value);
+                 if(flag){ return values[0]; }
+                 return [values[0]][0];
+             }
+             function read(value){ return value.answer; }",
+                "slot_moves.js",
+            )
+            .unwrap();
+        let make = engine.call("factory", &[]).unwrap();
+        for _ in 0..16 {
+            for flag in [Value::TRUE, Value::FALSE] {
+                for (name, args) in [
+                    ("main", vec![make.value(), flag]),
+                    ("captured", vec![flag]),
+                    ("mapped", vec![flag]),
+                ] {
+                    let result = engine.call(name, &args).unwrap();
+                    assert_eq!(
+                        engine.call("read", &[result.value()]).unwrap().value(),
+                        Value::number(42.0)
+                    );
+                    let stale = result.value();
+                    drop(result);
+                    engine.drain_disposals(1000);
+                    assert!(!engine.global().define("disposed", stale));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn failed_calls_release_scratch_references_from_local_writes() {
+    for ssa_opt in [false, true] {
+        let mut engine = Engine::with_options(EngineOptions {
+            ssa_opt,
+            background_compile: false,
+            ..Default::default()
+        })
+        .unwrap();
+        engine
+            .compile(
+                "var witness;
+             function runtimeFailure(){ return missing; }
+             function thrownFailure(){ throw 13; }
+             function factory(flag){ return flag ? runtimeFailure : thrownFailure; }
+             function main(raise, flag){
+                 let value = [9];
+                 witness = value;
+                 value = flag ? [8] : [7];
+                 return raise();
+             }",
+                "scratch_errors.js",
+            )
+            .unwrap();
+        for mode in [Value::TRUE, Value::FALSE] {
+            let raise = engine.call("factory", &[mode]).unwrap();
+            for _ in 0..16 {
+                for flag in [Value::TRUE, Value::FALSE] {
+                    assert!(engine.call("main", &[raise.value(), flag]).is_err());
+                    let witness = engine.global().get("witness").unwrap();
+                    let stale = witness.value();
+                    assert!(engine.global().set("witness", Value::UNDEFINED));
+                    drop(witness);
+                    engine.drain_disposals(1000);
+                    assert!(!engine.global().define("disposed", stale));
+                }
+            }
+        }
+    }
+}

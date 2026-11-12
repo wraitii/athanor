@@ -2,7 +2,7 @@ use crate::{FxHashMap, FxHashSet};
 use std::cell::RefCell;
 
 use super::{BlockArg, LoweredValue};
-use crate::jit::semantic::low_level::Variable;
+use crate::jit::semantic::low_level::{Scratch, Variable};
 use cranelift_codegen::entity::{EntityRef, SecondaryMap};
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{MemFlagsData, types};
@@ -13,25 +13,25 @@ use crate::heap::kind;
 use crate::jit::helpers::Helper;
 use crate::jit::semantic::{
     Constant, Facts, Graph, MemoryFormat, MemoryOp, Op, ScopeKind, TerminatorKind, TypedRead,
-    Types, UnaryOp, Value as GraphValue,
+    UnaryOp, Value as GraphValue, ValueType,
 };
 use crate::value::{TAG_SHIFT, TAG_STRING, Value};
 
 use super::FunctionCompiler;
 use super::ops::{self, BinaryOp, UnaryOp as EmitUnaryOp};
-use super::repr::{Operand, Repr};
-use super::slots::{self, Slots};
+use super::repr::Operand;
+use crate::jit::semantic::Repr;
+use crate::jit::semantic::ownership::{Holder, Plan};
+use crate::jit::semantic::selection::{Lowering, ResultReference};
 
-const HEAP: Types = Types::STRING.union(Types::OBJECT).union(Types::OTHER);
-const NUMERIC: Types = Types::NUMBER.union(Types::UNDEFINED);
+const NUMERIC: ValueType = ValueType::NUMBER.union(ValueType::UNDEFINED);
 
 struct Context<'a> {
     graph: &'a Graph,
     osr_buffers: RefCell<FxHashMap<GraphValue, (LoweredValue, usize)>>,
     direct: RefCell<SecondaryMap<GraphValue, Option<LoweredValue>>>,
-    reprs: &'a SecondaryMap<GraphValue, Repr>,
     facts: &'a Facts,
-    slots: Slots,
+    plan: &'a Plan,
 }
 
 impl Context<'_> {
@@ -41,10 +41,6 @@ impl Context<'_> {
 
     fn numeric(&self, value: GraphValue) -> bool {
         self.facts.of(value).within(NUMERIC)
-    }
-
-    fn number(&self, value: GraphValue) -> bool {
-        self.facts.of(value).within(Types::NUMBER)
     }
 }
 
@@ -210,34 +206,10 @@ impl FunctionCompiler<'_, '_> {
             .values()
             .map(|_| self.b.create_block())
             .collect();
-        let mut reprs: SecondaryMap<GraphValue, Repr> = SecondaryMap::with_default(Repr::Boxed);
-        for value in graph.values.keys() {
-            reprs[value] = if matches!(
-                graph.defining_op(value),
-                Some(Op::TypedData(_) | Op::Memory(MemoryOp::Address { .. }))
-            ) {
-                Repr::Pointer
-            } else if let Some(Op::Memory(
-                MemoryOp::IndexedLoad { format, .. } | MemoryOp::Load { format, .. },
-            )) = graph.defining_op(value)
-            {
-                match format {
-                    MemoryFormat::U8 | MemoryFormat::I8 => Repr::RawI8,
-                    MemoryFormat::U16 | MemoryFormat::I16 => Repr::RawI16,
-                    MemoryFormat::U32 | MemoryFormat::I32 => Repr::RawI32,
-                    MemoryFormat::F32 => Repr::RawF32,
-                    MemoryFormat::F64 => Repr::RawF64,
-                }
-            } else if matches!(graph.defining_op(value), Some(Op::SaturatingInteger(_))) {
-                Repr::Int64
-            } else {
-                Repr::of(facts.of(value))
-            };
-        }
         let values: Vec<Variable> = graph
             .values
             .keys()
-            .map(|value| self.b.declare_var(reprs[value].scalar_type()))
+            .map(|value| self.b.declare_var(graph.repr(value).machine()))
             .collect();
         let bindings: Vec<Variable> = graph
             .bindings
@@ -262,9 +234,6 @@ impl FunctionCompiler<'_, '_> {
                 address
             })
             .collect();
-        let rooted = |value: crate::jit::semantic::Value| {
-            facts.of(value).intersects(HEAP) && !graph.borrowed.contains(&value)
-        };
         let cfg = &facts.cfg;
         let reachable = cfg.rpo.clone();
         let mut pack_slots = SecondaryMap::new();
@@ -315,16 +284,17 @@ impl FunctionCompiler<'_, '_> {
         });
 
         let cyclic = cyclic_blocks(graph, cfg);
-        let releases = super::slots::releases(graph, facts, cfg);
-        let early: FxHashSet<GraphValue> = releases.values().flatten().copied().collect();
-        let mut result_tokens = FxHashMap::<GraphValue, Vec<Variable>>::default();
+        let plan = graph
+            .ownership
+            .as_ref()
+            .expect("ownership is planned before emission");
         let repeated =
             |block: crate::jit::semantic::Block| graph.has_handlers || cyclic.contains(&block);
         for &block in &reachable {
             let data = &graph.blocks[block];
             for &param in &data.params {
                 self.b
-                    .append_block_param(blocks[block.index()], reprs[param].scalar_type());
+                    .append_block_param(blocks[block.index()], graph.repr(param).machine());
             }
         }
         let undefined = self.constant(Value::UNDEFINED);
@@ -335,51 +305,13 @@ impl FunctionCompiler<'_, '_> {
             graph,
             osr_buffers: RefCell::new(FxHashMap::default()),
             direct: RefCell::new(SecondaryMap::new()),
-            reprs: &reprs,
             facts,
-            slots: if self.frame_size.is_none() {
-                Slots::none()
-            } else {
-                slots::assign(
-                    graph,
-                    cfg,
-                    |value| {
-                        facts.of(value).intersects(HEAP)
-                            && !graph.borrowed.contains(&value)
-                            && !graph.caller_rooted(value)
-                    },
-                    |value| match graph.defining_op(value) {
-                        Some(Op::Get(_, name)) => name != "length",
-                        Some(Op::Read(binding)) => {
-                            !graph.bindings[*binding].captured
-                                && !graph.lazy_captures.contains(binding)
-                        }
-                        Some(
-                            Op::GetIndex(..)
-                            | Op::TypedIndex(..)
-                            | Op::IndexedGet(..)
-                            | Op::ArrayLoad(..)
-                            | Op::PackTake(..)
-                            | Op::Call {
-                                target: Some(_), ..
-                            }
-                            | Op::GlobalRead(_)
-                            | Op::GlobalReadOptional(_)
-                            | Op::NewObject
-                            | Op::NewArray(_)
-                            | Op::NewHoleyArray(_)
-                            | Op::NewInstance(_)
-                            | Op::StringSplit(..),
-                        ) => true,
-                        _ => false,
-                    },
-                )
-            },
+            plan,
         };
-        for (value, slot) in cx.slots.assigned() {
+        for (value, slot) in cx.plan.slots.assigned() {
             self.slots.insert(values[value.index()].as_u32(), slot);
         }
-        self.slot_count = cx.slots.count();
+        self.slot_count = cx.plan.slots.count();
         self.jump(blocks[graph.entry.index()], &[]);
         for &block in &reachable {
             let data = &graph.blocks[block];
@@ -391,53 +323,14 @@ impl FunctionCompiler<'_, '_> {
             let cold = graph.cold.contains(&block);
             let created = self.b.num_blocks();
             let params = self.b.block_params(blocks[block.index()]).to_vec();
-            let undefined = self.constant(Value::UNDEFINED);
-            let slotted = self.frame_size.is_some();
-            let mut retained_any = false;
-            for (&value, &param) in data.params.iter().zip(&params) {
-                if !rooted(value) {
-                    continue;
-                }
-                if slotted {
-                    if !cx.slots.forwarded(value) {
-                        self.increment(param);
-                    }
-                    continue;
-                }
-                let uninitialized = self.b.ins().icmp_imm_s(
-                    cranelift_codegen::ir::condcodes::IntCC::Equal,
-                    param,
-                    Value::UNINITIALIZED.bits() as i64,
-                );
-                let retained = self.b.ins().select(uninitialized, undefined, param);
-                let heap = self.is_heap(retained);
-                let retain = self.b.create_block();
-                let done = self.b.create_block();
-                self.brif(heap, retain, &[], done, &[]);
-                self.switch(retain);
-                self.retain_temporary(retained);
-                self.jump(done, &[]);
-                self.switch(done);
-                retained_any = true;
-            }
             for (&value, param) in data.params.iter().zip(params) {
-                if rooted(value) && slotted {
-                    if cx.slots.forwarded(value) {
-                        self.b.def_var(values[value.index()], param);
-                    } else {
-                        let repeated = repeated(block) || cx.slots.shared(value);
-                        self.replace_local(values[value.index()], param, repeated);
-                    }
-                } else if rooted(value) {
-                    self.initialize_local(values[value.index()], param);
+                if cx.plan.slots.forwarded(value) {
+                    self.b.def_var(values[value.index()], param);
                 }
                 cx.define(value, param);
             }
-            if retained_any {
-                self.release_owned();
-            }
             for &inst in &data.insts {
-                let tracked = self.owned.len();
+                self.b.scratch(Scratch::Begin, &[]);
                 let handler = match &data.terminator.as_ref().unwrap().kind {
                     TerminatorKind::CheckException(_, error) => Some(blocks[error.block.index()]),
                     _ => None,
@@ -462,10 +355,9 @@ impl FunctionCompiler<'_, '_> {
                     let operand = this.operand(&cx, value);
                     this.convert(operand, Repr::Boxed)
                 };
-                let typed = self.typed_op(&cx, graph, inst)?;
-                let mut owned = false;
-                let result = if let Some(typed) = typed {
-                    typed
+                let result = if let Lowering::Typed(target) = cx.plan.implementations[inst].lowering
+                {
+                    self.typed_op(&cx, inst, target)?
                 } else {
                     let result = match &data.op {
                         Op::LowLevel(_) => {
@@ -515,7 +407,7 @@ impl FunctionCompiler<'_, '_> {
                             };
                             for (index, &input) in inputs.iter().enumerate() {
                                 let value = get(self, input);
-                                if graph.borrowed.contains(&input) {
+                                if cx.plan.holder(input) == Holder::Borrowed {
                                     let heap = self.is_heap(value);
                                     let retain = self.b.create_block();
                                     let stored = self.b.create_block();
@@ -594,7 +486,7 @@ impl FunctionCompiler<'_, '_> {
                                 self.switch(slow);
                                 for (index, &input) in inputs.iter().enumerate() {
                                     let value = get(self, input);
-                                    if graph.borrowed.contains(&input) {
+                                    if cx.plan.holder(input) == Holder::Borrowed {
                                         let heap = self.is_heap(value);
                                         let retain = self.b.create_block();
                                         let stored = self.b.create_block();
@@ -623,6 +515,65 @@ impl FunctionCompiler<'_, '_> {
                         }
                         Op::EntryAssume(..) => Some(self.constant(Value::boolean(true))),
                         Op::ReadHint(..) | Op::Assume(..) => None,
+                        Op::Retain(graph_value)
+                            if cx.plan.holder(*graph_value) == Holder::Temporary =>
+                        {
+                            let value = get(self, *graph_value);
+                            let heap = self.is_heap(value);
+                            let retain = self.b.create_block();
+                            let done = self.b.create_block();
+                            self.brif(heap, retain, &[], done, &[]);
+                            self.switch(retain);
+                            self.retain_temporary(value);
+                            self.jump(done, &[]);
+                            self.switch(done);
+                            self.b.scratch(
+                                Scratch::Bind {
+                                    owner: graph_value.index() as u32,
+                                    required: true,
+                                    append: true,
+                                },
+                                &[value],
+                            );
+                            None
+                        }
+                        Op::Retain(value) => {
+                            let value = get(self, *value);
+                            self.increment(value);
+                            None
+                        }
+                        Op::SlotStore(value) => {
+                            self.b.scratch(
+                                Scratch::MoveOwner {
+                                    owner: value.index() as u32,
+                                },
+                                &[],
+                            );
+                            let repeated = repeated(block) || cx.plan.slots.shared(*value);
+                            let variable = values[value.index()];
+                            let value = get(self, *value);
+                            self.replace_local(variable, value, repeated);
+                            None
+                        }
+                        Op::ParamStore(param, value) => {
+                            let variable = values[param.index()];
+                            let value = get(self, *value);
+                            self.replace_local(variable, value, true);
+                            None
+                        }
+                        Op::SlotClear(value) => {
+                            self.clear_local(values[value.index()]);
+                            None
+                        }
+                        Op::Release(value) => {
+                            self.b.scratch(
+                                Scratch::ReleaseOwner {
+                                    owner: value.index() as u32,
+                                },
+                                &[],
+                            );
+                            None
+                        }
                         Op::Observe(value, kind, site) => {
                             let value = get(self, *value);
                             self.observe(value, *site, *kind);
@@ -692,14 +643,9 @@ impl FunctionCompiler<'_, '_> {
                         }
                         Op::NewHoleyArray(length) => {
                             let length = get(self, *length);
-                            owned = data
-                                .result()
-                                .is_some_and(|value| self.slot_owned(graph, &cx, value));
-                            let helper = if owned {
-                                Helper::ArrayMapNewOwned
-                            } else {
-                                Helper::ArrayMapNew
-                            };
+                            let helper = cx.plan.implementations[inst]
+                                .helper
+                                .expect("selected allocation helper");
                             let value = self.call_helper(helper, &[length]);
                             self.check_error();
                             Some(value)
@@ -707,7 +653,7 @@ impl FunctionCompiler<'_, '_> {
                         Op::MapElement(receiver, index) => {
                             let receiver = get(self, *receiver);
                             let index = self.operand(&cx, *index);
-                            let index = self.convert(index, Repr::Int64);
+                            let index = self.convert(index, Repr::I64);
                             Some(self.call_helper(Helper::ArrayMapElement, &[receiver, index]))
                         }
                         Op::Throw(value) => {
@@ -773,18 +719,8 @@ impl FunctionCompiler<'_, '_> {
                             Constant::Uninitialized => self.constant(Value::UNINITIALIZED),
                             Constant::String(value) => self.string_constant(value),
                         }),
-                        Op::GlobalRead(name) => {
-                            let retain = data
-                                .result()
-                                .is_none_or(|value| !self.slot_owned(graph, &cx, value));
-                            Some(self.cached_global_get(name, false, retain))
-                        }
-                        Op::GlobalReadOptional(name) => {
-                            let retain = data
-                                .result()
-                                .is_none_or(|value| !self.slot_owned(graph, &cx, value));
-                            Some(self.global_get_optional(name, retain))
-                        }
+                        Op::GlobalRead(name) => Some(self.cached_global_get(name, false, false)),
+                        Op::GlobalReadOptional(name) => Some(self.global_get_optional(name)),
                         Op::PropertyKey(value) => {
                             let value = get(self, *value);
                             let result = self.call_helper(Helper::PropertyKey, &[value]);
@@ -836,10 +772,7 @@ impl FunctionCompiler<'_, '_> {
                                 self.check_error();
                                 value
                             } else {
-                                let retain = data
-                                    .result()
-                                    .is_none_or(|value| !self.slot_owned(graph, &cx, value));
-                                self.checked_temporary(value, retain)
+                                self.checked_temporary(value, false)
                             };
                             Some(value)
                         }
@@ -914,9 +847,9 @@ impl FunctionCompiler<'_, '_> {
                             let left = get(self, *left);
                             let right = get(self, *right);
                             let first = self.operand(&cx, numbers[0]);
-                            let first = self.convert(first, Repr::Bool);
+                            let first = self.convert(first, Repr::I8);
                             let second = self.operand(&cx, numbers[1]);
-                            let second = self.convert(second, Repr::Bool);
+                            let second = self.convert(second, Repr::I8);
                             let value = self.numeric_comparison(
                                 ops::binary_operator(*operator),
                                 left,
@@ -928,14 +861,9 @@ impl FunctionCompiler<'_, '_> {
                         }
                         Op::NewObject => {
                             let dummy = self.constant(Value::UNDEFINED);
-                            owned = data
-                                .result()
-                                .is_some_and(|value| self.slot_owned(graph, &cx, value));
-                            let helper = if owned {
-                                Helper::ObjectNewOwned
-                            } else {
-                                Helper::ObjectNew
-                            };
+                            let helper = cx.plan.implementations[inst]
+                                .helper
+                                .expect("selected allocation helper");
                             let value = self.call_helper(helper, &[dummy]);
                             self.check_error();
                             Some(value)
@@ -944,14 +872,9 @@ impl FunctionCompiler<'_, '_> {
                             let args: Vec<_> = args.iter().map(|&v| get(self, v)).collect();
                             let ptr = self.stack_values(&args, data.span)?;
                             let len = self.b.ins().iconst(types::I64, args.len() as i64);
-                            owned = data
-                                .result()
-                                .is_some_and(|value| self.slot_owned(graph, &cx, value));
-                            let helper = if owned {
-                                Helper::ArrayNewOwned
-                            } else {
-                                Helper::ArrayNew
-                            };
+                            let helper = cx.plan.implementations[inst]
+                                .helper
+                                .expect("selected allocation helper");
                             let value = self.call_helper(helper, &[ptr, len]);
                             self.check_error();
                             Some(value)
@@ -988,25 +911,17 @@ impl FunctionCompiler<'_, '_> {
                             let object = get(self, *object);
                             let offset = self.property_caches[site];
                             let address = self.data_address(offset);
-                            let retain = data.result().is_none_or(|value| {
-                                !graph.borrowed.contains(&value)
-                                    && !self.slot_owned(graph, &cx, value)
-                            });
                             let builtins = match &graph.insts[*site].op {
                                 Op::Get(_, name) | Op::FillPropertyCache(_, _, name) => {
                                     crate::heap::builtin_method(name)
                                 }
                                 _ => true,
                             };
-                            Some(self.cached_property_load(object, address, retain, builtins))
+                            Some(self.cached_property_load(object, address, builtins))
                         }
                         Op::ShapedGet(object, _, index) => {
                             let object = get(self, *object);
-                            let retain = data.result().is_none_or(|value| {
-                                !graph.borrowed.contains(&value)
-                                    && !self.slot_owned(graph, &cx, value)
-                            });
-                            Some(self.shaped_property_get(object, *index, retain))
+                            Some(self.shaped_property_get(object, *index))
                         }
                         Op::ShapedSet(object, name, index, value) => {
                             let object = get(self, *object);
@@ -1029,10 +944,6 @@ impl FunctionCompiler<'_, '_> {
                         }
                         Op::Get(object, name) => {
                             let object = get(self, *object);
-                            let retain = data.result().is_none_or(|value| {
-                                !graph.borrowed.contains(&value)
-                                    && !self.slot_owned(graph, &cx, value)
-                            });
                             let observer = self.property_observer(data);
                             let site = crate::jit::profile::Site {
                                 source: data.source_name.map_or(self.source_name.0, |name| name.0),
@@ -1040,28 +951,14 @@ impl FunctionCompiler<'_, '_> {
                                 end: data.span.end,
                             };
                             let megamorphic = graph.megamorphic_gets.contains(&site);
-                            Some(self.cached_property_get(
-                                object,
-                                name,
-                                retain,
-                                observer,
-                                megamorphic,
-                            ))
+                            Some(self.cached_property_get(object, name, observer, megamorphic))
                         }
                         Op::GetIndex(object, index)
                         | Op::TypedIndex(object, index, _)
                         | Op::IndexedGet(object, index) => {
                             let object = get(self, *object);
                             let index = get(self, *index);
-                            let retain = data.result().is_none_or(|value| {
-                                !graph.borrowed.contains(&value)
-                                    && !self.slot_owned(graph, &cx, value)
-                            });
-                            Some(self.element_read(
-                                object,
-                                Operand::new(index, Repr::Boxed),
-                                retain,
-                            ))
+                            Some(self.element_read(object, Operand::new(index, Repr::Boxed)))
                         }
                         Op::NewPack => {
                             let destination =
@@ -1100,14 +997,9 @@ impl FunctionCompiler<'_, '_> {
                         Op::PackTake(pack, index) => {
                             let pack = get(self, *pack);
                             let index = get(self, *index);
-                            owned = data
-                                .result()
-                                .is_some_and(|value| self.slot_owned(graph, &cx, value));
-                            let helper = if owned {
-                                Helper::PackTakeOwned
-                            } else {
-                                Helper::PackTake
-                            };
+                            let helper = cx.plan.implementations[inst]
+                                .helper
+                                .expect("selected allocation helper");
                             Some(self.call_helper(helper, &[pack, index]))
                         }
                         Op::SetIndex(object, index, value) => {
@@ -1187,7 +1079,8 @@ impl FunctionCompiler<'_, '_> {
                                     .bitcast(types::I64, MemFlagsData::new(), length),
                             )
                         }
-                        Op::AsNumber(value) | Op::AsObject(value) => Some(get(self, *value)),
+                        Op::AsObject(value) => Some(get(self, *value)),
+                        Op::AsNumber(_) | Op::Convert(..) => unreachable!(),
                         Op::IsInteger(_)
                         | Op::AsInteger(_)
                         | Op::NumericFloat(_)
@@ -1286,9 +1179,8 @@ impl FunctionCompiler<'_, '_> {
                                             &[callee, receiver],
                                         ),
                                     };
-                                    owned = data
-                                        .result()
-                                        .is_some_and(|value| self.slot_owned(graph, &cx, value));
+                                    let owned = cx.plan.implementations[inst].result
+                                        == ResultReference::Slot;
                                     self.direct_call(
                                         *target,
                                         callee,
@@ -1306,14 +1198,9 @@ impl FunctionCompiler<'_, '_> {
                         }
                         Op::NewInstance(prototype) => {
                             let prototype = get(self, *prototype);
-                            owned = data
-                                .result()
-                                .is_some_and(|value| self.slot_owned(graph, &cx, value));
-                            let helper = if owned {
-                                Helper::NewInstanceOwned
-                            } else {
-                                Helper::NewInstance
-                            };
+                            let helper = cx.plan.implementations[inst]
+                                .helper
+                                .expect("selected allocation helper");
                             let result = self.call_helper(helper, &[prototype]);
                             self.check_error();
                             Some(result)
@@ -1436,20 +1323,9 @@ impl FunctionCompiler<'_, '_> {
                                 self.b.ins().iconst(types::I64, 0)
                             };
                             let argc = self.b.ins().iconst(types::I64, args.len() as i64);
-                            owned = data
-                                .result()
-                                .is_some_and(|value| self.slot_owned(graph, &cx, value));
-                            let helper = if matches!(data.op, Op::StringSplitParts(..)) {
-                                if owned {
-                                    Helper::StringSplitPartsOwned
-                                } else {
-                                    Helper::StringSplitParts
-                                }
-                            } else if owned {
-                                Helper::StringSplitOwned
-                            } else {
-                                Helper::StringSplit
-                            };
+                            let helper = cx.plan.implementations[inst]
+                                .helper
+                                .expect("selected split helper");
                             let result =
                                 self.call_helper(helper, &[operation, receiver, argv, argc]);
                             self.check_error();
@@ -1588,30 +1464,24 @@ impl FunctionCompiler<'_, '_> {
                     result.map(|value| Operand::new(value, Repr::Boxed))
                 };
                 if let (Some(value), Some(result)) = (data.result(), result) {
-                    let result = self.convert(result, reprs[value]);
-                    let borrowed = graph.caller_rooted(value) || graph.borrowed.contains(&value);
-                    if owned {
-                        let repeated = repeated(block) || cx.slots.shared(value);
-                        self.replace_local(values[value.index()], result, repeated);
-                    } else if !borrowed && self.slot_owned(graph, &cx, value) {
-                        let repeated = repeated(block) || cx.slots.shared(value);
-                        self.own_local(values[value.index()], result, repeated);
-                    } else if rooted(value) && !borrowed && !slotted {
-                        self.initialize_local(values[value.index()], result);
-                    }
+                    debug_assert_eq!(
+                        result.repr,
+                        graph.repr(value),
+                        "{inst} produced {:?}",
+                        result.repr
+                    );
+                    let result = self.convert(result, graph.repr(value));
                     cx.define(value, result);
-                }
-                if self.owned.len() > tracked {
-                    let created = self.owned[tracked..].to_vec();
-                    if let Some(value) = data.result()
-                        && early.contains(&value)
-                    {
-                        result_tokens.insert(value, created);
-                    }
-                }
-                for value in releases.get(&inst).into_iter().flatten() {
-                    if let Some(variables) = result_tokens.remove(value) {
-                        self.release_tracked(&variables);
+                    let required = cx.plan.implementations[inst].result == ResultReference::Move;
+                    if required || cx.plan.holder(value) == Holder::Temporary {
+                        self.b.scratch(
+                            Scratch::Bind {
+                                owner: value.index() as u32,
+                                required,
+                                append: false,
+                            },
+                            &[result],
+                        );
                     }
                 }
                 if handler.is_some() {
@@ -1638,8 +1508,8 @@ impl FunctionCompiler<'_, '_> {
                     .iter()
                     .zip(&graph.blocks[target.block].params)
                     .map(|(&value, &param)| {
-                        let operand = this.operand(&cx, value);
-                        BlockArg::Value(this.convert(operand, reprs[param]))
+                        debug_assert_eq!(graph.repr(value), graph.repr(param));
+                        BlockArg::Value(this.operand(&cx, value).value)
                     })
                     .collect();
                 (blocks[target.block.index()], args)
@@ -1652,31 +1522,9 @@ impl FunctionCompiler<'_, '_> {
                 TerminatorKind::Branch(value, yes, no) => {
                     let operand = self.operand(&cx, *value);
                     let condition = self.condition(operand, cx.numeric(*value));
-                    let needs_edge = |target: &crate::jit::semantic::Target| {
-                        target
-                            .args
-                            .iter()
-                            .zip(&graph.blocks[target.block].params)
-                            .any(|(&value, &param)| reprs[value] != reprs[param])
-                    };
-                    let yes_edge = needs_edge(yes).then(|| self.b.create_block());
-                    let no_edge = needs_edge(no).then(|| self.b.create_block());
-                    let (yes_block, yes_args) =
-                        yes_edge.map_or_else(|| target(self, yes), |block| (block, Vec::new()));
-                    let (no_block, no_args) =
-                        no_edge.map_or_else(|| target(self, no), |block| (block, Vec::new()));
+                    let (yes_block, yes_args) = target(self, yes);
+                    let (no_block, no_args) = target(self, no);
                     self.brif(condition, yes_block, &yes_args, no_block, &no_args);
-                    for (edge, destination) in [(yes_edge, yes), (no_edge, no)] {
-                        let Some(edge) = edge else {
-                            continue;
-                        };
-                        self.switch(edge);
-                        if cold || graph.cold.contains(&destination.block) {
-                            self.b.set_cold_block(edge);
-                        }
-                        let (block, args) = target(self, destination);
-                        self.jump(block, &args);
-                    }
                 }
                 TerminatorKind::Switch(..)
                 | TerminatorKind::ReturnValues(..)
@@ -1740,18 +1588,9 @@ impl FunctionCompiler<'_, '_> {
 }
 
 impl FunctionCompiler<'_, '_> {
-    /// Whether a result is stored straight into its frame slot, which takes its own reference.
-    /// Values that die within their block stay owned by their temporary instead.
-    fn slot_owned(&self, graph: &Graph, cx: &Context<'_>, value: GraphValue) -> bool {
-        self.frame_size.is_some()
-            && cx.facts.of(value).intersects(HEAP)
-            && !graph.borrowed.contains(&value)
-            && cx.slots.of(value).is_some()
-    }
-
     fn operand(&mut self, cx: &Context<'_>, value: GraphValue) -> Operand {
         let clif = cx.direct.borrow()[value].expect("semantic value used before definition");
-        let operand = Operand::new(clif, cx.reprs[value]);
+        let operand = Operand::new(clif, cx.graph.repr(value));
         match cx.graph.defining_op(value) {
             Some(Op::Constant(Constant::Number(number))) => operand.with_constant(*number),
             _ => operand,
@@ -1761,43 +1600,28 @@ impl FunctionCompiler<'_, '_> {
     fn typed_op(
         &mut self,
         cx: &Context<'_>,
-        graph: &Graph,
         inst: crate::jit::semantic::Inst,
-    ) -> Result<Option<Option<Operand>>, Error> {
+        target: Option<Repr>,
+    ) -> Result<Option<Operand>, Error> {
+        let graph = cx.graph;
         let data = &graph.insts[inst];
-        let target = data.result().map(|value| cx.reprs[value]);
-        let boolean = |condition: LoweredValue| Some(Some(Operand::new(condition, Repr::Bool)));
-        Ok(match &data.op {
+        let boolean = |condition: LoweredValue| Some(Operand::new(condition, Repr::I8));
+        let result = match &data.op {
             Op::Constant(Constant::Number(number)) => match target {
-                Some(Repr::Float) => Some(Some(Operand::new(
-                    self.b.ins().f64const(*number),
-                    Repr::Float,
-                ))),
-                Some(Repr::Int64) => Some(Some(Operand::new(
+                Some(Repr::F64) => Some(Operand::new(self.b.ins().f64const(*number), Repr::F64)),
+                Some(Repr::I64) => Some(Operand::new(
                     self.b.ins().iconst(types::I64, *number as i64),
-                    Repr::Int64,
-                ))),
-                Some(Repr::Int32) => Some(Some(Operand::new(
+                    Repr::I64,
+                )),
+                Some(Repr::I32) => Some(Operand::new(
                     self.b.ins().iconst(types::I32, *number as i32 as i64),
-                    Repr::Int32,
-                ))),
+                    Repr::I32,
+                )),
                 _ => None,
             },
-            Op::Constant(Constant::Boolean(value)) if target == Some(Repr::Bool) => {
+            Op::Constant(Constant::Boolean(value)) => {
                 let value = self.b.ins().iconst(types::I8, i64::from(*value));
                 boolean(value)
-            }
-            Op::Binary(oxc_syntax::operator::BinaryOperator::Multiplication, left, right)
-                if target == Some(Repr::Int64) =>
-            {
-                let left = self.operand(cx, *left);
-                let right = self.operand(cx, *right);
-                let left = self.convert(left, Repr::Int64);
-                let right = self.convert(right, Repr::Int64);
-                Some(Some(Operand::new(
-                    self.b.ins().imul(left, right),
-                    Repr::Int64,
-                )))
             }
             Op::Binary(operator, left, right)
             | Op::GuardedCompare {
@@ -1807,53 +1631,35 @@ impl FunctionCompiler<'_, '_> {
                 ..
             } => {
                 let op = ops::binary_operator(*operator);
-                let applicable = match op {
-                    BinaryOp::LooseEqual
-                    | BinaryOp::StrictEqual
-                    | BinaryOp::LooseNotEqual
-                    | BinaryOp::StrictNotEqual => cx.number(*left) && cx.number(*right),
-                    BinaryOp::Instanceof | BinaryOp::In | BinaryOp::Rem | BinaryOp::Pow => false,
-                    _ => cx.numeric(*left) && cx.numeric(*right),
-                };
                 let (left, right) = (self.operand(cx, *left), self.operand(cx, *right));
-                if left.repr == Repr::Bool
-                    && right.repr == Repr::Bool
-                    && matches!(op, BinaryOp::StrictEqual | BinaryOp::StrictNotEqual)
-                {
-                    let condition = if op == BinaryOp::StrictEqual {
-                        IntCC::Equal
-                    } else {
-                        IntCC::NotEqual
-                    };
-                    let value = self.b.ins().icmp(condition, left.value, right.value);
-                    return Ok(boolean(value));
-                }
-                if !applicable {
-                    return Ok(None);
-                }
-                self.typed_binary(op, left, right).map(Some)
+                Some(self.typed_binary(
+                    op,
+                    left,
+                    right,
+                    target.expect("binary result representation"),
+                ))
             }
-            Op::Unary(UnaryOp::Increment | UnaryOp::Decrement, value) if cx.numeric(*value) => {
+            Op::Unary(UnaryOp::Increment | UnaryOp::Decrement, value) => {
                 let operand = self.operand(cx, *value);
                 let delta = if matches!(data.op, Op::Unary(UnaryOp::Increment, _)) {
                     1
                 } else {
                     -1
                 };
-                Some(Some(if matches!(target, Some(Repr::Int32 | Repr::Int64)) {
+                Some(if matches!(target, Some(Repr::I32 | Repr::I64)) {
                     let repr = target.unwrap();
                     let integer = self.convert(operand, repr);
                     Operand::new(self.b.ins().iadd_imm_s(integer, delta), repr)
                 } else {
-                    let float = self.convert(operand, Repr::Float);
+                    let float = self.convert(operand, Repr::F64);
                     let one = self.b.ins().f64const(delta as f64);
-                    Operand::new(self.b.ins().fadd(float, one), Repr::Float)
-                }))
+                    Operand::new(self.b.ins().fadd(float, one), Repr::F64)
+                })
             }
-            Op::Unary(UnaryOp::Negate, value) if cx.numeric(*value) => {
+            Op::Unary(UnaryOp::Negate, value) => {
                 let operand = self.operand(cx, *value);
-                let float = self.convert(operand, Repr::Float);
-                Some(Some(Operand::new(self.b.ins().fneg(float), Repr::Float)))
+                let float = self.convert(operand, Repr::F64);
+                Some(Operand::new(self.b.ins().fneg(float), Repr::F64))
             }
             Op::TypedData(view) => {
                 let view = self.operand(cx, *view).value;
@@ -1863,7 +1669,7 @@ impl FunctionCompiler<'_, '_> {
                     view,
                     crate::heap::DATA_OFFSET,
                 );
-                Some(Some(Operand::new(data, Repr::Pointer)))
+                Some(Operand::new(data, Repr::I64))
             }
             Op::Memory(MemoryOp::Address {
                 base,
@@ -1874,16 +1680,16 @@ impl FunctionCompiler<'_, '_> {
                 let index = self.operand(cx, *index).value;
                 let offset = self.b.ins().imul_imm_s(index, format.bytes() as i64);
                 let address = self.b.ins().iadd(base, offset);
-                Some(Some(Operand::new(address, Repr::Pointer)))
+                Some(Operand::new(address, Repr::I64))
             }
             Op::Memory(MemoryOp::Load { address, .. }) => {
                 let address = self.operand(cx, *address).value;
                 let repr = target.unwrap();
-                let value =
-                    self.b
-                        .ins()
-                        .load(repr.scalar_type(), MemFlagsData::trusted(), address, 0);
-                Some(Some(Operand::new(value, repr)))
+                let value = self
+                    .b
+                    .ins()
+                    .load(repr.machine(), MemFlagsData::trusted(), address, 0);
+                Some(Operand::new(value, repr))
             }
             Op::Memory(MemoryOp::IndexedLoad {
                 base,
@@ -1893,43 +1699,33 @@ impl FunctionCompiler<'_, '_> {
                 let base = self.operand(cx, *base).value;
                 let index = self.operand(cx, *index).value;
                 let repr = target.unwrap();
-                let value = self
-                    .b
-                    .indexed_load(base, index, *format, repr.scalar_type());
-                Some(Some(Operand::new(value, repr)))
+                let value = self.b.indexed_load(base, index, *format, repr.machine());
+                Some(Operand::new(value, repr))
             }
             Op::MemoryNumber(value, format) => {
                 let raw = self.operand(cx, *value).value;
                 let (value, repr) = match format {
                     MemoryFormat::U8 | MemoryFormat::U16 => {
-                        (self.b.ins().uextend(types::I32, raw), Repr::Int32)
+                        (self.b.ins().uextend(types::I32, raw), Repr::I32)
                     }
                     MemoryFormat::I8 | MemoryFormat::I16 => {
-                        (self.b.ins().sextend(types::I32, raw), Repr::Int32)
+                        (self.b.ins().sextend(types::I32, raw), Repr::I32)
                     }
-                    MemoryFormat::I32 => (raw, Repr::Int32),
-                    MemoryFormat::U32 => {
-                        (self.b.ins().fcvt_from_uint(types::F64, raw), Repr::Float)
-                    }
-                    MemoryFormat::F32 => (self.b.ins().fpromote(types::F64, raw), Repr::Float),
-                    MemoryFormat::F64 => (raw, Repr::Float),
+                    MemoryFormat::I32 => (raw, Repr::I32),
+                    MemoryFormat::U32 => (self.b.ins().fcvt_from_uint(types::F64, raw), Repr::F64),
+                    MemoryFormat::F32 => (self.b.ins().fpromote(types::F64, raw), Repr::F64),
+                    MemoryFormat::F64 => (raw, Repr::F64),
                 };
-                Some(Some(Operand::new(value, repr)))
+                Some(Operand::new(value, repr))
             }
-            Op::KeepAlive(_) => Some(None),
+            Op::KeepAlive(_) => None,
             Op::NumericFloat(value) => {
                 let operand = self.operand(cx, *value);
-                Some(Some(Operand::new(
-                    self.convert(operand, Repr::Float),
-                    Repr::Float,
-                )))
+                Some(Operand::new(self.convert(operand, Repr::F64), Repr::F64))
             }
             Op::SaturatingInteger(value) => {
                 let operand = self.operand(cx, *value);
-                Some(Some(Operand::new(
-                    self.convert(operand, Repr::Int64),
-                    Repr::Int64,
-                )))
+                Some(Operand::new(self.convert(operand, Repr::I64), Repr::I64))
             }
             Op::IntegerCheck(value, float, exact) => {
                 let operand = self.operand(cx, *value);
@@ -1956,34 +1752,32 @@ impl FunctionCompiler<'_, '_> {
             }
             Op::AsInteger(value) => {
                 let operand = self.operand(cx, *value);
-                Some(Some(Operand::new(
-                    self.convert(operand, Repr::Int64),
-                    Repr::Int64,
-                )))
+                Some(Operand::new(self.convert(operand, Repr::I64), Repr::I64))
             }
             Op::ToInt32(value) => {
                 debug_assert!(cx.numeric(*value));
                 let operand = self.operand(cx, *value);
-                let integer = self.convert(operand, Repr::Int32);
-                Some(Some(Operand::new(integer, Repr::Int32)))
+                let integer = self.convert(operand, Repr::I32);
+                Some(Operand::new(integer, Repr::I32))
             }
-            Op::Unary(UnaryOp::BitwiseNot, value) if cx.numeric(*value) => {
+            Op::Unary(UnaryOp::BitwiseNot, value) => {
                 let operand = self.operand(cx, *value);
-                let integer = self.convert(operand, Repr::Int32);
-                Some(Some(Operand::new(self.b.ins().bnot(integer), Repr::Int32)))
+                let integer = self.convert(operand, Repr::I32);
+                Some(Operand::new(self.b.ins().bnot(integer), Repr::I32))
             }
-            Op::Unary(UnaryOp::Plus, value) | Op::ToNumeric(value) | Op::AsNumber(value)
-                if cx.numeric(*value) || matches!(data.op, Op::AsNumber(_)) =>
-            {
+            Op::Convert(value, repr) => {
                 let operand = self.operand(cx, *value);
-                Some(Some(match operand.repr {
-                    Repr::Int32 | Repr::Int64 | Repr::Float => operand,
-                    _ => Operand::new(self.convert(operand, Repr::Float), Repr::Float),
-                }))
+                Some(Operand::new(self.convert(operand, *repr), *repr))
             }
-            Op::Unary(UnaryOp::Not, value)
-                if cx.numeric(*value) || cx.reprs[*value] != Repr::Boxed =>
-            {
+            Op::AsNumber(value) => Some(self.operand(cx, *value)),
+            Op::Unary(UnaryOp::Plus, value) | Op::ToNumeric(value) => {
+                let operand = self.operand(cx, *value);
+                Some(match operand.repr {
+                    Repr::I32 | Repr::I64 | Repr::F64 => operand,
+                    _ => Operand::new(self.convert(operand, Repr::F64), Repr::F64),
+                })
+            }
+            Op::Unary(UnaryOp::Not, value) => {
                 let operand = self.operand(cx, *value);
                 let truth = self.condition(operand, true);
                 let value = self.b.ins().icmp_imm_s(IntCC::Equal, truth, 0);
@@ -2014,7 +1808,7 @@ impl FunctionCompiler<'_, '_> {
                 let operand = self.operand(cx, *value);
                 let value = match operand.repr {
                     Repr::Boxed => self.is_number(operand.value),
-                    Repr::Bool => self.b.ins().iconst(types::I8, 0),
+                    Repr::I8 => self.b.ins().iconst(types::I8, 0),
                     _ => self.b.ins().iconst(types::I8, 1),
                 };
                 boolean(value)
@@ -2040,10 +1834,10 @@ impl FunctionCompiler<'_, '_> {
                 };
                 boolean(value)
             }
-            Op::CallNative(native, args) if args.iter().all(|&arg| cx.numeric(arg)) => {
+            Op::CallNative(native, args) => {
                 let function = crate::jit::math::METHODS[native.index()].1;
                 let operands: Vec<_> = args.iter().map(|&arg| self.operand(cx, arg)).collect();
-                self.typed_math(function, &operands).map(Some)
+                Some(self.typed_math(function, &operands))
             }
             Op::IsTyped(object, element) => {
                 let operand = self.operand(cx, *object);
@@ -2063,29 +1857,26 @@ impl FunctionCompiler<'_, '_> {
             Op::IsExactPosition(key, position) => {
                 let key = self.operand(cx, *key);
                 let position = self.operand(cx, *position);
-                let key = self.convert(key, Repr::Float);
-                let position = self.convert(position, Repr::Float);
+                let key = self.convert(key, Repr::F64);
+                let position = self.convert(position, Repr::F64);
                 boolean(self.b.ins().fcmp(FloatCC::Equal, key, position))
             }
             Op::IsInBounds(position, length) => {
                 let position = self.operand(cx, *position);
                 let length = self.operand(cx, *length);
-                let position = self.convert(position, Repr::Int64);
-                let length = self.convert(length, Repr::Int64);
+                let position = self.convert(position, Repr::I64);
+                let length = self.convert(length, Repr::I64);
                 boolean(self.b.ins().icmp(IntCC::UnsignedLessThan, position, length))
             }
             Op::ArrayPosition(key) => {
                 let key = self.operand(cx, *key);
-                Some(Some(Operand::new(
-                    self.convert(key, Repr::Int64),
-                    Repr::Int64,
-                )))
+                Some(Operand::new(self.convert(key, Repr::I64), Repr::I64))
             }
             Op::BooleanAnd(left, right) => {
                 let left = self.operand(cx, *left);
                 let right = self.operand(cx, *right);
-                let left = self.convert(left, Repr::Bool);
-                let right = self.convert(right, Repr::Bool);
+                let left = self.convert(left, Repr::I8);
+                let right = self.convert(right, Repr::I8);
                 boolean(self.b.ins().band(left, right))
             }
             Op::IsArrayIndex(..) => unreachable!(),
@@ -2099,7 +1890,7 @@ impl FunctionCompiler<'_, '_> {
                     }
                 };
                 let kind = self.view_kind(view);
-                Some(Some(Operand::new(kind, Repr::Int32)))
+                Some(Operand::new(kind, Repr::I32))
             }
             Op::IsArray(object, holey) => {
                 let view = match graph.views.get(&inst) {
@@ -2124,13 +1915,10 @@ impl FunctionCompiler<'_, '_> {
                     }
                 };
                 let position = self.operand(cx, *position);
-                let retain = data.result().is_none_or(|value| {
-                    !graph.borrowed.contains(&value) && !self.slot_owned(graph, cx, value)
-                });
-                Some(Some(Operand::new(
-                    self.array_load(view, position, *holey, retain),
+                Some(Operand::new(
+                    self.array_load(view, position, *holey),
                     Repr::Boxed,
-                )))
+                ))
             }
             Op::IndexedLength(object) => {
                 let view = match graph.views.get(&inst) {
@@ -2141,12 +1929,12 @@ impl FunctionCompiler<'_, '_> {
                         self.view(object)
                     }
                 };
-                if target == Some(Repr::Int64) {
+                if target == Some(Repr::I64) {
                     let length = self.view_length_integer(view);
-                    Some(Some(Operand::new(length, Repr::Int64)))
+                    Some(Operand::new(length, Repr::I64))
                 } else {
                     let length = self.view_length(view);
-                    Some(Some(Operand::new(length, Repr::Float)))
+                    Some(Operand::new(length, Repr::F64))
                 }
             }
             Op::TypedIndex(
@@ -2166,11 +1954,11 @@ impl FunctionCompiler<'_, '_> {
                     }
                 };
                 let key = self.operand(cx, *key);
-                Some(Some(if *bounded {
+                Some(if *bounded {
                     self.bounded_element_read(view, key, *element)
                 } else {
                     self.checked_element_read(view, key, *element)
-                }))
+                })
             }
             Op::GetIndex(object, key)
             | Op::TypedIndex(object, key, _)
@@ -2183,17 +1971,14 @@ impl FunctionCompiler<'_, '_> {
                     None => self.view(object),
                 };
                 let key = match self.operand(cx, *key) {
-                    key if key.repr == Repr::Bool => {
+                    key if key.repr == Repr::I8 => {
                         Operand::new(self.convert(key, Repr::Boxed), Repr::Boxed)
                     }
                     key => key,
                 };
-                let retain = data.result().is_none_or(|value| {
-                    !graph.borrowed.contains(&value) && !self.slot_owned(graph, cx, value)
-                });
                 let result =
-                    self.viewed_index_access(view, object, key, None, fallback, retain, true);
-                Some(Some(Operand::new(result, Repr::Boxed)))
+                    self.viewed_index_access(view, object, key, None, fallback, false, true);
+                Some(Operand::new(result, Repr::Boxed))
             }
             Op::SetIndex(object, key, value) => {
                 let object = self.operand(cx, *object);
@@ -2203,17 +1988,27 @@ impl FunctionCompiler<'_, '_> {
                     None => self.view(object),
                 };
                 let key = match self.operand(cx, *key) {
-                    key if key.repr == Repr::Bool => {
+                    key if key.repr == Repr::I8 => {
                         Operand::new(self.convert(key, Repr::Boxed), Repr::Boxed)
                     }
                     key => key,
                 };
                 let value = self.operand(cx, *value);
                 self.viewed_index_access(view, object, key, Some(value), true, true, true);
-                Some(None)
+                None
             }
-            _ => None,
-        })
+            _ => {
+                return Err(Error::Compile(format!(
+                    "{inst}: unsupported selected lowering"
+                )));
+            }
+        };
+        if result.as_ref().map(|operand| operand.repr) != target {
+            return Err(Error::Compile(format!(
+                "{inst}: selected lowering produced the wrong representation"
+            )));
+        }
+        Ok(result)
     }
 }
 

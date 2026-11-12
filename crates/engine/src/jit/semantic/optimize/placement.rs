@@ -361,7 +361,7 @@ mod tests {
     }
 
     fn number() -> Fact {
-        Fact::Type(Types::NUMBER)
+        Fact::Type(ValueType::NUMBER)
     }
 
     #[test]
@@ -416,7 +416,7 @@ mod tests {
         let mut graph = graph("function f(a,n){let s=0;for(let i=0;i<n;++i)s+=a;return s;}");
         let argument = find(&graph, |op| matches!(op, Op::Argument(0)));
         let weak = assume(&mut graph, argument, number());
-        let strong = assume(&mut graph, argument, Fact::Type(Types::INTEGER));
+        let strong = assume(&mut graph, argument, Fact::Type(ValueType::INTEGER));
         let again = assume(&mut graph, argument, number());
         place_assumes(&mut graph, &FxHashMap::default());
         let Op::Assume(_, _, origin) = graph.insts[strong].op else {

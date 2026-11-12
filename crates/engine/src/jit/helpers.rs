@@ -127,6 +127,7 @@ define_helpers! {
     FrameRelease => Nullary, js_frame_release;
     LocalReplace => IndexSet, js_local_replace;
     Release => Unary, js_release;
+    RetainAddress => Unary, js_retain_address;
     Bailout => Unary, js_bailout;
     Retain => Unary, js_retain, reference;
     IterateNew => Unary, js_iterate_new, reference;
@@ -245,6 +246,7 @@ impl Helper {
         !matches!(
             self,
             Self::Retain
+                | Self::RetainAddress
                 | Self::StringConstant
                 | Self::CompilePoll
                 | Self::CompileLeave
@@ -424,6 +426,16 @@ extern "C" fn js_bailout(_: *mut JitCtx, site: Value) -> Value {
 }
 extern "C" fn js_release(ctx: *mut JitCtx, value: Value) -> Value {
     unsafe { &*ctx }.global.heap().release(value);
+    Value::UNDEFINED
+}
+extern "C" fn js_retain_address(ctx: *mut JitCtx, address: Value) -> Value {
+    assert!(
+        unsafe { &*ctx }
+            .global
+            .heap()
+            .retain_address(address.bits()),
+        "retain of a freed value"
+    );
     Value::UNDEFINED
 }
 extern "C" fn js_local_replace(ctx: *mut JitCtx, slot: u64, value: Value, old: Value) -> Value {

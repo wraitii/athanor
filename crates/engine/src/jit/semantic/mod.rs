@@ -9,21 +9,29 @@ pub(in crate::jit) mod call_variants;
 mod comparisons;
 mod construction;
 pub(in crate::jit) mod continuation;
+mod conversions;
 mod dispatch;
 pub(in crate::jit) mod facts;
 mod fresh;
 mod guards;
 mod inlining;
 mod js;
+mod legalize;
 mod listing;
 pub(in crate::jit) mod low_level;
 mod memory_lowering;
+pub(in crate::jit) mod ownership_lowering;
+pub(in crate::jit) mod selection;
 pub(in crate::jit) use memory_lowering::lower_memory_for_cranelift;
+pub(in crate::jit) mod cleanup;
 mod numeric_lowering;
 mod observations;
 mod optimize;
 pub(super) mod osr;
+pub(in crate::jit) mod ownership;
 pub(super) mod reads;
+pub(in crate::jit) mod repr;
+pub(in crate::jit) mod scratch;
 mod shapes;
 pub(super) mod specialize;
 mod string_split;
@@ -48,12 +56,12 @@ use super::effects::{
 use super::math::METHODS;
 use crate::heap::TypedKind;
 
-pub(super) use borrow::receiver as borrowed_receiver;
-pub(in crate::jit) use facts::{Facts, Identity, Types};
+pub(in crate::jit) use facts::{Facts, Identity, ValueType};
 pub(super) use ids::{Binding, Block, Inst, RegionId, Scope, Value};
 pub(in crate::jit) use listing::ListingLine;
 #[cfg(test)]
 pub(in crate::jit) use listing::SourceLocation;
+pub(in crate::jit) use repr::Repr;
 
 #[allow(deprecated)]
 mod ids {
@@ -115,7 +123,8 @@ pub(super) struct Graph {
     pub(super) blocks: PrimaryMap<Block, BlockData>,
     pub(super) insts: PrimaryMap<Inst, InstData>,
     pub(super) values: PrimaryMap<Value, ValueDef>,
-    pub(super) low_level_types: SecondaryMap<Value, Option<cranelift_codegen::ir::Type>>,
+    pub(in crate::jit) reprs: SecondaryMap<Value, Option<Repr>>,
+    pub(in crate::jit) ownership: Option<ownership::Plan>,
     pub(super) low_level_slots: Vec<low_level::StackSlotData>,
     pub(super) low_level_signature: Option<cranelift_codegen::ir::Signature>,
     pub(super) bindings: PrimaryMap<Binding, BindingData>,
@@ -475,6 +484,12 @@ pub(super) enum Op {
     StringSplitParts(Value, Vec<Value>),
     IsTypeof(Value, u8),
     AsNumber(Value),
+    Convert(Value, Repr),
+    Release(Value),
+    Retain(Value),
+    SlotStore(Value),
+    SlotClear(Value),
+    ParamStore(Value, Value),
     AsObject(Value),
     EnterScope(Scope),
     EnterCaptures(Scope, Value),
@@ -520,7 +535,6 @@ pub(super) enum Ownership {
     Unowned,
     Borrowed,
     Owned,
-    MaybeOwned,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -545,6 +559,9 @@ impl Op {
 
     pub(super) fn operands_iter(&self) -> impl Iterator<Item = Value> + '_ {
         let (fixed, rest): ([Option<Value>; 3], &[Value]) = match self {
+            Op::LowLevel(
+                low_level::Op::Scratch { values, .. } | low_level::Op::Cleanup { values, .. },
+            ) => ([None; 3], values),
             Op::LowLevel(low_level::Op::Call { target, args, .. }) => (
                 [
                     match target {
@@ -558,11 +575,17 @@ impl Op {
             ),
             Op::LowLevel(
                 low_level::Op::Unary { value, .. }
+                | low_level::Op::Reference { value, .. }
                 | low_level::Op::Load { address: value, .. }
                 | low_level::Op::AtomicLoad { address: value, .. },
             ) => ([Some(*value), None, None], &[]),
             Op::LowLevel(
-                low_level::Op::Binary { left, right, .. }
+                low_level::Op::FrameStore {
+                    ctx: left,
+                    value: right,
+                    ..
+                }
+                | low_level::Op::Binary { left, right, .. }
                 | low_level::Op::IntCompare { left, right, .. }
                 | low_level::Op::FloatCompare { left, right, .. }
                 | low_level::Op::Store {
@@ -668,7 +691,13 @@ impl Op {
             | Op::IsStringSplit(value)
             | Op::IsTypeof(value, _)
             | Op::AsObject(value)
-            | Op::AsNumber(value) => ([Some(*value), None, None], &[]),
+            | Op::AsNumber(value)
+            | Op::Convert(value, _)
+            | Op::Release(value)
+            | Op::Retain(value)
+            | Op::SlotStore(value)
+            | Op::SlotClear(value)
+            | Op::ParamStore(_, value) => ([Some(*value), None, None], &[]),
             Op::Define(object, _, value)
             | Op::DefineHidden(object, _, value)
             | Op::ShapedSet(object, _, _, value)
@@ -742,6 +771,9 @@ impl Op {
 
     pub(super) fn operands_mut(&mut self) -> impl Iterator<Item = &mut Value> + '_ {
         let (fixed, rest): ([Option<&mut Value>; 3], &mut [Value]) = match self {
+            Op::LowLevel(
+                low_level::Op::Scratch { values, .. } | low_level::Op::Cleanup { values, .. },
+            ) => ([None, None, None], values),
             Op::LowLevel(low_level::Op::Call { target, args, .. }) => (
                 [
                     match target {
@@ -755,11 +787,17 @@ impl Op {
             ),
             Op::LowLevel(
                 low_level::Op::Unary { value, .. }
+                | low_level::Op::Reference { value, .. }
                 | low_level::Op::Load { address: value, .. }
                 | low_level::Op::AtomicLoad { address: value, .. },
             ) => ([Some(value), None, None], &mut []),
             Op::LowLevel(
-                low_level::Op::Binary { left, right, .. }
+                low_level::Op::FrameStore {
+                    ctx: left,
+                    value: right,
+                    ..
+                }
+                | low_level::Op::Binary { left, right, .. }
                 | low_level::Op::IntCompare { left, right, .. }
                 | low_level::Op::FloatCompare { left, right, .. }
                 | low_level::Op::Store {
@@ -865,7 +903,13 @@ impl Op {
             | Op::IsStringSplit(value)
             | Op::IsTypeof(value, _)
             | Op::AsObject(value)
-            | Op::AsNumber(value) => ([Some(value), None, None], &mut []),
+            | Op::AsNumber(value)
+            | Op::Convert(value, _)
+            | Op::Release(value)
+            | Op::Retain(value)
+            | Op::SlotStore(value)
+            | Op::SlotClear(value)
+            | Op::ParamStore(_, value) => ([Some(value), None, None], &mut []),
             Op::Define(object, _, value)
             | Op::DefineHidden(object, _, value)
             | Op::ShapedSet(object, _, _, value)
@@ -1291,7 +1335,8 @@ impl Graph {
             blocks,
             insts: PrimaryMap::new(),
             values: PrimaryMap::new(),
-            low_level_types: SecondaryMap::new(),
+            reprs: SecondaryMap::new(),
+            ownership: None,
             low_level_slots: Vec::new(),
             low_level_signature: Some(signature),
             bindings: PrimaryMap::new(),
@@ -1324,6 +1369,10 @@ impl Graph {
             ValueDef::Result(inst, _) => self.insts[inst].block,
             ValueDef::Param(block, _) => block,
         }
+    }
+
+    pub(in crate::jit) fn repr(&self, value: Value) -> Repr {
+        self.reprs[value].expect("value has no representation")
     }
 
     pub(super) fn defining_op(&self, value: Value) -> Option<&Op> {
@@ -1593,17 +1642,27 @@ impl Graph {
             result,
         };
         const COERCING: u16 = HEAP_READ | ALLOCATION | INTERNAL | ERROR;
-        let operands = op.operands_iter().fold(Types::default(), |types, value| {
-            types.union(facts.of(value))
-        });
+        let operands = op
+            .operands_iter()
+            .fold(ValueType::default(), |types, value| {
+                types.union(facts.of(value))
+            });
         let coercing = |result| {
-            if operands.within(Types::NUMBER) {
+            if operands.within(ValueType::NUMBER) {
                 closed(0, Unowned)
             } else {
                 closed(COERCING, result)
             }
         };
         match op {
+            Op::LowLevel(low_level::Op::Scratch { .. }) => closed(INTERNAL, None),
+            Op::LowLevel(low_level::Op::Reference { .. } | low_level::Op::Cleanup { .. }) => {
+                closed(INTERNAL | HEAP_WRITE, None)
+            }
+            Op::LowLevel(low_level::Op::FrameStore { .. }) => Contract {
+                effects: Effects::UNKNOWN,
+                result: Unowned,
+            },
             Op::LowLevel(low_level::Op::Call { .. }) => Contract {
                 effects: Effects::UNKNOWN,
                 result: Unowned,
@@ -1641,7 +1700,7 @@ impl Graph {
             Op::Argument(_) | Op::This => closed(0, Borrowed),
             Op::ClosureThis(_) => closed(HEAP_READ, Borrowed),
             Op::NewHoleyArray(_) => closed(ALLOCATION | INTERNAL | ERROR, Owned),
-            Op::MapElement(..) => closed(HEAP_READ | INTERNAL, Borrowed),
+            Op::MapElement(..) => closed(HEAP_READ | INTERNAL, Owned),
             Op::IsArrayIteration(..) | Op::IsStringSplit(_) => closed(HEAP_READ, Unowned),
             Op::StringSplit(..) | Op::StringSplitParts(..) => {
                 closed(HEAP_READ | ALLOCATION | INTERNAL | ERROR, Owned)
@@ -1663,7 +1722,11 @@ impl Graph {
                 } else {
                     ERROR
                 },
-                Borrowed,
+                if self.bindings[*binding].captured || self.lazy_captures.contains(binding) {
+                    Owned
+                } else {
+                    Borrowed
+                },
             ),
             Op::Initialize(binding, _) | Op::Write(binding, _)
                 if self.bindings[*binding].captured =>
@@ -1673,7 +1736,7 @@ impl Graph {
             Op::Initialize(..) => closed(INTERNAL, None),
             Op::Write(..) => closed(INTERNAL | ERROR, None),
             Op::CheckInitialized(_) => {
-                if operands.intersects(Types::UNINITIALIZED) {
+                if operands.intersects(ValueType::UNINITIALIZED) {
                     closed(ERROR, None)
                 } else {
                     closed(0, None)
@@ -1689,7 +1752,7 @@ impl Graph {
             Op::Spread(_) => closed(HEAP_READ | ALLOCATION | INTERNAL | ERROR, Owned),
             Op::IteratorNext(_) | Op::EnumerateNext(_) => closed(
                 HEAP_READ | HEAP_WRITE | ALLOCATION | INTERNAL | ERROR,
-                MaybeOwned,
+                Owned,
             ),
             Op::IsUninitialized(_) => closed(0, Unowned),
             // Defines only target the literal being built, which nothing has read yet, so the
@@ -1718,16 +1781,16 @@ impl Graph {
                 None,
             ),
             Op::Unary(UnaryOp::Not, _) => closed(HEAP_READ, Unowned),
-            Op::Unary(UnaryOp::Typeof, _) => closed(HEAP_READ | ALLOCATION | ERROR, MaybeOwned),
+            Op::Unary(UnaryOp::Typeof, _) => closed(HEAP_READ | ALLOCATION | ERROR, Owned),
             Op::Unary(UnaryOp::Increment | UnaryOp::Decrement, _) => {
-                if operands.within(Types::NUMBER) {
+                if operands.within(ValueType::NUMBER) {
                     closed(0, Unowned)
                 } else {
-                    closed(ALLOCATION | INTERNAL | ERROR, MaybeOwned)
+                    closed(ALLOCATION | INTERNAL | ERROR, Owned)
                 }
             }
             Op::ToInt32(_) => closed(0, Unowned),
-            Op::ToNumeric(_) | Op::Unary(..) => coercing(MaybeOwned),
+            Op::ToNumeric(_) | Op::Unary(..) => coercing(Owned),
             Op::GuardedCompare {
                 operator,
                 left,
@@ -1736,7 +1799,7 @@ impl Graph {
             } => self.contract(&Op::Binary(*operator, *left, *right), facts),
             Op::Binary(operator, ..) => match operator {
                 BinaryOperator::StrictEquality | BinaryOperator::StrictInequality => closed(
-                    if operands.within(Types::NUMBER) {
+                    if operands.within(ValueType::NUMBER) {
                         0
                     } else {
                         HEAP_READ
@@ -1753,7 +1816,7 @@ impl Graph {
                     effects: Effects::UNKNOWN,
                     result: Unowned,
                 },
-                _ => coercing(MaybeOwned),
+                _ => coercing(Owned),
             },
             Op::Call { .. }
             | Op::Construct { .. }
@@ -1806,6 +1869,12 @@ impl Graph {
             | Op::IsString(_) => closed(0, Unowned),
             Op::IsTypeof(..) => closed(HEAP_READ, Unowned),
             Op::AsNumber(_) => closed(INTERNAL, Unowned),
+            Op::Convert(..) => closed(0, Unowned),
+            Op::Release(_)
+            | Op::Retain(_)
+            | Op::SlotStore(_)
+            | Op::SlotClear(_)
+            | Op::ParamStore(..) => closed(INTERNAL, None),
             Op::AsObject(_) => closed(0, Unowned),
             Op::EnterCaptures(..) => closed(HEAP_READ | INTERNAL | ERROR, None),
             Op::EnterScope(scope) | Op::NextIteration(scope) | Op::FreshIteration(scope) => {
@@ -1834,14 +1903,7 @@ impl Graph {
         else {
             return false;
         };
-        let ty = match format {
-            MemoryFormat::U8 | MemoryFormat::I8 => cranelift_codegen::ir::types::I8,
-            MemoryFormat::U16 | MemoryFormat::I16 => cranelift_codegen::ir::types::I16,
-            MemoryFormat::U32 | MemoryFormat::I32 => cranelift_codegen::ir::types::I32,
-            MemoryFormat::F32 => cranelift_codegen::ir::types::F32,
-            MemoryFormat::F64 => cranelift_codegen::ir::types::F64,
-        };
-        self.low_level_types[value] == Some(ty)
+        self.reprs[value] == Some(format.repr())
     }
 
     pub(super) fn verify(&self) -> Result<()> {
@@ -1896,7 +1958,7 @@ impl Graph {
                         .iter()
                         .zip(&signature.returns)
                         .any(|(&value, param)| {
-                            self.low_level_types[value] != Some(param.value_type)
+                            self.reprs[value].map(Repr::machine) != Some(param.value_type)
                         })
                 {
                     return Err(format!("{block} has incompatible return values"));
@@ -1908,7 +1970,7 @@ impl Graph {
             {
                 if args.len() != signature.params.len()
                     || args.iter().zip(&signature.params).any(|(&value, param)| {
-                        self.low_level_types[value] != Some(param.value_type)
+                        self.reprs[value].map(Repr::machine) != Some(param.value_type)
                     })
                 {
                     return Err(format!("{block} has incompatible tail-call arguments"));
@@ -1928,7 +1990,7 @@ impl Graph {
                     return Err(format!("{block} passes wrong arity to {}", target.block));
                 }
                 for (&arg, &param) in target.args.iter().zip(&self.blocks[target.block].params) {
-                    if self.low_level_types[arg] != self.low_level_types[param] {
+                    if self.reprs[arg] != self.reprs[param] {
                         return Err(format!(
                             "{block} passes incompatible scalar type to {}",
                             target.block
@@ -1970,7 +2032,7 @@ impl Graph {
                         return Err(format!("{inst} has an invalid call signature"));
                     }
                     for (&value, ty) in instruction.results.iter().zip(&signature.returns) {
-                        if self.low_level_types[value] != Some(ty.value_type) {
+                        if self.reprs[value].map(Repr::machine) != Some(ty.value_type) {
                             return Err(format!("{inst} has an invalid call result type"));
                         }
                     }
@@ -2169,6 +2231,21 @@ impl FunctionState {
             self.ensure_facts();
             borrow::borrows(&mut self.graph, &self.facts, &mut self.notes);
         }
+        Ok(())
+    }
+
+    pub(in crate::jit) fn legalize_reprs(&mut self) -> Result<()> {
+        self.ensure_facts();
+        repr::assign(&mut self.graph, &self.facts);
+        legalize::legalize(&mut self.graph, &mut self.facts);
+        conversions::simplify(&mut self.graph, &self.facts);
+        conversions::hoist(&mut self.graph, &self.facts);
+        self.graph.verify()?;
+        let plan = ownership::plan(&mut self.graph, &mut self.facts);
+        if cfg!(debug_assertions) {
+            ownership::verify(&self.graph, &self.facts, &plan)?;
+        }
+        self.graph.ownership = Some(plan);
         Ok(())
     }
 

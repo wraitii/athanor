@@ -107,6 +107,9 @@ impl Arena {
     }
 
     pub(super) fn free(&mut self, slot: NonNull<Slot>) {
+        if super::strict_references() {
+            return;
+        }
         self.free.push(slot);
     }
 

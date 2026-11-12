@@ -178,7 +178,7 @@ pub(super) fn apply(graph: &mut Graph, body: &Graph, plan: &Inline) {
         blocks.insert(block, copy);
         for &param in &body.blocks[block].params {
             let new = graph.add_param(copy);
-            graph.low_level_types[new] = body.low_level_types[param];
+            graph.reprs[new] = body.reprs[param];
             values.insert(param, new);
         }
     }
@@ -245,7 +245,7 @@ pub(super) fn apply(graph: &mut Graph, body: &Graph, plan: &Inline) {
                 lexical_closures.push(copy);
             }
             for (&old, &new) in data.results.iter().zip(&results) {
-                graph.low_level_types[new] = body.low_level_types[old];
+                graph.reprs[new] = body.reprs[old];
                 values.insert(old, new);
             }
             insts.push(copy);

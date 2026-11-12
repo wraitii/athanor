@@ -1,8 +1,8 @@
 use crate::jit::profile::{ReadKind, ReadType, Site};
 
 use super::{
-    BlockData, Cfg, Facts, Graph, Inst, Op, Target, Terminator, TerminatorKind, TypedRead, Types,
-    ValueDef,
+    BlockData, Cfg, Facts, Graph, Inst, Op, Target, Terminator, TerminatorKind, TypedRead,
+    ValueDef, ValueType,
 };
 
 #[derive(Clone, PartialEq, Eq)]
@@ -55,7 +55,7 @@ pub(super) fn plan(
                 continue;
             };
             let types = facts.of(key);
-            if !types.intersects(Types::NUMBER) {
+            if !types.intersects(ValueType::NUMBER) {
                 continue;
             }
             reads.push(Read {
@@ -66,7 +66,7 @@ pub(super) fn plan(
                     ReadType::Array => None,
                     ReadType::Unknown | ReadType::Integer | ReadType::Number => continue,
                 },
-                guard_number: !types.within(Types::NUMBER),
+                guard_number: !types.within(ValueType::NUMBER),
             });
         }
     }

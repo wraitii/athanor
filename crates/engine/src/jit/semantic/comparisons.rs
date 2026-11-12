@@ -2,7 +2,7 @@ use crate::FxHashMap;
 
 use oxc_syntax::operator::BinaryOperator;
 
-use super::{Block, Constant, Op, Types, Value};
+use super::{Block, Constant, Op, Value, ValueType};
 
 pub(super) fn expose(function: &mut super::FunctionState) {
     function.ensure_values();
@@ -43,7 +43,7 @@ pub(super) fn expose(function: &mut super::FunctionState) {
             ) {
                 let undefined = |value| {
                     let types = facts.of(value);
-                    types.intersects(Types::UNDEFINED) && types.within(Types::UNDEFINED)
+                    types.intersects(ValueType::UNDEFINED) && types.within(ValueType::UNDEFINED)
                 };
                 let value = if undefined(left) {
                     Some(right)
@@ -79,10 +79,10 @@ pub(super) fn expose(function: &mut super::FunctionState) {
             ) || [left, right].iter().all(|&value| {
                 facts
                     .of(value)
-                    .within(Types::NUMBER.union(Types::UNDEFINED))
+                    .within(ValueType::NUMBER.union(ValueType::UNDEFINED))
             }) || [left, right]
                 .iter()
-                .any(|&value| !facts.of(value).intersects(Types::NUMBER))
+                .any(|&value| !facts.of(value).intersects(ValueType::NUMBER))
             {
                 continue;
             }
@@ -96,7 +96,7 @@ pub(super) fn expose(function: &mut super::FunctionState) {
                     *number = earlier;
                     continue;
                 }
-                let op = if facts.of(value).within(Types::NUMBER) {
+                let op = if facts.of(value).within(ValueType::NUMBER) {
                     Op::Constant(Constant::Boolean(true))
                 } else {
                     Op::IsNumber(value)

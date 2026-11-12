@@ -4,7 +4,7 @@ use oxc_syntax::operator::BinaryOperator;
 
 use super::{
     ArrayMethod, BlockData, Cfg, Constant, Facts, Graph, Inst, Op, Result, Target, Terminator,
-    TerminatorKind, Types,
+    TerminatorKind, ValueType,
 };
 
 impl ArrayMethod {
@@ -66,7 +66,7 @@ pub(super) fn expand(
             };
             if args
                 .get(1)
-                .is_some_and(|&value| !facts.of(value).within(Types::UNDEFINED))
+                .is_some_and(|&value| !facts.of(value).within(ValueType::UNDEFINED))
             {
                 continue;
             }

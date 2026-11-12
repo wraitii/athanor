@@ -1,6 +1,6 @@
 use oxc_syntax::operator::BinaryOperator;
 
-use super::super::{Op, Types, UnaryOp};
+use super::super::{Op, UnaryOp, ValueType};
 use super::NUMERIC;
 
 pub(in crate::jit::semantic) fn coercions(function: &mut super::super::FunctionState) {
@@ -32,7 +32,7 @@ pub(in crate::jit::semantic) fn coercions(function: &mut super::super::FunctionS
                 .all(|value| facts.of(value).within(NUMERIC))
                 || op
                     .operands_iter()
-                    .all(|value| facts.of(value).within(Types::INT32))
+                    .all(|value| facts.of(value).within(ValueType::INT32))
             {
                 continue;
             }
@@ -44,7 +44,7 @@ pub(in crate::jit::semantic) fn coercions(function: &mut super::super::FunctionS
                 .unwrap();
             let span = graph.insts[inst].span;
             for operand in op.operands_mut() {
-                if facts.of(*operand).within(Types::INT32) {
+                if facts.of(*operand).within(ValueType::INT32) {
                     continue;
                 }
                 *operand = graph.insert_value(block, position, span, Op::ToInt32(*operand));

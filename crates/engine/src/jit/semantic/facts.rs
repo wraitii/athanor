@@ -9,16 +9,14 @@ use super::access::Access;
 use super::available;
 use super::fresh::Fresh;
 use super::guards;
-use super::{
-    Block, Cfg, Constant, Graph, Inst, MemoryFormat, MemoryOp, Op, TerminatorKind, UnaryOp, Value,
-};
+use super::{Block, Cfg, Constant, Graph, Inst, MemoryFormat, Op, TerminatorKind, UnaryOp, Value};
 use crate::heap::TypedKind;
 use cranelift_module::FuncId;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub(in crate::jit) struct Types(u16);
+pub(in crate::jit) struct ValueType(u16);
 
-impl Types {
+impl ValueType {
     pub(in crate::jit) const INT32: Self = Self(1);
     pub(in crate::jit) const DOUBLE: Self = Self(2);
     pub(in crate::jit) const INT64: Self = Self(2048);
@@ -31,8 +29,6 @@ impl Types {
     pub(in crate::jit) const OTHER: Self = Self(128);
     pub(in crate::jit) const UNINITIALIZED: Self = Self(256);
     pub(in crate::jit) const PACK: Self = Self(1024);
-    pub(in crate::jit) const POINTER: Self = Self(4096);
-    pub(in crate::jit) const RAW: Self = Self(8192);
     pub(in crate::jit) const VIEW: Self = Self(512);
     pub(in crate::jit) const NUMBER: Self = Self(1 | 2 | 2048);
     pub(in crate::jit) const PRIMITIVE: Self = Self(1 | 2 | 4 | 8 | 16 | 32 | 2048);
@@ -60,7 +56,7 @@ impl Types {
     }
 }
 
-impl fmt::Display for Types {
+impl fmt::Display for ValueType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut names = Vec::new();
         if Self::NUMBER.within(*self) {
@@ -85,8 +81,6 @@ impl fmt::Display for Types {
             (Self::OTHER, "other"),
             (Self::UNINITIALIZED, "uninit"),
             (Self::VIEW, "view"),
-            (Self::POINTER, "pointer"),
-            (Self::RAW, "raw"),
             (Self::PACK, "pack"),
         ] {
             if self.intersects(types) {
@@ -120,7 +114,7 @@ impl Identity {
 
 struct Refinement {
     block: Block,
-    mask: Option<Types>,
+    mask: Option<ValueType>,
     positive: bool,
     identity: Option<FuncId>,
 }
@@ -132,7 +126,7 @@ pub(in crate::jit) struct Facts {
     rejected: FxHashSet<Inst>,
     identities: SecondaryMap<Value, Identity>,
     assumed: FxHashMap<Value, FuncId>,
-    types: SecondaryMap<Value, Types>,
+    types: SecondaryMap<Value, ValueType>,
     indexed: FxHashSet<Value>,
     known: bool,
     fresh: std::cell::OnceCell<std::rc::Rc<Fresh>>,
@@ -164,12 +158,16 @@ impl Facts {
         self.indexed.contains(&value)
     }
 
-    pub(in crate::jit) fn of(&self, value: Value) -> Types {
+    pub(in crate::jit) fn of(&self, value: Value) -> ValueType {
         if self.known {
             self.types[value]
         } else {
-            Types::ALL
+            ValueType::ALL
         }
+    }
+
+    pub(super) fn set(&mut self, value: Value, types: ValueType) {
+        self.types[value] = types;
     }
 
     pub(super) fn fresh(&self, graph: &Graph) -> std::rc::Rc<Fresh> {
@@ -317,7 +315,7 @@ impl Facts {
             .chain(candidates.iter().copied())
             .collect();
         let candidates = &entry_facts;
-        let assumptions: FxHashMap<Value, Types> = candidates
+        let assumptions: FxHashMap<Value, ValueType> = candidates
             .iter()
             .filter_map(|&(value, fact)| Some((value, fact.mask()?)))
             .collect();
@@ -355,7 +353,8 @@ impl Facts {
                 }
             }
         }
-        let mut edge_facts: FxHashMap<(Block, Value), Vec<(Types, bool)>> = FxHashMap::default();
+        let mut edge_facts: FxHashMap<(Block, Value), Vec<(ValueType, bool)>> =
+            FxHashMap::default();
         for &block in &cfg.rpo {
             let Some(terminator) = &graph.blocks[block].terminator else {
                 continue;
@@ -436,7 +435,7 @@ impl Facts {
                             types
                         } else {
                             match steps.get(&inst) {
-                                Some(bounds) if facts.bounded(&data.op, bounds) => Types::INT32,
+                                Some(bounds) if facts.bounded(&data.op, bounds) => ValueType::INT32,
                                 _ => result_types(graph, &data.op, &facts),
                             }
                         };
@@ -468,7 +467,7 @@ impl Facts {
                             && let Some(mask) = edge.fact.mask()
                         {
                             types = if target.block == edge.yes {
-                                Types(types.0 & mask.0)
+                                ValueType(types.0 & mask.0)
                             } else {
                                 types.without(mask)
                             };
@@ -476,7 +475,7 @@ impl Facts {
                         for &(mask, positive) in edge_facts.get(&(block, arg)).into_iter().flatten()
                         {
                             types = if positive {
-                                Types(types.0 & mask.0)
+                                ValueType(types.0 & mask.0)
                             } else {
                                 types.without(mask)
                             };
@@ -511,10 +510,10 @@ impl Facts {
     }
 
     fn bounded(&self, op: &Op, bounds: &[Value]) -> bool {
-        step(op).is_some_and(|(operand, _)| self.of(operand).within(Types::INT32))
+        step(op).is_some_and(|(operand, _)| self.of(operand).within(ValueType::INT32))
             && bounds
                 .iter()
-                .any(|&bound| self.of(bound).within(Types::INT32))
+                .any(|&bound| self.of(bound).within(ValueType::INT32))
     }
 
     fn join_identity(&mut self, value: Value, identity: Identity) -> bool {
@@ -526,7 +525,7 @@ impl Facts {
         true
     }
 
-    fn widen(&mut self, value: Value, types: Types) -> bool {
+    fn widen(&mut self, value: Value, types: ValueType) -> bool {
         let widened = self.types[value].union(types);
         if widened == self.types[value] {
             return false;
@@ -704,42 +703,42 @@ fn range(
     }
 }
 
-fn number(value: f64) -> Types {
+fn number(value: f64) -> ValueType {
     let integral = value.fract() == 0.0 && value >= i32::MIN as f64 && value <= i32::MAX as f64;
     if integral && !(value == 0.0 && value.is_sign_negative()) {
-        Types::INT32
+        ValueType::INT32
     } else {
-        Types::DOUBLE
+        ValueType::DOUBLE
     }
 }
 
 fn integer_product(graph: &Graph, facts: &Facts, left: Value, right: Value) -> bool {
     // Positive factors avoid negative zero; 2^31 * 2^22 stays exactly representable.
     let scaled = |value, factor| {
-        facts.of(value).within(Types::INT32)
+        facts.of(value).within(ValueType::INT32)
             && matches!(graph.defining_op(factor), Some(Op::Constant(Constant::Number(n)))
                 if *n > 0.0 && n.fract() == 0.0 && *n <= 4_194_304.0)
     };
     scaled(left, right) || scaled(right, left)
 }
 
-fn result_types(graph: &Graph, op: &Op, facts: &Facts) -> Types {
+fn result_types(graph: &Graph, op: &Op, facts: &Facts) -> ValueType {
     match op {
-        Op::OsrStart(..) => Types::INT32,
+        Op::OsrStart(..) => ValueType::INT32,
         Op::Continuation(body, _) => body.result,
-        Op::ContinuationOutput(..) | Op::BindingLoad(_) => Types::ALL,
+        Op::ContinuationOutput(..) | Op::BindingLoad(_) => ValueType::ALL,
         Op::BindingRestore(..)
         | Op::ContinuationStore(..)
         | Op::Observe(..)
         | Op::ReadHint(..)
-        | Op::Assume(..) => Types::default(),
+        | Op::Assume(..) => ValueType::default(),
         Op::Constant(constant) => match constant {
-            Constant::Undefined => Types::UNDEFINED,
-            Constant::Null => Types::NULL,
-            Constant::Boolean(_) => Types::BOOLEAN,
+            Constant::Undefined => ValueType::UNDEFINED,
+            Constant::Null => ValueType::NULL,
+            Constant::Boolean(_) => ValueType::BOOLEAN,
             Constant::Number(value) => number(*value),
-            Constant::String(_) => Types::STRING,
-            Constant::Uninitialized => Types::UNINITIALIZED,
+            Constant::String(_) => ValueType::STRING,
+            Constant::Uninitialized => ValueType::UNINITIALIZED,
         },
         Op::NewObject
         | Op::NewInstance(_)
@@ -747,123 +746,122 @@ fn result_types(graph: &Graph, op: &Op, facts: &Facts) -> Types {
         | Op::NewArray(_)
         | Op::NewHoleyArray(_)
         | Op::IteratorNew(_)
-        | Op::EnumerateNew(_) => Types::OBJECT,
-        Op::MapElement(..) => Types::ALL,
-        Op::IsArrayIteration(..) => Types::BOOLEAN,
-        Op::IteratorNext(_) | Op::EnumerateNext(_) => Types::ALL,
+        | Op::EnumerateNew(_) => ValueType::OBJECT,
+        Op::MapElement(..) => ValueType::ALL,
+        Op::IsArrayIteration(..) => ValueType::BOOLEAN,
+        Op::IteratorNext(_) | Op::EnumerateNext(_) => ValueType::ALL,
         Op::EntryAssume(..)
         | Op::IsUninitialized(_)
         | Op::IsPropertyCached(..)
-        | Op::IsShape(..) => Types::BOOLEAN,
+        | Op::IsShape(..) => ValueType::BOOLEAN,
         Op::ProbeProperty(..)
         | Op::ProbeShapeProperty(..)
         | Op::ProbeIndex(..)
         | Op::ConstructorPrototype(_)
         | Op::CachedProperty(..)
         | Op::ShapedGet(..)
-        | Op::FillPropertyCache(..) => Types::ALL,
-        Op::View(_) => Types::VIEW,
-        Op::LowLevel(_) => Types::RAW,
-        Op::TypedData(_) | Op::Memory(MemoryOp::Address { .. }) => Types::POINTER,
-        Op::Memory(MemoryOp::IndexedLoad { .. } | MemoryOp::Load { .. }) => Types::RAW,
+        | Op::FillPropertyCache(..) => ValueType::ALL,
+        Op::View(_) => ValueType::VIEW,
+        Op::Convert(value, repr) => repr.coerce(facts.of(*value)),
+        Op::LowLevel(_) | Op::TypedData(_) | Op::Memory(_) => ValueType::default(),
         Op::MemoryNumber(_, format) => match format {
-            MemoryFormat::U32 | MemoryFormat::F32 | MemoryFormat::F64 => Types::NUMBER,
-            _ => Types::INT32,
+            MemoryFormat::U32 | MemoryFormat::F32 | MemoryFormat::F64 => ValueType::NUMBER,
+            _ => ValueType::INT32,
         },
-        Op::KeepAlive(_) => Types::default(),
+        Op::KeepAlive(_) => ValueType::default(),
         Op::TypedIndex(.., read) if read.bounded => match read.element {
             Some(TypedKind::Float32 | TypedKind::Float64 | TypedKind::Uint32) | None => {
-                Types::NUMBER
+                ValueType::NUMBER
             }
-            Some(_) => Types::INT32,
+            Some(_) => ValueType::INT32,
         },
-        Op::TypedIndex(..) => Types::NUMBER.union(Types::UNDEFINED),
+        Op::TypedIndex(..) => ValueType::NUMBER.union(ValueType::UNDEFINED),
         Op::IsTyped(..)
         | Op::IsIndexed(_)
         | Op::IsArrayIndex(..)
         | Op::IsArray(..)
         | Op::IsExactPosition(..)
         | Op::IsInBounds(..)
-        | Op::BooleanAnd(..) => Types::BOOLEAN,
-        Op::IndexedLength(_) => Types::INT64,
-        Op::ArrayKind(_) => Types::INT32,
+        | Op::BooleanAnd(..) => ValueType::BOOLEAN,
+        Op::IndexedLength(_) => ValueType::INT64,
+        Op::ArrayKind(_) => ValueType::INT32,
         Op::IsNumber(_)
         | Op::IsInteger(_)
         | Op::IntegerCheck(..)
         | Op::IsString(_)
         | Op::IsStringSplit(_)
-        | Op::IsTypeof(..) => Types::BOOLEAN,
-        Op::NewPack | Op::Spread(_) | Op::StringSplitParts(..) => Types::PACK,
-        Op::StringSplit(..) => Types::OBJECT,
-        Op::ArrayPosition(_) => Types::INT64,
-        Op::ToInt32(_) => Types::INT32,
-        Op::AsInteger(_) => Types::INT64,
-        Op::NumericFloat(_) | Op::SaturatingInteger(_) => Types::NUMBER,
-        Op::AsObject(_) => Types::OBJECT,
+        | Op::IsTypeof(..) => ValueType::BOOLEAN,
+        Op::NewPack | Op::Spread(_) | Op::StringSplitParts(..) => ValueType::PACK,
+        Op::StringSplit(..) => ValueType::OBJECT,
+        Op::ArrayPosition(_) => ValueType::INT64,
+        Op::ToInt32(_) => ValueType::INT32,
+        Op::AsInteger(_) => ValueType::INT64,
+        Op::NumericFloat(_) | Op::SaturatingInteger(_) => ValueType::NUMBER,
+        Op::AsObject(_) => ValueType::OBJECT,
         Op::AsNumber(value) | Op::ToNumeric(value) | Op::Unary(UnaryOp::Plus, value)
-            if facts.of(*value).within(Types::NUMBER) =>
+            if facts.of(*value).within(ValueType::NUMBER) =>
         {
             facts.of(*value)
         }
-        Op::AsNumber(_) | Op::ToNumeric(_) => Types::NUMBER,
+        Op::AsNumber(_) | Op::ToNumeric(_) => ValueType::NUMBER,
         Op::Unary(UnaryOp::Increment | UnaryOp::Decrement, value)
-            if facts.of(*value).within(Types::INTEGER) =>
+            if facts.of(*value).within(ValueType::INTEGER) =>
         {
-            Types::INT64
+            ValueType::INT64
         }
         Op::Unary(operator, _) => match operator {
-            UnaryOp::Not => Types::BOOLEAN,
-            UnaryOp::Typeof => Types::STRING,
-            UnaryOp::Plus => Types::NUMBER,
-            UnaryOp::BitwiseNot => Types::INT32,
-            UnaryOp::Negate | UnaryOp::Increment | UnaryOp::Decrement => Types::NUMBER,
+            UnaryOp::Not => ValueType::BOOLEAN,
+            UnaryOp::Typeof => ValueType::STRING,
+            UnaryOp::Plus => ValueType::NUMBER,
+            UnaryOp::BitwiseNot => ValueType::INT32,
+            UnaryOp::Negate | UnaryOp::Increment | UnaryOp::Decrement => ValueType::NUMBER,
         },
         Op::Binary(BinaryOperator::Addition | BinaryOperator::Subtraction, left, right)
-            if facts.of(*left).within(Types::INTEGER)
-                && facts.of(*right).within(Types::INTEGER) =>
+            if facts.of(*left).within(ValueType::INTEGER)
+                && facts.of(*right).within(ValueType::INTEGER) =>
         {
-            Types::INT64
+            ValueType::INT64
         }
         Op::Binary(BinaryOperator::Multiplication, left, right)
             if integer_product(graph, facts, *left, *right) =>
         {
-            Types::INT64
+            ValueType::INT64
         }
         Op::Binary(operator, left, right) => match operator {
             BinaryOperator::Addition => {
                 let (left, right) = (facts.of(*left), facts.of(*right));
-                let nonstring = Types::NUMBER
-                    .union(Types::BOOLEAN)
-                    .union(Types::UNDEFINED)
-                    .union(Types::NULL);
+                let nonstring = ValueType::NUMBER
+                    .union(ValueType::BOOLEAN)
+                    .union(ValueType::UNDEFINED)
+                    .union(ValueType::NULL);
                 if left.within(nonstring) && right.within(nonstring) {
-                    Types::NUMBER
-                } else if left.within(Types::STRING) || right.within(Types::STRING) {
-                    Types::STRING
+                    ValueType::NUMBER
+                } else if left.within(ValueType::STRING) || right.within(ValueType::STRING) {
+                    ValueType::STRING
                 } else {
-                    Types::NUMBER.union(Types::STRING)
+                    ValueType::NUMBER.union(ValueType::STRING)
                 }
             }
             BinaryOperator::Subtraction
             | BinaryOperator::Multiplication
             | BinaryOperator::Division
             | BinaryOperator::Remainder
-            | BinaryOperator::Exponential => Types::NUMBER,
+            | BinaryOperator::Exponential => ValueType::NUMBER,
             BinaryOperator::ShiftLeft
             | BinaryOperator::ShiftRight
             | BinaryOperator::BitwiseOR
             | BinaryOperator::BitwiseXOR
-            | BinaryOperator::BitwiseAnd => Types::INT32,
-            BinaryOperator::ShiftRightZeroFill => Types::NUMBER,
-            _ => Types::BOOLEAN,
+            | BinaryOperator::BitwiseAnd => ValueType::INT32,
+            BinaryOperator::ShiftRightZeroFill => ValueType::NUMBER,
+            _ => ValueType::BOOLEAN,
         },
-        Op::GuardedCompare { .. } => Types::BOOLEAN,
-        Op::CallNative(..) => Types::NUMBER,
+        Op::GuardedCompare { .. } => ValueType::BOOLEAN,
+        Op::CallNative(..) => ValueType::NUMBER,
         Op::IsUndefined(_)
         | Op::IsNullish(_)
         | Op::IsNative(..)
         | Op::IsCode(..)
-        | Op::GuardValid(_) => Types::BOOLEAN,
-        _ => Types::VALUE,
+        | Op::GuardValid(_) => ValueType::BOOLEAN,
+        _ => ValueType::VALUE,
     }
 }

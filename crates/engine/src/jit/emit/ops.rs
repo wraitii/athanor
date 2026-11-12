@@ -24,8 +24,9 @@ use crate::jit::session::CALL_SITE_OFFSET;
 use crate::value::Value;
 use crate::value::{TAG_FIRST, TAG_OBJECT, TAG_SHIFT, TAG_SPAN, TAG_STRING};
 
-use super::repr::{Operand, Repr};
+use super::repr::Operand;
 use super::{BlockArg, FunctionCompiler, LoweredValue, SigRef, ir_helpers};
+use crate::jit::semantic::Repr;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Element {
@@ -404,8 +405,10 @@ impl FunctionCompiler<'_, '_> {
         let result = self.b.inst_results(call)[0];
         self.unchecked = None;
         if helper.returns_reference() {
-            self.track(result);
-            self.unchecked = self.owned.last().copied();
+            self.unchecked = Some(
+                self.b
+                    .scratch(crate::jit::semantic::low_level::Scratch::Own, &[result]),
+            );
         }
         result
     }
@@ -654,8 +657,8 @@ impl FunctionCompiler<'_, '_> {
             self.check_error();
             return result;
         }
-        let (helper, index) = if matches!(index.repr, Repr::Float | Repr::Int32 | Repr::Int64) {
-            (Helper::IndexGetNumeric, self.convert(index, Repr::Float))
+        let (helper, index) = if matches!(index.repr, Repr::F64 | Repr::I32 | Repr::I64) {
+            (Helper::IndexGetNumeric, self.convert(index, Repr::F64))
         } else {
             (Helper::IndexGet, index.value)
         };
@@ -729,7 +732,7 @@ impl FunctionCompiler<'_, '_> {
         {
             let result = self.generic_call(callee, receiver, args, span)?;
             if owned {
-                self.increment(result);
+                self.move_result_reference(result);
             }
             return Ok(result);
         }
@@ -765,7 +768,7 @@ impl FunctionCompiler<'_, '_> {
         let result = self.b.block_params(check)[0];
         self.check_error();
         if owned {
-            self.increment(result);
+            self.move_result_reference(result);
         }
         self.jump(done, &[BlockArg::Value(result)]);
         self.switch(done);
@@ -987,14 +990,9 @@ impl FunctionCompiler<'_, '_> {
         self.b.block_params(done)[0]
     }
 
-    pub(super) fn element_read(
-        &mut self,
-        object: LoweredValue,
-        key: Operand,
-        retain: bool,
-    ) -> LoweredValue {
+    pub(super) fn element_read(&mut self, object: LoweredValue, key: Operand) -> LoweredValue {
         let view = self.view(object);
-        self.viewed_index_access(view, object, key, None, true, retain, true)
+        self.viewed_index_access(view, object, key, None, true, false, true)
     }
 
     pub(super) fn typed_kind_is(&mut self, view: LoweredValue, kind: TypedKind) -> LoweredValue {
@@ -1014,10 +1012,10 @@ impl FunctionCompiler<'_, '_> {
     ) -> Operand {
         let element = Element::from(kind);
         let flags = MemFlagsData::trusted();
-        let position = if matches!(key.repr, Repr::Int32 | Repr::Int64) {
-            self.convert(key, Repr::Int64)
+        let position = if matches!(key.repr, Repr::I32 | Repr::I64) {
+            self.convert(key, Repr::I64)
         } else {
-            let key = self.convert(key, Repr::Float);
+            let key = self.convert(key, Repr::F64);
             self.b.ins().fcvt_to_sint_sat(types::I64, key)
         };
         let data = self.b.ins().load(self.pointer, flags, view, DATA_OFFSET);
@@ -1025,19 +1023,19 @@ impl FunctionCompiler<'_, '_> {
         let address = self.b.ins().iadd(data, offset);
         let raw = self.b.ins().load(element.into(), flags, address, 0);
         match element {
-            Element::F64 => Operand::new(raw, Repr::Float),
-            Element::F32 => Operand::new(self.b.ins().fpromote(types::F64, raw), Repr::Float),
+            Element::F64 => Operand::new(raw, Repr::F64),
+            Element::F32 => Operand::new(self.b.ins().fpromote(types::F64, raw), Repr::F64),
             Element::U32 => {
                 let wide = self.b.ins().uextend(types::I64, raw);
-                Operand::new(self.b.ins().fcvt_from_sint(types::F64, wide), Repr::Float)
+                Operand::new(self.b.ins().fcvt_from_sint(types::F64, wide), Repr::F64)
             }
             Element::U8 | Element::U16 => {
-                Operand::new(self.b.ins().uextend(types::I32, raw), Repr::Int32)
+                Operand::new(self.b.ins().uextend(types::I32, raw), Repr::I32)
             }
             Element::I8 | Element::I16 => {
-                Operand::new(self.b.ins().sextend(types::I32, raw), Repr::Int32)
+                Operand::new(self.b.ins().sextend(types::I32, raw), Repr::I32)
             }
-            Element::I32 => Operand::new(raw, Repr::Int32),
+            Element::I32 => Operand::new(raw, Repr::I32),
         }
     }
 
@@ -1046,9 +1044,8 @@ impl FunctionCompiler<'_, '_> {
         view: LoweredValue,
         position: Operand,
         holey: bool,
-        retain: bool,
     ) -> LoweredValue {
-        let position = self.convert(position, Repr::Int64);
+        let position = self.convert(position, Repr::I64);
         let flags = MemFlagsData::trusted();
         let data = self.b.ins().load(self.pointer, flags, view, DATA_OFFSET);
         let offset = self.b.ins().ishl_imm_s(position, 3);
@@ -1061,18 +1058,6 @@ impl FunctionCompiler<'_, '_> {
                 .icmp_imm_s(IntCC::Equal, bits, HOLE.bits() as i64);
             let undefined = self.constant(Value::UNDEFINED);
             bits = self.b.ins().select(hole, undefined, bits);
-        }
-        if retain {
-            let heap = self.is_heap(bits);
-            let retained = self.b.create_block();
-            let done = self.b.create_block();
-            self.b.append_block_param(done, types::I64);
-            self.brif(heap, retained, &[], done, &[bits.into()]);
-            self.switch(retained);
-            let value = self.retain_temporary(bits);
-            self.jump(done, &[value.into()]);
-            self.switch(done);
-            bits = self.b.block_params(done)[0];
         }
         bits
     }
@@ -1087,11 +1072,11 @@ impl FunctionCompiler<'_, '_> {
             .b
             .ins()
             .load(types::I64, MemFlagsData::trusted(), view, LENGTH_OFFSET);
-        let inside = if matches!(key.repr, Repr::Int32 | Repr::Int64) {
-            let position = self.convert(key, Repr::Int64);
+        let inside = if matches!(key.repr, Repr::I32 | Repr::I64) {
+            let position = self.convert(key, Repr::I64);
             self.b.ins().icmp(IntCC::UnsignedLessThan, position, length)
         } else {
-            let number = self.convert(key, Repr::Float);
+            let number = self.convert(key, Repr::F64);
             let position = self.b.ins().fcvt_to_sint_sat(types::I64, number);
             let exact = self.b.ins().fcvt_from_sint(types::F64, position);
             let integral = self.b.ins().fcmp(FloatCC::Equal, exact, number);
@@ -1123,12 +1108,12 @@ impl FunctionCompiler<'_, '_> {
     ) -> LoweredValue {
         let flags = MemFlagsData::trusted();
         let length = self.b.ins().load(types::I64, flags, view, LENGTH_OFFSET);
-        let (position, fast) = if matches!(key.repr, Repr::Int32 | Repr::Int64) {
-            let position = self.convert(key, Repr::Int64);
+        let (position, fast) = if matches!(key.repr, Repr::I32 | Repr::I64) {
+            let position = self.convert(key, Repr::I64);
             let inside = self.b.ins().icmp(IntCC::UnsignedLessThan, position, length);
             (position, inside)
         } else {
-            let key = self.convert(key, Repr::Float);
+            let key = self.convert(key, Repr::F64);
             let position = self.b.ins().fcvt_to_sint_sat(types::I64, key);
             let exact = self.b.ins().fcvt_from_sint(types::F64, position);
             let integral = self.b.ins().fcmp(FloatCC::Equal, exact, key);
@@ -1222,14 +1207,14 @@ impl FunctionCompiler<'_, '_> {
                     Repr::Boxed => self.is_number(value.value),
                     _ => self.b.ins().iconst(types::I8, 1),
                 };
-                let number = self.convert(value, Repr::Float);
+                let number = self.convert(value, Repr::F64);
                 let stored = if element == Element::F32 {
                     self.b.ins().fdemote(types::F32, number)
                 } else {
                     number
                 };
                 (stored, valid)
-            } else if value.repr == Repr::Int32 {
+            } else if value.repr == Repr::I32 {
                 let stored = if Type::from(element) == types::I32 {
                     value.value
                 } else {
@@ -1237,7 +1222,7 @@ impl FunctionCompiler<'_, '_> {
                 };
                 (stored, self.b.ins().iconst(types::I8, 1))
             } else {
-                let number = self.convert(value, Repr::Float);
+                let number = self.convert(value, Repr::F64);
                 let integer = self.b.ins().fcvt_to_sint_sat(types::I64, number);
                 let exact = self.b.ins().fcvt_from_sint(types::F64, integer);
                 let integral = self.b.ins().fcmp(FloatCC::Equal, exact, number);
@@ -1289,8 +1274,8 @@ impl FunctionCompiler<'_, '_> {
         result
     }
 
-    pub(super) fn global_get_optional(&mut self, name: &str, retain: bool) -> LoweredValue {
-        self.cached_global_get(name, true, retain)
+    pub(super) fn global_get_optional(&mut self, name: &str) -> LoweredValue {
+        self.cached_global_get(name, true, false)
     }
 
     pub(super) fn cached_global_get(
@@ -1399,11 +1384,10 @@ impl FunctionCompiler<'_, '_> {
         &mut self,
         object: LoweredValue,
         name: &str,
-        retain: bool,
         observer: Option<(u64, crate::jit::profile::Site)>,
         megamorphic: bool,
     ) -> LoweredValue {
-        self.cached_property_read(object, name, retain, false, observer, megamorphic)
+        self.cached_property_read(object, name, false, observer, megamorphic)
     }
 
     pub(super) fn cached_property_probe(
@@ -1413,14 +1397,13 @@ impl FunctionCompiler<'_, '_> {
         observer: Option<(u64, crate::jit::profile::Site)>,
         megamorphic: bool,
     ) -> LoweredValue {
-        self.cached_property_read(object, name, false, true, observer, megamorphic)
+        self.cached_property_read(object, name, true, observer, megamorphic)
     }
 
     fn cached_property_read(
         &mut self,
         object: LoweredValue,
         name: &str,
-        retain: bool,
         probe: bool,
         observer: Option<(u64, crate::jit::profile::Site)>,
         megamorphic: bool,
@@ -1441,7 +1424,7 @@ impl FunctionCompiler<'_, '_> {
         self.b.append_block_param(done, types::I64);
         self.brif(hit, inline, &[], slow, &[]);
         self.switch(inline);
-        let value = self.cached_property_entry_load(object, entry, retain, builtins);
+        let value = self.cached_property_entry_load(object, entry, builtins);
         self.jump(done, &[BlockArg::Value(value)]);
         self.switch(slow);
         let result = self.call_helper(
@@ -1601,26 +1584,22 @@ impl FunctionCompiler<'_, '_> {
         &mut self,
         object: LoweredValue,
         address: LoweredValue,
-        retain: bool,
         builtins: bool,
     ) -> LoweredValue {
         // A dominating guard validated the holder; reselect without depending on mutable hit state.
         let entry = self.property_cache_entry(object, address, builtins, false);
-        self.cached_property_entry_load(object, entry, retain, builtins)
+        self.cached_property_entry_load(object, entry, builtins)
     }
 
     fn cached_property_entry_load(
         &mut self,
         object: LoweredValue,
         entry: LoweredValue,
-        retain: bool,
         builtins: bool,
     ) -> LoweredValue {
         let flags = MemFlagsData::trusted();
         let ready = self.b.create_block();
-        let done = self.b.create_block();
         self.b.append_block_param(ready, types::I64);
-        self.b.append_block_param(done, types::I64);
         if builtins {
             let kind = self
                 .b
@@ -1664,19 +1643,7 @@ impl FunctionCompiler<'_, '_> {
         let value = self.b.ins().load(types::I64, flags, slot, 0);
         self.jump(ready, &[BlockArg::Value(value)]);
         self.switch(ready);
-        let value = self.b.block_params(ready)[0];
-        if retain {
-            let heap = self.is_heap(value);
-            let own = self.b.create_block();
-            self.brif(heap, own, &[], done, &[BlockArg::Value(value)]);
-            self.switch(own);
-            let value = self.retain_temporary(value);
-            self.jump(done, &[BlockArg::Value(value)]);
-        } else {
-            self.jump(done, &[BlockArg::Value(value)]);
-        }
-        self.switch(done);
-        self.b.block_params(done)[0]
+        self.b.block_params(ready)[0]
     }
 
     pub(super) fn fill_property_cache(
@@ -1725,7 +1692,7 @@ impl FunctionCompiler<'_, '_> {
             &[],
         );
         self.switch(overwrite_increment);
-        super::scope::increment_references(self.b, overwrite_incoming);
+        self.increment_address(overwrite_incoming);
         self.jump(overwrite_store, &[]);
         self.switch(overwrite_store);
         self.b.ins().store(flags, value, overwrite_slot, 0);
@@ -1758,7 +1725,7 @@ impl FunctionCompiler<'_, '_> {
         self.b.append_block_param(done, types::I64);
         self.brif(hit, fast, &[], miss, &[]);
         self.switch(fast);
-        let value = self.shaped_property_get(object, index, false);
+        let value = self.shaped_property_get(object, index);
         self.jump(done, &[BlockArg::Value(value)]);
         self.switch(miss);
         let missing = self.constant(Value::UNINITIALIZED);
@@ -1767,32 +1734,13 @@ impl FunctionCompiler<'_, '_> {
         self.b.block_params(done)[0]
     }
 
-    pub(super) fn shaped_property_get(
-        &mut self,
-        object: LoweredValue,
-        index: u32,
-        retain: bool,
-    ) -> LoweredValue {
+    pub(super) fn shaped_property_get(&mut self, object: LoweredValue, index: u32) -> LoweredValue {
         let flags = MemFlagsData::trusted();
         let view = self.b.ins().band_imm_s(object, ADDRESS_MASK);
         let data = self.b.ins().load(self.pointer, flags, view, DATA_OFFSET);
-        let bits = self
-            .b
+        self.b
             .ins()
-            .load(types::I64, flags, data, (index as i32) * 8);
-        if !retain {
-            return bits;
-        }
-        let heap = self.is_heap(bits);
-        let retain = self.b.create_block();
-        let done = self.b.create_block();
-        self.b.append_block_param(done, types::I64);
-        self.brif(heap, retain, &[], done, &[BlockArg::Value(bits)]);
-        self.switch(retain);
-        let retained = self.retain_temporary(bits);
-        self.jump(done, &[BlockArg::Value(retained)]);
-        self.switch(done);
-        self.b.block_params(done)[0]
+            .load(types::I64, flags, data, (index as i32) * 8)
     }
 
     pub(super) fn shaped_property_set(
@@ -1870,7 +1818,7 @@ impl FunctionCompiler<'_, '_> {
         let incoming = super::scope::heap_address(self.b, value);
         self.brif(incoming, retain, &[], store, &[]);
         self.switch(retain);
-        super::scope::increment_references(self.b, incoming);
+        self.increment_address(incoming);
         self.jump(store, &[]);
         self.switch(store);
         let index = self
@@ -2003,15 +1951,11 @@ impl FunctionCompiler<'_, '_> {
             Some(handler) => handler,
             None => self.failed_exit(),
         };
-        if !self.unwind_releases() {
-            self.brif(condition, target, &[], done, &[]);
-        } else {
-            let thrown = self.b.create_block();
-            self.b.set_cold_block(thrown);
-            self.brif(condition, thrown, &[], done, &[]);
-            self.switch(thrown);
-            self.unwind(target, &[]);
-        }
+        let thrown = self.b.create_block();
+        self.b.set_cold_block(thrown);
+        self.brif(condition, thrown, &[], done, &[]);
+        self.switch(thrown);
+        self.unwind(target, &[]);
         self.switch(done);
         self.unchecked = None;
     }

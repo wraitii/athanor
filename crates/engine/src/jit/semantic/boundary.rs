@@ -145,7 +145,7 @@ pub(super) fn compact(graph: &mut Graph) {
     let old_blocks = std::mem::take(&mut graph.blocks);
     let old_insts = std::mem::take(&mut graph.insts);
     graph.values.clear();
-    let old_types = std::mem::take(&mut graph.low_level_types);
+    let old_types = std::mem::take(&mut graph.reprs);
     let mut blocks = FxHashMap::default();
     let mut insts = FxHashMap::default();
     let mut values = FxHashMap::default();
@@ -154,7 +154,7 @@ pub(super) fn compact(graph: &mut Graph) {
         blocks.insert(block, copy);
         for &value in &old_blocks[block].params {
             let new = graph.add_param(copy);
-            graph.low_level_types[new] = old_types[value];
+            graph.reprs[new] = old_types[value];
             values.insert(value, new);
         }
     }
@@ -168,7 +168,7 @@ pub(super) fn compact(graph: &mut Graph) {
             graph.insts[new_inst].emission_location = data.emission_location;
             insts.insert(inst, new_inst);
             for (&old, &new) in data.results.iter().zip(&results) {
-                graph.low_level_types[new] = old_types[old];
+                graph.reprs[new] = old_types[old];
                 values.insert(old, new);
             }
         }
@@ -220,10 +220,17 @@ pub(super) fn compact(graph: &mut Graph) {
     }
 }
 
-pub(super) fn unbox(graph: &mut Graph, block: Block, value: Value, types: super::Types) -> Value {
-    let op = if types.intersects(super::Types::INTEGER) && types.within(super::Types::INTEGER) {
+pub(super) fn unbox(
+    graph: &mut Graph,
+    block: Block,
+    value: Value,
+    types: super::ValueType,
+) -> Value {
+    let op = if types.intersects(super::ValueType::INTEGER)
+        && types.within(super::ValueType::INTEGER)
+    {
         Op::AsInteger(value)
-    } else if types.intersects(super::Types::NUMBER) && types.within(super::Types::NUMBER) {
+    } else if types.intersects(super::ValueType::NUMBER) && types.within(super::ValueType::NUMBER) {
         Op::AsNumber(value)
     } else {
         return value;

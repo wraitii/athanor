@@ -7,7 +7,6 @@ mod poll;
 mod repr;
 pub(in crate::jit) mod scope;
 mod semantic_graph;
-mod slots;
 mod statement;
 pub(super) mod stubs;
 
@@ -75,11 +74,7 @@ pub(super) struct FunctionCompiler<'a, 'f> {
     property_caches: FxHashMap<super::semantic::Inst, i64>,
     slots: FxHashMap<u32, u32>,
     slot_count: u32,
-    empty_owned: LoweredValue,
-    owned: Vec<Variable>,
-    free_owned: Vec<Variable>,
-    unchecked: Option<Variable>,
-    unwinds: FxHashMap<Block, (Vec<Block>, Block)>,
+    unchecked: Option<Inst>,
 }
 
 enum Arguments {
@@ -292,18 +287,14 @@ fn lower_callable(
         property_caches: FxHashMap::default(),
         slots: FxHashMap::default(),
         slot_count: 0,
-        empty_owned,
-        owned: Vec::new(),
-        free_owned: Vec::new(),
         unchecked: None,
-        unwinds: FxHashMap::default(),
     };
 
     compiler.enter_frame();
     if let CallableBody::Factory(resume) = body {
         let (argv, argc) = compiler.argument_vector()?;
         let args = compiler.call_helper(Helper::ArrayNew, &[argv, argc]);
-        let arguments = *compiler.owned.last().unwrap();
+        let arguments = compiler.unchecked.expect("argument array reference");
         compiler.check_error();
         let plan = compiler.data.pin(resume);
         let code = compiler.b.ins().iconst(types::I64, plan as i64);
@@ -322,7 +313,15 @@ fn lower_callable(
         compiler.patch_frame_size();
     }
     drop(compiler);
+    super::semantic::scratch::resolve(&mut graph_builder, empty_owned).map_err(Error::Compile)?;
     graph_builder.finish().map_err(Error::Compile)?;
+    super::semantic::cleanup::lower(&mut lowered);
+    super::semantic::ownership_lowering::lower(
+        &mut lowered,
+        ctx,
+        module.target_config().default_call_conv,
+        pointer,
+    );
     lowered.verify().map_err(Error::Compile)?;
     Ok(lowered)
 }
@@ -334,6 +333,7 @@ impl FunctionCompiler<'_, '_> {
     }
 
     pub(super) fn jump(&mut self, block: Block, args: &[BlockArg]) {
+        self.forward_references(block, args);
         self.b.ins().jump(block, args);
         self.terminated = true;
     }
@@ -346,6 +346,8 @@ impl FunctionCompiler<'_, '_> {
         else_block: Block,
         else_args: &[BlockArg],
     ) {
+        self.forward_references(then_block, then_args);
+        self.forward_references(else_block, else_args);
         self.b
             .ins()
             .brif(condition, then_block, then_args, else_block, else_args);
@@ -481,12 +483,8 @@ impl FunctionCompiler<'_, '_> {
     }
 
     fn release_slot(&mut self, slot: u32) {
-        let flags = MemFlagsData::trusted();
-        let base = self.load_ctx(crate::jit::session::LOCALS_OFFSET);
-        let offset = (slot * 8) as i32;
-        let value = self.b.ins().load(types::I64, flags, base, offset);
         let empty = self.constant(Value::UNDEFINED);
-        self.b.ins().store(flags, empty, base, offset);
+        let value = self.b.store_frame(self.ctx, empty, slot);
         let heap = self.is_heap(value);
         let release = self.b.create_block();
         let done = self.b.create_block();

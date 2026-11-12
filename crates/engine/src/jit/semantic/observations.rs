@@ -2,7 +2,7 @@ use crate::{FxHashMap, FxHashSet};
 
 use crate::jit::profile::{Observation, ReadKind, ReadType, Site};
 
-use super::{Cfg, Facts, Graph, Op, Types, specialize::Repository};
+use super::{Cfg, Facts, Graph, Op, ValueType, specialize::Repository};
 
 pub(super) fn plan(
     graph: &mut Graph,
@@ -109,7 +109,7 @@ pub(super) fn plan(
             ) {
                 data.result()
                     .filter(|value| {
-                        receivers.contains(value) && facts.of(*value).intersects(Types::OBJECT)
+                        receivers.contains(value) && facts.of(*value).intersects(ValueType::OBJECT)
                     })
                     .map(|value| (value, Observation::Read(ReadKind::Result)))
             } else {
@@ -121,8 +121,8 @@ pub(super) fn plan(
             ) {
                 data.result()
                     .filter(|value| {
-                        facts.of(*value).intersects(Types::NUMBER)
-                            && !facts.of(*value).within(Types::INTEGER)
+                        facts.of(*value).intersects(ValueType::NUMBER)
+                            && !facts.of(*value).within(ValueType::INTEGER)
                     })
                     .map(|value| (value, Observation::Read(ReadKind::Number)))
             } else {

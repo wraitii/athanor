@@ -923,6 +923,7 @@ impl Compiler {
                     None,
                 )
             } else {
+                graph.legalize_reprs().map_err(Error::Unsupported)?;
                 self.emit_body(self.signature.clone(), self.source_name, |out| {
                     emit::build_global(out, &graph.graph, &graph.facts, &continuations)
                 })?
@@ -1626,6 +1627,7 @@ impl Compiler {
                 None,
             )
         } else {
+            graph.legalize_reprs().map_err(Error::Unsupported)?;
             self.emit_body(signature, emission.source_name, |out| {
                 emit::build_function(
                     out,
@@ -1857,22 +1859,17 @@ impl Compiler {
         continuations: &FxHashMap<usize, FuncId>,
         feedback: Option<emit::Feedback>,
     ) -> Result<FunctionBody, Error> {
-        let lowered = if self.ssa_opt {
-            let mut lowered = super::semantic::FunctionState::from_graph(graph.clone());
-            lowered.lower_memory().map_err(Error::Unsupported)?;
-            Some(lowered)
-        } else {
-            None
-        };
-        let graph = lowered.as_ref().map_or(graph, |lowered| &lowered.graph);
-        let facts = super::semantic::Facts::compute(graph);
+        let mut state = super::semantic::FunctionState::from_graph(graph.clone());
+        if self.ssa_opt {
+            state.lower_memory().map_err(Error::Unsupported)?;
+        }
         let mut data = FunctionData::new();
         let baseline = if !self.ssa_opt
             && self.module.isa().name() == "aarch64"
             && std::env::var_os("JS_JIT_BASELINE").is_some()
         {
             super::aarch64::compile_baseline(
-                graph,
+                &state.graph,
                 source_name,
                 self.dump_ir || self.inspection.is_some(),
                 &mut self.names,
@@ -1901,10 +1898,13 @@ impl Compiler {
                 None,
             )
         } else {
+            state.legalize_reprs().map_err(Error::Unsupported)?;
+            let (graph, facts) = (&state.graph, &state.facts);
             self.emit_body(self.signature.clone(), source_name, |out| {
-                emit::build_function(out, params, graph, &facts, continuations, feedback)
+                emit::build_function(out, params, graph, facts, continuations, feedback)
             })?
         };
+        let (graph, facts) = (&state.graph, &state.facts);
         Ok(FunctionBody {
             function,
             lowered,
@@ -2199,6 +2199,9 @@ impl Compiler {
                 None,
             )
         } else {
+            if let Some(graph) = &mut graph {
+                graph.legalize_reprs().map_err(Error::Unsupported)?;
+            }
             self.emit_body(signature, self.source_name, |out| match &graph {
                 Some(graph) => emit::build_function(
                     out,

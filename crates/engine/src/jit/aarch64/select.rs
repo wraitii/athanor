@@ -5,6 +5,7 @@ use cranelift_codegen::ir::types;
 use super::encode::{self as e, Index, Logical, Mem, Width};
 use super::lower::{float_conds, width};
 use crate::jit::alloc::{RegClass, graph as alloc};
+use crate::jit::semantic::Repr;
 use crate::jit::semantic::{
     Block, Graph, Inst, MemoryFormat, MemoryOp, Op, TerminatorKind, Value, ValueDef, low_level,
 };
@@ -58,7 +59,7 @@ pub(super) struct Comparison {
 
 pub(super) fn signed_constant(graph: &Graph, value: Value) -> Option<i64> {
     let bits = alloc::constant(graph, value)?;
-    let width = graph.low_level_types[value]?.bits();
+    let width = graph.reprs[value].map(Repr::machine)?.bits();
     Some(if width >= 64 {
         bits as i64
     } else {
@@ -79,7 +80,7 @@ pub(super) fn binary(graph: &Graph, inst: Inst) -> Option<Binary> {
         None if !matches!(op, B::Subtract) => (right, signed_constant(graph, left)?),
         None => return None,
     };
-    let ty = graph.low_level_types[graph.insts[inst].results[0]]?;
+    let ty = graph.reprs[graph.insts[inst].results[0]]?.machine();
     let width = width(ty);
     let immediate = if matches!(op, B::Add | B::Subtract) {
         let amount = if matches!(op, B::Subtract) {
@@ -123,7 +124,10 @@ pub(super) fn comparison(graph: &Graph, cond: IntCC, x: Value, y: Value) -> Comp
             | IntCC::SignedGreaterThan
             | IntCC::SignedGreaterThanOrEqual
     );
-    let extended = matches!(graph.low_level_types[x], Some(types::I8 | types::I16));
+    let extended = matches!(
+        graph.reprs[x].map(Repr::machine),
+        Some(types::I8 | types::I16)
+    );
     let unsigned = alloc::constant(graph, y).map(|bits| bits as i64);
     let sign_extended = signed_constant(graph, y);
     let negatable = signed || (!extended && matches!(cond, IntCC::Equal | IntCC::NotEqual));
@@ -162,7 +166,7 @@ pub(super) fn remat_cost(graph: &Graph, value: Value) -> u32 {
     let Some(bits) = remat_bits(graph, value) else {
         return 0;
     };
-    let class = graph.low_level_types[value].and_then(RegClass::of);
+    let class = graph.reprs[value].map(Repr::machine).and_then(RegClass::of);
     if class == Some(RegClass::Float) && (bits == 0 || e::float_imm8(bits).is_some()) {
         return 1;
     }
@@ -190,7 +194,7 @@ pub(super) fn indexed_load(graph: &Graph, inst: Inst) -> Option<(Address, Mem)> 
         MemoryFormat::F32 => Mem::LdrS,
         MemoryFormat::F64 => Mem::LdrD,
     };
-    let kind = match graph.low_level_types[index]? {
+    let kind = match graph.reprs[index].map(Repr::machine)? {
         types::I64 => Index::Lsl,
         types::I32 => Index::Uxtw,
         _ => return None,
@@ -238,7 +242,7 @@ fn memory_address(
     offset: i32,
     size: u32,
 ) -> Option<(Address, Vec<Inst>)> {
-    if graph.low_level_types[value] != Some(types::I64) {
+    if graph.reprs[value].map(Repr::machine) != Some(types::I64) {
         return None;
     }
     let ValueDef::Result(add, 0) = graph.values[value] else {
@@ -292,7 +296,7 @@ fn memory_address(
     let mut kind = Index::Lsl;
     if let ValueDef::Result(inst, 0) = graph.values[index]
         && let Op::LowLevel(low_level::Op::Unary { op, value, .. }) = graph.insts[inst].op
-        && graph.low_level_types[value] == Some(types::I32)
+        && graph.reprs[value].map(Repr::machine) == Some(types::I32)
     {
         kind = match op {
             low_level::Unary::ZeroExtend => Index::Uxtw,
@@ -324,7 +328,7 @@ fn shifted_operand(
     if uses[value] != 1 {
         return None;
     }
-    let wide = graph.low_level_types[value] == Some(types::I64);
+    let wide = graph.reprs[value].map(Repr::machine) == Some(types::I64);
     let ValueDef::Result(inst, 0) = graph.values[value] else {
         return None;
     };
@@ -334,7 +338,7 @@ fn shifted_operand(
             left,
             right,
         }) => {
-            let bits = graph.low_level_types[value]?.bits();
+            let bits = graph.reprs[value].map(Repr::machine)?.bits();
             (
                 left,
                 alloc::constant(graph, right)? as u32 & (bits - 1),
@@ -347,7 +351,7 @@ fn shifted_operand(
     if wide && shift <= 4 && uses[leaf] == 1 {
         if let ValueDef::Result(def, 0) = graph.values[leaf] {
             if let Op::LowLevel(low_level::Op::Unary { op, value, .. }) = graph.insts[def].op {
-                if graph.low_level_types[value] == Some(types::I32) {
+                if graph.reprs[value].map(Repr::machine) == Some(types::I32) {
                     kind = match op {
                         low_level::Unary::ZeroExtend => Index::Uxtw,
                         low_level::Unary::SignExtend => Index::Sxtw,
@@ -412,9 +416,9 @@ impl Selection {
                         address,
                         offset,
                         flags,
-                    }) if flags.trap_code().is_none() => {
-                        graph.low_level_types[*value].map(|ty| (*address, *offset, ty.bytes()))
-                    }
+                    }) if flags.trap_code().is_none() => graph.reprs[*value]
+                        .map(Repr::machine)
+                        .map(|ty| (*address, *offset, ty.bytes())),
                     _ => None,
                 };
                 if let Some((address, offset, size)) = memory {

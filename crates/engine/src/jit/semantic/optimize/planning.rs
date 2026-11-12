@@ -942,7 +942,7 @@ mod tests {
             let decisions =
                 super::super::super::observations::plan(&mut graph, Some((&repository, 7)));
             assert_eq!(decisions, vec![(site, observed)]);
-            assert!(!Facts::compute(&graph).of(value).within(Types::INTEGER));
+            assert!(!Facts::compute(&graph).of(value).within(ValueType::INTEGER));
             version(&mut graph, &Default::default(), None, &mut Vec::new()).unwrap();
             let facts = Facts::compute(&graph);
             let integers: Vec<_> = Cfg::new(&graph)
@@ -954,7 +954,7 @@ mod tests {
                 .collect();
             assert_eq!(!integers.is_empty(), observed == ReadType::Integer);
             for value in integers {
-                assert!(facts.of(value).within(Types::INTEGER));
+                assert!(facts.of(value).within(ValueType::INTEGER));
             }
             graph.verify().unwrap();
         }
@@ -1012,7 +1012,7 @@ mod tests {
                             bounded: true
                         }
                     ))
-                ) && facts.of(data.result().unwrap()).within(Types::INTEGER)
+                ) && facts.of(data.result().unwrap()).within(ValueType::INTEGER)
             });
         assert!(integer_add);
         graph.verify().unwrap();
@@ -1264,7 +1264,7 @@ mod tests {
         assert!(
             additions
                 .iter()
-                .all(|&value| analysis.facts.of(value).within(Types::NUMBER))
+                .all(|&value| analysis.facts.of(value).within(ValueType::NUMBER))
         );
         assert_eq!(natural_loops(graph, &cfg).len(), 2);
         assert!(

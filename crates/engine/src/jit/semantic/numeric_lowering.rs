@@ -1,6 +1,6 @@
 use oxc_syntax::operator::BinaryOperator;
 
-use super::{Block, FunctionState, Graph, InstData, Op, Types, Value};
+use super::{Block, FunctionState, Graph, InstData, Op, Value, ValueType};
 
 pub(super) fn lower(function: &mut FunctionState) -> bool {
     if function.graph.generator || function.graph.has_handlers {
@@ -15,7 +15,7 @@ pub(super) fn lower(function: &mut FunctionState) -> bool {
             let data = graph.insts[inst].clone();
             let value = match data.op {
                 Op::IsInteger(value) => value,
-                Op::AsInteger(value) if !facts.of(value).within(Types::INTEGER) => value,
+                Op::AsInteger(value) if !facts.of(value).within(ValueType::INTEGER) => value,
                 Op::Binary(
                     operator @ (BinaryOperator::Addition
                     | BinaryOperator::Subtraction
@@ -23,14 +23,14 @@ pub(super) fn lower(function: &mut FunctionState) -> bool {
                     | BinaryOperator::Division),
                     left,
                     right,
-                ) if facts.of(left).intersects(Types::NUMBER)
-                    && facts.of(left).within(Types::NUMBER)
-                    && facts.of(right).intersects(Types::NUMBER)
-                    && facts.of(right).within(Types::NUMBER)
+                ) if facts.of(left).intersects(ValueType::NUMBER)
+                    && facts.of(left).within(ValueType::NUMBER)
+                    && facts.of(right).intersects(ValueType::NUMBER)
+                    && facts.of(right).within(ValueType::NUMBER)
                     && !(operator != BinaryOperator::Division
                         && data
                             .result()
-                            .is_some_and(|result| facts.of(result).within(Types::INTEGER))) =>
+                            .is_some_and(|result| facts.of(result).within(ValueType::INTEGER))) =>
                 {
                     let at = graph.blocks[block]
                         .insts

@@ -9,8 +9,8 @@ use super::guards;
 use super::js::NUMERIC;
 use super::{
     Block, BlockData, Cfg, Constant, Facts, FunctionState, Graph, Inst, Native, Op, Region,
-    RegionFallback, RegionId, Result, Target, Terminator, TerminatorKind, TypedRead, Types,
-    UnaryOp, Value, ValueDef, resolve,
+    RegionFallback, RegionId, Result, Target, Terminator, TerminatorKind, TypedRead, UnaryOp,
+    Value, ValueDef, ValueType, resolve,
 };
 use crate::heap::TypedKind;
 
@@ -354,7 +354,7 @@ fn bounded_reads(
         if !body.contains(&inside.block)
             || body.contains(&outside.block)
             || region.contains(&graph.def_block(bound)) && !available.contains(&bound)
-            || !facts.of(bound).within(Types::NUMBER)
+            || !facts.of(bound).within(ValueType::NUMBER)
             || !counts_up(graph, cfg, header, &body, counter)
         {
             continue;
@@ -481,8 +481,8 @@ fn entry_assumes(
             if !matches!(fact, guards::Fact::Type(_)) {
                 return false;
             }
-            let desired = if fact == guards::Fact::Type(Types::INTEGER) {
-                Types::INTEGER
+            let desired = if fact == guards::Fact::Type(ValueType::INTEGER) {
+                ValueType::INTEGER
             } else {
                 NUMERIC
             };
@@ -697,7 +697,7 @@ pub(super) fn views(function: &mut FunctionState) {
                 | Op::IndexedGet(object, key)
                 | Op::ArrayLoad(object, key, _)
                 | Op::SetIndex(object, key, _)
-                    if facts.of(key).intersects(Types::NUMBER) =>
+                    if facts.of(key).intersects(ValueType::NUMBER) =>
                 {
                     object
                 }
@@ -706,7 +706,7 @@ pub(super) fn views(function: &mut FunctionState) {
                 }
                 _ => continue,
             };
-            if !facts.of(object).intersects(Types::OBJECT) {
+            if !facts.of(object).intersects(ValueType::OBJECT) {
                 continue;
             }
             let Some(preheader) = loops.iter().find_map(|(header, body)| {

@@ -1,7 +1,7 @@
 use super::{Block, BlockArg, GraphBuilder as FunctionBuilder, Inst, Variable};
 use super::{FunctionCompiler, LoweredValue};
-use crate::heap::REFERENCES_OFFSET;
 use crate::jit::helpers::Helper;
+use crate::jit::semantic::low_level::{Reference, Scratch};
 use crate::value::{TAG_OBJECT, TAG_SHIFT, TAG_STRING, Value};
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{MemFlagsData, types};
@@ -29,22 +29,11 @@ pub(super) fn heap_address(b: &mut FunctionBuilder<'_>, value: LoweredValue) -> 
     b.ins().select(heap, address, zero)
 }
 
-pub(super) fn increment_references(b: &mut FunctionBuilder<'_>, address: LoweredValue) -> Inst {
-    let flags = MemFlagsData::trusted();
-    let references = b.ins().load(types::I32, flags, address, REFERENCES_OFFSET);
-    let references = b.ins().iadd_imm_s(references, 1);
-    b.ins().store(flags, references, address, REFERENCES_OFFSET)
-}
-
 impl FunctionCompiler<'_, '_> {
     // Binding slots are not reused by SSA temporaries, so the variable tracks their contents.
     pub(super) fn initialize_binding(&mut self, variable: Variable, value: LoweredValue) {
         let old = self.b.use_var(variable);
         self.initialize_local_with_old(variable, value, Some(old));
-    }
-
-    pub(super) fn initialize_local(&mut self, variable: Variable, value: LoweredValue) {
-        self.initialize_local_with_old(variable, value, None);
     }
 
     fn initialize_local_with_old(
@@ -75,23 +64,12 @@ impl FunctionCompiler<'_, '_> {
         self.b.def_var(variable, value);
     }
 
-    /// Stores a value in its slot under a reference of the slot's own; a temporary keeps any
-    /// reference it holds until its block's clear. Only a slot written more than once per call
-    /// can hold an old value to release.
-    pub(super) fn own_local(&mut self, variable: Variable, value: LoweredValue, repeated: bool) {
-        self.increment(value);
-        self.replace_local(variable, value, repeated);
+    pub(super) fn increment_address(&mut self, address: LoweredValue) {
+        self.b.reference(Reference::RetainAddress, address);
     }
 
     pub(super) fn increment(&mut self, value: LoweredValue) {
-        let address = heap_address(self.b, value);
-        let increment = self.b.create_block();
-        let done = self.b.create_block();
-        self.brif(address, increment, &[], done, &[]);
-        self.switch(increment);
-        increment_references(self.b, address);
-        self.jump(done, &[]);
-        self.switch(done);
+        self.b.reference(Reference::Retain, value);
     }
 
     pub(super) fn checked_temporary(&mut self, value: LoweredValue, retain: bool) -> LoweredValue {
@@ -134,124 +112,44 @@ impl FunctionCompiler<'_, '_> {
     }
 
     pub(super) fn track(&mut self, value: LoweredValue) -> LoweredValue {
-        let variable = match self.free_owned.pop() {
-            Some(variable) => variable,
-            None => self
-                .b
-                .declare_var_with_entry_value(types::I64, self.empty_owned),
-        };
-        self.b.def_var(variable, value);
-        self.owned.push(variable);
+        self.b.scratch(Scratch::Own, &[value]);
         value
     }
 
+    pub(super) fn forward_references(&mut self, block: Block, args: &[BlockArg]) {
+        if args.is_empty() {
+            return;
+        }
+        let values: Vec<_> = args.iter().map(|&BlockArg::Value(value)| value).collect();
+        self.b
+            .scratch_owned(Scratch::Forward { target: block }, values);
+    }
+
+    pub(super) fn move_result_reference(&mut self, value: LoweredValue) {
+        self.b.scratch(Scratch::MoveValue, &[value]);
+    }
+
     pub(super) fn release_owned(&mut self) {
-        let owned = std::mem::take(&mut self.owned);
-        self.release_variables(&owned);
-        self.free_owned.extend(owned);
+        self.b.scratch(Scratch::End, &[]);
         self.unchecked = None;
     }
 
-    pub(super) fn release_tracked(&mut self, variables: &[Variable]) {
-        let unchecked = self
-            .unchecked
-            .filter(|unchecked| !variables.contains(unchecked));
-        self.release_variables(variables);
-        self.owned.retain(|owned| !variables.contains(owned));
-        self.free_owned.extend_from_slice(variables);
-        self.unchecked = unchecked;
+    pub(super) fn release_tracked(&mut self, tokens: &[Inst]) {
+        for &token in tokens {
+            self.b.scratch(Scratch::ReleaseToken { token }, &[]);
+        }
+        self.unchecked = self.unchecked.filter(|token| !tokens.contains(token));
     }
 
-    /// References the current block holds in variables at this point, leaving out the result of
-    /// a helper that has just failed, which owns nothing.
-    pub(super) fn live_temporaries(&self) -> Vec<Variable> {
-        self.owned
-            .iter()
-            .copied()
-            .filter(|&variable| Some(variable) != self.unchecked)
-            .collect()
-    }
-
-    /// Whether leaving the block here has anything to release.
-    pub(super) fn unwind_releases(&self) -> bool {
-        !self.live_temporaries().is_empty()
-    }
-
-    /// Leaves the block early through `target`, releasing the references live here on the way.
-    /// Each target has a ladder of cold exits: the exit taking `depth` references releases the
-    /// last one and continues to the exit below, so cleanup code grows with the deepest live set
-    /// rather than with the number of sites.
     pub(super) fn unwind(&mut self, target: Block, args: &[BlockArg]) {
-        let live = self.live_temporaries();
-        let mut exit_args = args.to_vec();
-        for &variable in &live {
-            exit_args.push(BlockArg::Value(self.b.use_var(variable)));
-        }
-        if !self.unwinds.contains_key(&target) {
-            let cleanup = target;
-            self.unwinds.insert(target, (Vec::new(), cleanup));
-        }
-        let (ladder, cleanup) = self.unwinds.get_mut(&target).unwrap();
-        let cleanup = *cleanup;
-        let built = ladder.len();
-        while ladder.len() < live.len() {
-            ladder.push(self.b.create_block());
-        }
-        let ladder = ladder.clone();
-        let exit = match live.len() {
-            0 => cleanup,
-            depth => ladder[depth - 1],
-        };
-        self.jump(exit, &exit_args);
-        for depth in built + 1..=live.len() {
-            let next = match depth - 1 {
-                0 => cleanup,
-                below => ladder[below - 1],
-            };
-            self.fill_exit(ladder[depth - 1], next, args.len() + depth);
-        }
-    }
-
-    fn fill_exit(&mut self, exit: Block, next: Block, params: usize) {
-        for _ in 0..params {
-            self.b.append_block_param(exit, types::I64);
-        }
-        let created = self.b.num_blocks();
-        self.switch(exit);
-        let params = self.b.block_params(exit).to_vec();
-        let (&released, kept) = params.split_last().unwrap();
-        let unchecked = self.unchecked;
-        self.release_heap(released, true);
-        self.unchecked = unchecked;
-        let kept: Vec<BlockArg> = kept.iter().map(|&value| BlockArg::Value(value)).collect();
-        self.jump(next, &kept);
-        self.b.set_cold_block(exit);
-        for index in created..self.b.num_blocks() {
-            self.b.set_cold_block(Block::from_u32(index as u32));
-        }
-    }
-
-    fn release_variables(&mut self, variables: &[Variable]) {
-        if variables.is_empty() {
-            return;
-        }
-        let undefined = self.constant(Value::UNDEFINED);
-        for &variable in variables.iter().rev() {
-            let value = self.b.use_var(variable);
-            self.b.def_var(variable, undefined);
-            self.release_heap(value, true);
-        }
-    }
-
-    /// Releases a value that may or may not be heap-tagged.
-    fn release_heap(&mut self, value: LoweredValue, cold_drop: bool) {
-        let heap = self.is_heap(value);
-        let release = self.b.create_block();
-        let done = self.b.create_block();
-        self.brif(heap, release, &[], done, &[]);
-        self.switch(release);
-        self.release_inline(value, done, cold_drop);
-        self.switch(done);
+        self.b.scratch(
+            Scratch::Unwind {
+                exclude: self.unchecked,
+            },
+            &[],
+        );
+        self.b.ins().jump(target, args);
+        self.terminated = true;
     }
 
     /// Loads a string literal from its cache in the function's data, creating it on the first
@@ -309,6 +207,12 @@ impl FunctionCompiler<'_, '_> {
         self.b.def_var(variable, value);
     }
 
+    /// Empties a slot whose reference has moved elsewhere.
+    pub(super) fn clear_local(&mut self, variable: Variable) {
+        let undefined = self.constant(Value::UNDEFINED);
+        self.store_local(variable, undefined);
+    }
+
     fn store_local(&mut self, variable: Variable, value: LoweredValue) -> (u32, LoweredValue) {
         // Even scalar stores conservatively require the normal frame cleanup.
         if let Some(roots) = self.frame_roots {
@@ -319,48 +223,19 @@ impl FunctionCompiler<'_, '_> {
             self.slot_count += 1;
             self.slot_count - 1
         });
-        let flags = MemFlagsData::trusted();
-        let base = self.b.ins().load(
-            types::I64,
-            flags,
-            self.ctx,
-            crate::jit::session::LOCALS_OFFSET,
-        );
-        let offset = (index as i32) * 8;
-        let old = self.b.ins().load(types::I64, flags, base, offset);
-        self.b.ins().store(flags, value, base, offset);
+        let old = self.b.store_frame(self.ctx, value, index);
         (index, old)
     }
 
     /// Releases a heap-tagged value, calling the runtime only when its count would reach zero.
     pub(super) fn release_inline(&mut self, value: LoweredValue, done: Block, cold_drop: bool) {
-        let address = self.b.ins().band_imm_s(value, ADDRESS_MASK);
-        let load = self.b.create_block();
-        let decrement = self.b.create_block();
-        let last = self.b.create_block();
-        self.brif(address, load, &[], done, &[]);
-        self.switch(load);
-        let flags = MemFlagsData::trusted();
-        let references = self
-            .b
-            .ins()
-            .load(types::I32, flags, address, REFERENCES_OFFSET);
-        let shared = self
-            .b
-            .ins()
-            .icmp_imm_s(IntCC::UnsignedGreaterThan, references, 1);
-        self.brif(shared, decrement, &[], last, &[]);
-        self.switch(decrement);
-        let references = self.b.ins().iadd_imm_s(references, -1);
-        self.b
-            .ins()
-            .store(flags, references, address, REFERENCES_OFFSET);
-        self.jump(done, &[]);
-        self.switch(last);
-        if cold_drop {
-            self.b.set_cold_block(last);
-        }
-        self.call_helper(Helper::Release, &[value]);
+        self.b.reference(
+            Reference::Release {
+                heap: true,
+                cold: cold_drop,
+            },
+            value,
+        );
         self.jump(done, &[]);
     }
 

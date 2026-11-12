@@ -3,7 +3,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap};
 
 use super::liveness::{self, Segment};
-use crate::jit::semantic::{Block, Cfg, Graph, Inst, Op, Value, ValueDef, low_level};
+use crate::jit::semantic::{Block, Cfg, Graph, Inst, Op, Repr, Value, ValueDef, low_level};
 use cranelift_codegen::entity::SecondaryMap;
 
 use super::{RegClass, Target};
@@ -368,7 +368,9 @@ pub(crate) fn allocate(
         if liveness.of(value).is_empty() {
             continue;
         }
-        let ty = graph.low_level_types[value].ok_or_else(|| format!("missing type for {value}"))?;
+        let ty = graph.reprs[value]
+            .map(Repr::machine)
+            .ok_or_else(|| format!("missing type for {value}"))?;
         let class = RegClass::of(ty).ok_or_else(|| format!("value type {ty}"))?;
         bundle_of[value] = Some(bundles.len());
         bundles.push(Bundle::single(class, value, weights[value]));

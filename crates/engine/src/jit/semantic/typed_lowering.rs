@@ -1,6 +1,6 @@
 use super::{
     BlockData, Constant, FunctionState, Graph, Op, Target, Terminator, TerminatorKind, TypedRead,
-    Types,
+    ValueType,
 };
 
 pub(super) fn lower(function: &mut FunctionState) -> super::Result<bool> {
@@ -18,7 +18,7 @@ pub(super) fn lower(function: &mut FunctionState) -> super::Result<bool> {
         .filter(|&inst| {
             matches!(graph.insts[inst].op,
                 Op::TypedIndex(_, key, TypedRead { element: Some(_), bounded: false })
-                if facts.of(key).intersects(Types::NUMBER) && facts.of(key).within(Types::NUMBER))
+                if facts.of(key).intersects(ValueType::NUMBER) && facts.of(key).within(ValueType::NUMBER))
         })
         .collect();
     let changed = !reads.is_empty();
@@ -41,7 +41,7 @@ pub(super) fn lower(function: &mut FunctionState) -> super::Result<bool> {
             graph,
             &data,
             block,
-            if facts.of(key).within(Types::INTEGER) {
+            if facts.of(key).within(ValueType::INTEGER) {
                 Op::Constant(Constant::Boolean(true))
             } else {
                 Op::IsExactPosition(key, position)
@@ -98,7 +98,7 @@ fn lower_bitwise(function: &mut FunctionState) -> bool {
             | BinaryOperator::BitwiseXOR | BinaryOperator::ShiftLeft
             | BinaryOperator::ShiftRight | BinaryOperator::ShiftRightZeroFill,
             left, right,
-        ) if !facts.of(left).within(Types::NUMBER) || !facts.of(right).within(Types::NUMBER))
+        ) if !facts.of(left).within(ValueType::NUMBER) || !facts.of(right).within(ValueType::NUMBER))
         })
         .collect();
     for &inst in &candidates {
@@ -169,7 +169,7 @@ pub(super) fn lower_arrays(function: &mut FunctionState) -> bool {
                 value.unwrap()
             };
             let layout = insert(Op::IsArray(object, holey));
-            let exact = insert(if facts.of(key).within(Types::INTEGER) {
+            let exact = insert(if facts.of(key).within(ValueType::INTEGER) {
                 Op::Constant(Constant::Boolean(true))
             } else {
                 Op::IsExactPosition(key, position)

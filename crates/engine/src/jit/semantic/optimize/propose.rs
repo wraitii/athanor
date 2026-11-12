@@ -20,7 +20,7 @@ pub(super) fn numbers(graph: &mut Graph) -> Vec<(Value, Fact)> {
             let op = &graph.insts[inst].op;
             for (index, value) in op.operands_iter().enumerate() {
                 let integer = hints.get(&value) == Some(&ReadType::Integer);
-                let desired = if integer { Types::INTEGER } else { NUMERIC };
+                let desired = if integer { ValueType::INTEGER } else { NUMERIC };
                 if hints.get(&value) == Some(&ReadType::Unknown)
                     || !(numeric_use(op, index)
                         || native_calls.contains(&inst)
@@ -31,9 +31,9 @@ pub(super) fn numbers(graph: &mut Graph) -> Vec<(Value, Fact)> {
                     continue;
                 }
                 let fact = Fact::Type(if integer {
-                    Types::INTEGER
+                    ValueType::INTEGER
                 } else {
-                    Types::NUMBER
+                    ValueType::NUMBER
                 });
                 if !seen.insert((block, value, fact)) {
                     continue;

@@ -7,7 +7,7 @@ use cranelift_codegen::ir::{
 use cranelift_module::FuncId;
 use oxc_span::Span;
 
-use super::{Block, Cfg, Graph, Inst, Op as GraphOp, Value};
+use super::{Block, Cfg, Graph, Inst, Op as GraphOp, Repr, Value};
 use crate::jit::helpers::Helper;
 
 #[derive(Clone, Debug)]
@@ -64,8 +64,60 @@ pub(in crate::jit) struct StackSlotData {
     pub align_shift: u8,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(in crate::jit) enum Reference {
+    Retain,
+    RetainAddress,
+    Release { heap: bool, cold: bool },
+}
+
+#[derive(Clone, Debug)]
+pub(in crate::jit) enum Scratch {
+    Begin,
+    Own,
+    Forward {
+        target: Block,
+    },
+    Bind {
+        owner: u32,
+        required: bool,
+        append: bool,
+    },
+    MoveOwner {
+        owner: u32,
+    },
+    ReleaseOwner {
+        owner: u32,
+    },
+    MoveValue,
+    ReleaseToken {
+        token: Inst,
+    },
+    End,
+    Unwind {
+        exclude: Option<Inst>,
+    },
+}
+
 #[derive(Clone, Debug)]
 pub(in crate::jit) enum Op {
+    Cleanup {
+        values: Vec<Value>,
+        unwind: bool,
+    },
+    Scratch {
+        op: Scratch,
+        values: Vec<Value>,
+    },
+    FrameStore {
+        ctx: Value,
+        value: Value,
+        slot: u32,
+    },
+    Reference {
+        op: Reference,
+        value: Value,
+    },
     Integer {
         ty: Type,
         bits: u64,
@@ -231,7 +283,13 @@ impl<'a> Builder<'a> {
 
     pub(in crate::jit) fn last_helper(&self) -> Option<Helper> {
         let block = self.current?;
-        let inst = *self.graph.blocks[block].insts.last()?;
+        // Lifetime requests do not change which helper a status check belongs to.
+        let inst = *self.graph.blocks[block].insts.iter().rev().find(|&&inst| {
+            !matches!(
+                self.graph.insts[inst].op,
+                GraphOp::LowLevel(Op::Scratch { .. })
+            )
+        })?;
         match self.graph.insts[inst].op {
             GraphOp::LowLevel(Op::Call { helper, .. }) => helper,
             _ => None,
@@ -259,7 +317,7 @@ impl<'a> Builder<'a> {
         self.graph.insts[inst].emission_location = self.location;
         self.graph.insts[inst].source_name = self.source_name;
         let result = result.unwrap();
-        self.graph.low_level_types[result] = Some(ty);
+        self.graph.reprs[result] = Some(Repr::from_machine(ty));
         result
     }
 
@@ -316,7 +374,7 @@ impl<'a> Builder<'a> {
 
     pub(in crate::jit) fn append_block_param(&mut self, block: Block, ty: Type) -> Value {
         let value = self.graph.add_param(block);
-        self.graph.low_level_types[value] = Some(ty);
+        self.graph.reprs[value] = Some(Repr::from_machine(ty));
         value
     }
 
@@ -335,7 +393,7 @@ impl<'a> Builder<'a> {
         ty: Type,
         value: Value,
     ) -> Variable {
-        assert_eq!(self.graph.low_level_types[value], Some(ty));
+        assert_eq!(self.graph.reprs[value].map(Repr::machine), Some(ty));
         let variable = self.declare_var(ty);
         self.definitions
             .insert((self.graph.entry, variable.0), value);
@@ -360,6 +418,46 @@ impl<'a> Builder<'a> {
         )
     }
 
+    pub(in crate::jit) fn scratch(&mut self, op: Scratch, values: &[Value]) -> Inst {
+        self.scratch_owned(op, values.to_vec())
+    }
+
+    pub(in crate::jit) fn scratch_owned(&mut self, op: Scratch, values: Vec<Value>) -> Inst {
+        self.effect(
+            self.current.expect("no current block"),
+            self.span,
+            Op::Scratch { op, values },
+        )
+    }
+
+    pub(in crate::jit) fn cleanup(&mut self, values: Vec<Value>, unwind: bool) {
+        if values.is_empty() {
+            return;
+        }
+        self.effect(
+            self.current.expect("no current block"),
+            self.span,
+            Op::Cleanup { values, unwind },
+        );
+    }
+
+    pub(in crate::jit) fn store_frame(&mut self, ctx: Value, value: Value, slot: u32) -> Value {
+        self.value(
+            self.current.expect("no current block"),
+            self.span,
+            Op::FrameStore { ctx, value, slot },
+            cranelift_codegen::ir::types::I64,
+        )
+    }
+
+    pub(in crate::jit) fn reference(&mut self, op: Reference, value: Value) {
+        self.effect(
+            self.current.expect("no current block"),
+            self.span,
+            Op::Reference { op, value },
+        );
+    }
+
     pub(in crate::jit) fn ins(&mut self) -> Instructions<'_, 'a> {
         Instructions { builder: self }
     }
@@ -368,7 +466,6 @@ impl<'a> Builder<'a> {
         self.source_name = source_name;
     }
 
-    #[cfg(test)]
     pub(in crate::jit) fn set_location(&mut self, location: Option<u32>) {
         self.location = location;
     }
@@ -390,7 +487,7 @@ impl<'a> Builder<'a> {
         self.graph.insts[inst].emission_location = self.location;
         self.graph.insts[inst].source_name = self.source_name;
         let value = value.unwrap();
-        self.graph.low_level_types[value] = Some(ty);
+        self.graph.reprs[value] = Some(Repr::from_machine(ty));
         value
     }
 
@@ -448,7 +545,7 @@ impl<'a> Builder<'a> {
         self.graph.insts[inst].emission_location = self.location;
         self.graph.insts[inst].source_name = self.source_name;
         for (&value, ty) in results.iter().zip(types) {
-            self.graph.low_level_types[value] = Some(ty);
+            self.graph.reprs[value] = Some(Repr::from_machine(ty));
         }
         inst
     }
@@ -457,10 +554,10 @@ impl<'a> Builder<'a> {
         if let Some(previous) = self.types.insert(variable, ty) {
             assert_eq!(previous, ty);
         }
-        if let Some(existing) = self.graph.low_level_types[value] {
+        if let Some(existing) = self.graph.reprs[value].map(Repr::machine) {
             assert_eq!(existing, ty);
         }
-        self.graph.low_level_types[value] = Some(ty);
+        self.graph.reprs[value] = Some(Repr::from_machine(ty));
         self.definitions.insert((block, variable), value);
     }
 
@@ -481,7 +578,7 @@ impl<'a> Builder<'a> {
             self.graph
                 .append(block, span, GraphOp::LowLevel(Op::VariableRead), true);
         let value = result.unwrap();
-        self.graph.low_level_types[value] = Some(ty);
+        self.graph.reprs[value] = Some(Repr::from_machine(ty));
         self.reads.push((block, variable, inst, value));
         self.definitions.insert((block, variable), value);
         value
@@ -536,7 +633,7 @@ impl<'a> Builder<'a> {
                         // Backedges must find this phi before its inputs are resolved.
                         let param = self.graph.add_param(current);
                         entries.insert((current, variable), param);
-                        self.graph.low_level_types[param] = Some(self.types[&variable]);
+                        self.graph.reprs[param] = Some(Repr::from_machine(self.types[&variable]));
                     }
                     work.last_mut().unwrap().1 = Some(0);
                     0
@@ -609,7 +706,7 @@ macro_rules! binary_methods {
 macro_rules! immediate_methods {
     ($($name:ident => $op:ident),* $(,)?) => { $(
         pub(in crate::jit) fn $name(&mut self, value: Value, immediate: i64) -> Value {
-            let ty = self.builder.graph.low_level_types[value].expect("untyped low-level operand");
+            let ty = self.builder.graph.reprs[value].map(Repr::machine).expect("untyped low-level operand");
             let immediate = self.iconst(ty, immediate);
             self.binary(Binary::$op, value, immediate)
         }
@@ -619,7 +716,7 @@ macro_rules! immediate_methods {
 macro_rules! unary_methods {
     ($($name:ident => $op:ident),* $(,)?) => { $(
         pub(in crate::jit) fn $name(&mut self, value: Value) -> Value {
-            let ty = self.builder.graph.low_level_types[value].expect("untyped low-level operand");
+            let ty = self.builder.graph.reprs[value].map(Repr::machine).expect("untyped low-level operand");
             self.value(Op::Unary { op: Unary::$op, ty, value }, ty)
         }
     )* };
@@ -640,8 +737,10 @@ impl Instructions<'_, '_> {
     }
 
     fn binary(&mut self, op: Binary, left: Value, right: Value) -> Value {
-        let ty = self.builder.graph.low_level_types[left].expect("untyped low-level operand");
-        assert_eq!(self.builder.graph.low_level_types[right], Some(ty));
+        let ty = self.builder.graph.reprs[left]
+            .map(Repr::machine)
+            .expect("untyped low-level operand");
+        assert_eq!(self.builder.graph.reprs[right].map(Repr::machine), Some(ty));
         self.value(Op::Binary { op, left, right }, ty)
     }
 
@@ -695,7 +794,9 @@ impl Instructions<'_, '_> {
         left: Value,
         immediate: i64,
     ) -> Value {
-        let ty = self.builder.graph.low_level_types[left].expect("untyped low-level operand");
+        let ty = self.builder.graph.reprs[left]
+            .map(Repr::machine)
+            .expect("untyped low-level operand");
         let right = self.iconst(ty, immediate);
         self.icmp(condition, left, right)
     }
@@ -721,8 +822,10 @@ impl Instructions<'_, '_> {
     }
 
     pub(in crate::jit) fn select(&mut self, condition: Value, yes: Value, no: Value) -> Value {
-        let ty = self.builder.graph.low_level_types[yes].expect("untyped low-level operand");
-        assert_eq!(self.builder.graph.low_level_types[no], Some(ty));
+        let ty = self.builder.graph.reprs[yes]
+            .map(Repr::machine)
+            .expect("untyped low-level operand");
+        assert_eq!(self.builder.graph.reprs[no].map(Repr::machine), Some(ty));
         self.value(Op::Select { condition, yes, no }, ty)
     }
 

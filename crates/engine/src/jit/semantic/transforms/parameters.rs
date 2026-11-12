@@ -136,7 +136,7 @@ pub(in crate::jit::semantic) fn simplify_parameters(
 mod tests {
     use super::*;
     use crate::jit::semantic::{
-        Target, TerminatorKind,
+        Repr, Target, TerminatorKind,
         low_level::{Builder, CallTarget},
     };
     use cranelift_codegen::ir::{AbiParam, Signature, types};
@@ -210,8 +210,8 @@ mod tests {
         graph.verify().unwrap();
         assert_eq!(graph.blocks[entry].params.len(), 2);
         assert!(graph.blocks[header].params.is_empty());
-        assert_eq!(graph.low_level_types[first], Some(types::I64));
-        assert_eq!(graph.low_level_types[second], Some(types::I64));
+        assert_eq!(graph.reprs[first].map(Repr::machine), Some(types::I64));
+        assert_eq!(graph.reprs[second].map(Repr::machine), Some(types::I64));
         assert!(graph.blocks.iter().any(|(_, data)| data.terminator.as_ref().is_some_and(|term| matches!(&term.kind, TerminatorKind::ReturnValues(values) if values == &[first, first]))));
     }
 

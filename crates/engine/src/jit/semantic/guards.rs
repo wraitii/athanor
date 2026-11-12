@@ -1,14 +1,14 @@
 use crate::FxHashMap;
 use cranelift_module::FuncId;
 
-use super::facts::Types;
+use super::facts::ValueType;
 use super::{Block, Graph, Native, Op, TerminatorKind, UnaryOp, Value};
 use crate::heap::TypedKind;
 use crate::jit::profile::Site;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(in crate::jit) enum Fact {
-    Type(Types),
+    Type(ValueType),
     Code(FuncId),
     Shape(u32),
     Typed(Option<TypedKind>),
@@ -34,7 +34,7 @@ pub(in crate::jit) struct Origin {
 }
 
 pub(super) fn assumed(
-    types: &FxHashMap<Value, Types>,
+    types: &FxHashMap<Value, ValueType>,
     code: &FxHashMap<Value, FuncId>,
 ) -> Vec<(Value, Fact)> {
     let mut facts: Vec<_> = types
@@ -49,10 +49,10 @@ pub(super) fn assumed(
 impl Fact {
     pub(super) fn test(self, value: Value) -> Option<Op> {
         Some(match self {
-            Self::Type(types) if types == Types::NUMBER => Op::IsNumber(value),
-            Self::Type(types) if types == Types::INTEGER => Op::IsInteger(value),
-            Self::Type(types) if types == Types::STRING => Op::IsString(value),
-            Self::Type(types) if types == Types::UNDEFINED => Op::IsUndefined(value),
+            Self::Type(types) if types == ValueType::NUMBER => Op::IsNumber(value),
+            Self::Type(types) if types == ValueType::INTEGER => Op::IsInteger(value),
+            Self::Type(types) if types == ValueType::STRING => Op::IsString(value),
+            Self::Type(types) if types == ValueType::UNDEFINED => Op::IsUndefined(value),
             Self::Code(code) => Op::IsCode(value, code),
             Self::Shape(shape) => Op::IsShape(value, shape),
             Self::Typed(element) => Op::IsTyped(value, element),
@@ -62,7 +62,7 @@ impl Fact {
         })
     }
 
-    pub(super) fn mask(self) -> Option<Types> {
+    pub(super) fn mask(self) -> Option<ValueType> {
         match self {
             Self::Type(mask) => Some(mask),
             _ => None,
@@ -93,12 +93,17 @@ pub(super) struct Edge {
 
 pub(super) fn implies(op: &Op) -> Option<(Value, Fact)> {
     Some(match *op {
-        Op::IsUninitialized(value) => (value, Fact::Type(Types::UNINITIALIZED)),
-        Op::IsUndefined(value) => (value, Fact::Type(Types::UNDEFINED)),
-        Op::IsNullish(value) => (value, Fact::Type(Types::UNDEFINED.union(Types::NULL))),
-        Op::IsString(value) => (value, Fact::Type(Types::STRING)),
-        Op::IsNumber(value) => (value, Fact::Type(Types::NUMBER)),
-        Op::IsInteger(value) | Op::IntegerCheck(value, ..) => (value, Fact::Type(Types::INTEGER)),
+        Op::IsUninitialized(value) => (value, Fact::Type(ValueType::UNINITIALIZED)),
+        Op::IsUndefined(value) => (value, Fact::Type(ValueType::UNDEFINED)),
+        Op::IsNullish(value) => (
+            value,
+            Fact::Type(ValueType::UNDEFINED.union(ValueType::NULL)),
+        ),
+        Op::IsString(value) => (value, Fact::Type(ValueType::STRING)),
+        Op::IsNumber(value) => (value, Fact::Type(ValueType::NUMBER)),
+        Op::IsInteger(value) | Op::IntegerCheck(value, ..) => {
+            (value, Fact::Type(ValueType::INTEGER))
+        }
         Op::IsCode(value, code) => (value, Fact::Code(code)),
         Op::EntryAssume(value, fact) => (value, fact),
         Op::IsShape(value, shape) => (value, Fact::Shape(shape)),
@@ -131,8 +136,8 @@ pub(super) fn record_entry(graph: &mut Graph, value: Value, fact: Fact) {
         _ => return,
     };
     let fact = match fact {
-        Fact::Type(types) if types == Types::NUMBER => InputFact::Number,
-        Fact::Type(types) if types == Types::INTEGER => InputFact::Integer,
+        Fact::Type(types) if types == ValueType::NUMBER => InputFact::Number,
+        Fact::Type(types) if types == ValueType::INTEGER => InputFact::Integer,
         Fact::Shape(shape) => InputFact::Shape(shape),
         _ => return,
     };

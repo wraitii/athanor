@@ -91,6 +91,36 @@ also remain available for profiling. The current implementation rebuilds the
 graph during runtime lowering. That is an implementation choice, not a separate
 IR or a required semantic boundary.
 
+After representation legalization, conversion cleanup removes identities and
+lossless int32/boolean round trips. Conversions of invariant non-heap values can
+move out of loops to their source's definition block. Slot coloring prefers an
+available slot already used by a connected block argument or parameter.
+
+Semantic results and helper/coercion references share one lifetime resolver.
+Runtime emission describes acquisitions, result bindings, moves, releases,
+forwarding across internal edges, and scope ends. `semantic/scratch.rs` resolves
+these emission requests before graph rewrites, using pooled holders initialized
+to zero on paths that never acquired a reference. Normal and exceptional cleanup
+then have explicit SSA operands in `Cleanup` graph operations. Operand replacement,
+block splitting and ordinary CFG liveness preserve those references without an
+external live-reference set. `semantic/cleanup.rs` consumes these operations in
+CFG order after variable resolution and builds shared cold unwind ladders.
+The emitter supplies obligations and identifies an unchecked helper result;
+it maintains no live-reference lists, result-token maps, or unwind ladders.
+Scratch references still live until their scope ends unless explicitly moved or
+released; this does not infer earlier last uses through borrowed helper results.
+
+Runtime lowering leaves reference operations in the graph until mutable
+variables have been resolved. `semantic/ownership_lowering.rs` then expands boxed retains,
+raw-address retains, and releases into ordinary loads, arithmetic, stores and
+control flow, with a helper call for the last reference. Both backends consume
+this expansion. Retain/release pairs on the same value cancel across pure
+arithmetic and comparisons before expansion. Memory access, calls, unmatched
+releases and control-flow edges are barriers. Strict-reference mode preserves
+the pairs for diagnostics. Frame-slot stores also remain graph operations until
+this pass resolves their addressing,
+reads the previous contents, and writes the replacement.
+
 Known-kind bounded typed reads receive a final graph lowering after OSR
 preparation, followed by refreshed facts and borrow analysis. Reusable OSR
 graphs retain the earlier runtime operations. Runtime storage extraction
@@ -117,14 +147,31 @@ reference the generated code owns; inline fast paths take the same reference by
 incrementing the count. Lowering holds each such reference in a pooled graph
 variable, initialized to a non-reference zero on paths that never took it. A result's references
 are released right after its last use in its block, counting the uses of borrowed
-values that may alias it. Maybe-owned results are owned or not heap-tagged, so
-they never alias their operands. Results used by a terminator or another block,
-and references taken without a result, are released inline at the block's end. A
-result stored into a frame slot takes a reference of its own.
+values that may alias it. Owned results carry a reference when heap-tagged.
+References used by a terminator and internal helper scratch references are
+released inline at the block's end. A frame slot takes an owned result's
+reference directly; borrowed results take a new reference for their slot.
+Result-reference tokens follow values through internal lowering joins, separately
+from scratch references created by the same instruction. Moving a result into a
+slot clears its tokens without releasing them.
 
-Early exits through a failed helper or a thrown exception pass the references
-live at the site to a ladder of cold exits per target: the exit taking `n`
-references releases the last one and continues to the exit taking `n - 1`.
+Implementation selection in `semantic/selection.rs` describes operand/result
+representations and selects result-reference delivery for allocations and borrowed
+reads. After slot assignment, the ownership plan records the chosen helper variant
+and whether its result is borrowed, emitter-managed, delivered directly to a
+frame slot, or moved from an emitter temporary into the slot. Both retain insertion
+and runtime emission consume that decision.
+Semantic effects and result ownership remain in `Graph::contract`. The same
+representation contracts select typed or generic implementations and record the
+result representation; emission executes that choice. Typed arithmetic consumes
+legalized operands without rechecking numeric eligibility or reconverting them.
+
+Early exits through a failed helper or a thrown exception carry explicit cleanup
+operands for all references still held at the site, including internal references
+created by the current operation. Semantic releases and slot moves retire their
+holders in the same resolver; there is no separate semantic unwind live set.
+The exit ladder is shared per target:
+the exit taking `n` references releases the last one and continues to the exit taking `n - 1`.
 Cleanup code therefore grows with the deepest live set, not with the number of
 sites, and live ranges end at a reference's last use. The result of a helper
 that has just failed owns nothing and is left out.

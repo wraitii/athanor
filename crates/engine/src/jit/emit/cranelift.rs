@@ -7,6 +7,7 @@ use cranelift_jit::JITModule;
 use cranelift_module::Module;
 
 use crate::error::Error;
+use crate::jit::semantic::Repr;
 use crate::jit::semantic::{
     Cfg, Graph, MemoryFormat, MemoryOp, Op as GraphOp, TerminatorKind, Value,
     low_level::{Binary, CallTarget, Op, Unary},
@@ -26,7 +27,8 @@ pub(in crate::jit) fn emit(
     for (block, data) in &graph.blocks {
         let target = blocks[block].unwrap();
         for &param in &data.params {
-            let ty = graph.low_level_types[param]
+            let ty = graph.reprs[param]
+                .map(Repr::machine)
                 .ok_or_else(|| Error::Compile(format!("missing scalar type for {param}")))?;
             values[param] = Some(builder.append_block_param(target, ty));
         }
@@ -211,6 +213,12 @@ pub(in crate::jit) fn emit(
                         annotations.helpers.insert(call, *helper);
                     }
                     builder.inst_results(call).to_vec()
+                }
+                Op::Cleanup { .. }
+                | Op::Scratch { .. }
+                | Op::Reference { .. }
+                | Op::FrameStore { .. } => {
+                    return Err(Error::Compile("unlowered runtime operation".into()));
                 }
                 Op::VariableRead => {
                     return Err(Error::Compile("unresolved low-level variable".into()));

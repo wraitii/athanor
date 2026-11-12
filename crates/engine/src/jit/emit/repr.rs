@@ -1,60 +1,13 @@
 use super::LoweredValue;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
-use cranelift_codegen::ir::{MemFlagsData, Type, types};
+use cranelift_codegen::ir::{MemFlagsData, types};
 
 use crate::heap::MathFunction;
-use crate::jit::semantic::Types;
+use crate::jit::semantic::Repr;
 use crate::value::Value;
 
 use super::FunctionCompiler;
 use super::ops::BinaryOp;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Repr {
-    Boxed,
-    Float,
-    Int32,
-    Int64,
-    Bool,
-    Pointer,
-    RawI8,
-    RawI16,
-    RawI32,
-    RawF32,
-    RawF64,
-}
-
-impl Repr {
-    pub(super) fn of(types: Types) -> Self {
-        if types == Types::default() {
-            Self::Boxed
-        } else if types.within(Types::BOOLEAN) {
-            Self::Bool
-        } else if types.within(Types::INT32) {
-            Self::Int32
-        } else if types.within(Types::INTEGER) {
-            Self::Int64
-        } else if types.within(Types::NUMBER) {
-            Self::Float
-        } else {
-            Self::Boxed
-        }
-    }
-
-    pub(super) fn scalar_type(self) -> Type {
-        match self {
-            Self::Boxed | Self::Int64 => types::I64,
-            Self::Float => types::F64,
-            Self::Int32 => types::I32,
-            Self::Bool | Self::RawI8 => types::I8,
-            Self::Pointer => types::I64,
-            Self::RawI16 => types::I16,
-            Self::RawI32 => types::I32,
-            Self::RawF32 => types::F32,
-            Self::RawF64 => types::F64,
-        }
-    }
-}
 
 #[derive(Clone, Copy)]
 pub(super) struct Operand {
@@ -84,26 +37,19 @@ impl FunctionCompiler<'_, '_> {
     fn fold(&mut self, operand: Operand, to: Repr) -> Option<LoweredValue> {
         let number = operand.constant?;
         let integer = match operand.repr {
-            Repr::Int32 => Some(i64::from(number as i32)),
-            Repr::Int64 => Some(number as i64),
-            Repr::Float => None,
-            Repr::Boxed
-            | Repr::Bool
-            | Repr::Pointer
-            | Repr::RawI8
-            | Repr::RawI16
-            | Repr::RawI32
-            | Repr::RawF32
-            | Repr::RawF64 => return None,
+            Repr::I32 => Some(i64::from(number as i32)),
+            Repr::I64 => Some(number as i64),
+            Repr::F64 => None,
+            Repr::Boxed | Repr::I8 | Repr::I16 | Repr::F32 => return None,
         };
         Some(match (integer, to) {
-            (Some(integer), Repr::Int64) => self.b.ins().iconst(types::I64, integer),
-            (Some(integer), Repr::Int32) => {
+            (Some(integer), Repr::I64) => self.b.ins().iconst(types::I64, integer),
+            (Some(integer), Repr::I32) => {
                 self.b.ins().iconst(types::I32, i64::from(integer as i32))
             }
-            (Some(integer), Repr::Float) => self.b.ins().f64const(integer as f64),
-            (None, Repr::Int64) => self.b.ins().iconst(types::I64, number as i64),
-            (None, Repr::Int32) => self
+            (Some(integer), Repr::F64) => self.b.ins().f64const(integer as f64),
+            (None, Repr::I64) => self.b.ins().iconst(types::I64, number as i64),
+            (None, Repr::I32) => self
                 .b
                 .ins()
                 .iconst(types::I32, i64::from(crate::jit::helpers::to_int32(number))),
@@ -120,60 +66,60 @@ impl FunctionCompiler<'_, '_> {
         }
         match (operand.repr, to) {
             (from, to) if from == to => value,
-            (Repr::Boxed, Repr::Float) => {
+            (Repr::Boxed, Repr::F64) => {
                 self.b.ins().bitcast(types::F64, MemFlagsData::new(), value)
             }
-            (Repr::Boxed, Repr::Int64) => {
+            (Repr::Boxed, Repr::I64) => {
                 let float = self.b.ins().bitcast(types::F64, MemFlagsData::new(), value);
                 self.b.ins().fcvt_to_sint_sat(types::I64, float)
             }
-            (Repr::Boxed, Repr::Int32) => {
+            (Repr::Boxed, Repr::I32) => {
                 let float = self.b.ins().bitcast(types::F64, MemFlagsData::new(), value);
                 self.to_int32(float)
             }
-            (Repr::Boxed, Repr::Bool) => {
+            (Repr::Boxed, Repr::I8) => {
                 self.b
                     .ins()
                     .icmp_imm_s(IntCC::Equal, value, Value::TRUE.bits() as i64)
             }
-            (Repr::Float, Repr::Boxed) => {
+            (Repr::F64, Repr::Boxed) => {
                 let unordered = self.b.ins().fcmp(FloatCC::Unordered, value, value);
                 let bits = self.b.ins().bitcast(types::I64, MemFlagsData::new(), value);
                 let nan = self.constant(Value::number(f64::NAN));
 
                 self.b.ins().select(unordered, nan, bits)
             }
-            (Repr::Int64, Repr::Boxed) | (Repr::Int32, Repr::Boxed) => {
+            (Repr::I64, Repr::Boxed) | (Repr::I32, Repr::Boxed) => {
                 let float = self.b.ins().fcvt_from_sint(types::F64, value);
 
                 self.b.ins().bitcast(types::I64, MemFlagsData::new(), float)
             }
-            (Repr::Bool, Repr::Boxed) => {
+            (Repr::I8, Repr::Boxed) => {
                 let yes = self.constant(Value::TRUE);
                 let no = self.constant(Value::FALSE);
                 self.b.ins().select(value, yes, no)
             }
-            (Repr::Int64, Repr::Float) | (Repr::Int32, Repr::Float) => {
+            (Repr::I64, Repr::F64) | (Repr::I32, Repr::F64) => {
                 self.b.ins().fcvt_from_sint(types::F64, value)
             }
-            (Repr::Float, Repr::Int32) => self.to_int32(value),
-            (Repr::Bool, Repr::Int32) => self.b.ins().uextend(types::I32, value),
-            (Repr::Bool, Repr::Float) => {
+            (Repr::F64, Repr::I32) => self.to_int32(value),
+            (Repr::I8, Repr::I32) => self.b.ins().uextend(types::I32, value),
+            (Repr::I8, Repr::F64) => {
                 let wide = self.b.ins().uextend(types::I32, value);
                 self.b.ins().fcvt_from_uint(types::F64, wide)
             }
-            (Repr::Int64, Repr::Bool) | (Repr::Int32, Repr::Bool) => {
+            (Repr::I64, Repr::I8) | (Repr::I32, Repr::I8) => {
                 self.b.ins().icmp_imm_s(IntCC::NotEqual, value, 0)
             }
-            (Repr::Float, Repr::Bool) => {
+            (Repr::F64, Repr::I8) => {
                 let zero = self.b.ins().f64const(0.0);
                 let negative = self.b.ins().fcmp(FloatCC::LessThan, value, zero);
                 let positive = self.b.ins().fcmp(FloatCC::GreaterThan, value, zero);
                 self.b.ins().bor(negative, positive)
             }
-            (Repr::Int32, Repr::Int64) => self.b.ins().sextend(types::I64, value),
-            (Repr::Float, Repr::Int64) => self.b.ins().fcvt_to_sint_sat(types::I64, value),
-            (Repr::Int64, Repr::Int32) => self.b.ins().ireduce(types::I32, value),
+            (Repr::I32, Repr::I64) => self.b.ins().sextend(types::I64, value),
+            (Repr::F64, Repr::I64) => self.b.ins().fcvt_to_sint_sat(types::I64, value),
+            (Repr::I64, Repr::I32) => self.b.ins().ireduce(types::I32, value),
             _ => unreachable!(),
         }
     }
@@ -194,31 +140,28 @@ impl FunctionCompiler<'_, '_> {
         op: BinaryOp,
         left: Operand,
         right: Operand,
-    ) -> Option<Operand> {
-        if matches!(op, BinaryOp::Add | BinaryOp::Sub)
-            && matches!(left.repr, Repr::Int32 | Repr::Int64)
-            && matches!(right.repr, Repr::Int32 | Repr::Int64)
-        {
-            let left = self.convert(left, Repr::Int64);
-            let right = self.convert(right, Repr::Int64);
-            let value = if op == BinaryOp::Add {
-                self.b.ins().iadd(left, right)
-            } else {
-                self.b.ins().isub(left, right)
-            };
-            return Some(Operand::new(value, Repr::Int64));
-        }
-        Some(match op {
+        result: Repr,
+    ) -> Operand {
+        debug_assert_eq!(left.repr, right.repr);
+        let repr = left.repr;
+        let (left, right) = (left.value, right.value);
+        let value = match op {
+            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul if result == Repr::I64 => {
+                debug_assert_eq!(repr, Repr::I64);
+                match op {
+                    BinaryOp::Add => self.b.ins().iadd(left, right),
+                    BinaryOp::Sub => self.b.ins().isub(left, right),
+                    _ => self.b.ins().imul(left, right),
+                }
+            }
             BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
-                let left = self.convert(left, Repr::Float);
-                let right = self.convert(right, Repr::Float);
-                let result = match op {
+                debug_assert_eq!(repr, Repr::F64);
+                match op {
                     BinaryOp::Add => self.b.ins().fadd(left, right),
                     BinaryOp::Sub => self.b.ins().fsub(left, right),
                     BinaryOp::Mul => self.b.ins().fmul(left, right),
                     _ => self.b.ins().fdiv(left, right),
-                };
-                Operand::new(result, Repr::Float)
+                }
             }
             BinaryOp::Less
             | BinaryOp::LessEqual
@@ -228,16 +171,7 @@ impl FunctionCompiler<'_, '_> {
             | BinaryOp::StrictEqual
             | BinaryOp::LooseNotEqual
             | BinaryOp::StrictNotEqual => {
-                let result = if matches!(left.repr, Repr::Int32 | Repr::Int64)
-                    && matches!(right.repr, Repr::Int32 | Repr::Int64)
-                {
-                    let repr = if left.repr == Repr::Int32 && right.repr == Repr::Int32 {
-                        Repr::Int32
-                    } else {
-                        Repr::Int64
-                    };
-                    let left = self.convert(left, repr);
-                    let right = self.convert(right, repr);
+                if matches!(repr, Repr::I8 | Repr::I32 | Repr::I64) {
                     let condition = match op {
                         BinaryOp::Less => IntCC::SignedLessThan,
                         BinaryOp::LessEqual => IntCC::SignedLessThanOrEqual,
@@ -248,6 +182,7 @@ impl FunctionCompiler<'_, '_> {
                     };
                     self.b.ins().icmp(condition, left, right)
                 } else {
+                    debug_assert_eq!(repr, Repr::F64);
                     let condition = match op {
                         BinaryOp::Less => FloatCC::LessThan,
                         BinaryOp::LessEqual => FloatCC::LessThanOrEqual,
@@ -256,11 +191,8 @@ impl FunctionCompiler<'_, '_> {
                         BinaryOp::LooseEqual | BinaryOp::StrictEqual => FloatCC::Equal,
                         _ => FloatCC::NotEqual,
                     };
-                    let left = self.convert(left, Repr::Float);
-                    let right = self.convert(right, Repr::Float);
                     self.b.ins().fcmp(condition, left, right)
-                };
-                Operand::new(result, Repr::Bool)
+                }
             }
             BinaryOp::BitwiseAnd
             | BinaryOp::BitwiseOr
@@ -268,9 +200,8 @@ impl FunctionCompiler<'_, '_> {
             | BinaryOp::ShiftLeft
             | BinaryOp::ShiftRight
             | BinaryOp::ShiftRightUnsigned => {
-                let left = self.convert(left, Repr::Int32);
-                let right = self.convert(right, Repr::Int32);
-                let result = match op {
+                debug_assert_eq!(repr, Repr::I32);
+                match op {
                     BinaryOp::BitwiseAnd => self.b.ins().band(left, right),
                     BinaryOp::BitwiseOr => self.b.ins().bor(left, right),
                     BinaryOp::BitwiseXor => self.b.ins().bxor(left, right),
@@ -278,57 +209,40 @@ impl FunctionCompiler<'_, '_> {
                     BinaryOp::ShiftRight => self.b.ins().sshr(left, right),
                     _ => {
                         let shifted = self.b.ins().ushr(left, right);
-                        let float = self.b.ins().fcvt_from_uint(types::F64, shifted);
-                        return Some(Operand::new(float, Repr::Float));
+                        self.b.ins().fcvt_from_uint(types::F64, shifted)
                     }
-                };
-                Operand::new(result, Repr::Int32)
+                }
             }
-            _ => return None,
-        })
+            _ => unreachable!("unsupported selected binary operation"),
+        };
+        Operand::new(value, result)
     }
 
-    pub(super) fn typed_math(
-        &mut self,
-        function: MathFunction,
-        args: &[Operand],
-    ) -> Option<Operand> {
-        let inline = matches!(
-            (function, args.len()),
-            (
-                MathFunction::Floor | MathFunction::Ceil | MathFunction::Sqrt,
-                1
-            ) | (MathFunction::Min | MathFunction::Max, 1..)
-        );
-        if !inline {
-            return None;
-        }
-        let floats: Vec<_> = args
-            .iter()
-            .map(|&arg| self.convert(arg, Repr::Float))
-            .collect();
+    pub(super) fn typed_math(&mut self, function: MathFunction, args: &[Operand]) -> Operand {
+        debug_assert!(args.iter().all(|arg| arg.repr == Repr::F64));
+        let mut values = args.iter().map(|arg| arg.value);
+        let first = values
+            .next()
+            .expect("selected math operation has an argument");
         let result = match function {
-            MathFunction::Floor => self.b.ins().floor(floats[0]),
-            MathFunction::Ceil => self.b.ins().ceil(floats[0]),
-            MathFunction::Sqrt => self.b.ins().sqrt(floats[0]),
-            MathFunction::Min => floats[1..]
-                .iter()
-                .fold(floats[0], |left, &right| self.b.ins().fmin(left, right)),
-            _ => floats[1..]
-                .iter()
-                .fold(floats[0], |left, &right| self.b.ins().fmax(left, right)),
+            MathFunction::Floor => self.b.ins().floor(first),
+            MathFunction::Ceil => self.b.ins().ceil(first),
+            MathFunction::Sqrt => self.b.ins().sqrt(first),
+            MathFunction::Min => values.fold(first, |left, right| self.b.ins().fmin(left, right)),
+            MathFunction::Max => values.fold(first, |left, right| self.b.ins().fmax(left, right)),
+            _ => unreachable!("unsupported selected math operation"),
         };
-        Some(Operand::new(result, Repr::Float))
+        Operand::new(result, Repr::F64)
     }
 
     pub(super) fn condition(&mut self, operand: Operand, numeric: bool) -> LoweredValue {
         match operand.repr {
             Repr::Boxed if numeric => {
-                let float = self.convert(operand, Repr::Float);
-                self.convert(Operand::new(float, Repr::Float), Repr::Bool)
+                let float = self.convert(operand, Repr::F64);
+                self.convert(Operand::new(float, Repr::F64), Repr::I8)
             }
             Repr::Boxed => self.truthy(operand.value),
-            _ => self.convert(operand, Repr::Bool),
+            _ => self.convert(operand, Repr::I8),
         }
     }
 }

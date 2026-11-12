@@ -1,11 +1,14 @@
 use crate::{FxHashMap, FxHashSet};
 
 use super::{
-    Block, BlockData, Cfg, Constant, Graph, Inst, Op, Target, Terminator, TerminatorKind, Types,
-    Value,
+    Block, BlockData, Cfg, Constant, Graph, Inst, Op, Target, Terminator, TerminatorKind, Value,
+    ValueType,
 };
 
-pub(super) fn result_facts(graph: &Graph, cfg: &Cfg) -> (FxHashSet<Value>, FxHashMap<Inst, Types>) {
+pub(super) fn result_facts(
+    graph: &Graph,
+    cfg: &Cfg,
+) -> (FxHashSet<Value>, FxHashMap<Inst, ValueType>) {
     let mut arrays = FxHashMap::default();
     for &block in &cfg.rpo {
         for &inst in &graph.blocks[block].insts {
@@ -175,9 +178,9 @@ pub(super) fn result_facts(graph: &Graph, cfg: &Cfg) -> (FxHashSet<Value>, FxHas
             reads.insert(
                 inst,
                 if nonempty && *index == 0.0 && !matches!(graph.insts[inst].op, Op::PackTake(..)) {
-                    Types::STRING
+                    ValueType::STRING
                 } else {
-                    Types::STRING.union(Types::UNDEFINED)
+                    ValueType::STRING.union(ValueType::UNDEFINED)
                 },
             );
         }
@@ -352,10 +355,10 @@ mod tests {
     #[test]
     fn split_spread_elements_retain_string_and_missing_argument_facts() {
         for (separator, expected) in [
-            ("'|'", Types::STRING.union(Types::UNDEFINED)),
-            ("undefined", Types::STRING.union(Types::UNDEFINED)),
-            ("''", Types::STRING.union(Types::UNDEFINED)),
-            ("other", Types::STRING.union(Types::UNDEFINED)),
+            ("'|'", ValueType::STRING.union(ValueType::UNDEFINED)),
+            ("undefined", ValueType::STRING.union(ValueType::UNDEFINED)),
+            ("''", ValueType::STRING.union(ValueType::UNDEFINED)),
+            ("other", ValueType::STRING.union(ValueType::UNDEFINED)),
         ] {
             let mut graph = native_graph(&format!(
                 "const parts=text.split({separator}); return parts[0];"
@@ -395,7 +398,7 @@ mod tests {
             native_graph("const parts=flag ? text.split('|') : text.split(','); return parts[0];");
         let (_, reads) = result_facts(&graph, &Cfg::new(&graph));
         assert_eq!(reads.len(), 1);
-        assert!(reads.values().all(|types| *types == Types::STRING));
+        assert!(reads.values().all(|types| *types == ValueType::STRING));
     }
 
     #[test]
@@ -407,7 +410,7 @@ mod tests {
             let graph = native_graph(body);
             let (_, reads) = result_facts(&graph, &Cfg::new(&graph));
             assert_eq!(reads.len(), 1, "{body}");
-            assert!(reads.values().all(|types| *types == Types::STRING));
+            assert!(reads.values().all(|types| *types == ValueType::STRING));
         }
     }
 

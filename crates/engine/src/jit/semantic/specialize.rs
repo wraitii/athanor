@@ -9,7 +9,7 @@ use super::super::effects::{Assumption, Control, Effects, Locations, Memory};
 use super::super::math::METHODS;
 use super::{
     CallSummary, Cfg, DirectTarget, Facts, FunctionState, Graph, Inst, Native, Op, Result,
-    TerminatorKind, Types, UnaryOp, Value,
+    TerminatorKind, UnaryOp, Value, ValueType,
 };
 
 pub(super) const SPECIALIZATION_BUDGET: usize = 128;
@@ -276,10 +276,12 @@ fn assumptions(op: &Op, facts: &Facts) -> &'static [Assumption] {
     const PROPERTY: &[Assumption] = &[Assumption::NoAccessors, Assumption::NoCoercionCallbacks];
     const COERCION: &[Assumption] = &[Assumption::NoCoercionCallbacks];
     let coercing = || {
-        let operands = op.operands_iter().fold(Types::default(), |types, value| {
-            types.union(facts.of(value))
-        });
-        if operands.within(Types::PRIMITIVE) {
+        let operands = op
+            .operands_iter()
+            .fold(ValueType::default(), |types, value| {
+                types.union(facts.of(value))
+            });
+        if operands.within(ValueType::PRIMITIVE) {
             &[]
         } else {
             COERCION
@@ -1011,7 +1013,7 @@ pub(super) fn apply(
 
 #[cfg(test)]
 mod tests {
-    use super::super::Types;
+    use super::super::ValueType;
     use super::*;
     use oxc_allocator::Allocator;
     use oxc_ast::ast::Statement;
@@ -1123,11 +1125,11 @@ mod tests {
         for value in setters {
             let types = analysis.facts.of(value);
             assert!(
-                types.within(Types::STRING.union(Types::UNDEFINED)),
+                types.within(ValueType::STRING.union(ValueType::UNDEFINED)),
                 "{analysis}"
             );
-            assert!(types.intersects(Types::STRING));
-            assert!(types.intersects(Types::UNDEFINED));
+            assert!(types.intersects(ValueType::STRING));
+            assert!(types.intersects(ValueType::UNDEFINED));
         }
         graph.verify().unwrap();
     }

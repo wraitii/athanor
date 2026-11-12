@@ -1,5 +1,5 @@
 use super::{
-    Block, BlockData, Cfg, Constant, Facts, Graph, Op, Target, TerminatorKind, Types, Value,
+    Block, BlockData, Cfg, Constant, Facts, Graph, Op, Target, TerminatorKind, Value, ValueType,
 };
 use crate::{FxHashMap, FxHashSet};
 use cranelift_codegen::entity::SecondaryMap;
@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 pub(in crate::jit) struct Body {
     pub(in crate::jit) graph: Graph,
-    pub(super) result: super::Types,
+    pub(super) result: super::ValueType,
     pub(in crate::jit) outputs: usize,
 }
 
@@ -36,17 +36,16 @@ impl Body {
             ..
         } = function;
         super::borrow::borrows(&mut graph, &facts, &mut notes);
-        let result =
-            facts
-                .cfg
-                .rpo
-                .iter()
-                .fold(super::Types::default(), |types, &block| {
-                    match graph.blocks[block].terminator.as_ref().unwrap().kind {
-                        TerminatorKind::Return(value) => types.union(facts.of(value)),
-                        _ => types,
-                    }
-                });
+        let result = facts
+            .cfg
+            .rpo
+            .iter()
+            .fold(super::ValueType::default(), |types, &block| {
+                match graph.blocks[block].terminator.as_ref().unwrap().kind {
+                    TerminatorKind::Return(value) => types.union(facts.of(value)),
+                    _ => types,
+                }
+            });
         Self {
             graph,
             result,
@@ -156,8 +155,8 @@ pub(super) struct Piece {
 
 pub(super) struct Exit {
     pub(super) block: Block,
-    pub(super) outputs: Vec<(Value, Types)>,
-    pub(super) params: Vec<Types>,
+    pub(super) outputs: Vec<(Value, ValueType)>,
+    pub(super) params: Vec<ValueType>,
 }
 
 impl Exit {
@@ -169,7 +168,7 @@ impl Exit {
 pub(super) struct Shape {
     pub(super) body: FxHashSet<Block>,
     pub(super) exits: Vec<Exit>,
-    pub(super) returns: Option<Types>,
+    pub(super) returns: Option<ValueType>,
 }
 
 impl Shape {
@@ -180,7 +179,7 @@ impl Shape {
         body: FxHashSet<Block>,
     ) -> Self {
         let mut targets = BTreeSet::new();
-        let mut returns: Option<Types> = None;
+        let mut returns: Option<ValueType> = None;
         for &block in &body {
             let kind = &graph.blocks[block].terminator.as_ref().unwrap().kind;
             if let TerminatorKind::Return(value) = kind {

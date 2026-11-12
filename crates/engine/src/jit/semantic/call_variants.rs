@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use super::dispatch::{self, Alternative};
 use super::guards::Fact;
 use super::specialize::Repository;
-use super::{Cfg, DirectTarget, Graph, Op, Types, Value};
+use super::{Cfg, DirectTarget, Graph, Op, Value, ValueType};
 use crate::jit::profile::Site;
 use crate::jit::variants::{Fact as InputFact, Input, Requirements};
 
@@ -105,8 +105,8 @@ pub(in crate::jit) fn assume(graph: &mut Graph, requirements: &Requirements) {
             .collect();
         graph.replace_uses(&aliases);
         let fact = match fact {
-            InputFact::Number => Fact::Type(Types::NUMBER),
-            InputFact::Integer => Fact::Type(Types::INTEGER),
+            InputFact::Number => Fact::Type(ValueType::NUMBER),
+            InputFact::Integer => Fact::Type(ValueType::INTEGER),
             InputFact::Shape(shape) => Fact::Shape(shape),
         };
         graph.insert(
@@ -228,8 +228,8 @@ pub(super) fn apply(
                         Input::Argument(index) => args[index],
                     };
                     let fact = match fact {
-                        InputFact::Number => Fact::Type(Types::NUMBER),
-                        InputFact::Integer => Fact::Type(Types::INTEGER),
+                        InputFact::Number => Fact::Type(ValueType::NUMBER),
+                        InputFact::Integer => Fact::Type(ValueType::INTEGER),
                         InputFact::Shape(shape) => Fact::Shape(shape),
                     };
                     requirements.push((value, fact));

@@ -21,6 +21,7 @@ use crate::jit::alloc::{
     graph::{self as alloc, Allocation, Frame, Hint, Place},
 };
 use crate::jit::machine::{MachineCode, SourceRange};
+use crate::jit::semantic::Repr;
 use crate::jit::semantic::{Block, Cfg, Graph, Inst, Op, Target, TerminatorKind, Value, low_level};
 
 const T0: u8 = 9;
@@ -147,7 +148,8 @@ fn check_function(graph: &Graph, order: &[Block]) -> Result<(), Unsupported> {
     }
     for &block in order {
         for &value in &graph.blocks[block].params {
-            let ty = graph.low_level_types[value]
+            let ty = graph.reprs[value]
+                .map(Repr::machine)
                 .ok_or_else(|| Unsupported(format!("missing type for {value}")))?;
             if RegClass::of(ty).is_none() {
                 return Err(Unsupported(format!("value type {ty}")));
@@ -155,7 +157,8 @@ fn check_function(graph: &Graph, order: &[Block]) -> Result<(), Unsupported> {
         }
         for &inst in &graph.blocks[block].insts {
             for &value in &graph.insts[inst].results {
-                let ty = graph.low_level_types[value]
+                let ty = graph.reprs[value]
+                    .map(Repr::machine)
                     .ok_or_else(|| Unsupported(format!("missing type for {value}")))?;
                 if RegClass::of(ty).is_none() {
                     return Err(Unsupported(format!("value type {ty}")));
@@ -372,7 +375,7 @@ impl Lower<'_> {
     }
 
     fn ty(&self, value: Value) -> Type {
-        self.func.low_level_types[value].unwrap()
+        self.func.reprs[value].map(Repr::machine).unwrap()
     }
 
     fn class(&self, value: Value) -> RegClass {
@@ -1222,6 +1225,9 @@ impl Lower<'_> {
             L::Store { .. } => Opcode::Store,
             L::StackAddress { .. } => Opcode::StackAddr,
             L::StackPointer { .. } => Opcode::GetStackPointer,
+            L::Cleanup { .. } | L::Scratch { .. } | L::Reference { .. } | L::FrameStore { .. } => {
+                return Err(Unsupported("unlowered runtime operation".into()));
+            }
             L::VariableRead => return Err(Unsupported("unresolved variable".into())),
             L::Call { .. } => unreachable!(),
         };
