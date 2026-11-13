@@ -130,7 +130,7 @@ pub(super) fn enter(
         *value = definitions[value][0];
     }
     graph.terminate(entry, graph.span, TerminatorKind::Jump(target));
-    super::optimize::repair(graph, &definitions);
+    super::transforms::repair(graph, &definitions);
     let reachable: FxHashSet<_> = Cfg::new(graph).rpo.into_iter().collect();
     for (block, data) in graph.blocks.iter_mut() {
         if !reachable.contains(&block) {

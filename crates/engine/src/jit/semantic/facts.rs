@@ -380,7 +380,7 @@ impl Facts {
                 }
             }
         }
-        let (indexed, reads) = super::string_split::result_facts(graph, &cfg);
+        let (indexed, reads) = super::js::string_split::result_facts(graph, &cfg);
         let mut probes = Vec::new();
         for (&value, entries) in &refinements {
             let Some(Op::ProbeGlobal(name)) = graph.defining_op(value) else {

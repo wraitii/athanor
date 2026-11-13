@@ -43,7 +43,7 @@ impl Inspection {
     pub(super) fn new(
         options: Option<&CompileOptions>,
         graph: &semantic::FunctionState,
-        repository: &semantic::specialize::Repository,
+        repository: &semantic::specialization::calls::Repository,
         source: usize,
         inline_multiplier: usize,
     ) -> Self {

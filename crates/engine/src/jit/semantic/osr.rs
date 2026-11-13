@@ -79,7 +79,7 @@ impl Plan {
         }
         let facts = Facts::compute(graph);
         let live = liveness(graph, &cfg.rpo);
-        let loops: Vec<_> = super::optimize::natural_loops(graph, &cfg)
+        let loops: Vec<_> = super::transforms::loops::natural_loops(graph, &cfg)
             .into_iter()
             .filter_map(|(header, body)| {
                 if graph.cold.contains(&header) || header == graph.entry {
@@ -171,7 +171,7 @@ impl Plan {
                 .shape
                 .dispatch(graph, dispatch, start, &mut definitions);
         }
-        super::optimize::repair(graph, &definitions);
+        super::transforms::repair(graph, &definitions);
         graph.verify()
     }
 
@@ -457,7 +457,7 @@ mod tests {
         let graph = super::super::build::lower(function, semantic.scoping(), &FxHashSet::default())
             .unwrap();
         let mut graph = super::super::canonicalize_graph(graph, true).unwrap().graph;
-        super::super::observations::plan(&mut graph, None);
+        super::super::specialization::observations::plan(&mut graph, None);
         graph
     }
 
@@ -480,8 +480,13 @@ mod tests {
                 .all(|&value| !inner.body.contains(&plan.graph.def_block(value)))
         );
         let mut optimized = graph;
-        super::super::optimize::version(&mut optimized, &Default::default(), None, &mut Vec::new())
-            .unwrap();
+        super::super::specialization::regions::version(
+            &mut optimized,
+            &Default::default(),
+            None,
+            &mut Vec::new(),
+        )
+        .unwrap();
         plan.graph.verify().unwrap();
         assert_eq!(plan.loops.len(), 2);
     }
@@ -586,7 +591,7 @@ mod tests {
             "function f(holder,x,n){const row=holder.row;let sum=0;for(let i=0;i<n;++i)sum+=row[i]*x;return sum;}",
         );
         let cfg = Cfg::new(&graph);
-        let (_, body) = super::super::optimize::natural_loops(&graph, &cfg).remove(0);
+        let (_, body) = super::super::transforms::loops::natural_loops(&graph, &cfg).remove(0);
         let row = graph
             .blocks
             .iter()
@@ -625,7 +630,7 @@ mod tests {
         }
         let plan = Plan::discover(&graph, 7).unwrap();
         let mut extracted = plan.extract(0).unwrap();
-        let mut repository = super::super::specialize::Repository::default();
+        let mut repository = super::super::specialization::calls::Repository::default();
         repository.read_feedback.insert(
             (site, ReadKind::Result),
             ReadType::Typed(crate::heap::TypedKind::Float32),
@@ -633,9 +638,9 @@ mod tests {
         repository
             .read_feedback
             .insert((site, ReadKind::Number), ReadType::Integer);
-        super::super::observations::plan(&mut extracted, Some((&repository, 7)));
-        assert!(!super::super::observations::numeric_hints(&extracted).is_empty());
-        let reads = super::super::reads::plan(&extracted, &repository, 7);
+        super::super::specialization::observations::plan(&mut extracted, Some((&repository, 7)));
+        assert!(!super::super::specialization::observations::numeric_hints(&extracted).is_empty());
+        let reads = super::super::specialization::reads::plan(&extracted, &repository, 7);
         assert!(
             reads
                 .iter()
@@ -649,8 +654,13 @@ mod tests {
         let mut graph = graph(
             "function f(xs,n,callback){let sum=0;for(let i=0;i<n;++i)sum+=callback(xs[i]);return sum;}",
         );
-        super::super::optimize::version(&mut graph, &Default::default(), None, &mut Vec::new())
-            .unwrap();
+        super::super::specialization::regions::version(
+            &mut graph,
+            &Default::default(),
+            None,
+            &mut Vec::new(),
+        )
+        .unwrap();
         let plan = Plan::discover(&graph, 7).unwrap();
         let opportunities = &plan.loops[0].opportunities;
         assert!(
@@ -674,7 +684,7 @@ mod tests {
             .filter(|&&inst| matches!(graph.insts[inst].op, Op::Observe(..)))
             .map(|&inst| graph.op_text(&graph.insts[inst].op))
             .collect();
-        super::super::observations::plan(&mut graph, None);
+        super::super::specialization::observations::plan(&mut graph, None);
         let after: Vec<_> = graph
             .blocks
             .iter()
@@ -691,7 +701,7 @@ mod tests {
     fn observed_reads_no_longer_request_discovery() {
         let graph = graph("function f(xs,n){let sum=0;for(let i=0;i<n;++i)sum+=xs[i];return sum;}");
         let initial = Plan::discover(&graph, 7).unwrap();
-        let mut repository = super::super::specialize::Repository::default();
+        let mut repository = super::super::specialization::calls::Repository::default();
         for opportunity in &initial.loops[0].opportunities {
             let Observation::Read(kind) = opportunity.kind else {
                 panic!()
@@ -702,7 +712,7 @@ mod tests {
             );
         }
         let mut graph = graph;
-        super::super::observations::plan(&mut graph, Some((&repository, 7)));
+        super::super::specialization::observations::plan(&mut graph, Some((&repository, 7)));
         assert!(Plan::discover(&graph, 7).is_none());
     }
 }

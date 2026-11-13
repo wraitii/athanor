@@ -162,7 +162,7 @@ and whether its result is borrowed, emitter-managed, delivered directly to a
 frame slot, or moved from an emitter temporary into the slot. Both retain insertion
 and runtime emission consume that decision.
 Semantic effects and result ownership remain in `Graph::contract`.
-`semantic/lowering/numeric.rs` replaces proven numeric arithmetic, comparisons
+`semantic/runtime/numeric.rs` replaces proven numeric arithmetic, comparisons
 and unary operations with low-level operations before representation assignment.
 Value facts choose integer or floating operations; integer widths remain for
 representation assignment. Floating operands use `NumericFloat`, including
@@ -1214,9 +1214,40 @@ and optimized normally; the shared CLIF optimization passes also apply.
 ```text
 Oxc AST -> build -> promote -> simplify -> canonical graph
         -> plan specialization -> inline -> simplify -> plan regions -> version
-        -> reuse loads -> hoist -> coercions and bit tests -> reuse loads -> hoist
-        -> views -> simplify -> numeric lowering -> memory lowering -> borrow
+        -> specialize accesses -> coercions and bit tests -> reuse loads -> hoist
+        -> numeric/array/typed checks -> shapes/properties -> views -> simplify
+        -> numeric lowering -> borrow -> OSR instrumentation
+        -> property/typed/metadata/numeric lowering -> representation/legalization
+        -> ownership planning -> array loads and slot stores
+        -> shared runtime emission -> scratch/cleanup/reference lowering
+        -> native backend, or Cranelift memory expansion -> CLIF
 ```
+
+`semantic/pipeline.rs` owns canonicalization, specialization rounds, optimization,
+continuation preparation, OSR instrumentation and preparation for runtime emission.
+The compiler selects the compilation mode and backend; the pipeline keeps the
+pass order and analysis refreshes together. Directory boundaries describe the
+purpose of a pass rather than a single point at which all its operations run:
+
+- `js/` contains language-specific rewrites: coercions, folding, comparisons,
+  array-method and constructor expansion, string splitting, and capture optimization.
+- `specialization/` contains feedback and call planning, inlining, read/write and
+  shape specialization, and cache assumptions. `regions/` contains region planning,
+  assumption placement, cost decisions, versioning, and region-specific hoisting.
+- `transforms/` contains structural SSA transformations and repair, simplification,
+  loop discovery, load reuse, and conversion simplification and placement.
+- `runtime/` exposes numeric operations, array checks, typed-array access, named
+  properties, views, and storage operations. Cleanup and reference lowering run
+  on the graph produced by shared runtime emission.
+- `cranelift.rs` expands indexed memory loads for CLIF; the native backend keeps
+  these compound loads.
+
+Typed accesses and metadata lower before representation assignment and ownership
+planning. Borrowed array element loads survive ownership planning, then expand
+alongside slot stores while preserving scheduled reference operations. Continuations
+use their own preparation sequence in the same pipeline module. Shared runtime
+emission in `emit/semantic_graph.rs` still expands calls, captures, observations,
+OSR protocols, cache-entry selection and other remaining runtime operations.
 
 Canonicalization, planning and optimization operate on the same `FunctionState`,
 containing the working graph, its facts, specialization plan, OSR plan and
@@ -1315,7 +1346,7 @@ their code IDs, before specialization or region copying. Emission optimizes a
 clone. The repository also records the originating compilation. Cross-source
 inlining preserves the callee's error locations and resolved closure code IDs.
 
-`semantic/specialize.rs` separates specialization requests, guard planning, and
+`semantic/specialization/calls.rs` separates specialization requests, guard planning, and
 application. The static producer recognizes global bindings and known local
 closures through their SSA definitions. Inlining substitutes ordinary argument
 values without numeric guards or type-based eligibility restrictions. The
@@ -1323,7 +1354,7 @@ planner bounds initial expansion to 128 callee instructions per caller, with at
 most 32 instructions per eligible callee. Recompilation multiplies both limits as described below. These counts use canonical semantic operations, including
 arguments, constants and scopes, but not block parameters or terminators.
 
-`semantic/inlining.rs` copies callee blocks, values, bindings and scopes, and
+`semantic/specialization/inlining.rs` copies callee blocks, values, bindings and scopes, and
 joins returns through a continuation parameter. Mutable global targets keep a
 code-identity guard and the original call as fallback. Direct local closure
 creation proves the code identity without a repeated guard, except when class

@@ -14,7 +14,7 @@ impl Graph {
     pub(in crate::jit) fn specialization_entries(
         &self,
         plan: &SpecializationPlan,
-        repository: &specialize::Repository,
+        repository: &super::specialization::calls::Repository,
         source: usize,
         site_name: impl Fn(crate::jit::profile::Site) -> String,
     ) -> std::collections::BTreeMap<String, String> {
@@ -671,7 +671,7 @@ impl fmt::Display for FunctionState {
 impl FunctionState {
     pub(in crate::jit) fn plan_report(
         &self,
-        repository: &super::specialize::Repository,
+        repository: &super::specialization::calls::Repository,
         source: usize,
         inline_multiplier: usize,
     ) -> String {
@@ -681,8 +681,9 @@ impl FunctionState {
         writeln!(
             out,
             "inline budget: {} instructions, {} per callee (multiplier {inline_multiplier})",
-            super::specialize::SPECIALIZATION_BUDGET.saturating_mul(inline_multiplier),
-            super::specialize::SPECIALIZATION_BODY_INSTS.saturating_mul(inline_multiplier)
+            super::specialization::calls::SPECIALIZATION_BUDGET.saturating_mul(inline_multiplier),
+            super::specialization::calls::SPECIALIZATION_BODY_INSTS
+                .saturating_mul(inline_multiplier)
         )
         .unwrap();
         let relevant = |site: &crate::jit::profile::Site| {

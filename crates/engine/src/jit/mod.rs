@@ -30,6 +30,6 @@ pub(crate) use compiler::{CompilationTier, CompiledFunction, Compiler, Recompile
 pub(crate) use entries::DirectEntries;
 pub use inspect::CompileOptions;
 pub(crate) use profile::{Profile, Recompiles};
-pub(crate) use semantic::specialize::DEFAULT_RECOMPILE_INLINE_MULTIPLIER;
+pub(crate) use semantic::specialization::calls::DEFAULT_RECOMPILE_INLINE_MULTIPLIER;
 pub(crate) use session::{LocalSlots, call};
 pub(crate) use tiering::Tiering;

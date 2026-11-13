@@ -1,7 +1,7 @@
 use crate::FxHashMap;
 
 use super::guards::Fact;
-use super::{Block, BlockData, Graph, Inst, Target, Terminator, TerminatorKind, Value};
+use super::{Block, BlockData, Graph, Inst, Op, Target, Terminator, TerminatorKind, Value};
 
 pub(super) struct Alternative<T> {
     pub(super) requirements: Vec<(Value, Fact)>,
@@ -95,4 +95,43 @@ pub(super) fn apply<T>(
         data.span,
         TerminatorKind::Jump(Target::new(fallback)),
     );
+}
+
+pub(super) fn append(
+    graph: &mut Graph,
+    source: &super::InstData,
+    block: super::Block,
+    op: Op,
+) -> super::Value {
+    let (inst, value) = graph.append(block, source.span, op, true);
+    graph.insts[inst].source_name = source.source_name;
+    value.unwrap()
+}
+
+pub(super) fn branch(
+    graph: &mut Graph,
+    inst: Inst,
+    block: Block,
+    condition: Value,
+    fallback: Block,
+) -> Block {
+    let fast = graph.blocks.push(BlockData::default());
+    graph.terminate(
+        block,
+        graph.insts[inst].span,
+        TerminatorKind::Branch(condition, Target::new(fast), Target::new(fallback)),
+    );
+    fast
+}
+
+pub(super) fn extend_regions(graph: &mut Graph, block: Block, first: usize) {
+    let added: Vec<_> = graph.blocks.keys().skip(first).collect();
+    if graph.cold.contains(&block) {
+        graph.cold.extend(added.iter().copied());
+    }
+    for region in graph.regions.values_mut() {
+        if region.blocks.contains(&block) {
+            region.blocks.extend(added.iter().copied());
+        }
+    }
 }

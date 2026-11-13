@@ -15,27 +15,8 @@ pub(in crate::jit) struct Body {
 
 impl Body {
     fn new(graph: Graph, outputs: usize) -> Self {
-        let mut function = super::FunctionState::new(graph, Vec::new(), true);
-        super::js::simplify(&mut function);
-        super::js::coercions(&mut function);
-        super::js::bit_tests(&mut function);
-        if super::typed_lowering::lower_arrays(&mut function) {
-            super::js::simplify(&mut function);
-            super::optimize::reuse_loads(&mut function);
-        }
-        super::optimize::views(&mut function);
-        super::js::simplify(&mut function);
-        function.invalidate_cfg();
-        super::transforms::trim(&mut function.graph);
-        super::transforms::remove_trivial_params(&mut function.graph);
-        function.ensure_facts();
-        let super::FunctionState {
-            mut graph,
-            facts,
-            mut notes,
-            ..
-        } = function;
-        super::borrow::borrows(&mut graph, &facts, &mut notes);
+        let super::FunctionState { graph, facts, .. } =
+            super::pipeline::prepare_continuation(graph);
         let result = facts
             .cfg
             .rpo
@@ -414,7 +395,7 @@ impl Pieces {
         self.shapes.get_or_insert_with(|| {
             let cfg = Cfg::new(graph);
             let live = liveness(graph, &cfg.rpo);
-            super::optimize::natural_loops(graph, &cfg)
+            super::transforms::loops::natural_loops(graph, &cfg)
                 .into_iter()
                 .map(|(header, body)| (header, Shape::new(graph, facts, &live, body)))
                 .collect()
@@ -473,7 +454,7 @@ impl Pieces {
         let start = result.blocks.push(BlockData::default());
         terminate(&mut result, start, TerminatorKind::Jump(entry.clone()));
         result.entry = start;
-        super::optimize::repair(&mut result, &definitions);
+        super::transforms::repair(&mut result, &definitions);
         let (mut extracted, inputs) = extract(&result, entry, self.facts.as_ref().unwrap())?;
         extracted.name = name;
         Ok(Piece {
@@ -587,7 +568,7 @@ mod tests {
             .unwrap();
         let graph = super::super::canonicalize_graph(graph, true).unwrap().graph;
         let cfg = Cfg::new(&graph);
-        let (header, body) = super::super::optimize::natural_loops(&graph, &cfg).remove(0);
+        let (header, body) = super::super::transforms::loops::natural_loops(&graph, &cfg).remove(0);
         let (pred, target) = body
             .iter()
             .find_map(|&block| {

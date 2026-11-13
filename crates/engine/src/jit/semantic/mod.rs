@@ -1,54 +1,42 @@
 mod access;
-mod arrays;
 mod available;
 mod borrow;
 pub(in crate::jit) mod boundary;
 mod build;
-mod caches;
-pub(in crate::jit) mod call_variants;
-mod comparisons;
-mod construction;
 pub(in crate::jit) mod continuation;
-mod conversions;
+pub(in crate::jit) mod cranelift;
 mod dispatch;
 pub(in crate::jit) mod facts;
 mod fresh;
 mod guards;
-mod inlining;
 mod js;
 mod legalize;
 mod listing;
 pub(in crate::jit) mod low_level;
-mod memory_lowering;
-pub(in crate::jit) mod ownership_lowering;
-pub(in crate::jit) mod selection;
-pub(in crate::jit) use memory_lowering::lower_memory_for_cranelift;
-pub(in crate::jit) mod cleanup;
-mod lowering;
-mod observations;
-mod optimize;
 pub(super) mod osr;
 pub(in crate::jit) mod ownership;
-pub(super) mod reads;
+mod pipeline;
 pub(in crate::jit) mod repr;
+pub(in crate::jit) mod runtime;
 pub(in crate::jit) mod scratch;
-mod shapes;
-pub(super) mod specialize;
-mod string_split;
+pub(in crate::jit) mod selection;
+pub(in crate::jit) mod specialization;
 pub(in crate::jit) mod suspension;
 mod transforms;
-mod typed_lowering;
-mod writes;
+
+pub(super) use pipeline::{
+    Versioning, canonical_for_emission, canonicalize_graph, lower_global, optimize_planned,
+    plan_canonical_with_budget,
+};
+#[cfg(test)]
+use pipeline::{analyze, optimize_canonical, plan_canonical};
 
 use crate::{FxHashMap, FxHashSet};
 use std::fmt;
 
 use cranelift_codegen::entity::{EntityRef, PrimaryMap, SecondaryMap};
-use oxc_ast::ast::{Expression, FormalParameters, Statement};
-use oxc_semantic::Scoping;
 use oxc_span::Span;
 use oxc_syntax::operator::BinaryOperator;
-use oxc_syntax::symbol::SymbolId;
 
 use super::effects::{
     ALLOCATION, CODE_READ, CODE_WRITE, Control, ERROR, Effects, GLOBAL_READ, GLOBAL_WRITE,
@@ -2205,12 +2193,12 @@ fn unsupported<T>(what: &str, span: Span) -> Result<T> {
 #[derive(Clone, Default, PartialEq, Eq)]
 pub(in crate::jit) struct SpecializationPlan {
     pub(in crate::jit) call_variants: Vec<(super::profile::Site, super::entries::VariantId)>,
-    pub(in crate::jit) inlines: Vec<specialize::Inline>,
-    pub(in crate::jit) reads: Vec<reads::Read>,
-    stores: Vec<reads::Read>,
-    pub(in crate::jit) shapes: shapes::Plan,
+    pub(in crate::jit) inlines: Vec<specialization::calls::Inline>,
+    pub(in crate::jit) reads: Vec<specialization::reads::Read>,
+    stores: Vec<specialization::reads::Read>,
+    pub(in crate::jit) shapes: specialization::shapes::Plan,
     pub(in crate::jit) numbers: Vec<(super::profile::Site, super::profile::ReadType)>,
-    pub(in crate::jit) conditional: specialize::ConditionalPlan,
+    pub(in crate::jit) conditional: specialization::calls::ConditionalPlan,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -2285,469 +2273,6 @@ impl FunctionState {
     fn invalidate_effects(&mut self) {
         self.facts_level = self.facts_level.min(FactsLevel::Values);
     }
-
-    pub(in crate::jit) fn lower_memory(&mut self) -> Result<()> {
-        let typed = typed_lowering::lower_memory(self);
-        let metadata = memory_lowering::lower_metadata(self);
-        if typed || metadata {
-            self.graph.verify()?;
-            self.ensure_facts();
-            borrow::borrows(&mut self.graph, &self.facts, &mut self.notes);
-        }
-        Ok(())
-    }
-
-    pub(in crate::jit) fn prepare_for_emission(&mut self) -> Result<()> {
-        if lowering::properties::lower(self)? {
-            self.ensure_facts();
-            borrow::borrows(&mut self.graph, &self.facts, &mut self.notes);
-        }
-        self.lower_memory()?;
-        if lowering::numeric::operations(self) {
-            self.ensure_facts();
-            borrow::borrows(&mut self.graph, &self.facts, &mut self.notes);
-        }
-        self.ensure_facts();
-        repr::assign(&mut self.graph, &self.facts);
-        legalize::legalize(&mut self.graph, &mut self.facts);
-        conversions::simplify(&mut self.graph, &self.facts);
-        conversions::hoist(&mut self.graph, &self.facts);
-        self.graph.verify()?;
-        let plan = ownership::plan(&mut self.graph, &mut self.facts);
-        if cfg!(debug_assertions) {
-            ownership::verify(&self.graph, &self.facts, &plan)?;
-        }
-        self.graph.ownership = Some(plan);
-        memory_lowering::lower_array_loads(self);
-        memory_lowering::lower_stores(self);
-        self.graph.verify()?;
-        Ok(())
-    }
-
-    pub(in crate::jit) fn prepare_osr(&mut self, source: usize) -> Result<()> {
-        self.osr = osr::Plan::discover(&self.graph, source).map(std::sync::Arc::new);
-        if let Some(plan) = self.osr.clone() {
-            self.invalidate_cfg();
-            plan.instrument(&mut self.graph)?;
-            self.ensure_facts();
-            borrow::borrows(&mut self.graph, &self.facts, &mut self.notes);
-        }
-        Ok(())
-    }
-}
-
-pub(super) fn lower_global(
-    statements: &[Statement<'_>],
-    span: Span,
-    scoping: &Scoping,
-    captured: &FxHashSet<SymbolId>,
-    closures: &FxHashMap<u32, (cranelift_module::FuncId, Vec<SymbolId>, bool)>,
-    arguments_references: &FxHashMap<u32, SymbolId>,
-    ssa_opt: bool,
-    continuations: bool,
-    report_regions: bool,
-) -> Result<FunctionState> {
-    let graph = build::lower_global(
-        statements,
-        span,
-        scoping,
-        captured,
-        closures,
-        arguments_references,
-    )?;
-    let mut function = FunctionState::new(graph, Vec::new(), ssa_opt);
-    canonicalize(&mut function)?;
-    let planned = plan_canonical(function, ssa_opt, None)?;
-    let versioning = Versioning::Speculate {
-        fallback: None,
-        continuations,
-    };
-    optimize_planned(planned, versioning, report_regions)
-}
-
-pub(super) fn canonical_for_emission(
-    params: &FormalParameters<'_>,
-    statements: &[Statement<'_>],
-    expression: Option<&Expression<'_>>,
-    span: Span,
-    scoping: &Scoping,
-    captured: &FxHashSet<SymbolId>,
-    captures: &[SymbolId],
-    closures: &FxHashMap<u32, (cranelift_module::FuncId, Vec<SymbolId>, bool)>,
-    arguments_binding: Option<SymbolId>,
-    arguments_references: &FxHashMap<u32, SymbolId>,
-    generator: bool,
-    ssa_opt: bool,
-) -> Result<FunctionState> {
-    let graph = build::lower_parts(
-        params,
-        statements,
-        expression,
-        span,
-        scoping,
-        captured,
-        captures,
-        closures,
-        arguments_binding,
-        arguments_references,
-        generator,
-    )?;
-    let mut function = FunctionState::new(graph, Vec::new(), ssa_opt);
-    canonicalize(&mut function)?;
-    Ok(function)
-}
-
-#[cfg(test)]
-pub(super) fn analyze(
-    function: &oxc_ast::ast::Function<'_>,
-    scoping: &Scoping,
-    captured: &FxHashSet<SymbolId>,
-) -> Result<FunctionState> {
-    optimize_graph(build::lower(function, scoping, captured)?, true)
-}
-
-fn canonicalize(function: &mut FunctionState) -> Result<()> {
-    if !function.optimize {
-        return Ok(());
-    }
-    function.invalidate_cfg();
-    transforms::promote(&mut function.graph, &mut function.notes);
-    function.graph.verify()?;
-    js::typeof_comparisons(&mut function.graph);
-    js::simplify(function);
-    function.graph.verify()
-}
-
-pub(in crate::jit) fn canonicalize_graph(graph: Graph, ssa_opt: bool) -> Result<FunctionState> {
-    let mut function = FunctionState::new(graph, Vec::new(), ssa_opt);
-    canonicalize(&mut function)?;
-    Ok(function)
-}
-
-#[cfg(test)]
-fn optimize_graph(graph: Graph, ssa_opt: bool) -> Result<FunctionState> {
-    optimize_canonical(canonicalize_graph(graph, ssa_opt)?, ssa_opt, None)
-}
-
-#[cfg(test)]
-pub(super) fn optimize_canonical(
-    function: FunctionState,
-    ssa_opt: bool,
-    specialization: Option<(&specialize::Repository, usize)>,
-) -> Result<FunctionState> {
-    optimize_planned(
-        plan_canonical(function, ssa_opt, specialization)?,
-        Versioning::Speculate {
-            fallback: None,
-            continuations: true,
-        },
-        false,
-    )
-}
-
-#[derive(Default)]
-struct Expansions {
-    arrays: FxHashSet<Inst>,
-    constructors: FxHashSet<Inst>,
-    splits: FxHashSet<Inst>,
-}
-
-impl Expansions {
-    fn calls(&mut self, graph: &mut Graph, source: usize, notes: &mut Vec<String>) -> Result<()> {
-        arrays::expand(graph, source, notes, &mut self.arrays)?;
-        string_split::expand(graph, &mut self.splits);
-        Ok(())
-    }
-
-    fn constructors(&mut self, graph: &mut Graph) {
-        construction::resolve(graph);
-        construction::expand(graph, &mut self.constructors);
-    }
-}
-
-pub(super) fn plan_canonical(
-    function: FunctionState,
-    ssa_opt: bool,
-    specialization: Option<(&specialize::Repository, usize)>,
-) -> Result<FunctionState> {
-    plan_canonical_with_budget(function, ssa_opt, specialization, 1)
-}
-
-pub(super) fn plan_canonical_with_budget(
-    function: FunctionState,
-    ssa_opt: bool,
-    specialization: Option<(&specialize::Repository, usize)>,
-    inline_multiplier: usize,
-) -> Result<FunctionState> {
-    plan_canonical_inner(function, ssa_opt, specialization, inline_multiplier, true)
-}
-
-fn plan_canonical_inner(
-    mut function: FunctionState,
-    ssa_opt: bool,
-    specialization: Option<(&specialize::Repository, usize)>,
-    inline_multiplier: usize,
-    select_call_variants: bool,
-) -> Result<FunctionState> {
-    function.optimize = ssa_opt && !function.graph.has_handlers && !function.graph.generator;
-    if !function.optimize {
-        return Ok(function);
-    }
-    let mut inline_budget = specialize::Budget::new(inline_multiplier);
-    let mut expansions = Expansions::default();
-    if let Some((bodies, source)) = specialization {
-        function.invalidate_cfg();
-        expansions.calls(&mut function.graph, source, &mut function.notes)?;
-        let requests = specialize::requests(&function.graph, bodies, source, &inline_budget);
-        let plan = specialize::plan_round(
-            &function.graph,
-            bodies,
-            source,
-            &requests,
-            &mut inline_budget,
-        );
-        specialize::apply(
-            &mut function.graph,
-            bodies,
-            source,
-            plan,
-            &mut function.notes,
-        )?;
-        js::simplify(&mut function);
-        function.invalidate_cfg();
-        expansions.calls(&mut function.graph, source, &mut function.notes)?;
-        function.graph.verify()?;
-    }
-    function.invalidate_cfg();
-    expansions.constructors(&mut function.graph);
-    if let Some((bodies, source)) = specialization {
-        for _ in 0..specialize::SPECIALIZATION_ROUNDS {
-            let requests = specialize::requests(&function.graph, bodies, source, &inline_budget);
-            let plan = specialize::plan_round(
-                &function.graph,
-                bodies,
-                source,
-                &requests,
-                &mut inline_budget,
-            );
-            if plan.is_empty() {
-                break;
-            }
-            function.invalidate_cfg();
-            specialize::apply(
-                &mut function.graph,
-                bodies,
-                source,
-                plan,
-                &mut function.notes,
-            )?;
-            js::simplify(&mut function);
-            function.invalidate_cfg();
-            expansions.calls(&mut function.graph, source, &mut function.notes)?;
-            expansions.constructors(&mut function.graph);
-            function.graph.verify()?;
-        }
-    }
-    function.invalidate_effects();
-    if let Some((bodies, _)) = specialization {
-        specialize::install_summaries(&mut function.graph, bodies, &mut function.notes);
-    }
-    function.invalidate_values();
-    let mut call_variants = Vec::new();
-    if let Some((bodies, source)) = specialization {
-        specialize::direct_calls(&mut function.graph, bodies, source);
-        if select_call_variants {
-            call_variants = call_variants::apply(&mut function.graph, bodies, source)?;
-        }
-    }
-    let numbers = observations::plan(&mut function.graph, specialization);
-    let reads = specialization.map_or_else(Vec::new, |(bodies, source)| {
-        reads::plan(&function.graph, bodies, source)
-    });
-    let stores = specialization.map_or_else(Vec::new, |(bodies, source)| {
-        reads::plan_stores(&function.graph, bodies, source)
-    });
-    let shapes = specialization.map_or_else(shapes::Plan::default, |(bodies, source)| {
-        shapes::plan(&function.graph, bodies, source)
-    });
-    let mut conditional = specialization
-        .map_or_else(specialize::ConditionalPlan::default, |(bodies, _)| {
-            specialize::conditional_plan(&function.graph, bodies, &mut function.notes)
-        });
-    if let Some((bodies, source)) = specialization {
-        conditional.native_calls =
-            arrays::push_calls(&mut function.graph, bodies, source, &mut function.notes)?;
-    }
-    function.plan = SpecializationPlan {
-        call_variants,
-        conditional,
-        inlines: inline_budget.inlines,
-        reads,
-        stores,
-        shapes,
-        numbers,
-    };
-    Ok(function)
-}
-
-#[derive(Clone, Copy)]
-pub(super) enum Versioning {
-    Generic,
-    Speculate {
-        fallback: Option<usize>,
-        continuations: bool,
-    },
-}
-
-pub(super) fn optimize_planned(
-    mut function: FunctionState,
-    versioning: Versioning,
-    report_regions: bool,
-) -> Result<FunctionState> {
-    if !function.optimize {
-        function.ensure_facts();
-        return Ok(function);
-    }
-    function.graph.entry_guards.clear();
-    function.invalidate_cfg();
-    function.graph.megamorphic_gets = function
-        .plan
-        .shapes
-        .megamorphic_sites()
-        .iter()
-        .copied()
-        .collect();
-    let cached_reads = caches::assume(&mut function.graph, &function.plan.shapes);
-    reads::assume(&mut function.graph, &function.plan.reads);
-    reads::assume(&mut function.graph, &function.plan.stores);
-    optimize::sink_closures(&mut function);
-    if optimize::lazy_captures(&mut function) {
-        function.invalidate_cfg();
-        transforms::promote(&mut function.graph, &mut function.notes);
-        js::simplify(&mut function);
-    }
-    function.graph.verify()?;
-    optimize::forward_captured_parameters(&mut function);
-    function.graph.verify()?;
-    function.invalidate_cfg();
-    let regions = match versioning {
-        Versioning::Generic => Vec::new(),
-        Versioning::Speculate {
-            fallback,
-            continuations,
-        } => {
-            let mut regions = optimize::version_with_report(
-                &mut function.graph,
-                &function.plan.conditional,
-                fallback,
-                continuations,
-                &mut function.notes,
-                report_regions,
-                &function.plan.shapes,
-            )?;
-            function.graph.verify()?;
-            if regions.is_empty() {
-                regions.extend(optimize::version_string_leaves(
-                    &mut function.graph,
-                    continuations,
-                    &mut function.notes,
-                )?);
-            }
-            regions
-        }
-    };
-    if report_regions {
-        for (id, region) in &function.graph.regions {
-            let mut blocks: Vec<_> = region.blocks.iter().copied().collect();
-            blocks.sort();
-            let blocks = blocks
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ");
-            let fallback = match region.fallback {
-                Some(RegionFallback::Region(id)) => id.to_string(),
-                Some(RegionFallback::CompiledEntry(address)) => {
-                    format!("compiled entry {address:#x}")
-                }
-                None => "none".into(),
-            };
-            function
-                .notes
-                .push(format!("{id}: blocks [{blocks}], fallback {fallback}"));
-        }
-    }
-    function.graph.strip_assumes();
-    caches::lower(&mut function.graph, &cached_reads)?;
-    reads::lower(
-        &mut function.graph,
-        &function.plan.reads,
-        &mut function.notes,
-    )?;
-    writes::lower(&mut function.graph, &function.plan.stores)?;
-    function.invalidate_cfg();
-    optimize::normalise_regions(&mut function, &regions)?;
-    js::coercions(&mut function);
-    js::bit_tests(&mut function);
-    function.graph.verify()?;
-    optimize::reuse_loads(&mut function);
-    function.graph.verify()?;
-    for region in &regions {
-        optimize::hoist(&mut function, *region);
-        function.graph.verify()?;
-    }
-    if typed_lowering::lower(&mut function)? {
-        js::simplify(&mut function);
-        optimize::reuse_loads(&mut function);
-    }
-    function.invalidate_cfg();
-    shapes::apply(
-        &mut function.graph,
-        &function.plan.shapes,
-        &mut function.notes,
-    )?;
-    if !function.plan.shapes.polymorphic_reads().is_empty()
-        || function
-            .graph
-            .insts
-            .values()
-            .any(|data| matches!(data.op, Op::EntryAssume(_, guards::Fact::Shape(_))))
-    {
-        optimize::reuse_loads(&mut function);
-    }
-    if lowering::properties::lower(&mut function)? {
-        optimize::reuse_loads(&mut function);
-    }
-    if typed_lowering::lower_array_kinds(&mut function) {
-        optimize::reuse_loads(&mut function);
-    }
-    optimize::views(&mut function);
-    comparisons::expose(&mut function);
-    function.graph.verify()?;
-    js::simplify(&mut function);
-    function.graph.verify()?;
-    optimize::sink_closures(&mut function);
-    optimize::lazy_captures(&mut function);
-    function.graph.verify()?;
-    function.invalidate_cfg();
-    string_split::forward_packs(&mut function.graph);
-    transforms::trim(&mut function.graph);
-    transforms::remove_trivial_params(&mut function.graph);
-    function.graph.verify()?;
-    for region in &regions {
-        optimize::hoist(&mut function, *region);
-        function.graph.verify()?;
-    }
-    if lowering::numeric::lower(&mut function) {
-        optimize::reuse_loads(&mut function);
-        for region in &regions {
-            optimize::hoist(&mut function, *region);
-            function.graph.verify()?;
-        }
-    }
-    function.ensure_facts();
-    borrow::borrows(&mut function.graph, &function.facts, &mut function.notes);
-    Ok(function)
 }
 
 #[cfg(test)]

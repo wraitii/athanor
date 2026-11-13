@@ -1,8 +1,15 @@
+use super::js::comparisons;
+use super::runtime::{arrays as array_checks, numeric, properties, storage, typed, views};
+use super::specialization::{
+    caches, call_variants, calls, observations, reads, regions, shapes, writes,
+};
+use super::transforms::{conversions, loops, reuse};
 use super::*;
 use crate::FxHashSet;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::Statement;
 use oxc_parser::Parser;
+use oxc_semantic::Scoping;
 use oxc_span::SourceType;
 
 fn with_function<T>(
@@ -232,7 +239,7 @@ fn comparisons_share_number_checks_with_refined_reads_without_splitting() {
                 .flatten()
         })
         .unwrap();
-    let mut bodies = specialize::Repository::default();
+    let mut bodies = calls::Repository::default();
     for data in graph.insts.values() {
         if matches!(data.op, Op::GetIndex(..)) {
             bodies.read_feedback.insert(
@@ -286,7 +293,7 @@ fn late_number_facts_remove_refinement_guards_and_assertions() {
                 .flatten()
         })
         .unwrap();
-    let mut bodies = specialize::Repository::default();
+    let mut bodies = calls::Repository::default();
     for data in graph.insts.values() {
         if matches!(data.op, Op::GetIndex(..)) {
             bodies.read_feedback.insert(
@@ -423,7 +430,7 @@ fn array_reads_are_reused_and_probed_without_implicit_views() {
     }
     let viewed = canonical.graph.clone();
     let mut function = FunctionState::new(viewed, Vec::new(), true);
-    optimize::views(&mut function);
+    views::views(&mut function);
     let viewed = function.graph;
     assert!(
         viewed
@@ -455,7 +462,7 @@ fn indexed_rows_borrow_from_owned_receivers_through_guards() {
             "function f(owner,n){{const height=owner.height;let sum=0;for(let i=0;i<n;++i){{const row=height[i&1];{body}}}return sum;}}"
         );
         let canonical = canonicalize_graph(lower_source(&source).unwrap(), true).unwrap();
-        let mut repository = specialize::Repository::default();
+        let mut repository = calls::Repository::default();
         for data in canonical.graph.insts.values() {
             if !matches!(data.op, Op::GetIndex(..)) {
                 continue;
@@ -505,7 +512,7 @@ fn guard_only_region_borrows_rows_without_entry_assumptions() {
     let source =
         "function f(height){let sum=0;for(let i=0;i<8;++i)sum+=height[i][0]/1;return sum;}";
     let canonical = canonicalize_graph(lower_source(source).unwrap(), true).unwrap();
-    let mut repository = specialize::Repository::default();
+    let mut repository = calls::Repository::default();
     for data in canonical.graph.insts.values() {
         if !matches!(data.op, Op::GetIndex(..)) {
             continue;
@@ -566,7 +573,7 @@ fn typed_loop_reads_are_reused_before_inner_loop_versioning() {
         .filter(|data| matches!(data.op, Op::GetIndex(..)))
         .min_by_key(|data| data.span.start)
         .unwrap();
-    let mut bodies = specialize::Repository::default();
+    let mut bodies = calls::Repository::default();
     bodies.read_feedback.insert(
         (
             crate::jit::profile::Site {
@@ -881,9 +888,9 @@ fn capture_cell_writes_preserve_guarded_globals_and_properties() {
     graph.bindings[binding].captured = true;
     let canonical = canonicalize_graph(graph, true).unwrap();
     let mut graph = canonical.graph.clone();
-    let regions = optimize::version(
+    let regions = regions::version(
         &mut graph,
-        &specialize::ConditionalPlan::default(),
+        &calls::ConditionalPlan::default(),
         None,
         &mut Vec::new(),
     )
@@ -1063,7 +1070,7 @@ fn unsupported_numeric_reads_are_not_observed_again() {
             _ => None,
         })
         .unwrap();
-    let mut repository = specialize::Repository::default();
+    let mut repository = calls::Repository::default();
     let site = Site { source: 7, ..site };
     repository
         .read_feedback
@@ -1120,7 +1127,7 @@ fn checked_typed_reads_expose_shared_numeric_checks() {
     }
     let previous_insts = graph.insts.len();
     let mut function = FunctionState::new(graph, Vec::new(), true);
-    assert!(typed_lowering::lower(&mut function).unwrap());
+    assert!(typed::lower(&mut function).unwrap());
     let graph = function.graph;
     let cfg = Cfg::new(&graph);
     assert!(
@@ -1165,7 +1172,7 @@ fn checked_typed_reads_expose_shared_numeric_checks() {
         ));
     }
     let mut function = FunctionState::new(graph, Vec::new(), true);
-    optimize::reuse_loads(&mut function);
+    reuse::reuse_loads(&mut function);
     let graph = function.graph;
     graph.verify().unwrap();
     let ops: Vec<_> = Cfg::new(&graph)
@@ -1237,7 +1244,7 @@ fn integer_typed_read_skips_exactness_roundtrip() {
         },
     );
     let mut function = FunctionState::new(graph, Vec::new(), true);
-    assert!(typed_lowering::lower(&mut function).unwrap());
+    assert!(typed::lower(&mut function).unwrap());
     let graph = function.graph;
     assert!(matches!(
         graph.insts[inst].op,
@@ -1301,7 +1308,7 @@ fn undefined_comparisons_refine_typed_read_results() {
             "{source}: {types}"
         );
         let mut lowered = FunctionState::from_graph(graph.clone());
-        lowering::numeric::operations(&mut lowered);
+        numeric::operations(&mut lowered);
         lowered.graph.verify().unwrap();
         assert_eq!(Facts::compute(&lowered.graph).of(result), types, "{source}");
     }
@@ -1451,9 +1458,9 @@ fn unchanged_hoisting_preserves_facts() {
         fallback: None,
     });
     function.ensure_facts();
-    assert!(!optimize::natural_loops(&function.graph, &function.facts.cfg).is_empty());
+    assert!(!loops::natural_loops(&function.graph, &function.facts.cfg).is_empty());
     let fresh = function.facts.fresh(&function.graph);
-    optimize::hoist(&mut function, region);
+    regions::hoist(&mut function, region);
     function.ensure_facts();
     assert!(std::rc::Rc::ptr_eq(
         &fresh,
@@ -1541,7 +1548,7 @@ fn trusted_shapes_expire_after_writes_and_reentry() {
             );
         }
         function.invalidate_cfg();
-        optimize::reuse_loads(&mut function);
+        reuse::reuse_loads(&mut function);
         function.graph.verify().unwrap();
         assert_eq!(
             ops(&function.graph)
@@ -1560,7 +1567,7 @@ fn trusted_input_shapes_remove_redundant_callee_checks() {
         true,
     )
     .unwrap();
-    let mut repository = specialize::Repository::default();
+    let mut repository = calls::Repository::default();
     for block in Cfg::new(&function.graph).rpo {
         for &inst in &function.graph.blocks[block].insts {
             let data = &function.graph.insts[inst];
@@ -1625,7 +1632,7 @@ fn caller_shapes_select_useful_polymorphic_callee_contracts() {
         ),
     ] {
         let function = canonicalize_graph(lower_source(source).unwrap(), true).unwrap();
-        let mut repository = specialize::Repository::default();
+        let mut repository = calls::Repository::default();
         for block in Cfg::new(&function.graph).rpo {
             for &inst in &function.graph.blocks[block].insts {
                 let data = &function.graph.insts[inst];
@@ -1714,7 +1721,7 @@ fn call_variant_contracts_only_lift_entry_guards() {
     ] {
         let function = canonicalize_graph(lower_source(source).unwrap(), true).unwrap();
         assert_eq!(
-            call_variants::requirements(function, &specialize::Repository::default(), 0).unwrap(),
+            call_variants::requirements(function, &calls::Repository::default(), 0).unwrap(),
             expected,
             "{source}"
         );
@@ -1740,7 +1747,7 @@ fn call_variant_contracts_do_not_lift_shape_guards_after_reentry() {
         ),
     ] {
         let function = canonicalize_graph(lower_source(source).unwrap(), true).unwrap();
-        let mut repository = specialize::Repository::default();
+        let mut repository = calls::Repository::default();
         for block in Cfg::new(&function.graph).rpo {
             for &inst in &function.graph.blocks[block].insts {
                 let data = &function.graph.insts[inst];
@@ -1775,7 +1782,7 @@ fn call_variant_contracts_respect_disabled_numeric_speculation() {
     use crate::jit::profile::{ReadKind, ReadType, Site};
     let function =
         canonicalize_graph(lower_source("function f(x){return x*2;}").unwrap(), true).unwrap();
-    let mut repository = specialize::Repository::default();
+    let mut repository = calls::Repository::default();
     for block in Cfg::new(&function.graph).rpo {
         for &inst in &function.graph.blocks[block].insts {
             let data = &function.graph.insts[inst];
@@ -1822,7 +1829,7 @@ fn arithmetic_lowering_preserves_value_contracts_before_legalization() {
             panic!()
         };
         let mut function = FunctionState::new(graph, Vec::new(), true);
-        assert!(lowering::numeric::arithmetic(&mut function), "{expression}");
+        assert!(numeric::arithmetic(&mut function), "{expression}");
         let Some(Op::LowLevel(low_level::Op::Binary { op, .. })) =
             function.graph.defining_op(result)
         else {
@@ -1833,7 +1840,7 @@ fn arithmetic_lowering_preserves_value_contracts_before_legalization() {
             std::mem::discriminant(&expected)
         );
         assert!(function.graph.reprs.values().all(Option::is_none));
-        assert!(!lowering::numeric::arithmetic(&mut function));
+        assert!(!numeric::arithmetic(&mut function));
         function.ensure_facts();
         let types = if expected.is_float() {
             ValueType::NUMBER
@@ -1848,7 +1855,7 @@ fn arithmetic_lowering_preserves_value_contracts_before_legalization() {
 
     let graph = lower_source("function f(a,b){return a+b;}").unwrap();
     let mut function = FunctionState::new(graph, Vec::new(), true);
-    assert!(!lowering::numeric::arithmetic(&mut function));
+    assert!(!numeric::arithmetic(&mut function));
     assert!(
         ops(&function.graph)
             .iter()
@@ -1885,8 +1892,8 @@ fn lowered_comparisons_and_steps_preserve_loop_facts() {
         for &step in &steps {
             assert_eq!(function.facts.of(step), ValueType::INT32, "{source}");
         }
-        assert!(lowering::numeric::operations(&mut function));
-        assert!(!lowering::numeric::operations(&mut function));
+        assert!(numeric::operations(&mut function));
+        assert!(!numeric::operations(&mut function));
         function.ensure_values();
         for step in steps {
             assert_eq!(function.facts.of(step), ValueType::INT32, "{source}");
@@ -1939,8 +1946,8 @@ fn numeric_lowering_reuses_guard_conversions_across_calls() {
     graph.terminate(success, span, TerminatorKind::Return(product));
     graph.terminate(fallback, span, TerminatorKind::Return(value));
     let mut function = FunctionState::new(graph, Vec::new(), true);
-    lowering::numeric::lower(&mut function);
-    optimize::reuse_loads(&mut function);
+    numeric::lower(&mut function);
+    reuse::reuse_loads(&mut function);
     function.graph.verify().unwrap();
     function.ensure_values();
     assert_eq!(function.facts.of(integer), ValueType::INT64);
@@ -1975,8 +1982,8 @@ fn hoisting_moves_constant_arithmetic_and_lowered_conversions() {
     ] {
         let mut graph = lower_source("function f(a){while(a){a=a.next;}return a;}").unwrap();
         let cfg = Cfg::new(&graph);
-        let (header, body) = optimize::natural_loops(&graph, &cfg).pop().unwrap();
-        let preheader = optimize::preheader(&graph, &cfg, header, &body).unwrap();
+        let (header, body) = loops::natural_loops(&graph, &cfg).pop().unwrap();
+        let preheader = loops::preheader(&graph, &cfg, header, &body).unwrap();
         let block = *body.iter().find(|&&block| block != header).unwrap();
         let span = graph.span;
         let input = graph.append_value(preheader, span, Op::Argument(1));
@@ -1988,9 +1995,9 @@ fn hoisting_moves_constant_arithmetic_and_lowered_conversions() {
             blocks: function.graph.blocks.keys().collect(),
             fallback: None,
         });
-        lowering::numeric::lower(&mut function);
-        optimize::reuse_loads(&mut function);
-        optimize::hoist(&mut function, region);
+        numeric::lower(&mut function);
+        reuse::reuse_loads(&mut function);
+        regions::hoist(&mut function, region);
         function.graph.verify().unwrap();
         let graph = &function.graph;
         assert_eq!(graph.def_block(factor), preheader);
@@ -2040,8 +2047,8 @@ fn array_kind_reuse_stops_at_calls_and_writes() {
             graph.append_value(block, span, Op::IsArray(object, super::ArrayLayout::Packed));
         graph.terminate(block, span, TerminatorKind::Return(result));
         let mut function = FunctionState::new(graph, Vec::new(), true);
-        typed_lowering::lower_array_kinds(&mut function);
-        optimize::reuse_loads(&mut function);
+        array_checks::lower_array_kinds(&mut function);
+        reuse::reuse_loads(&mut function);
         function.graph.verify().unwrap();
         assert_eq!(
             ops(&function.graph)
@@ -2057,8 +2064,8 @@ fn array_kind_reuse_stops_at_calls_and_writes() {
 fn array_metadata_uses_shared_loop_views() {
     let mut graph = lower_source("function f(a){while(a){a=a.next;}return a;}").unwrap();
     let cfg = Cfg::new(&graph);
-    let (header, body) = optimize::natural_loops(&graph, &cfg).pop().unwrap();
-    let preheader = optimize::preheader(&graph, &cfg, header, &body).unwrap();
+    let (header, body) = loops::natural_loops(&graph, &cfg).pop().unwrap();
+    let preheader = loops::preheader(&graph, &cfg, header, &body).unwrap();
     let block = *body.iter().find(|&&block| block != header).unwrap();
     let span = graph.span;
     let object = graph.append_value(preheader, span, Op::Argument(1));
@@ -2066,9 +2073,9 @@ fn array_metadata_uses_shared_loop_views() {
     graph.append_value(block, span, Op::IsArray(object, super::ArrayLayout::Holey));
     graph.append_value(block, span, Op::IndexedLength(object));
     let mut function = FunctionState::new(graph, Vec::new(), true);
-    typed_lowering::lower_array_kinds(&mut function);
-    optimize::reuse_loads(&mut function);
-    optimize::views(&mut function);
+    array_checks::lower_array_kinds(&mut function);
+    reuse::reuse_loads(&mut function);
+    views::views(&mut function);
     function.graph.verify().unwrap();
     let views: Vec<_> = function
         .graph
@@ -2150,7 +2157,7 @@ fn hoisting_distinguishes_pure_unknown_reads_and_ordered_operations() {
             blocks: function.graph.blocks.keys().collect(),
             fallback: None,
         });
-        optimize::hoist(&mut function, region);
+        regions::hoist(&mut function, region);
         function.graph.verify().unwrap();
         assert_eq!(
             function.graph.def_block(unknown),
@@ -2225,7 +2232,7 @@ fn property_lowering_exposes_named_reads_and_leaves_computed_reads_generic() {
         .unwrap()
         .graph;
     let mut function = FunctionState::new(graph, Vec::new(), true);
-    assert!(lowering::properties::lower(&mut function).unwrap());
+    assert!(properties::lower(&mut function).unwrap());
     function.graph.verify().unwrap();
     let operations = ops(&function.graph);
     assert!(!operations.iter().any(|op| matches!(op, Op::Get(..))));
@@ -2251,7 +2258,7 @@ fn property_lowering_exposes_named_reads_and_leaves_computed_reads_generic() {
     );
     assert!(operations.iter().any(|op| matches!(op, Op::GetIndex(..))));
     assert!(!operations.iter().any(|op| matches!(op, Op::ArrayLoad(..))));
-    assert!(!lowering::properties::lower(&mut function).unwrap());
+    assert!(!properties::lower(&mut function).unwrap());
     function.prepare_for_emission().unwrap();
 }
 
@@ -2311,7 +2318,7 @@ fn array_storage_lowering_preserves_planned_ownership() {
                         .then_some(inst)
                 })
                 .collect();
-            memory_lowering::lower_array_loads(&mut function);
+            storage::lower_array_loads(&mut function);
             function.graph.verify().unwrap();
             assert_eq!(function.graph.repr(result), Repr::Boxed);
             assert_eq!(retained(&function.graph), mutate);
@@ -2381,7 +2388,7 @@ fn typed_loads_lower_to_explicit_memory_operations() {
             },
         );
         let mut function = FunctionState::new(graph, Vec::new(), true);
-        assert!(typed_lowering::lower_memory(&mut function));
+        assert!(typed::lower_memory(&mut function));
         let graph = function.graph;
         graph.verify().unwrap();
         let Op::MemoryNumber(raw, actual) = graph.insts[inst].op else {
@@ -2398,7 +2405,7 @@ fn typed_loads_lower_to_explicit_memory_operations() {
                 .any(|&i| matches!(graph.insts[i].op, Op::KeepAlive(value) if value == object))
         );
         let mut fallback = graph.clone();
-        lower_memory_for_cranelift(&mut fallback);
+        cranelift::lower_memory(&mut fallback);
         fallback.verify().unwrap();
         assert!(
             matches!(fallback.defining_op(raw), Some(Op::Memory(MemoryOp::Load { format: actual, .. })) if *actual == format)
@@ -3031,7 +3038,7 @@ fn conversion_hoisting_keeps_heap_values_inside_the_loop() {
     graph.reprs[constant] = Some(Repr::I32);
     graph.reprs[argument] = Some(Repr::Boxed);
     let facts = Facts::compute(&graph);
-    let header = optimize::natural_loops(&graph, &facts.cfg)[0].0;
+    let header = loops::natural_loops(&graph, &facts.cfg)[0].0;
     let (scalar, scalar_value) =
         graph.append(header, graph.span, Op::Convert(constant, Repr::F64), true);
     let (unknown, unknown_value) =
@@ -3120,7 +3127,7 @@ fn cache_entry_guards_preserve_receiver_proofs() {
         );
         let reads = caches::assume(&mut graph, &shapes::Plan::default());
         let regions =
-            optimize::version(&mut graph, &Default::default(), Some(1), &mut Vec::new()).unwrap();
+            regions::version(&mut graph, &Default::default(), Some(1), &mut Vec::new()).unwrap();
         assert!(!regions.is_empty());
         assert_eq!(
             ops(&graph).iter().any(|op| matches!(op, Op::AsObject(..))),
@@ -3203,7 +3210,7 @@ fn write_lowering_keeps_generic_keys_and_materializes_selected_stores() {
         Some(TypedKind::Float64),
     ] {
         let mut graph = graph.clone();
-        let mut repository = specialize::Repository::default();
+        let mut repository = calls::Repository::default();
         repository.read_feedback.insert(
             (
                 crate::jit::profile::Site {
@@ -3229,8 +3236,8 @@ fn write_lowering_keeps_generic_keys_and_materializes_selected_stores() {
             element.is_none()
         );
         let mut function = FunctionState::new(graph, Vec::new(), true);
-        typed_lowering::lower(&mut function).unwrap();
-        typed_lowering::lower_array_kinds(&mut function);
+        typed::lower(&mut function).unwrap();
+        array_checks::lower_array_kinds(&mut function);
         function.prepare_for_emission().unwrap();
         assert!(
             !ops(&function.graph)
@@ -3266,7 +3273,7 @@ fn property_write_lowering_exposes_addition_and_overwrite() {
     .unwrap()
     .graph;
     let mut function = FunctionState::new(graph, Vec::new(), true);
-    assert!(lowering::properties::lower(&mut function).unwrap());
+    assert!(properties::lower(&mut function).unwrap());
     let operations = ops(&function.graph);
     assert!(!operations.iter().any(|op| matches!(op, Op::Set(..))));
     assert!(
@@ -3284,7 +3291,7 @@ fn property_write_lowering_exposes_addition_and_overwrite() {
             .iter()
             .any(|op| matches!(op, Op::FillPropertyStore(..)))
     );
-    assert!(!lowering::properties::lower(&mut function).unwrap());
+    assert!(!properties::lower(&mut function).unwrap());
     function.ensure_facts();
     let defines: Vec<_> = Cfg::new(&function.graph)
         .rpo

@@ -1,9 +1,14 @@
-use super::ValueType;
-
+pub(in crate::jit::semantic) mod arrays;
 mod bit_tests;
+pub(in crate::jit::semantic) mod captures;
 mod coercions;
+pub(in crate::jit::semantic) mod comparisons;
+pub(in crate::jit::semantic) mod construction;
 mod folding;
+pub(in crate::jit::semantic) mod string_split;
 mod typeof_comparisons;
+
+use super::ValueType;
 
 pub(super) use bit_tests::bit_tests;
 pub(super) use coercions::coercions;

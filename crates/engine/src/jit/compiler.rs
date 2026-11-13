@@ -82,7 +82,7 @@ pub(crate) struct RecompileJob {
     initial: bool,
     previous: Entry,
     emission: Emission,
-    canonical: Arc<super::semantic::specialize::Repository>,
+    canonical: Arc<super::semantic::specialization::calls::Repository>,
     sources: Arc<FxHashMap<usize, Arc<(String, String)>>>,
     pub(super) label: String,
     pub(super) queued_at: Option<Instant>,
@@ -178,13 +178,19 @@ pub(crate) struct Compiler {
     continuations: Vec<(FuncId, FunctionBody)>,
     log: super::recompile::Log,
     emissions: FxHashMap<VariantId, Emission>,
-    lazy: FxHashMap<FuncId, (Emission, Arc<super::semantic::specialize::Repository>)>,
+    lazy: FxHashMap<
+        FuncId,
+        (
+            Emission,
+            Arc<super::semantic::specialization::calls::Repository>,
+        ),
+    >,
     sources: Arc<FxHashMap<usize, Arc<(String, String)>>>,
     names: Vec<Box<str>>,
     cells: Vec<Box<u64>>,
     data: Vec<Box<FunctionData>>,
     source_name: (usize, usize),
-    canonical: Arc<super::semantic::specialize::Repository>,
+    canonical: Arc<super::semantic::specialization::calls::Repository>,
     module: JITModule,
     signature: Signature,
     fixed: FxHashMap<FuncId, u16>,
@@ -307,10 +313,12 @@ impl Compiler {
             data: Vec::new(),
             continuations: Vec::new(),
             source_name: (0, 0),
-            canonical: Arc::new(super::semantic::specialize::Repository::with_call_options(
-                options.call_variants,
-                options.call_specialization,
-            )),
+            canonical: Arc::new(
+                super::semantic::specialization::calls::Repository::with_call_options(
+                    options.call_variants,
+                    options.call_specialization,
+                ),
+            ),
             module,
             signature,
             fixed: FxHashMap::default(),
@@ -450,7 +458,7 @@ impl Compiler {
         }
         if self.context.func.layout.entry_block().is_none() {
             let mut graph = graph.clone();
-            super::semantic::lower_memory_for_cranelift(&mut graph);
+            super::semantic::cranelift::lower_memory(&mut graph);
             graph.verify().map_err(Error::Compile)?;
             let mut builder = cranelift_frontend::FunctionBuilder::new(
                 &mut self.context.func,
@@ -1486,7 +1494,10 @@ impl Compiler {
         if region.is_none()
             && let Some(variant) = self.variant(variant)
         {
-            super::semantic::call_variants::assume(&mut canonical.graph, &variant.requirements);
+            super::semantic::specialization::call_variants::assume(
+                &mut canonical.graph,
+                &variant.requirements,
+            );
         }
         let inline_multiplier = if !self.inlining {
             0

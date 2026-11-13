@@ -210,7 +210,7 @@ fn build_callable(
     if native {
         *output_graph = Some(lowered.clone());
     }
-    super::semantic::lower_memory_for_cranelift(&mut lowered);
+    super::semantic::cranelift::lower_memory(&mut lowered);
     lowered.verify().map_err(Error::Compile)?;
     cranelift::emit(clif_builder, module, &lowered, Some(annotations))?;
     Ok(())
@@ -315,8 +315,8 @@ fn lower_callable(
     drop(compiler);
     super::semantic::scratch::resolve(&mut graph_builder, empty_owned).map_err(Error::Compile)?;
     graph_builder.finish().map_err(Error::Compile)?;
-    super::semantic::cleanup::lower(&mut lowered);
-    super::semantic::ownership_lowering::lower(
+    super::semantic::runtime::cleanup::lower(&mut lowered);
+    super::semantic::runtime::ownership::lower(
         &mut lowered,
         ctx,
         module.target_config().default_call_conv,
