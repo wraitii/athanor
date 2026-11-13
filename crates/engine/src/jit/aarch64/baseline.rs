@@ -331,7 +331,7 @@ fn emit(
                 Op::NewObject => {
                     asm.emit(e::mem_scaled(Mem::LdrX, 0, e::SP, context_offset as u32)?);
                     e::mov_imm(Width::X, 1, Value::UNDEFINED.bits(), |word| asm.emit(word));
-                    call(&mut asm, Helper::ObjectNewOwned);
+                    call(&mut asm, Helper::ObjectNew);
                     store(
                         &mut asm,
                         context_offset as u32,
@@ -359,7 +359,7 @@ fn emit(
                     asm.emit(e::mem_scaled(Mem::LdrX, 0, e::SP, context_offset as u32)?);
                     stack_address(&mut asm, 1, call_offset as u32);
                     e::mov_imm(Width::X, 2, args.len() as u64, |word| asm.emit(word));
-                    call(&mut asm, Helper::ArrayNewOwned);
+                    call(&mut asm, Helper::ArrayNew);
                     store(
                         &mut asm,
                         context_offset as u32,

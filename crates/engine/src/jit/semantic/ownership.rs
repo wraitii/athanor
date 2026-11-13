@@ -128,18 +128,10 @@ pub(super) fn plan(graph: &mut Graph, facts: &mut Facts) -> Plan {
                 | Op::TypedIndex(..)
                 | Op::ArrayGet(..)
                 | Op::ArrayLoad(..)
-                | Op::PackTake(..)
-                | Op::Call {
-                    target: Some(_), ..
-                }
                 | Op::GlobalRead(_)
-                | Op::GlobalReadOptional(_)
-                | Op::NewObject
-                | Op::NewArray(_)
-                | Op::NewHoleyArray(_)
-                | Op::NewInstance(_)
-                | Op::StringSplit(..),
+                | Op::GlobalReadOptional(_),
             ) => true,
+            Some(op) => super::selection::fresh_reference(op),
             _ => false,
         },
     );

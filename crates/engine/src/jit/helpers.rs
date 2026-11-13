@@ -73,7 +73,6 @@ define_helpers! {
     PackAppend => Binary, js_pack_append;
     PackExtend => Binary, js_pack_extend;
     PackTake => Binary, js_pack_take, reference;
-    PackTakeOwned => Binary, js_pack_take;
     CompilePoll => Nullary, js_compile_poll;
     VariantEntry => Pointer, js_variant_entry;
     OsrPoll => Callable, js_osr_poll;
@@ -92,7 +91,6 @@ define_helpers! {
     Construct => Callable, js_construct, reference;
     ConstructorPrototype => Unary, js_constructor_prototype;
     NewInstance => Unary, js_new_instance, reference;
-    NewInstanceOwned => Unary, js_new_instance;
     ConstructorCall => MethodCallable, js_constructor_call, reference;
     ConstructorCallPack => IndexSet, js_constructor_call_pack, reference;
     ConstructResolved => MethodCallable, js_construct_resolved, reference;
@@ -116,11 +114,8 @@ define_helpers! {
     ArrayIterationGuard => IndexSet, js_array_iteration_guard;
     IsStringSplit => Unary, js_is_string_split;
     StringSplitParts => MethodCallable, js_string_split_parts, reference;
-    StringSplitPartsOwned => MethodCallable, js_string_split_parts;
     StringSplit => MethodCallable, js_string_split, reference;
-    StringSplitOwned => MethodCallable, js_string_split;
     ArrayMapNew => Unary, js_array_map_new, reference;
-    ArrayMapNewOwned => Unary, js_array_map_new;
     ArrayMapElement => Binary, js_array_map_element, reference;
     MathDirect => MethodCallable, js_math_direct;
     FrameOverflow => Nullary, js_frame_overflow;
@@ -138,12 +133,10 @@ define_helpers! {
     IsTypeof => Binary, js_is_typeof;
     Truthy => Unary, js_truthy;
     ObjectNew => Unary, js_object_new, reference;
-    ObjectNewOwned => Unary, js_object_new;
     PropertyKey => Unary, js_property_key, reference;
     StringConstant => SourceLocation, js_string_constant;
     RegExpNew => PropertyGet, js_regexp_new, reference;
     ArrayNew => ArrayNew, js_array_new, reference;
-    ArrayNewOwned => ArrayNew, js_array_new;
     Rest => Rest, js_rest, reference;
     IndexGet => Binary, js_index_get, reference;
     IndexGetNumeric => NumericIndex, js_index_get_numeric, reference;

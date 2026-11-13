@@ -12,8 +12,8 @@ use crate::error::Error;
 use crate::heap::kind;
 use crate::jit::helpers::Helper;
 use crate::jit::semantic::{
-    Constant, Facts, Graph, MemoryFormat, MemoryOp, Op, ScopeKind, TerminatorKind, TypedRead,
-    UnaryOp, Value as GraphValue, ValueType,
+    Binding, Block, Constant, Facts, Graph, Inst, InstData, MemoryFormat, MemoryOp, Op,
+    ScopeKind, TerminatorKind, TypedRead, UnaryOp, Value as GraphValue, ValueType,
 };
 use crate::value::{TAG_SHIFT, TAG_STRING, Value};
 
@@ -26,15 +26,57 @@ use crate::jit::semantic::selection::{Lowering, ResultReference};
 
 const NUMERIC: ValueType = ValueType::NUMBER.union(ValueType::UNDEFINED);
 
-struct Context<'a> {
-    graph: &'a Graph,
+pub(super) struct Context<'a> {
+    entry: Block,
+    values: usize,
+    plan: Plan,
+    cyclic: FxHashSet<Block>,
+    entering_guards: FxHashMap<Inst, String>,
+    terminator_base: usize,
     osr_buffers: RefCell<FxHashMap<GraphValue, (LoweredValue, usize)>>,
     direct: RefCell<SecondaryMap<GraphValue, Option<LoweredValue>>>,
     facts: &'a Facts,
-    plan: &'a Plan,
 }
 
-impl Context<'_> {
+impl<'a> Context<'a> {
+    pub(super) fn new(graph: &mut Graph, facts: &'a Facts) -> Self {
+        let rpo = &facts.cfg.rpo;
+        let entering_guards = if crate::jit::bailouts::enabled() {
+            rpo.iter()
+                .flat_map(|&block| &graph.blocks[block].insts)
+                .filter(|&&inst| matches!(graph.insts[inst].op, Op::Continuation(..)))
+                .map(|&inst| (inst, graph.entering_guard(inst)))
+                .collect()
+        } else {
+            FxHashMap::default()
+        };
+        let reachable: FxHashSet<_> = rpo.iter().copied().collect();
+        for (block, data) in graph.blocks.iter_mut() {
+            if !reachable.contains(&block) {
+                data.insts.clear();
+                data.terminator = None;
+            }
+        }
+        Self {
+            entry: graph.entry,
+            values: graph.values.len(),
+            plan: graph
+                .ownership
+                .take()
+                .expect("ownership is planned before emission"),
+            cyclic: cyclic_blocks(graph, &facts.cfg),
+            entering_guards,
+            terminator_base: graph.insts.len(),
+            osr_buffers: RefCell::new(FxHashMap::default()),
+            direct: RefCell::new(SecondaryMap::new()),
+            facts,
+        }
+    }
+
+    fn terminator_location(&self, block: Block) -> u32 {
+        u32::try_from(self.terminator_base + block.index() + 1).unwrap()
+    }
+
     fn define(&self, value: GraphValue, clif: LoweredValue) {
         self.direct.borrow_mut()[value] = Some(clif);
     }
@@ -195,38 +237,28 @@ impl FunctionCompiler<'_, '_> {
 
     pub(super) fn emit_semantic_graph(
         &mut self,
-        graph: &Graph,
-        facts: &Facts,
+        cx: Context<'_>,
         closure: LoweredValue,
         continuations: &FxHashMap<usize, FuncId>,
     ) -> Result<(), Error> {
         let source_name = self.source_name;
-        let blocks: Vec<_> = graph
-            .blocks
-            .values()
-            .map(|_| self.b.create_block())
-            .collect();
-        let values: Vec<Variable> = graph
-            .values
-            .keys()
-            .map(|value| self.b.declare_var(graph.repr(value).machine()))
-            .collect();
-        let bindings: Vec<Variable> = graph
-            .bindings
-            .values()
-            .map(|_| self.b.declare_var(types::I64))
-            .collect();
-        let lazy_cells: Vec<_> = graph
-            .bindings
-            .keys()
-            .map(|binding| {
-                graph
-                    .lazy_captures
-                    .contains(&binding)
-                    .then(|| self.b.declare_var(types::I64))
+        let values: Vec<Variable> = (0..cx.values)
+            .map(|index| {
+                self.b
+                    .declare_var(self.b.graph.repr(GraphValue::from_u32(index as u32)).machine())
             })
             .collect();
-        let cells: Vec<i64> = (0..graph.guards)
+        let bindings: Vec<Variable> = (0..self.b.graph.bindings.len())
+            .map(|_| self.b.declare_var(types::I64))
+            .collect();
+        let lazy_cells: Vec<_> = (0..self.b.graph.bindings.len())
+            .map(|index| {
+                let binding = Binding::new(index);
+                let lazy = self.b.graph.lazy_captures.contains(&binding);
+                lazy.then(|| self.b.declare_var(types::I64))
+            })
+            .collect();
+        let cells: Vec<i64> = (0..self.b.graph.guards)
             .map(|_| {
                 let mut cell = Box::new(u64::MAX);
                 let address = &raw mut *cell as i64;
@@ -234,40 +266,38 @@ impl FunctionCompiler<'_, '_> {
                 address
             })
             .collect();
-        let cfg = &facts.cfg;
-        let reachable = cfg.rpo.clone();
+        let reachable = &cx.facts.cfg.rpo;
+        let packs: Vec<Inst> = reachable
+            .iter()
+            .flat_map(|&block| self.b.graph.blocks[block].insts.iter())
+            .copied()
+            .filter(|&inst| {
+                matches!(
+                    self.b.graph.insts[inst].op,
+                    Op::NewPack | Op::Spread(_) | Op::StringSplitParts(..)
+                )
+            })
+            .collect();
         let mut pack_slots = SecondaryMap::new();
         let mut pack_cleanup = Vec::new();
-        for &block in &reachable {
-            for &inst in &graph.blocks[block].insts {
-                if !matches!(
-                    graph.insts[inst].op,
-                    Op::NewPack | Op::Spread(_) | Op::StringSplitParts(..)
-                ) {
-                    continue;
-                }
-                let address = {
-                    let slot =
-                        self.b
-                            .create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
-                                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-                                std::mem::size_of::<crate::jit::pack::StackPack>() as u32,
-                                std::mem::align_of::<crate::jit::pack::StackPack>().trailing_zeros()
-                                    as u8,
-                            ));
-                    let address = self.b.ins().stack_addr(self.pointer, slot, 0);
-                    self.call_helper(Helper::PackInit, &[address]);
-                    pack_cleanup.push(address);
-                    address
-                };
-                pack_slots[inst] = Some(address);
-            }
+        for inst in packs {
+            let slot = self
+                .b
+                .create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                    cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                    std::mem::size_of::<crate::jit::pack::StackPack>() as u32,
+                    std::mem::align_of::<crate::jit::pack::StackPack>().trailing_zeros() as u8,
+                ));
+            let address = self.b.ins().stack_addr(self.pointer, slot, 0);
+            self.call_helper(Helper::PackInit, &[address]);
+            pack_cleanup.push(address);
+            pack_slots[inst] = Some(address);
         }
 
         let continuation_words = reachable
             .iter()
-            .flat_map(|&block| &graph.blocks[block].insts)
-            .filter_map(|&inst| match &graph.insts[inst].op {
+            .flat_map(|&block| &self.b.graph.blocks[block].insts)
+            .filter_map(|&inst| match &self.b.graph.insts[inst].op {
                 Op::Continuation(_, inputs) => Some(inputs.len()),
                 _ => None,
             })
@@ -283,68 +313,53 @@ impl FunctionCompiler<'_, '_> {
             self.b.ins().stack_addr(self.pointer, slot, 0)
         });
 
-        let cyclic = cyclic_blocks(graph, cfg);
-        let plan = graph
-            .ownership
-            .as_ref()
-            .expect("ownership is planned before emission");
-        let repeated =
-            |block: crate::jit::semantic::Block| graph.has_handlers || cyclic.contains(&block);
-        for &block in &reachable {
-            let data = &graph.blocks[block];
-            for &param in &data.params {
-                self.b
-                    .append_block_param(blocks[block.index()], graph.repr(param).machine());
-            }
-        }
+        let has_handlers = self.b.graph.has_handlers;
+        let repeated = |block: Block| has_handlers || cx.cyclic.contains(&block);
         let undefined = self.constant(Value::UNDEFINED);
         for &variable in bindings.iter().chain(lazy_cells.iter().flatten()) {
             self.b.def_var(variable, undefined);
         }
-        let cx = Context {
-            graph,
-            osr_buffers: RefCell::new(FxHashMap::default()),
-            direct: RefCell::new(SecondaryMap::new()),
-            facts,
-            plan,
-        };
         for (value, slot) in cx.plan.slots.assigned() {
             self.slots.insert(values[value.index()].as_u32(), slot);
         }
         self.slot_count = cx.plan.slots.count();
-        self.jump(blocks[graph.entry.index()], &[]);
-        for &block in &reachable {
-            let data = &graph.blocks[block];
+        self.jump(cx.entry, &[]);
+        for &block in reachable {
+            let insts = std::mem::take(&mut self.b.graph.blocks[block].insts);
+            let terminator = self.b.graph.blocks[block]
+                .terminator
+                .take()
+                .expect("reachable block has a terminator");
             if self.annotations.semantic_locations {
                 self.b
                     .set_srcloc(cranelift_codegen::ir::SourceLoc::default());
             }
-            self.switch(blocks[block.index()]);
-            let cold = graph.cold.contains(&block);
+            self.switch(block);
+            let cold = self.b.graph.cold.contains(&block);
             let created = self.b.num_blocks();
-            let params = self.b.block_params(blocks[block.index()]).to_vec();
-            for (&value, param) in data.params.iter().zip(params) {
+            for value in self.b.block_params(block).to_vec() {
                 if cx.plan.slots.forwarded(value) {
-                    self.b.def_var(values[value.index()], param);
+                    self.b.def_var(values[value.index()], value);
                 }
-                cx.define(value, param);
+                cx.define(value, value);
             }
-            for &inst in &data.insts {
+            for &inst in &insts {
                 self.b.scratch(Scratch::Begin, &[]);
-                let handler = match &data.terminator.as_ref().unwrap().kind {
-                    TerminatorKind::CheckException(_, error) => Some(blocks[error.block.index()]),
+                let handler = match &terminator.kind {
+                    TerminatorKind::CheckException(_, error) => Some(error.block),
                     _ => None,
                 };
                 if let Some(handler) = handler {
                     self.handlers.push(handler);
                 }
-                let data = &graph.insts[inst];
+                let data = self.b.graph.insts[inst].clone();
+                let data = &data;
                 self.source_span = data.span;
                 self.b.set_span(data.span);
                 self.source_name = data.source_name.unwrap_or(source_name);
                 self.b.set_source_name(Some(self.source_name));
                 let location = if self.annotations.semantic_locations {
-                    cranelift_codegen::ir::SourceLoc::new(graph.inst_location(inst))
+                    cranelift_codegen::ir::SourceLoc::new(self.b.graph.inst_location(inst))
                 } else if self.source_name == source_name {
                     cranelift_codegen::ir::SourceLoc::new(data.span.start)
                 } else {
@@ -355,9 +370,13 @@ impl FunctionCompiler<'_, '_> {
                     let operand = this.operand(&cx, value);
                     this.convert(operand, Repr::Boxed)
                 };
-                let result = if let Lowering::Typed(target) = cx.plan.implementations[inst].lowering
+                let result = if let Op::LowLevel(_) = data.op {
+                    self.adopt(&cx, inst);
+                    data.result()
+                        .map(|value| Operand::new(value, self.b.graph.repr(value)))
+                } else if let Lowering::Typed(target) = cx.plan.implementations[inst].lowering
                 {
-                    self.typed_op(&cx, inst, target)?
+                    self.typed_op(&cx, inst, data, target)?
                 } else {
                     let result = match &data.op {
                         Op::LowLevel(_) => {
@@ -369,13 +388,13 @@ impl FunctionCompiler<'_, '_> {
                             if crate::jit::bailouts::enabled() {
                                 let site = crate::jit::bailouts::register(format!(
                                     "{} => {} (source {}..{}) guard: {}",
-                                    graph.name,
+                                    self.b.graph.name,
                                     target.graph.name,
                                     data.span.start,
                                     data.span.end,
                                     Some(crate::jit::bailouts::guard_text(data.span))
                                         .filter(|text| !text.is_empty())
-                                        .unwrap_or_else(|| graph.entering_guard(inst))
+                                        .unwrap_or_else(|| cx.entering_guards[&inst].clone())
                                 ));
                                 let site = self.b.ins().iconst(types::I64, site as i64);
                                 self.call_helper(Helper::Bailout, &[site]);
@@ -628,39 +647,83 @@ impl FunctionCompiler<'_, '_> {
                             Some(value)
                         }
                         Op::This => Some(self.receiver),
-                        Op::ClosureThis(value) => {
-                            let value = get(self, *value);
-                            Some(self.call_helper(Helper::ClosureThis, &[value]))
-                        }
-                        Op::IsArrayIteration(callee, receiver, method) => {
-                            let callee = get(self, *callee);
-                            let receiver = get(self, *receiver);
-                            let method = self.b.ins().iconst(types::I64, *method as i64);
-                            Some(self.call_helper(
-                                Helper::ArrayIterationGuard,
-                                &[callee, receiver, method],
-                            ))
-                        }
-                        Op::NewHoleyArray(length) => {
-                            let length = get(self, *length);
-                            let helper = cx.plan.implementations[inst]
-                                .helper
-                                .expect("selected allocation helper");
-                            let value = self.call_helper(helper, &[length]);
-                            self.check_error();
-                            Some(value)
-                        }
-                        Op::MapElement(receiver, index) => {
-                            let receiver = get(self, *receiver);
-                            let index = self.operand(&cx, *index);
-                            let index = self.convert(index, Repr::I64);
-                            Some(self.call_helper(Helper::ArrayMapElement, &[receiver, index]))
-                        }
-                        Op::Throw(value) => {
-                            let value = get(self, *value);
-                            self.call_helper(Helper::Throw, &[value]);
-                            self.check_error();
-                            None
+                        Op::ClosureThis(..)
+                        | Op::IsArrayIteration(..)
+                        | Op::NewHoleyArray(..)
+                        | Op::MapElement(..)
+                        | Op::Throw(..)
+                        | Op::PropertyKey(..)
+                        | Op::IteratorNew(..)
+                        | Op::IteratorNext(..)
+                        | Op::EnumerateNew(..)
+                        | Op::EnumerateNext(..)
+                        | Op::NewObject
+                        | Op::MarkClass(..)
+                        | Op::DisableConstructor(..)
+                        | Op::CachedProperty(..)
+                        | Op::ShapedGet(..)
+                        | Op::FillPropertyCache(..)
+                        | Op::PrimePropertyCache(..)
+                        | Op::PropertyLoad(..)
+                        | Op::HelperCall { .. }
+                        | Op::ArrayStore(..)
+                        | Op::PropertyStore(..)
+                        | Op::PropertyAdd(..)
+                        | Op::CanOverwrite(..)
+                        | Op::FillPropertyStore(..)
+                        | Op::PackAppend(..)
+                        | Op::PackRelease(..)
+                        | Op::PackTake(..)
+                        | Op::TypedData(..)
+                        | Op::Memory(..)
+                        | Op::MemoryNumber(..)
+                        | Op::KeepAlive(..)
+                        | Op::IsTypeof(..)
+                        | Op::ArrayPosition(..)
+                        | Op::IsExactPosition(..)
+                        | Op::IsInBounds(..)
+                        | Op::IsArrayIndex(..)
+                        | Op::IsArray(..)
+                        | Op::ArrayKind(..)
+                        | Op::BooleanAnd(..)
+                        | Op::ArrayLoad(..)
+                        | Op::IsTyped(..)
+                        | Op::PropertyCache(..)
+                        | Op::IsPropertyCached(..)
+                        | Op::IsShape(..)
+                        | Op::IsCode(..)
+                        | Op::AsNumber(..)
+                        | Op::Convert(..)
+                        | Op::IsInteger(..)
+                        | Op::AsInteger(..)
+                        | Op::NumericFloat(..)
+                        | Op::SaturatingInteger(..)
+                        | Op::IntegerCheck(..)
+                        | Op::ToInt32(..)
+                        | Op::ArrayAppend(..)
+                        | Op::CallPack(..)
+                        | Op::ConstructPack(..)
+                        | Op::NewInstance(..)
+                        | Op::ConstructorResult(..)
+                        | Op::IsUninitialized(..)
+                        | Op::IsNumber(..)
+                        | Op::IsString(..)
+                        | Op::IsIndexed(..)
+                        | Op::IndexedLength(..)
+                        | Op::IsUndefined(..)
+                        | Op::IsNullish(..)
+                        | Op::NewArray(..)
+                        | Op::Construct { .. }
+                        | Op::ConstructResolved { .. }
+                        | Op::ConstructorCall { .. }
+                        | Op::StringSplit(..)
+                        | Op::ConstructorCallPack(..)
+                        | Op::ConstructorPrototype(..)
+                        | Op::ConstructPackResolved(..)
+                        | Op::ProbeIndex(..)
+                        | Op::IsStringSplit(..)
+                        | Op::IsNative(..) => {
+                            unreachable!("{:?} must be lowered before emission", data.op)
                         }
                         Op::Catch => {
                             // A caught throw abandons argument evaluation in this frame.
@@ -721,12 +784,6 @@ impl FunctionCompiler<'_, '_> {
                         }),
                         Op::GlobalRead(name) => Some(self.cached_global_get(name, false, false)),
                         Op::GlobalReadOptional(name) => Some(self.global_get_optional(name)),
-                        Op::PropertyKey(value) => {
-                            let value = get(self, *value);
-                            let result = self.call_helper(Helper::PropertyKey, &[value]);
-                            self.check_error();
-                            Some(result)
-                        }
                         Op::RegExp(pattern, flags) => {
                             let pattern: Box<str> = pattern.as_str().into();
                             let ptr = self.b.ins().iconst(self.pointer, pattern.as_ptr() as i64);
@@ -767,7 +824,7 @@ impl FunctionCompiler<'_, '_> {
                         }
                         Op::Read(binding) => {
                             let value = self.b.use_var(bindings[binding.index()]);
-                            let value = if graph.bindings[*binding].captured {
+                            let value = if self.b.graph.bindings[*binding].captured {
                                 let value = self.call_helper(Helper::CellGet, &[value]);
                                 self.check_error();
                                 value
@@ -778,7 +835,7 @@ impl FunctionCompiler<'_, '_> {
                         }
                         Op::Write(binding, value) => {
                             let old = self.b.use_var(bindings[binding.index()]);
-                            let helper = if graph.bindings[*binding].captured {
+                            let helper = if self.b.graph.bindings[*binding].captured {
                                 Helper::CellGet
                             } else {
                                 Helper::Retain
@@ -786,7 +843,7 @@ impl FunctionCompiler<'_, '_> {
                             self.call_helper(helper, &[old]);
                             self.check_error();
                             let value = get(self, *value);
-                            if graph.bindings[*binding].captured {
+                            if self.b.graph.bindings[*binding].captured {
                                 self.call_helper(Helper::CellSet, &[old, value]);
                                 self.check_error();
                             } else {
@@ -796,7 +853,7 @@ impl FunctionCompiler<'_, '_> {
                         }
                         Op::Initialize(binding, value) => {
                             let value = get(self, *value);
-                            if graph.bindings[*binding].captured {
+                            if self.b.graph.bindings[*binding].captured {
                                 let cell = self.b.use_var(bindings[binding.index()]);
                                 self.call_helper(Helper::CellSet, &[cell, value]);
                                 self.check_error();
@@ -809,34 +866,6 @@ impl FunctionCompiler<'_, '_> {
                             let value = get(self, *value);
                             let value = self.checked_temporary(value, true);
                             Some(value)
-                        }
-                        Op::IteratorNew(value)
-                        | Op::IteratorNext(value)
-                        | Op::EnumerateNew(value)
-                        | Op::EnumerateNext(value) => {
-                            let value = get(self, *value);
-                            let helper = match data.op {
-                                Op::IteratorNew(_) => Helper::IterateNew,
-                                Op::IteratorNext(_) => Helper::IterateNext,
-                                Op::EnumerateNew(_) => Helper::EnumerateNew,
-                                Op::EnumerateNext(_) => Helper::EnumerateNext,
-                                _ => unreachable!(),
-                            };
-                            let result = self.call_helper(helper, &[value]);
-                            self.check_error();
-                            self.check_error();
-                            Some(result)
-                        }
-                        Op::IsUninitialized(value) => {
-                            let value = get(self, *value);
-                            let condition = self.b.ins().icmp_imm_s(
-                                cranelift_codegen::ir::condcodes::IntCC::Equal,
-                                value,
-                                Value::UNINITIALIZED.bits() as i64,
-                            );
-                            let yes = self.constant(Value::TRUE);
-                            let no = self.constant(Value::FALSE);
-                            Some(self.b.ins().select(condition, yes, no))
                         }
                         Op::GuardedCompare {
                             operator,
@@ -859,41 +888,10 @@ impl FunctionCompiler<'_, '_> {
                             self.check_error();
                             Some(value)
                         }
-                        Op::NewObject => {
-                            let dummy = self.constant(Value::UNDEFINED);
-                            let helper = cx.plan.implementations[inst]
-                                .helper
-                                .expect("selected allocation helper");
-                            let value = self.call_helper(helper, &[dummy]);
-                            self.check_error();
-                            Some(value)
-                        }
-                        Op::NewArray(args) => {
-                            let args: Vec<_> = args.iter().map(|&v| get(self, v)).collect();
-                            let ptr = self.stack_values(&args, data.span)?;
-                            let len = self.b.ins().iconst(types::I64, args.len() as i64);
-                            let helper = cx.plan.implementations[inst]
-                                .helper
-                                .expect("selected allocation helper");
-                            let value = self.call_helper(helper, &[ptr, len]);
-                            self.check_error();
-                            Some(value)
-                        }
                         Op::DefineHidden(object, name, value) => {
                             let object = get(self, *object);
                             let value = get(self, *value);
                             self.define_hidden_property(object, name, value);
-                            None
-                        }
-                        Op::MarkClass(value) | Op::DisableConstructor(value) => {
-                            let value = get(self, *value);
-                            let helper = if matches!(data.op, Op::MarkClass(_)) {
-                                Helper::MarkClass
-                            } else {
-                                Helper::DisableConstructor
-                            };
-                            self.call_helper(helper, &[value]);
-                            self.check_error();
                             None
                         }
                         Op::Define(object, name, value) | Op::Set(object, name, value) => {
@@ -903,23 +901,12 @@ impl FunctionCompiler<'_, '_> {
                             self.property_access(object, name, Some(value), observer);
                             None
                         }
-                        Op::CachedProperty(..)
-                        | Op::ShapedGet(..)
-                        | Op::FillPropertyCache(..)
-                        | Op::PrimePropertyCache(..)
-                        | Op::PropertyLoad(..)
-                        | Op::HelperCall { .. } => unreachable!(),
                         Op::ShapedSet(object, name, index, value) => {
                             let object = get(self, *object);
                             let value = get(self, *value);
                             self.shaped_property_set(object, name, *index, value);
                             None
                         }
-                        Op::ArrayStore(..)
-                        | Op::PropertyStore(..)
-                        | Op::PropertyAdd(..)
-                        | Op::CanOverwrite(..)
-                        | Op::FillPropertyStore(..) => unreachable!(),
                         Op::Get(object, name) => {
                             let object = get(self, *object);
                             let observer = self.property_observer(data);
@@ -928,7 +915,7 @@ impl FunctionCompiler<'_, '_> {
                                 start: data.span.start,
                                 end: data.span.end,
                             };
-                            let megamorphic = graph.megamorphic_gets.contains(&site);
+                            let megamorphic = self.b.graph.megamorphic_gets.contains(&site);
                             Some(self.cached_property_get(object, name, observer, megamorphic))
                         }
                         Op::GetIndex(object, index)
@@ -953,33 +940,6 @@ impl FunctionCompiler<'_, '_> {
                             self.check_error();
                             Some(pack)
                         }
-                        Op::PackAppend(pack, value, spread) => {
-                            let pack = get(self, *pack);
-                            let value = get(self, *value);
-                            self.call_helper(
-                                if *spread {
-                                    Helper::PackExtend
-                                } else {
-                                    Helper::PackAppend
-                                },
-                                &[pack, value],
-                            );
-                            self.check_error();
-                            None
-                        }
-                        Op::PackRelease(pack) => {
-                            let pack = get(self, *pack);
-                            self.call_helper(Helper::PackRelease, &[pack]);
-                            None
-                        }
-                        Op::PackTake(pack, index) => {
-                            let pack = get(self, *pack);
-                            let index = get(self, *index);
-                            let helper = cx.plan.implementations[inst]
-                                .helper
-                                .expect("selected allocation helper");
-                            Some(self.call_helper(helper, &[pack, index]))
-                        }
                         Op::SetIndex(object, index, value) => {
                             let object = get(self, *object);
                             let index = get(self, *index);
@@ -991,81 +951,11 @@ impl FunctionCompiler<'_, '_> {
                             );
                             None
                         }
-                        Op::TypedData(..)
-                        | Op::Memory(..)
-                        | Op::MemoryNumber(..)
-                        | Op::KeepAlive(..) => unreachable!(),
                         Op::View(object) => {
                             let object = get(self, *object);
                             Some(self.view(object))
                         }
-                        Op::IsNumber(value) => {
-                            let value = get(self, *value);
-                            let condition = self.is_number(value);
-                            let yes = self.constant(Value::TRUE);
-                            let no = self.constant(Value::FALSE);
-                            Some(self.b.ins().select(condition, yes, no))
-                        }
-                        Op::IsTypeof(value, kind) => {
-                            let value = get(self, *value);
-                            let kind = self.constant(Value::number(*kind as f64));
-                            Some(self.call_helper(Helper::IsTypeof, &[value, kind]))
-                        }
-                        Op::IsString(value) => {
-                            let value = get(self, *value);
-                            let tag = self.b.ins().ushr_imm_s(value, TAG_SHIFT as i64);
-                            let condition = self.b.ins().icmp_imm_s(
-                                IntCC::Equal,
-                                tag,
-                                (TAG_STRING >> TAG_SHIFT) as i64,
-                            );
-                            let yes = self.constant(Value::TRUE);
-                            let no = self.constant(Value::FALSE);
-                            Some(self.b.ins().select(condition, yes, no))
-                        }
-                        Op::ArrayPosition(..)
-                        | Op::IsExactPosition(..)
-                        | Op::IsInBounds(..)
-                        | Op::IsArrayIndex(..)
-                        | Op::IsArray(..)
-                        | Op::ArrayKind(..)
-                        | Op::BooleanAnd(..)
-                        | Op::ArrayLoad(..) => {
-                            unreachable!()
-                        }
-                        Op::IsTyped(..)
-                        | Op::PropertyCache(..)
-                        | Op::IsPropertyCached(..)
-                        | Op::IsShape(..)
-                        | Op::IsCode(..) => {
-                            unreachable!()
-                        }
-                        Op::IsIndexed(value) => {
-                            let value = get(self, *value);
-                            let view = self.view(value);
-                            let condition = self.has_kind(view, kind::ARRAY | kind::TYPED);
-                            let yes = self.constant(Value::TRUE);
-                            let no = self.constant(Value::FALSE);
-                            Some(self.b.ins().select(condition, yes, no))
-                        }
-                        Op::IndexedLength(value) => {
-                            let value = get(self, *value);
-                            let view = self.view(value);
-                            let length = self.view_length(view);
-                            Some(
-                                self.b
-                                    .ins()
-                                    .bitcast(types::I64, MemFlagsData::new(), length),
-                            )
-                        }
                         Op::AsObject(value) => Some(get(self, *value)),
-                        Op::AsNumber(_) | Op::Convert(..) => unreachable!(),
-                        Op::IsInteger(_)
-                        | Op::AsInteger(_)
-                        | Op::NumericFloat(_)
-                        | Op::SaturatingInteger(_)
-                        | Op::IntegerCheck(..) => unreachable!(),
-                        Op::ToInt32(_) => unreachable!(),
                         Op::ToNumeric(value) => {
                             let value = get(self, *value);
                             Some(ops::to_number(self, value))
@@ -1103,43 +993,13 @@ impl FunctionCompiler<'_, '_> {
                             let right = get(self, *right);
                             Some(self.binary(ops::binary_operator(*op), left, right))
                         }
-                        Op::ArrayAppend(array, value, spread) => {
-                            let array = get(self, *array);
-                            let value = get(self, *value);
-                            self.call_helper(
-                                if *spread {
-                                    Helper::ArrayExtend
-                                } else {
-                                    Helper::ArrayAppend
-                                },
-                                &[array, value],
-                            );
-                            self.check_error();
-                            None
-                        }
-                        Op::CallPack(callee, receiver, args) => {
-                            let callee = get(self, *callee);
-                            let receiver = get(self, *receiver);
-                            let args = get(self, *args);
-                            let value =
-                                self.call_helper(Helper::CallPack, &[callee, receiver, args]);
-                            self.check_error();
-                            Some(value)
-                        }
-                        Op::ConstructPack(callee, args) => {
-                            let callee = get(self, *callee);
-                            let args = get(self, *args);
-                            let value = self.call_helper(Helper::ConstructPack, &[callee, args]);
-                            self.check_error();
-                            Some(value)
-                        }
                         Op::Call {
                             callee,
                             receiver,
                             args,
                             target,
                         } => {
-                            let closure = graph.defining_op(*callee);
+                            let closure = self.b.graph.defining_op(*callee).cloned();
                             let identity = cx.facts.identity_at(*callee, data.block);
                             let callee = get(self, *callee);
                             let receiver = receiver
@@ -1175,98 +1035,6 @@ impl FunctionCompiler<'_, '_> {
                             };
                             Some(value)
                         }
-                        Op::NewInstance(prototype) => {
-                            let prototype = get(self, *prototype);
-                            let helper = cx.plan.implementations[inst]
-                                .helper
-                                .expect("selected allocation helper");
-                            let result = self.call_helper(helper, &[prototype]);
-                            self.check_error();
-                            Some(result)
-                        }
-                        Op::ConstructorResult(result, instance) => {
-                            let result = get(self, *result);
-                            let instance = get(self, *instance);
-                            let tag = self
-                                .b
-                                .ins()
-                                .band_imm_s(result, 0xffff_0000_0000_0000u64 as i64);
-                            let object = self.b.ins().icmp_imm_s(
-                                IntCC::Equal,
-                                tag,
-                                crate::value::TAG_OBJECT as i64,
-                            );
-                            Some(self.b.ins().select(object, result, instance))
-                        }
-                        Op::ConstructorCall {
-                            callee,
-                            receiver,
-                            args,
-                        } => {
-                            let callee = get(self, *callee);
-                            let receiver = get(self, *receiver);
-                            let args: Vec<_> = args.iter().map(|&v| get(self, v)).collect();
-                            let argv = self.stack_values(&args, data.span)?;
-                            let argc = self.b.ins().iconst(types::I64, args.len() as i64);
-                            let result = self.call_helper(
-                                Helper::ConstructorCall,
-                                &[callee, receiver, argv, argc],
-                            );
-                            self.check_error();
-                            Some(result)
-                        }
-                        Op::ConstructorCallPack(callee, receiver, args) => {
-                            let callee = get(self, *callee);
-                            let receiver = get(self, *receiver);
-                            let args = get(self, *args);
-                            let result = self.call_helper(
-                                Helper::ConstructorCallPack,
-                                &[callee, receiver, args],
-                            );
-                            self.check_error();
-                            Some(result)
-                        }
-                        Op::ConstructorPrototype(callee) => {
-                            let callee = get(self, *callee);
-                            Some(self.call_helper(Helper::ConstructorPrototype, &[callee]))
-                        }
-                        Op::ConstructResolved {
-                            callee,
-                            prototype,
-                            args,
-                        } => {
-                            let callee = get(self, *callee);
-                            let prototype = get(self, *prototype);
-                            let args: Vec<_> = args.iter().map(|&v| get(self, v)).collect();
-                            let argv = self.stack_values(&args, data.span)?;
-                            let argc = self.b.ins().iconst(types::I64, args.len() as i64);
-                            let value = self.call_helper(
-                                Helper::ConstructResolved,
-                                &[callee, prototype, argv, argc],
-                            );
-                            self.check_error();
-                            Some(value)
-                        }
-                        Op::ConstructPackResolved(callee, prototype, args) => {
-                            let callee = get(self, *callee);
-                            let prototype = get(self, *prototype);
-                            let args = get(self, *args);
-                            let value = self.call_helper(
-                                Helper::ConstructPackResolved,
-                                &[callee, prototype, args],
-                            );
-                            self.check_error();
-                            Some(value)
-                        }
-                        Op::Construct { callee, args } => {
-                            let callee = get(self, *callee);
-                            let args: Vec<_> = args.iter().map(|&v| get(self, v)).collect();
-                            let argv = self.stack_values(&args, data.span)?;
-                            let argc = self.b.ins().iconst(types::I64, args.len() as i64);
-                            let value = self.call_helper(Helper::Construct, &[callee, argv, argc]);
-                            self.check_error();
-                            Some(value)
-                        }
                         Op::ProbeGlobal(name) => Some(self.cached_global_probe(name)),
                         Op::ProbeProperty(object, name) => {
                             let object = get(self, *object);
@@ -1276,44 +1044,29 @@ impl FunctionCompiler<'_, '_> {
                                 start: data.span.start,
                                 end: data.span.end,
                             };
-                            let megamorphic = graph.megamorphic_gets.contains(&site);
+                            let megamorphic = self.b.graph.megamorphic_gets.contains(&site);
                             Some(self.cached_property_probe(object, name, observer, megamorphic))
                         }
                         Op::ProbeShapeProperty(object, _, shape, index) => {
                             let object = get(self, *object);
                             Some(self.shaped_property_probe(object, *shape, *index))
                         }
-                        Op::ProbeIndex(object, key) => {
-                            let object = get(self, *object);
-                            let key = get(self, *key);
-                            Some(self.call_helper(Helper::SemanticIndexProbe, &[object, key]))
-                        }
-                        Op::IsStringSplit(value) => {
-                            let value = get(self, *value);
-                            Some(self.call_helper(Helper::IsStringSplit, &[value]))
-                        }
-                        Op::StringSplit(receiver, args) | Op::StringSplitParts(receiver, args) => {
+                        Op::StringSplitParts(receiver, args) => {
                             let receiver = get(self, *receiver);
                             let args: Vec<_> = args.iter().map(|&v| get(self, v)).collect();
                             let argv = self.stack_values(&args, data.span)?;
-                            let operation = if matches!(data.op, Op::StringSplitParts(..)) {
-                                pack_slots[inst].unwrap_or_else(|| self.constant(Value::UNDEFINED))
-                            } else {
-                                self.b.ins().iconst(types::I64, 0)
-                            };
+                            let operation =
+                                pack_slots[inst].unwrap_or_else(|| self.constant(Value::UNDEFINED));
                             let argc = self.b.ins().iconst(types::I64, args.len() as i64);
-                            let helper = cx.plan.implementations[inst]
-                                .helper
-                                .expect("selected split helper");
-                            let result =
-                                self.call_helper(helper, &[operation, receiver, argv, argc]);
+                            let track = cx.plan.implementations[inst].result
+                                != ResultReference::Slot;
+                            let result = self.call_helper_tracked(
+                                Helper::StringSplitParts,
+                                &[operation, receiver, argv, argc],
+                                track,
+                            );
                             self.check_error();
                             Some(result)
-                        }
-                        Op::IsNative(value, native) => {
-                            let value = get(self, *value);
-                            let operation = self.b.ins().iconst(types::I64, native.index() as i64);
-                            Some(self.call_helper(Helper::SemanticMathNative, &[value, operation]))
                         }
                         Op::GuardValid(guard) => {
                             let epoch = self.epoch();
@@ -1350,39 +1103,21 @@ impl FunctionCompiler<'_, '_> {
                                 value
                             }))
                         }
-                        Op::IsUndefined(value) => {
-                            let value = get(self, *value);
-                            let condition = self.b.ins().icmp_imm_s(
-                                cranelift_codegen::ir::condcodes::IntCC::Equal,
-                                value,
-                                Value::UNDEFINED.bits() as i64,
-                            );
-                            let yes = self.constant(Value::TRUE);
-                            let no = self.constant(Value::FALSE);
-                            Some(self.b.ins().select(condition, yes, no))
-                        }
-                        Op::IsNullish(value) => {
-                            let value = get(self, *value);
-                            let condition = self.is_nullish(value);
-                            let yes = self.constant(Value::TRUE);
-                            let no = self.constant(Value::FALSE);
-                            Some(self.b.ins().select(condition, yes, no))
-                        }
                         Op::EnterScope(scope) | Op::EnterCaptures(scope, _) => {
                             let closure = match data.op {
                                 Op::EnterCaptures(_, value) => get(self, value),
                                 _ => closure,
                             };
-                            for (index, &binding) in
-                                graph.scopes[*scope].bindings.iter().enumerate()
-                            {
-                                let value = if graph.scopes[*scope].kind == ScopeKind::Captures {
+                            let captures = self.b.graph.scopes[*scope].kind == ScopeKind::Captures;
+                            let scope = self.b.graph.scopes[*scope].bindings.clone();
+                            for (index, &binding) in scope.iter().enumerate() {
+                                let value = if captures {
                                     let index = self.b.ins().iconst(types::I64, index as i64);
                                     let cell =
                                         self.call_helper(Helper::CaptureGet, &[closure, index]);
                                     self.check_error();
                                     cell
-                                } else if graph.bindings[binding].captured
+                                } else if self.b.graph.bindings[binding].captured
                                     && lazy_cells[binding.index()].is_none()
                                 {
                                     let initial = self.constant(Value::UNINITIALIZED);
@@ -1401,7 +1136,7 @@ impl FunctionCompiler<'_, '_> {
                             None
                         }
                         Op::LeaveScope(scope) => {
-                            for &binding in &graph.scopes[*scope].bindings {
+                            for binding in self.b.graph.scopes[*scope].bindings.clone() {
                                 let value = self.constant(Value::UNDEFINED);
                                 self.initialize_binding(bindings[binding.index()], value);
                                 if let Some(cell) = lazy_cells[binding.index()] {
@@ -1411,8 +1146,8 @@ impl FunctionCompiler<'_, '_> {
                             None
                         }
                         Op::NextIteration(scope) | Op::FreshIteration(scope) => {
-                            for &binding in &graph.scopes[*scope].bindings {
-                                if !graph.bindings[binding].captured {
+                            for binding in self.b.graph.scopes[*scope].bindings.clone() {
+                                if !self.b.graph.bindings[binding].captured {
                                     continue;
                                 }
                                 let initial = if matches!(data.op, Op::FreshIteration(_)) {
@@ -1445,11 +1180,11 @@ impl FunctionCompiler<'_, '_> {
                 if let (Some(value), Some(result)) = (data.result(), result) {
                     debug_assert_eq!(
                         result.repr,
-                        graph.repr(value),
+                        self.b.graph.repr(value),
                         "{inst} produced {:?}",
                         result.repr
                     );
-                    let result = self.convert(result, graph.repr(value));
+                    let result = self.convert(result, self.b.graph.repr(value));
                     cx.define(value, result);
                     let required = cx.plan.implementations[inst].result == ResultReference::Move;
                     if required || cx.plan.holder(value) == Holder::Temporary {
@@ -1468,13 +1203,12 @@ impl FunctionCompiler<'_, '_> {
                 }
             }
             self.release_owned();
-            let terminator = data.terminator.as_ref().unwrap();
             self.source_span = terminator.span;
             self.b.set_span(terminator.span);
             self.source_name = terminator.source_name.unwrap_or(source_name);
             self.b.set_source_name(Some(self.source_name));
             let location = if self.annotations.semantic_locations {
-                cranelift_codegen::ir::SourceLoc::new(graph.terminator_location(block))
+                cranelift_codegen::ir::SourceLoc::new(cx.terminator_location(block))
             } else if self.source_name == source_name {
                 cranelift_codegen::ir::SourceLoc::new(terminator.span.start)
             } else {
@@ -1482,16 +1216,17 @@ impl FunctionCompiler<'_, '_> {
             };
             self.b.set_srcloc(location);
             let target = |this: &mut Self, target: &crate::jit::semantic::Target| {
+                let params = this.b.graph.blocks[target.block].params.clone();
                 let args: Vec<_> = target
                     .args
                     .iter()
-                    .zip(&graph.blocks[target.block].params)
+                    .zip(&params)
                     .map(|(&value, &param)| {
-                        debug_assert_eq!(graph.repr(value), graph.repr(param));
+                        debug_assert_eq!(this.b.graph.repr(value), this.b.graph.repr(param));
                         BlockArg::Value(this.operand(&cx, value).value)
                     })
                     .collect();
-                (blocks[target.block.index()], args)
+                (target.block, args)
             };
             match &terminator.kind {
                 TerminatorKind::CheckException(to, _) | TerminatorKind::Jump(to) => {
@@ -1544,7 +1279,7 @@ impl FunctionCompiler<'_, '_> {
                 }
             }
             if cold {
-                self.b.set_cold_block(blocks[block.index()]);
+                self.b.set_cold_block(block);
                 for index in created..self.b.num_blocks() {
                     self.b
                         .set_cold_block(crate::jit::semantic::Block::from_u32(index as u32));
@@ -1567,10 +1302,19 @@ impl FunctionCompiler<'_, '_> {
 }
 
 impl FunctionCompiler<'_, '_> {
+    fn adopt(&mut self, cx: &Context<'_>, inst: Inst) {
+        let direct = cx.direct.borrow();
+        for operand in self.b.graph.insts[inst].op.operands_mut() {
+            *operand = direct[*operand].expect("semantic value used before definition");
+        }
+        drop(direct);
+        self.b.adopt(inst);
+    }
+
     fn operand(&mut self, cx: &Context<'_>, value: GraphValue) -> Operand {
         let clif = cx.direct.borrow()[value].expect("semantic value used before definition");
-        let operand = Operand::new(clif, cx.graph.repr(value));
-        match cx.graph.defining_op(value) {
+        let operand = Operand::new(clif, self.b.graph.repr(value));
+        match self.b.graph.defining_op(value) {
             Some(Op::Constant(Constant::Number(number))) => operand.with_constant(*number),
             _ => operand,
         }
@@ -1579,11 +1323,10 @@ impl FunctionCompiler<'_, '_> {
     fn typed_op(
         &mut self,
         cx: &Context<'_>,
-        inst: crate::jit::semantic::Inst,
+        inst: Inst,
+        data: &InstData,
         target: Option<Repr>,
     ) -> Result<Option<Operand>, Error> {
-        let graph = cx.graph;
-        let data = &graph.insts[inst];
         let boolean = |condition: LoweredValue| Some(Operand::new(condition, Repr::I8));
         let result = match &data.op {
             Op::PropertyCache(site, name) => {
@@ -1602,7 +1345,9 @@ impl FunctionCompiler<'_, '_> {
                     .iter()
                     .map(|&value| self.operand(cx, value).value)
                     .collect();
-                let value = self.call_helper(*helper, &args);
+                let track = helper.returns_reference()
+                    && cx.plan.implementations[inst].result != ResultReference::Slot;
+                let value = self.call_helper_tracked(*helper, &args, track);
                 if contract.effects.control.throws {
                     self.check_error();
                 }
@@ -1611,81 +1356,6 @@ impl FunctionCompiler<'_, '_> {
             Op::View(object) => {
                 let object = self.operand(cx, *object).value;
                 Some(Operand::new(self.view(object), Repr::Boxed))
-            }
-            Op::LowLevel(crate::jit::semantic::low_level::Op::Store {
-                value,
-                address,
-                offset,
-                flags,
-            }) => {
-                let value = self.operand(cx, *value).value;
-                let address = self.operand(cx, *address).value;
-                self.b.ins().store(*flags, value, address, *offset);
-                None
-            }
-            Op::LowLevel(crate::jit::semantic::low_level::Op::Reference { op, value }) => {
-                let value = self.operand(cx, *value).value;
-                self.b.reference(*op, value);
-                None
-            }
-            Op::LowLevel(crate::jit::semantic::low_level::Op::Load {
-                ty,
-                address,
-                offset,
-                flags,
-            }) => {
-                let address = self.operand(cx, *address).value;
-                let value = self.b.ins().load(*ty, *flags, address, *offset);
-                Some(Operand::new(value, target.unwrap()))
-            }
-            Op::LowLevel(crate::jit::semantic::low_level::Op::Integer { ty, bits }) => Some(
-                Operand::new(self.b.ins().iconst(*ty, *bits as i64), target.unwrap()),
-            ),
-            Op::LowLevel(crate::jit::semantic::low_level::Op::Select { condition, yes, no }) => {
-                let condition = self.operand(cx, *condition).value;
-                let yes = self.operand(cx, *yes).value;
-                let no = self.operand(cx, *no).value;
-                Some(Operand::new(
-                    self.b.ins().select(condition, yes, no),
-                    target.unwrap(),
-                ))
-            }
-            Op::LowLevel(crate::jit::semantic::low_level::Op::Binary { op, left, right }) => {
-                let left = self.operand(cx, *left);
-                let right = self.operand(cx, *right);
-                Some(Operand::new(
-                    self.b.ins().binary(*op, left.value, right.value),
-                    target.expect("low-level binary result representation"),
-                ))
-            }
-            Op::LowLevel(crate::jit::semantic::low_level::Op::Unary { op, ty, value }) => {
-                let value = self.operand(cx, *value).value;
-                Some(Operand::new(
-                    if matches!(op, crate::jit::semantic::low_level::Unary::FloatDemote) {
-                        self.b.ins().fdemote(*ty, value)
-                    } else {
-                        self.b.ins().unary(*op, *ty, value)
-                    },
-                    Repr::from_machine(*ty),
-                ))
-            }
-            Op::LowLevel(crate::jit::semantic::low_level::Op::IntCompare {
-                condition,
-                left,
-                right,
-            }) => {
-                let left = self.operand(cx, *left).value;
-                let right = self.operand(cx, *right).value;
-                boolean(self.b.ins().icmp(*condition, left, right))
-            }
-            Op::LowLevel(crate::jit::semantic::low_level::Op::FloatCompare {
-                condition,
-                left,
-                right,
-            }) => {
-                let left = self.operand(cx, *left).value;
-                let right = self.operand(cx, *right).value;
-                boolean(self.b.ins().fcmp(*condition, left, right))
             }
             Op::Constant(Constant::Number(number)) => match target {
                 Some(Repr::F64) => Some(Operand::new(self.b.ins().f64const(*number), Repr::F64)),
@@ -1862,6 +1532,16 @@ impl FunctionCompiler<'_, '_> {
                     None => self.has_kind(view, kind::TYPED),
                 })
             }
+            Op::IsString(value) => {
+                let operand = self.operand(cx, *value);
+                let value = self.convert(operand, Repr::Boxed);
+                let tag = self.b.ins().ushr_imm_s(value, TAG_SHIFT as i64);
+                boolean(self.b.ins().icmp_imm_s(
+                    IntCC::Equal,
+                    tag,
+                    (TAG_STRING >> TAG_SHIFT) as i64,
+                ))
+            }
             Op::IsIndexed(object) => {
                 let operand = self.operand(cx, *object);
                 let object = self.convert(operand, Repr::Boxed);
@@ -1898,8 +1578,8 @@ impl FunctionCompiler<'_, '_> {
                 unreachable!("array storage must be lowered before emission")
             }
             Op::IsArray(object, layout) => {
-                let view = match graph.views.get(&inst) {
-                    Some(&view) => self.operand(cx, view).value,
+                let view = match self.b.graph.views.get(&inst).copied() {
+                    Some(view) => self.operand(cx, view).value,
                     None => {
                         let object = self.operand(cx, *object);
                         let object = self.convert(object, Repr::Boxed);
@@ -1918,8 +1598,8 @@ impl FunctionCompiler<'_, '_> {
                     bounded,
                 },
             ) => {
-                let view = match graph.views.get(&inst) {
-                    Some(&view) => self.operand(cx, view).value,
+                let view = match self.b.graph.views.get(&inst).copied() {
+                    Some(view) => self.operand(cx, view).value,
                     None => {
                         let object = self.operand(cx, *object);
                         let object = self.convert(object, Repr::Boxed);

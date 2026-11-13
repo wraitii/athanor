@@ -1,4 +1,6 @@
-use super::runtime::{arrays as array_checks, numeric, properties, storage, typed, views};
+use super::runtime::{
+    arrays as array_checks, helpers, numeric, properties, storage, typed, values, views,
+};
 use super::specialization::{
     call_variants, calls, observations, properties as property_accesses, reads, regions, shapes,
     writes,
@@ -44,6 +46,7 @@ impl FunctionState {
         legalize::legalize(&mut self.graph, &mut self.facts);
         conversions::simplify(&mut self.graph, &self.facts);
         conversions::hoist(&mut self.graph, &self.facts);
+        helpers::lower(self);
         self.graph.verify()?;
         let plan = ownership::plan(&mut self.graph, &mut self.facts);
         if cfg!(debug_assertions) {
@@ -53,6 +56,7 @@ impl FunctionState {
         properties::lower_loads(self);
         storage::lower_array_loads(self);
         storage::lower_stores(self);
+        values::lower(self);
         self.graph.verify()?;
         Ok(())
     }

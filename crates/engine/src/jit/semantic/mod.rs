@@ -115,7 +115,7 @@ pub(super) struct Graph {
     pub(super) values: PrimaryMap<Value, ValueDef>,
     pub(in crate::jit) reprs: SecondaryMap<Value, Option<Repr>>,
     pub(in crate::jit) ownership: Option<ownership::Plan>,
-    pub(super) low_level_slots: Vec<low_level::StackSlotData>,
+    pub(in crate::jit) low_level_slots: Vec<low_level::StackSlotData>,
     pub(super) low_level_signature: Option<cranelift_codegen::ir::Signature>,
     pub(super) bindings: PrimaryMap<Binding, BindingData>,
     pub(super) scopes: PrimaryMap<Scope, ScopeData>,
@@ -2079,7 +2079,12 @@ impl Graph {
                     return Err(format!("{block} passes wrong arity to {}", target.block));
                 }
                 for (&arg, &param) in target.args.iter().zip(&self.blocks[target.block].params) {
-                    if self.reprs[arg] != self.reprs[param] {
+                    let compatible = if self.low_level_signature.is_some() {
+                        self.reprs[arg].map(Repr::machine) == self.reprs[param].map(Repr::machine)
+                    } else {
+                        self.reprs[arg] == self.reprs[param]
+                    };
+                    if !compatible {
                         return Err(format!(
                             "{block} passes incompatible scalar type to {}",
                             target.block

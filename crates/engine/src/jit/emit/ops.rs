@@ -365,6 +365,15 @@ impl FunctionCompiler<'_, '_> {
     }
 
     pub(super) fn call_helper(&mut self, helper: Helper, args: &[LoweredValue]) -> LoweredValue {
+        self.call_helper_tracked(helper, args, helper.returns_reference())
+    }
+
+    pub(super) fn call_helper_tracked(
+        &mut self,
+        helper: Helper,
+        args: &[LoweredValue],
+        track: bool,
+    ) -> LoweredValue {
         let target = self.module.target_config();
         let signature = *self.helper_signatures.entry(helper).or_insert_with(|| {
             self.b.import_signature(helpers::signature(
@@ -386,7 +395,7 @@ impl FunctionCompiler<'_, '_> {
         self.b.mark_helper(call, helper);
         let result = self.b.inst_results(call)[0];
         self.unchecked = None;
-        if helper.returns_reference() {
+        if track {
             self.unchecked = Some(
                 self.b
                     .scratch(crate::jit::semantic::low_level::Scratch::Own, &[result]),
@@ -937,17 +946,6 @@ impl FunctionCompiler<'_, '_> {
         let kind = self.view_kind(view);
         let masked = self.b.ins().band_imm_s(kind, mask as i64);
         self.b.ins().icmp_imm_s(IntCC::NotEqual, masked, 0)
-    }
-
-    pub(super) fn view_length_integer(&mut self, view: LoweredValue) -> LoweredValue {
-        self.b
-            .ins()
-            .load(types::I64, MemFlagsData::trusted(), view, LENGTH_OFFSET)
-    }
-
-    pub(super) fn view_length(&mut self, view: LoweredValue) -> LoweredValue {
-        let length = self.view_length_integer(view);
-        self.b.ins().fcvt_from_uint(types::F64, length)
     }
 
     pub(super) fn typed_kind_is(&mut self, view: LoweredValue, kind: TypedKind) -> LoweredValue {

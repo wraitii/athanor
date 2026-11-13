@@ -399,9 +399,9 @@ mod tests {
     #[test]
     fn owned_allocations_transfer_one_reference_to_frame_slots() {
         for (helper, input) in [
-            (Helper::ObjectNewOwned, Value::UNDEFINED),
-            (Helper::NewInstanceOwned, Value::UNDEFINED),
-            (Helper::ArrayMapNewOwned, Value::number(2.0)),
+            (Helper::ObjectNew, Value::UNDEFINED),
+            (Helper::NewInstance, Value::UNDEFINED),
+            (Helper::ArrayMapNew, Value::number(2.0)),
         ] {
             let engine = Engine::new().unwrap();
             let heap = engine.global().heap();
@@ -430,12 +430,12 @@ mod tests {
             let source = heap.string(text).unwrap();
             let separator = heap.string("|").unwrap();
             let split: extern "C" fn(*mut JitCtx, u64, Value, *const Value, u64) -> Value =
-                unsafe { std::mem::transmute(HELPERS[Helper::StringSplitOwned as usize].pointer) };
+                unsafe { std::mem::transmute(HELPERS[Helper::StringSplit as usize].pointer) };
             let parts = split(&mut ctx, 0, source, &separator, 1);
             ctx.locals.values_mut()[0] = parts;
             let first = heap.get(parts, 0).unwrap();
             let array: extern "C" fn(*mut JitCtx, *const Value, u64) -> Value =
-                unsafe { std::mem::transmute(HELPERS[Helper::ArrayNewOwned as usize].pointer) };
+                unsafe { std::mem::transmute(HELPERS[Helper::ArrayNew as usize].pointer) };
             let values = array(&mut ctx, &first, 1);
             ctx.locals.values_mut()[1] = values;
             assert!(ctx.error.is_none());

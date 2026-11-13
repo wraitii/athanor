@@ -1,5 +1,5 @@
-use crate::heap::MathFunction;
 use crate::jit::helpers::Helper;
+use crate::heap::MathFunction;
 use oxc_syntax::operator::BinaryOperator;
 
 use super::{
@@ -78,7 +78,8 @@ fn typed(graph: &Graph, facts: &Facts, inst: Inst) -> Option<Representations> {
         Op::LowLevel(super::low_level::Op::Load { ty, .. }) => {
             any(1, Some(Repr::from_machine(*ty)))
         }
-        Op::LowLevel(super::low_level::Op::Integer { ty, .. }) => {
+        Op::LowLevel(super::low_level::Op::Integer { .. }) => any(0, target),
+        Op::LowLevel(super::low_level::Op::StackAddress { ty, .. }) => {
             any(0, Some(Repr::from_machine(*ty)))
         }
         Op::LowLevel(super::low_level::Op::Select { .. }) => any(3, target),
@@ -182,7 +183,7 @@ fn typed(graph: &Graph, facts: &Facts, inst: Inst) -> Option<Representations> {
             uses: vec![Use::Exact(Repr::Boxed), Use::Exact(Repr::I64)],
             produces: None,
         },
-        Op::IsIndexed(_) => exact(&[Repr::Boxed], Repr::I8),
+        Op::IsIndexed(_) | Op::IsString(_) => exact(&[Repr::Boxed], Repr::I8),
         Op::IsNumber(_) | Op::IsUninitialized(_) | Op::IsUndefined(_) | Op::IsNullish(_) => {
             any(1, Some(Repr::I8))
         }
@@ -298,8 +299,25 @@ pub(in crate::jit) enum Lowering {
 #[derive(Clone, Copy, Debug, Default)]
 pub(in crate::jit) struct Implementation {
     pub(in crate::jit) result: ResultReference,
-    pub(in crate::jit) helper: Option<Helper>,
     pub(in crate::jit) lowering: Lowering,
+}
+
+pub(super) fn fresh_reference(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Call {
+            target: Some(_),
+            ..
+        } | Op::HelperCall {
+            helper: Helper::ArrayMapNew
+                | Helper::ObjectNew
+                | Helper::ArrayNew
+                | Helper::PackTake
+                | Helper::NewInstance
+                | Helper::StringSplit,
+            ..
+        }
+    )
 }
 
 fn reference_implementation(
@@ -309,41 +327,16 @@ fn reference_implementation(
     slot: bool,
 ) -> Implementation {
     let op = &graph.insts[inst].op;
-    let helpers = match op {
-        Op::NewHoleyArray(_) => Some((Helper::ArrayMapNew, Helper::ArrayMapNewOwned)),
-        Op::NewObject => Some((Helper::ObjectNew, Helper::ObjectNewOwned)),
-        Op::NewArray(_) => Some((Helper::ArrayNew, Helper::ArrayNewOwned)),
-        Op::PackTake(..) => Some((Helper::PackTake, Helper::PackTakeOwned)),
-        Op::NewInstance(_) => Some((Helper::NewInstance, Helper::NewInstanceOwned)),
-        Op::StringSplit(..) => Some((Helper::StringSplit, Helper::StringSplitOwned)),
-        Op::StringSplitParts(..) => Some((Helper::StringSplitParts, Helper::StringSplitPartsOwned)),
-        Op::Call {
-            target: Some(_), ..
-        } => None,
-        _ => {
-            return Implementation {
-                result: match graph.contract(op, facts).result {
-                    Ownership::Borrowed => ResultReference::Borrowed,
-                    Ownership::Owned if slot => ResultReference::Move,
-                    _ => ResultReference::Managed,
-                },
-                helper: None,
-                ..Default::default()
-            };
-        }
+    let allocation = fresh_reference(op) || matches!(op, Op::StringSplitParts(..));
+    let result = match graph.contract(op, facts).result {
+        Ownership::Owned if allocation && slot => ResultReference::Slot,
+        Ownership::Owned if allocation => ResultReference::Managed,
+        Ownership::Borrowed => ResultReference::Borrowed,
+        Ownership::Owned if slot => ResultReference::Move,
+        _ => ResultReference::Managed,
     };
-    debug_assert_eq!(graph.contract(op, facts).result, Ownership::Owned);
     Implementation {
-        result: if slot {
-            ResultReference::Slot
-        } else {
-            ResultReference::Managed
-        },
-        helper: helpers.map(|(temporary, owned)| {
-            debug_assert!(temporary.returns_reference());
-            debug_assert!(!owned.returns_reference());
-            if slot { owned } else { temporary }
-        }),
+        result,
         ..Default::default()
     }
 }

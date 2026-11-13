@@ -918,6 +918,18 @@ impl Compiler {
             } else {
                 None
             };
+            if baseline.is_none() {
+                graph.prepare_for_emission().map_err(Error::Unsupported)?;
+            }
+            let inspection = super::inspect::Inspection::new(
+                self.inspection.as_deref(),
+                &graph,
+                &self.canonical,
+                self.source_name.0,
+                1,
+            )
+            .ast(self.inspection.as_deref(), &program);
+            let listing = self.listing().then(|| graph.listing_lines());
             let (function, annotations, lowered) = if baseline.is_some() {
                 self.data.push(baseline_data);
                 let mut function = cranelift_codegen::ir::Function::new();
@@ -931,9 +943,8 @@ impl Compiler {
                     None,
                 )
             } else {
-                graph.prepare_for_emission().map_err(Error::Unsupported)?;
                 self.emit_body(self.signature.clone(), self.source_name, |out| {
-                    emit::build_global(out, &graph.graph, &graph.facts, &continuations)
+                    emit::build_global(out, graph.graph, &graph.facts, &continuations)
                 })?
             };
             pending.push((
@@ -943,15 +954,8 @@ impl Compiler {
                     lowered,
                     baseline,
                     annotations,
-                    inspection: super::inspect::Inspection::new(
-                        self.inspection.as_deref(),
-                        &graph,
-                        &self.canonical,
-                        self.source_name.0,
-                        1,
-                    )
-                    .ast(self.inspection.as_deref(), &program),
-                    listing: self.listing().then(|| graph.listing_lines()),
+                    inspection,
+                    listing,
                 },
             ));
             Some(id)
@@ -1625,7 +1629,17 @@ impl Compiler {
         };
         if baseline.is_some() {
             self.data.push(baseline_data);
+        } else {
+            graph.prepare_for_emission().map_err(Error::Unsupported)?;
         }
+        let listing = self.listing().then(|| graph.listing_lines());
+        let inspection = super::inspect::Inspection::new(
+            self.inspection.as_deref(),
+            &graph,
+            &self.canonical,
+            source,
+            inline_multiplier,
+        );
         let (function, annotations, lowered) = if baseline.is_some() {
             let mut function = cranelift_codegen::ir::Function::new();
             function.signature = signature;
@@ -1638,12 +1652,11 @@ impl Compiler {
                 None,
             )
         } else {
-            graph.prepare_for_emission().map_err(Error::Unsupported)?;
             self.emit_body(signature, emission.source_name, |out| {
                 emit::build_function(
                     out,
                     emission.params,
-                    &graph.graph,
+                    graph.graph,
                     &graph.facts,
                     &continuations,
                     feedback,
@@ -1655,14 +1668,8 @@ impl Compiler {
             lowered,
             baseline,
             annotations,
-            listing: self.listing().then(|| graph.listing_lines()),
-            inspection: super::inspect::Inspection::new(
-                self.inspection.as_deref(),
-                &graph,
-                &self.canonical,
-                source,
-                inline_multiplier,
-            ),
+            listing,
+            inspection,
         };
         let id = if declared {
             code
@@ -1896,8 +1903,17 @@ impl Compiler {
         } else {
             None
         };
-        let (function, annotations, lowered) = if baseline.is_some() {
+        if baseline.is_some() {
             self.data.push(data);
+        } else {
+            state.prepare_for_emission().map_err(Error::Unsupported)?;
+        }
+        let inspection =
+            super::inspect::Inspection::from_graph(self.inspection.as_deref(), &state.graph);
+        let listing = self
+            .listing()
+            .then(|| state.graph.listing(&state.facts).lines());
+        let (function, annotations, lowered) = if baseline.is_some() {
             let mut function = cranelift_codegen::ir::Function::new();
             function.signature = self.signature.clone();
             (
@@ -1909,20 +1925,24 @@ impl Compiler {
                 None,
             )
         } else {
-            state.prepare_for_emission().map_err(Error::Unsupported)?;
-            let (graph, facts) = (&state.graph, &state.facts);
             self.emit_body(self.signature.clone(), source_name, |out| {
-                emit::build_function(out, params, graph, facts, continuations, feedback)
+                emit::build_function(
+                    out,
+                    params,
+                    state.graph,
+                    &state.facts,
+                    continuations,
+                    feedback,
+                )
             })?
         };
-        let (graph, facts) = (&state.graph, &state.facts);
         Ok(FunctionBody {
             function,
             lowered,
             annotations,
             baseline,
-            inspection: super::inspect::Inspection::from_graph(self.inspection.as_deref(), graph),
-            listing: self.listing().then(|| graph.listing(&facts).lines()),
+            inspection,
+            listing,
         })
     }
 
@@ -2198,6 +2218,24 @@ impl Compiler {
         };
         let signature = self.graph_signature(graph.as_ref().map(|graph| &graph.graph));
         let feedback = feedback.map(|owner| self.feedback(owner, true));
+        if baseline.is_none()
+            && let Some(graph) = &mut graph
+        {
+            graph.prepare_for_emission().map_err(Error::Unsupported)?;
+        }
+        let inspection = graph.as_ref().map_or_else(Default::default, |graph| {
+            super::inspect::Inspection::new(
+                self.inspection.as_deref(),
+                graph,
+                &self.canonical,
+                self.source_name.0,
+                usize::from(self.inlining),
+            )
+        });
+        let listing = self
+            .listing()
+            .then(|| graph.as_ref().map(|graph| graph.listing_lines()))
+            .flatten();
         let (function, annotations, lowered) = if baseline.is_some() {
             let mut function = cranelift_codegen::ir::Function::new();
             function.signature = signature;
@@ -2210,14 +2248,11 @@ impl Compiler {
                 None,
             )
         } else {
-            if let Some(graph) = &mut graph {
-                graph.prepare_for_emission().map_err(Error::Unsupported)?;
-            }
-            self.emit_body(signature, self.source_name, |out| match &graph {
+            self.emit_body(signature, self.source_name, |out| match graph {
                 Some(graph) => emit::build_function(
                     out,
                     params.span,
-                    &graph.graph,
+                    graph.graph,
                     &graph.facts,
                     &continuations,
                     feedback,
@@ -2235,19 +2270,8 @@ impl Compiler {
             lowered,
             baseline,
             annotations,
-            inspection: graph.as_ref().map_or_else(Default::default, |graph| {
-                super::inspect::Inspection::new(
-                    self.inspection.as_deref(),
-                    graph,
-                    &self.canonical,
-                    self.source_name.0,
-                    usize::from(self.inlining),
-                )
-            }),
-            listing: self
-                .listing()
-                .then(|| graph.as_ref().map(|graph| graph.listing_lines()))
-                .flatten(),
+            inspection,
+            listing,
         })
     }
 }

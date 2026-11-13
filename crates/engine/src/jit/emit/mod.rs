@@ -120,7 +120,7 @@ pub(super) struct Output<'a, 'f> {
 pub(super) fn build_function(
     out: Output<'_, '_>,
     params: Span,
-    graph: &super::semantic::Graph,
+    graph: super::semantic::Graph,
     facts: &super::semantic::Facts,
     continuations: &FxHashMap<usize, FuncId>,
     feedback: Option<Feedback>,
@@ -150,7 +150,7 @@ pub(super) fn build_factory(
 
 pub(super) fn build_global(
     out: Output<'_, '_>,
-    graph: &super::semantic::Graph,
+    graph: super::semantic::Graph,
     facts: &super::semantic::Facts,
     continuations: &FxHashMap<usize, FuncId>,
 ) -> Result<(), Error> {
@@ -165,7 +165,12 @@ pub(super) fn build_global(
 }
 
 enum CallableBody<'g> {
-    Graph(&'g super::semantic::Graph, &'g super::semantic::Facts),
+    Graph(super::semantic::Graph, &'g super::semantic::Facts),
+    Factory(std::sync::Arc<crate::continuation::Plan>),
+}
+
+enum Body<'g> {
+    Graph(semantic_graph::Context<'g>),
     Factory(std::sync::Arc<crate::continuation::Plan>),
 }
 
@@ -230,23 +235,37 @@ fn lower_callable(
     data: &mut FunctionData,
     source_name: (usize, usize),
 ) -> Result<super::semantic::Graph, Error> {
-    let mut lowered = super::semantic::Graph::new_low_level("<lowered>".into(), params, signature);
+    let (mut lowered, body) = match body {
+        CallableBody::Graph(mut graph, facts) => {
+            let context = semantic_graph::Context::new(&mut graph, facts);
+            graph.span = params;
+            graph.low_level_signature = Some(signature);
+            (graph, Body::Graph(context))
+        }
+        CallableBody::Factory(resume) => (
+            super::semantic::Graph::new_low_level("<lowered>".into(), params, signature),
+            Body::Factory(resume),
+        ),
+    };
+    let fixed = lowered.arity.is_some();
     let mut graph_builder = GraphBuilder::new(&mut lowered);
     let b = &mut graph_builder;
     b.set_source_name(Some(source_name));
+    if matches!(body, Body::Graph(_)) {
+        b.graph.entry = b.create_block();
+    }
     let entry = b.graph.entry;
     b.switch_to_block(entry);
     b.append_block_params_for_function_params(entry);
     let values = b.block_params(entry).to_vec();
     let (ctx, closure, receiver) = (values[0], values[1], values[2]);
-    let arguments = match body {
-        CallableBody::Graph(graph, _) if graph.arity.is_some() => {
-            Arguments::Fixed(values[3..].to_vec())
-        }
-        _ => Arguments::Vector {
+    let arguments = if fixed {
+        Arguments::Fixed(values[3..].to_vec())
+    } else {
+        Arguments::Vector {
             argv: values[3],
             argc: values[4],
-        },
+        }
     };
     let return_block = b.create_block();
     b.append_block_param(return_block, types::I64);
@@ -291,7 +310,7 @@ fn lower_callable(
     };
 
     compiler.enter_frame();
-    if let CallableBody::Factory(resume) = body {
+    if let Body::Factory(resume) = body {
         let (argv, argc) = compiler.argument_vector()?;
         let args = compiler.call_helper(Helper::ArrayNew, &[argv, argc]);
         let arguments = compiler.unchecked.expect("argument array reference");
@@ -308,8 +327,8 @@ fn lower_callable(
         compiler.switch(return_block);
         let result = compiler.b.block_params(return_block)[0];
         compiler.return_value(result);
-    } else if let CallableBody::Graph(graph, facts) = body {
-        compiler.emit_semantic_graph(graph, facts, closure, continuations)?;
+    } else if let Body::Graph(context) = body {
+        compiler.emit_semantic_graph(context, closure, continuations)?;
         compiler.patch_frame_size();
     }
     drop(compiler);

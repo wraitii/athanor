@@ -275,10 +275,10 @@ fn native_push_feedback_specializes_unknown_receivers_and_keeps_fallback() {
     );
     let text = String::from_utf8(output.stdout).unwrap();
     let (initial, specialized) = text.split_once(".feedback@").unwrap();
-    assert!(!initial.contains("array_append"), "{text}");
+    assert!(!initial.contains("helper_call ArrayAppend"), "{text}");
     assert!(specialized.contains("native ArrayPush"), "{text}");
-    assert!(specialized.contains("is_array_push"), "{text}");
-    assert!(specialized.contains("array_append"), "{text}");
+    assert!(specialized.contains("helper_call ArrayIterationGuard"), "{text}");
+    assert!(specialized.contains("helper_call ArrayAppend"), "{text}");
     assert!(text.lines().any(|line| line == "true"), "{text}");
 }
 
@@ -294,8 +294,8 @@ fn fresh_array_push_is_lowered_without_execution_or_identity_guards() {
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(text.contains("feedback: 0"), "{text}");
     assert!(text.contains("lower Array.push without guards"), "{text}");
-    assert!(text.contains("array_append"), "{text}");
-    assert!(!text.contains("is_array_push"), "{text}");
+    assert!(text.contains("helper_call ArrayAppend"), "{text}");
+    assert!(!text.contains("helper_call ArrayIterationGuard"), "{text}");
     assert!(!text.contains(".feedback@"), "{text}");
     let output = compile(
         &["--filter", "selected", "--execute", "print(selected(7));"],

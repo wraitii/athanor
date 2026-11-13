@@ -365,13 +365,13 @@ fn array_iteration_exposes_and_inlines_known_closures() {
                 .split("semantic IR")
                 .next()
                 .unwrap();
-            assert_eq!(caller.contains(&format!("is_array_{method}")), enabled);
-            assert_eq!(caller.contains("map_element"), enabled);
+            assert_eq!(caller.contains("helper_call ArrayIterationGuard("), enabled);
+            assert_eq!(caller.contains("helper_call ArrayMapElement("), enabled);
             if enabled {
                 assert!(caller.contains("inline") && caller.contains("0 code check(s)"));
                 assert!(caller.contains("materialized only in fallback"));
                 assert!(
-                    caller.find(&format!("is_array_{method}")).unwrap()
+                    caller.find("helper_call ArrayIterationGuard(").unwrap()
                         < caller.find(" = closure ").unwrap()
                 );
             }
@@ -429,17 +429,16 @@ fn construction_exposes_prototype_resolution() {
             String::from_utf8_lossy(&output.stderr)
         );
         let dump = String::from_utf8(output.stdout).unwrap();
-        assert_eq!(dump.contains("constructor_prototype"), enabled);
-        assert_eq!(dump.contains("construct_resolved"), enabled);
-        assert_eq!(dump.contains("construct_pack_resolved"), enabled);
-        assert_eq!(dump.contains("new_instance"), enabled);
-        assert_eq!(dump.contains("constructor_call "), enabled);
-        assert_eq!(dump.contains("constructor_call_pack"), enabled);
-        assert_eq!(dump.contains("constructor_result"), enabled);
+        assert_eq!(dump.contains("helper_call ConstructorPrototype("), enabled);
+        assert_eq!(dump.contains("helper_call ConstructResolved("), enabled);
+        assert_eq!(dump.contains("helper_call ConstructPackResolved("), enabled);
+        assert_eq!(dump.contains("helper_call NewInstance"), enabled);
+        assert_eq!(dump.contains("helper_call ConstructorCall("), enabled);
+        assert_eq!(dump.contains("helper_call ConstructorCallPack("), enabled);
         if enabled {
             assert!(
                 dump.find("helper_call PropertySetCached").unwrap()
-                    < dump.find("constructor_prototype").unwrap()
+                    < dump.find("helper_call ConstructorPrototype(").unwrap()
             );
         }
     }
@@ -467,7 +466,7 @@ fn known_constructor_bodies_can_be_inlined() {
     let dump = String::from_utf8(output.stdout).unwrap();
     let main = dump.split("semantic IR main\n").nth(1).unwrap();
     assert!(main.contains("inline"));
-    assert!(main.contains("constructor_result"));
+    assert!(main.contains("helper_call NewInstance"));
 }
 
 #[test]
@@ -722,7 +721,7 @@ fn spread_constructor_has_guarded_inline_and_generic_fallback() {
     );
     let dump = String::from_utf8(output.stdout).unwrap();
     let caller = dump.split("semantic IR main\n").nth(1).unwrap();
-    assert!(caller.contains("constructor_call_pack"));
+    assert!(caller.contains("helper_call ConstructorCallPack("));
     assert!(caller.contains("inline funcid"));
     assert!(caller.contains("is_code"));
 }
@@ -754,11 +753,11 @@ fn recursively_inlined_bodies_expand_arrays_and_constructors_once() {
         .split("semantic IR")
         .next()
         .unwrap();
-    let maps = caller.matches(" = is_array_map ").count();
-    let constructors = caller.matches(" = construct_pack_resolved ").count();
+    let maps = caller.matches(" = helper_call ArrayIterationGuard(").count();
+    let constructors = caller.matches(" = helper_call ConstructPackResolved(").count();
     assert!((2..=4).contains(&maps), "{maps}");
     assert!((2..=4).contains(&constructors), "{constructors}");
-    assert!(!caller.contains(" = construct_pack "));
+    assert!(!caller.contains(" = helper_call ConstructPack("));
     let start = source.find("new SimpleTerrain").unwrap();
     assert!(caller.lines().any(|line| {
         line.contains("note: call inst")
@@ -789,12 +788,12 @@ fn split_and_spread_inline_have_guarded_semantic_operations() {
     );
     let dump = String::from_utf8(output.stdout).unwrap();
     let caller = dump.split("semantic IR main\n").nth(1).unwrap();
-    assert!(caller.contains("is_string_split"));
-    assert!(caller.contains(" = string_split "));
+    assert!(caller.contains("helper_call IsStringSplit("));
+    assert!(caller.contains(" = helper_call StringSplit"));
     assert!(caller.contains(" = spread "));
     assert!(!caller.contains("is_indexed"));
-    assert_eq!(caller.matches(" = pack_take ").count(), 2);
-    assert!(caller.contains("constructor_call_pack"));
+    assert_eq!(caller.matches(" = helper_call PackTake").count(), 2);
+    assert!(caller.contains("helper_call ConstructorCallPack("));
     assert!(caller.contains("reenters, throws"));
 }
 
@@ -825,6 +824,6 @@ fn string_split_guard_can_select_a_closed_version() {
         .split("semantic IR")
         .next()
         .unwrap();
-    assert!(caller.contains("probe") && caller.contains("is_string_split"));
+    assert!(caller.contains("probe") && caller.contains("helper_call IsStringSplit("));
     assert!(caller.contains("hoisted guards"));
 }

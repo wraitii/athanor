@@ -338,6 +338,15 @@ impl<'a> Builder<'a> {
         result
     }
 
+    pub(in crate::jit) fn adopt(&mut self, inst: Inst) {
+        let block = self.current.expect("no current block");
+        self.graph.blocks[block].insts.push(inst);
+        let data = &mut self.graph.insts[inst];
+        data.block = block;
+        data.emission_location = self.location;
+        data.source_name = self.source_name;
+    }
+
     pub(in crate::jit) fn set_srcloc(&mut self, location: cranelift_codegen::ir::SourceLoc) {
         self.location = (!location.is_default()).then(|| location.bits());
     }
@@ -571,10 +580,10 @@ impl<'a> Builder<'a> {
         if let Some(previous) = self.types.insert(variable, ty) {
             assert_eq!(previous, ty);
         }
-        if let Some(existing) = self.graph.reprs[value].map(Repr::machine) {
-            assert_eq!(existing, ty);
+        match self.graph.reprs[value] {
+            Some(existing) => assert_eq!(existing.machine(), ty),
+            None => self.graph.reprs[value] = Some(Repr::from_machine(ty)),
         }
-        self.graph.reprs[value] = Some(Repr::from_machine(ty));
         self.definitions.insert((block, variable), value);
     }
 
@@ -761,10 +770,6 @@ impl Instructions<'_, '_> {
         self.value(Op::Binary { op, left, right }, ty)
     }
 
-    pub(in crate::jit) fn unary(&mut self, op: Unary, ty: Type, value: Value) -> Value {
-        self.value(Op::Unary { op, ty, value }, ty)
-    }
-
     binary_methods!(isub => Subtract, band => And, bor => Or, bxor => Xor,
         ishl => ShiftLeft, sshr => ShiftRightSigned, ushr => ShiftRightUnsigned,
         fadd => FloatAdd, fsub => FloatSubtract, fmul => FloatMultiply,
@@ -776,7 +781,7 @@ impl Instructions<'_, '_> {
     unary_methods!(fabs => FloatAbs,
         ceil => Ceil, floor => Floor, trunc => Trunc, sqrt => Sqrt);
     conversion_methods!(ireduce => Reduce, sextend => SignExtend, uextend => ZeroExtend,
-        fpromote => FloatPromote, fdemote => FloatDemote, fcvt_from_sint => FloatFromSigned,
+        fpromote => FloatPromote, fcvt_from_sint => FloatFromSigned,
         fcvt_from_uint => FloatFromUnsigned, fcvt_to_sint_sat => SignedSaturatingFromFloat);
 
     pub(in crate::jit) fn f64const(&mut self, value: f64) -> Value {
