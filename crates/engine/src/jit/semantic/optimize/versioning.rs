@@ -609,7 +609,7 @@ fn entry_checks(
                 }
             }
             Op::ProbeShapeProperty(..) => data.op.clone(),
-            Op::GetIndex(object, key) | Op::IndexedGet(object, key) => Op::ProbeIndex(object, key),
+            Op::GetIndex(object, key) | Op::ArrayGet(object, key) => Op::ProbeIndex(object, key),
             Op::GlobalRead(name) => Op::ProbeGlobal(name),
             Op::Argument(index) => Op::Argument(index),
             Op::This => Op::This,

@@ -18,14 +18,34 @@ pub(super) fn plan(
     bodies: &super::specialize::Repository,
     source: usize,
 ) -> Vec<Read> {
+    plan_accesses(graph, bodies, source, false)
+}
+
+pub(super) fn plan_stores(
+    graph: &Graph,
+    bodies: &super::specialize::Repository,
+    source: usize,
+) -> Vec<Read> {
+    plan_accesses(graph, bodies, source, true)
+}
+
+fn plan_accesses(
+    graph: &Graph,
+    bodies: &super::specialize::Repository,
+    source: usize,
+    stores: bool,
+) -> Vec<Read> {
     let facts = Facts::compute(graph);
     let hints = super::observations::read_hints(graph);
     let mut reads = Vec::new();
     for block in Cfg::new(graph).rpo {
         for &inst in &graph.blocks[block].insts {
             let (object, key) = match graph.insts[inst].op {
-                Op::GetIndex(object, key)
-                | Op::TypedIndex(object, key, TypedRead { element: None, .. }) => (object, key),
+                Op::SetIndex(object, key, _) if stores => (object, key),
+                Op::GetIndex(object, key) if !stores => (object, key),
+                Op::TypedIndex(object, key, TypedRead { element: None, .. }) if !stores => {
+                    (object, key)
+                }
                 _ => continue,
             };
             let site = |inst: Inst| {
@@ -78,7 +98,9 @@ pub(super) fn assume(graph: &mut Graph, reads: &[Read]) {
     for read in reads {
         let data = graph.insts[read.inst].clone();
         let (object, key) = match data.op {
-            Op::GetIndex(object, key) | Op::TypedIndex(object, key, _) => (object, key),
+            Op::GetIndex(object, key)
+            | Op::TypedIndex(object, key, _)
+            | Op::SetIndex(object, key, _) => (object, key),
             _ => unreachable!(),
         };
         let at = graph.blocks[data.block]
@@ -156,7 +178,27 @@ pub(super) fn lower(
                 })
         })
         .collect();
-    apply(graph, &reads, notes)
+    apply(graph, &reads, notes)?;
+    let facts = Facts::compute(graph);
+    let arrays: Vec<_> = facts
+        .cfg
+        .rpo
+        .iter()
+        .filter(|block| !graph.cold.contains(block))
+        .flat_map(|&block| graph.blocks[block].insts.iter().copied())
+        .filter(|&inst| {
+            matches!(graph.insts[inst].op, Op::ArrayGet(_, key)
+            if facts.of(key).within(ValueType::NUMBER))
+        })
+        .collect();
+    for inst in arrays {
+        lower_array(graph, inst, false);
+        notes.push(format!(
+            "read at {}: packed/holey array checks",
+            graph.note_inst(inst)
+        ));
+    }
+    graph.verify()
 }
 
 pub(super) fn apply(
@@ -180,7 +222,7 @@ pub(super) fn apply(
             && super::guards::holds(graph, &cfg, block, object, super::guards::Fact::Indexed)
             && facts.of(key).within(ValueType::NUMBER)
         {
-            graph.insts[read.inst].op = Op::IndexedGet(object, key);
+            graph.insts[read.inst].op = Op::ArrayGet(object, key);
         }
         if read.typed
             && super::guards::holds(
@@ -202,21 +244,21 @@ pub(super) fn apply(
             );
             continue;
         }
+        if !read.typed {
+            lower_array(graph, read.inst, read.guard_number);
+            notes.push(format!("read at {site}: packed/holey array checks"));
+            continue;
+        }
         let first_block = graph.blocks.len();
         let (block, continuation, fallback) = super::dispatch::split(graph, read.inst);
-        let fast = if read.typed {
-            let fast = graph.blocks.push(BlockData::default());
-            let check = graph.append_value(block, data.span, Op::IsTyped(object, read.element));
-            graph.blocks[block].terminator = Some(Terminator {
-                source_name: data.source_name,
-                emission_location: None,
-                span: data.span,
-                kind: TerminatorKind::Branch(check, Target::new(fast), Target::new(fallback)),
-            });
-            fast
-        } else {
-            block
-        };
+        let fast = graph.blocks.push(BlockData::default());
+        let check = graph.append_value(block, data.span, Op::IsTyped(object, read.element));
+        graph.blocks[block].terminator = Some(Terminator {
+            source_name: data.source_name,
+            emission_location: None,
+            span: data.span,
+            kind: TerminatorKind::Branch(check, Target::new(fast), Target::new(fallback)),
+        });
         let (fast, key) = if read.guard_number {
             let typed = graph.blocks.push(BlockData::default());
             let check = graph.append_value(fast, data.span, Op::IsNumber(key));
@@ -231,51 +273,6 @@ pub(super) fn apply(
         } else {
             (fast, key)
         };
-        if !read.typed {
-            let position = graph.append_value(fast, data.span, Op::ArrayPosition(key));
-            let mut guard = fast;
-            for holey in [false, true] {
-                let load = graph.blocks.push(BlockData::default());
-                let otherwise = if holey {
-                    fallback
-                } else {
-                    graph.blocks.push(BlockData::default())
-                };
-                let valid = graph.append_value(
-                    guard,
-                    data.span,
-                    Op::IsArrayIndex(object, key, position, holey),
-                );
-                graph.blocks[guard].terminator = Some(Terminator {
-                    source_name: data.source_name,
-                    emission_location: None,
-                    span: data.span,
-                    kind: TerminatorKind::Branch(valid, Target::new(load), Target::new(otherwise)),
-                });
-                let (inst, value) = graph.append(
-                    load,
-                    data.span,
-                    Op::ArrayLoad(object, position, holey),
-                    true,
-                );
-                graph.insts[inst].source_name = data.source_name;
-                graph.blocks[load].terminator = Some(Terminator {
-                    source_name: data.source_name,
-                    emission_location: None,
-                    span: data.span,
-                    kind: TerminatorKind::Jump(Target {
-                        block: continuation,
-                        args: vec![value.unwrap()],
-                    }),
-                });
-                guard = otherwise;
-            }
-            extend_regions(graph, data.block, first_block);
-            notes.push(format!(
-                "read at {site}: packed/holey indexed receiver checks"
-            ));
-            continue;
-        }
         let (inst, value) = graph.append(
             fast,
             data.span,
@@ -303,6 +300,74 @@ pub(super) fn apply(
         notes.push(format!("read at {site}: typed receiver check"));
     }
     graph.verify()
+}
+
+fn lower_array(graph: &mut Graph, inst: Inst, guard_number: bool) {
+    let data = graph.insts[inst].clone();
+    let (object, key) = match data.op {
+        Op::GetIndex(object, key) | Op::ArrayGet(object, key) => (object, key),
+        _ => unreachable!(),
+    };
+    let terminate = |graph: &mut Graph, block, kind| {
+        graph.blocks[block].terminator = Some(Terminator {
+            source_name: data.source_name,
+            emission_location: None,
+            span: data.span,
+            kind,
+        });
+    };
+    let first_block = graph.blocks.len();
+    let (block, continuation, fallback) = super::dispatch::split(graph, inst);
+    let (fast, key) = if guard_number {
+        let fast = graph.blocks.push(BlockData::default());
+        let check = graph.append_value(block, data.span, Op::IsNumber(key));
+        terminate(
+            graph,
+            block,
+            TerminatorKind::Branch(check, Target::new(fast), Target::new(fallback)),
+        );
+        let key = graph.append_value(fast, data.span, Op::AsNumber(key));
+        (fast, key)
+    } else {
+        (block, key)
+    };
+    let position = graph.append_value(fast, data.span, Op::ArrayPosition(key));
+    let mut guard = fast;
+    for layout in [super::ArrayLayout::Packed, super::ArrayLayout::Holey] {
+        let load = graph.blocks.push(BlockData::default());
+        let otherwise = if layout == super::ArrayLayout::Holey {
+            fallback
+        } else {
+            graph.blocks.push(BlockData::default())
+        };
+        let valid = graph.append_value(
+            guard,
+            data.span,
+            Op::IsArrayIndex(object, key, position, layout),
+        );
+        terminate(
+            graph,
+            guard,
+            TerminatorKind::Branch(valid, Target::new(load), Target::new(otherwise)),
+        );
+        let (load_inst, value) = graph.append(
+            load,
+            data.span,
+            Op::ArrayLoad(object, position, layout),
+            true,
+        );
+        graph.insts[load_inst].source_name = data.source_name;
+        terminate(
+            graph,
+            load,
+            TerminatorKind::Jump(Target {
+                block: continuation,
+                args: vec![value.unwrap()],
+            }),
+        );
+        guard = otherwise;
+    }
+    extend_regions(graph, data.block, first_block);
 }
 
 fn extend_regions(graph: &mut Graph, block: super::Block, first: usize) {

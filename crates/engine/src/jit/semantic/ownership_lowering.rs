@@ -247,7 +247,6 @@ pub(in crate::jit) fn lower(graph: &mut Graph, ctx: Value, convention: CallConv,
             match op {
                 low_level::Op::Reference { op, value } => match op {
                     Reference::Retain => current = lowering.retain(value),
-                    Reference::RetainAddress => lowering.retain_address(value),
                     Reference::Release { heap, cold } => {
                         current = lowering.release(value, heap, cold)
                     }

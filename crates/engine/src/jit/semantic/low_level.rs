@@ -85,7 +85,6 @@ pub(in crate::jit) struct StackSlotData {
 #[derive(Clone, Copy, Debug)]
 pub(in crate::jit) enum Reference {
     Retain,
-    RetainAddress,
     Release { heap: bool, cold: bool },
 }
 

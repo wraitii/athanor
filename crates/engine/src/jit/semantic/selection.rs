@@ -70,10 +70,17 @@ fn typed(graph: &Graph, facts: &Facts, inst: Inst) -> Option<Representations> {
         produces,
     };
     Some(match &data.op {
+        Op::LowLevel(super::low_level::Op::Load { ty, .. }) => {
+            any(1, Some(Repr::from_machine(*ty)))
+        }
+        Op::LowLevel(super::low_level::Op::Integer { ty, .. }) => {
+            any(0, Some(Repr::from_machine(*ty)))
+        }
+        Op::LowLevel(super::low_level::Op::Select { .. }) => any(3, target),
         Op::LowLevel(super::low_level::Op::Binary { op, .. }) if op.is_float() => {
             exact(&[Repr::F64, Repr::F64], Repr::F64)
         }
-        Op::LowLevel(super::low_level::Op::Binary { op, .. }) if op.is_integer_arithmetic() => {
+        Op::LowLevel(super::low_level::Op::Binary { op, .. }) if !op.is_float() => {
             let repr = target.expect("integer arithmetic result representation");
             exact(&[repr, repr], repr)
         }
@@ -132,6 +139,26 @@ fn typed(graph: &Graph, facts: &Facts, inst: Inst) -> Option<Representations> {
             }),
         ),
         Op::KeepAlive(_) => any(1, None),
+        Op::PropertyWriteCache(..) => any(0, Some(Repr::I64)),
+        Op::CanOverwrite(..) => exact(&[Repr::Boxed, Repr::I64], Repr::I8),
+        Op::ArrayStore(..) | Op::PropertyStore(..) | Op::PropertyAdd(..) => Representations {
+            uses: vec![
+                Use::Exact(Repr::Boxed),
+                Use::Exact(Repr::I64),
+                Use::Exact(Repr::Boxed),
+            ],
+            produces: None,
+        },
+        Op::LowLevel(super::low_level::Op::Store { .. }) => any(2, None),
+        Op::LowLevel(super::low_level::Op::Reference { .. }) => any(1, None),
+        Op::LowLevel(super::low_level::Op::Unary { op, ty, .. }) => Representations {
+            uses: vec![match op {
+                super::low_level::Unary::FloatDemote => Use::Exact(Repr::F64),
+                super::low_level::Unary::Reduce => Use::Exact(Repr::I64),
+                _ => Use::Any,
+            }],
+            produces: Some(Repr::from_machine(*ty)),
+        },
         Op::NumericFloat(_) => exact(&[Repr::F64], Repr::F64),
         Op::SaturatingInteger(_) | Op::AsInteger(_) => exact(&[Repr::I64], Repr::I64),
         Op::IntegerCheck(..) => Representations {
@@ -200,7 +227,7 @@ fn typed(graph: &Graph, facts: &Facts, inst: Inst) -> Option<Representations> {
                 Repr::Boxed
             }),
         },
-        Op::GetIndex(_, index) | Op::TypedIndex(_, index, _) | Op::IndexedGet(_, index) => {
+        Op::GetIndex(_, index) | Op::TypedIndex(_, index, _) | Op::ArrayGet(_, index) => {
             Representations {
                 uses: vec![Use::Exact(Repr::Boxed), key(graph, *index)],
                 produces: Some(Repr::Boxed),

@@ -38,6 +38,7 @@ mod string_split;
 pub(in crate::jit) mod suspension;
 mod transforms;
 mod typed_lowering;
+mod writes;
 
 use crate::{FxHashMap, FxHashSet};
 use std::fmt;
@@ -280,6 +281,22 @@ pub(in crate::jit) struct DirectTarget {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(in crate::jit) enum ArrayLayout {
+    Packed,
+    Holey,
+}
+
+impl ArrayLayout {
+    pub(in crate::jit) fn kind(self) -> u32 {
+        crate::heap::kind::ARRAY
+            | match self {
+                Self::Packed => 0,
+                Self::Holey => crate::heap::kind::HOLEY,
+            }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(in crate::jit) enum MemoryFormat {
     U8,
     U16,
@@ -318,6 +335,12 @@ pub(in crate::jit) enum MemoryOp {
         address: Value,
         format: MemoryFormat,
     },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum PropertyWrite {
+    Set,
+    Define,
 }
 
 #[derive(Clone, Debug)]
@@ -404,15 +427,17 @@ pub(super) enum Op {
     IsExactPosition(Value, Value),
     // Compare integer position and length as unsigned values.
     IsInBounds(Value, Value),
-    IsArrayIndex(Value, Value, Value, bool),
-    IsArray(Value, bool),
+    IsArrayIndex(Value, Value, Value, ArrayLayout),
+    IsArray(Value, ArrayLayout),
     // Non-short-circuit conjunction of boolean operands.
     BooleanAnd(Value, Value),
     // Requires matching layout, exact position and bounds checks with no intervening array mutation.
-    ArrayLoad(Value, Value, bool),
+    // The array holds the borrowed result; holes produce undefined.
+    ArrayLoad(Value, Value, ArrayLayout),
     IndexedLength(Value),
     ArrayKind(Value),
-    IndexedGet(Value, Value),
+    // Array or typed-array receiver; retains generic key and bounds handling.
+    ArrayGet(Value, Value),
     // Extracted values stay rooted independently of the pack across argument initialization.
     PackTake(Value, Value),
     EnumerateNew(Value),
@@ -433,6 +458,14 @@ pub(super) enum Op {
     GetIndex(Value, Value),
     Set(Value, String, Value),
     SetIndex(Value, Value, Value),
+    // Bounded packed-array replacement; storage retains the incoming value before releasing the old one.
+    ArrayStore(Value, Value, Value),
+    PropertyStore(Value, Value, Value, PropertyWrite),
+    PropertyAdd(Value, Value, Value, PropertyWrite),
+    // Native slot replacement must go through the runtime setter.
+    CanOverwrite(Value, Value),
+    PropertyWriteCache(Inst, String),
+    FillPropertyStore(Value, Inst, String, Value, PropertyWrite),
     ToNumeric(Value),
     // Pure integer coercion of a value proven to be a number or undefined.
     ToInt32(Value),
@@ -612,7 +645,8 @@ impl Op {
             | Op::ReadHint(value, ..)
             | Op::Assume(value, ..)
             | Op::EntryAssume(value, _) => ([Some(*value), None, None], &[]),
-            Op::Argument(_)
+            Op::PropertyWriteCache(..)
+            | Op::Argument(_)
             | Op::Arguments
             | Op::Rest(_)
             | Op::This
@@ -701,6 +735,7 @@ impl Op {
             Op::Define(object, _, value)
             | Op::DefineHidden(object, _, value)
             | Op::ShapedSet(object, _, _, value)
+            | Op::FillPropertyStore(object, _, _, value, _)
             | Op::Set(object, _, value) => ([Some(*object), Some(*value), None], &[]),
             Op::Memory(MemoryOp::IndexedLoad {
                 base: object,
@@ -714,9 +749,10 @@ impl Op {
             })
             | Op::MapElement(object, key)
             | Op::IsArrayIteration(object, key, _)
+            | Op::CanOverwrite(object, key)
             | Op::GetIndex(object, key)
             | Op::TypedIndex(object, key, _)
-            | Op::IndexedGet(object, key)
+            | Op::ArrayGet(object, key)
             | Op::ArrayLoad(object, key, _)
             | Op::PackTake(object, key)
             | Op::ProbeIndex(object, key)
@@ -753,7 +789,10 @@ impl Op {
                 numbers,
                 ..
             } => ([Some(*left), Some(*right), None], numbers),
-            Op::SetIndex(object, key, value) => ([Some(*object), Some(*key), Some(*value)], &[]),
+            Op::ArrayStore(object, key, value)
+            | Op::PropertyStore(object, key, value, _)
+            | Op::PropertyAdd(object, key, value, _)
+            | Op::SetIndex(object, key, value) => ([Some(*object), Some(*key), Some(*value)], &[]),
             Op::NewArray(values) | Op::CallNative(_, values) => ([None; 3], values),
             Op::StringSplit(receiver, args) | Op::StringSplitParts(receiver, args) => {
                 ([Some(*receiver), None, None], args)
@@ -824,7 +863,8 @@ impl Op {
             | Op::ReadHint(value, ..)
             | Op::Assume(value, ..)
             | Op::EntryAssume(value, _) => ([Some(value), None, None], &mut []),
-            Op::Argument(_)
+            Op::PropertyWriteCache(..)
+            | Op::Argument(_)
             | Op::Arguments
             | Op::Rest(_)
             | Op::This
@@ -913,6 +953,7 @@ impl Op {
             Op::Define(object, _, value)
             | Op::DefineHidden(object, _, value)
             | Op::ShapedSet(object, _, _, value)
+            | Op::FillPropertyStore(object, _, _, value, _)
             | Op::Set(object, _, value) => ([Some(object), Some(value), None], &mut []),
             Op::Memory(MemoryOp::IndexedLoad {
                 base: object,
@@ -926,9 +967,10 @@ impl Op {
             })
             | Op::MapElement(object, key)
             | Op::IsArrayIteration(object, key, _)
+            | Op::CanOverwrite(object, key)
             | Op::GetIndex(object, key)
             | Op::TypedIndex(object, key, _)
-            | Op::IndexedGet(object, key)
+            | Op::ArrayGet(object, key)
             | Op::ArrayLoad(object, key, _)
             | Op::PackTake(object, key)
             | Op::ProbeIndex(object, key)
@@ -965,7 +1007,10 @@ impl Op {
                 numbers,
                 ..
             } => ([Some(left), Some(right), None], numbers),
-            Op::SetIndex(object, key, value) => ([Some(object), Some(key), Some(value)], &mut []),
+            Op::ArrayStore(object, key, value)
+            | Op::PropertyStore(object, key, value, _)
+            | Op::PropertyAdd(object, key, value, _)
+            | Op::SetIndex(object, key, value) => ([Some(object), Some(key), Some(value)], &mut []),
             Op::NewArray(values) | Op::CallNative(_, values) => ([None, None, None], values),
             Op::StringSplit(receiver, args) | Op::StringSplitParts(receiver, args) => {
                 ([Some(receiver), None, None], args)
@@ -986,6 +1031,10 @@ impl Op {
             Op::Define(object, ..)
             | Op::Set(object, ..)
             | Op::ShapedSet(object, ..)
+            | Op::ArrayStore(object, ..)
+            | Op::PropertyStore(object, ..)
+            | Op::PropertyAdd(object, ..)
+            | Op::FillPropertyStore(object, ..)
             | Op::SetIndex(object, ..)
             | Op::ArrayAppend(object, ..)
             | Op::IteratorNext(object)
@@ -1667,12 +1716,11 @@ impl Graph {
                 effects: Effects::UNKNOWN,
                 result: Unowned,
             },
-            Op::LowLevel(low_level::Op::Load { .. } | low_level::Op::AtomicLoad { .. }) => {
-                Contract {
-                    effects: Effects::UNKNOWN,
-                    result: Unowned,
-                }
-            }
+            Op::LowLevel(low_level::Op::Load { .. }) => closed(HEAP_READ, Unowned),
+            Op::LowLevel(low_level::Op::AtomicLoad { .. }) => Contract {
+                effects: Effects::UNKNOWN,
+                result: Unowned,
+            },
             Op::LowLevel(low_level::Op::Store { .. }) => Contract {
                 effects: Effects::UNKNOWN,
                 result: None,
@@ -1776,7 +1824,14 @@ impl Graph {
             }
             Op::PrimePropertyCache(..) => closed(HEAP_READ | CODE_READ | INTERNAL, None),
             Op::CachedProperty(..) => closed(HEAP_READ | INTERNAL | ERROR, Borrowed),
-            Op::Set(..) | Op::SetIndex(..) => closed(
+            Op::FillPropertyStore(.., PropertyWrite::Define) => {
+                closed(HEAP_READ | CODE_WRITE | ALLOCATION | INTERNAL | ERROR, None)
+            }
+            Op::PropertyStore(.., PropertyWrite::Define)
+            | Op::PropertyAdd(.., PropertyWrite::Define) => {
+                closed(HEAP_READ | CODE_WRITE | INTERNAL, None)
+            }
+            Op::Set(..) | Op::SetIndex(..) | Op::FillPropertyStore(..) => closed(
                 HEAP_READ | HEAP_WRITE | CODE_WRITE | ALLOCATION | INTERNAL | ERROR,
                 None,
             ),
@@ -1855,9 +1910,14 @@ impl Graph {
             Op::ArrayPosition(_) => closed(INTERNAL, Unowned),
             Op::IsExactPosition(..) | Op::IsInBounds(..) | Op::BooleanAnd(..) => closed(0, Unowned),
             Op::ArrayKind(_) | Op::IndexedLength(_) => closed(HEAP_READ, Unowned),
-            Op::IndexedGet(..) | Op::ArrayLoad(..) => {
-                closed(HEAP_READ | INTERNAL | ERROR, Borrowed)
+            Op::ArrayGet(..) => closed(HEAP_READ | INTERNAL | ERROR, Borrowed),
+            Op::ArrayLoad(..) => closed(HEAP_READ, Borrowed),
+            Op::ArrayStore(..) | Op::PropertyStore(..) => {
+                closed(HEAP_READ | HEAP_WRITE | INTERNAL, None)
             }
+            Op::PropertyAdd(..) => closed(HEAP_READ | HEAP_WRITE | CODE_WRITE | INTERNAL, None),
+            Op::CanOverwrite(..) => closed(HEAP_READ, Unowned),
+            Op::PropertyWriteCache(..) => closed(INTERNAL, Unowned),
             Op::PackTake(..) => closed(HEAP_READ | HEAP_WRITE | INTERNAL, Owned),
             Op::TypedIndex(..) => closed(HEAP_READ, Unowned),
             Op::IsNumber(_)
@@ -2147,6 +2207,7 @@ pub(in crate::jit) struct SpecializationPlan {
     pub(in crate::jit) call_variants: Vec<(super::profile::Site, super::entries::VariantId)>,
     pub(in crate::jit) inlines: Vec<specialize::Inline>,
     pub(in crate::jit) reads: Vec<reads::Read>,
+    stores: Vec<reads::Read>,
     pub(in crate::jit) shapes: shapes::Plan,
     pub(in crate::jit) numbers: Vec<(super::profile::Site, super::profile::ReadType)>,
     pub(in crate::jit) conditional: specialize::ConditionalPlan,
@@ -2226,7 +2287,9 @@ impl FunctionState {
     }
 
     pub(in crate::jit) fn lower_memory(&mut self) -> Result<()> {
-        if typed_lowering::lower_memory(self) {
+        let typed = typed_lowering::lower_memory(self);
+        let metadata = memory_lowering::lower_metadata(self);
+        if typed || metadata {
             self.graph.verify()?;
             self.ensure_facts();
             borrow::borrows(&mut self.graph, &self.facts, &mut self.notes);
@@ -2235,6 +2298,11 @@ impl FunctionState {
     }
 
     pub(in crate::jit) fn prepare_for_emission(&mut self) -> Result<()> {
+        if lowering::properties::lower(self)? {
+            self.ensure_facts();
+            borrow::borrows(&mut self.graph, &self.facts, &mut self.notes);
+        }
+        self.lower_memory()?;
         if lowering::numeric::operations(self) {
             self.ensure_facts();
             borrow::borrows(&mut self.graph, &self.facts, &mut self.notes);
@@ -2250,6 +2318,9 @@ impl FunctionState {
             ownership::verify(&self.graph, &self.facts, &plan)?;
         }
         self.graph.ownership = Some(plan);
+        memory_lowering::lower_array_loads(self);
+        memory_lowering::lower_stores(self);
+        self.graph.verify()?;
         Ok(())
     }
 
@@ -2493,6 +2564,9 @@ fn plan_canonical_inner(
     let reads = specialization.map_or_else(Vec::new, |(bodies, source)| {
         reads::plan(&function.graph, bodies, source)
     });
+    let stores = specialization.map_or_else(Vec::new, |(bodies, source)| {
+        reads::plan_stores(&function.graph, bodies, source)
+    });
     let shapes = specialization.map_or_else(shapes::Plan::default, |(bodies, source)| {
         shapes::plan(&function.graph, bodies, source)
     });
@@ -2509,6 +2583,7 @@ fn plan_canonical_inner(
         conditional,
         inlines: inline_budget.inlines,
         reads,
+        stores,
         shapes,
         numbers,
     };
@@ -2544,6 +2619,7 @@ pub(super) fn optimize_planned(
         .collect();
     let cached_reads = caches::assume(&mut function.graph, &function.plan.shapes);
     reads::assume(&mut function.graph, &function.plan.reads);
+    reads::assume(&mut function.graph, &function.plan.stores);
     optimize::sink_closures(&mut function);
     if optimize::lazy_captures(&mut function) {
         function.invalidate_cfg();
@@ -2608,6 +2684,7 @@ pub(super) fn optimize_planned(
         &function.plan.reads,
         &mut function.notes,
     )?;
+    writes::lower(&mut function.graph, &function.plan.stores)?;
     function.invalidate_cfg();
     optimize::normalise_regions(&mut function, &regions)?;
     js::coercions(&mut function);
@@ -2636,6 +2713,9 @@ pub(super) fn optimize_planned(
             .values()
             .any(|data| matches!(data.op, Op::EntryAssume(_, guards::Fact::Shape(_))))
     {
+        optimize::reuse_loads(&mut function);
+    }
+    if lowering::properties::lower(&mut function)? {
         optimize::reuse_loads(&mut function);
     }
     if typed_lowering::lower_array_kinds(&mut function) {

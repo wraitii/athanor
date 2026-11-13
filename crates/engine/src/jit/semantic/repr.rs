@@ -92,14 +92,27 @@ impl MemoryFormat {
 
 pub(super) fn assign(graph: &mut Graph, facts: &Facts) {
     for value in graph.values.keys() {
-        let repr = match graph.defining_op(value) {
-            Some(Op::TypedData(_) | Op::Memory(MemoryOp::Address { .. })) => Repr::I64,
-            Some(Op::Memory(
-                MemoryOp::IndexedLoad { format, .. } | MemoryOp::Load { format, .. },
-            )) => format.repr(),
-            Some(Op::SaturatingInteger(_)) => Repr::I64,
-            _ => Repr::of(facts.of(value)),
-        };
-        graph.reprs[value] = Some(repr);
+        graph.reprs[value] = Some(representation(graph, facts, value));
+    }
+}
+
+fn representation(graph: &Graph, facts: &Facts, value: super::Value) -> Repr {
+    match graph.defining_op(value) {
+        Some(Op::LowLevel(
+            super::low_level::Op::Load { ty, .. }
+            | super::low_level::Op::Integer { ty, .. }
+            | super::low_level::Op::Unary { ty, .. },
+        )) => Repr::from_machine(*ty),
+        Some(Op::LowLevel(super::low_level::Op::Binary { op, left, .. }))
+            if !op.is_float() && !op.is_integer_arithmetic() =>
+        {
+            representation(graph, facts, *left)
+        }
+        Some(Op::TypedData(_) | Op::Memory(MemoryOp::Address { .. })) => Repr::I64,
+        Some(Op::Memory(MemoryOp::IndexedLoad { format, .. } | MemoryOp::Load { format, .. })) => {
+            format.repr()
+        }
+        Some(Op::SaturatingInteger(_)) => Repr::I64,
+        _ => Repr::of(facts.of(value)),
     }
 }

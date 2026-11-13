@@ -30,6 +30,7 @@ impl Field {
         match op {
             Op::Read(_) | Op::Initialize(..) | Op::Write(..) => Self::Cells,
             Op::Get(_, name)
+            | Op::FillPropertyStore(_, _, name, _, _)
             | Op::Set(_, name, _)
             | Op::Define(_, name, _)
             | Op::ShapedGet(_, name, _)
@@ -40,8 +41,9 @@ impl Field {
             | Op::GlobalInitialize(name, _) => Self::named(name),
             Op::GetIndex(_, key)
             | Op::TypedIndex(_, key, _)
-            | Op::IndexedGet(_, key)
+            | Op::ArrayGet(_, key)
             | Op::ArrayLoad(_, key, _)
+            | Op::ArrayStore(_, key, _)
             | Op::SetIndex(_, key, _)
                 if facts.of(*key).within(ValueType::NUMBER) =>
             {
@@ -89,7 +91,7 @@ impl Access {
             | Op::ShapedGet(object, ..)
             | Op::GetIndex(object, _)
             | Op::TypedIndex(object, ..)
-            | Op::IndexedGet(object, _)
+            | Op::ArrayGet(object, _)
             | Op::ArrayLoad(object, _, _)
             | Op::IndexedLength(object)
             | Op::ArrayKind(object)

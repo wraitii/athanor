@@ -37,6 +37,7 @@ pub(super) fn plan(
         .flat_map(|&block| graph.blocks[block].insts.iter())
         .filter_map(|&inst| match graph.insts[inst].op {
             Op::GetIndex(object, _)
+            | Op::SetIndex(object, _, _)
             | Op::TypedIndex(object, _, super::TypedRead { element: None, .. }) => Some(object),
             _ => None,
         })
@@ -87,6 +88,7 @@ pub(super) fn plan(
             let mut before = None;
             match data.op {
                 Op::GetIndex(object, _)
+                | Op::SetIndex(object, _, _)
                 | Op::TypedIndex(object, _, super::TypedRead { element: None, .. })
                     if super::optimize::element_guess(graph, object).is_none() =>
                 {
@@ -105,7 +107,7 @@ pub(super) fn plan(
             }
             let after = if matches!(
                 data.op,
-                Op::Get(..) | Op::GetIndex(..) | Op::IndexedGet(..) | Op::ArrayLoad(..)
+                Op::Get(..) | Op::GetIndex(..) | Op::ArrayGet(..) | Op::ArrayLoad(..)
             ) {
                 data.result()
                     .filter(|value| {
@@ -117,7 +119,7 @@ pub(super) fn plan(
             };
             let number = if matches!(
                 data.op,
-                Op::Get(..) | Op::GetIndex(..) | Op::IndexedGet(..) | Op::ArrayLoad(..)
+                Op::Get(..) | Op::GetIndex(..) | Op::ArrayGet(..) | Op::ArrayLoad(..)
             ) {
                 data.result()
                     .filter(|value| {

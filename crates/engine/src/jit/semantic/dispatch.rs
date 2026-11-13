@@ -17,6 +17,9 @@ pub(super) fn split(graph: &mut Graph, inst: Inst) -> (Block, Block, Block) {
         .position(|&current| current == inst)
         .unwrap();
     let continuation = graph.blocks.push(BlockData::default());
+    if graph.cold.contains(&block) {
+        graph.cold.insert(continuation);
+    }
     if let Some(original) = call.result() {
         let result = graph.add_param(continuation);
         graph.replace_uses(&FxHashMap::from_iter([(original, result)]));

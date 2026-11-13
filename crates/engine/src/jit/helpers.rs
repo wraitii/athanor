@@ -147,7 +147,6 @@ define_helpers! {
     Rest => Rest, js_rest, reference;
     IndexGet => Binary, js_index_get, reference;
     IndexGetNumeric => NumericIndex, js_index_get_numeric, reference;
-    TypedIndexGet => Binary, js_typed_index_get;
     IndexSet => IndexSet, js_index_set;
     PropertyGet => PropertyGet, js_property_get, reference;
     PropertySet => PropertySet, js_property_set;
@@ -256,7 +255,6 @@ impl Helper {
                 | Self::FrameRelease
                 | Self::IndexGet
                 | Self::IndexGetNumeric
-                | Self::TypedIndexGet
                 | Self::PropertyGet
                 | Self::PropertyGetCached
                 | Self::GlobalGet

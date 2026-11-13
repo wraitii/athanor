@@ -1,4 +1,3 @@
-use crate::jit::semantic::low_level::Switch;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{MemFlagsData, Type, types};
 use cranelift_module::Module;
@@ -7,15 +6,13 @@ use oxc_syntax::operator::BinaryOperator;
 
 use crate::error::Error;
 use crate::heap::{
-    CODE_OFFSET, DATA_OFFSET, HOLE, INLINE_PROPERTY_LENGTH_OFFSET, KIND_OFFSET, LENGTH_OFFSET,
-    MathFunction, NO_ELEMENTS, SHAPE_OFFSET, TypedKind, kind,
+    CODE_OFFSET, DATA_OFFSET, KIND_OFFSET, LENGTH_OFFSET, MathFunction, NO_ELEMENTS, SHAPE_OFFSET,
+    TypedKind, kind,
 };
 use crate::jit::helpers::{
-    self, CACHE_ADDITION_DESTINATION_OFFSET, CACHE_ADDITION_INDEX_OFFSET,
-    CACHE_ADDITION_SOURCE_OFFSET, CACHE_BUILTIN_KIND_OFFSET, CACHE_BUILTIN_VALUE_OFFSET,
-    CACHE_ENTRY_OFFSET, CACHE_ENTRY_SIZE, CACHE_HOLDER_OFFSET, CACHE_HOLDER_SHAPE_OFFSET,
-    CACHE_INDEX_OFFSET, CACHE_LEN_OFFSET, CACHE_MEGAMORPHIC_OFFSET, CACHE_OVERFLOW_OFFSET,
-    CACHE_OVERWRITE_INDEX_OFFSET, CACHE_OVERWRITE_SHAPE_OFFSET, CACHE_SHAPE_OFFSET, HELPERS,
+    self, CACHE_BUILTIN_KIND_OFFSET, CACHE_BUILTIN_VALUE_OFFSET, CACHE_ENTRY_OFFSET,
+    CACHE_ENTRY_SIZE, CACHE_HOLDER_OFFSET, CACHE_HOLDER_SHAPE_OFFSET, CACHE_INDEX_OFFSET,
+    CACHE_LEN_OFFSET, CACHE_MEGAMORPHIC_OFFSET, CACHE_OVERFLOW_OFFSET, CACHE_SHAPE_OFFSET, HELPERS,
     Helper, PROPERTY_CACHE_LIMIT, PropertyCache,
 };
 use crate::jit::profile::{CallSite, Site};
@@ -42,24 +39,9 @@ enum Element {
 
 use super::scope::ADDRESS_MASK;
 
-const TYPED_KINDS: [Element; 8] = [
-    Element::U8,
-    Element::U16,
-    Element::U32,
-    Element::I8,
-    Element::I16,
-    Element::I32,
-    Element::F32,
-    Element::F64,
-];
-
 impl Element {
     fn bytes(self) -> u32 {
         Type::from(self).bytes()
-    }
-
-    fn is_float(self) -> bool {
-        matches!(self, Self::F32 | Self::F64)
     }
 
     fn kind(self) -> u32 {
@@ -660,7 +642,7 @@ impl FunctionCompiler<'_, '_> {
         let (helper, index) = if matches!(index.repr, Repr::F64 | Repr::I32 | Repr::I64) {
             (Helper::IndexGetNumeric, self.convert(index, Repr::F64))
         } else {
-            (Helper::IndexGet, index.value)
+            (Helper::IndexGet, self.convert(index, Repr::Boxed))
         };
         let result = self.call_helper(helper, &[object, index]);
         self.check_error();
@@ -968,33 +950,6 @@ impl FunctionCompiler<'_, '_> {
         self.b.ins().fcvt_from_uint(types::F64, length)
     }
 
-    pub(super) fn length_access(&mut self, object: LoweredValue) -> LoweredValue {
-        let view = self.view(object);
-        let indexed = self.has_kind(view, kind::ARRAY | kind::TYPED);
-        let inline = self.b.create_block();
-        let slow = self.b.create_block();
-        let done = self.b.create_block();
-        self.b.append_block_param(done, types::I64);
-        self.brif(indexed, inline, &[], slow, &[]);
-        self.switch(inline);
-        let length = self.view_length(view);
-        let bits = self
-            .b
-            .ins()
-            .bitcast(types::I64, MemFlagsData::new(), length);
-        self.jump(done, &[BlockArg::Value(bits)]);
-        self.switch(slow);
-        let result = self.property_access(object, "length", None, None);
-        self.jump(done, &[BlockArg::Value(result)]);
-        self.switch(done);
-        self.b.block_params(done)[0]
-    }
-
-    pub(super) fn element_read(&mut self, object: LoweredValue, key: Operand) -> LoweredValue {
-        let view = self.view(object);
-        self.viewed_index_access(view, object, key, None, true, false, true)
-    }
-
     pub(super) fn typed_kind_is(&mut self, view: LoweredValue, kind: TypedKind) -> LoweredValue {
         let actual = self.view_kind(view);
         let expected = Element::from(kind).kind();
@@ -1039,29 +994,6 @@ impl FunctionCompiler<'_, '_> {
         }
     }
 
-    pub(super) fn array_load(
-        &mut self,
-        view: LoweredValue,
-        position: Operand,
-        holey: bool,
-    ) -> LoweredValue {
-        let position = self.convert(position, Repr::I64);
-        let flags = MemFlagsData::trusted();
-        let data = self.b.ins().load(self.pointer, flags, view, DATA_OFFSET);
-        let offset = self.b.ins().ishl_imm_s(position, 3);
-        let address = self.b.ins().iadd(data, offset);
-        let mut bits = self.b.ins().load(types::I64, flags, address, 0);
-        if holey {
-            let hole = self
-                .b
-                .ins()
-                .icmp_imm_s(IntCC::Equal, bits, HOLE.bits() as i64);
-            let undefined = self.constant(Value::UNDEFINED);
-            bits = self.b.ins().select(hole, undefined, bits);
-        }
-        bits
-    }
-
     pub(super) fn checked_element_read(
         &mut self,
         view: LoweredValue,
@@ -1094,167 +1026,6 @@ impl FunctionCompiler<'_, '_> {
         self.jump(done, &[value.into()]);
         self.switch(done);
         Operand::new(self.b.block_params(done)[0], Repr::Boxed)
-    }
-
-    pub(super) fn viewed_index_access(
-        &mut self,
-        view: LoweredValue,
-        object: LoweredValue,
-        key: Operand,
-        value: Option<Operand>,
-        fallback: bool,
-        retain: bool,
-        typed: bool,
-    ) -> LoweredValue {
-        let flags = MemFlagsData::trusted();
-        let length = self.b.ins().load(types::I64, flags, view, LENGTH_OFFSET);
-        let (position, fast) = if matches!(key.repr, Repr::I32 | Repr::I64) {
-            let position = self.convert(key, Repr::I64);
-            let inside = self.b.ins().icmp(IntCC::UnsignedLessThan, position, length);
-            (position, inside)
-        } else {
-            let key = self.convert(key, Repr::F64);
-            let position = self.b.ins().fcvt_to_sint_sat(types::I64, key);
-            let exact = self.b.ins().fcvt_from_sint(types::F64, position);
-            let integral = self.b.ins().fcmp(FloatCC::Equal, exact, key);
-            let inside = self.b.ins().icmp(IntCC::UnsignedLessThan, position, length);
-            (position, self.b.ins().band(integral, inside))
-        };
-        let inline = self.b.create_block();
-        let slow = self.b.create_block();
-        let done = self.b.create_block();
-        self.b.append_block_param(done, types::I64);
-        self.brif(fast, inline, &[], slow, &[]);
-
-        self.switch(inline);
-        let data = self.b.ins().load(self.pointer, flags, view, DATA_OFFSET);
-        let kind = self.view_kind(view);
-        let mut switch = Switch::new();
-        let kinds: Vec<_> = TYPED_KINDS
-            .iter()
-            .filter(|_| value.is_some())
-            .map(|&element| (element, self.b.create_block()))
-            .collect();
-        let overwrite = value.map(|_| {
-            let block = self.b.create_block();
-            switch.set_entry(kind::ARRAY as u128, block);
-            block
-        });
-        for (element, block) in &kinds {
-            switch.set_entry(element.kind() as u128, *block);
-        }
-        let elements = value.is_none().then(|| {
-            let packed = self.b.create_block();
-            let holey = self.b.create_block();
-            switch.set_entry(kind::ARRAY as u128, packed);
-            switch.set_entry((kind::ARRAY | kind::HOLEY) as u128, holey);
-            let offset = self.b.ins().ishl_imm_s(position, 3);
-            let address = self.b.ins().iadd(data, offset);
-            (packed, holey, address)
-        });
-        let typed_block = (value.is_none() && typed).then(|| self.b.create_block());
-        switch.emit(self.b, kind, typed_block.unwrap_or(slow));
-        if let Some(overwrite) = overwrite {
-            self.switch(overwrite);
-            let value = self.convert(value.unwrap(), Repr::Boxed);
-            self.overwrite_slot(view, position, value, slow, done);
-        }
-        if let Some(typed_block) = typed_block {
-            self.switch(typed_block);
-            let typed = self.has_kind(view, kind::TYPED);
-            let read = self.b.create_block();
-            self.brif(typed, read, &[], slow, &[]);
-            self.switch(read);
-            let bits = self.call_helper(Helper::TypedIndexGet, &[object, position]);
-            self.jump(done, &[BlockArg::Value(bits)]);
-        }
-        if let Some((packed, holey, address)) = elements {
-            let element = self.b.create_block();
-            self.b.append_block_param(element, types::I64);
-            self.switch(packed);
-            let bits = self.b.ins().load(types::I64, flags, address, 0);
-            self.jump(element, &[BlockArg::Value(bits)]);
-            self.switch(holey);
-            let bits = self.b.ins().load(types::I64, flags, address, 0);
-            let hole = self
-                .b
-                .ins()
-                .icmp_imm_s(IntCC::Equal, bits, HOLE.bits() as i64);
-            let undefined = self.constant(Value::UNDEFINED);
-            let bits = self.b.ins().select(hole, undefined, bits);
-            self.jump(element, &[BlockArg::Value(bits)]);
-            self.switch(element);
-            let bits = self.b.block_params(element)[0];
-            if retain {
-                let heap = self.is_heap(bits);
-                // Matches the IndexGet helper, which hands heap elements out as temporaries.
-                let retain = self.b.create_block();
-                self.brif(heap, retain, &[], done, &[BlockArg::Value(bits)]);
-                self.switch(retain);
-                let retained = self.retain_temporary(bits);
-                self.jump(done, &[BlockArg::Value(retained)]);
-            } else {
-                self.jump(done, &[BlockArg::Value(bits)]);
-            }
-        }
-        for (element, block) in kinds {
-            self.switch(block);
-            let offset = self.b.ins().imul_imm_s(position, element.bytes() as i64);
-            let address = self.b.ins().iadd(data, offset);
-            let value = value.unwrap();
-            let (stored, valid) = if element.is_float() {
-                let valid = match value.repr {
-                    Repr::Boxed => self.is_number(value.value),
-                    _ => self.b.ins().iconst(types::I8, 1),
-                };
-                let number = self.convert(value, Repr::F64);
-                let stored = if element == Element::F32 {
-                    self.b.ins().fdemote(types::F32, number)
-                } else {
-                    number
-                };
-                (stored, valid)
-            } else if value.repr == Repr::I32 {
-                let stored = if Type::from(element) == types::I32 {
-                    value.value
-                } else {
-                    self.b.ins().ireduce(element.into(), value.value)
-                };
-                (stored, self.b.ins().iconst(types::I8, 1))
-            } else {
-                let number = self.convert(value, Repr::F64);
-                let integer = self.b.ins().fcvt_to_sint_sat(types::I64, number);
-                let exact = self.b.ins().fcvt_from_sint(types::F64, integer);
-                let integral = self.b.ins().fcmp(FloatCC::Equal, exact, number);
-                let upper = self.b.ins().f64const(9223372036854775808.0);
-                let lower = self.b.ins().f64const(-9223372036854775808.0);
-                let below = self.b.ins().fcmp(FloatCC::LessThan, number, upper);
-                let above = self
-                    .b
-                    .ins()
-                    .fcmp(FloatCC::GreaterThanOrEqual, number, lower);
-                let in_range = self.b.ins().band(below, above);
-                let valid = self.b.ins().band(integral, in_range);
-                (self.b.ins().ireduce(element.into(), integer), valid)
-            };
-            let store = self.b.create_block();
-            self.brif(valid, store, &[], slow, &[]);
-            self.switch(store);
-            self.b.ins().store(flags, stored, address, 0);
-            let undefined = self.constant(Value::UNDEFINED);
-            self.jump(done, &[BlockArg::Value(undefined)]);
-        }
-
-        self.switch(slow);
-        let result = if fallback {
-            let value = value.map(|value| self.convert(value, Repr::Boxed));
-            self.index_access(object, key, value)
-        } else {
-            self.constant(Value::UNDEFINED)
-        };
-        self.jump(done, &[BlockArg::Value(result)]);
-        self.switch(done);
-        self.b.block_params(done)[0]
     }
 
     pub(super) fn global_access(
@@ -1387,7 +1158,13 @@ impl FunctionCompiler<'_, '_> {
         observer: Option<(u64, crate::jit::profile::Site)>,
         megamorphic: bool,
     ) -> LoweredValue {
-        self.cached_property_read(object, name, false, observer, megamorphic)
+        if megamorphic {
+            return self.property_access(object, name, None, None);
+        }
+        let address = self.function_data(PropertyCache::new(name, observer, false));
+        let result = self.call_helper(Helper::PropertyGetCached, &[object, address]);
+        self.check_error();
+        result
     }
 
     pub(super) fn cached_property_probe(
@@ -1397,20 +1174,6 @@ impl FunctionCompiler<'_, '_> {
         observer: Option<(u64, crate::jit::profile::Site)>,
         megamorphic: bool,
     ) -> LoweredValue {
-        self.cached_property_read(object, name, true, observer, megamorphic)
-    }
-
-    fn cached_property_read(
-        &mut self,
-        object: LoweredValue,
-        name: &str,
-        probe: bool,
-        observer: Option<(u64, crate::jit::profile::Site)>,
-        megamorphic: bool,
-    ) -> LoweredValue {
-        if megamorphic && !probe {
-            return self.property_access(object, name, None, None);
-        }
         let address = self.function_data(PropertyCache::new(name, observer, megamorphic));
         if megamorphic {
             return self.call_helper(Helper::SemanticPropertyProbeCached, &[object, address]);
@@ -1427,17 +1190,7 @@ impl FunctionCompiler<'_, '_> {
         let value = self.cached_property_entry_load(object, entry, builtins);
         self.jump(done, &[BlockArg::Value(value)]);
         self.switch(slow);
-        let result = self.call_helper(
-            if probe {
-                Helper::SemanticPropertyProbeCached
-            } else {
-                Helper::PropertyGetCached
-            },
-            &[object, address],
-        );
-        if !probe {
-            self.check_error();
-        }
+        let result = self.call_helper(Helper::SemanticPropertyProbeCached, &[object, address]);
         self.jump(done, &[BlockArg::Value(result)]);
         self.switch(done);
         self.b.block_params(done)[0]
@@ -1656,53 +1409,6 @@ impl FunctionCompiler<'_, '_> {
         result
     }
 
-    fn overwrite_slot(
-        &mut self,
-        view: LoweredValue,
-        overwrite_index: LoweredValue,
-        value: LoweredValue,
-        slow: crate::jit::semantic::Block,
-        done: crate::jit::semantic::Block,
-    ) {
-        let flags = MemFlagsData::trusted();
-        let overwrite_data = self.b.ins().load(self.pointer, flags, view, DATA_OFFSET);
-        let overwrite_offset = self.b.ins().ishl_imm_s(overwrite_index, 3);
-        let overwrite_slot = self.b.ins().iadd(overwrite_data, overwrite_offset);
-        let old = self.b.ins().load(types::I64, flags, overwrite_slot, 0);
-        let old_address = super::scope::heap_address(self.b, old);
-        let old_native = self.b.create_block();
-        let overwrite_retain = self.b.create_block();
-        let overwrite_store = self.b.create_block();
-        let overwrite_release = self.b.create_block();
-        let overwrite_done = self.b.create_block();
-        self.brif(old_address, old_native, &[], overwrite_retain, &[]);
-        self.switch(old_native);
-        let old_view_kind = self.view_kind(old_address);
-        let native_bits = self.b.ins().band_imm_s(old_view_kind, kind::NATIVE as i64);
-        let is_native = self.b.ins().icmp_imm_s(IntCC::NotEqual, native_bits, 0);
-        self.brif(is_native, slow, &[], overwrite_retain, &[]);
-        self.switch(overwrite_retain);
-        let overwrite_incoming = super::scope::heap_address(self.b, value);
-        let overwrite_increment = self.b.create_block();
-        self.brif(
-            overwrite_incoming,
-            overwrite_increment,
-            &[],
-            overwrite_store,
-            &[],
-        );
-        self.switch(overwrite_increment);
-        self.increment_address(overwrite_incoming);
-        self.jump(overwrite_store, &[]);
-        self.switch(overwrite_store);
-        self.b.ins().store(flags, value, overwrite_slot, 0);
-        self.brif(old_address, overwrite_release, &[], overwrite_done, &[]);
-        self.switch(overwrite_release);
-        self.release_inline(old, overwrite_done, false);
-        self.switch(overwrite_done);
-        self.jump(done, &[BlockArg::Value(value)]);
-    }
-
     pub(super) fn shape_hit(&mut self, object: LoweredValue, shape: u32) -> LoweredValue {
         let view = self.view(object);
         let actual = self
@@ -1747,22 +1453,10 @@ impl FunctionCompiler<'_, '_> {
         &mut self,
         object: LoweredValue,
         name: &str,
-        index: u32,
+        _index: u32,
         value: LoweredValue,
     ) {
-        let view = self.b.ins().band_imm_s(object, ADDRESS_MASK);
-        let index = self.b.ins().iconst(types::I64, index as i64);
-        let slow = self.b.create_block();
-        let done = self.b.create_block();
-        self.b.append_block_param(done, types::I64);
-        self.b.set_cold_block(slow);
-        self.overwrite_slot(view, index, value, slow, done);
-        self.switch(slow);
-        let address = self.function_data(PropertyCache::new(name, None, false));
-        self.call_helper(Helper::PropertySetCached, &[object, address, value]);
-        self.check_error();
-        self.jump(done, &[BlockArg::Value(value)]);
-        self.switch(done);
+        self.cached_property_set(object, name, value, None);
     }
 
     fn cached_property_set(
@@ -1773,83 +1467,9 @@ impl FunctionCompiler<'_, '_> {
         observer: Option<(u64, crate::jit::profile::Site)>,
     ) -> LoweredValue {
         let address = self.function_data(PropertyCache::new(name, observer, false));
-        let flags = MemFlagsData::trusted();
-        let view = self.view(object);
-        let slow = self.b.create_block();
-        let inline = self.b.create_block();
-        let retain = self.b.create_block();
-        let store = self.b.create_block();
-        let done = self.b.create_block();
-        self.b.append_block_param(done, types::I64);
-        self.b.set_cold_block(slow);
-        let kind = self.view_kind(view);
-        let inline_object =
-            self.b
-                .ins()
-                .icmp_imm_s(IntCC::Equal, kind, (kind::OBJECT | kind::INLINE) as i64);
-        let shape = self.b.ins().load(types::I32, flags, view, SHAPE_OFFSET);
-        let expected = self
-            .b
-            .ins()
-            .load(types::I32, flags, address, CACHE_ADDITION_SOURCE_OFFSET);
-        let matches = self.b.ins().icmp(IntCC::Equal, shape, expected);
-        let hit = self.b.ins().band(inline_object, matches);
-        let overwrite_check = self.b.create_block();
-        self.brif(hit, inline, &[], overwrite_check, &[]);
-        self.switch(overwrite_check);
-        let object_bits = self.b.ins().band_imm_s(kind, kind::OBJECT as i64);
-        let is_object = self.b.ins().icmp_imm_s(IntCC::NotEqual, object_bits, 0);
-        let overwrite_expected =
-            self.b
-                .ins()
-                .load(types::I32, flags, address, CACHE_OVERWRITE_SHAPE_OFFSET);
-        let overwrite_matches = self.b.ins().icmp(IntCC::Equal, shape, overwrite_expected);
-        let overwrite_hit = self.b.ins().band(is_object, overwrite_matches);
-        let overwrite = self.b.create_block();
-        self.brif(overwrite_hit, overwrite, &[], slow, &[]);
-        self.switch(overwrite);
-        let overwrite_index =
-            self.b
-                .ins()
-                .load(types::I32, flags, address, CACHE_OVERWRITE_INDEX_OFFSET);
-        let overwrite_index = self.b.ins().uextend(types::I64, overwrite_index);
-        self.overwrite_slot(view, overwrite_index, value, slow, done);
-        self.switch(inline);
-        let incoming = super::scope::heap_address(self.b, value);
-        self.brif(incoming, retain, &[], store, &[]);
-        self.switch(retain);
-        self.increment_address(incoming);
-        self.jump(store, &[]);
-        self.switch(store);
-        let index = self
-            .b
-            .ins()
-            .load(types::I32, flags, address, CACHE_ADDITION_INDEX_OFFSET);
-        let index = self.b.ins().uextend(types::I64, index);
-        let data = self.b.ins().load(self.pointer, flags, view, DATA_OFFSET);
-        let offset = self.b.ins().ishl_imm_s(index, 3);
-        let slot = self.b.ins().iadd(data, offset);
-        self.b.ins().store(flags, value, slot, 0);
-        let destination = self.b.ins().load(
-            types::I32,
-            flags,
-            address,
-            CACHE_ADDITION_DESTINATION_OFFSET,
-        );
-        self.b.ins().store(flags, destination, view, SHAPE_OFFSET);
-        let length = self.b.ins().iadd_imm_s(index, 1);
-        self.b.ins().store(flags, length, view, LENGTH_OFFSET);
-        let small_length = self.b.ins().ireduce(types::I8, length);
-        self.b
-            .ins()
-            .store(flags, small_length, data, INLINE_PROPERTY_LENGTH_OFFSET);
-        self.jump(done, &[BlockArg::Value(value)]);
-        self.switch(slow);
         let result = self.call_helper(Helper::PropertySetCached, &[object, address, value]);
         self.check_error();
-        self.jump(done, &[BlockArg::Value(result)]);
-        self.switch(done);
-        self.b.block_params(done)[0]
+        result
     }
 
     pub(super) fn property_access(

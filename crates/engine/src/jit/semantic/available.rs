@@ -20,7 +20,7 @@ pub(super) enum LoadKey {
     BooleanAnd(Value, Value),
     Length(Value),
     ArrayKind(Value),
-    Array(Value, bool),
+    Array(Value, super::ArrayLayout),
     Constructor(Value),
     Property(Value, String),
     Index(Value, Value),
@@ -69,7 +69,7 @@ fn load_key(
         }
         Op::GetIndex(object, key)
         | Op::TypedIndex(object, key, _)
-        | Op::IndexedGet(object, key)
+        | Op::ArrayGet(object, key)
         | Op::ArrayLoad(object, key, _) => LoadKey::Index(at(object), at(key)),
         Op::ConstructorPrototype(callee) => LoadKey::Constructor(at(callee)),
         Op::GlobalRead(name) => LoadKey::Global(name.clone()),
@@ -104,7 +104,7 @@ fn load_key(
         Op::IsInBounds(position, length) => LoadKey::InBounds(at(position), at(length)),
         Op::IndexedLength(object) => LoadKey::Length(at(object)),
         Op::ArrayKind(object) => LoadKey::ArrayKind(at(object)),
-        Op::IsArray(object, holey) => LoadKey::Array(at(object), *holey),
+        Op::IsArray(object, layout) => LoadKey::Array(at(object), *layout),
         Op::This => LoadKey::This,
         Op::Argument(index) => LoadKey::Argument(*index),
         Op::Binary(operator, left, right)

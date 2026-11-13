@@ -73,7 +73,7 @@ pub(super) fn result_facts(
                 let safe = match data.op {
                     Op::Get(..)
                     | Op::GetIndex(..)
-                    | Op::IndexedGet(..)
+                    | Op::ArrayGet(..)
                     | Op::ArrayLoad(..)
                     | Op::PackTake(..)
                     | Op::ProbeProperty(..)
@@ -108,7 +108,7 @@ pub(super) fn result_facts(
         for &inst in &graph.blocks[block].insts {
             let (array, key) = match graph.insts[inst].op {
                 Op::GetIndex(array, key)
-                | Op::IndexedGet(array, key)
+                | Op::ArrayGet(array, key)
                 | Op::ArrayLoad(array, key, _)
                 | Op::PackTake(array, key) => (array, key),
                 _ => continue,

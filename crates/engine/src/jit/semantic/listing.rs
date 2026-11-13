@@ -281,21 +281,30 @@ impl Graph {
             Op::IsExactPosition(key, position) => format!("is_exact_position {key}, {position}"),
             Op::IsInBounds(position, length) => format!("is_in_bounds {position}, {length}"),
             Op::ArrayPosition(key) => format!("array_position {key}"),
-            Op::IsArrayIndex(object, key, position, holey) => format!(
+            Op::IsArrayIndex(object, key, position, layout) => format!(
                 "is_array_index {object}[{key}] position={position} {}",
-                if *holey { "holey" } else { "packed" }
+                match layout {
+                    super::ArrayLayout::Packed => "packed",
+                    super::ArrayLayout::Holey => "holey",
+                }
             ),
-            Op::IsArray(object, holey) => format!(
+            Op::IsArray(object, layout) => format!(
                 "is_array {object} {}",
-                if *holey { "holey" } else { "packed" }
+                match layout {
+                    super::ArrayLayout::Packed => "packed",
+                    super::ArrayLayout::Holey => "holey",
+                }
             ),
-            Op::ArrayLoad(object, key, holey) => format!(
+            Op::ArrayLoad(object, key, layout) => format!(
                 "load_array {object}[{key}] {}",
-                if *holey { "holey" } else { "packed" }
+                match layout {
+                    super::ArrayLayout::Packed => "packed",
+                    super::ArrayLayout::Holey => "holey",
+                }
             ),
             Op::ArrayKind(value) => format!("array_kind {value}"),
             Op::IndexedLength(value) => format!("indexed_length {value}"),
-            Op::IndexedGet(object, key) => format!("get_indexed {object}[{key}]"),
+            Op::ArrayGet(object, key) => format!("array_get {object}[{key}]"),
             Op::PackTake(object, key) => format!("pack_take {object}[{key}]"),
             Op::EnumerateNew(value) => format!("enumerate_new {value}"),
             Op::EnumerateNext(value) => format!("enumerate_next {value}"),
@@ -326,6 +335,18 @@ impl Graph {
             }
             Op::GetIndex(object, key) => format!("get {object}[{key}]"),
             Op::Set(object, name, value) => format!("set {object}.{name}, {value}"),
+            Op::ArrayStore(object, key, value) => format!("store_array {object}[{key}], {value}"),
+            Op::PropertyStore(object, key, value, _) => {
+                format!("store_property {object}[{key}], {value}")
+            }
+            Op::PropertyAdd(object, cache, value, _) => {
+                format!("add_property {object}, {cache}, {value}")
+            }
+            Op::CanOverwrite(object, key) => format!("can_overwrite {object}[{key}]"),
+            Op::PropertyWriteCache(site, name) => format!("property_write_cache {site} {name}"),
+            Op::FillPropertyStore(object, _, name, value, _) => {
+                format!("fill_property_store {object}.{name}, {value}")
+            }
             Op::SetIndex(object, key, value) => format!("set {object}[{key}], {value}"),
             Op::ToNumeric(value) => format!("to_numeric {value}"),
             Op::ToInt32(value) => format!("to_int32 {value}"),

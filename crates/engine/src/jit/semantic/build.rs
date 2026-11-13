@@ -1250,7 +1250,7 @@ impl<'a> Builder<'a> {
         let inside = self.emit(span, Op::Binary(BinaryOperator::LessThan, index, length));
         self.branch(span, inside, Target::new(read), Target::new(done));
         self.switch(read);
-        let element = self.emit(span, Op::IndexedGet(iterable, index));
+        let element = self.emit(span, Op::ArrayGet(iterable, index));
         let one = self.constant(span, Constant::Number(1.0));
         let next = self.emit(span, Op::Binary(BinaryOperator::Addition, index, one));
         self.effect(span, Op::Write(position, next));

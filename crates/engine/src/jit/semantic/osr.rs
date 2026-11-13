@@ -187,7 +187,6 @@ impl Plan {
                         | Op::LeaveScope(_)
                         | Op::NextIteration(_)
                         | Op::FreshIteration(_)
-                        | Op::View(_)
                 )
             });
         }

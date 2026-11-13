@@ -903,10 +903,6 @@ impl FunctionCompiler<'_, '_> {
                             self.property_access(object, name, Some(value), observer);
                             None
                         }
-                        Op::Get(object, name) if name == "length" => {
-                            let object = get(self, *object);
-                            Some(self.length_access(object))
-                        }
                         Op::CachedProperty(object, site, builtins) => {
                             let object = get(self, *object);
                             let offset = self.property_caches[site];
@@ -923,6 +919,20 @@ impl FunctionCompiler<'_, '_> {
                             self.shaped_property_set(object, name, *index, value);
                             None
                         }
+                        Op::FillPropertyStore(object, site, name, value, _) => {
+                            let object = get(self, *object);
+                            let value = get(self, *value);
+                            let observer = self.property_observer(data);
+                            let address = self.property_cache(*site, name, observer);
+                            self.call_helper(Helper::PropertySetCached, &[object, address, value]);
+                            self.check_error();
+                            None
+                        }
+                        Op::ArrayStore(..)
+                        | Op::PropertyStore(..)
+                        | Op::PropertyAdd(..)
+                        | Op::CanOverwrite(..)
+                        | Op::PropertyWriteCache(..) => unreachable!(),
                         Op::FillPropertyCache(object, site, name) => {
                             let object = get(self, *object);
                             let observer = self.property_observer(data);
@@ -949,10 +959,10 @@ impl FunctionCompiler<'_, '_> {
                         }
                         Op::GetIndex(object, index)
                         | Op::TypedIndex(object, index, _)
-                        | Op::IndexedGet(object, index) => {
+                        | Op::ArrayGet(object, index) => {
                             let object = get(self, *object);
                             let index = get(self, *index);
-                            Some(self.element_read(object, Operand::new(index, Repr::Boxed)))
+                            Some(self.index_access(object, Operand::new(index, Repr::Boxed), None))
                         }
                         Op::NewPack => {
                             let destination =
@@ -1601,6 +1611,53 @@ impl FunctionCompiler<'_, '_> {
         let data = &graph.insts[inst];
         let boolean = |condition: LoweredValue| Some(Operand::new(condition, Repr::I8));
         let result = match &data.op {
+            Op::PropertyWriteCache(site, name) => {
+                let observer = self.property_observer(data);
+                let address = self.property_cache(*site, name, observer);
+                Some(Operand::new(address, Repr::I64))
+            }
+            Op::View(object) => {
+                let object = self.operand(cx, *object).value;
+                Some(Operand::new(self.view(object), Repr::Boxed))
+            }
+            Op::LowLevel(crate::jit::semantic::low_level::Op::Store {
+                value,
+                address,
+                offset,
+                flags,
+            }) => {
+                let value = self.operand(cx, *value).value;
+                let address = self.operand(cx, *address).value;
+                self.b.ins().store(*flags, value, address, *offset);
+                None
+            }
+            Op::LowLevel(crate::jit::semantic::low_level::Op::Reference { op, value }) => {
+                let value = self.operand(cx, *value).value;
+                self.b.reference(*op, value);
+                None
+            }
+            Op::LowLevel(crate::jit::semantic::low_level::Op::Load {
+                ty,
+                address,
+                offset,
+                flags,
+            }) => {
+                let address = self.operand(cx, *address).value;
+                let value = self.b.ins().load(*ty, *flags, address, *offset);
+                Some(Operand::new(value, target.unwrap()))
+            }
+            Op::LowLevel(crate::jit::semantic::low_level::Op::Integer { ty, bits }) => Some(
+                Operand::new(self.b.ins().iconst(*ty, *bits as i64), target.unwrap()),
+            ),
+            Op::LowLevel(crate::jit::semantic::low_level::Op::Select { condition, yes, no }) => {
+                let condition = self.operand(cx, *condition).value;
+                let yes = self.operand(cx, *yes).value;
+                let no = self.operand(cx, *no).value;
+                Some(Operand::new(
+                    self.b.ins().select(condition, yes, no),
+                    target.unwrap(),
+                ))
+            }
             Op::LowLevel(crate::jit::semantic::low_level::Op::Binary { op, left, right }) => {
                 let left = self.operand(cx, *left);
                 let right = self.operand(cx, *right);
@@ -1612,7 +1669,11 @@ impl FunctionCompiler<'_, '_> {
             Op::LowLevel(crate::jit::semantic::low_level::Op::Unary { op, ty, value }) => {
                 let value = self.operand(cx, *value).value;
                 Some(Operand::new(
-                    self.b.ins().unary(*op, *ty, value),
+                    if matches!(op, crate::jit::semantic::low_level::Unary::FloatDemote) {
+                        self.b.ins().fdemote(*ty, value)
+                    } else {
+                        self.b.ins().unary(*op, *ty, value)
+                    },
                     Repr::from_machine(*ty),
                 ))
             }
@@ -1660,16 +1721,7 @@ impl FunctionCompiler<'_, '_> {
                     target.expect("binary result representation"),
                 ))
             }
-            Op::TypedData(view) => {
-                let view = self.operand(cx, *view).value;
-                let data = self.b.ins().load(
-                    self.pointer,
-                    MemFlagsData::trusted(),
-                    view,
-                    crate::heap::DATA_OFFSET,
-                );
-                Some(Operand::new(data, Repr::I64))
-            }
+            Op::TypedData(..) => unreachable!("data pointer must be lowered before emission"),
             Op::Memory(MemoryOp::Address {
                 base,
                 index,
@@ -1861,19 +1913,10 @@ impl FunctionCompiler<'_, '_> {
                 boolean(self.b.ins().band(left, right))
             }
             Op::IsArrayIndex(..) => unreachable!(),
-            Op::ArrayKind(object) => {
-                let view = match graph.views.get(&inst) {
-                    Some(&view) => self.operand(cx, view).value,
-                    None => {
-                        let object = self.operand(cx, *object);
-                        let object = self.convert(object, Repr::Boxed);
-                        self.view(object)
-                    }
-                };
-                let kind = self.view_kind(view);
-                Some(Operand::new(kind, Repr::I32))
+            Op::ArrayKind(..) | Op::IndexedLength(..) | Op::ArrayLoad(..) => {
+                unreachable!("array storage must be lowered before emission")
             }
-            Op::IsArray(object, holey) => {
+            Op::IsArray(object, layout) => {
                 let view = match graph.views.get(&inst) {
                     Some(&view) => self.operand(cx, view).value,
                     None => {
@@ -1883,40 +1926,8 @@ impl FunctionCompiler<'_, '_> {
                     }
                 };
                 let kind = self.view_kind(view);
-                let expected = kind::ARRAY | if *holey { kind::HOLEY } else { 0 };
+                let expected = layout.kind();
                 boolean(self.b.ins().icmp_imm_s(IntCC::Equal, kind, expected as i64))
-            }
-            Op::ArrayLoad(object, position, holey) => {
-                let view = match graph.views.get(&inst) {
-                    Some(&view) => self.operand(cx, view).value,
-                    None => {
-                        let object = self.operand(cx, *object);
-                        let object = self.convert(object, Repr::Boxed);
-                        self.view(object)
-                    }
-                };
-                let position = self.operand(cx, *position);
-                Some(Operand::new(
-                    self.array_load(view, position, *holey),
-                    Repr::Boxed,
-                ))
-            }
-            Op::IndexedLength(object) => {
-                let view = match graph.views.get(&inst) {
-                    Some(&view) => self.operand(cx, view).value,
-                    None => {
-                        let object = self.operand(cx, *object);
-                        let object = self.convert(object, Repr::Boxed);
-                        self.view(object)
-                    }
-                };
-                if target == Some(Repr::I64) {
-                    let length = self.view_length_integer(view);
-                    Some(Operand::new(length, Repr::I64))
-                } else {
-                    let length = self.view_length(view);
-                    Some(Operand::new(length, Repr::F64))
-                }
             }
             Op::TypedIndex(
                 object,
@@ -1943,39 +1954,20 @@ impl FunctionCompiler<'_, '_> {
             }
             Op::GetIndex(object, key)
             | Op::TypedIndex(object, key, _)
-            | Op::IndexedGet(object, key) => {
-                let fallback = !matches!(data.op, Op::TypedIndex(..) | Op::PackTake(..));
+            | Op::ArrayGet(object, key) => {
                 let object = self.operand(cx, *object);
                 let object = self.convert(object, Repr::Boxed);
-                let view = match graph.views.get(&inst) {
-                    Some(&view) => self.operand(cx, view).value,
-                    None => self.view(object),
-                };
-                let key = match self.operand(cx, *key) {
-                    key if key.repr == Repr::I8 => {
-                        Operand::new(self.convert(key, Repr::Boxed), Repr::Boxed)
-                    }
-                    key => key,
-                };
-                let result =
-                    self.viewed_index_access(view, object, key, None, fallback, false, true);
+                let key = self.operand(cx, *key);
+                let result = self.index_access(object, key, None);
                 Some(Operand::new(result, Repr::Boxed))
             }
             Op::SetIndex(object, key, value) => {
                 let object = self.operand(cx, *object);
                 let object = self.convert(object, Repr::Boxed);
-                let view = match graph.views.get(&inst) {
-                    Some(&view) => self.operand(cx, view).value,
-                    None => self.view(object),
-                };
-                let key = match self.operand(cx, *key) {
-                    key if key.repr == Repr::I8 => {
-                        Operand::new(self.convert(key, Repr::Boxed), Repr::Boxed)
-                    }
-                    key => key,
-                };
+                let key = self.operand(cx, *key);
                 let value = self.operand(cx, *value);
-                self.viewed_index_access(view, object, key, Some(value), true, true, true);
+                let value = self.convert(value, Repr::Boxed);
+                self.index_access(object, key, Some(value));
                 None
             }
             _ => {

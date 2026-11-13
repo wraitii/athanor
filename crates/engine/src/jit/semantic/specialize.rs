@@ -397,7 +397,7 @@ impl Repository {
                         effects.memory.writes = effects.memory.writes.union(Locations::HEAP);
                     }
                     Op::GetIndex(..)
-                    | Op::IndexedGet(..)
+                    | Op::ArrayGet(..)
                     | Op::ArrayLoad(..)
                     | Op::TypedIndex(..) => {
                         effects.properties_read.insert("*".into());
@@ -1113,9 +1113,12 @@ mod tests {
             .iter()
             .flat_map(|&block| &graph.blocks[block].insts)
             .filter_map(|&inst| match graph.insts[inst].op {
-                Op::Set(_, ref name, value)
+                Op::PropertyWriteCache(site, ref name)
                     if name == "template" && !graph.cold.contains(&graph.insts[inst].block) =>
                 {
+                    let Op::FillPropertyStore(_, _, _, value, _) = graph.insts[site].op else {
+                        panic!()
+                    };
                     Some(value)
                 }
                 _ => None,
@@ -1488,15 +1491,15 @@ mod tests {
                 if let Some(shape) = shape.filter(|shape| *shape != 30 && !invalidated) {
                     assert!(operations.iter().any(|op| matches!(op, Op::ShapedGet(_, _, index) if *index == u32::from(shape == 20))));
                     assert!(
-                        !operations
-                            .iter()
-                            .any(|op| matches!(op, Op::Get(_, name) if name == "x"))
+                        !operations.iter().any(
+                            |op| matches!(op, Op::FillPropertyCache(_, _, name) if name == "x")
+                        )
                     );
                 } else {
                     assert!(
-                        operations
-                            .iter()
-                            .any(|op| matches!(op, Op::Get(_, name) if name == "x"))
+                        operations.iter().any(
+                            |op| matches!(op, Op::FillPropertyCache(_, _, name) if name == "x")
+                        )
                     );
                 }
             }

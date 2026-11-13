@@ -22,13 +22,6 @@ pub(super) fn is_heap(b: &mut FunctionBuilder<'_>, value: LoweredValue) -> Lower
     b.ins().icmp_imm_s(IntCC::UnsignedLessThan, offset, 2)
 }
 
-pub(super) fn heap_address(b: &mut FunctionBuilder<'_>, value: LoweredValue) -> LoweredValue {
-    let heap = is_heap(b, value);
-    let address = b.ins().band_imm_s(value, ADDRESS_MASK);
-    let zero = b.ins().iconst(types::I64, 0);
-    b.ins().select(heap, address, zero)
-}
-
 impl FunctionCompiler<'_, '_> {
     // Binding slots are not reused by SSA temporaries, so the variable tracks their contents.
     pub(super) fn initialize_binding(&mut self, variable: Variable, value: LoweredValue) {
@@ -62,10 +55,6 @@ impl FunctionCompiler<'_, '_> {
         self.release_inline(old, done, false);
         self.switch(done);
         self.b.def_var(variable, value);
-    }
-
-    pub(super) fn increment_address(&mut self, address: LoweredValue) {
-        self.b.reference(Reference::RetainAddress, address);
     }
 
     pub(super) fn increment(&mut self, value: LoweredValue) {

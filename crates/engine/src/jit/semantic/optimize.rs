@@ -456,7 +456,7 @@ fn numeric_use(op: &Op, index: usize) -> bool {
         Op::ToNumeric(_) | Op::CallNative(..) => true,
         Op::GetIndex(..)
         | Op::TypedIndex(..)
-        | Op::IndexedGet(..)
+        | Op::ArrayGet(..)
         | Op::ArrayLoad(..)
         | Op::SetIndex(..) => index == 1,
         _ => false,
@@ -661,7 +661,7 @@ fn probe_reads(
                         | Op::ProbeProperty(..)
                         | Op::ProbeShapeProperty(..)
                         | Op::GetIndex(..)
-                        | Op::IndexedGet(..)
+                        | Op::ArrayGet(..)
                         | Op::GlobalRead(_)
                 ))
                 && data.op.operands_iter().all(|value| {
@@ -692,11 +692,17 @@ pub(super) fn views(function: &mut FunctionState) {
     for &block in &cfg.rpo {
         for inst in graph.blocks[block].insts.clone() {
             let object = match graph.insts[inst].op {
-                Op::GetIndex(object, key)
-                | Op::TypedIndex(object, key, _)
-                | Op::IndexedGet(object, key)
+                Op::TypedIndex(
+                    object,
+                    key,
+                    super::TypedRead {
+                        element: Some(_), ..
+                    },
+                )
                 | Op::ArrayLoad(object, key, _)
-                | Op::SetIndex(object, key, _)
+                | Op::CanOverwrite(object, key)
+                | Op::ArrayStore(object, key, _)
+                | Op::PropertyStore(object, key, _, _)
                     if facts.of(key).intersects(ValueType::NUMBER) =>
                 {
                     object

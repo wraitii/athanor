@@ -826,6 +826,12 @@ fn result_types(graph: &Graph, op: &Op, facts: &Facts) -> ValueType {
             op: super::low_level::Unary::BitNot,
             ..
         }) => ValueType::INT32,
+        Op::LowLevel(LowOp::Load { ty, .. }) if *ty == cranelift_codegen::ir::types::I32 => {
+            ValueType::INT32
+        }
+        Op::LowLevel(LowOp::Load { ty, .. }) if *ty == cranelift_codegen::ir::types::I64 => {
+            ValueType::INT64
+        }
         Op::LowLevel(_) | Op::TypedData(_) | Op::Memory(_) => ValueType::default(),
         Op::MemoryNumber(_, format) => match format {
             MemoryFormat::U32 | MemoryFormat::F32 | MemoryFormat::F64 => ValueType::NUMBER,
@@ -846,6 +852,8 @@ fn result_types(graph: &Graph, op: &Op, facts: &Facts) -> ValueType {
         | Op::IsExactPosition(..)
         | Op::IsInBounds(..)
         | Op::BooleanAnd(..) => ValueType::BOOLEAN,
+        Op::PropertyWriteCache(..) => ValueType::INT64,
+        Op::CanOverwrite(..) => ValueType::BOOLEAN,
         Op::IndexedLength(_) => ValueType::INT64,
         Op::ArrayKind(_) => ValueType::INT32,
         Op::IsNumber(_)

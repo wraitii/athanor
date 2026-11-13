@@ -126,7 +126,7 @@ pub(super) fn plan(graph: &mut Graph, facts: &mut Facts) -> Plan {
             Some(
                 Op::GetIndex(..)
                 | Op::TypedIndex(..)
-                | Op::IndexedGet(..)
+                | Op::ArrayGet(..)
                 | Op::ArrayLoad(..)
                 | Op::PackTake(..)
                 | Op::Call {

@@ -413,12 +413,12 @@ fn comparison_checks_do_not_cross_non_dominating_branches() {
 }
 
 #[test]
-fn indexed_reads_are_reused_probed_and_get_hoisted_views() {
+fn array_reads_are_reused_and_probed_without_implicit_views() {
     let graph = lower_source("function f(array){const zero=0;let sum=0;for(let i=0;i<2;++i){sum+=array[zero]+array[zero];}return sum;}").unwrap();
     let mut canonical = canonicalize_graph(graph, true).unwrap();
     for data in canonical.graph.insts.values_mut() {
         if let Op::GetIndex(object, key) = data.op {
-            data.op = Op::IndexedGet(object, key);
+            data.op = Op::ArrayGet(object, key);
         }
     }
     let viewed = canonical.graph.clone();
@@ -429,7 +429,7 @@ fn indexed_reads_are_reused_probed_and_get_hoisted_views() {
         viewed
             .views
             .keys()
-            .any(|&inst| matches!(viewed.insts[inst].op, Op::IndexedGet(..)))
+            .all(|&inst| !matches!(viewed.insts[inst].op, Op::ArrayGet(..)))
     );
     let analysis = optimize_canonical(canonical, true, None).unwrap();
     assert!(ops(&analysis.graph).iter().any(|op| matches!(
@@ -1007,7 +1007,7 @@ fn borrowed_rows_flow_through_phi_parameters() {
                         },
                     );
                 } else {
-                    data.op = Op::IndexedGet(object, key);
+                    data.op = Op::ArrayGet(object, key);
                 }
             }
         }
@@ -2018,8 +2018,8 @@ fn array_kind_reuse_stops_at_calls_and_writes() {
         let block = graph.entry;
         let span = graph.span;
         let object = graph.append_value(block, span, Op::Argument(0));
-        graph.append_value(block, span, Op::IsArray(object, false));
-        graph.append_value(block, span, Op::IsArray(object, true));
+        graph.append_value(block, span, Op::IsArray(object, super::ArrayLayout::Packed));
+        graph.append_value(block, span, Op::IsArray(object, super::ArrayLayout::Holey));
         if call {
             let callback = graph.append_value(block, span, Op::Argument(1));
             graph.append_value(
@@ -2036,7 +2036,8 @@ fn array_kind_reuse_stops_at_calls_and_writes() {
             let index = graph.append_value(block, span, Op::Constant(Constant::Number(100.0)));
             graph.append_value(block, span, Op::SetIndex(object, index, index));
         }
-        let result = graph.append_value(block, span, Op::IsArray(object, false));
+        let result =
+            graph.append_value(block, span, Op::IsArray(object, super::ArrayLayout::Packed));
         graph.terminate(block, span, TerminatorKind::Return(result));
         let mut function = FunctionState::new(graph, Vec::new(), true);
         typed_lowering::lower_array_kinds(&mut function);
@@ -2061,8 +2062,8 @@ fn array_metadata_uses_shared_loop_views() {
     let block = *body.iter().find(|&&block| block != header).unwrap();
     let span = graph.span;
     let object = graph.append_value(preheader, span, Op::Argument(1));
-    graph.append_value(block, span, Op::IsArray(object, false));
-    graph.append_value(block, span, Op::IsArray(object, true));
+    graph.append_value(block, span, Op::IsArray(object, super::ArrayLayout::Packed));
+    graph.append_value(block, span, Op::IsArray(object, super::ArrayLayout::Holey));
     graph.append_value(block, span, Op::IndexedLength(object));
     let mut function = FunctionState::new(graph, Vec::new(), true);
     typed_lowering::lower_array_kinds(&mut function);
@@ -2213,6 +2214,135 @@ fn continuation_exit_stubs_preserve_cold_paths() {
                     .iter()
                     .any(|&inst| matches!(result.insts[inst].op, Op::ContinuationStore(_)))
             );
+        }
+    }
+}
+
+#[test]
+fn property_lowering_exposes_named_reads_and_leaves_computed_reads_generic() {
+    let source = "function f(o,a,k){return o.x+a.length+a[k];}";
+    let graph = canonicalize_graph(lower_source(source).unwrap(), true)
+        .unwrap()
+        .graph;
+    let mut function = FunctionState::new(graph, Vec::new(), true);
+    assert!(lowering::properties::lower(&mut function).unwrap());
+    function.graph.verify().unwrap();
+    let operations = ops(&function.graph);
+    assert!(!operations.iter().any(|op| matches!(op, Op::Get(..))));
+    assert!(
+        operations
+            .iter()
+            .any(|op| matches!(op, Op::IsPropertyCached(..)))
+    );
+    assert!(
+        operations
+            .iter()
+            .any(|op| matches!(op, Op::CachedProperty(..)))
+    );
+    assert!(
+        operations
+            .iter()
+            .any(|op| matches!(op, Op::FillPropertyCache(_, _, name) if name == "x"))
+    );
+    assert!(
+        operations
+            .iter()
+            .any(|op| matches!(op, Op::IndexedLength(..)))
+    );
+    assert!(operations.iter().any(|op| matches!(op, Op::GetIndex(..))));
+    assert!(!operations.iter().any(|op| matches!(op, Op::ArrayLoad(..))));
+    assert!(!lowering::properties::lower(&mut function).unwrap());
+    function.prepare_for_emission().unwrap();
+}
+
+#[test]
+fn array_storage_lowering_preserves_planned_ownership() {
+    for layout in [ArrayLayout::Packed, ArrayLayout::Holey] {
+        for mutate in [false, true] {
+            let mutation = if mutate { "a[0]=null;" } else { "" };
+            let source = format!(
+                "function f(){{const a=[{{n:1}}];const value=a[0];const length=a.length;{mutation}return value.n+length;}}"
+            );
+            let mut graph = canonicalize_graph(lower_source(&source).unwrap(), true)
+                .unwrap()
+                .graph;
+            let mut load = None;
+            for (inst, data) in graph.insts.iter_mut() {
+                match &data.op {
+                    Op::GetIndex(object, key) => {
+                        let result = data.result().unwrap();
+                        load = Some((inst, result));
+                        data.op = Op::ArrayLoad(*object, *key, layout);
+                    }
+                    Op::Get(object, name) if name == "length" => {
+                        data.op = Op::IndexedLength(*object)
+                    }
+                    _ => {}
+                }
+            }
+            let (inst, result) = load.unwrap();
+            let mut function = FunctionState::new(graph, Vec::new(), true);
+            function.lower_memory().unwrap();
+            assert!(matches!(function.graph.insts[inst].op, Op::ArrayLoad(..)));
+            assert_eq!(function.graph.borrowed.contains(&result), !mutate);
+            assert!(
+                !ops(&function.graph)
+                    .iter()
+                    .any(|op| matches!(op, Op::IndexedLength(..)))
+            );
+            function.ensure_facts();
+            repr::assign(&mut function.graph, &function.facts);
+            legalize::legalize(&mut function.graph, &mut function.facts);
+            let plan = ownership::plan(&mut function.graph, &mut function.facts);
+            ownership::verify(&function.graph, &function.facts, &plan).unwrap();
+            function.graph.ownership = Some(plan);
+            let retained = |graph: &Graph| {
+                ops(graph)
+                    .iter()
+                    .any(|op| matches!(op, Op::Retain(value) if *value == result))
+            };
+            assert_eq!(retained(&function.graph), mutate);
+            let refs: Vec<_> = function
+                .graph
+                .insts
+                .iter()
+                .filter_map(|(inst, data)| {
+                    matches!(data.op, Op::Retain(_) | Op::Release(_) | Op::SlotStore(_))
+                        .then_some(inst)
+                })
+                .collect();
+            memory_lowering::lower_array_loads(&mut function);
+            function.graph.verify().unwrap();
+            assert_eq!(function.graph.repr(result), Repr::Boxed);
+            assert_eq!(retained(&function.graph), mutate);
+            assert_eq!(
+                refs,
+                function
+                    .graph
+                    .insts
+                    .iter()
+                    .filter_map(|(inst, data)| matches!(
+                        data.op,
+                        Op::Retain(_) | Op::Release(_) | Op::SlotStore(_)
+                    )
+                    .then_some(inst))
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                !ops(&function.graph)
+                    .iter()
+                    .any(|op| matches!(op, Op::ArrayLoad(..)))
+            );
+            assert!(matches!(
+                (&function.graph.insts[inst].op, layout),
+                (
+                    Op::LowLevel(low_level::Op::Load { .. }),
+                    ArrayLayout::Packed
+                ) | (
+                    Op::LowLevel(low_level::Op::Select { .. }),
+                    ArrayLayout::Holey
+                )
+            ));
         }
     }
 }
@@ -3043,4 +3173,158 @@ fn guarded_cache_loads_preserve_their_builtin_mode() {
         assert!(matches!(graph.insts[inst].op, Op::CachedProperty(_, _, mode) if mode == builtins));
         graph.verify().unwrap();
     }
+}
+
+#[test]
+fn write_lowering_keeps_generic_keys_and_materializes_selected_stores() {
+    use crate::heap::TypedKind;
+    let graph = canonicalize_graph(
+        lower_source("function f(a,k,v){a[k]=v;return v;}").unwrap(),
+        true,
+    )
+    .unwrap()
+    .graph;
+    let inst = Cfg::new(&graph)
+        .rpo
+        .iter()
+        .flat_map(|&block| &graph.blocks[block].insts)
+        .copied()
+        .find(|&inst| matches!(graph.insts[inst].op, Op::SetIndex(..)))
+        .unwrap();
+    for element in [
+        None,
+        Some(TypedKind::Uint8),
+        Some(TypedKind::Uint16),
+        Some(TypedKind::Uint32),
+        Some(TypedKind::Int8),
+        Some(TypedKind::Int16),
+        Some(TypedKind::Int32),
+        Some(TypedKind::Float32),
+        Some(TypedKind::Float64),
+    ] {
+        let mut graph = graph.clone();
+        let mut repository = specialize::Repository::default();
+        repository.read_feedback.insert(
+            (
+                crate::jit::profile::Site {
+                    source: 0,
+                    start: graph.insts[inst].span.start,
+                    end: graph.insts[inst].span.end,
+                },
+                crate::jit::profile::ReadKind::Receiver,
+            ),
+            element.map_or(
+                crate::jit::profile::ReadType::Array,
+                crate::jit::profile::ReadType::Typed,
+            ),
+        );
+        let planned = reads::plan_stores(&graph, &repository, 0);
+        assert_eq!(planned.len(), 1);
+        writes::lower(&mut graph, &planned).unwrap();
+        assert!(ops(&graph).iter().any(|op| matches!(op, Op::SetIndex(..))));
+        assert_eq!(
+            ops(&graph)
+                .iter()
+                .any(|op| matches!(op, Op::ArrayStore(..))),
+            element.is_none()
+        );
+        let mut function = FunctionState::new(graph, Vec::new(), true);
+        typed_lowering::lower(&mut function).unwrap();
+        typed_lowering::lower_array_kinds(&mut function);
+        function.prepare_for_emission().unwrap();
+        assert!(
+            !ops(&function.graph)
+                .iter()
+                .any(|op| matches!(op, Op::ArrayStore(..)))
+        );
+        assert!(
+            ops(&function.graph)
+                .iter()
+                .any(|op| matches!(op, Op::LowLevel(low_level::Op::Store { .. })))
+        );
+        if element.is_none() {
+            let old_reads = ops(&function.graph).iter().filter(|op| matches!(op,
+                Op::LowLevel(low_level::Op::Load { ty, offset: 0, .. }) if *ty == cranelift_codegen::ir::types::I64)).count();
+            assert_eq!(old_reads, 1);
+        }
+    }
+    let mut function = FunctionState::new(graph, Vec::new(), true);
+    function.prepare_for_emission().unwrap();
+    assert!(
+        !ops(&function.graph)
+            .iter()
+            .any(|op| matches!(op, Op::ArrayStore(..) | Op::CanOverwrite(..)))
+    );
+}
+
+#[test]
+fn property_write_lowering_exposes_addition_and_overwrite() {
+    let graph = canonicalize_graph(
+        lower_source("function f(o,v){const p={x:v};o.x=p;return o.x;}").unwrap(),
+        true,
+    )
+    .unwrap()
+    .graph;
+    let mut function = FunctionState::new(graph, Vec::new(), true);
+    assert!(lowering::properties::lower(&mut function).unwrap());
+    let operations = ops(&function.graph);
+    assert!(!operations.iter().any(|op| matches!(op, Op::Set(..))));
+    assert!(
+        operations
+            .iter()
+            .any(|op| matches!(op, Op::PropertyAdd(..)))
+    );
+    assert!(
+        operations
+            .iter()
+            .any(|op| matches!(op, Op::PropertyStore(..)))
+    );
+    assert!(
+        operations
+            .iter()
+            .any(|op| matches!(op, Op::FillPropertyStore(..)))
+    );
+    assert!(!lowering::properties::lower(&mut function).unwrap());
+    function.ensure_facts();
+    let defines: Vec<_> = Cfg::new(&function.graph)
+        .rpo
+        .iter()
+        .flat_map(|&block| &function.graph.blocks[block].insts)
+        .filter(|&&inst| {
+            matches!(
+                function.graph.insts[inst].op,
+                Op::PropertyStore(.., PropertyWrite::Define)
+                    | Op::PropertyAdd(.., PropertyWrite::Define)
+                    | Op::FillPropertyStore(.., PropertyWrite::Define)
+            )
+        })
+        .copied()
+        .collect();
+    assert!(!defines.is_empty());
+    assert!(
+        defines
+            .iter()
+            .all(|&inst| !function.facts.memory(inst).writes_data())
+    );
+    function.prepare_for_emission().unwrap();
+    assert!(
+        !ops(&function.graph)
+            .iter()
+            .any(|op| matches!(op, Op::PropertyAdd(..) | Op::PropertyStore(..)))
+    );
+    let operations = ops(&function.graph);
+    assert!(operations.iter().any(|op| matches!(
+        op,
+        Op::LowLevel(low_level::Op::Reference {
+            op: low_level::Reference::Retain,
+            ..
+        })
+    )));
+    assert!(operations.iter().any(|op| matches!(
+        op,
+        Op::LowLevel(low_level::Op::Reference {
+            op: low_level::Reference::Release { .. },
+            ..
+        })
+    )));
 }

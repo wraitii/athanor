@@ -896,7 +896,7 @@ fn emit(
                         failed,
                     )?;
                 }
-                Op::GetIndex(array, index) | Op::IndexedGet(array, index) => {
+                Op::GetIndex(array, index) | Op::ArrayGet(array, index) => {
                     asm.emit(e::mem_scaled(Mem::LdrX, 0, e::SP, context_offset as u32)?);
                     asm.emit(e::mem_scaled(
                         Mem::LdrX,

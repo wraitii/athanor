@@ -34,7 +34,7 @@ fn is_load(op: &Op) -> bool {
         Op::Get(..)
             | Op::ShapedGet(..)
             | Op::GetIndex(..)
-            | Op::IndexedGet(..)
+            | Op::ArrayGet(..)
             | Op::GlobalRead(_)
             | Op::ProbeGlobal(_)
             | Op::ProbeProperty(..)

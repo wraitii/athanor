@@ -66,6 +66,49 @@ fn constant_integer_products_preserve_extremes_and_zero_signs() {
 }
 
 #[test]
+fn array_iteration_preserves_elements_across_mutation() {
+    let source = r#"
+        function replace(a) {
+            a[0] = null;
+            a.length = 0;
+            for (let i = 0; i < 40; ++i)
+                a.push({n: i});
+        }
+        function read(a) {
+            for (const item of a) {
+                replace(a);
+                return item.n;
+            }
+        }
+        function main() {
+            if (read([{n: 123}]) !== 123)
+                return false;
+            const holey = new Array(3);
+            holey[1] = {n: 7};
+            let total = 0;
+            for (const item of holey) {
+                if (item === undefined)
+                    ++total;
+                else {
+                    holey[1] = null;
+                    total += item.n;
+                }
+            }
+            const typed = new Float64Array(2);
+            typed[0] = 1.5;
+            typed[1] = 2.5;
+            for (const item of typed)
+                total += item;
+            return total === 13;
+        }
+    "#;
+    for mut engine in engines() {
+        engine.compile(source, "array-iteration.js").unwrap();
+        assert_eq!(engine.call("main", &[]).unwrap().value(), Value::TRUE);
+    }
+}
+
+#[test]
 fn indexed_stores_preserve_values_and_ownership() {
     let source = r#"
         function store(a, k, v) { return a[k] = v; }
@@ -1204,6 +1247,134 @@ fn typed_indexed_loads_preserve_scalar_formats_and_bounds() {
                     "{backend:?} {kind} {value}"
                 );
             }
+        }
+    }
+}
+
+#[test]
+fn specialized_writes_preserve_values_and_generic_property_fallbacks() {
+    let source = r#"
+        function write(a,k,v){return a[k]=v;}
+        function named(o,v){o.x=v;return o.x;}
+        function main(){
+            const a=[{n:7},{n:8}];
+            for(let i=0;i<180;++i){
+                const old=a[0];
+                write(a,0,old);
+                write(a,1,old);
+                if(old.n!==7 || a[0]!==a[1])return false;
+                write(a,1,{n:8});
+            }
+            const old=a[0];
+            write(a,0,null);
+            if(old.n!==7)return false;
+            write(a,0,Math.abs);
+            write(a,0,old);
+            write(a,2,12);
+            write(a,'0',old);
+            if(a.length!==3 || a[2]!==12 || a[0]!==old)return false;
+            const properties={};
+            write(properties,'label',13);
+            write(properties,1.5,14);
+            write(properties,'01',15);
+            if(properties.label!==13 || properties[1.5]!==14 || properties['01']!==15)return false;
+            const holey=new Array(3);
+            write(holey,1,old);
+            if(holey[1].n!==7 || holey[0]!==undefined)return false;
+            const o={};
+            for(let i=0;i<180;++i){
+                if(named(o,old)!==old || named({},old)!==old)return false;
+            }
+            o.x=Math.abs;
+            if(named(o,old)!==old)return false;
+            const arrays=[new Uint8Array(1),new Uint16Array(1),new Uint32Array(1),new Int8Array(1),new Int16Array(1),new Int32Array(1),new Float32Array(1),new Float64Array(1)];
+            for(let j=0;j<arrays.length;++j){
+                const t=arrays[j];
+                for(let i=0;i<180;++i)if(write(t,0,257)!==257)return false;
+                const expected=j===0 || j===3 ? 1 : 257;
+                if(t[0]!==expected)return false;
+                if(write(t,0,1.5)!==1.5 || t[0] !== (j<6 ? 1 : 1.5))return false;
+                write(t,'0','3');
+                if(t[0]!==3)return false;
+                write(t,-1,9);
+                write(t,0.5,9);
+                if(t[0]!==3 || t[-1]!==undefined)return false;
+                write(t,0,9223372036854775808);
+                if(j<6 && t[0]!==0)return false;
+                write(t,0,NaN);
+                if(j<6 && t[0]!==0)return false;
+            }
+            return true;
+        }
+    "#;
+    let mut backends = vec![js_engine::Backend::Cranelift];
+    if cfg!(target_arch = "aarch64") {
+        backends.push(js_engine::Backend::NativeOnly);
+    }
+    for backend in backends {
+        let mut engine = Engine::with_options(EngineOptions {
+            backend,
+            background_compile: false,
+            ..Default::default()
+        })
+        .unwrap();
+        engine.compile(source, "specialized-writes.js").unwrap();
+        assert_eq!(engine.call("main", &[]).unwrap().value(), Value::TRUE);
+    }
+}
+
+#[test]
+fn typed_store_specializations_preserve_conversion_and_assignment_results() {
+    for (kind, negative, float) in [
+        ("Uint8Array", 255.0, false),
+        ("Uint16Array", 65279.0, false),
+        ("Uint32Array", 4294967039.0, false),
+        ("Int8Array", -1.0, false),
+        ("Int16Array", -257.0, false),
+        ("Int32Array", -257.0, false),
+        ("Float32Array", -257.0, true),
+        ("Float64Array", -257.0, true),
+    ] {
+        let source = format!(
+            r#"
+            function write(t,k,v){{return t[k]=v;}}
+            function main(){{
+                const t=new {kind}(1);
+                for(let i=0;i<180;++i)write(t,0,3);
+                if(write(t,0,-257)!==-257 || t[0]!=={negative})return false;
+                if(write(t,0,1.5)!==1.5 || t[0]!=={})return false;
+                write(t,'0','3');
+                if(t[0]!==3)return false;
+                write(t,'-0',9);
+                write(t,-1,9);
+                write(t,0.5,9);
+                if(t[0]!==3)return false;
+                write(t,0,9223372036854775808);
+                if(!{float} && t[0]!==0)return false;
+                write(t,0,NaN);
+                if({float} ? t[0]===t[0] : t[0]!==0)return false;
+                return true;
+            }}
+        "#,
+            if float { 1.5 } else { 1.0 }
+        );
+        let mut backends = vec![js_engine::Backend::Cranelift];
+        if cfg!(target_arch = "aarch64") {
+            backends.push(js_engine::Backend::NativeOnly);
+        }
+        for backend in backends {
+            let mut engine = Engine::with_options(EngineOptions {
+                backend,
+                background_compile: false,
+                ..Default::default()
+            })
+            .unwrap();
+            engine.compile(&source, "typed-stores.js").unwrap();
+            assert_eq!(
+                engine.call("main", &[]).unwrap().value(),
+                Value::TRUE,
+                "{kind}"
+            );
         }
     }
 }

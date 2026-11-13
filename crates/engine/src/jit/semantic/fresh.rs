@@ -12,7 +12,7 @@ fn contained_use(op: &Op, index: usize) -> bool {
         | Op::ShapedSet(..)
         | Op::GetIndex(..)
         | Op::TypedIndex(..)
-        | Op::IndexedGet(..)
+        | Op::ArrayGet(..)
         | Op::ArrayLoad(..)
         | Op::Set(..)
         | Op::SetIndex(..)
