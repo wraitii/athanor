@@ -923,7 +923,7 @@ impl Compiler {
                     None,
                 )
             } else {
-                graph.legalize_reprs().map_err(Error::Unsupported)?;
+                graph.prepare_for_emission().map_err(Error::Unsupported)?;
                 self.emit_body(self.signature.clone(), self.source_name, |out| {
                     emit::build_global(out, &graph.graph, &graph.facts, &continuations)
                 })?
@@ -1627,7 +1627,7 @@ impl Compiler {
                 None,
             )
         } else {
-            graph.legalize_reprs().map_err(Error::Unsupported)?;
+            graph.prepare_for_emission().map_err(Error::Unsupported)?;
             self.emit_body(signature, emission.source_name, |out| {
                 emit::build_function(
                     out,
@@ -1898,7 +1898,7 @@ impl Compiler {
                 None,
             )
         } else {
-            state.legalize_reprs().map_err(Error::Unsupported)?;
+            state.prepare_for_emission().map_err(Error::Unsupported)?;
             let (graph, facts) = (&state.graph, &state.facts);
             self.emit_body(self.signature.clone(), source_name, |out| {
                 emit::build_function(out, params, graph, facts, continuations, feedback)
@@ -2200,7 +2200,7 @@ impl Compiler {
             )
         } else {
             if let Some(graph) = &mut graph {
-                graph.legalize_reprs().map_err(Error::Unsupported)?;
+                graph.prepare_for_emission().map_err(Error::Unsupported)?;
             }
             self.emit_body(signature, self.source_name, |out| match &graph {
                 Some(graph) => emit::build_function(

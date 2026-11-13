@@ -1,15 +1,18 @@
 use crate::{FxHashMap, FxHashSet};
 
+use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use oxc_syntax::operator::BinaryOperator;
 
 use super::access::Access;
 use super::guards::{Fact, implies};
-use super::{Block, Cfg, Facts, Graph, Inst, Op, TerminatorKind, UnaryOp, Value, resolve};
+use super::{Block, Cfg, Facts, Graph, Inst, Op, TerminatorKind, Value, resolve};
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(super) enum LoadKey {
     ToInt32(Value),
     NumericFloat(Value),
+    IntCompare(IntCC, Value, Value),
+    FloatCompare(FloatCC, Value, Value),
     SaturatingInteger(Value),
     Position(Value),
     ExactPosition(Value, Value),
@@ -85,6 +88,16 @@ fn load_key(
         }
         Op::SaturatingInteger(value) => LoadKey::SaturatingInteger(at(value)),
         Op::ToInt32(value) => LoadKey::ToInt32(at(value)),
+        Op::LowLevel(super::low_level::Op::IntCompare {
+            condition,
+            left,
+            right,
+        }) if pure => LoadKey::IntCompare(*condition, at(left), at(right)),
+        Op::LowLevel(super::low_level::Op::FloatCompare {
+            condition,
+            left,
+            right,
+        }) if pure => LoadKey::FloatCompare(*condition, at(left), at(right)),
         Op::ArrayPosition(value) => LoadKey::Position(at(value)),
         Op::IsExactPosition(key, position) => LoadKey::ExactPosition(at(key), at(position)),
         Op::BooleanAnd(left, right) => LoadKey::BooleanAnd(at(left), at(right)),
@@ -204,8 +217,8 @@ fn entering(
             && let TerminatorKind::Branch(condition, yes, no) = &terminator.kind
             && yes.block != no.block
         {
-            let (condition, inverted) = match graph.defining_op(*condition) {
-                Some(Op::Unary(UnaryOp::Not, value)) => (*value, true),
+            let (condition, inverted) = match super::guards::negated(graph, *condition) {
+                Some(value) => (value, true),
                 _ => (*condition, false),
             };
             let condition = resolve(aliases, condition);

@@ -157,7 +157,10 @@ fn integer_failure_replans_other_numeric_sites_as_numbers() {
             .unwrap();
         assert!(!final_graph.contains("is_integer"), "{final_graph}");
         assert!(final_graph.contains("is_number"), "{final_graph}");
-        assert!(final_graph.contains(":int32 = increment"), "{final_graph}");
+        assert!(
+            final_graph.contains(":int32 = low_level Binary { op: Add,"),
+            "{final_graph}"
+        );
     }
 }
 
@@ -623,7 +626,7 @@ fn whole_function_guards_expose_closed_inlined_arithmetic() {
     assert_eq!(fast.matches(" = is_number ").count(), 4);
     assert!(!fast.contains(" = global "));
     assert!(!fast.contains(" = call "));
-    assert_eq!(fast.matches(" * ").count(), 2);
+    assert_eq!(fast.matches("op: FloatMultiply").count(), 2);
     assert!(!function.contains("not optimized:"));
 }
 

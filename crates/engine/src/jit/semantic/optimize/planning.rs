@@ -14,10 +14,7 @@ fn pure_guard(graph: &Graph, block: Block) -> bool {
     else {
         return false;
     };
-    let condition = match graph.defining_op(*condition) {
-        Some(Op::Unary(UnaryOp::Not, inner)) => *inner,
-        _ => *condition,
-    };
+    let condition = super::super::guards::negated(graph, *condition).unwrap_or(*condition);
     match graph.defining_op(condition) {
         None => true,
         Some(op) => matches!(
@@ -878,6 +875,7 @@ pub(in crate::jit::semantic) fn version_with_report(
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::low_level::{Binary as LowBinary, Op as LowOp};
     use super::*;
     use oxc_allocator::Allocator;
     use oxc_ast::ast::Statement;
@@ -1028,7 +1026,12 @@ mod tests {
             .flat_map(|&block| &graph.blocks[block].insts)
             .any(|&inst| {
                 let data = &graph.insts[inst];
-                let Op::Binary(BinaryOperator::Addition, _, right) = data.op else {
+                let Op::LowLevel(LowOp::Binary {
+                    op: LowBinary::Add,
+                    right,
+                    ..
+                }) = data.op
+                else {
                     return false;
                 };
                 matches!(
@@ -1284,7 +1287,10 @@ mod tests {
             .filter_map(|&inst| {
                 matches!(
                     graph.insts[inst].op,
-                    Op::Binary(BinaryOperator::Addition, ..)
+                    Op::LowLevel(LowOp::Binary {
+                        op: LowBinary::Add | LowBinary::FloatAdd,
+                        ..
+                    })
                 )
                 .then(|| graph.insts[inst].result().unwrap())
             })

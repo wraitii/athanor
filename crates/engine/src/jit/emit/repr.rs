@@ -146,54 +146,6 @@ impl FunctionCompiler<'_, '_> {
         let repr = left.repr;
         let (left, right) = (left.value, right.value);
         let value = match op {
-            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul if result == Repr::I64 => {
-                debug_assert_eq!(repr, Repr::I64);
-                match op {
-                    BinaryOp::Add => self.b.ins().iadd(left, right),
-                    BinaryOp::Sub => self.b.ins().isub(left, right),
-                    _ => self.b.ins().imul(left, right),
-                }
-            }
-            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
-                debug_assert_eq!(repr, Repr::F64);
-                match op {
-                    BinaryOp::Add => self.b.ins().fadd(left, right),
-                    BinaryOp::Sub => self.b.ins().fsub(left, right),
-                    BinaryOp::Mul => self.b.ins().fmul(left, right),
-                    _ => self.b.ins().fdiv(left, right),
-                }
-            }
-            BinaryOp::Less
-            | BinaryOp::LessEqual
-            | BinaryOp::Greater
-            | BinaryOp::GreaterEqual
-            | BinaryOp::LooseEqual
-            | BinaryOp::StrictEqual
-            | BinaryOp::LooseNotEqual
-            | BinaryOp::StrictNotEqual => {
-                if matches!(repr, Repr::I8 | Repr::I32 | Repr::I64) {
-                    let condition = match op {
-                        BinaryOp::Less => IntCC::SignedLessThan,
-                        BinaryOp::LessEqual => IntCC::SignedLessThanOrEqual,
-                        BinaryOp::Greater => IntCC::SignedGreaterThan,
-                        BinaryOp::GreaterEqual => IntCC::SignedGreaterThanOrEqual,
-                        BinaryOp::LooseEqual | BinaryOp::StrictEqual => IntCC::Equal,
-                        _ => IntCC::NotEqual,
-                    };
-                    self.b.ins().icmp(condition, left, right)
-                } else {
-                    debug_assert_eq!(repr, Repr::F64);
-                    let condition = match op {
-                        BinaryOp::Less => FloatCC::LessThan,
-                        BinaryOp::LessEqual => FloatCC::LessThanOrEqual,
-                        BinaryOp::Greater => FloatCC::GreaterThan,
-                        BinaryOp::GreaterEqual => FloatCC::GreaterThanOrEqual,
-                        BinaryOp::LooseEqual | BinaryOp::StrictEqual => FloatCC::Equal,
-                        _ => FloatCC::NotEqual,
-                    };
-                    self.b.ins().fcmp(condition, left, right)
-                }
-            }
             BinaryOp::BitwiseAnd
             | BinaryOp::BitwiseOr
             | BinaryOp::BitwiseXor

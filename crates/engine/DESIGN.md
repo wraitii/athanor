@@ -161,10 +161,20 @@ reads. After slot assignment, the ownership plan records the chosen helper varia
 and whether its result is borrowed, emitter-managed, delivered directly to a
 frame slot, or moved from an emitter temporary into the slot. Both retain insertion
 and runtime emission consume that decision.
-Semantic effects and result ownership remain in `Graph::contract`. The same
-representation contracts select typed or generic implementations and record the
-result representation; emission executes that choice. Typed arithmetic consumes
-legalized operands without rechecking numeric eligibility or reconverting them.
+Semantic effects and result ownership remain in `Graph::contract`.
+`semantic/lowering/numeric.rs` replaces proven numeric arithmetic, comparisons
+and unary operations with low-level operations before representation assignment.
+Value facts choose integer or floating operations; integer widths remain for
+representation assignment. Floating operands use `NumericFloat`, including
+conversion of undefined to NaN. Numeric unary plus becomes an alias when no
+conversion is required. Boolean negation compares with false; numeric negation
+of truthiness tests for zero or NaN. Loop facts and predicate propagation recognize
+both JS operations and their lowered forms. Legalization reconciles operand and
+result representations, and emission forwards the concrete operations. This
+lowering also runs when semantic optimization is disabled. Coercing operations
+retain their runtime paths. Binary bitwise operations and inline Math calls still
+use representation contracts to select typed or generic implementations during
+preparation for emission.
 
 Early exits through a failed helper or a thrown exception carry explicit cleanup
 operands for all references still held at the site, including internal references

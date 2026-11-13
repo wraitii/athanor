@@ -55,6 +55,24 @@ pub(in crate::jit) enum Binary {
     FloatMax,
 }
 
+impl Binary {
+    pub(in crate::jit) fn is_integer_arithmetic(self) -> bool {
+        matches!(self, Self::Add | Self::Subtract | Self::Multiply)
+    }
+
+    pub(in crate::jit) fn is_float(self) -> bool {
+        matches!(
+            self,
+            Self::FloatAdd
+                | Self::FloatSubtract
+                | Self::FloatMultiply
+                | Self::FloatDivide
+                | Self::FloatMin
+                | Self::FloatMax
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(in crate::jit) struct StackSlot(pub usize);
 
@@ -736,12 +754,16 @@ impl Instructions<'_, '_> {
         self.builder.value(block, self.builder.span, op, ty)
     }
 
-    fn binary(&mut self, op: Binary, left: Value, right: Value) -> Value {
+    pub(in crate::jit) fn binary(&mut self, op: Binary, left: Value, right: Value) -> Value {
         let ty = self.builder.graph.reprs[left]
             .map(Repr::machine)
             .expect("untyped low-level operand");
         assert_eq!(self.builder.graph.reprs[right].map(Repr::machine), Some(ty));
         self.value(Op::Binary { op, left, right }, ty)
+    }
+
+    pub(in crate::jit) fn unary(&mut self, op: Unary, ty: Type, value: Value) -> Value {
+        self.value(Op::Unary { op, ty, value }, ty)
     }
 
     binary_methods!(isub => Subtract, band => And, bor => Or, bxor => Xor,
@@ -752,7 +774,7 @@ impl Instructions<'_, '_> {
         band_imm_s => And, band_imm_u => And, ishl_imm_s => ShiftLeft,
         ushr_imm_s => ShiftRightUnsigned);
 
-    unary_methods!(bnot => BitNot, fneg => FloatNeg, fabs => FloatAbs,
+    unary_methods!(fabs => FloatAbs,
         ceil => Ceil, floor => Floor, trunc => Trunc, sqrt => Sqrt);
     conversion_methods!(ireduce => Reduce, sextend => SignExtend, uextend => ZeroExtend,
         fpromote => FloatPromote, fdemote => FloatDemote, fcvt_from_sint => FloatFromSigned,
@@ -858,10 +880,6 @@ impl Instructions<'_, '_> {
 
     pub(in crate::jit) fn iadd(&mut self, left: Value, right: Value) -> Value {
         self.binary(Binary::Add, left, right)
-    }
-
-    pub(in crate::jit) fn imul(&mut self, left: Value, right: Value) -> Value {
-        self.binary(Binary::Multiply, left, right)
     }
 
     pub(in crate::jit) fn load(

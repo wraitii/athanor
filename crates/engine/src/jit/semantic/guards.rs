@@ -1,7 +1,9 @@
 use crate::FxHashMap;
+use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_module::FuncId;
 
 use super::facts::ValueType;
+use super::low_level;
 use super::{Block, Graph, Inst, Native, Op, TerminatorKind, UnaryOp, Value};
 use crate::heap::TypedKind;
 use crate::jit::profile::Site;
@@ -116,6 +118,32 @@ pub(super) fn implies(op: &Op) -> Option<(Value, Fact)> {
     })
 }
 
+pub(super) fn negated(graph: &Graph, value: Value) -> Option<Value> {
+    match *graph.defining_op(value)? {
+        Op::Unary(UnaryOp::Not, value) => Some(value),
+        Op::LowLevel(low_level::Op::IntCompare {
+            condition: IntCC::Equal,
+            left,
+            right,
+        }) => {
+            let is_false = |value| {
+                matches!(
+                    graph.defining_op(value),
+                    Some(Op::Constant(super::Constant::Boolean(false)))
+                )
+            };
+            if is_false(right) {
+                Some(left)
+            } else if is_false(left) {
+                Some(right)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 pub(super) fn edge_of(graph: &Graph, kind: &TerminatorKind) -> Option<Edge> {
     let TerminatorKind::Branch(condition, yes, no) = kind else {
         return None;
@@ -123,8 +151,8 @@ pub(super) fn edge_of(graph: &Graph, kind: &TerminatorKind) -> Option<Edge> {
     if yes.block == no.block {
         return None;
     }
-    let (condition, yes) = match graph.defining_op(*condition)? {
-        Op::Unary(UnaryOp::Not, value) => (*value, no.block),
+    let (condition, yes) = match negated(graph, *condition) {
+        Some(value) => (value, no.block),
         _ => (*condition, yes.block),
     };
     let (value, fact) = implies(graph.defining_op(condition)?)?;

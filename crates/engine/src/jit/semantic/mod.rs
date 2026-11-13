@@ -24,7 +24,7 @@ pub(in crate::jit) mod ownership_lowering;
 pub(in crate::jit) mod selection;
 pub(in crate::jit) use memory_lowering::lower_memory_for_cranelift;
 pub(in crate::jit) mod cleanup;
-mod numeric_lowering;
+mod lowering;
 mod observations;
 mod optimize;
 pub(super) mod osr;
@@ -2234,7 +2234,11 @@ impl FunctionState {
         Ok(())
     }
 
-    pub(in crate::jit) fn legalize_reprs(&mut self) -> Result<()> {
+    pub(in crate::jit) fn prepare_for_emission(&mut self) -> Result<()> {
+        if lowering::numeric::operations(self) {
+            self.ensure_facts();
+            borrow::borrows(&mut self.graph, &self.facts, &mut self.notes);
+        }
         self.ensure_facts();
         repr::assign(&mut self.graph, &self.facts);
         legalize::legalize(&mut self.graph, &mut self.facts);
@@ -2654,7 +2658,7 @@ pub(super) fn optimize_planned(
         optimize::hoist(&mut function, *region);
         function.graph.verify()?;
     }
-    if numeric_lowering::lower(&mut function) {
+    if lowering::numeric::lower(&mut function) {
         optimize::reuse_loads(&mut function);
         for region in &regions {
             optimize::hoist(&mut function, *region);

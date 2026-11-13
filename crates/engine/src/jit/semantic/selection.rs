@@ -3,8 +3,8 @@ use crate::jit::helpers::Helper;
 use oxc_syntax::operator::BinaryOperator;
 
 use super::{
-    Constant, Facts, Graph, Inst, MemoryFormat, MemoryOp, Op, Ownership, Repr, TypedRead, UnaryOp,
-    Value, ValueType,
+    Constant, Facts, Graph, Inst, MemoryFormat, MemoryOp, Op, Ownership, Repr, TypedRead, Value,
+    ValueType,
 };
 use crate::jit::math::METHODS;
 
@@ -23,67 +23,6 @@ const NUMERIC: ValueType = ValueType::NUMBER.union(ValueType::UNDEFINED);
 
 fn integer(repr: Repr) -> bool {
     matches!(repr, Repr::I32 | Repr::I64)
-}
-
-fn binary(operator: BinaryOperator, left: Repr, right: Repr) -> (Repr, Repr) {
-    use BinaryOperator as B;
-    match operator {
-        B::Addition | B::Subtraction if integer(left) && integer(right) => (Repr::I64, Repr::I64),
-        B::Addition | B::Subtraction | B::Multiplication | B::Division => (Repr::F64, Repr::F64),
-        B::LessThan
-        | B::LessEqualThan
-        | B::GreaterThan
-        | B::GreaterEqualThan
-        | B::Equality
-        | B::StrictEquality
-        | B::Inequality
-        | B::StrictInequality => {
-            if !integer(left) || !integer(right) {
-                (Repr::F64, Repr::I8)
-            } else if left == Repr::I32 && right == Repr::I32 {
-                (Repr::I32, Repr::I8)
-            } else {
-                (Repr::I64, Repr::I8)
-            }
-        }
-        B::ShiftRightZeroFill => (Repr::I32, Repr::F64),
-        _ => (Repr::I32, Repr::I32),
-    }
-}
-
-fn typed_binary(
-    graph: &Graph,
-    facts: &Facts,
-    operator: BinaryOperator,
-    left: Value,
-    right: Value,
-) -> Option<Representations> {
-    use BinaryOperator as B;
-    let (left_repr, right_repr) = (graph.repr(left), graph.repr(right));
-    if left_repr == Repr::I8
-        && right_repr == Repr::I8
-        && matches!(operator, B::StrictEquality | B::StrictInequality)
-    {
-        return Some(Representations {
-            uses: vec![Use::Any, Use::Any],
-            produces: Some(Repr::I8),
-        });
-    }
-    let applicable = match operator {
-        B::Equality | B::StrictEquality | B::Inequality | B::StrictInequality => {
-            facts.of(left).within(ValueType::NUMBER) && facts.of(right).within(ValueType::NUMBER)
-        }
-        B::Instanceof | B::In | B::Remainder | B::Exponential => false,
-        _ => facts.of(left).within(NUMERIC) && facts.of(right).within(NUMERIC),
-    };
-    if !applicable {
-        return None;
-    }
-    let (operand, result) = binary(operator, left_repr, right_repr);
-    Some(Representations {
-        uses: vec![Use::Exact(operand), Use::Exact(operand)],
-        produces: Some(result),
-    })
 }
 
 fn view_object(graph: &Graph, inst: Inst) -> Use {
@@ -131,33 +70,56 @@ fn typed(graph: &Graph, facts: &Facts, inst: Inst) -> Option<Representations> {
         produces,
     };
     Some(match &data.op {
+        Op::LowLevel(super::low_level::Op::Binary { op, .. }) if op.is_float() => {
+            exact(&[Repr::F64, Repr::F64], Repr::F64)
+        }
+        Op::LowLevel(super::low_level::Op::Binary { op, .. }) if op.is_integer_arithmetic() => {
+            let repr = target.expect("integer arithmetic result representation");
+            exact(&[repr, repr], repr)
+        }
+        Op::LowLevel(super::low_level::Op::IntCompare { left, right, .. }) => {
+            let (left, right) = (graph.repr(*left), graph.repr(*right));
+            let repr = if left == right { left } else { Repr::I64 };
+            exact(&[repr, repr], Repr::I8)
+        }
+        Op::LowLevel(super::low_level::Op::FloatCompare { .. }) => {
+            exact(&[Repr::F64, Repr::F64], Repr::I8)
+        }
+        Op::LowLevel(super::low_level::Op::Unary {
+            op: super::low_level::Unary::FloatNeg | super::low_level::Unary::BitNot,
+            ty,
+            ..
+        }) => {
+            let repr = Repr::from_machine(*ty);
+            exact(&[repr], repr)
+        }
         Op::Convert(_, repr) => any(1, Some(*repr)),
         Op::Constant(Constant::Number(_)) => match target {
             Some(repr @ (Repr::F64 | Repr::I64 | Repr::I32)) => any(0, Some(repr)),
             _ => return None,
         },
         Op::Constant(Constant::Boolean(_)) if target == Some(Repr::I8) => any(0, Some(Repr::I8)),
-        Op::Binary(BinaryOperator::Multiplication, ..) if target == Some(Repr::I64) => {
-            exact(&[Repr::I64, Repr::I64], Repr::I64)
+        Op::Binary(operator, left, right)
+            if matches!(
+                operator,
+                BinaryOperator::BitwiseAnd
+                    | BinaryOperator::BitwiseOR
+                    | BinaryOperator::BitwiseXOR
+                    | BinaryOperator::ShiftLeft
+                    | BinaryOperator::ShiftRight
+                    | BinaryOperator::ShiftRightZeroFill
+            ) && numeric(*left)
+                && numeric(*right) =>
+        {
+            exact(
+                &[Repr::I32, Repr::I32],
+                if *operator == BinaryOperator::ShiftRightZeroFill {
+                    Repr::F64
+                } else {
+                    Repr::I32
+                },
+            )
         }
-        Op::Binary(operator, left, right) => typed_binary(graph, facts, *operator, *left, *right)?,
-        Op::GuardedCompare {
-            operator,
-            left,
-            right,
-            numbers,
-        } => {
-            let mut contract = typed_binary(graph, facts, *operator, *left, *right)?;
-            contract.uses.extend(numbers.iter().map(|_| Use::Any));
-            contract
-        }
-        Op::Unary(UnaryOp::Increment | UnaryOp::Decrement, value) if numeric(*value) => {
-            match target {
-                Some(repr @ (Repr::I32 | Repr::I64)) => exact(&[repr], repr),
-                _ => exact(&[Repr::F64], Repr::F64),
-            }
-        }
-        Op::Unary(UnaryOp::Negate, value) if numeric(*value) => exact(&[Repr::F64], Repr::F64),
         Op::TypedData(_) => any(1, Some(Repr::I64)),
         Op::Memory(MemoryOp::Address { .. }) => any(2, Some(Repr::I64)),
         Op::Memory(MemoryOp::Load { format, .. }) => any(1, Some(format.repr())),
@@ -178,21 +140,7 @@ fn typed(graph: &Graph, facts: &Facts, inst: Inst) -> Option<Representations> {
         },
         Op::IsInteger(_) => exact(&[Repr::Boxed], Repr::I8),
         Op::ToInt32(_) => exact(&[Repr::I32], Repr::I32),
-        Op::Unary(UnaryOp::BitwiseNot, value) if numeric(*value) => exact(&[Repr::I32], Repr::I32),
         Op::AsNumber(value) => any(1, Some(graph.repr(*value))),
-        Op::Unary(UnaryOp::Plus, value) | Op::ToNumeric(value) if numeric(*value) => {
-            match graph.repr(*value) {
-                repr @ (Repr::I32 | Repr::I64 | Repr::F64) => any(1, Some(repr)),
-                _ => exact(&[Repr::F64], Repr::F64),
-            }
-        }
-        Op::Unary(UnaryOp::Not, value) if numeric(*value) || graph.repr(*value) != Repr::Boxed => {
-            if graph.repr(*value) == Repr::Boxed {
-                exact(&[Repr::F64], Repr::I8)
-            } else {
-                any(1, Some(Repr::I8))
-            }
-        }
         Op::IsCode(..) | Op::IsShape(..) | Op::IsPropertyCached(..) | Op::IsTyped(..) => {
             exact(&[Repr::Boxed], Repr::I8)
         }

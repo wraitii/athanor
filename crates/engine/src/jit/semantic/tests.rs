@@ -433,7 +433,7 @@ fn indexed_reads_are_reused_probed_and_get_hoisted_views() {
     );
     let analysis = optimize_canonical(canonical, true, None).unwrap();
     assert!(ops(&analysis.graph).iter().any(|op| matches!(
-        op, Op::Binary(oxc_syntax::operator::BinaryOperator::Addition, left, right) if left == right
+        op, Op::LowLevel(low_level::Op::Binary { op: low_level::Binary::FloatAdd, left, right }) if left == right
     )));
     assert!(
         analysis
@@ -1300,6 +1300,10 @@ fn undefined_comparisons_refine_typed_read_results() {
             types.intersects(ValueType::NUMBER) && types.within(ValueType::NUMBER),
             "{source}: {types}"
         );
+        let mut lowered = FunctionState::from_graph(graph.clone());
+        lowering::numeric::operations(&mut lowered);
+        lowered.graph.verify().unwrap();
+        assert_eq!(Facts::compute(&lowered.graph).of(result), types, "{source}");
     }
     for source in [
         "function f(x){return x==undefined;}",
@@ -1798,6 +1802,106 @@ fn call_variant_contracts_respect_disabled_numeric_speculation() {
 }
 
 #[test]
+fn arithmetic_lowering_preserves_value_contracts_before_legalization() {
+    use low_level::Binary as B;
+
+    for (expression, expected) in [
+        ("(a|0)+(b|0)", B::Add),
+        ("(a|0)-(b|0)", B::Subtract),
+        ("(a|0)*2", B::Multiply),
+        ("(a|0)/(b|0)", B::FloatDivide),
+        ("(+a)+(+b)", B::FloatAdd),
+        ("(+a)-(+b)", B::FloatSubtract),
+        ("(+a)*(+b)", B::FloatMultiply),
+        ("undefined+(+a)", B::FloatAdd),
+    ] {
+        let graph = lower_source(&format!("function f(a,b){{return {expression};}}")).unwrap();
+        let block = graph.entry;
+        let TerminatorKind::Return(result) = graph.blocks[block].terminator.as_ref().unwrap().kind
+        else {
+            panic!()
+        };
+        let mut function = FunctionState::new(graph, Vec::new(), true);
+        assert!(lowering::numeric::arithmetic(&mut function), "{expression}");
+        let Some(Op::LowLevel(low_level::Op::Binary { op, .. })) =
+            function.graph.defining_op(result)
+        else {
+            panic!("{expression}")
+        };
+        assert_eq!(
+            std::mem::discriminant(op),
+            std::mem::discriminant(&expected)
+        );
+        assert!(function.graph.reprs.values().all(Option::is_none));
+        assert!(!lowering::numeric::arithmetic(&mut function));
+        function.ensure_facts();
+        let types = if expected.is_float() {
+            ValueType::NUMBER
+        } else {
+            ValueType::INTEGER
+        };
+        assert!(function.facts.of(result).intersects(types));
+        assert!(function.facts.of(result).within(types));
+        function.graph.verify().unwrap();
+        function.prepare_for_emission().unwrap();
+    }
+
+    let graph = lower_source("function f(a,b){return a+b;}").unwrap();
+    let mut function = FunctionState::new(graph, Vec::new(), true);
+    assert!(!lowering::numeric::arithmetic(&mut function));
+    assert!(
+        ops(&function.graph)
+            .iter()
+            .any(|op| matches!(op, Op::Binary(BinaryOperator::Addition, ..)))
+    );
+}
+
+#[test]
+fn lowered_comparisons_and_steps_preserve_loop_facts() {
+    for (initial, condition, step) in [
+        ("0", "i<16", "++i"),
+        ("16", "i>0", "--i"),
+        ("0", "i<=15", "i=i+1"),
+        ("16", "i>=1", "i=i-1"),
+    ] {
+        let source =
+            format!("function f(){{let i={initial};while({condition}){{{step};}}return i;}}");
+        let mut function = canonicalize_graph(lower_source(&source).unwrap(), true).unwrap();
+        function.ensure_values();
+        let steps: Vec<_> = function
+            .graph
+            .insts
+            .values()
+            .filter_map(|data| {
+                matches!(
+                    data.op,
+                    Op::Unary(UnaryOp::Increment | UnaryOp::Decrement, _)
+                        | Op::Binary(BinaryOperator::Addition | BinaryOperator::Subtraction, ..)
+                )
+                .then(|| data.result().unwrap())
+            })
+            .collect();
+        assert!(!steps.is_empty());
+        for &step in &steps {
+            assert_eq!(function.facts.of(step), ValueType::INT32, "{source}");
+        }
+        assert!(lowering::numeric::operations(&mut function));
+        assert!(!lowering::numeric::operations(&mut function));
+        function.ensure_values();
+        for step in steps {
+            assert_eq!(function.facts.of(step), ValueType::INT32, "{source}");
+        }
+        assert!(
+            ops(&function.graph)
+                .iter()
+                .any(|op| matches!(op, Op::LowLevel(low_level::Op::IntCompare { .. })))
+        );
+        assert!(function.graph.reprs.values().all(Option::is_none));
+        function.prepare_for_emission().unwrap();
+    }
+}
+
+#[test]
 fn numeric_lowering_reuses_guard_conversions_across_calls() {
     let mut graph = lower_source("function f(a, callback){return a;}").unwrap();
     let block = graph.entry;
@@ -1835,7 +1939,7 @@ fn numeric_lowering_reuses_guard_conversions_across_calls() {
     graph.terminate(success, span, TerminatorKind::Return(product));
     graph.terminate(fallback, span, TerminatorKind::Return(value));
     let mut function = FunctionState::new(graph, Vec::new(), true);
-    numeric_lowering::lower(&mut function);
+    lowering::numeric::lower(&mut function);
     optimize::reuse_loads(&mut function);
     function.graph.verify().unwrap();
     function.ensure_values();
@@ -1844,7 +1948,11 @@ fn numeric_lowering_reuses_guard_conversions_across_calls() {
     let Some(Op::IntegerCheck(_, _, exact)) = graph.defining_op(guard) else {
         panic!()
     };
-    let Some(Op::Binary(BinaryOperator::Multiplication, left, _)) = graph.defining_op(product)
+    let Some(Op::LowLevel(low_level::Op::Binary {
+        op: low_level::Binary::FloatMultiply,
+        left,
+        ..
+    })) = graph.defining_op(product)
     else {
         panic!()
     };
@@ -1880,14 +1988,16 @@ fn hoisting_moves_constant_arithmetic_and_lowered_conversions() {
             blocks: function.graph.blocks.keys().collect(),
             fallback: None,
         });
-        numeric_lowering::lower(&mut function);
+        lowering::numeric::lower(&mut function);
         optimize::reuse_loads(&mut function);
         optimize::hoist(&mut function, region);
         function.graph.verify().unwrap();
         let graph = &function.graph;
         assert_eq!(graph.def_block(factor), preheader);
         assert_eq!(graph.def_block(product), preheader);
-        let Some(Op::Binary(_, left, right)) = graph.defining_op(product) else {
+        let Some(Op::LowLevel(low_level::Op::Binary { left, right, .. })) =
+            graph.defining_op(product)
+        else {
             panic!()
         };
         assert_eq!(graph.def_block(*left), preheader);

@@ -1601,6 +1601,39 @@ impl FunctionCompiler<'_, '_> {
         let data = &graph.insts[inst];
         let boolean = |condition: LoweredValue| Some(Operand::new(condition, Repr::I8));
         let result = match &data.op {
+            Op::LowLevel(crate::jit::semantic::low_level::Op::Binary { op, left, right }) => {
+                let left = self.operand(cx, *left);
+                let right = self.operand(cx, *right);
+                Some(Operand::new(
+                    self.b.ins().binary(*op, left.value, right.value),
+                    target.expect("low-level binary result representation"),
+                ))
+            }
+            Op::LowLevel(crate::jit::semantic::low_level::Op::Unary { op, ty, value }) => {
+                let value = self.operand(cx, *value).value;
+                Some(Operand::new(
+                    self.b.ins().unary(*op, *ty, value),
+                    Repr::from_machine(*ty),
+                ))
+            }
+            Op::LowLevel(crate::jit::semantic::low_level::Op::IntCompare {
+                condition,
+                left,
+                right,
+            }) => {
+                let left = self.operand(cx, *left).value;
+                let right = self.operand(cx, *right).value;
+                boolean(self.b.ins().icmp(*condition, left, right))
+            }
+            Op::LowLevel(crate::jit::semantic::low_level::Op::FloatCompare {
+                condition,
+                left,
+                right,
+            }) => {
+                let left = self.operand(cx, *left).value;
+                let right = self.operand(cx, *right).value;
+                boolean(self.b.ins().fcmp(*condition, left, right))
+            }
             Op::Constant(Constant::Number(number)) => match target {
                 Some(Repr::F64) => Some(Operand::new(self.b.ins().f64const(*number), Repr::F64)),
                 Some(Repr::I64) => Some(Operand::new(
@@ -1617,13 +1650,7 @@ impl FunctionCompiler<'_, '_> {
                 let value = self.b.ins().iconst(types::I8, i64::from(*value));
                 boolean(value)
             }
-            Op::Binary(operator, left, right)
-            | Op::GuardedCompare {
-                operator,
-                left,
-                right,
-                ..
-            } => {
+            Op::Binary(operator, left, right) => {
                 let op = ops::binary_operator(*operator);
                 let (left, right) = (self.operand(cx, *left), self.operand(cx, *right));
                 Some(self.typed_binary(
@@ -1632,28 +1659,6 @@ impl FunctionCompiler<'_, '_> {
                     right,
                     target.expect("binary result representation"),
                 ))
-            }
-            Op::Unary(UnaryOp::Increment | UnaryOp::Decrement, value) => {
-                let operand = self.operand(cx, *value);
-                let delta = if matches!(data.op, Op::Unary(UnaryOp::Increment, _)) {
-                    1
-                } else {
-                    -1
-                };
-                Some(if matches!(target, Some(Repr::I32 | Repr::I64)) {
-                    let repr = target.unwrap();
-                    let integer = self.convert(operand, repr);
-                    Operand::new(self.b.ins().iadd_imm_s(integer, delta), repr)
-                } else {
-                    let float = self.convert(operand, Repr::F64);
-                    let one = self.b.ins().f64const(delta as f64);
-                    Operand::new(self.b.ins().fadd(float, one), Repr::F64)
-                })
-            }
-            Op::Unary(UnaryOp::Negate, value) => {
-                let operand = self.operand(cx, *value);
-                let float = self.convert(operand, Repr::F64);
-                Some(Operand::new(self.b.ins().fneg(float), Repr::F64))
             }
             Op::TypedData(view) => {
                 let view = self.operand(cx, *view).value;
@@ -1754,29 +1759,11 @@ impl FunctionCompiler<'_, '_> {
                 let integer = self.convert(operand, Repr::I32);
                 Some(Operand::new(integer, Repr::I32))
             }
-            Op::Unary(UnaryOp::BitwiseNot, value) => {
-                let operand = self.operand(cx, *value);
-                let integer = self.convert(operand, Repr::I32);
-                Some(Operand::new(self.b.ins().bnot(integer), Repr::I32))
-            }
             Op::Convert(value, repr) => {
                 let operand = self.operand(cx, *value);
                 Some(Operand::new(self.convert(operand, *repr), *repr))
             }
             Op::AsNumber(value) => Some(self.operand(cx, *value)),
-            Op::Unary(UnaryOp::Plus, value) | Op::ToNumeric(value) => {
-                let operand = self.operand(cx, *value);
-                Some(match operand.repr {
-                    Repr::I32 | Repr::I64 | Repr::F64 => operand,
-                    _ => Operand::new(self.convert(operand, Repr::F64), Repr::F64),
-                })
-            }
-            Op::Unary(UnaryOp::Not, value) => {
-                let operand = self.operand(cx, *value);
-                let truth = self.condition(operand, true);
-                let value = self.b.ins().icmp_imm_s(IntCC::Equal, truth, 0);
-                boolean(value)
-            }
             Op::IsCode(value, code) => {
                 let operand = self.operand(cx, *value);
                 let value = self.convert(operand, Repr::Boxed);

@@ -2,6 +2,7 @@ use crate::{FxHashMap, FxHashSet};
 use std::fmt;
 
 use cranelift_codegen::entity::SecondaryMap;
+use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use oxc_syntax::operator::BinaryOperator;
 
 use super::super::effects::{Control, Memory};
@@ -9,6 +10,7 @@ use super::access::Access;
 use super::available;
 use super::fresh::Fresh;
 use super::guards;
+use super::low_level::{Binary as LowBinary, Op as LowOp};
 use super::{Block, Cfg, Constant, Graph, Inst, MemoryFormat, Op, TerminatorKind, UnaryOp, Value};
 use crate::heap::TypedKind;
 use cranelift_module::FuncId;
@@ -544,6 +546,48 @@ enum Relation {
 }
 
 impl Relation {
+    fn comparison(op: &Op) -> Option<(Self, Value, Value)> {
+        let (relation, left, right) = match *op {
+            Op::Binary(operator, left, right)
+            | Op::GuardedCompare {
+                operator,
+                left,
+                right,
+                ..
+            } => (Self::of(operator)?, left, right),
+            Op::LowLevel(LowOp::IntCompare {
+                condition,
+                left,
+                right,
+            }) => {
+                let relation = match condition {
+                    IntCC::SignedLessThan => Self::Less,
+                    IntCC::SignedLessThanOrEqual => Self::LessEqual,
+                    IntCC::SignedGreaterThan => Self::Greater,
+                    IntCC::SignedGreaterThanOrEqual => Self::GreaterEqual,
+                    _ => return None,
+                };
+                (relation, left, right)
+            }
+            Op::LowLevel(LowOp::FloatCompare {
+                condition,
+                left,
+                right,
+            }) => {
+                let relation = match condition {
+                    FloatCC::LessThan => Self::Less,
+                    FloatCC::LessThanOrEqual => Self::LessEqual,
+                    FloatCC::GreaterThan => Self::Greater,
+                    FloatCC::GreaterThanOrEqual => Self::GreaterEqual,
+                    _ => return None,
+                };
+                (relation, left, right)
+            }
+            _ => return None,
+        };
+        Some((relation, left, right))
+    }
+
     fn of(operator: BinaryOperator) -> Option<Self> {
         Some(match operator {
             BinaryOperator::LessThan => Self::Less,
@@ -583,6 +627,16 @@ fn step(op: &Op) -> Option<(Value, bool)> {
         Op::Unary(UnaryOp::Decrement, operand) => Some((operand, false)),
         Op::Binary(BinaryOperator::Addition, left, _) => Some((left, true)),
         Op::Binary(BinaryOperator::Subtraction, left, _) => Some((left, false)),
+        Op::LowLevel(LowOp::Binary {
+            op: LowBinary::Add,
+            left,
+            ..
+        }) => Some((left, true)),
+        Op::LowLevel(LowOp::Binary {
+            op: LowBinary::Subtract,
+            left,
+            ..
+        }) => Some((left, false)),
         _ => None,
     }
 }
@@ -602,21 +656,18 @@ fn steps(graph: &Graph, cfg: &Cfg) -> FxHashMap<Inst, Vec<Value>> {
         let TerminatorKind::Branch(condition, yes, no) = &terminator.kind else {
             continue;
         };
-        let Some(
-            &(Op::Binary(operator, left, right)
-            | Op::GuardedCompare {
-                operator,
-                left,
-                right,
-                ..
-            }),
-        ) = graph.defining_op(*condition)
+        let Some((relation, left, right)) =
+            graph.defining_op(*condition).and_then(Relation::comparison)
         else {
             continue;
         };
-        let Some(relation) = Relation::of(operator) else {
-            continue;
+        let source = |mut value| {
+            while let Some(Op::NumericFloat(inner)) = graph.defining_op(value) {
+                value = *inner;
+            }
+            value
         };
+        let (left, right) = (source(left), source(right));
         if yes.block == no.block {
             continue;
         }
@@ -634,7 +685,8 @@ fn steps(graph: &Graph, cfg: &Cfg) -> FxHashMap<Inst, Vec<Value>> {
             let Some((operand, up)) = step(op) else {
                 continue;
             };
-            if let Op::Binary(_, left, right) = *op
+            if let Op::Binary(_, left, right) | Op::LowLevel(LowOp::Binary { left, right, .. }) =
+                *op
                 && (left != operand || !one(graph, right))
             {
                 continue;
@@ -763,6 +815,17 @@ fn result_types(graph: &Graph, op: &Op, facts: &Facts) -> ValueType {
         | Op::FillPropertyCache(..) => ValueType::ALL,
         Op::View(_) => ValueType::VIEW,
         Op::Convert(value, repr) => repr.coerce(facts.of(*value)),
+        Op::LowLevel(LowOp::Binary { op, .. }) if op.is_float() => ValueType::NUMBER,
+        Op::LowLevel(LowOp::Binary { op, .. }) if op.is_integer_arithmetic() => ValueType::INT64,
+        Op::LowLevel(LowOp::IntCompare { .. } | LowOp::FloatCompare { .. }) => ValueType::BOOLEAN,
+        Op::LowLevel(LowOp::Unary {
+            op: super::low_level::Unary::FloatNeg,
+            ..
+        }) => ValueType::NUMBER,
+        Op::LowLevel(LowOp::Unary {
+            op: super::low_level::Unary::BitNot,
+            ..
+        }) => ValueType::INT32,
         Op::LowLevel(_) | Op::TypedData(_) | Op::Memory(_) => ValueType::default(),
         Op::MemoryNumber(_, format) => match format {
             MemoryFormat::U32 | MemoryFormat::F32 | MemoryFormat::F64 => ValueType::NUMBER,

@@ -170,6 +170,118 @@ fn numeric_lowering_preserves_mixed_paths_loops_and_calls() {
 }
 
 #[test]
+fn lowered_comparisons_and_unary_preserve_numeric_boundaries() {
+    let source = r#"
+        function compare(a,b) {
+            a=+a; b=+b;
+            return (a<b?1:0)+(a<=b?2:0)+(a>b?4:0)+(a>=b?8:0)+
+                (a==b?16:0)+(a!=b?32:0)+(a===b?64:0)+(a!==b?128:0);
+        }
+        function integerCompare(a,b) {
+            a=(a|0)+4294967296; b=b|0;
+            return a>b && b<a && a!==b && b!==a;
+        }
+        function negate(x) { return -(+x); }
+        function not(x) { return !(+x); }
+        function bitnot(x) { return ~(+x); }
+        function increment(x) { x=+x; return ++x; }
+        function decrement(x) { x=+x; return --x; }
+        function integerIncrement(x) { x=x|0; return ++x; }
+        function integerDecrement(x) { x=x|0; return --x; }
+        function booleanCompare(a,b) { return (a<0)===(b<0) && (a<0)!==(b>=0); }
+    "#;
+    let numbers = [
+        f64::NAN,
+        f64::NEG_INFINITY,
+        -2147483648.0,
+        -1.5,
+        -0.0,
+        0.0,
+        1.5,
+        2147483647.0,
+        4294967296.0,
+        f64::INFINITY,
+    ];
+    for mut engine in engines() {
+        engine.compile(source, "numeric-operations.js").unwrap();
+        for a in numbers {
+            for b in numbers {
+                let expected = [a < b, a <= b, a > b, a >= b, a == b, a != b, a == b, a != b]
+                    .into_iter()
+                    .enumerate()
+                    .fold(0, |mask, (bit, value)| mask | (u32::from(value) << bit));
+                assert_eq!(
+                    engine
+                        .call("compare", &[Value::number(a), Value::number(b)])
+                        .unwrap()
+                        .value(),
+                    Value::number(expected as f64),
+                    "{a}, {b}"
+                );
+            }
+            for (function, expected) in [
+                ("negate", -a),
+                ("increment", a + 1.0),
+                ("decrement", a - 1.0),
+            ] {
+                assert_eq!(
+                    engine.call(function, &[Value::number(a)]).unwrap().value(),
+                    Value::number(expected),
+                    "{function}({a})"
+                );
+            }
+            assert_eq!(
+                engine.call("not", &[Value::number(a)]).unwrap().value(),
+                Value::boolean(a == 0.0 || a.is_nan())
+            );
+            let integer = if a.is_finite() {
+                (a.trunc() % 4294967296.0) as i64 as i32
+            } else {
+                0
+            };
+            assert_eq!(
+                engine.call("bitnot", &[Value::number(a)]).unwrap().value(),
+                Value::number((!integer) as f64)
+            );
+        }
+        assert_eq!(
+            engine
+                .call(
+                    "integerCompare",
+                    &[Value::number(-1.0), Value::number(2147483647.0)]
+                )
+                .unwrap()
+                .value(),
+            Value::TRUE
+        );
+        assert_eq!(
+            engine
+                .call("integerIncrement", &[Value::number(2147483647.0)])
+                .unwrap()
+                .value(),
+            Value::number(2147483648.0)
+        );
+        assert_eq!(
+            engine
+                .call("integerDecrement", &[Value::number(-2147483648.0)])
+                .unwrap()
+                .value(),
+            Value::number(-2147483649.0)
+        );
+        assert_eq!(
+            engine
+                .call(
+                    "booleanCompare",
+                    &[Value::number(-2.0), Value::number(-1.0)]
+                )
+                .unwrap()
+                .value(),
+            Value::TRUE
+        );
+    }
+}
+
+#[test]
 fn numeric_lowering_preserves_nan_signed_zero_and_runtime_errors() {
     for mut engine in engines() {
         engine.compile(
