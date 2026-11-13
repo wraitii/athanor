@@ -348,17 +348,45 @@ receiver or eight uncacheable misses permanently marks the site megamorphic.
 Such a site skips probing and refilling the small cache. Existing entries remain
 allocated so an earlier dominating cache guard still supports its load.
 
-For own properties, feedback retains up to four receiver-shape/slot pairs.
-Polymorphic sites materialize these alternatives as local `IsShape` branches and
-`ShapedGet` loads in the semantic graph, after versioning and before final
-simplification. Each access rejoins locally and retains its original Get as the
-fallback. Property reads used as callees also take this path. Inlining preserves
-the source site, so inlined reads consume the same feedback. Available-check
-analysis tracks branch truth and excludes other shapes while a positive shape
-fact remains valid; writes and reentry invalidate that knowledge normally.
-These alternatives do not create entry contracts or versioning regions. A
-contextually selected monomorphic access retains the existing shape-guard path.
-Prototype and builtin alternatives remain in the runtime PIC.
+Property specialization has a proposal pass before versioning and a rewrite pass
+following guard materialization. The proposal pass leaves named `Get` operations
+intact, creates explicit `PropertyCache` address values, and attaches `Property`
+assumptions to receivers. Named `Set` operations with monomorphic overwrite
+feedback take the same path. An instruction-keyed graph table associates each
+access with its cache operand and observed shape/slot alternatives. Versioning,
+SSA repair and graph compaction preserve those associations.
+
+The planner resolves these IC proposals into shape or cache-hit requirements.
+Monomorphic own-property feedback can provide a shared, hoisted shape guard;
+cache-hit requirements carry the cache address as an SSA dependency and can move
+when both dependencies and the cache proof are preserved. Polymorphic feedback
+currently selects local shape dispatch in the planner. Each arm still contains a
+`Get`, with its selected shape/slot alternative, and the original read remains
+as the fallback. This avoids combining incompatible shape requirements into one
+version. Compatible monomorphic requirements can share region guards. Writes only
+produce shape requirements. An overwrite whose own shape requirement holds cannot
+change any shape, so planning does not count its `CODE` write against the
+region's shape or cache checks; requirements that still fail drop those writes
+from the optimistic set until it is stable. Writes that may add properties keep
+their `CODE` effect and invalidate shape facts.
+
+The rewrite pass uses established, effect-valid facts to select `ShapedGet` or
+`CachedProperty`. It first turns every proposed overwrite into `ShapedSet`,
+then reverts those whose shape fact is not available until the remaining set
+proves itself. Other writes stay `Set` and later expand into the write-cache
+addition/overwrite paths, whose slow path is a `FillPropertyStore` on an
+explicit `PropertyCache` operand. Unguarded cache reads become explicit hit/load/refill branches;
+shape dispatch is already present and is not chosen by this pass. Before emission,
+`runtime/properties.rs` expands `IsPropertyCached` and `CachedProperty` into
+ordinary graph branches, integer operations and loads, including bounded entry
+selection, builtin kinds and prototype-holder validation. `ShapedGet` exposes
+its slot address in the same pass. Refill, cache priming and write-cache stores become `HelperCall`
+operations with explicit argument/result representations and effect/ownership
+contracts. Boxed `PropertyLoad` operations retain their receiver dependency
+through ownership planning, then become low-level loads while preserving their
+result identities and scheduled reference operations. Prototype and
+builtin alternatives remain in the runtime PIC. Inlined accesses retain their
+source feedback, and trusted caller shapes can eliminate local shape dispatch.
 
 Megamorphic shape feedback is terminal and tracked per observing function, including
 inlined copies. Recompilation removes cache-hit speculation at the affected site
@@ -1214,8 +1242,8 @@ and optimized normally; the shared CLIF optimization passes also apply.
 ```text
 Oxc AST -> build -> promote -> simplify -> canonical graph
         -> plan specialization -> inline -> simplify -> plan regions -> version
-        -> specialize accesses -> coercions and bit tests -> reuse loads -> hoist
-        -> numeric/array/typed checks -> shapes/properties -> views -> simplify
+        -> rewrite property/read accesses -> coercions and bit tests -> reuse loads -> hoist
+        -> numeric/array/typed checks -> property writes/reads -> views -> simplify
         -> numeric lowering -> borrow -> OSR instrumentation
         -> property/typed/metadata/numeric lowering -> representation/legalization
         -> ownership planning -> array loads and slot stores
@@ -1247,7 +1275,7 @@ planning. Borrowed array element loads survive ownership planning, then expand
 alongside slot stores while preserving scheduled reference operations. Continuations
 use their own preparation sequence in the same pipeline module. Shared runtime
 emission in `emit/semantic_graph.rs` still expands calls, captures, observations,
-OSR protocols, cache-entry selection and other remaining runtime operations.
+OSR protocols, helper invocations and other remaining runtime operations.
 
 Canonicalization, planning and optimization operate on the same `FunctionState`,
 containing the working graph, its facts, specialization plan, OSR plan and

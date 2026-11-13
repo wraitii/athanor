@@ -51,6 +51,15 @@ impl<F: std::borrow::Borrow<Facts>> Writes<F> {
         }
     }
 
+    pub(in crate::jit::semantic) fn preserving_shapes(mut self, overwrites: &FxHashSet<Inst>) -> Self {
+        for (inst, write) in &mut self.writes {
+            if overwrites.contains(inst) {
+                write.location = write.location.difference(Locations::CODE);
+            }
+        }
+        self
+    }
+
     pub(in crate::jit::semantic) fn kills(
         &self,
         inst: Inst,

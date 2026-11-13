@@ -4,7 +4,7 @@ use cranelift_module::FuncId;
 
 use super::facts::ValueType;
 use super::low_level;
-use super::{Block, Graph, Inst, Native, Op, TerminatorKind, UnaryOp, Value};
+use super::{Block, Graph, Native, Op, TerminatorKind, UnaryOp, Value};
 use crate::heap::TypedKind;
 use crate::jit::profile::Site;
 
@@ -15,8 +15,9 @@ pub(in crate::jit) enum Fact {
     Shape(u32),
     Typed(Option<TypedKind>),
     Indexed,
-    // The original property-read site identifies one cache across versioned copies.
-    Cached(Inst),
+    // Planning resolves this IC proposal into a shape or cache-hit requirement.
+    Property(Value),
+    Cached(Value, bool),
     Native(Native),
     Bound(Value),
 }
@@ -58,6 +59,7 @@ impl Fact {
             Self::Type(types) if types == ValueType::STRING => Op::IsString(value),
             Self::Type(types) if types == ValueType::UNDEFINED => Op::IsUndefined(value),
             Self::Code(code) => Op::IsCode(value, code),
+            Self::Cached(cache, builtins) => Op::IsPropertyCached(value, cache, builtins),
             Self::Shape(shape) => Op::IsShape(value, shape),
             Self::Typed(element) => Op::IsTyped(value, element),
             Self::Indexed => Op::IsIndexed(value),
@@ -113,7 +115,7 @@ pub(super) fn implies(op: &Op) -> Option<(Value, Fact)> {
         Op::IsShape(value, shape) => (value, Fact::Shape(shape)),
         Op::IsTyped(value, element) => (value, Fact::Typed(element)),
         Op::IsIndexed(value) => (value, Fact::Indexed),
-        Op::IsPropertyCached(value, site, _) => (value, Fact::Cached(site)),
+        Op::IsPropertyCached(value, cache, builtins) => (value, Fact::Cached(cache, builtins)),
         _ => return None,
     })
 }

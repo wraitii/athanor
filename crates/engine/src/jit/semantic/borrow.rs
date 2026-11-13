@@ -11,6 +11,7 @@ const HEAP: ValueType = ValueType::STRING
 pub(in crate::jit) fn receiver(op: &Op) -> Option<Value> {
     match op {
         Op::Get(object, _)
+        | Op::PropertyLoad(object, _)
         | Op::CachedProperty(object, _, _)
         | Op::ShapedGet(object, ..)
         | Op::ProbeProperty(object, _)
@@ -106,6 +107,7 @@ pub(super) fn borrows(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>)
                     | Op::ArrayLoad(..)
                     | Op::ProbeProperty(..)
                     | Op::ProbeShapeProperty(..)
+                    | Op::PropertyLoad(..)
                     | Op::CachedProperty(..)
                     | Op::ShapedGet(..)
             ) {

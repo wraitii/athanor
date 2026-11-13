@@ -70,6 +70,11 @@ fn typed(graph: &Graph, facts: &Facts, inst: Inst) -> Option<Representations> {
         produces,
     };
     Some(match &data.op {
+        Op::HelperCall { uses, produces, .. } => Representations {
+            uses: uses.iter().copied().map(Use::Exact).collect(),
+            produces: *produces,
+        },
+        Op::PropertyLoad(..) => exact(&[Repr::Boxed, Repr::I64], Repr::Boxed),
         Op::LowLevel(super::low_level::Op::Load { ty, .. }) => {
             any(1, Some(Repr::from_machine(*ty)))
         }
@@ -139,7 +144,7 @@ fn typed(graph: &Graph, facts: &Facts, inst: Inst) -> Option<Representations> {
             }),
         ),
         Op::KeepAlive(_) => any(1, None),
-        Op::PropertyWriteCache(..) => any(0, Some(Repr::I64)),
+        Op::PropertyCache(..) => any(0, Some(Repr::I64)),
         Op::CanOverwrite(..) => exact(&[Repr::Boxed, Repr::I64], Repr::I8),
         Op::ArrayStore(..) | Op::PropertyStore(..) | Op::PropertyAdd(..) => Representations {
             uses: vec![
@@ -168,9 +173,15 @@ fn typed(graph: &Graph, facts: &Facts, inst: Inst) -> Option<Representations> {
         Op::IsInteger(_) => exact(&[Repr::Boxed], Repr::I8),
         Op::ToInt32(_) => exact(&[Repr::I32], Repr::I32),
         Op::AsNumber(value) => any(1, Some(graph.repr(*value))),
-        Op::IsCode(..) | Op::IsShape(..) | Op::IsPropertyCached(..) | Op::IsTyped(..) => {
-            exact(&[Repr::Boxed], Repr::I8)
+        Op::IsCode(..) | Op::IsShape(..) | Op::IsTyped(..) => exact(&[Repr::Boxed], Repr::I8),
+        Op::IsPropertyCached(..) => exact(&[Repr::Boxed, Repr::I64], Repr::I8),
+        Op::CachedProperty(..) | Op::FillPropertyCache(..) => {
+            exact(&[Repr::Boxed, Repr::I64], Repr::Boxed)
         }
+        Op::PrimePropertyCache(..) => Representations {
+            uses: vec![Use::Exact(Repr::Boxed), Use::Exact(Repr::I64)],
+            produces: None,
+        },
         Op::IsIndexed(_) => exact(&[Repr::Boxed], Repr::I8),
         Op::IsNumber(_) | Op::IsUninitialized(_) | Op::IsUndefined(_) | Op::IsNullish(_) => {
             any(1, Some(Repr::I8))

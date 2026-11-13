@@ -180,10 +180,7 @@ pub(super) fn compact(graph: &mut Graph) {
             *value = values[value];
         }
         match &mut data.op {
-            Op::IsPropertyCached(_, site, _)
-            | Op::CachedProperty(_, site, _)
-            | Op::FillPropertyCache(_, site, _)
-            | Op::PrimePropertyCache(_, site, _) => *site = *caches.entry(*site).or_insert(inst),
+            Op::PropertyCache(site, _) => *site = *caches.entry(*site).or_insert(inst),
             _ => {}
         }
     }
@@ -206,6 +203,16 @@ pub(super) fn compact(graph: &mut Graph) {
         .borrowed
         .iter()
         .filter_map(|value| values.get(value).copied())
+        .collect();
+    graph.property_accesses = graph
+        .property_accesses
+        .iter()
+        .filter_map(|(inst, read)| {
+            let inst = *insts.get(inst)?;
+            let mut read = read.clone();
+            read.cache = read.cache.map(|cache| values[&cache]);
+            Some((inst, read))
+        })
         .collect();
     graph.views = graph
         .views

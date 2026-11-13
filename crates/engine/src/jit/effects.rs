@@ -64,6 +64,10 @@ impl Locations {
         self.0 & other.0 != 0
     }
 
+    pub(super) fn difference(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+
     pub(super) fn is_empty(self) -> bool {
         self.0 == 0
     }

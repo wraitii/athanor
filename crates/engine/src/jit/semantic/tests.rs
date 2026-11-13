@@ -1,7 +1,8 @@
 use super::js::comparisons;
 use super::runtime::{arrays as array_checks, numeric, properties, storage, typed, views};
 use super::specialization::{
-    caches, call_variants, calls, observations, reads, regions, shapes, writes,
+    call_variants, calls, observations, properties as property_accesses, reads, regions, shapes,
+    writes,
 };
 use super::transforms::{conversions, loops, reuse};
 use super::*;
@@ -3052,7 +3053,7 @@ fn conversion_hoisting_keeps_heap_values_inside_the_loop() {
 }
 
 #[test]
-fn cache_requirements_leave_property_reads_until_lowering() {
+fn cache_requirements_leave_property_accesses_until_lowering() {
     let mut graph = canonicalize_graph(
         lower_source("function f(object){return object.method();}").unwrap(),
         true,
@@ -3073,8 +3074,8 @@ fn cache_requirements_leave_property_reads_until_lowering() {
         Op::IsCode(callee, cranelift_module::FuncId::from_u32(0)),
     );
     let blocks = graph.blocks.len();
-    let reads = caches::assume(&mut graph, &shapes::Plan::default());
-    assert_eq!(reads.len(), 1);
+    property_accesses::assume(&mut graph, &shapes::Plan::default());
+    assert_eq!(graph.property_accesses.len(), 1);
     assert_eq!(graph.blocks.len(), blocks);
     assert!(
         ops(&graph)
@@ -3084,14 +3085,15 @@ fn cache_requirements_leave_property_reads_until_lowering() {
     assert!(
         ops(&graph)
             .iter()
-            .any(|op| matches!(op, Op::Assume(_, guards::Fact::Cached(_), _)))
+            .any(|op| matches!(op, Op::Assume(_, guards::Fact::Property(_), _)))
     );
     assert!(!ops(&graph).iter().any(|op| matches!(
         op,
         Op::IsPropertyCached(..) | Op::CachedProperty(..) | Op::FillPropertyCache(..)
     )));
     graph.strip_assumes();
-    caches::lower(&mut graph, &reads).unwrap();
+    regions::materialize_properties(&mut graph).unwrap();
+    property_accesses::rewrite(&mut graph).unwrap();
     assert!(
         ops(&graph)
             .iter()
@@ -3125,7 +3127,7 @@ fn cache_entry_guards_preserve_receiver_proofs() {
             span,
             Op::IsCode(callee, cranelift_module::FuncId::from_u32(0)),
         );
-        let reads = caches::assume(&mut graph, &shapes::Plan::default());
+        property_accesses::assume(&mut graph, &shapes::Plan::default());
         let regions =
             regions::version(&mut graph, &Default::default(), Some(1), &mut Vec::new()).unwrap();
         assert!(!regions.is_empty());
@@ -3134,7 +3136,8 @@ fn cache_entry_guards_preserve_receiver_proofs() {
             !builtins
         );
         let blocks = graph.blocks.len();
-        caches::lower(&mut graph, &reads).unwrap();
+        regions::materialize_properties(&mut graph).unwrap();
+        property_accesses::rewrite(&mut graph).unwrap();
         assert_eq!(graph.blocks.len(), blocks);
         boundary::compact(&mut graph);
         graph.verify().unwrap();
@@ -3160,22 +3163,22 @@ fn guarded_cache_loads_preserve_their_builtin_mode() {
             })
             .unwrap();
         let span = graph.insts[inst].span;
+        property_accesses::assume(&mut graph, &shapes::Plan::default());
+        graph.strip_assumes();
+        let cache = graph.property_accesses[&inst].cache.unwrap();
         let (before, _, read) = dispatch::split(&mut graph, inst);
         let failed = graph.blocks.push(BlockData::default());
         let undefined = graph.append_value(failed, span, Op::Constant(Constant::Undefined));
         graph.terminate(failed, span, TerminatorKind::Return(undefined));
-        let check = graph.append_value(
-            before,
-            span,
-            Op::IsPropertyCached(object, inst, name.into()),
-        );
+        let check = graph.append_value(before, span, Op::IsPropertyCached(object, cache, builtins));
         graph.terminate(
             before,
             span,
             TerminatorKind::Branch(check, Target::new(read), Target::new(failed)),
         );
         let blocks = graph.blocks.len();
-        caches::lower(&mut graph, &[inst]).unwrap();
+        regions::materialize_properties(&mut graph).unwrap();
+        property_accesses::rewrite(&mut graph).unwrap();
         assert_eq!(graph.blocks.len(), blocks);
         assert!(matches!(graph.insts[inst].op, Op::CachedProperty(_, _, mode) if mode == builtins));
         graph.verify().unwrap();
@@ -3334,4 +3337,466 @@ fn property_write_lowering_exposes_addition_and_overwrite() {
             ..
         })
     )));
+}
+
+#[test]
+fn polymorphic_property_dispatch_is_planned_before_read_rewriting() {
+    use crate::jit::profile::{PropertyAccess, ShapeAccess, Site};
+
+    let mut graph = canonicalize_graph(
+        lower_source("function f(object){return object.x;}").unwrap(),
+        true,
+    )
+    .unwrap()
+    .graph;
+    let (read, site) = graph
+        .insts
+        .iter()
+        .find_map(|(inst, data)| {
+            matches!(data.op, Op::Get(..)).then_some((
+                inst,
+                Site {
+                    source: 0,
+                    start: data.span.start,
+                    end: data.span.end,
+                },
+            ))
+        })
+        .unwrap();
+    let mut repository = calls::Repository::default();
+    repository.shape_feedback.insert(
+        (site, PropertyAccess::Get),
+        ShapeAccess::PolymorphicRead {
+            entries: [(10, 0), (20, 1), (0, 0), (0, 0)],
+            len: 2,
+        },
+    );
+    let shapes = shapes::plan(&graph, &repository, 0);
+    property_accesses::assume(&mut graph, &shapes);
+    let cache = graph.property_accesses[&read].cache.unwrap();
+    assert!(ops(&graph).iter().any(|op| matches!(op,
+        Op::Assume(_, guards::Fact::Property(value), _) if *value == cache)));
+    assert!(!ops(&graph).iter().any(|op| matches!(
+        op,
+        Op::Assume(_, guards::Fact::Shape(_), _) | Op::IsShape(..)
+    )));
+    regions::version(&mut graph, &Default::default(), None, &mut Vec::new()).unwrap();
+    assert_eq!(
+        ops(&graph)
+            .iter()
+            .filter(|op| matches!(op, Op::Get(..)))
+            .count(),
+        3
+    );
+    assert_eq!(
+        ops(&graph)
+            .iter()
+            .filter(|op| matches!(op, Op::IsShape(..)))
+            .count(),
+        2
+    );
+    assert!(!ops(&graph).iter().any(|op| matches!(op, Op::ShapedGet(..))));
+    graph.verify().unwrap();
+    property_accesses::rewrite(&mut graph).unwrap();
+    assert_eq!(
+        ops(&graph)
+            .iter()
+            .filter(|op| matches!(op, Op::ShapedGet(..)))
+            .count(),
+        2
+    );
+    assert!(!ops(&graph).iter().any(|op| matches!(op, Op::Get(..))));
+    assert!(
+        ops(&graph)
+            .iter()
+            .any(|op| matches!(op, Op::FillPropertyCache(..)))
+    );
+    assert!(graph.property_accesses.is_empty());
+    graph.verify().unwrap();
+}
+
+#[test]
+fn cache_dependencies_follow_versioning_and_compaction() {
+    let mut graph = canonicalize_graph(
+        lower_source(
+            "function f(object,n){let total=0;for(let i=0;i<n;++i)total+=object.x;return total;}",
+        )
+        .unwrap(),
+        true,
+    )
+    .unwrap()
+    .graph;
+    property_accesses::assume(&mut graph, &shapes::Plan::default());
+    let cache = graph
+        .property_accesses
+        .values()
+        .find_map(|read| read.cache)
+        .unwrap();
+    assert!(matches!(
+        graph.defining_op(cache),
+        Some(Op::PropertyCache(..))
+    ));
+    regions::version(&mut graph, &Default::default(), None, &mut Vec::new()).unwrap();
+    graph.verify().unwrap();
+    boundary::compact(&mut graph);
+    graph.verify().unwrap();
+    property_accesses::rewrite(&mut graph).unwrap();
+    for op in ops(&graph) {
+        let cache = match op {
+            Op::IsPropertyCached(_, cache, _)
+            | Op::CachedProperty(_, cache, _)
+            | Op::FillPropertyCache(_, cache, _)
+            | Op::PrimePropertyCache(_, cache) => *cache,
+            _ => continue,
+        };
+        assert!(matches!(
+            graph.defining_op(cache),
+            Some(Op::PropertyCache(..))
+        ));
+    }
+    graph.verify().unwrap();
+}
+
+#[test]
+fn cache_guards_hoist_only_when_the_receiver_is_available() {
+    for (source, hoisted) in [
+        (
+            "function f(object,n){let total=0;for(let i=0;i<n;++i)total+=object.x;return total;}",
+            true,
+        ),
+        (
+            "function f(objects,n){let total=0;for(let i=0;i<n;++i)total+=objects[i].x;return total;}",
+            false,
+        ),
+    ] {
+        let mut graph = canonicalize_graph(lower_source(source).unwrap(), true)
+            .unwrap()
+            .graph;
+        property_accesses::assume(&mut graph, &shapes::Plan::default());
+        regions::version(&mut graph, &Default::default(), None, &mut Vec::new()).unwrap();
+        property_accesses::rewrite(&mut graph).unwrap();
+        let cfg = Cfg::new(&graph);
+        let loops = loops::natural_loops(&graph, &cfg);
+        let guards: Vec<_> = cfg
+            .rpo
+            .iter()
+            .copied()
+            .flat_map(|block| graph.blocks[block].insts.iter().copied())
+            .filter(|&inst| matches!(graph.insts[inst].op, Op::IsPropertyCached(..)))
+            .collect();
+        assert!(!guards.is_empty());
+        assert_eq!(
+            guards.iter().any(|&inst| !loops
+                .iter()
+                .any(|(_, body)| body.contains(&graph.insts[inst].block))),
+            hoisted,
+            "{source}"
+        );
+        graph.verify().unwrap();
+    }
+}
+
+#[test]
+fn conflicting_property_shapes_remain_alternative_local_guards() {
+    use crate::jit::profile::{PropertyAccess, ShapeAccess, Site};
+
+    let mut graph = canonicalize_graph(
+        lower_source("function f(object){return [object.x,object.y];}").unwrap(),
+        true,
+    )
+    .unwrap()
+    .graph;
+    let mut repository = calls::Repository::default();
+    for data in graph.insts.values() {
+        if let Op::Get(_, name) = &data.op {
+            let site = Site {
+                source: 0,
+                start: data.span.start,
+                end: data.span.end,
+            };
+            let shape = if name == "x" { 10 } else { 20 };
+            repository.shape_feedback.insert(
+                (site, PropertyAccess::Get),
+                ShapeAccess::Read { shape, index: 0 },
+            );
+        }
+    }
+    let shapes = shapes::plan(&graph, &repository, 0);
+    property_accesses::assume(&mut graph, &shapes);
+    let mut notes = Vec::new();
+    regions::version(&mut graph, &Default::default(), None, &mut notes).unwrap();
+    assert!(graph.entry_guards.is_empty());
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.contains("conflicting shape requirements"))
+    );
+    assert_eq!(
+        ops(&graph)
+            .iter()
+            .filter(|op| matches!(op, Op::IsShape(..)))
+            .count(),
+        2
+    );
+    property_accesses::rewrite(&mut graph).unwrap();
+    assert_eq!(
+        ops(&graph)
+            .iter()
+            .filter(|op| matches!(op, Op::ShapedGet(..)))
+            .count(),
+        2
+    );
+    graph.verify().unwrap();
+}
+
+#[test]
+fn property_access_lowering_preserves_boxed_loads_until_ownership_planning() {
+    for shaped in [false, true] {
+        let mut graph = canonicalize_graph(
+            lower_source("function f(object){return object.x;}").unwrap(),
+            true,
+        )
+        .unwrap()
+        .graph;
+        if shaped {
+            for data in graph.insts.values_mut() {
+                if let Op::Get(object, ref name) = data.op {
+                    data.op = Op::ShapedGet(object, name.clone(), 0);
+                }
+            }
+        } else {
+            property_accesses::assume(&mut graph, &shapes::Plan::default());
+            graph.strip_assumes();
+            property_accesses::rewrite(&mut graph).unwrap();
+        }
+        let mut function = FunctionState::from_graph(graph);
+        properties::lower_accesses(&mut function).unwrap();
+        assert!(!ops(&function.graph).iter().any(|op| matches!(
+            op,
+            Op::ShapedGet(..)
+                | Op::CachedProperty(..)
+                | Op::IsPropertyCached(..)
+                | Op::FillPropertyCache(..)
+        )));
+        function.ensure_facts();
+        let loads: Vec<_> = Cfg::new(&function.graph)
+            .rpo
+            .into_iter()
+            .flat_map(|block| function.graph.blocks[block].insts.clone())
+            .filter(|&inst| matches!(function.graph.insts[inst].op, Op::PropertyLoad(..)))
+            .collect();
+        assert!(!loads.is_empty());
+        for &inst in &loads {
+            assert_eq!(
+                function
+                    .graph
+                    .contract(&function.graph.insts[inst].op, &function.facts)
+                    .result,
+                Ownership::Borrowed
+            );
+        }
+        if !shaped {
+            assert!(ops(&function.graph).iter().any(|op| matches!(
+                op,
+                Op::HelperCall {
+                    helper: crate::jit::helpers::Helper::PropertyGetCached,
+                    ..
+                }
+            )));
+        }
+        function.prepare_for_emission().unwrap();
+        assert!(
+            !ops(&function.graph)
+                .iter()
+                .any(|op| matches!(op, Op::PropertyLoad(..)))
+        );
+        for inst in loads {
+            assert!(matches!(
+                function.graph.insts[inst].op,
+                Op::LowLevel(low_level::Op::Load { .. })
+            ));
+            assert_eq!(
+                function
+                    .graph
+                    .repr(function.graph.insts[inst].result().unwrap()),
+                Repr::Boxed
+            );
+        }
+        function.graph.verify().unwrap();
+    }
+}
+
+fn optimize_with_shapes(
+    source: &str,
+    feedback: &[(&str, crate::jit::profile::PropertyAccess, crate::jit::profile::ShapeAccess)],
+) -> FunctionState {
+    use crate::jit::profile::{PropertyAccess, Site};
+
+    let canonical = canonicalize_graph(lower_source(source).unwrap(), true).unwrap();
+    let mut repository = calls::Repository::default();
+    for data in canonical.graph.insts.values() {
+        let (name, access) = match &data.op {
+            Op::Get(_, name) => (name, PropertyAccess::Get),
+            Op::Set(_, name, _) => (name, PropertyAccess::Set),
+            _ => continue,
+        };
+        let site = Site {
+            source: 0,
+            start: data.span.start,
+            end: data.span.end,
+        };
+        if let Some(&(.., shape)) = feedback
+            .iter()
+            .find(|&&(property, kind, _)| property == name && kind == access)
+        {
+            repository.shape_feedback.insert((site, access), shape);
+        }
+    }
+    optimize_canonical(canonical, true, Some((&repository, 0))).unwrap()
+}
+
+fn loop_ops(graph: &Graph) -> Vec<&Op> {
+    let cfg = Cfg::new(graph);
+    let bodies: FxHashSet<Block> = loops::natural_loops(graph, &cfg)
+        .into_iter()
+        .flat_map(|(_, body)| body)
+        .filter(|block| !graph.cold.contains(block))
+        .collect();
+    cfg.rpo
+        .iter()
+        .filter(|block| bodies.contains(block))
+        .flat_map(|&block| &graph.blocks[block].insts)
+        .map(|&inst| &graph.insts[inst].op)
+        .collect()
+}
+
+fn count(ops: &[&Op], predicate: impl Fn(&Op) -> bool) -> usize {
+    ops.iter().filter(|op| predicate(op)).count()
+}
+
+fn generic_property_access(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Get(..)
+            | Op::Set(..)
+            | Op::IsPropertyCached(..)
+            | Op::CachedProperty(..)
+            | Op::FillPropertyCache(..)
+            | Op::PropertyAdd(..)
+    )
+}
+
+#[test]
+fn shaped_overwrites_share_hoisted_guards_with_reads() {
+    use crate::jit::profile::{PropertyAccess::*, ShapeAccess::*};
+
+    let function = optimize_with_shapes(
+        "function f(o,n){for(let i=0;i<n;++i)o.x=o.x+o.y;return o.x;}",
+        &[
+            ("x", Get, Read { shape: 10, index: 0 }),
+            ("y", Get, Read { shape: 10, index: 1 }),
+            ("x", Set, Overwrite { shape: 10, index: 0 }),
+        ],
+    );
+    let graph = &function.graph;
+    let body = loop_ops(graph);
+    assert!(!body.iter().any(|op| generic_property_access(op)), "{function}");
+    assert_eq!(count(&body, |op| matches!(op, Op::IsShape(..))), 0, "{function}");
+    assert_eq!(count(&body, |op| matches!(op, Op::ShapedGet(..))), 1, "{function}");
+    assert_eq!(count(&body, |op| matches!(op, Op::PropertyStore(..))), 1, "{function}");
+    assert_eq!(
+        count(&ops(graph), |op| matches!(op, Op::IsShape(_, 10))),
+        1,
+        "{function}"
+    );
+    graph.verify().unwrap();
+}
+
+#[test]
+fn shaped_overwrites_keep_one_entry_guard_across_reads() {
+    use crate::jit::profile::{PropertyAccess::*, ShapeAccess::*};
+
+    let function = optimize_with_shapes(
+        "function f(o){o.x=1;o.y=o.x+1;return o.y;}",
+        &[
+            ("x", Get, Read { shape: 10, index: 0 }),
+            ("y", Get, Read { shape: 10, index: 1 }),
+            ("x", Set, Overwrite { shape: 10, index: 0 }),
+            ("y", Set, Overwrite { shape: 10, index: 1 }),
+        ],
+    );
+    let graph = &function.graph;
+    let Some(TerminatorKind::Branch(condition, guarded, _)) =
+        graph.blocks[graph.entry].terminator.as_ref().map(|t| &t.kind)
+    else {
+        panic!("{function}")
+    };
+    assert!(matches!(graph.defining_op(*condition), Some(Op::IsShape(_, 10))));
+    let mut pending = vec![guarded.block];
+    let mut seen = FxHashSet::default();
+    let mut speculative = Vec::new();
+    while let Some(block) = pending.pop() {
+        if !seen.insert(block) || graph.cold.contains(&block) {
+            continue;
+        }
+        speculative.extend(graph.blocks[block].insts.iter().map(|&inst| &graph.insts[inst].op));
+        if let Some(terminator) = &graph.blocks[block].terminator {
+            pending.extend(terminator.kind.targets().map(|target| target.block));
+        }
+    }
+    assert!(!speculative.iter().any(|op| generic_property_access(op)), "{function}");
+    assert_eq!(count(&speculative, |op| matches!(op, Op::IsShape(..))), 0, "{function}");
+    assert_eq!(count(&speculative, |op| matches!(op, Op::ShapedGet(..))), 2, "{function}");
+    assert_eq!(count(&speculative, |op| matches!(op, Op::PropertyStore(..))), 2, "{function}");
+    graph.verify().unwrap();
+}
+
+#[test]
+fn property_additions_keep_shape_guards_inside_loops() {
+    use crate::jit::profile::{PropertyAccess::*, ShapeAccess::*};
+
+    let function = optimize_with_shapes(
+        "function f(o,n){for(let i=0;i<n;++i){o.x=o.x+1;o.z=i;}return o.x;}",
+        &[
+            ("x", Get, Read { shape: 10, index: 0 }),
+            ("x", Set, Overwrite { shape: 10, index: 0 }),
+        ],
+    );
+    let body = loop_ops(&function.graph);
+    assert_eq!(count(&body, |op| matches!(op, Op::IsShape(_, 10))), 1, "{function}");
+    assert_eq!(count(&body, |op| matches!(op, Op::ShapedGet(..))), 1, "{function}");
+    assert_eq!(count(&body, |op| matches!(op, Op::PropertyAdd(..))), 1, "{function}");
+    assert!(
+        !body
+            .iter()
+            .any(|op| matches!(op, Op::ShapedSet(..) | Op::Set(..))),
+        "{function}"
+    );
+    function.graph.verify().unwrap();
+}
+
+#[test]
+fn shaped_accesses_on_two_receivers_hoist_both_guards() {
+    use crate::jit::profile::{PropertyAccess::*, ShapeAccess::*};
+
+    let function = optimize_with_shapes(
+        "function f(a,b,n){for(let i=0;i<n;++i){a.p=b.r;b.s=a.q+a.p;}return b.s;}",
+        &[
+            ("p", Get, Read { shape: 10, index: 0 }),
+            ("q", Get, Read { shape: 10, index: 1 }),
+            ("p", Set, Overwrite { shape: 10, index: 0 }),
+            ("r", Get, Read { shape: 20, index: 0 }),
+            ("s", Get, Read { shape: 20, index: 1 }),
+            ("s", Set, Overwrite { shape: 20, index: 1 }),
+        ],
+    );
+    let graph = &function.graph;
+    let body = loop_ops(graph);
+    assert!(!body.iter().any(|op| generic_property_access(op)), "{function}");
+    assert_eq!(count(&body, |op| matches!(op, Op::IsShape(..))), 0, "{function}");
+    assert_eq!(count(&body, |op| matches!(op, Op::PropertyStore(..))), 2, "{function}");
+    let all = ops(graph);
+    assert_eq!(count(&all, |op| matches!(op, Op::IsShape(_, 10))), 1, "{function}");
+    assert_eq!(count(&all, |op| matches!(op, Op::IsShape(_, 20))), 1, "{function}");
+    graph.verify().unwrap();
 }

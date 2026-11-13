@@ -806,13 +806,17 @@ fn result_types(graph: &Graph, op: &Op, facts: &Facts) -> ValueType {
         | Op::IsUninitialized(_)
         | Op::IsPropertyCached(..)
         | Op::IsShape(..) => ValueType::BOOLEAN,
-        Op::ProbeProperty(..)
+        Op::PropertyLoad(..)
+        | Op::ProbeProperty(..)
         | Op::ProbeShapeProperty(..)
         | Op::ProbeIndex(..)
         | Op::ConstructorPrototype(_)
         | Op::CachedProperty(..)
         | Op::ShapedGet(..)
         | Op::FillPropertyCache(..) => ValueType::ALL,
+        Op::HelperCall { produces, .. } => {
+            produces.map_or(ValueType::default(), |repr| repr.coerce(ValueType::ALL))
+        }
         Op::View(_) => ValueType::VIEW,
         Op::Convert(value, repr) => repr.coerce(facts.of(*value)),
         Op::LowLevel(LowOp::Binary { op, .. }) if op.is_float() => ValueType::NUMBER,
@@ -852,7 +856,7 @@ fn result_types(graph: &Graph, op: &Op, facts: &Facts) -> ValueType {
         | Op::IsExactPosition(..)
         | Op::IsInBounds(..)
         | Op::BooleanAnd(..) => ValueType::BOOLEAN,
-        Op::PropertyWriteCache(..) => ValueType::INT64,
+        Op::PropertyCache(..) => ValueType::INT64,
         Op::CanOverwrite(..) => ValueType::BOOLEAN,
         Op::IndexedLength(_) => ValueType::INT64,
         Op::ArrayKind(_) => ValueType::INT32,

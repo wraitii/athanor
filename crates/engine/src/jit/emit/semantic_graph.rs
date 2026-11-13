@@ -903,49 +903,23 @@ impl FunctionCompiler<'_, '_> {
                             self.property_access(object, name, Some(value), observer);
                             None
                         }
-                        Op::CachedProperty(object, site, builtins) => {
-                            let object = get(self, *object);
-                            let offset = self.property_caches[site];
-                            let address = self.data_address(offset);
-                            Some(self.cached_property_load(object, address, *builtins))
-                        }
-                        Op::ShapedGet(object, _, index) => {
-                            let object = get(self, *object);
-                            Some(self.shaped_property_get(object, *index))
-                        }
+                        Op::CachedProperty(..)
+                        | Op::ShapedGet(..)
+                        | Op::FillPropertyCache(..)
+                        | Op::PrimePropertyCache(..)
+                        | Op::PropertyLoad(..)
+                        | Op::HelperCall { .. } => unreachable!(),
                         Op::ShapedSet(object, name, index, value) => {
                             let object = get(self, *object);
                             let value = get(self, *value);
                             self.shaped_property_set(object, name, *index, value);
                             None
                         }
-                        Op::FillPropertyStore(object, site, name, value, _) => {
-                            let object = get(self, *object);
-                            let value = get(self, *value);
-                            let observer = self.property_observer(data);
-                            let address = self.property_cache(*site, name, observer);
-                            self.call_helper(Helper::PropertySetCached, &[object, address, value]);
-                            self.check_error();
-                            None
-                        }
                         Op::ArrayStore(..)
                         | Op::PropertyStore(..)
                         | Op::PropertyAdd(..)
                         | Op::CanOverwrite(..)
-                        | Op::PropertyWriteCache(..) => unreachable!(),
-                        Op::FillPropertyCache(object, site, name) => {
-                            let object = get(self, *object);
-                            let observer = self.property_observer(data);
-                            let address = self.property_cache(*site, name, observer);
-                            Some(self.fill_property_cache(object, address))
-                        }
-                        Op::PrimePropertyCache(object, site, name) => {
-                            let object = get(self, *object);
-                            let observer = self.property_observer(data);
-                            let address = self.property_cache(*site, name, observer);
-                            self.call_helper(Helper::PropertyCachePrime, &[object, address]);
-                            None
-                        }
+                        | Op::FillPropertyStore(..) => unreachable!(),
                         Op::Get(object, name) => {
                             let object = get(self, *object);
                             let observer = self.property_observer(data);
@@ -1060,6 +1034,7 @@ impl FunctionCompiler<'_, '_> {
                             unreachable!()
                         }
                         Op::IsTyped(..)
+                        | Op::PropertyCache(..)
                         | Op::IsPropertyCached(..)
                         | Op::IsShape(..)
                         | Op::IsCode(..) => {
@@ -1611,10 +1586,27 @@ impl FunctionCompiler<'_, '_> {
         let data = &graph.insts[inst];
         let boolean = |condition: LoweredValue| Some(Operand::new(condition, Repr::I8));
         let result = match &data.op {
-            Op::PropertyWriteCache(site, name) => {
+            Op::PropertyCache(site, name) => {
                 let observer = self.property_observer(data);
                 let address = self.property_cache(*site, name, observer);
                 Some(Operand::new(address, Repr::I64))
+            }
+            Op::HelperCall {
+                helper,
+                args,
+                produces,
+                contract,
+                ..
+            } => {
+                let args: Vec<_> = args
+                    .iter()
+                    .map(|&value| self.operand(cx, value).value)
+                    .collect();
+                let value = self.call_helper(*helper, &args);
+                if contract.effects.control.throws {
+                    self.check_error();
+                }
+                produces.map(|repr| Operand::new(value, repr))
             }
             Op::View(object) => {
                 let object = self.operand(cx, *object).value;
@@ -1825,17 +1817,6 @@ impl FunctionCompiler<'_, '_> {
                 let operand = self.operand(cx, *object);
                 let object = self.convert(operand, Repr::Boxed);
                 boolean(self.shape_hit(object, *shape))
-            }
-            Op::IsPropertyCached(object, site, name) => {
-                let operand = self.operand(cx, *object);
-                let object = self.convert(operand, Repr::Boxed);
-                let observer = self.property_observer(data);
-                let address = self.property_cache(*site, name, observer);
-                if crate::heap::builtin_method(name) {
-                    boolean(self.property_cache_hit(object, address))
-                } else {
-                    boolean(self.property_shape_hit(object, address))
-                }
             }
             Op::IsNumber(value) => {
                 let operand = self.operand(cx, *value);

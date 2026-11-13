@@ -114,35 +114,6 @@ pub(in crate::jit::semantic) fn typed(graph: &mut Graph, numbers: &[(Value, Fact
     }
 }
 
-pub(in crate::jit::semantic) fn natives(graph: &mut Graph) {
-    let blocks = Cfg::new(graph).rpo;
-    let mut proposals = Vec::new();
-    let mut seen = FxHashSet::default();
-    for requirement in requirements(graph, &blocks) {
-        let Op::Call { callee, .. } = graph.insts[requirement.call].op else {
-            continue;
-        };
-        let block = graph.insts[requirement.call].block;
-        if seen.insert((block, callee, requirement.native)) {
-            proposals.push((block, callee, requirement.native));
-        }
-    }
-    let span = graph.span;
-    for (block, callee, native) in proposals {
-        let origin = Origin {
-            site: None,
-            kind: Kind::Native,
-            gain: 1,
-        };
-        graph.append(
-            block,
-            span,
-            Op::Assume(callee, Fact::Native(native), origin),
-            false,
-        );
-    }
-}
-
 pub(in crate::jit::semantic) fn identities(
     graph: &mut Graph,
     conditional: &ConditionalPlan,
@@ -198,7 +169,6 @@ pub(in crate::jit::semantic) fn assume(
 ) -> Vec<Reach> {
     let numbers = numbers(graph);
     typed(graph, &numbers);
-    natives(graph);
     let probes = identities(graph, conditional);
     let assumed = assumed_calls(graph, conditional);
     let mut reached = place_assumes(graph, &assumed);

@@ -1124,12 +1124,9 @@ mod tests {
             .iter()
             .flat_map(|&block| &graph.blocks[block].insts)
             .filter_map(|&inst| match graph.insts[inst].op {
-                Op::PropertyWriteCache(site, ref name)
-                    if name == "template" && !graph.cold.contains(&graph.insts[inst].block) =>
+                Op::FillPropertyStore(_, cache, ref name, value, _)
+                    if name == "template" && !graph.cold.contains(&graph.def_block(cache)) =>
                 {
-                    let Op::FillPropertyStore(_, _, _, value, _) = graph.insts[site].op else {
-                        panic!()
-                    };
                     Some(value)
                 }
                 _ => None,

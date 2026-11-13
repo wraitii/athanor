@@ -1315,35 +1315,6 @@ impl FunctionCompiler<'_, '_> {
         self.b.block_params(done)[0]
     }
 
-    pub(super) fn property_cache_hit(
-        &mut self,
-        object: LoweredValue,
-        address: LoweredValue,
-    ) -> LoweredValue {
-        let entry = self.property_cache_entry(object, address, true, true);
-        self.b.ins().icmp_imm_s(IntCC::NotEqual, entry, 0)
-    }
-
-    pub(super) fn property_shape_hit(
-        &mut self,
-        object: LoweredValue,
-        address: LoweredValue,
-    ) -> LoweredValue {
-        let entry = self.property_cache_entry(object, address, false, true);
-        self.b.ins().icmp_imm_s(IntCC::NotEqual, entry, 0)
-    }
-
-    pub(super) fn cached_property_load(
-        &mut self,
-        object: LoweredValue,
-        address: LoweredValue,
-        builtins: bool,
-    ) -> LoweredValue {
-        // A dominating guard validated the holder; reselect without depending on mutable hit state.
-        let entry = self.property_cache_entry(object, address, builtins, false);
-        self.cached_property_entry_load(object, entry, builtins)
-    }
-
     fn cached_property_entry_load(
         &mut self,
         object: LoweredValue,
@@ -1397,16 +1368,6 @@ impl FunctionCompiler<'_, '_> {
         self.jump(ready, &[BlockArg::Value(value)]);
         self.switch(ready);
         self.b.block_params(ready)[0]
-    }
-
-    pub(super) fn fill_property_cache(
-        &mut self,
-        object: LoweredValue,
-        address: LoweredValue,
-    ) -> LoweredValue {
-        let result = self.call_helper(Helper::PropertyGetCached, &[object, address]);
-        self.check_error();
-        result
     }
 
     pub(super) fn shape_hit(&mut self, object: LoweredValue, shape: u32) -> LoweredValue {

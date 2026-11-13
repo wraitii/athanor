@@ -386,6 +386,12 @@ fn duplicate(
                 values.insert(old, new);
             }
             insts.insert(inst, copy);
+            if let Some(mut read) = graph.property_accesses.get(&inst).cloned() {
+                read.cache = read
+                    .cache
+                    .map(|cache| values.get(&cache).copied().unwrap_or(cache));
+                graph.property_accesses.insert(copy, read);
+            }
         }
         let mut terminator = graph.blocks[block].terminator.clone().unwrap();
         for value in terminator.kind.operands_mut() {
@@ -613,6 +619,7 @@ fn entry_checks(
             Op::GlobalRead(name) => Op::ProbeGlobal(name),
             Op::Argument(index) => Op::Argument(index),
             Op::This => Op::This,
+            Op::PropertyCache(..) => data.op.clone(),
             _ => unreachable!(),
         };
         for value in op.operands_mut() {
@@ -628,12 +635,13 @@ fn entry_checks(
             Op::ProbeIndex(object, key) => LoadKey::Index(*object, *key),
             Op::Argument(index) => LoadKey::Argument(*index),
             Op::This => LoadKey::This,
+            Op::PropertyCache(site, _) => LoadKey::PropertyCache(*site),
             _ => unreachable!(),
         };
         let value = match available.get(&key) {
             Some(&value) => value,
             None => {
-                let input = matches!(op, Op::Argument(_) | Op::This);
+                let input = matches!(op, Op::Argument(_) | Op::This | Op::PropertyCache(..));
                 let value = graph.append_value(current, data.span, op);
                 if !input {
                     let failed = graph.append_value(current, data.span, Op::IsUninitialized(value));
@@ -710,10 +718,10 @@ fn entry_checks(
             super::super::super::guards::record_entry(graph, value, fact);
         }
         let otherwise = match &test {
-            Some(Op::IsPropertyCached(object, site, name)) if fallback.is_some() => {
+            Some(Op::IsPropertyCached(object, site, _)) if fallback.is_some() => {
                 let prime = graph.blocks.push(BlockData::default());
                 graph.cold.insert(prime);
-                let op = Op::PrimePropertyCache(*object, *site, name.clone());
+                let op = Op::PrimePropertyCache(*object, *site);
                 graph.append(prime, span, op, false);
                 graph.blocks[prime].terminator = Some(Terminator {
                     source_name,
@@ -726,9 +734,7 @@ fn entry_checks(
             _ => original.clone(),
         };
         let shaped = match &test {
-            Some(Op::IsPropertyCached(object, _, name))
-                if !crate::heap::builtin_method(name) && graph.caller_rooted(*object) =>
-            {
+            Some(Op::IsPropertyCached(object, _, false)) if graph.caller_rooted(*object) => {
                 Some(*object)
             }
             Some(Op::IsShape(object, _)) if graph.caller_rooted(*object) => Some(*object),
@@ -760,12 +766,12 @@ fn entry_checks(
         let checked = values.get(&value).copied().unwrap_or(value);
         let test = match fact {
             Fact::Indexed => Op::IsIndexed(checked),
-            Fact::Cached(site) => {
-                let Op::Get(_, name) = &graph.insts[site].op else {
-                    unreachable!();
-                };
-                Op::IsPropertyCached(checked, site, name.clone())
-            }
+            Fact::Shape(shape) => Op::IsShape(checked, shape),
+            Fact::Cached(cache, builtins) => Op::IsPropertyCached(
+                checked,
+                values.get(&cache).copied().unwrap_or(cache),
+                builtins,
+            ),
             _ => continue,
         };
         let guard = EntryGuard::Fact(checked, fact);
@@ -774,15 +780,10 @@ fn entry_checks(
         }
         tested.insert(guard);
         let otherwise = if fallback.is_some() {
-            if let Op::IsPropertyCached(object, site, name) = &test {
+            if let Op::IsPropertyCached(object, site, _) = &test {
                 let prime = graph.blocks.push(BlockData::default());
                 graph.cold.insert(prime);
-                graph.append(
-                    prime,
-                    span,
-                    Op::PrimePropertyCache(*object, *site, name.clone()),
-                    false,
-                );
+                graph.append(prime, span, Op::PrimePropertyCache(*object, *site), false);
                 graph.terminate(prime, span, TerminatorKind::Jump(original.clone()));
                 Target::new(prime)
             } else {
@@ -791,8 +792,16 @@ fn entry_checks(
         } else {
             original.clone()
         };
-        let shaped = matches!(&test, Op::IsPropertyCached(object, _, name)
-            if !crate::heap::builtin_method(name) && graph.caller_rooted(*object));
+        let shaped = match &test {
+            Op::IsPropertyCached(object, _, builtins) => !builtins && graph.caller_rooted(*object),
+            Op::IsShape(object, _) => graph.caller_rooted(*object),
+            _ => false,
+        };
+        if entry.is_none() {
+            if let Some((value, fact)) = implies(&test) {
+                super::super::super::guards::record_entry(graph, value, fact);
+            }
+        }
         let condition = graph.append_value(current, span, test);
         let next = graph.blocks.push(BlockData::default());
         graph.terminate(
@@ -1115,7 +1124,7 @@ fn wire_failures(
         .collect();
     exits.sort_by_key(|(block, _)| order.get(&blocks[block]).copied().unwrap_or(usize::MAX));
     let mut pieces = canonical.pieces.borrow_mut();
-    let mut stubs: FxHashMap<(usize, Vec<Value>, Option<Inst>), Block> = FxHashMap::default();
+    let mut stubs: FxHashMap<(usize, Vec<Value>, Option<Value>), Block> = FxHashMap::default();
     let mut resumed: FxHashMap<Block, Block> = FxHashMap::default();
     for &(block, taken) in &exits {
         if let Some(stub) = shared_resume(graph, &cfg, &facts, blocks[&block], &resumed) {
@@ -1171,9 +1180,7 @@ fn wire_failures(
             .kind
         {
             TerminatorKind::Branch(condition, ..) => match graph.defining_op(*condition) {
-                Some(Op::IsPropertyCached(object, site, name)) => {
-                    Some((*object, *site, name.clone()))
-                }
+                Some(Op::IsPropertyCached(object, site, _)) => Some((*object, *site)),
                 _ => None,
             },
             _ => None,
@@ -1196,15 +1203,15 @@ fn wire_failures(
         let key = (
             std::sync::Arc::as_ptr(&piece.body) as usize,
             inputs.clone(),
-            prime.as_ref().map(|(_, site, _)| *site),
+            prime.as_ref().map(|(_, site)| *site),
         );
         let stub = *stubs.entry(key).or_insert_with(|| {
             let stub = graph.blocks.push(BlockData::default());
-            if let Some((object, site, name)) = prime {
+            if let Some((object, site)) = prime {
                 graph.append(
                     stub,
                     guard_span,
-                    Op::PrimePropertyCache(object, site, name),
+                    Op::PrimePropertyCache(object, site),
                     false,
                 );
             }

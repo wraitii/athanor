@@ -1,6 +1,7 @@
 use super::runtime::{arrays as array_checks, numeric, properties, storage, typed, views};
 use super::specialization::{
-    caches, call_variants, calls, observations, reads, regions, shapes, writes,
+    call_variants, calls, observations, properties as property_accesses, reads, regions, shapes,
+    writes,
 };
 use crate::{FxHashMap, FxHashSet};
 use js::{arrays, captures, comparisons, construction, string_split};
@@ -11,8 +12,8 @@ use oxc_syntax::symbol::SymbolId;
 use transforms::{conversions, reuse};
 
 use super::{
-    FunctionState, Graph, Inst, Op, RegionFallback, Result, SpecializationPlan, borrow, build,
-    guards, js, legalize, osr, ownership, repr, transforms,
+    FunctionState, Graph, Inst, RegionFallback, Result, SpecializationPlan, borrow, build, js,
+    legalize, osr, ownership, repr, transforms,
 };
 
 impl FunctionState {
@@ -32,6 +33,7 @@ impl FunctionState {
             self.ensure_facts();
             borrow::borrows(&mut self.graph, &self.facts, &mut self.notes);
         }
+        properties::lower_accesses(self)?;
         self.lower_memory()?;
         if numeric::operations(self) {
             self.ensure_facts();
@@ -48,6 +50,7 @@ impl FunctionState {
             ownership::verify(&self.graph, &self.facts, &plan)?;
         }
         self.graph.ownership = Some(plan);
+        properties::lower_loads(self);
         storage::lower_array_loads(self);
         storage::lower_stores(self);
         self.graph.verify()?;
@@ -347,7 +350,7 @@ pub(in crate::jit) fn optimize_planned(
         .iter()
         .copied()
         .collect();
-    let cached_reads = caches::assume(&mut function.graph, &function.plan.shapes);
+    property_accesses::assume(&mut function.graph, &function.plan.shapes);
     reads::assume(&mut function.graph, &function.plan.reads);
     reads::assume(&mut function.graph, &function.plan.stores);
     captures::sink_closures(&mut function);
@@ -361,7 +364,10 @@ pub(in crate::jit) fn optimize_planned(
     function.graph.verify()?;
     function.invalidate_cfg();
     let regions = match versioning {
-        Versioning::Generic => Vec::new(),
+        Versioning::Generic => {
+            regions::materialize_properties(&mut function.graph)?;
+            Vec::new()
+        }
         Versioning::Speculate {
             fallback,
             continuations,
@@ -408,7 +414,7 @@ pub(in crate::jit) fn optimize_planned(
         }
     }
     function.graph.strip_assumes();
-    caches::lower(&mut function.graph, &cached_reads)?;
+    property_accesses::rewrite(&mut function.graph)?;
     reads::lower(
         &mut function.graph,
         &function.plan.reads,
@@ -434,20 +440,6 @@ pub(in crate::jit) fn optimize_planned(
         reuse::reuse_loads(&mut function);
     }
     function.invalidate_cfg();
-    shapes::apply(
-        &mut function.graph,
-        &function.plan.shapes,
-        &mut function.notes,
-    )?;
-    if !function.plan.shapes.polymorphic_reads().is_empty()
-        || function
-            .graph
-            .insts
-            .values()
-            .any(|data| matches!(data.op, Op::EntryAssume(_, guards::Fact::Shape(_))))
-    {
-        reuse::reuse_loads(&mut function);
-    }
     if properties::lower(&mut function)? {
         reuse::reuse_loads(&mut function);
     }

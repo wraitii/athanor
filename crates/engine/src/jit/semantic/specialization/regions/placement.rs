@@ -87,7 +87,7 @@ impl Hoister<'_> {
             return Err(format!("{value} is a block parameter inside the loop"));
         };
         let op = self.graph.insts[inst].op.clone();
-        let input = matches!(op, Op::Argument(_) | Op::This);
+        let input = matches!(op, Op::Argument(_) | Op::This | Op::PropertyCache(..));
         if !input && !is_load(&op) {
             return Err(format!(
                 "{value} is not a load ({})",
@@ -243,12 +243,23 @@ pub(in crate::jit::semantic) fn place_assumes(
                 continue;
             };
             let operands: Vec<Value> = match fact {
-                Fact::Bound(bound) => vec![value, bound],
+                Fact::Bound(bound) | Fact::Cached(bound, _) => vec![value, bound],
                 _ => vec![value],
             };
             let mut best = None;
             for index in 0..points.len() {
                 if !points[index].body.contains(&block) {
+                    continue;
+                }
+                if matches!(fact, Fact::Shape(_))
+                    && points[index].header.is_none()
+                    && cfg.rpo.iter().any(|&exit| {
+                        matches!(
+                            graph.blocks[exit].terminator.as_ref().map(|t| &t.kind),
+                            Some(TerminatorKind::Return(_))
+                        ) && !cfg.dominates(block, exit)
+                    })
+                {
                     continue;
                 }
                 let verdict = operands

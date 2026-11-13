@@ -96,6 +96,7 @@ pub(super) struct Graph {
     pub(super) has_handlers: bool,
     pub(in crate::jit) guards: usize,
     pub(in crate::jit) views: FxHashMap<Inst, Value>,
+    property_accesses: FxHashMap<Inst, specialization::properties::Access>,
     pub(in crate::jit) borrowed: FxHashSet<Value>,
     pub(in crate::jit) summaries: std::sync::Arc<FxHashMap<cranelift_module::FuncId, CallSummary>>,
     pub(in crate::jit) cold: FxHashSet<Block>,
@@ -436,13 +437,22 @@ pub(super) enum Op {
     MarkClass(Value),
     DisableConstructor(Value),
     Get(Value, String),
-    IsPropertyCached(Value, Inst, String),
-    CachedProperty(Value, Inst, bool),
+    PropertyCache(Inst, String),
+    PropertyLoad(Value, Value),
+    HelperCall {
+        helper: super::helpers::Helper,
+        args: Vec<Value>,
+        uses: Vec<Repr>,
+        produces: Option<Repr>,
+        contract: Contract,
+    },
+    IsPropertyCached(Value, Value, bool),
+    CachedProperty(Value, Value, bool),
     IsShape(Value, u32),
     ShapedGet(Value, String, u32),
     ShapedSet(Value, String, u32, Value),
-    FillPropertyCache(Value, Inst, String),
-    PrimePropertyCache(Value, Inst, String),
+    FillPropertyCache(Value, Value, String),
+    PrimePropertyCache(Value, Value),
     GetIndex(Value, Value),
     Set(Value, String, Value),
     SetIndex(Value, Value, Value),
@@ -452,8 +462,7 @@ pub(super) enum Op {
     PropertyAdd(Value, Value, Value, PropertyWrite),
     // Native slot replacement must go through the runtime setter.
     CanOverwrite(Value, Value),
-    PropertyWriteCache(Inst, String),
-    FillPropertyStore(Value, Inst, String, Value, PropertyWrite),
+    FillPropertyStore(Value, Value, String, Value, PropertyWrite),
     ToNumeric(Value),
     // Pure integer coercion of a value proven to be a number or undefined.
     ToInt32(Value),
@@ -631,9 +640,14 @@ impl Op {
             Op::ContinuationOutput(value, _)
             | Op::Observe(value, ..)
             | Op::ReadHint(value, ..)
-            | Op::Assume(value, ..)
             | Op::EntryAssume(value, _) => ([Some(*value), None, None], &[]),
-            Op::PropertyWriteCache(..)
+            Op::Assume(
+                value,
+                guards::Fact::Cached(cache, _) | guards::Fact::Property(cache),
+                _,
+            ) => ([Some(*value), Some(*cache), None], &[]),
+            Op::Assume(value, ..) => ([Some(*value), None, None], &[]),
+            Op::PropertyCache(..)
             | Op::Argument(_)
             | Op::Arguments
             | Op::Rest(_)
@@ -676,12 +690,8 @@ impl Op {
             | Op::EnumerateNext(value)
             | Op::IsUninitialized(value)
             | Op::Get(value, _)
-            | Op::IsPropertyCached(value, _, _)
-            | Op::CachedProperty(value, _, _)
             | Op::IsShape(value, _)
             | Op::ShapedGet(value, _, _)
-            | Op::FillPropertyCache(value, _, _)
-            | Op::PrimePropertyCache(value, _, _)
             | Op::MarkClass(value)
             | Op::DisableConstructor(value)
             | Op::PropertyKey(value)
@@ -720,10 +730,14 @@ impl Op {
             | Op::SlotStore(value)
             | Op::SlotClear(value)
             | Op::ParamStore(_, value) => ([Some(*value), None, None], &[]),
+            Op::PropertyLoad(object, cache)
+            | Op::IsPropertyCached(object, cache, _)
+            | Op::CachedProperty(object, cache, _)
+            | Op::FillPropertyCache(object, cache, _)
+            | Op::PrimePropertyCache(object, cache) => ([Some(*object), Some(*cache), None], &[]),
             Op::Define(object, _, value)
             | Op::DefineHidden(object, _, value)
             | Op::ShapedSet(object, _, _, value)
-            | Op::FillPropertyStore(object, _, _, value, _)
             | Op::Set(object, _, value) => ([Some(*object), Some(*value), None], &[]),
             Op::Memory(MemoryOp::IndexedLoad {
                 base: object,
@@ -780,8 +794,11 @@ impl Op {
             Op::ArrayStore(object, key, value)
             | Op::PropertyStore(object, key, value, _)
             | Op::PropertyAdd(object, key, value, _)
+            | Op::FillPropertyStore(object, key, _, value, _)
             | Op::SetIndex(object, key, value) => ([Some(*object), Some(*key), Some(*value)], &[]),
-            Op::NewArray(values) | Op::CallNative(_, values) => ([None; 3], values),
+            Op::HelperCall { args: values, .. }
+            | Op::NewArray(values)
+            | Op::CallNative(_, values) => ([None; 3], values),
             Op::StringSplit(receiver, args) | Op::StringSplitParts(receiver, args) => {
                 ([Some(*receiver), None, None], args)
             }
@@ -849,9 +866,14 @@ impl Op {
             Op::ContinuationOutput(value, _)
             | Op::Observe(value, ..)
             | Op::ReadHint(value, ..)
-            | Op::Assume(value, ..)
             | Op::EntryAssume(value, _) => ([Some(value), None, None], &mut []),
-            Op::PropertyWriteCache(..)
+            Op::Assume(
+                value,
+                guards::Fact::Cached(cache, _) | guards::Fact::Property(cache),
+                _,
+            ) => ([Some(value), Some(cache), None], &mut []),
+            Op::Assume(value, ..) => ([Some(value), None, None], &mut []),
+            Op::PropertyCache(..)
             | Op::Argument(_)
             | Op::Arguments
             | Op::Rest(_)
@@ -894,12 +916,8 @@ impl Op {
             | Op::EnumerateNext(value)
             | Op::IsUninitialized(value)
             | Op::Get(value, _)
-            | Op::IsPropertyCached(value, _, _)
-            | Op::CachedProperty(value, _, _)
             | Op::IsShape(value, _)
             | Op::ShapedGet(value, _, _)
-            | Op::FillPropertyCache(value, _, _)
-            | Op::PrimePropertyCache(value, _, _)
             | Op::MarkClass(value)
             | Op::DisableConstructor(value)
             | Op::PropertyKey(value)
@@ -938,10 +956,14 @@ impl Op {
             | Op::SlotStore(value)
             | Op::SlotClear(value)
             | Op::ParamStore(_, value) => ([Some(value), None, None], &mut []),
+            Op::PropertyLoad(object, cache)
+            | Op::IsPropertyCached(object, cache, _)
+            | Op::CachedProperty(object, cache, _)
+            | Op::FillPropertyCache(object, cache, _)
+            | Op::PrimePropertyCache(object, cache) => ([Some(object), Some(cache), None], &mut []),
             Op::Define(object, _, value)
             | Op::DefineHidden(object, _, value)
             | Op::ShapedSet(object, _, _, value)
-            | Op::FillPropertyStore(object, _, _, value, _)
             | Op::Set(object, _, value) => ([Some(object), Some(value), None], &mut []),
             Op::Memory(MemoryOp::IndexedLoad {
                 base: object,
@@ -998,8 +1020,11 @@ impl Op {
             Op::ArrayStore(object, key, value)
             | Op::PropertyStore(object, key, value, _)
             | Op::PropertyAdd(object, key, value, _)
+            | Op::FillPropertyStore(object, key, _, value, _)
             | Op::SetIndex(object, key, value) => ([Some(object), Some(key), Some(value)], &mut []),
-            Op::NewArray(values) | Op::CallNative(_, values) => ([None, None, None], values),
+            Op::HelperCall { args: values, .. }
+            | Op::NewArray(values)
+            | Op::CallNative(_, values) => ([None, None, None], values),
             Op::StringSplit(receiver, args) | Op::StringSplitParts(receiver, args) => {
                 ([Some(receiver), None, None], args)
             }
@@ -1359,6 +1384,7 @@ impl Graph {
             has_handlers: false,
             guards: 0,
             views: FxHashMap::default(),
+            property_accesses: FxHashMap::default(),
             borrowed: FxHashSet::default(),
             summaries: Default::default(),
             cold: FxHashSet::default(),
@@ -1536,6 +1562,7 @@ impl Graph {
 
     pub(super) fn remove_inst(&mut self, inst: Inst) {
         self.detach_inst(inst);
+        self.property_accesses.remove(&inst);
         if !self.has_assumes {
             return;
         }
@@ -1545,7 +1572,11 @@ impl Graph {
             self.blocks[block].insts = insts
                 .into_iter()
                 .filter(|&other| {
-                    !matches!(self.insts[other].op, Op::Assume(value, ..) if results.contains(&value))
+                    !(matches!(self.insts[other].op, Op::Assume(..))
+                        && self.insts[other]
+                            .op
+                            .operands_iter()
+                            .any(|value| results.contains(&value)))
                 })
                 .collect();
         }
@@ -1590,6 +1621,11 @@ impl Graph {
                 *value = resolve(aliases, *value);
             }
         }
+        for read in self.property_accesses.values_mut() {
+            if let Some(cache) = &mut read.cache {
+                *cache = resolve(aliases, *cache);
+            }
+        }
         for view in self.views.values_mut() {
             *view = resolve(aliases, *view);
         }
@@ -1614,6 +1650,9 @@ impl Graph {
                 }
                 if let Some(&view) = self.views.get(&inst) {
                     counts[view] += 1;
+                }
+                if let Some(cache) = self.property_accesses.get(&inst).and_then(|read| read.cache) {
+                    counts[cache] += 1;
                 }
             }
             if let Some(terminator) = &data.terminator {
@@ -1805,6 +1844,9 @@ impl Graph {
                 HEAP_READ | GLOBAL_READ | ALLOCATION | INTERNAL | ERROR,
                 Borrowed,
             ),
+            Op::HelperCall { contract, .. } => *contract,
+            Op::PropertyLoad(..) => closed(HEAP_READ, Borrowed),
+            Op::PropertyCache(..) => closed(0, Unowned),
             Op::IsPropertyCached(..) | Op::IsShape(..) => closed(CODE_READ, Unowned),
             Op::ShapedGet(..) => closed(HEAP_READ | INTERNAL | ERROR, Borrowed),
             Op::ShapedSet(..) => {
@@ -1905,7 +1947,6 @@ impl Graph {
             }
             Op::PropertyAdd(..) => closed(HEAP_READ | HEAP_WRITE | CODE_WRITE | INTERNAL, None),
             Op::CanOverwrite(..) => closed(HEAP_READ, Unowned),
-            Op::PropertyWriteCache(..) => closed(INTERNAL, Unowned),
             Op::PackTake(..) => closed(HEAP_READ | HEAP_WRITE | INTERNAL, Owned),
             Op::TypedIndex(..) => closed(HEAP_READ, Unowned),
             Op::IsNumber(_)
@@ -2171,6 +2212,9 @@ impl Graph {
                 }
                 if let Some(&view) = self.views.get(&inst) {
                     check(view, index)?;
+                }
+                if let Some(cache) = self.property_accesses.get(&inst).and_then(|read| read.cache) {
+                    check(cache, index)?;
                 }
             }
             for value in data.terminator.as_ref().unwrap().kind.operands_iter() {

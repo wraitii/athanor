@@ -26,6 +26,7 @@ pub(super) enum LoadKey {
     Index(Value, Value),
     Global(String),
     Probe(String),
+    PropertyCache(Inst),
     This,
     Argument(usize),
     Binary(BinaryOperator, Value, Value),
@@ -115,9 +116,14 @@ fn load_key(
             ..
         } if pure => LoadKey::Binary(*operator, at(left), at(right)),
         _ => match implies(op)? {
-            (value, fact @ (Fact::Type(_) | Fact::Code(_) | Fact::Typed(_) | Fact::Shape(_))) => {
-                LoadKey::Check(at(&value), fact)
-            }
+            (
+                value,
+                fact @ (Fact::Type(_)
+                | Fact::Code(_)
+                | Fact::Typed(_)
+                | Fact::Shape(_)
+                | Fact::Cached(..)),
+            ) => LoadKey::Check(at(&value), fact),
             _ => return None,
         },
     })
@@ -330,5 +336,24 @@ impl Solved {
 
     pub(super) fn canonical(&self, value: Value) -> Value {
         resolve(&self.aliases, value)
+    }
+
+    pub(super) fn holds(
+        &self,
+        graph: &Graph,
+        state: &AvailableLoads,
+        value: Value,
+        fact: Fact,
+    ) -> bool {
+        let original = |mut value| {
+            value = self.canonical(value);
+            while let Some(Op::AsObject(source)) = graph.defining_op(value) {
+                value = self.canonical(*source);
+            }
+            value
+        };
+        let value = original(value);
+        state.iter().any(|(key, entry)| matches!(key, LoadKey::Check(known, established)
+            if original(*known) == value && established.implies(fact) && entry.truth == Some(true)))
     }
 }

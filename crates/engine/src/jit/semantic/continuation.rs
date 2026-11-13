@@ -123,6 +123,7 @@ fn extract(graph: &Graph, target: Target, facts: &Facts) -> super::Result<(Graph
     }
     result.has_assumes = false;
     result.views.clear();
+    result.property_accesses.clear();
     super::boundary::enter(&mut result, &target, &inputs, &[], &[], Some(facts));
     result.verify()?;
     Ok((result, inputs))

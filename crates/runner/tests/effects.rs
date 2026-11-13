@@ -438,7 +438,7 @@ fn construction_exposes_prototype_resolution() {
         assert_eq!(dump.contains("constructor_result"), enabled);
         if enabled {
             assert!(
-                dump.find("fill_property_store ").unwrap()
+                dump.find("helper_call PropertySetCached").unwrap()
                     < dump.find("constructor_prototype").unwrap()
             );
         }

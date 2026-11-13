@@ -123,8 +123,17 @@ impl RegionPlan {
             writeln!(out, "{indent}  identity {name}={code}").unwrap();
         }
         for &(value, fact) in &self.checks {
-            let Fact::Type(types) = fact else {
-                continue;
+            let types = match fact {
+                Fact::Shape(shape) => {
+                    writeln!(out, "{indent}  shape assumption {value}: {shape}").unwrap();
+                    continue;
+                }
+                Fact::Cached(cache, _) => {
+                    writeln!(out, "{indent}  cache-hit assumption {value}: {cache}").unwrap();
+                    continue;
+                }
+                Fact::Type(types) => types,
+                _ => continue,
             };
             let origin = graph
                 .defining_op(value)
@@ -198,7 +207,9 @@ impl RegionPlan {
             && child
                 .checks
                 .iter()
-                .filter(|(_, fact)| matches!(fact, Fact::Indexed | Fact::Cached(_)))
+                .filter(|(_, fact)| {
+                    matches!(fact, Fact::Indexed | Fact::Cached(..) | Fact::Shape(_))
+                })
                 .all(|&(value, fact)| {
                     self.checks
                         .iter()
@@ -248,7 +259,7 @@ impl RegionPlan {
         };
         for (subject, fact) in self.assumes.iter_mut().chain(self.checks.iter_mut()) {
             *subject = value(*subject);
-            if let Fact::Bound(bound) = fact {
+            if let Fact::Bound(bound) | Fact::Cached(bound, _) = fact {
                 *bound = value(*bound);
             }
         }
@@ -324,8 +335,12 @@ impl RegionPlan {
                 .reads
                 .iter()
                 .filter_map(|&inst| {
+                    let Op::Get(object, _) = graph.insts[inst].op else {
+                        return None;
+                    };
                     shapes
                         .read(graph, inst)
+                        .filter(|&(shape, _)| self.checks.contains(&(object, Fact::Shape(shape))))
                         .map(|(shape, index)| (inst, shape, index))
                 })
                 .collect();
@@ -628,23 +643,40 @@ fn plan_region(
             .map(|&(object, bound)| (object, Fact::Bound(bound))),
     );
     checks.extend(requirements.iter().map(native_of));
-    let writes = Writes::with_facts(&planning, &written, &shared);
-    checks.extend(assumes.iter().copied().filter(|&(value, fact)| {
-        if body.contains(&planning.def_block(value)) && !available.contains(&value) {
-            return false;
-        }
-        match fact {
-            Fact::Indexed => true,
-            Fact::Cached(site) if reentry.is_none() => {
-                let Op::Get(_, name) = &planning.insts[site].op else {
+    let mut overwrites = shaped_overwrites(&planning, &written, &assumes);
+    let preserved = loop {
+        let writes = Writes::with_facts(&planning, &written, &shared).preserving_shapes(
+            &overwrites.iter().map(|&(inst, _)| inst).collect(),
+        );
+        let preserved: Vec<_> = assumes
+            .iter()
+            .copied()
+            .filter(|&(value, fact)| {
+                if body.contains(&planning.def_block(value)) && !available.contains(&value) {
                     return false;
-                };
-                Access::read(&Op::IsPropertyCached(value, site, name.clone()), &shared)
-                    .is_some_and(|read| !writes.clobbers(&read))
-            }
-            _ => false,
+                }
+                match fact {
+                    Fact::Indexed => true,
+                    Fact::Shape(shape) if reentry.is_none() => {
+                        Access::read(&Op::IsShape(value, shape), &shared)
+                            .is_some_and(|read| !writes.clobbers(&read))
+                    }
+                    Fact::Cached(cache, builtins) if reentry.is_none() => {
+                        (!body.contains(&planning.def_block(cache)) || available.contains(&cache))
+                            && Access::read(&Op::IsPropertyCached(value, cache, builtins), &shared)
+                                .is_some_and(|read| !writes.clobbers(&read))
+                    }
+                    _ => false,
+                }
+            })
+            .collect();
+        let count = overwrites.len();
+        overwrites.retain(|(_, requirement)| preserved.contains(requirement));
+        if overwrites.len() == count {
+            break preserved;
         }
-    }));
+    };
+    checks.extend(preserved);
     let mut typed_reads = Vec::new();
     for &block in &blocks {
         for &inst in &planning.blocks[block].insts {
@@ -825,6 +857,7 @@ pub(in crate::jit::semantic) fn version(
     fallback: Option<usize>,
     notes: &mut Vec<String>,
 ) -> Result<Vec<RegionId>> {
+    super::super::properties::assume_natives(graph);
     version_with_report(
         graph,
         conditional,
@@ -845,6 +878,7 @@ pub(in crate::jit::semantic) fn version_with_report(
     report_regions: bool,
     shapes: &super::super::shapes::Plan,
 ) -> Result<Vec<RegionId>> {
+    property_assumptions(graph, notes);
     let reached = super::propose::assume(graph, conditional);
     let plans = plan(graph, conditional, &reached, notes);
     let original = graph.clone();
@@ -869,6 +903,7 @@ pub(in crate::jit::semantic) fn version_with_report(
             shapes,
         )?;
     }
+    materialize_properties(graph)?;
     graph.strip_assumes();
     Ok(regions)
 }
@@ -1099,6 +1134,7 @@ mod tests {
         let mut graph = graph(
             "function f(grid,width){let sum=0;for(let y=0;y<2;++y){const offset=y*width;for(let x=0;x<2;++x)sum+=Math.sqrt(grid[offset+x]);}return sum;}",
         );
+        super::super::super::properties::assume_natives(&mut graph);
         let reached = super::propose::assume(&mut graph, &ConditionalPlan::default());
         let plans = plan(
             &graph,
@@ -1191,6 +1227,7 @@ mod tests {
         let mut graph = graph(
             "function f(rows){let sum=0;for(let y=0;y<2;++y){const row=rows[y];for(let x=0;x<2;++x)sum+=row[x];}return sum;}",
         );
+        super::super::super::properties::assume_natives(&mut graph);
         let reached = super::propose::assume(&mut graph, &ConditionalPlan::default());
         let plans = plan(
             &graph,
@@ -1386,6 +1423,7 @@ mod tests {
                     .flatten()
             })
             .unwrap();
+        super::super::super::properties::assume_natives(&mut graph);
         let reached = super::propose::assume(&mut graph, &ConditionalPlan::default());
         let plans = plan(
             &graph,
@@ -1423,6 +1461,7 @@ mod tests {
         let mut graph = graph(
             "function f(state){let sum=0;for(let y=0;y<2;++y){state.width=y+1;for(let x=0;x<2;++x)sum+=state.grid[x*state.width];}return sum;}",
         );
+        super::super::super::properties::assume_natives(&mut graph);
         let reached = super::propose::assume(&mut graph, &ConditionalPlan::default());
         let plans = plan(
             &graph,
@@ -1465,5 +1504,165 @@ mod tests {
         assert!(!regions.is_empty());
         assert!(notes.iter().any(|note| note.contains("gate open")));
         graph.verify().unwrap();
+    }
+}
+
+// Overwrites guarded by their own shape requirement cannot change any shape, so they do not
+// clobber the region's shape or cache checks.
+fn shaped_overwrites(
+    graph: &Graph,
+    written: &FxHashSet<Block>,
+    assumes: &[(Value, Fact)],
+) -> Vec<(Inst, (Value, Fact))> {
+    written
+        .iter()
+        .flat_map(|&block| &graph.blocks[block].insts)
+        .filter_map(|&inst| {
+            let Op::Set(object, ..) = graph.insts[inst].op else {
+                return None;
+            };
+            let &[(shape, _)] = graph.property_accesses.get(&inst)?.shapes.as_slice() else {
+                return None;
+            };
+            let requirement = (object, Fact::Shape(shape));
+            assumes
+                .contains(&requirement)
+                .then_some((inst, requirement))
+        })
+        .collect()
+}
+
+pub(in crate::jit::semantic) fn materialize_properties(graph: &mut Graph) -> Result<()> {
+    use super::super::super::{available, dispatch};
+    use super::super::properties::{Access, shape_writes};
+
+    shape_writes(graph);
+    let facts = Facts::compute(graph);
+    let solved = available::solve(graph, &facts, &facts.cfg, Default::default(), false);
+    let accesses: Vec<_> = facts
+        .cfg
+        .rpo
+        .iter()
+        .copied()
+        .flat_map(|block| graph.blocks[block].insts.iter().copied())
+        .filter_map(|inst| {
+            let (Op::Get(object, _) | Op::Set(object, ..)) = graph.insts[inst].op else {
+                return None;
+            };
+            let access = graph.property_accesses.get(&inst)?;
+            if access.shapes.is_empty() {
+                return None;
+            }
+            if solved.as_ref().is_some_and(|solved| {
+                let state = solved.before(graph, &facts, &facts.cfg, inst);
+                access
+                    .shapes
+                    .iter()
+                    .any(|&(shape, _)| solved.holds(graph, &state, object, Fact::Shape(shape)))
+            }) {
+                return None;
+            }
+            Some((inst, object, access.shapes.clone()))
+        })
+        .collect();
+    for (inst, object, shapes) in accesses {
+        let data = graph.insts[inst].clone();
+        let alternatives = shapes
+            .into_iter()
+            .map(|(shape, index)| dispatch::Alternative {
+                requirements: vec![(object, Fact::Shape(shape))],
+                implementation: (shape, index),
+            })
+            .collect();
+        let first = graph.blocks.len();
+        dispatch::apply(graph, inst, alternatives, |graph, block, (shape, index)| {
+            let (copy, value) =
+                graph.append(block, data.span, data.op.clone(), data.result().is_some());
+            graph.insts[copy].source_name = data.source_name;
+            graph.property_accesses.insert(
+                copy,
+                Access {
+                    cache: None,
+                    shapes: vec![(shape, index)],
+                },
+            );
+            value
+        });
+        graph.property_accesses.get_mut(&inst).unwrap().shapes.clear();
+        dispatch::extend_regions(graph, data.block, first);
+    }
+    graph.verify()
+}
+
+fn property_assumptions(graph: &mut Graph, notes: &mut Vec<String>) {
+    use super::super::super::available;
+
+    let facts = Facts::compute(graph);
+    let solved = available::solve(graph, &facts, &facts.cfg, Default::default(), false);
+    let accesses: FxHashMap<_, _> = graph
+        .property_accesses
+        .iter()
+        .filter_map(|(&inst, access)| Some((access.cache?, (inst, access.shapes.clone()))))
+        .collect();
+    let proposals: Vec<_> = facts
+        .cfg
+        .rpo
+        .iter()
+        .copied()
+        .flat_map(|block| graph.blocks[block].insts.iter().copied())
+        .filter_map(|inst| {
+            let Op::Assume(object, Fact::Property(cache), origin) = graph.insts[inst].op else {
+                return None;
+            };
+            let (access, shapes) = accesses.get(&cache)?;
+            let fact = match (&graph.insts[*access].op, shapes.as_slice()) {
+                (Op::Get(_, name), []) => {
+                    Some(Fact::Cached(cache, crate::heap::builtin_method(&name)))
+                }
+                (Op::Get(..) | Op::Set(..), &[(shape, _)]) => {
+                    (!solved.as_ref().is_some_and(|solved| {
+                        let state = solved.before(graph, &facts, &facts.cfg, inst);
+                        solved.holds(graph, &state, object, Fact::Shape(shape))
+                    }))
+                    .then_some(Fact::Shape(shape))
+                }
+                _ => None,
+            };
+            Some((inst, object, fact, origin))
+        })
+        .collect();
+    let canonical = |value| {
+        solved
+            .as_ref()
+            .map_or(value, |solved| solved.canonical(value))
+    };
+    let mut shapes = FxHashMap::default();
+    let mut conflicting = FxHashSet::default();
+    for &(_, object, fact, _) in &proposals {
+        if let Some(Fact::Shape(shape)) = fact {
+            let object = canonical(object);
+            if shapes
+                .insert(object, shape)
+                .is_some_and(|other| other != shape)
+            {
+                conflicting.insert(object);
+            }
+        }
+    }
+    if !conflicting.is_empty() {
+        notes.push(format!(
+            "property ICs: conflicting shape requirements for {} receiver(s) stay inline",
+            conflicting.len()
+        ));
+    }
+    for (inst, object, fact, origin) in proposals {
+        let fact = fact.filter(|fact| {
+            !matches!(fact, Fact::Shape(_)) || !conflicting.contains(&canonical(object))
+        });
+        if let Some(fact) = fact {
+            graph.insts[inst].op = Op::Assume(object, fact, origin);
+        } else {
+            graph.detach_inst(inst);
+        }
     }
 }

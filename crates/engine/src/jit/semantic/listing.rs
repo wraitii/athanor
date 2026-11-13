@@ -316,10 +316,10 @@ impl Graph {
             Op::MarkClass(value) => format!("mark_class {value}"),
             Op::DisableConstructor(value) => format!("disable_constructor {value}"),
             Op::Get(object, name) => format!("get {object}.{name}"),
-            Op::IsPropertyCached(object, _, name) => {
-                format!("property_cached {object}.{name}")
+            Op::IsPropertyCached(object, cache, _) => {
+                format!("is_property_cached {object} {cache}")
             }
-            Op::CachedProperty(object, _, _) => format!("cached_property {object}"),
+            Op::CachedProperty(object, cache, _) => format!("cached_property {object} {cache}"),
             Op::IsShape(object, shape) => format!("is_shape {object}, {shape}"),
             Op::ShapedGet(object, name, index) => {
                 format!("shaped_get {object}.{name} @{index}")
@@ -327,11 +327,11 @@ impl Graph {
             Op::ShapedSet(object, name, index, value) => {
                 format!("shaped_set {object}.{name} @{index}, {value}")
             }
-            Op::FillPropertyCache(object, _, name) => {
-                format!("fill_property_cache {object}.{name}")
+            Op::FillPropertyCache(object, cache, name) => {
+                format!("fill_property_cache {object}.{name} {cache}")
             }
-            Op::PrimePropertyCache(object, _, name) => {
-                format!("prime_property_cache {object}.{name}")
+            Op::PrimePropertyCache(object, cache) => {
+                format!("prime_property_cache {object} {cache}")
             }
             Op::GetIndex(object, key) => format!("get {object}[{key}]"),
             Op::Set(object, name, value) => format!("set {object}.{name}, {value}"),
@@ -343,9 +343,17 @@ impl Graph {
                 format!("add_property {object}, {cache}, {value}")
             }
             Op::CanOverwrite(object, key) => format!("can_overwrite {object}[{key}]"),
-            Op::PropertyWriteCache(site, name) => format!("property_write_cache {site} {name}"),
-            Op::FillPropertyStore(object, _, name, value, _) => {
-                format!("fill_property_store {object}.{name}, {value}")
+            Op::HelperCall { helper, args, .. } => format!(
+                "helper_call {helper:?}({})",
+                args.iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Op::PropertyLoad(object, address) => format!("property_load {object} {address}"),
+            Op::PropertyCache(site, name) => format!("property_cache {site} {name}"),
+            Op::FillPropertyStore(object, cache, name, value, _) => {
+                format!("fill_property_store {object}.{name}, {value} {cache}")
             }
             Op::SetIndex(object, key, value) => format!("set {object}[{key}], {value}"),
             Op::ToNumeric(value) => format!("to_numeric {value}"),

@@ -25,13 +25,13 @@ mod propose;
 mod versioning;
 
 use super::super::transforms::repair;
+pub(in crate::jit::semantic) use analysis::requirements;
 use analysis::{
     Requirement, Writes, closure_failure, closure_failure_with, conflicts, guarded_accesses,
-    requirements,
 };
 #[cfg(test)]
 pub(in crate::jit::semantic) use planning::version;
-pub(in crate::jit::semantic) use planning::version_with_report;
+pub(in crate::jit::semantic) use planning::{materialize_properties, version_with_report};
 use versioning::{Speculation, apply_version};
 
 pub(in crate::jit::semantic) fn version_string_leaves(
@@ -575,7 +575,8 @@ fn probe_reads(
     for &block in scan {
         for &inst in &graph.blocks[block].insts {
             let data = &graph.insts[inst];
-            let input = inputs && matches!(data.op, Op::Argument(_) | Op::This);
+            let input = matches!(data.op, Op::PropertyCache(..))
+                || inputs && matches!(data.op, Op::Argument(_) | Op::This);
             if (input
                 || matches!(
                     data.op,
