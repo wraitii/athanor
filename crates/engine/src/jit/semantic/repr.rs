@@ -331,14 +331,7 @@ fn representation(graph: &Graph, facts: &Facts, value: super::Value) -> Repr {
         }
     }
     if let Some(&Op::AsNumber(input)) = op {
-        let input = graph.reprs[input].unwrap_or_else(|| representation(graph, facts, input));
-        if matches!(input, Repr::Integer(_) | Repr::Float(_)) {
-            return input;
-        }
-        return match Repr::of(facts.of(value)) {
-            repr @ (Repr::Integer(_) | Repr::Float(_)) => repr,
-            _ => Repr::F64,
-        };
+        return repr(input);
     }
     match (op, Repr::of(facts.of(value))) {
         (Some(Op::LowLevel(_)), Repr::Boxed) => Repr::I64,
@@ -416,7 +409,9 @@ fn rewrite(builder: &mut Builder<'_>, stage: Stage) -> Result<(), String> {
                 position += 1;
                 continue;
             }
-            if let Op::AsBoxed(word) | Op::AsWord(word) = builder.graph.insts[inst].op {
+            if let Op::AsBoxed(word) | Op::AsWord(word) | Op::AsNumber(word) =
+                builder.graph.insts[inst].op
+            {
                 let result = builder.graph.insts[inst].result().unwrap();
                 aliases.insert(result, resolve(&aliases, word));
                 builder.graph.blocks[block].insts.remove(position);

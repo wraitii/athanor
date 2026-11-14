@@ -272,28 +272,8 @@ impl Legalizer<'_> {
     }
 }
 
-fn numbers(graph: &mut Graph, rpo: &[Block]) {
-    let mut aliases = FxHashMap::default();
-    for &block in rpo {
-        for inst in graph.blocks[block].insts.clone() {
-            let Op::AsNumber(input) = graph.insts[inst].op else {
-                continue;
-            };
-            let result = graph.insts[inst].result().unwrap();
-            if graph.repr(input) == graph.repr(result) {
-                aliases.insert(result, input);
-                graph.remove_inst(inst);
-            } else {
-                graph.set_op(inst, Op::Convert(input, graph.repr(result)));
-            }
-        }
-    }
-    graph.replace_uses(&aliases);
-}
-
 pub(super) fn legalize(graph: &mut Graph, facts: &mut Facts) {
     let rpo = facts.cfg.rpo.clone();
-    numbers(graph, &rpo);
     let blocks = graph.blocks.len();
     let mut legalizer = Legalizer { graph, facts };
     legalizer.results(&rpo);
