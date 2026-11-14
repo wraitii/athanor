@@ -73,17 +73,6 @@ impl FunctionState {
         self.ensure_facts();
         helpers::lower(self);
         after("helpers", self);
-        legalize::conditions(&mut self.graph, &mut self.facts);
-        after("conditions", self);
-        repr::assign(&mut self.graph, &self.facts);
-        after("repr", self);
-        legalize::legalize(&mut self.graph, &mut self.facts);
-        after("legalize", self);
-        conversions::simplify(&mut self.graph, &self.facts);
-        conversions::hoist(&mut self.graph, &self.facts);
-        conversions::split(&mut self.graph, &self.facts);
-        after("conversions", self);
-        self.graph.verify()?;
         let plan = ownership::plan(&mut self.graph, &mut self.facts);
         if cfg!(debug_assertions) {
             ownership::verify(&self.graph, &self.facts, &plan)?;
@@ -98,6 +87,17 @@ impl FunctionState {
         after("stores", self);
         values::lower(self);
         after("values", self);
+        self.ensure_facts();
+        legalize::conditions(&mut self.graph, &mut self.facts);
+        after("conditions", self);
+        repr::assign(&mut self.graph, &self.facts);
+        after("repr", self);
+        legalize::legalize(&mut self.graph, &mut self.facts);
+        after("legalize", self);
+        conversions::simplify(&mut self.graph, &self.facts);
+        conversions::hoist(&mut self.graph, &self.facts);
+        conversions::split(&mut self.graph, &self.facts);
+        after("conversions", self);
         self.graph.verify()?;
         Ok(())
     }

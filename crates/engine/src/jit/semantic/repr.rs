@@ -106,21 +106,32 @@ pub(super) fn assign(graph: &mut Graph, facts: &Facts) {
 }
 
 fn representation(graph: &Graph, facts: &Facts, value: super::Value) -> Repr {
+    let repr =
+        |value: Value| graph.reprs[value].unwrap_or_else(|| representation(graph, facts, value));
     match graph.defining_op(value) {
         Some(Op::LowLevel(
             super::low_level::Op::Load { ty, .. }
+            | super::low_level::Op::AtomicLoad { ty, .. }
             | super::low_level::Op::Integer { ty, .. }
-            | super::low_level::Op::Unary { ty, .. },
+            | super::low_level::Op::Unary { ty, .. }
+            | super::low_level::Op::StackAddress { ty, .. }
+            | super::low_level::Op::StackPointer { ty },
         )) => Repr::from_machine(*ty),
+        Some(Op::LowLevel(super::low_level::Op::Float64(_))) => Repr::F64,
+        Some(Op::LowLevel(
+            super::low_level::Op::IntCompare { .. }
+            | super::low_level::Op::FloatCompare { .. }
+            | super::low_level::Op::InRange { .. }
+            | super::low_level::Op::TestMask { .. },
+        )) => Repr::I8,
+        Some(Op::LowLevel(super::low_level::Op::ExtractBits { value, .. })) => repr(*value),
+        Some(Op::LowLevel(super::low_level::Op::Binary { op, .. })) if op.is_float() => Repr::F64,
         Some(Op::LowLevel(super::low_level::Op::Binary { op, left, .. }))
-            if !op.is_float() && !op.is_integer_arithmetic() =>
+            if !op.is_integer_arithmetic() =>
         {
-            representation(graph, facts, *left)
+            repr(*left)
         }
         Some(Op::LowLevel(super::low_level::Op::Select { yes, no, .. })) => {
-            let repr = |value: Value| {
-                graph.reprs[value].unwrap_or_else(|| representation(graph, facts, value))
-            };
             let (yes, no) = (repr(*yes), repr(*no));
             debug_assert_eq!(yes, no, "select arms disagree");
             yes

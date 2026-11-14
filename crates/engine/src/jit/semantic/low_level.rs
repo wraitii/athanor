@@ -766,7 +766,14 @@ impl<I: Insert + ?Sized> Instructions<'_, I> {
             .map(Repr::machine)
             .expect("untyped low-level operand");
         assert!(u32::from(shift) + u32::from(width) <= ty.bits() && width > 0);
-        self.value(Op::ExtractBits { value, shift, width }, ty)
+        self.value(
+            Op::ExtractBits {
+                value,
+                shift,
+                width,
+            },
+            ty,
+        )
     }
 
     pub(in crate::jit) fn in_range(&mut self, value: Value, low: u64, high: u64) -> Value {

@@ -2,14 +2,16 @@ use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{MemFlagsData, types};
 
 use super::super::cursor::{Cursor, Insert};
-use super::super::{Cfg, FunctionState, Graph, Inst, Op, Repr, Value, low_level};
+use super::super::{Cfg, Facts, FunctionState, Graph, Inst, Op, Repr, Value, ValueType, low_level};
 use super::layout;
 use crate::FxHashMap;
 use crate::heap::{CODE_OFFSET, KIND_OFFSET, SHAPE_OFFSET, TypedKind, kind};
 use crate::value::Value as JsValue;
 
 pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) {
+    function.ensure_values();
     let graph = &mut function.graph;
+    let facts = &function.facts;
     let mut aliases = FxHashMap::default();
     let mut removed = Vec::new();
     for block in Cfg::new(graph).rpo {
@@ -21,7 +23,7 @@ pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) {
                 removed.push(inst);
                 continue;
             }
-            if let Some(value) = predicate(graph, inst) {
+            if let Some(value) = predicate(graph, facts, inst) {
                 let result = graph.insts[inst].result().unwrap();
                 aliases.insert(result, value);
                 removed.push(inst);
@@ -95,9 +97,14 @@ fn integer_check(at: &mut Cursor, value: Value, float: Value, exact: Value) -> V
     at.ins().band(valid, positive_zero)
 }
 
-fn predicate(graph: &mut Graph, inst: Inst) -> Option<Value> {
+fn scalar(types: ValueType) -> bool {
+    types != ValueType::default()
+        && (types.within(ValueType::BOOLEAN) || types.within(ValueType::NUMBER))
+}
+
+fn predicate(graph: &mut Graph, facts: &Facts, inst: Inst) -> Option<Value> {
     let op = graph.insts[inst].op.clone();
-    let boxed = |graph: &Graph, value: Value| graph.repr(value) == Repr::Boxed;
+    let boxed = |_: &Graph, value: Value| !scalar(facts.of(value));
     Some(match op {
         Op::IntegerCheck(value, float, exact) => {
             integer_check(&mut Cursor::before(graph, inst), value, float, exact)
@@ -116,7 +123,7 @@ fn predicate(graph: &mut Graph, inst: Inst) -> Option<Value> {
             layout::is_number(&mut at, word)
         }
         Op::IsNumber(value) => {
-            let bits = i64::from(graph.repr(value) != Repr::I8);
+            let bits = i64::from(!facts.of(value).within(ValueType::BOOLEAN));
             let mut at = Cursor::before(graph, inst);
             at.ins().iconst(types::I8, bits)
         }

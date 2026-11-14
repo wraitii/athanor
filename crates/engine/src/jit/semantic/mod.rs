@@ -1,7 +1,7 @@
 mod access;
 mod available;
-mod borrow;
 mod bits;
+mod borrow;
 pub(in crate::jit) mod boundary;
 mod build;
 pub(in crate::jit) mod continuation;

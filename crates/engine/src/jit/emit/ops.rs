@@ -5,9 +5,7 @@ use oxc_span::Span;
 use oxc_syntax::operator::BinaryOperator;
 
 use crate::error::Error;
-use crate::heap::{
-    CODE_OFFSET, DATA_OFFSET, KIND_OFFSET, LENGTH_OFFSET, SHAPE_OFFSET, TypedKind,
-};
+use crate::heap::{CODE_OFFSET, DATA_OFFSET, KIND_OFFSET, LENGTH_OFFSET, SHAPE_OFFSET, TypedKind};
 use crate::jit::helpers::{
     self, CACHE_BUILTIN_KIND_OFFSET, CACHE_BUILTIN_VALUE_OFFSET, CACHE_ENTRY_OFFSET,
     CACHE_ENTRY_SIZE, CACHE_HOLDER_OFFSET, CACHE_HOLDER_SHAPE_OFFSET, CACHE_INDEX_OFFSET,
@@ -680,7 +678,9 @@ impl FunctionCompiler<'_, '_> {
             .ins()
             .load(types::I64, MemFlagsData::trusted(), view, LENGTH_OFFSET);
         let inside = if key.repr == Repr::I64 {
-            self.b.ins().icmp(IntCC::UnsignedLessThan, key.value, length)
+            self.b
+                .ins()
+                .icmp(IntCC::UnsignedLessThan, key.value, length)
         } else {
             let number = key.value;
             let position = self.b.ins().fcvt_to_sint_sat(types::I64, number);

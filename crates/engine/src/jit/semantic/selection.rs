@@ -128,7 +128,10 @@ fn specific(graph: &Graph, inst: Inst) -> Option<Representations> {
         Op::LowLevel(
             super::low_level::Op::InRange { .. } | super::low_level::Op::TestMask { .. },
         ) => any(1, Some(Repr::I8)),
-        Op::LowLevel(super::low_level::Op::Reference { .. }) => any(1, None),
+        Op::LowLevel(super::low_level::Op::Reference { .. }) => Representations {
+            uses: vec![Use::Exact(Repr::Boxed)],
+            produces: None,
+        },
         Op::LowLevel(super::low_level::Op::Unary { op, ty, .. }) => Representations {
             uses: vec![match op {
                 super::low_level::Unary::FloatDemote => Use::Exact(Repr::F64),
@@ -215,10 +218,11 @@ fn generic(graph: &Graph, inst: Inst) -> Representations {
             .collect(),
         _ => vec![Use::Exact(Repr::Boxed); count],
     };
-    Representations {
-        uses,
-        produces: data.result().map(|_| Repr::Boxed),
-    }
+    let produces = match &data.op {
+        Op::LowLevel(_) => data.result().map(|value| graph.repr(value)),
+        _ => data.result().map(|_| Repr::Boxed),
+    };
+    Representations { uses, produces }
 }
 
 pub(in crate::jit) fn repr_contract(graph: &Graph, inst: Inst) -> Representations {

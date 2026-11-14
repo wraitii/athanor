@@ -61,7 +61,11 @@ fn extract(at: &mut Cursor, value: Value, shift: u8, width: u8) -> LowOp {
 
 fn range(at: &mut Cursor, value: Value, low: u64, high: u64, inside: bool) -> LowOp {
     if low == high {
-        let condition = if inside { IntCC::Equal } else { IntCC::NotEqual };
+        let condition = if inside {
+            IntCC::Equal
+        } else {
+            IntCC::NotEqual
+        };
         return compare(at, condition, value, low);
     }
     let offset = if low == 0 {

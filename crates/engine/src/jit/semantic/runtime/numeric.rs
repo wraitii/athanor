@@ -562,8 +562,10 @@ fn inline_math(native: super::super::Native, arguments: usize) -> bool {
     use crate::heap::MathFunction;
     matches!(
         (crate::jit::math::METHODS[native.index()].1, arguments),
-        (MathFunction::Floor | MathFunction::Ceil | MathFunction::Sqrt, 1)
-            | (MathFunction::Min | MathFunction::Max, 1..)
+        (
+            MathFunction::Floor | MathFunction::Ceil | MathFunction::Sqrt,
+            1
+        ) | (MathFunction::Min | MathFunction::Max, 1..)
     )
 }
 
