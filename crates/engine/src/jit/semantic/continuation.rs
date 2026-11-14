@@ -83,8 +83,15 @@ fn extract(graph: &Graph, target: Target, facts: &Facts) -> super::Result<(Graph
                 | Op::Write(..)
                 | Op::Initialize(..)
                 | Op::Closure(..)
+                | Op::ClosureCells(..)
+                | Op::CellNew(_)
+                | Op::CellGet(_)
+                | Op::CellSet(..)
+                | Op::CaptureGet(..)
                 | Op::Argument(_)
+                | Op::Restored(_)
                 | Op::ClosureThis(_)
+                | Op::Callee
                 | Op::EnterCaptures(..)
                 | Op::Arguments
                 | Op::Rest(_)

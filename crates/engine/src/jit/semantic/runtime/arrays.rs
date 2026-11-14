@@ -1,5 +1,6 @@
 #[cfg(test)]
 use super::super::TerminatorKind;
+use super::super::cursor::{Cursor, Insert};
 #[cfg(test)]
 use super::super::dispatch::append;
 use super::super::{Constant, FunctionState, Graph, Inst, Op, Repr, Value, ValueType, low_level};
@@ -16,26 +17,16 @@ pub(in crate::jit::semantic) fn lower_arrays(function: &mut FunctionState) -> bo
             let Op::IsArrayIndex(object, key, position, layout) = data.op else {
                 continue;
             };
-            let mut at = graph.blocks[block]
-                .insts
-                .iter()
-                .position(|&i| i == inst)
-                .unwrap();
-            let mut insert = |op| {
-                let (lowered, value) = graph.insert(block, at, data.span, op, true);
-                graph.insts[lowered].source_name = data.source_name;
-                at += 1;
-                value.unwrap()
-            };
-            let matching = insert(Op::IsArray(object, layout));
-            let exact = insert(if facts.of(key).within(ValueType::INTEGER) {
-                Op::Constant(Constant::Boolean(true))
+            let mut at = Cursor::before(graph, inst);
+            let matching = at.add_unassigned(Op::IsArray(object, layout));
+            let exact = if facts.of(key).within(ValueType::INTEGER) {
+                at.add_unassigned(Op::Constant(Constant::Boolean(true)))
             } else {
-                Op::IsExactPosition(key, position)
-            });
-            let length = insert(Op::IndexedLength(object));
-            let inside = insert(Op::IsInBounds(position, length));
-            let valid = insert(Op::BooleanAnd(exact, inside));
+                at.add_unassigned(Op::IsExactPosition(key, position))
+            };
+            let length = at.add_unassigned(Op::IndexedLength(object));
+            let inside = at.add_unassigned(Op::IsInBounds(position, length));
+            let valid = at.add_unassigned(Op::BooleanAnd(exact, inside));
             graph.insts[inst].op = Op::BooleanAnd(matching, valid);
             changed = true;
         }
@@ -80,17 +71,7 @@ pub(in crate::jit::semantic) fn lower_checks(function: &mut FunctionState) -> bo
 }
 
 fn integer(graph: &mut Graph, inst: Inst, value: Value) -> Value {
-    let data = &graph.insts[inst];
-    let (block, span) = (data.block, data.span);
-    let at = graph.blocks[block]
-        .insts
-        .iter()
-        .position(|&i| i == inst)
-        .unwrap();
-    let (_, converted) = graph.insert(block, at, span, Op::Convert(value, Repr::I64), true);
-    let converted = converted.unwrap();
-    graph.reprs[converted] = Some(Repr::I64);
-    converted
+    Cursor::before(graph, inst).add(Op::Convert(value, Repr::I64), Repr::I64)
 }
 
 pub(in crate::jit::semantic) fn lower_array_kinds(function: &mut FunctionState) -> bool {
@@ -102,26 +83,13 @@ pub(in crate::jit::semantic) fn lower_array_kinds(function: &mut FunctionState) 
             let Op::IsArray(object, layout) = data.op else {
                 continue;
             };
-            let at = graph.blocks[block]
-                .insts
-                .iter()
-                .position(|&i| i == inst)
-                .unwrap();
-            let (load, kind) = graph.insert(block, at, data.span, Op::ArrayKind(object), true);
-            graph.insts[load].source_name = data.source_name;
-            let expected = layout.kind();
-            let (constant, expected) = graph.insert(
-                block,
-                at + 1,
-                data.span,
-                Op::Constant(Constant::Number(expected as f64)),
-                true,
-            );
-            graph.insts[constant].source_name = data.source_name;
+            let mut at = Cursor::before(graph, inst);
+            let kind = at.add_unassigned(Op::ArrayKind(object));
+            let expected = at.add_unassigned(Op::Constant(Constant::Number(layout.kind() as f64)));
             graph.insts[inst].op = Op::Binary(
                 oxc_syntax::operator::BinaryOperator::StrictEquality,
-                kind.unwrap(),
-                expected.unwrap(),
+                kind,
+                expected,
             );
             changed = true;
         }

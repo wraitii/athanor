@@ -649,7 +649,7 @@ fn emit(
                     );
                     check_error(&mut asm, context_offset as u32, failed)?;
                 }
-                Op::Argument(index) if !fixed => {
+                Op::Argument(index) | Op::Restored(index) if !fixed => {
                     let missing = asm.label();
                     let loaded = asm.label();
                     asm.emit(e::mem_scaled(Mem::LdrX, 10, e::SP, argc_offset as u32)?);
@@ -722,7 +722,7 @@ fn emit(
                         call_address(&mut asm, output as *const () as u64);
                     }
                 }
-                Op::Argument(index) if *index < arity => {
+                Op::Argument(index) | Op::Restored(index) if *index < arity => {
                     let source = (arguments_offset + index * 8) as u32;
                     let dest = data.result()?.index().checked_mul(8)? as u32;
                     asm.emit(e::mem_scaled(Mem::LdrX, 9, e::SP, source)?);

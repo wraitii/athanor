@@ -102,6 +102,7 @@ fn release(b: &mut Builder<'_>, value: Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jit::semantic::variables::Variables;
     use cranelift_codegen::ir::{AbiParam, Signature};
     use cranelift_codegen::isa::CallConv;
     use oxc_span::Span;
@@ -128,15 +129,29 @@ mod tests {
         b.ins().brif(args[2], left, &[], right, &[]);
         b.switch_to_block(right);
         let zero = b.ins().iconst(types::I64, 0);
-        b.cleanup(vec![args[0], args[0], zero], true);
+        b.effect(
+            right,
+            Span::new(0, 0),
+            low_level::Op::Cleanup {
+                values: vec![args[0], args[0], zero],
+                unwind: true,
+            },
+        );
         let other_status = b.ins().iconst(types::I8, 0);
         b.ins().jump(exit, &[other_status.into()]);
         b.switch_to_block(left);
-        b.cleanup(vec![args[0]], true);
+        b.effect(
+            left,
+            Span::new(0, 0),
+            low_level::Op::Cleanup {
+                values: vec![args[0]],
+                unwind: true,
+            },
+        );
         b.ins().jump(exit, &[args[2].into()]);
         b.switch_to_block(exit);
         b.ins().return_(&[status]);
-        b.finish().unwrap();
+        Variables::default().finish(&mut graph).unwrap();
         graph.replace_uses(&FxHashMap::from_iter([(args[0], args[1])]));
         let moved = std::mem::take(&mut graph.blocks[left].insts);
         let terminator = graph.blocks[left].terminator.take();

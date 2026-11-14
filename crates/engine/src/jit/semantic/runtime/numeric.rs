@@ -6,10 +6,9 @@ use cranelift_codegen::ir::{
 };
 use oxc_syntax::operator::BinaryOperator;
 
+use super::super::cursor::{Cursor, Insert};
 use super::super::low_level::{Binary, Op as LowLevel, Unary};
-use super::super::{
-    Block, Constant, FunctionState, Graph, InstData, Op, UnaryOp, Value, ValueType,
-};
+use super::super::{Constant, FunctionState, Op, UnaryOp, Value, ValueType};
 use crate::FxHashMap;
 
 pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) -> bool {
@@ -34,24 +33,18 @@ fn lower_checks(function: &mut FunctionState) -> bool {
                 _ => continue,
             };
             changed = true;
-            let at = graph.blocks[block]
-                .insts
-                .iter()
-                .position(|&i| i == inst)
-                .unwrap();
-            let float = insert(graph, block, at, &data, Op::NumericFloat(value));
-            graph.insts[inst].op = match data.op {
+            let mut at = Cursor::before(graph, inst);
+            let float = at.add_unassigned(Op::NumericFloat(value));
+            let integer = at.add_unassigned(Op::SaturatingInteger(float));
+            let op = match data.op {
                 Op::IsInteger(_) => {
-                    let integer = insert(graph, block, at + 1, &data, Op::SaturatingInteger(float));
-                    let exact = insert(graph, block, at + 2, &data, Op::NumericFloat(integer));
+                    let exact = at.add_unassigned(Op::NumericFloat(integer));
                     Op::IntegerCheck(value, float, exact)
                 }
-                Op::AsInteger(_) => {
-                    let integer = insert(graph, block, at + 1, &data, Op::SaturatingInteger(float));
-                    Op::AsInteger(integer)
-                }
+                Op::AsInteger(_) => Op::AsInteger(integer),
                 _ => unreachable!(),
             };
+            graph.insts[inst].op = op;
         }
     }
     if changed {
@@ -100,13 +93,9 @@ pub(in crate::jit::semantic) fn arithmetic(function: &mut FunctionState) -> bool
                 _ => unreachable!(),
             };
             if !integer {
-                let at = graph.blocks[block]
-                    .insts
-                    .iter()
-                    .position(|&i| i == inst)
-                    .unwrap();
-                left = insert(graph, block, at, &data, Op::NumericFloat(left));
-                right = insert(graph, block, at + 1, &data, Op::NumericFloat(right));
+                let mut at = Cursor::before(graph, inst);
+                left = at.add_unassigned(Op::NumericFloat(left));
+                right = at.add_unassigned(Op::NumericFloat(right));
             }
             graph.insts[inst].op = Op::LowLevel(LowLevel::Binary { op, left, right });
             changed = true;
@@ -149,24 +138,19 @@ fn integer_operations(function: &mut FunctionState) -> bool {
             if !facts.of(left).within(numeric) || !facts.of(right).within(numeric) {
                 continue;
             }
-            let mut at = graph.blocks[block]
-                .insts
-                .iter()
-                .position(|&i| i == inst)
-                .unwrap();
-            let mut integer = |graph: &mut Graph, value: Value| {
+            let mut at = Cursor::before(graph, inst);
+            let mut integer = |value: Value| {
                 let types = facts.of(value);
                 if types != ValueType::default() && types.within(ValueType::INT32) {
                     return value;
                 }
-                at += 1;
-                insert(graph, block, at - 1, &data, Op::ToInt32(value))
+                at.add_unassigned(Op::ToInt32(value))
             };
-            let left = integer(graph, left);
-            let right = integer(graph, right);
+            let left = integer(left);
+            let right = integer(right);
             let binary = LowLevel::Binary { op, left, right };
-            graph.insts[inst].op = if operator == BinaryOperator::ShiftRightZeroFill {
-                let value = insert(graph, block, at, &data, Op::LowLevel(binary));
+            let replacement = if operator == BinaryOperator::ShiftRightZeroFill {
+                let value = at.add_unassigned(Op::LowLevel(binary));
                 Op::LowLevel(LowLevel::Unary {
                     op: Unary::FloatFromUnsigned,
                     ty: types::F64,
@@ -175,6 +159,7 @@ fn integer_operations(function: &mut FunctionState) -> bool {
             } else {
                 Op::LowLevel(binary)
             };
+            graph.insts[inst].op = replacement;
             changed = true;
         }
     }
@@ -214,18 +199,12 @@ fn natives(function: &mut FunctionState) -> bool {
                 graph.insts[inst].op = Op::NumericFloat(args[0]);
                 continue;
             }
-            let at = graph.blocks[block]
-                .insts
-                .iter()
-                .position(|&i| i == inst)
-                .unwrap();
+            let mut at = Cursor::before(graph, inst);
             let floats: Vec<_> = args
                 .iter()
-                .enumerate()
-                .map(|(index, &arg)| insert(graph, block, at + index, &data, Op::NumericFloat(arg)))
+                .map(|&arg| at.add_unassigned(Op::NumericFloat(arg)))
                 .collect();
-            let at = at + floats.len();
-            graph.insts[inst].op = match unary {
+            let replacement = match unary {
                 Some(op) => Op::LowLevel(LowLevel::Unary {
                     op,
                     ty: types::F64,
@@ -239,9 +218,9 @@ fn natives(function: &mut FunctionState) -> bool {
                     };
                     let (&last, rest) = floats.split_last().unwrap();
                     let mut left = floats[0];
-                    for (offset, &right) in rest.iter().skip(1).enumerate() {
+                    for &right in rest.iter().skip(1) {
                         let binary = LowLevel::Binary { op, left, right };
-                        left = insert(graph, block, at + offset, &data, Op::LowLevel(binary));
+                        left = at.add_unassigned(Op::LowLevel(binary));
                     }
                     Op::LowLevel(LowLevel::Binary {
                         op,
@@ -250,6 +229,7 @@ fn natives(function: &mut FunctionState) -> bool {
                     })
                 }
             };
+            graph.insts[inst].op = replacement;
         }
     }
     if changed {
@@ -270,17 +250,8 @@ fn comparisons_and_unary(function: &mut FunctionState) -> bool {
     for block in facts.cfg.rpo.clone() {
         for inst in graph.blocks[block].insts.clone() {
             let data = graph.insts[inst].clone();
-            let at = graph.blocks[block]
-                .insts
-                .iter()
-                .position(|&i| i == inst)
-                .unwrap();
-            let mut position = at;
-            let mut insert = |op| {
-                let value = insert(graph, block, position, &data, op);
-                position += 1;
-                value
-            };
+            let mut at = Cursor::before(graph, inst);
+            let mut insert = |op| at.add_unassigned(op);
             let replacement = match data.op {
                 Op::Binary(operator, left, right)
                 | Op::GuardedCompare {
@@ -425,12 +396,6 @@ fn comparisons_and_unary(function: &mut FunctionState) -> bool {
         function.invalidate_values();
     }
     changed
-}
-
-fn insert(graph: &mut Graph, block: Block, at: usize, data: &InstData, op: Op) -> Value {
-    let (inst, value) = graph.insert(block, at, data.span, op, true);
-    graph.insts[inst].source_name = data.source_name;
-    value.unwrap()
 }
 
 pub(in crate::jit::semantic) fn bitwise(function: &mut FunctionState) -> bool {

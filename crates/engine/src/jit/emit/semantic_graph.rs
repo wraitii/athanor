@@ -2,17 +2,18 @@ use crate::{FxHashMap, FxHashSet};
 use std::cell::RefCell;
 
 use super::{BlockArg, LoweredValue};
-use crate::jit::semantic::low_level::{Scratch, Variable};
+use crate::jit::semantic::low_level::Scratch;
 use cranelift_codegen::entity::{EntityRef, SecondaryMap};
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{MemFlagsData, types};
 use cranelift_module::{FuncId, Module};
+use oxc_span::Span;
 
 use crate::error::Error;
 use crate::jit::helpers::Helper;
 use crate::jit::semantic::{
-    Binding, Block, Constant, Facts, Graph, Inst, InstData, MemoryFormat, MemoryOp, Op, ScopeKind,
-    TerminatorKind, TypedRead, UnaryOp, Value as GraphValue, ValueType,
+    Block, Constant, Facts, Graph, Inst, InstData, MemoryFormat, MemoryOp, Op, TerminatorKind,
+    TypedRead, UnaryOp, Value as GraphValue, ValueType,
 };
 use crate::value::Value;
 
@@ -27,7 +28,6 @@ const NUMERIC: ValueType = ValueType::NUMBER.union(ValueType::UNDEFINED);
 
 pub(super) struct Context<'a> {
     entry: Block,
-    values: usize,
     plan: Plan,
     cyclic: FxHashSet<Block>,
     entering_guards: FxHashMap<Inst, String>,
@@ -58,7 +58,6 @@ impl<'a> Context<'a> {
         }
         Self {
             entry: graph.entry,
-            values: graph.values.len(),
             plan: graph
                 .ownership
                 .take()
@@ -170,72 +169,33 @@ impl FunctionCompiler<'_, '_> {
             .load(types::I64, MemFlagsData::trusted(), address, 0)
     }
 
-    fn lazy_capture_read(&mut self, local: Variable, cell: Variable) -> LoweredValue {
-        let raw = self.b.use_var(local);
-        let cell = self.b.use_var(cell);
-        let word = self.b.as_word(cell);
-        let boxed = self
-            .b
-            .ins()
-            .icmp_imm_s(IntCC::NotEqual, word, Value::UNDEFINED.bits() as i64);
-        let shared = self.b.create_block();
-        let direct = self.b.create_block();
-        let done = self.b.create_block();
-        self.b.append_block_param_repr(done, Repr::Boxed);
-        self.brif(boxed, shared, &[], direct, &[]);
-        self.switch(shared);
-        let value = self.call_helper(Helper::CellGet, &[cell]);
+    fn closure_object(
+        &mut self,
+        span: Span,
+        id: FuncId,
+        cells: &[LoweredValue],
+        (arrow, generator, lexical_this): (bool, bool, bool),
+        lexical_receiver: Option<LoweredValue>,
+    ) -> Result<LoweredValue, Error> {
+        let argv = self.stack_values(cells, span)?;
+        let count = self.b.ins().iconst(types::I64, cells.len() as i64);
+        let code = self.b.ins().iconst(types::I64, id.as_u32() as i64);
+        let result = self.call_helper(Helper::ClosureNew, &[code, argv, count]);
         self.check_error();
-        self.jump(done, &[value.into()]);
-        self.switch(direct);
-        let value = self.checked_temporary(raw, true);
-        self.jump(done, &[value.into()]);
-        self.switch(done);
-        self.b.block_params(done)[0]
-    }
-
-    fn lazy_capture_write(&mut self, local: Variable, cell: Variable, value: LoweredValue) {
-        let cell = self.b.use_var(cell);
-        let word = self.b.as_word(cell);
-        let boxed = self
-            .b
-            .ins()
-            .icmp_imm_s(IntCC::NotEqual, word, Value::UNDEFINED.bits() as i64);
-        let shared = self.b.create_block();
-        let direct = self.b.create_block();
-        let done = self.b.create_block();
-        self.brif(boxed, shared, &[], direct, &[]);
-        self.switch(shared);
-        self.call_helper(Helper::CellSet, &[cell, value]);
-        self.check_error();
-        self.jump(done, &[]);
-        self.switch(direct);
-        self.initialize_binding(local, value);
-        self.jump(done, &[]);
-        self.switch(done);
-    }
-
-    fn materialize_capture(&mut self, local: Variable, cell: Variable) -> LoweredValue {
-        let current = self.b.use_var(cell);
-        let current = self.b.as_word(current);
-        let boxed =
-            self.b
-                .ins()
-                .icmp_imm_s(IntCC::NotEqual, current, Value::UNDEFINED.bits() as i64);
-        let create = self.b.create_block();
-        let done = self.b.create_block();
-        self.brif(boxed, done, &[], create, &[]);
-        self.switch(create);
-        let value = self.b.use_var(local);
-        let created = self.call_helper(Helper::CellNew, &[value]);
-        self.check_error();
-        self.initialize_binding(cell, created);
-        // The cell now owns the binding value, including updates made by escaped callbacks.
-        let undefined = self.constant(Value::UNDEFINED);
-        self.initialize_binding(local, undefined);
-        self.jump(done, &[]);
-        self.switch(done);
-        self.b.use_var(cell)
+        if arrow {
+            let receiver = if lexical_this {
+                lexical_receiver.unwrap_or(self.receiver)
+            } else {
+                self.constant(Value::UNDEFINED)
+            };
+            self.call_helper(Helper::BindThis, &[result, receiver]);
+            self.check_error();
+        } else if generator {
+            self.call_helper(Helper::DisableConstructor, &[result]);
+            self.check_error();
+            self.check_error();
+        }
+        Ok(result)
     }
 
     pub(super) fn emit_semantic_graph(
@@ -245,22 +205,6 @@ impl FunctionCompiler<'_, '_> {
         continuations: &FxHashMap<usize, FuncId>,
     ) -> Result<(), Error> {
         let source_name = self.source_name;
-        let values: Vec<Variable> = (0..cx.values)
-            .map(|index| {
-                self.b
-                    .declare_var(self.b.graph.repr(GraphValue::from_u32(index as u32)))
-            })
-            .collect();
-        let bindings: Vec<Variable> = (0..self.b.graph.bindings.len())
-            .map(|_| self.b.declare_var(Repr::Boxed))
-            .collect();
-        let lazy_cells: Vec<_> = (0..self.b.graph.bindings.len())
-            .map(|index| {
-                let binding = Binding::new(index);
-                let lazy = self.b.graph.lazy_captures.contains(&binding);
-                lazy.then(|| self.b.declare_var(Repr::Boxed))
-            })
-            .collect();
         let cells: Vec<i64> = (0..self.b.graph.guards)
             .map(|_| {
                 let mut cell = Box::new(u64::MAX);
@@ -319,12 +263,8 @@ impl FunctionCompiler<'_, '_> {
 
         let has_handlers = self.b.graph.has_handlers;
         let repeated = |block: Block| has_handlers || cx.cyclic.contains(&block);
-        let undefined = self.constant(Value::UNDEFINED);
-        for &variable in bindings.iter().chain(lazy_cells.iter().flatten()) {
-            self.b.def_var(variable, undefined);
-        }
         for (value, slot) in cx.plan.slots.assigned() {
-            self.slots.insert(values[value.index()].as_u32(), slot);
+            self.slots.insert(value, slot);
         }
         self.slot_count = cx.plan.slots.count();
         self.jump(cx.entry, &[]);
@@ -342,9 +282,6 @@ impl FunctionCompiler<'_, '_> {
             let cold = self.b.graph.cold.contains(&block);
             let created = self.b.num_blocks();
             for value in self.b.block_params(block).to_vec() {
-                if cx.plan.slots.forwarded(value) {
-                    self.b.def_var(values[value.index()], value);
-                }
                 cx.define(value, value);
             }
             for &inst in &insts {
@@ -558,7 +495,17 @@ impl FunctionCompiler<'_, '_> {
                             | Op::IsNullish(..)
                             | Op::IsTyped(..)
                             | Op::IsString(..)
-                            | Op::IsIndexed(..) => {
+                            | Op::IsIndexed(..)
+                            | Op::CellNew(..)
+                            | Op::CellGet(..)
+                            | Op::CellSet(..)
+                            | Op::CaptureGet(..)
+                            | Op::Closure(..)
+                            | Op::Read(_)
+                            | Op::Write(..)
+                            | Op::Initialize(..)
+                            | Op::BindingLoad(_)
+                            | Op::BindingRestore(..) => {
                                 unreachable!("{:?} must be lowered before emission", data.op)
                             }
                             Op::Constant(
@@ -616,19 +563,18 @@ impl FunctionCompiler<'_, '_> {
                                     &[],
                                 );
                                 let repeated = repeated(block) || cx.plan.slots.shared(*value);
-                                let variable = values[value.index()];
-                                let value = get(self, *value);
-                                self.replace_local(variable, value, repeated);
+                                let slot = *value;
+                                let value = get(self, slot);
+                                self.replace_local(slot, value, repeated);
                                 None
                             }
                             Op::ParamStore(param, value) => {
-                                let variable = values[param.index()];
                                 let value = get(self, *value);
-                                self.replace_local(variable, value, true);
+                                self.replace_local(*param, value, true);
                                 None
                             }
                             Op::SlotClear(value) => {
-                                self.clear_local(values[value.index()]);
+                                self.clear_local(*value);
                                 None
                             }
                             Op::Release(value) => {
@@ -675,15 +621,9 @@ impl FunctionCompiler<'_, '_> {
                                 }
                                 None
                             }
-                            Op::BindingLoad(binding) => {
-                                Some(self.b.use_var(bindings[binding.index()]))
+                            Op::Argument(index) | Op::Restored(index) => {
+                                Some(self.load_arg(*index))
                             }
-                            Op::BindingRestore(binding, value) => {
-                                let value = get(self, *value);
-                                self.initialize_binding(bindings[binding.index()], value);
-                                None
-                            }
-                            Op::Argument(index) => Some(self.load_arg(*index)),
                             Op::Arguments => {
                                 let (argv, argc) = self.argument_vector()?;
                                 let value = self.call_helper(Helper::ArrayNew, &[argv, argc]);
@@ -698,6 +638,7 @@ impl FunctionCompiler<'_, '_> {
                                 Some(value)
                             }
                             Op::This => Some(self.receiver),
+                            Op::Callee => Some(closure),
                             Op::ClosureThis(..)
                             | Op::IsArrayIteration(..)
                             | Op::NewHoleyArray(..)
@@ -766,47 +707,26 @@ impl FunctionCompiler<'_, '_> {
                                 let dummy = self.constant(Value::UNDEFINED);
                                 Some(self.call_helper(Helper::Catch, &[dummy]))
                             }
-                            Op::Closure(
+                            Op::ClosureCells(
                                 span,
                                 id,
                                 arrow,
                                 generator,
                                 lexical_this,
-                                captures,
+                                cells,
                                 lexical_receiver,
                             ) => {
-                                let cells: Vec<_> = captures
-                                    .iter()
-                                    .map(|binding| {
-                                        let local = bindings[binding.index()];
-                                        match lazy_cells[binding.index()] {
-                                            Some(cell) => self.materialize_capture(local, cell),
-                                            None => self.b.use_var(local),
-                                        }
-                                    })
-                                    .collect();
-                                let argv = self.stack_values(&cells, *span)?;
-                                let count = self.b.ins().iconst(types::I64, cells.len() as i64);
-                                let code = self.b.ins().iconst(types::I64, id.as_u32() as i64);
-                                let result =
-                                    self.call_helper(Helper::ClosureNew, &[code, argv, count]);
-                                self.check_error();
-                                if *arrow {
-                                    let receiver = if *lexical_this {
-                                        lexical_receiver
-                                            .map(|value| get(self, value))
-                                            .unwrap_or(self.receiver)
-                                    } else {
-                                        self.constant(Value::UNDEFINED)
-                                    };
-                                    self.call_helper(Helper::BindThis, &[result, receiver]);
-                                    self.check_error();
-                                } else if *generator {
-                                    self.call_helper(Helper::DisableConstructor, &[result]);
-                                    self.check_error();
-                                    self.check_error();
-                                }
-                                Some(result)
+                                let cells: Vec<_> =
+                                    cells.iter().map(|&cell| get(self, cell)).collect();
+                                let lexical_receiver =
+                                    lexical_receiver.map(|value| get(self, value));
+                                Some(self.closure_object(
+                                    *span,
+                                    *id,
+                                    &cells,
+                                    (*arrow, *generator, *lexical_this),
+                                    lexical_receiver,
+                                )?)
                             }
                             Op::Constant(Constant::String(value)) => {
                                 Some(self.string_constant(value))
@@ -835,64 +755,6 @@ impl FunctionCompiler<'_, '_> {
                             Op::GlobalWrite(name, value) => {
                                 let value = get(self, *value);
                                 self.global_access(name, Some(value));
-                                None
-                            }
-                            Op::Read(binding) if lazy_cells[binding.index()].is_some() => {
-                                Some(self.lazy_capture_read(
-                                    bindings[binding.index()],
-                                    lazy_cells[binding.index()].unwrap(),
-                                ))
-                            }
-                            Op::Write(binding, value) | Op::Initialize(binding, value)
-                                if lazy_cells[binding.index()].is_some() =>
-                            {
-                                let local = bindings[binding.index()];
-                                let cell = lazy_cells[binding.index()].unwrap();
-                                if matches!(data.op, Op::Write(..)) {
-                                    self.lazy_capture_read(local, cell);
-                                }
-                                let value = get(self, *value);
-                                self.lazy_capture_write(local, cell, value);
-                                None
-                            }
-                            Op::Read(binding) => {
-                                let value = self.b.use_var(bindings[binding.index()]);
-                                let value = if self.b.graph.bindings[*binding].captured {
-                                    let value = self.call_helper(Helper::CellGet, &[value]);
-                                    self.check_error();
-                                    value
-                                } else {
-                                    self.checked_temporary(value, false)
-                                };
-                                Some(value)
-                            }
-                            Op::Write(binding, value) => {
-                                let old = self.b.use_var(bindings[binding.index()]);
-                                let helper = if self.b.graph.bindings[*binding].captured {
-                                    Helper::CellGet
-                                } else {
-                                    Helper::Retain
-                                };
-                                self.call_helper(helper, &[old]);
-                                self.check_error();
-                                let value = get(self, *value);
-                                if self.b.graph.bindings[*binding].captured {
-                                    self.call_helper(Helper::CellSet, &[old, value]);
-                                    self.check_error();
-                                } else {
-                                    self.initialize_binding(bindings[binding.index()], value);
-                                }
-                                None
-                            }
-                            Op::Initialize(binding, value) => {
-                                let value = get(self, *value);
-                                if self.b.graph.bindings[*binding].captured {
-                                    let cell = self.b.use_var(bindings[binding.index()]);
-                                    self.call_helper(Helper::CellSet, &[cell, value]);
-                                    self.check_error();
-                                } else {
-                                    self.initialize_binding(bindings[binding.index()], value);
-                                }
                                 None
                             }
                             Op::CheckInitialized(value) => {
@@ -1128,78 +990,11 @@ impl FunctionCompiler<'_, '_> {
                                     value
                                 }))
                             }
-                            Op::EnterScope(scope) | Op::EnterCaptures(scope, _) => {
-                                let closure = match data.op {
-                                    Op::EnterCaptures(_, value) => get(self, value),
-                                    _ => closure,
-                                };
-                                let captures =
-                                    self.b.graph.scopes[*scope].kind == ScopeKind::Captures;
-                                let scope = self.b.graph.scopes[*scope].bindings.clone();
-                                for (index, &binding) in scope.iter().enumerate() {
-                                    let value = if captures {
-                                        let index = self.b.ins().iconst(types::I64, index as i64);
-                                        let cell =
-                                            self.call_helper(Helper::CaptureGet, &[closure, index]);
-                                        self.check_error();
-                                        cell
-                                    } else if self.b.graph.bindings[binding].captured
-                                        && lazy_cells[binding.index()].is_none()
-                                    {
-                                        let initial = self.constant(Value::UNINITIALIZED);
-                                        let cell = self.call_helper(Helper::CellNew, &[initial]);
-                                        self.check_error();
-                                        cell
-                                    } else {
-                                        self.constant(Value::UNINITIALIZED)
-                                    };
-                                    if let Some(cell) = lazy_cells[binding.index()] {
-                                        let undefined = self.constant(Value::UNDEFINED);
-                                        self.initialize_binding(cell, undefined);
-                                    }
-                                    self.initialize_binding(bindings[binding.index()], value);
-                                }
-                                None
-                            }
-                            Op::LeaveScope(scope) => {
-                                for binding in self.b.graph.scopes[*scope].bindings.clone() {
-                                    let value = self.constant(Value::UNDEFINED);
-                                    self.initialize_binding(bindings[binding.index()], value);
-                                    if let Some(cell) = lazy_cells[binding.index()] {
-                                        self.initialize_binding(cell, value);
-                                    }
-                                }
-                                None
-                            }
-                            Op::NextIteration(scope) | Op::FreshIteration(scope) => {
-                                for binding in self.b.graph.scopes[*scope].bindings.clone() {
-                                    if !self.b.graph.bindings[binding].captured {
-                                        continue;
-                                    }
-                                    let initial = if matches!(data.op, Op::FreshIteration(_)) {
-                                        self.constant(Value::UNINITIALIZED)
-                                    } else {
-                                        if let Some(cell) = lazy_cells[binding.index()] {
-                                            self.lazy_capture_read(bindings[binding.index()], cell)
-                                        } else {
-                                            let cell = self.b.use_var(bindings[binding.index()]);
-                                            let value = self.call_helper(Helper::CellGet, &[cell]);
-                                            self.check_error();
-                                            value
-                                        }
-                                    };
-                                    if let Some(cell) = lazy_cells[binding.index()] {
-                                        let undefined = self.constant(Value::UNDEFINED);
-                                        self.initialize_binding(cell, undefined);
-                                        self.initialize_binding(bindings[binding.index()], initial);
-                                        continue;
-                                    }
-                                    let cell = self.call_helper(Helper::CellNew, &[initial]);
-                                    self.check_error();
-                                    self.initialize_binding(bindings[binding.index()], cell);
-                                }
-                                None
-                            }
+                            Op::EnterScope(_)
+                            | Op::EnterCaptures(..)
+                            | Op::LeaveScope(_)
+                            | Op::NextIteration(_)
+                            | Op::FreshIteration(_) => None,
                         };
                         result.map(|value| Operand::new(value, Repr::Boxed))
                     }

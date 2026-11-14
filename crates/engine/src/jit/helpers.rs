@@ -143,7 +143,6 @@ define_helpers! {
     MathDirect => js_math_direct(u64, Value, *const Value, u64) -> Value;
     FrameOverflow => js_frame_overflow() -> Value;
     FrameRelease => js_frame_release() -> Value;
-    LocalReplace => js_local_replace(u64, Value, Value) -> Value;
     Release => js_release(Value) -> Value;
     RetainAddress => js_retain_address(u64) -> Value;
     Bailout => js_bailout(u64) -> Value;
@@ -395,9 +394,6 @@ extern "C" fn js_retain_address(ctx: *mut JitCtx, address: u64) -> Value {
         "retain of a freed value"
     );
     Value::UNDEFINED
-}
-extern "C" fn js_local_replace(ctx: *mut JitCtx, slot: u64, value: Value, old: Value) -> Value {
-    unsafe { &mut *ctx }.local_replace(slot as usize, value, old)
 }
 extern "C" fn js_retain(ctx: *mut JitCtx, value: Value) -> Value {
     let ctx = unsafe { &mut *ctx };

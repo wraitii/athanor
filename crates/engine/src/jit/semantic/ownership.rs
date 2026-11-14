@@ -121,9 +121,7 @@ pub(super) fn plan(graph: &mut Graph, facts: &mut Facts) -> Plan {
         },
         |value| match graph.defining_op(value) {
             Some(Op::Get(_, name)) => name != "length",
-            Some(Op::Read(binding)) => {
-                !graph.bindings[*binding].captured && !graph.lazy_captures.contains(binding)
-            }
+            Some(Op::Read(binding)) => !graph.bindings[*binding].captured,
             Some(
                 Op::TypedIndex(..)
                 | Op::HelperCall {

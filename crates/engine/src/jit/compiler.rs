@@ -381,9 +381,21 @@ impl Compiler {
             cranelift_codegen::ir::Function,
             Annotations,
             Option<super::semantic::Graph>,
+            Option<(String, String)>,
         ),
         Error,
     > {
+        let pass = self
+            .inspection
+            .as_deref()
+            .filter(|options| options.semantic_ir)
+            .and_then(|options| options.after.clone());
+        let mut snapshot = None;
+        let mut after = |name: &str, graph: &super::semantic::Graph| {
+            if pass.as_deref() == Some(name) {
+                snapshot = Some((name.to_owned(), super::inspect::graph_text(graph)));
+            }
+        };
         let mut annotations = Annotations {
             semantic_locations: self.dump_ir || self.inspection.is_some(),
             ..Annotations::default()
@@ -411,6 +423,7 @@ impl Compiler {
             cells: &mut self.cells,
             data: &mut data,
             source_name,
+            after: &mut after,
         })?;
         builder.seal_all_blocks();
         builder.finalize(self.module.target_config());
@@ -420,7 +433,7 @@ impl Compiler {
             &mut self.context.func,
             cranelift_codegen::ir::Function::new(),
         );
-        Ok((function, annotations, lowered))
+        Ok((function, annotations, lowered, snapshot))
     }
 
     fn machine_code(
@@ -934,7 +947,7 @@ impl Compiler {
             .after(after)
             .ast(self.inspection.as_deref(), &program);
             let listing = self.listing().then(|| graph.listing_lines());
-            let (function, annotations, lowered) = if baseline.is_some() {
+            let (function, annotations, lowered, snapshot) = if baseline.is_some() {
                 self.data.push(baseline_data);
                 let mut function = cranelift_codegen::ir::Function::new();
                 function.signature = self.signature.clone();
@@ -945,12 +958,14 @@ impl Compiler {
                         ..Annotations::default()
                     },
                     None,
+                    None,
                 )
             } else {
                 self.emit_body(self.signature.clone(), self.source_name, |out| {
                     emit::build_global(out, graph.graph, &graph.facts, &continuations)
                 })?
             };
+            let inspection = inspection.lowered(snapshot);
             pending.push((
                 id,
                 FunctionBody {
@@ -1647,7 +1662,7 @@ impl Compiler {
             inline_multiplier,
         )
         .after(after);
-        let (function, annotations, lowered) = if baseline.is_some() {
+        let (function, annotations, lowered, snapshot) = if baseline.is_some() {
             let mut function = cranelift_codegen::ir::Function::new();
             function.signature = signature;
             (
@@ -1656,6 +1671,7 @@ impl Compiler {
                     semantic_locations: self.dump_ir || self.inspection.is_some(),
                     ..Annotations::default()
                 },
+                None,
                 None,
             )
         } else {
@@ -1670,6 +1686,7 @@ impl Compiler {
                 )
             })?
         };
+        let inspection = inspection.lowered(snapshot);
         let body = FunctionBody {
             function,
             lowered,
@@ -1923,7 +1940,7 @@ impl Compiler {
         let listing = self
             .listing()
             .then(|| state.graph.listing(&state.facts).lines());
-        let (function, annotations, lowered) = if baseline.is_some() {
+        let (function, annotations, lowered, snapshot) = if baseline.is_some() {
             let mut function = cranelift_codegen::ir::Function::new();
             function.signature = self.signature.clone();
             (
@@ -1932,6 +1949,7 @@ impl Compiler {
                     semantic_locations: self.dump_ir || self.inspection.is_some(),
                     ..Annotations::default()
                 },
+                None,
                 None,
             )
         } else {
@@ -1946,6 +1964,7 @@ impl Compiler {
                 )
             })?
         };
+        let inspection = inspection.lowered(snapshot);
         Ok(FunctionBody {
             function,
             lowered,
@@ -2249,7 +2268,7 @@ impl Compiler {
             .listing()
             .then(|| graph.as_ref().map(|graph| graph.listing_lines()))
             .flatten();
-        let (function, annotations, lowered) = if baseline.is_some() {
+        let (function, annotations, lowered, snapshot) = if baseline.is_some() {
             let mut function = cranelift_codegen::ir::Function::new();
             function.signature = signature;
             (
@@ -2258,6 +2277,7 @@ impl Compiler {
                     semantic_locations: self.dump_ir || self.inspection.is_some(),
                     ..Annotations::default()
                 },
+                None,
                 None,
             )
         } else {
@@ -2278,6 +2298,7 @@ impl Compiler {
                 },
             })?
         };
+        let inspection = inspection.lowered(snapshot);
         Ok(FunctionBody {
             function,
             lowered,
@@ -2560,7 +2581,7 @@ mod listing_tests {
 
 #[cfg(all(test, target_arch = "aarch64"))]
 mod native_fallback_tests {
-    use super::super::semantic::{Graph, low_level::Builder};
+    use super::super::semantic::{Graph, low_level::Builder, variables::Variables};
     use super::*;
     use cranelift_codegen::ir::{AbiParam, MemFlagsData, Signature, TrapCode, types};
     use cranelift_module::{Linkage, Module};
@@ -2595,7 +2616,7 @@ mod native_fallback_tests {
         let flags = MemFlagsData::new().with_trap_code(Some(TrapCode::HEAP_OUT_OF_BOUNDS));
         let value = builder.ins().load(types::I32, flags, pointer, 0);
         builder.ins().return_(&[value]);
-        builder.finish().unwrap();
+        Variables::default().finish(&mut graph).unwrap();
         assert!(super::super::aarch64::compile_graph(&graph).is_err());
         compiler.context.func.signature = signature;
         let machine = compiler

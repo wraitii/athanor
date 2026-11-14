@@ -374,7 +374,7 @@ fn array_iteration_exposes_and_inlines_known_closures() {
                 assert!(caller.contains("materialized only in fallback"));
                 assert!(
                     caller.find("helper_call ArrayIterationGuard(").unwrap()
-                        < caller.find(" = closure ").unwrap()
+                        < caller.find(" = closure_cells ").unwrap()
                 );
             }
         }
@@ -405,7 +405,7 @@ fn inlined_local_calls_remove_unused_closure_allocations() {
         .split("semantic IR")
         .next()
         .unwrap();
-    assert!(!caller.contains(" = closure "));
+    assert!(!caller.contains(" = closure_cells "));
     assert!(caller.contains("unused closure"));
 }
 
@@ -520,6 +520,8 @@ fn inlined_captures_use_bindings_and_materialize_only_for_fallbacks() {
             "--no-ir",
             "--semantic-ir",
             "--planner",
+            "--after",
+            "input",
             "--eval",
             source,
         ])
@@ -532,7 +534,7 @@ fn inlined_captures_use_bindings_and_materialize_only_for_fallbacks() {
     );
     let dump = String::from_utf8(output.stdout).unwrap();
     let caller = dump
-        .split("semantic IR main\n")
+        .split("semantic IR main after input\n")
         .nth(1)
         .unwrap()
         .split("semantic IR")

@@ -1,5 +1,3 @@
-use crate::FxHashMap;
-use cranelift_codegen::entity::SecondaryMap;
 use cranelift_codegen::ir::{
     MemFlagsData, Signature, Type,
     condcodes::{FloatCC, IntCC},
@@ -7,7 +5,8 @@ use cranelift_codegen::ir::{
 use cranelift_module::FuncId;
 use oxc_span::Span;
 
-use super::{Block, Cfg, Graph, Inst, Op as GraphOp, Repr, Value};
+use super::cursor::Insert;
+use super::{Block, Graph, Inst, Op as GraphOp, Repr, Value};
 use crate::jit::helpers::Helper;
 
 #[derive(Clone, Debug)]
@@ -210,15 +209,6 @@ impl From<Value> for BlockArg {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(in crate::jit) struct Variable(usize);
-
-impl Variable {
-    pub(in crate::jit) fn as_u32(self) -> u32 {
-        self.0 as u32
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 pub(in crate::jit) struct SignatureRef(usize);
 
@@ -227,14 +217,10 @@ pub(in crate::jit) struct FunctionRef(usize);
 
 pub(in crate::jit) struct Builder<'a> {
     pub(in crate::jit) graph: &'a mut Graph,
-    definitions: FxHashMap<(Block, usize), Value>,
-    reads: Vec<(Block, usize, Inst, Value)>,
-    types: FxHashMap<usize, Repr>,
     location: Option<u32>,
     source_name: Option<(usize, usize)>,
     current: Option<Block>,
     cursor: Option<usize>,
-    variable_types: Vec<Repr>,
     signatures: Vec<Signature>,
     functions: Vec<(FuncId, Signature)>,
     span: Span,
@@ -245,14 +231,10 @@ impl<'a> Builder<'a> {
         let span = graph.span;
         Self {
             graph,
-            definitions: FxHashMap::default(),
-            reads: Vec::new(),
-            types: FxHashMap::default(),
             location: None,
             source_name: None,
             current: None,
             cursor: None,
-            variable_types: Vec::new(),
             signatures: Vec::new(),
             functions: Vec::new(),
             span,
@@ -277,7 +259,7 @@ impl<'a> Builder<'a> {
         self.cursor
     }
 
-    fn place(
+    fn place_in(
         &mut self,
         block: Block,
         span: Span,
@@ -292,13 +274,7 @@ impl<'a> Builder<'a> {
     }
 
     pub(in crate::jit) fn semantic(&mut self, op: GraphOp, repr: Repr) -> Value {
-        let block = self.current.expect("no current block");
-        let (inst, value) = self.place(block, self.span, op, true);
-        self.graph.insts[inst].emission_location = self.location;
-        self.graph.insts[inst].source_name = self.source_name;
-        let value = value.unwrap();
-        self.graph.reprs[value] = Some(repr);
-        value
+        self.add(op, repr)
     }
 
     pub(in crate::jit) fn create_sized_stack_slot(
@@ -447,48 +423,17 @@ impl<'a> Builder<'a> {
     #[track_caller]
     pub(in crate::jit) fn as_boxed(&mut self, word: Value) -> Value {
         debug_assert_eq!(self.graph.repr(word), Repr::I64);
-        self.semantic(GraphOp::AsBoxed(word), Repr::Boxed)
+        Insert::as_boxed(self, word)
     }
 
     #[track_caller]
     pub(in crate::jit) fn as_word(&mut self, value: Value) -> Value {
         debug_assert_eq!(self.graph.repr(value), Repr::Boxed);
-        self.semantic(GraphOp::AsWord(value), Repr::I64)
+        Insert::as_word(self, value)
     }
 
     pub(in crate::jit) fn block_params(&self, block: Block) -> &[Value] {
         &self.graph.blocks[block].params
-    }
-
-    pub(in crate::jit) fn declare_var(&mut self, repr: Repr) -> Variable {
-        let variable = Variable(self.variable_types.len());
-        self.variable_types.push(repr);
-        variable
-    }
-
-    pub(in crate::jit) fn declare_var_with_entry_value(&mut self, value: Value) -> Variable {
-        let variable = self.declare_var(self.graph.repr(value));
-        self.definitions
-            .insert((self.graph.entry, variable.0), value);
-        variable
-    }
-
-    pub(in crate::jit) fn def_var(&mut self, variable: Variable, value: Value) {
-        self.write(
-            self.current.expect("no current block"),
-            variable.0,
-            value,
-            self.variable_types[variable.0],
-        );
-    }
-
-    pub(in crate::jit) fn use_var(&mut self, variable: Variable) -> Value {
-        self.read(
-            self.current.expect("no current block"),
-            variable.0,
-            self.variable_types[variable.0],
-            self.span,
-        )
     }
 
     pub(in crate::jit) fn scratch(&mut self, op: Scratch, values: &[Value]) -> Inst {
@@ -501,17 +446,6 @@ impl<'a> Builder<'a> {
             self.span,
             Op::Scratch { op, values },
         )
-    }
-
-    pub(in crate::jit) fn cleanup(&mut self, values: Vec<Value>, unwind: bool) {
-        if values.is_empty() {
-            return;
-        }
-        self.effect(
-            self.current.expect("no current block"),
-            self.span,
-            Op::Cleanup { values, unwind },
-        );
     }
 
     pub(in crate::jit) fn store_frame(&mut self, ctx: Value, value: Value, slot: u32) -> Value {
@@ -529,8 +463,8 @@ impl<'a> Builder<'a> {
         );
     }
 
-    pub(in crate::jit) fn ins(&mut self) -> Instructions<'_, 'a> {
-        Instructions { builder: self }
+    pub(in crate::jit) fn ins(&mut self) -> Instructions<'_, Self> {
+        Instructions { inserter: self }
     }
 
     pub(in crate::jit) fn set_source_name(&mut self, source_name: Option<(usize, usize)>) {
@@ -553,8 +487,9 @@ impl<'a> Builder<'a> {
         terminator.source_name = self.source_name;
     }
 
+    #[cfg(test)]
     pub(in crate::jit) fn value(&mut self, block: Block, span: Span, op: Op, ty: Type) -> Value {
-        let (inst, value) = self.place(block, span, GraphOp::LowLevel(op), true);
+        let (inst, value) = self.place_in(block, span, GraphOp::LowLevel(op), true);
         self.graph.insts[inst].emission_location = self.location;
         self.graph.insts[inst].source_name = self.source_name;
         let value = value.unwrap();
@@ -563,7 +498,7 @@ impl<'a> Builder<'a> {
     }
 
     pub(in crate::jit) fn effect(&mut self, block: Block, span: Span, op: Op) -> Inst {
-        let inst = self.place(block, span, GraphOp::LowLevel(op), false).0;
+        let inst = self.place_in(block, span, GraphOp::LowLevel(op), false).0;
         self.graph.insts[inst].emission_location = self.location;
         self.graph.insts[inst].source_name = self.source_name;
         inst
@@ -617,126 +552,28 @@ impl<'a> Builder<'a> {
         }
         inst
     }
+}
 
-    pub(in crate::jit) fn write(
-        &mut self,
-        block: Block,
-        variable: usize,
-        value: Value,
-        repr: Repr,
-    ) {
-        if let Some(previous) = self.types.insert(variable, repr) {
-            assert_eq!(previous, repr);
-        }
-        match self.graph.reprs[value] {
-            Some(existing) => {
-                assert_eq!(existing, repr, "variable {variable} written with {value}")
-            }
-            None => self.graph.reprs[value] = Some(repr),
-        }
-        self.definitions.insert((block, variable), value);
+impl Insert for Builder<'_> {
+    fn graph(&self) -> &Graph {
+        self.graph
     }
 
-    pub(in crate::jit) fn read(
-        &mut self,
-        block: Block,
-        variable: usize,
-        repr: Repr,
-        span: Span,
-    ) -> Value {
-        if let Some(previous) = self.types.insert(variable, repr) {
-            assert_eq!(previous, repr);
-        }
-        if let Some(&value) = self.definitions.get(&(block, variable)) {
-            return value;
-        }
-        let (inst, result) =
-            self.graph
-                .append(block, span, GraphOp::LowLevel(Op::VariableRead), true);
-        let value = result.unwrap();
-        self.graph.reprs[value] = Some(repr);
-        self.reads.push((block, variable, inst, value));
-        self.definitions.insert((block, variable), value);
-        value
+    fn graph_mut(&mut self) -> &mut Graph {
+        self.graph
     }
 
-    pub(in crate::jit) fn finish(mut self) -> Result<(), String> {
-        let cfg = Cfg::new(self.graph);
-        let mut reachable = SecondaryMap::<Block, bool>::new();
-        for &block in &cfg.rpo {
-            reachable[block] = true;
-        }
-        let mut entries = FxHashMap::default();
-        let mut aliases = SecondaryMap::new();
-        let mut work = Vec::new();
-        let mut changed = false;
-        for (block, variable, inst, value) in std::mem::take(&mut self.reads) {
-            if !reachable[block] {
-                self.graph.remove_inst(inst);
-                continue;
-            }
-            let definition = self.entry_value(&cfg, &mut entries, &mut work, block, variable)?;
-            aliases[value] = Some(definition);
-            self.graph.remove_inst(inst);
-            changed = true;
-        }
-        super::transforms::simplify_parameters(self.graph, &cfg.rpo, &mut aliases, changed);
-        Ok(())
+    fn place(&mut self, op: GraphOp, has_result: bool) -> (Inst, Option<Value>) {
+        let block = self.current.expect("no current block");
+        let (inst, value) = self.place_in(block, self.span, op, has_result);
+        self.graph.insts[inst].emission_location = self.location;
+        self.graph.insts[inst].source_name = self.source_name;
+        (inst, value)
     }
 
-    fn entry_value(
-        &mut self,
-        cfg: &Cfg,
-        entries: &mut FxHashMap<(Block, usize), Value>,
-        work: &mut Vec<(Block, Option<usize>)>,
-        block: Block,
-        variable: usize,
-    ) -> Result<Value, String> {
-        if let Some(&value) = entries.get(&(block, variable)) {
-            return Ok(value);
-        }
-        work.push((block, None));
-        while let Some(&(current, next)) = work.last() {
-            let next = match next {
-                Some(next) => next,
-                None => {
-                    if current == self.graph.entry || cfg.preds[current].is_empty() {
-                        return Err(format!(
-                            "variable {variable} has no definition at entry to {current}"
-                        ));
-                    }
-                    if cfg.preds[current].len() > 1 {
-                        // Backedges must find this phi before its inputs are resolved.
-                        let param = self.graph.add_param(current);
-                        entries.insert((current, variable), param);
-                        self.graph.reprs[param] = Some(self.types[&variable]);
-                    }
-                    work.last_mut().unwrap().1 = Some(0);
-                    0
-                }
-            };
-            let pred = cfg.preds[current][next];
-            let value = self
-                .definitions
-                .get(&(pred, variable))
-                .or_else(|| entries.get(&(pred, variable)))
-                .copied();
-            let Some(value) = value else {
-                work.push((pred, None));
-                continue;
-            };
-            if cfg.preds[current].len() == 1 {
-                entries.insert((current, variable), value);
-            } else {
-                self.graph.push_edge_arg(pred, current, value);
-            }
-            if next + 1 == cfg.preds[current].len() {
-                work.pop();
-            } else {
-                work.last_mut().unwrap().1 = Some(next + 1);
-            }
-        }
-        Ok(entries[&(block, variable)])
+    fn terminate_current(&mut self, kind: super::TerminatorKind) {
+        let block = self.current.expect("no current block");
+        self.terminate(block, self.span, kind);
     }
 }
 
@@ -767,8 +604,8 @@ impl Switch {
     }
 }
 
-pub(in crate::jit) struct Instructions<'b, 'g> {
-    builder: &'b mut Builder<'g>,
+pub(in crate::jit) struct Instructions<'b, I: Insert + ?Sized> {
+    pub(super) inserter: &'b mut I,
 }
 
 macro_rules! binary_methods {
@@ -782,7 +619,7 @@ macro_rules! binary_methods {
 macro_rules! immediate_methods {
     ($($name:ident => $op:ident),* $(,)?) => { $(
         pub(in crate::jit) fn $name(&mut self, value: Value, immediate: i64) -> Value {
-            let ty = self.builder.graph.reprs[value].map(Repr::machine).expect("untyped low-level operand");
+            let ty = self.inserter.graph().reprs[value].map(Repr::machine).expect("untyped low-level operand");
             let immediate = self.iconst(ty, immediate);
             self.binary(Binary::$op, value, immediate)
         }
@@ -792,7 +629,7 @@ macro_rules! immediate_methods {
 macro_rules! unary_methods {
     ($($name:ident => $op:ident),* $(,)?) => { $(
         pub(in crate::jit) fn $name(&mut self, value: Value) -> Value {
-            let ty = self.builder.graph.reprs[value].map(Repr::machine).expect("untyped low-level operand");
+            let ty = self.inserter.graph().reprs[value].map(Repr::machine).expect("untyped low-level operand");
             self.value(Op::Unary { op: Unary::$op, ty, value }, ty)
         }
     )* };
@@ -806,18 +643,29 @@ macro_rules! conversion_methods {
     )* };
 }
 
-impl Instructions<'_, '_> {
+impl<I: Insert + ?Sized> Instructions<'_, I> {
     fn value(&mut self, op: Op, ty: Type) -> Value {
-        let block = self.builder.current.expect("no current block");
-        self.builder.value(block, self.builder.span, op, ty)
+        self.inserter
+            .add(GraphOp::LowLevel(op), Repr::from_machine(ty))
+    }
+
+    fn derived(&mut self, op: Op, first: Value, second: Value) -> Value {
+        let reprs = &self.inserter.graph().reprs;
+        let (first, second) = (
+            reprs[first].map(Repr::machine),
+            reprs[second].map(Repr::machine),
+        );
+        if let (Some(first), Some(second)) = (first, second) {
+            assert_eq!(first, second, "mismatched low-level operands");
+        }
+        match first.or(second) {
+            Some(ty) => self.value(op, ty),
+            None => self.inserter.place(GraphOp::LowLevel(op), true).1.unwrap(),
+        }
     }
 
     pub(in crate::jit) fn binary(&mut self, op: Binary, left: Value, right: Value) -> Value {
-        let ty = self.builder.graph.reprs[left]
-            .map(Repr::machine)
-            .expect("untyped low-level operand");
-        assert_eq!(self.builder.graph.reprs[right].map(Repr::machine), Some(ty));
-        self.value(Op::Binary { op, left, right }, ty)
+        self.derived(Op::Binary { op, left, right }, left, right)
     }
 
     binary_methods!(isub => Subtract, band => And, bor => Or, bxor => Xor,
@@ -869,7 +717,7 @@ impl Instructions<'_, '_> {
         left: Value,
         immediate: i64,
     ) -> Value {
-        let ty = self.builder.graph.reprs[left]
+        let ty = self.inserter.graph().reprs[left]
             .map(Repr::machine)
             .expect("untyped low-level operand");
         let right = self.iconst(ty, immediate);
@@ -897,11 +745,7 @@ impl Instructions<'_, '_> {
     }
 
     pub(in crate::jit) fn select(&mut self, condition: Value, yes: Value, no: Value) -> Value {
-        let ty = self.builder.graph.reprs[yes]
-            .map(Repr::machine)
-            .expect("untyped low-level operand");
-        assert_eq!(self.builder.graph.reprs[no].map(Repr::machine), Some(ty));
-        self.value(Op::Select { condition, yes, no }, ty)
+        self.derived(Op::Select { condition, yes, no }, yes, no)
     }
 
     pub(in crate::jit) fn atomic_load(
@@ -960,73 +804,17 @@ impl Instructions<'_, '_> {
         address: Value,
         offset: i32,
     ) -> Inst {
-        let block = self.builder.current.expect("no current block");
-        self.builder.effect(
-            block,
-            self.builder.span,
-            Op::Store {
-                value,
-                address,
-                offset,
-                flags,
-            },
-        )
-    }
-
-    pub(in crate::jit) fn call(&mut self, function: FunctionRef, args: &[Value]) -> Inst {
-        let (id, signature) = self.builder.functions[function.0].clone();
-        let block = self.builder.current.expect("no current block");
-        self.builder.call_inst(
-            block,
-            self.builder.span,
-            CallTarget::Direct(id),
-            signature,
-            args.to_vec(),
-        )
-    }
-
-    pub(in crate::jit) fn call_indirect(
-        &mut self,
-        signature: SignatureRef,
-        address: Value,
-        args: &[Value],
-    ) -> Inst {
-        let signature = self.builder.signatures[signature.0].clone();
-        let block = self.builder.current.expect("no current block");
-        self.builder.call_inst(
-            block,
-            self.builder.span,
-            CallTarget::Indirect(address),
-            signature,
-            args.to_vec(),
-        )
-    }
-
-    pub(in crate::jit) fn return_call_indirect(
-        &mut self,
-        signature: SignatureRef,
-        address: Value,
-        args: &[Value],
-    ) {
-        let signature = self.builder.signatures[signature.0].clone();
-        let block = self.builder.current.expect("no current block");
-        self.builder.terminate(
-            block,
-            self.builder.span,
-            super::TerminatorKind::TailCall {
-                target: CallTarget::Indirect(address),
-                signature,
-                args: args.to_vec(),
-            },
-        );
+        self.inserter.add_effect(GraphOp::LowLevel(Op::Store {
+            value,
+            address,
+            offset,
+            flags,
+        }))
     }
 
     pub(in crate::jit) fn jump(&mut self, destination: Block, args: &[BlockArg]) {
-        let block = self.builder.current.expect("no current block");
-        self.builder.terminate(
-            block,
-            self.builder.span,
-            super::TerminatorKind::Jump(super::Target {
+        self.inserter
+            .terminate_current(super::TerminatorKind::Jump(super::Target {
                 block: destination,
                 args: args
                     .iter()
@@ -1034,8 +822,7 @@ impl Instructions<'_, '_> {
                         BlockArg::Value(value) => *value,
                     })
                     .collect(),
-            }),
-        );
+            }));
     }
 
     pub(in crate::jit) fn brif(
@@ -1046,11 +833,8 @@ impl Instructions<'_, '_> {
         no: Block,
         no_args: &[BlockArg],
     ) {
-        let block = self.builder.current.expect("no current block");
-        self.builder.terminate(
-            block,
-            self.builder.span,
-            super::TerminatorKind::Branch(
+        self.inserter
+            .terminate_current(super::TerminatorKind::Branch(
                 condition,
                 super::Target {
                     block: yes,
@@ -1070,16 +854,61 @@ impl Instructions<'_, '_> {
                         })
                         .collect(),
                 },
-            ),
-        );
+            ));
     }
 
     pub(in crate::jit) fn return_(&mut self, values: &[Value]) {
-        let block = self.builder.current.expect("no current block");
-        self.builder.terminate(
+        self.inserter
+            .terminate_current(super::TerminatorKind::ReturnValues(values.to_vec()));
+    }
+}
+
+impl Instructions<'_, Builder<'_>> {
+    pub(in crate::jit) fn call(&mut self, function: FunctionRef, args: &[Value]) -> Inst {
+        let (id, signature) = self.inserter.functions[function.0].clone();
+        let block = self.inserter.current.expect("no current block");
+        self.inserter.call_inst(
             block,
-            self.builder.span,
-            super::TerminatorKind::ReturnValues(values.to_vec()),
+            self.inserter.span,
+            CallTarget::Direct(id),
+            signature,
+            args.to_vec(),
+        )
+    }
+
+    pub(in crate::jit) fn call_indirect(
+        &mut self,
+        signature: SignatureRef,
+        address: Value,
+        args: &[Value],
+    ) -> Inst {
+        let signature = self.inserter.signatures[signature.0].clone();
+        let block = self.inserter.current.expect("no current block");
+        self.inserter.call_inst(
+            block,
+            self.inserter.span,
+            CallTarget::Indirect(address),
+            signature,
+            args.to_vec(),
+        )
+    }
+
+    pub(in crate::jit) fn return_call_indirect(
+        &mut self,
+        signature: SignatureRef,
+        address: Value,
+        args: &[Value],
+    ) {
+        let signature = self.inserter.signatures[signature.0].clone();
+        let block = self.inserter.current.expect("no current block");
+        self.inserter.terminate(
+            block,
+            self.inserter.span,
+            super::TerminatorKind::TailCall {
+                target: CallTarget::Indirect(address),
+                signature,
+                args: args.to_vec(),
+            },
         );
     }
 }

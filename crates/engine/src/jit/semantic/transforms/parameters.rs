@@ -138,6 +138,7 @@ mod tests {
     use crate::jit::semantic::{
         Repr, Target, TerminatorKind,
         low_level::{Builder, CallTarget},
+        variables::Variables,
     };
     use cranelift_codegen::ir::{AbiParam, Signature, types};
     use cranelift_codegen::isa::CallConv;
@@ -200,7 +201,7 @@ mod tests {
             }),
         );
         builder.terminate(exit, span, TerminatorKind::ReturnValues(vec![x, y]));
-        builder.finish().unwrap();
+        Variables::default().finish(&mut graph).unwrap();
         (graph, header, entry, results[0], results[1])
     }
 
@@ -275,7 +276,7 @@ mod tests {
             }),
         );
         builder.terminate(exit, span, TerminatorKind::ReturnValues(vec![forwarded]));
-        builder.finish().unwrap();
+        Variables::default().finish(&mut graph).unwrap();
         graph.verify().unwrap();
         assert_eq!(graph.blocks[join].params, vec![varying]);
         assert!(graph.blocks[exit].params.is_empty());
@@ -309,7 +310,7 @@ mod tests {
         );
         builder.terminate(unreachable, span, TerminatorKind::Jump(Target::new(join)));
         builder.terminate(join, span, TerminatorKind::ReturnValues(vec![param]));
-        builder.finish().unwrap();
+        Variables::default().finish(&mut graph).unwrap();
         graph.verify().unwrap();
         assert!(graph.blocks[join].params.is_empty());
         assert!(

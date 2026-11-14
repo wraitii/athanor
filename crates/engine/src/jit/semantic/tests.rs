@@ -5,6 +5,7 @@ use super::specialization::{
     writes,
 };
 use super::transforms::{conversions, loops, reuse};
+use super::variables::Variables;
 use super::*;
 use crate::FxHashSet;
 use oxc_allocator::Allocator;
@@ -2450,20 +2451,21 @@ fn low_level_variables_forward_through_chains_and_loop() {
     let body = builder.create_block();
     let backedge = builder.create_block();
     let exit = builder.create_block();
-    builder.write(entry, 0, input, super::Repr::I64);
-    builder.write(entry, 1, input, super::Repr::I64);
+    let mut variables = Variables::default();
+    let variable0 = variables.declare(builder.graph, input, super::Repr::I64);
+    let variable1 = variables.declare(builder.graph, input, super::Repr::I64);
     builder.terminate(entry, span, TerminatorKind::Jump(Target::new(first)));
     builder.terminate(first, span, TerminatorKind::Jump(Target::new(second)));
     builder.terminate(second, span, TerminatorKind::Jump(Target::new(header)));
-    let invariant = builder.read(header, 0, super::Repr::I64, span);
-    let induction = builder.read(header, 1, super::Repr::I64, span);
+    let invariant = variables.read(builder.graph, header, span, variable0);
+    let induction = variables.read(builder.graph, header, span, variable1);
     builder.terminate(
         header,
         span,
         TerminatorKind::Branch(condition, Target::new(body), Target::new(exit)),
     );
     builder.terminate(body, span, TerminatorKind::Jump(Target::new(backedge)));
-    let prior = builder.read(backedge, 1, super::Repr::I64, span);
+    let prior = variables.read(builder.graph, backedge, span, variable1);
     let one = builder.value(
         backedge,
         span,
@@ -2483,14 +2485,14 @@ fn low_level_variables_forward_through_chains_and_loop() {
         },
         types::I64,
     );
-    builder.write(backedge, 1, next, super::Repr::I64);
+    variables.define(builder.graph, backedge, variable1, next);
     builder.terminate(backedge, span, TerminatorKind::Jump(Target::new(header)));
     builder.terminate(
         exit,
         span,
         TerminatorKind::ReturnValues(vec![invariant, induction]),
     );
-    builder.finish().unwrap();
+    variables.finish(builder.graph).unwrap();
     graph.verify().unwrap();
     assert_eq!(graph.blocks[entry].params.len(), 2);
     assert_eq!(graph.blocks[header].params.len(), 1);
@@ -2531,16 +2533,14 @@ fn low_level_variables_resolve_diamond_and_loop() {
         TerminatorKind::Branch(initial, Target::new(body), Target::new(exit)),
     );
     graph.terminate(body, span, TerminatorKind::Jump(Target::new(join)));
-    let mut builder = low_level::Builder::new(&mut graph);
-    builder.write(entry, 0, initial, super::Repr::I64);
-    builder.write(left, 0, changed, super::Repr::I64);
-    let joined = builder.read(join, 0, super::Repr::I64, span);
-    builder.write(body, 0, joined, super::Repr::I64);
-    let result = builder.read(exit, 0, super::Repr::I64, span);
-    builder
-        .graph
-        .terminate(exit, span, TerminatorKind::Return(result));
-    builder.finish().unwrap();
+    let mut variables = Variables::default();
+    let variable = variables.declare(&mut graph, initial, super::Repr::I64);
+    variables.define(&mut graph, left, variable, changed);
+    let joined = variables.read(&mut graph, join, span, variable);
+    variables.define(&mut graph, body, variable, joined);
+    let result = variables.read(&mut graph, exit, span, variable);
+    graph.terminate(exit, span, TerminatorKind::Return(result));
+    variables.finish(&mut graph).unwrap();
     let param = graph.blocks[join].params[0];
     assert_eq!(graph.blocks[join].params.len(), 1);
     assert!(
@@ -2604,7 +2604,7 @@ fn low_level_call_results_keep_types_and_operands() {
         signature,
         vec![arg],
     );
-    builder.finish().unwrap();
+    Variables::default().finish(&mut graph).unwrap();
     let [result, status] = results[..] else {
         panic!()
     };
@@ -2654,34 +2654,6 @@ fn low_level_call_results_keep_types_and_operands() {
 }
 
 #[test]
-fn low_level_ssa_rejects_undefined_cycle() {
-    let mut graph = lower_source("function f(a){return a;}").unwrap();
-    let entry = graph.entry;
-    let span = graph.span;
-    let condition = graph.blocks[entry]
-        .terminator
-        .as_ref()
-        .unwrap()
-        .kind
-        .operands_iter()
-        .next()
-        .unwrap();
-    let header = graph.blocks.push(BlockData::default());
-    let body = graph.blocks.push(BlockData::default());
-    graph.terminate(entry, span, TerminatorKind::Jump(Target::new(header)));
-    graph.terminate(
-        header,
-        span,
-        TerminatorKind::Branch(condition, Target::new(body), Target::new(body)),
-    );
-    graph.terminate(body, span, TerminatorKind::Jump(Target::new(header)));
-    let mut builder = low_level::Builder::new(&mut graph);
-    let value = builder.read(header, 0, super::Repr::I64, span);
-    builder.write(body, 0, value, super::Repr::I64);
-    assert!(builder.finish().is_err());
-}
-
-#[test]
 fn low_level_ssa_same_target_edges_receive_one_argument() {
     let mut graph = lower_source("function f(a){return a;}").unwrap();
     let entry = graph.entry;
@@ -2709,14 +2681,12 @@ fn low_level_ssa_same_target_edges_receive_one_argument() {
         TerminatorKind::Branch(initial, Target::new(body), Target::new(exit)),
     );
     graph.terminate(body, span, TerminatorKind::Jump(Target::new(join)));
-    let mut builder = low_level::Builder::new(&mut graph);
-    builder.write(entry, 0, initial, super::Repr::I64);
-    let value = builder.read(join, 0, super::Repr::I64, span);
-    builder.write(body, 0, changed, super::Repr::I64);
-    builder
-        .graph
-        .terminate(exit, span, TerminatorKind::Return(value));
-    builder.finish().unwrap();
+    let mut variables = Variables::default();
+    let variable = variables.declare(&mut graph, initial, super::Repr::I64);
+    let value = variables.read(&mut graph, join, span, variable);
+    variables.define(&mut graph, body, variable, changed);
+    graph.terminate(exit, span, TerminatorKind::Return(value));
+    variables.finish(&mut graph).unwrap();
     assert!(
         graph.blocks[entry]
             .terminator
@@ -2788,11 +2758,12 @@ fn low_level_graph_emits_executable_cranelift() {
         },
         types::I64,
     );
-    builder.write(entry, 0, zero, super::Repr::I64);
-    builder.write(entry, 1, zero, super::Repr::I64);
+    let mut variables = Variables::default();
+    let index_variable = variables.declare(builder.graph, zero, super::Repr::I64);
+    let sum_variable = variables.declare(builder.graph, zero, super::Repr::I64);
     builder.terminate(entry, span, TerminatorKind::Jump(Target::new(header)));
-    let index = builder.read(header, 0, super::Repr::I64, span);
-    let sum = builder.read(header, 1, super::Repr::I64, span);
+    let index = variables.read(builder.graph, header, span, index_variable);
+    let sum = variables.read(builder.graph, header, span, sum_variable);
     let condition = builder.value(
         header,
         span,
@@ -2859,11 +2830,11 @@ fn low_level_graph_emits_executable_cranelift() {
         },
         types::I64,
     );
-    builder.write(body, 0, next_index, super::Repr::I64);
-    builder.write(body, 1, next_sum, super::Repr::I64);
+    variables.define(builder.graph, body, index_variable, next_index);
+    variables.define(builder.graph, body, sum_variable, next_sum);
     builder.terminate(body, span, TerminatorKind::Jump(Target::new(header)));
     builder.terminate(exit, span, TerminatorKind::ReturnValues(vec![sum]));
-    builder.finish().unwrap();
+    variables.finish(builder.graph).unwrap();
     boundary::compact(&mut graph);
     graph.verify().unwrap();
     for block in Cfg::new(&graph).rpo {
@@ -2950,16 +2921,17 @@ fn low_level_variables_resolve_long_forwarding_chain() {
     let mut builder = low_level::Builder::new(&mut graph);
     builder.append_block_params_for_function_params(entry);
     let input = builder.block_params(entry)[0];
-    builder.write(entry, 0, input, super::Repr::I64);
+    let mut variables = Variables::default();
+    let variable = variables.declare(builder.graph, input, super::Repr::I64);
     let mut block = entry;
     for _ in 0..10_000 {
         let next = builder.create_block();
         builder.terminate(block, span, TerminatorKind::Jump(Target::new(next)));
         block = next;
     }
-    let result = builder.read(block, 0, super::Repr::I64, span);
+    let result = variables.read(builder.graph, block, span, variable);
     builder.terminate(block, span, TerminatorKind::ReturnValues(vec![result]));
-    builder.finish().unwrap();
+    variables.finish(builder.graph).unwrap();
     graph.verify().unwrap();
     assert!(matches!(
         &graph.blocks[block].terminator.as_ref().unwrap().kind,

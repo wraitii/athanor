@@ -73,6 +73,7 @@ impl Promoter<'_> {
 
 enum Access {
     Read,
+    Load,
     Write(Value),
     Initialize(Value),
 }
@@ -81,7 +82,7 @@ pub(in crate::jit::semantic) fn promote(graph: &mut Graph, notes: &mut Vec<Strin
     let promoted: FxHashSet<Binding> = graph
         .bindings
         .iter()
-        .filter(|(_, data)| !data.captured && !data.persistent)
+        .filter(|(_, data)| !data.captured)
         .map(|(binding, _)| binding)
         .collect();
     if promoted.is_empty() {
@@ -104,7 +105,9 @@ pub(in crate::jit::semantic) fn promote(graph: &mut Graph, notes: &mut Vec<Strin
                         }
                     }
                 }
-                Op::Initialize(binding, value) | Op::Write(binding, value)
+                Op::Initialize(binding, value)
+                | Op::BindingRestore(binding, value)
+                | Op::Write(binding, value)
                     if promoted.contains(&binding) =>
                 {
                     end_defs.insert((block, binding), value);
@@ -134,8 +137,11 @@ pub(in crate::jit::semantic) fn promote(graph: &mut Graph, notes: &mut Vec<Strin
                     continue;
                 }
                 Op::Read(binding) => (binding, Access::Read),
+                Op::BindingLoad(binding) => (binding, Access::Load),
                 Op::Write(binding, value) => (binding, Access::Write(value)),
-                Op::Initialize(binding, value) => (binding, Access::Initialize(value)),
+                Op::Initialize(binding, value) | Op::BindingRestore(binding, value) => {
+                    (binding, Access::Initialize(value))
+                }
                 _ => continue,
             };
             if !promoted.contains(&binding) {
@@ -150,6 +156,12 @@ pub(in crate::jit::semantic) fn promote(graph: &mut Graph, notes: &mut Vec<Strin
                 Some(&value) => value,
                 None => promoter.at_entry(block, binding),
             };
+            if let Access::Load = access {
+                let result = promoter.graph.insts[inst].results.pop().unwrap();
+                aliases.insert(result, old);
+                promoter.graph.remove_inst(inst);
+                continue;
+            }
             let data = &mut promoter.graph.insts[inst];
             match access {
                 Access::Read => {
@@ -158,7 +170,7 @@ pub(in crate::jit::semantic) fn promote(graph: &mut Graph, notes: &mut Vec<Strin
                 Access::Write(value) => {
                     current.insert(binding, value);
                 }
-                Access::Initialize(_) => unreachable!(),
+                Access::Load | Access::Initialize(_) => unreachable!(),
             }
             data.op = Op::CheckInitialized(old);
         }

@@ -1,11 +1,13 @@
 use super::runtime::{
-    arrays as array_checks, helpers, numeric, properties, storage, typed, values, views,
+    arrays as array_checks, cells, helpers, numeric, properties, storage, typed, values, views,
 };
 use super::specialization::{
     call_variants, calls, observations, properties as property_accesses, reads, regions, shapes,
     writes,
 };
 use crate::{FxHashMap, FxHashSet};
+use cranelift_codegen::ir::Type;
+use cranelift_codegen::isa::CallConv;
 use js::{arrays, captures, comparisons, construction, string_split};
 use oxc_ast::ast::{Expression, FormalParameters, Statement};
 use oxc_semantic::Scoping;
@@ -14,8 +16,8 @@ use oxc_syntax::symbol::SymbolId;
 use transforms::{conversions, reuse};
 
 use super::{
-    FunctionState, Graph, Inst, RegionFallback, Result, SpecializationPlan, borrow, build, js,
-    legalize, osr, ownership, repr, transforms,
+    FunctionState, Graph, Inst, RegionFallback, Result, SpecializationPlan, Value, borrow, build,
+    js, legalize, low_level, osr, ownership, repr, transforms,
 };
 
 impl FunctionState {
@@ -41,6 +43,12 @@ impl FunctionState {
     ) -> Result<()> {
         after("input", self);
         self.graph.strip_hints();
+        cells::lower(self);
+        after("cells", self);
+        self.invalidate_cfg();
+        transforms::promote(&mut self.graph, &mut self.notes);
+        self.graph.verify()?;
+        after("bindings", self);
         if properties::lower(self)? {
             self.ensure_facts();
             borrow::borrows(&mut self.graph, &self.facts, &mut self.notes);
@@ -97,6 +105,30 @@ impl FunctionState {
         }
         Ok(())
     }
+}
+
+pub(in crate::jit) const LOWERING_PASSES: &[&str] = &[
+    "emit",
+    "scratch",
+    "repr-lower",
+    "cleanup",
+    "ownership-lower",
+];
+
+pub(in crate::jit) fn lower_emitted(
+    graph: &mut Graph,
+    ctx: Value,
+    call_conv: CallConv,
+    pointer: Type,
+    after: &mut dyn FnMut(&str, &Graph),
+) -> Result<()> {
+    repr::lower(&mut low_level::Builder::new(graph))?;
+    after("repr-lower", graph);
+    super::runtime::cleanup::lower(graph);
+    after("cleanup", graph);
+    super::runtime::ownership::lower(graph, ctx, call_conv, pointer);
+    after("ownership-lower", graph);
+    graph.verify()
 }
 
 pub(in crate::jit) fn lower_global(

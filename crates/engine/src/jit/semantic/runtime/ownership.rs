@@ -268,6 +268,7 @@ pub(in crate::jit) fn lower(graph: &mut Graph, ctx: Value, convention: CallConv,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jit::semantic::variables::Variables;
     use cranelift_codegen::ir::{AbiParam, Signature};
     use oxc_span::Span;
 
@@ -312,7 +313,7 @@ mod tests {
                 value,
             );
             b.ins().return_(&[]);
-            b.finish().unwrap();
+            Variables::default().finish(&mut graph).unwrap();
             cancel_pairs(&mut graph, &[entry]);
             let count = graph.blocks[entry]
                 .insts

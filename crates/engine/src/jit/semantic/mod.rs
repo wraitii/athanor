@@ -5,6 +5,7 @@ pub(in crate::jit) mod boundary;
 mod build;
 pub(in crate::jit) mod continuation;
 pub(in crate::jit) mod cranelift;
+pub(in crate::jit) mod cursor;
 mod dispatch;
 pub(in crate::jit) mod facts;
 mod fresh;
@@ -23,10 +24,11 @@ pub(in crate::jit) mod selection;
 pub(in crate::jit) mod specialization;
 pub(in crate::jit) mod suspension;
 mod transforms;
+pub(in crate::jit) mod variables;
 
 pub(super) use pipeline::{
-    Versioning, canonical_for_emission, canonicalize_graph, lower_global, optimize_planned,
-    plan_canonical_with_budget,
+    LOWERING_PASSES, Versioning, canonical_for_emission, canonicalize_graph, lower_emitted,
+    lower_global, optimize_planned, plan_canonical_with_budget,
 };
 #[cfg(test)]
 use pipeline::{analyze, optimize_canonical, plan_canonical};
@@ -350,9 +352,11 @@ pub(super) enum Op {
     ContinuationOutput(Value, usize),
     ContinuationStore(Vec<Value>),
     Argument(usize),
+    Restored(usize),
     Arguments,
     Rest(usize),
     This,
+    Callee,
     ClosureThis(Value),
     Throw(Value),
     Catch,
@@ -365,6 +369,19 @@ pub(super) enum Op {
         Vec<Binding>,
         Option<Value>,
     ),
+    ClosureCells(
+        Span,
+        cranelift_module::FuncId,
+        bool,
+        bool,
+        bool,
+        Vec<Value>,
+        Option<Value>,
+    ),
+    CellNew(Value),
+    CellGet(Value),
+    CellSet(Value, Value),
+    CaptureGet(Value, usize),
     Constant(Constant),
     GlobalRead(String),
     GlobalReadOptional(String),
@@ -653,9 +670,11 @@ impl Op {
             Op::Assume(value, ..) => ([Some(*value), None, None], &[]),
             Op::PropertyCache(..)
             | Op::Argument(_)
+            | Op::Restored(_)
             | Op::Arguments
             | Op::Rest(_)
             | Op::This
+            | Op::Callee
             | Op::Catch
             | Op::Constant(_)
             | Op::GlobalRead(_)
@@ -673,6 +692,13 @@ impl Op {
             | Op::NextIteration(_)
             | Op::FreshIteration(_) => ([None; 3], &[]),
             Op::Closure(_, _, _, _, _, _, receiver) => ([*receiver, None, None], &[]),
+            Op::ClosureCells(_, _, _, _, _, cells, receiver) => {
+                ([*receiver, None, None], cells.as_slice())
+            }
+            Op::CellSet(cell, value) => ([Some(*cell), Some(*value), None], &[]),
+            Op::CellNew(value) | Op::CellGet(value) | Op::CaptureGet(value, _) => {
+                ([Some(*value), None, None], &[])
+            }
             Op::ClosureThis(value)
             | Op::NewHoleyArray(value)
             | Op::EnterCaptures(_, value)
@@ -883,9 +909,11 @@ impl Op {
             Op::Assume(value, ..) => ([Some(value), None, None], &mut []),
             Op::PropertyCache(..)
             | Op::Argument(_)
+            | Op::Restored(_)
             | Op::Arguments
             | Op::Rest(_)
             | Op::This
+            | Op::Callee
             | Op::Catch
             | Op::Constant(_)
             | Op::GlobalRead(_)
@@ -903,6 +931,13 @@ impl Op {
             | Op::NextIteration(_)
             | Op::FreshIteration(_) => ([None, None, None], &mut []),
             Op::Closure(_, _, _, _, _, _, receiver) => ([receiver.as_mut(), None, None], &mut []),
+            Op::ClosureCells(_, _, _, _, _, cells, receiver) => {
+                ([receiver.as_mut(), None, None], cells.as_mut_slice())
+            }
+            Op::CellSet(cell, value) => ([Some(cell), Some(value), None], &mut []),
+            Op::CellNew(value) | Op::CellGet(value) | Op::CaptureGet(value, _) => {
+                ([Some(value), None, None], &mut [])
+            }
             Op::ClosureThis(value)
             | Op::NewHoleyArray(value)
             | Op::EnterCaptures(_, value)
@@ -1469,7 +1504,7 @@ impl Graph {
 
     pub(super) fn caller_rooted(&self, value: Value) -> bool {
         match self.defining_op(value) {
-            Some(Op::This | Op::Argument(_)) => true,
+            Some(Op::This | Op::Callee | Op::Argument(_) | Op::Restored(_)) => true,
             Some(Op::AsObject(source)) => self.caller_rooted(*source),
             _ => false,
         }
@@ -1692,9 +1727,11 @@ impl Graph {
 
     pub(super) fn materialized(&self, scope: Scope) -> bool {
         self.scopes.iter().any(|(candidate, data)| {
-            if !data.bindings.iter().any(|&binding| {
-                self.bindings[binding].captured || self.bindings[binding].persistent
-            }) {
+            if !data
+                .bindings
+                .iter()
+                .any(|&binding| self.bindings[binding].captured)
+            {
                 return false;
             }
             let mut current = Some(candidate);
@@ -1798,7 +1835,7 @@ impl Graph {
             Op::Rest(_) | Op::Arguments => closed(ALLOCATION | INTERNAL | ERROR, Owned),
             Op::Throw(_) => closed(INTERNAL | ERROR, None),
             Op::Catch => closed(INTERNAL, Owned),
-            Op::Argument(_) | Op::This => closed(0, Borrowed),
+            Op::Argument(_) | Op::Restored(_) | Op::This | Op::Callee => closed(0, Borrowed),
             Op::ClosureThis(_) => closed(HEAP_READ, Borrowed),
             Op::NewHoleyArray(_) => closed(ALLOCATION | INTERNAL | ERROR, Owned),
             Op::MapElement(..) => closed(HEAP_READ | INTERNAL, Owned),
@@ -1836,6 +1873,8 @@ impl Graph {
             }
             Op::Initialize(..) => closed(INTERNAL, None),
             Op::Write(..) => closed(INTERNAL | ERROR, None),
+            Op::CellGet(_) | Op::CaptureGet(..) => closed(HEAP_READ | INTERNAL | ERROR, Owned),
+            Op::CellSet(..) => closed(HEAP_WRITE | INTERNAL | ERROR, None),
             Op::CheckInitialized(_) => {
                 if operands.intersects(ValueType::UNINITIALIZED) {
                     closed(ERROR, None)
@@ -1844,6 +1883,8 @@ impl Graph {
                 }
             }
             Op::Closure(..)
+            | Op::ClosureCells(..)
+            | Op::CellNew(_)
             | Op::NewPack
             | Op::NewObject
             | Op::NewArray(_)

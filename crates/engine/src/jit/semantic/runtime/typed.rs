@@ -1,7 +1,7 @@
-use super::super::dispatch::append;
+use super::super::cursor::{Cursor, Insert};
 use super::super::{
-    BlockData, Constant, FunctionState, Graph, Op, Target, Terminator, TerminatorKind, TypedRead,
-    ValueType,
+    BlockData, Constant, FunctionState, Graph, Op, Repr, Target, Terminator, TerminatorKind,
+    TypedRead, ValueType,
 };
 
 pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) -> super::super::Result<bool> {
@@ -35,25 +35,22 @@ pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) -> super::su
                 region.blocks.extend([continuation, load, bounds, failure]);
             }
         }
-        let position = append(graph, &data, block, Op::ArrayPosition(key));
-        let exact = append(
-            graph,
-            &data,
-            block,
-            if facts.of(key).within(ValueType::INTEGER) {
-                Op::Constant(Constant::Boolean(true))
-            } else {
-                Op::IsExactPosition(key, position)
-            },
-        );
+        let mut at = Cursor::at_end(graph, block, inst);
+        let position = at.add_unassigned(Op::ArrayPosition(key));
+        let exact = if facts.of(key).within(ValueType::INTEGER) {
+            at.add_unassigned(Op::Constant(Constant::Boolean(true)))
+        } else {
+            at.add_unassigned(Op::IsExactPosition(key, position))
+        };
         graph.blocks[block].terminator = Some(Terminator {
             source_name: data.source_name,
             emission_location: None,
             span: data.span,
             kind: TerminatorKind::Branch(exact, Target::new(bounds), Target::new(failure)),
         });
-        let length = append(graph, &data, bounds, Op::IndexedLength(object));
-        let inside = append(graph, &data, bounds, Op::IsInBounds(position, length));
+        let mut at = Cursor::at_end(graph, bounds, inst);
+        let length = at.add_unassigned(Op::IndexedLength(object));
+        let inside = at.add_unassigned(Op::IsInBounds(position, length));
         graph.blocks[bounds].terminator = Some(Terminator {
             source_name: data.source_name,
             emission_location: None,
@@ -62,7 +59,8 @@ pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) -> super::su
         });
         read.bounded = true;
         graph.insts[inst].op = Op::TypedIndex(object, position, read);
-        let undefined = append(graph, &data, failure, Op::Constant(Constant::Undefined));
+        let undefined =
+            Cursor::at_end(graph, failure, inst).add_unassigned(Op::Constant(Constant::Undefined));
         graph.blocks[failure].terminator = Some(Terminator {
             source_name: data.source_name,
             emission_location: None,
@@ -114,28 +112,17 @@ pub(in crate::jit::semantic) fn lower_memory(function: &mut FunctionState) -> bo
                 TypedKind::Float64 => MemoryFormat::F64,
             };
             let existing_view = graph.views.remove(&inst);
-            let mut at = graph.blocks[block]
-                .insts
-                .iter()
-                .position(|&i| i == inst)
-                .unwrap();
-            let mut insert = |op| {
-                let (inserted, value) = graph.insert(block, at, data.span, op, true);
-                graph.insts[inserted].source_name = data.source_name;
-                at += 1;
-                value.unwrap()
-            };
-            let view = existing_view.unwrap_or_else(|| insert(Op::View(object)));
-            let base = insert(Op::TypedData(view));
-            let index = insert(Op::ArrayPosition(key));
-            let raw = insert(Op::Memory(MemoryOp::IndexedLoad {
+            let mut at = Cursor::before(graph, inst);
+            let view = existing_view.unwrap_or_else(|| at.add_unassigned(Op::View(object)));
+            let base = at.add_unassigned(Op::TypedData(view));
+            let index = at.add_unassigned(Op::ArrayPosition(key));
+            let raw = at.add_unassigned(Op::Memory(MemoryOp::IndexedLoad {
                 base,
                 index,
                 format,
             }));
             graph.insts[inst].op = Op::MemoryNumber(raw, format);
-            let (keep, _) = graph.insert(block, at + 1, data.span, Op::KeepAlive(object), false);
-            graph.insts[keep].source_name = data.source_name;
+            Cursor::after(graph, inst).add_effect(Op::KeepAlive(object));
             changed = true;
         }
     }
@@ -150,7 +137,7 @@ pub(in crate::jit::semantic) fn lower_store(
     inst: super::super::Inst,
     element: crate::heap::TypedKind,
 ) {
-    use super::super::{Repr, low_level};
+    use super::super::low_level;
     use cranelift_codegen::ir::{MemFlagsData, types};
     use oxc_syntax::operator::BinaryOperator as B;
     let data = graph.insts[inst].clone();
@@ -170,124 +157,84 @@ pub(in crate::jit::semantic) fn lower_store(
     let mut fast = if typed {
         block
     } else {
-        let check = append(graph, &data, block, Op::IsTyped(object, Some(element)));
+        let check =
+            Cursor::at_end(graph, block, inst).add_unassigned(Op::IsTyped(object, Some(element)));
         super::super::dispatch::branch(graph, inst, block, check, fallback)
     };
     for value in [key, value] {
         if !facts.of(value).within(ValueType::NUMBER) {
-            let number = append(graph, &data, fast, Op::IsNumber(value));
+            let number = Cursor::at_end(graph, fast, inst).add_unassigned(Op::IsNumber(value));
             fast = super::super::dispatch::branch(graph, inst, fast, number, fallback);
         }
     }
-    let key = append(graph, &data, fast, Op::AsNumber(key));
-    let value = append(graph, &data, fast, Op::AsNumber(value));
-    let position = append(graph, &data, fast, Op::ArrayPosition(key));
-    let exact = append(graph, &data, fast, Op::IsExactPosition(key, position));
+    let key = Cursor::at_end(graph, fast, inst)
+        .place(Op::AsNumber(key), true)
+        .1
+        .unwrap();
+    let value = Cursor::at_end(graph, fast, inst)
+        .place(Op::AsNumber(value), true)
+        .1
+        .unwrap();
+    let mut at = Cursor::at_end(graph, fast, inst);
+    let position = at.add_unassigned(Op::ArrayPosition(key));
+    let exact = at.add_unassigned(Op::IsExactPosition(key, position));
     fast = super::super::dispatch::branch(graph, inst, fast, exact, fallback);
-    let length = append(graph, &data, fast, Op::IndexedLength(object));
-    let inside = append(graph, &data, fast, Op::IsInBounds(position, length));
+    let mut at = Cursor::at_end(graph, fast, inst);
+    let length = at.add_unassigned(Op::IndexedLength(object));
+    let inside = at.add_unassigned(Op::IsInBounds(position, length));
     fast = super::super::dispatch::branch(graph, inst, fast, inside, fallback);
     let float = matches!(
         element,
         crate::heap::TypedKind::Float32 | crate::heap::TypedKind::Float64
     );
     let stored = if float {
-        let number = append(graph, &data, fast, Op::Convert(value, Repr::F64));
+        let number = Cursor::at_end(graph, fast, inst)
+            .place(Op::Convert(value, Repr::F64), true)
+            .1
+            .unwrap();
         if element == crate::heap::TypedKind::Float32 {
-            append(
-                graph,
-                &data,
-                fast,
-                Op::LowLevel(low_level::Op::Unary {
-                    op: low_level::Unary::FloatDemote,
-                    ty: types::F32,
-                    value: number,
-                }),
-            )
+            Cursor::at_end(graph, fast, inst).add_unassigned(Op::LowLevel(low_level::Op::Unary {
+                op: low_level::Unary::FloatDemote,
+                ty: types::F32,
+                value: number,
+            }))
         } else {
             number
         }
     } else {
-        let integer = append(graph, &data, fast, Op::ArrayPosition(value));
-        let exact = append(graph, &data, fast, Op::IsExactPosition(value, integer));
+        let integer = Cursor::at_end(graph, fast, inst).add_unassigned(Op::ArrayPosition(value));
+        let exact =
+            Cursor::at_end(graph, fast, inst).add_unassigned(Op::IsExactPosition(value, integer));
         fast = super::super::dispatch::branch(graph, inst, fast, exact, fallback);
-        let upper = append(
-            graph,
-            &data,
-            fast,
-            Op::Constant(Constant::Number(9223372036854775808.0)),
-        );
-        let below = append(graph, &data, fast, Op::Binary(B::LessThan, value, upper));
+        let upper = Cursor::at_end(graph, fast, inst)
+            .add_unassigned(Op::Constant(Constant::Number(9223372036854775808.0)));
+        let below =
+            Cursor::at_end(graph, fast, inst).add_unassigned(Op::Binary(B::LessThan, value, upper));
         fast = super::super::dispatch::branch(graph, inst, fast, below, fallback);
         let ty = match 1 << (element.element() & 3) {
             1 => types::I8,
             2 => types::I16,
             _ => types::I32,
         };
-        append(
-            graph,
-            &data,
-            fast,
-            Op::LowLevel(low_level::Op::Unary {
-                op: low_level::Unary::Reduce,
-                ty,
-                value: integer,
-            }),
-        )
+        Cursor::at_end(graph, fast, inst).ins().ireduce(ty, integer)
     };
-    let view = append(graph, &data, fast, Op::View(object));
-    let base = append(
-        graph,
-        &data,
-        fast,
-        Op::LowLevel(low_level::Op::Load {
-            ty: types::I64,
-            address: view,
-            offset: crate::heap::DATA_OFFSET,
-            flags: MemFlagsData::trusted(),
-        }),
+    let mut at = Cursor::at_end(graph, fast, inst);
+    let view = at.add_unassigned(Op::View(object));
+    let base = at.ins().load(
+        types::I64,
+        MemFlagsData::trusted(),
+        view,
+        crate::heap::DATA_OFFSET,
     );
-    let bytes = append(
-        graph,
-        &data,
-        fast,
-        Op::LowLevel(low_level::Op::Integer {
-            ty: types::I64,
-            bits: (1 << (element.element() & 3)) as u64,
-        }),
-    );
-    let offset = append(
-        graph,
-        &data,
-        fast,
-        Op::LowLevel(low_level::Op::Binary {
-            op: low_level::Binary::Multiply,
-            left: position,
-            right: bytes,
-        }),
-    );
-    let address = append(
-        graph,
-        &data,
-        fast,
-        Op::LowLevel(low_level::Op::Binary {
-            op: low_level::Binary::Add,
-            left: base,
-            right: offset,
-        }),
-    );
-    graph.append(
-        fast,
-        data.span,
-        Op::LowLevel(low_level::Op::Store {
-            value: stored,
-            address,
-            offset: 0,
-            flags: MemFlagsData::trusted(),
-        }),
-        false,
-    );
-    graph.append(fast, data.span, Op::KeepAlive(object), false);
+    let bytes = at
+        .ins()
+        .iconst(types::I64, (1 << (element.element() & 3)) as i64);
+    let offset = at
+        .ins()
+        .binary(low_level::Binary::Multiply, position, bytes);
+    let address = at.ins().iadd(base, offset);
+    at.ins().store(MemFlagsData::trusted(), stored, address, 0);
+    at.add_effect(Op::KeepAlive(object));
     graph.terminate(fast, data.span, TerminatorKind::Jump(Target::new(done)));
     super::super::dispatch::extend_regions(graph, block, first);
 }

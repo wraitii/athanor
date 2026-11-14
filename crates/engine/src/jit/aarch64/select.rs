@@ -575,6 +575,7 @@ impl Selection {
 mod tests {
     use super::*;
     use crate::jit::semantic::low_level::Builder;
+    use crate::jit::semantic::variables::Variables;
     use cranelift_codegen::ir::{AbiParam, Signature};
     use cranelift_codegen::isa::CallConv;
     use oxc_span::Span;
@@ -652,7 +653,7 @@ mod tests {
             let address_inst = builder.defining_inst(address);
             let shift_inst = builder.defining_inst(shift);
             let wide_inst = builder.defining_inst(wide);
-            builder.finish().unwrap();
+            Variables::default().finish(&mut graph).unwrap();
             graph.verify().unwrap();
             let selection = Selection::new(&graph, &crate::jit::semantic::Cfg::new(&graph).rpo);
             for inst in [load, store] {

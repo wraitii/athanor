@@ -9,6 +9,7 @@ use crate::jit::profile::{Observation, Site};
 use super::continuation::{Shape, liveness, unbox};
 use super::{
     Block, BlockData, Cfg, Constant, Facts, Graph, Inst, Op, Target, TerminatorKind, Value,
+    ValueType,
 };
 
 impl std::fmt::Debug for Plan {
@@ -205,8 +206,12 @@ impl Plan {
             if let Some(Op::Constant(constant)) = self.graph.defining_op(value) {
                 return graph.append_value(entry, span, Op::Constant(constant.clone()));
             }
+            let input = facts.of(value);
+            if input.intersects(ValueType::UNINITIALIZED) {
+                return graph.append_value(entry, span, Op::Restored(index));
+            }
             let argument = graph.append_value(entry, span, Op::Argument(index));
-            unbox(graph, entry, argument, facts.of(value))
+            unbox(graph, entry, argument, input)
         };
         let aliases: FxHashMap<_, _> = transfer
             .inputs
@@ -368,8 +373,15 @@ fn transfer(
                 | Op::Write(..)
                 | Op::Initialize(..)
                 | Op::Closure(..)
+                | Op::ClosureCells(..)
+                | Op::CellNew(_)
+                | Op::CellGet(_)
+                | Op::CellSet(..)
+                | Op::CaptureGet(..)
                 | Op::Argument(_)
+                | Op::Restored(_)
                 | Op::EnterCaptures(..)
+                | Op::Callee
                 | Op::Arguments
                 | Op::Rest(_) => {
                     return Err(format!(

@@ -1,6 +1,7 @@
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{MemFlagsData, types};
 
+use super::super::cursor::{Cursor, Insert};
 use super::super::{ArrayLayout, Cfg, FunctionState, Graph, Op, Repr, ValueType, low_level};
 
 pub(in crate::jit::semantic) fn lower_metadata(function: &mut FunctionState) -> bool {
@@ -30,16 +31,11 @@ pub(in crate::jit::semantic) fn lower_metadata(function: &mut FunctionState) -> 
                 }
                 _ => continue,
             };
-            let mut at = graph.blocks[block]
-                .insts
-                .iter()
-                .position(|&i| i == inst)
-                .unwrap();
             let view = existing_view.unwrap_or_else(|| {
-                let (view_inst, view) = graph.insert(block, at, data.span, Op::View(object), true);
-                graph.insts[view_inst].source_name = data.source_name;
-                at += 1;
-                view.unwrap()
+                Cursor::before(graph, inst)
+                    .place(Op::View(object), true)
+                    .1
+                    .unwrap()
             });
             graph.insts[inst].op = Op::LowLevel(low_level::Op::Load {
                 ty,
@@ -47,8 +43,7 @@ pub(in crate::jit::semantic) fn lower_metadata(function: &mut FunctionState) -> 
                 offset,
                 flags: MemFlagsData::trusted(),
             });
-            let (keep, _) = graph.insert(block, at + 1, data.span, Op::KeepAlive(object), false);
-            graph.insts[keep].source_name = data.source_name;
+            Cursor::after(graph, inst).add_effect(Op::KeepAlive(object));
             changed = true;
         }
     }
@@ -67,112 +62,45 @@ pub(in crate::jit::semantic) fn lower_array_loads(function: &mut FunctionState) 
             let Op::ArrayLoad(object, position, layout) = data.op else {
                 continue;
             };
-            let mut at = graph.blocks[block]
-                .insts
-                .iter()
-                .position(|&i| i == inst)
-                .unwrap();
             let existing_view = graph.views.remove(&inst);
-            let mut insert = |graph: &mut Graph, op, repr, value_type| {
-                let (inserted, value) = graph.insert(block, at, data.span, op, true);
-                let value = value.unwrap();
-                graph.insts[inserted].source_name = data.source_name;
-                graph.insts[inserted].emission_location = data.emission_location;
-                graph.reprs[value] = Some(repr);
+            let mut at = Cursor::before(graph, inst);
+            let mut typed = |value, value_type| {
                 function.facts.set(value, value_type);
-                at += 1;
                 value
             };
             let view = existing_view
-                .unwrap_or_else(|| insert(graph, Op::View(object), Repr::Boxed, ValueType::VIEW));
-            let base = insert(
-                graph,
-                Op::LowLevel(low_level::Op::Load {
-                    ty: types::I64,
-                    address: view,
-                    offset: crate::heap::DATA_OFFSET,
-                    flags: MemFlagsData::trusted(),
-                }),
-                Repr::I64,
+                .unwrap_or_else(|| typed(at.add(Op::View(object), Repr::Boxed), ValueType::VIEW));
+            let base = typed(
+                at.ins().load(
+                    types::I64,
+                    MemFlagsData::trusted(),
+                    view,
+                    crate::heap::DATA_OFFSET,
+                ),
                 ValueType::INT64,
             );
-            let shift = insert(
-                graph,
-                Op::LowLevel(low_level::Op::Integer {
-                    ty: types::I64,
-                    bits: 3,
-                }),
-                Repr::I64,
+            let shift = typed(at.ins().iconst(types::I64, 3), ValueType::INT64);
+            let offset = typed(at.ins().ishl(position, shift), ValueType::INT64);
+            let address = typed(at.ins().iadd(base, offset), ValueType::INT64);
+            let raw = typed(
+                at.ins()
+                    .load(types::I64, MemFlagsData::trusted(), address, 0),
                 ValueType::INT64,
             );
-            let offset = insert(
-                graph,
-                Op::LowLevel(low_level::Op::Binary {
-                    op: low_level::Binary::ShiftLeft,
-                    left: position,
-                    right: shift,
-                }),
-                Repr::I64,
-                ValueType::INT64,
-            );
-            let address = insert(
-                graph,
-                Op::LowLevel(low_level::Op::Binary {
-                    op: low_level::Binary::Add,
-                    left: base,
-                    right: offset,
-                }),
-                Repr::I64,
-                ValueType::INT64,
-            );
-            let load = low_level::Op::Load {
-                ty: types::I64,
-                address,
-                offset: 0,
-                flags: MemFlagsData::trusted(),
-            };
-            let raw = insert(graph, Op::LowLevel(load), Repr::I64, ValueType::INT64);
             let word = if layout == ArrayLayout::Packed {
                 raw
             } else {
-                let hole = insert(
-                    graph,
-                    Op::LowLevel(low_level::Op::Integer {
-                        ty: types::I64,
-                        bits: crate::heap::HOLE.bits(),
-                    }),
-                    Repr::I64,
+                let hole = typed(
+                    at.ins().iconst(types::I64, crate::heap::HOLE.bits() as i64),
                     ValueType::INT64,
                 );
-                let absent = insert(
-                    graph,
-                    Op::LowLevel(low_level::Op::IntCompare {
-                        condition: IntCC::Equal,
-                        left: raw,
-                        right: hole,
-                    }),
-                    Repr::I8,
-                    ValueType::BOOLEAN,
-                );
-                let undefined = insert(
-                    graph,
-                    Op::LowLevel(low_level::Op::Integer {
-                        ty: types::I64,
-                        bits: crate::value::Value::UNDEFINED.bits(),
-                    }),
-                    Repr::I64,
+                let absent = typed(at.ins().icmp(IntCC::Equal, raw, hole), ValueType::BOOLEAN);
+                let undefined = typed(
+                    at.ins()
+                        .iconst(types::I64, crate::value::Value::UNDEFINED.bits() as i64),
                     ValueType::INT64,
                 );
-                insert(
-                    graph,
-                    Op::LowLevel(low_level::Op::Select {
-                        condition: absent,
-                        yes: undefined,
-                        no: raw,
-                    }),
-                    Repr::I64,
-                    ValueType::INT64,
-                )
+                typed(at.ins().select(absent, undefined, raw), ValueType::INT64)
             };
             graph.insts[inst].op = Op::AsBoxed(word);
         }
@@ -200,190 +128,55 @@ pub(in crate::jit::semantic) fn lower_stores(function: &mut FunctionState) {
             let store = checked_store(graph, inst, object, key);
             let existing_view = graph.views.remove(&inst);
             let checking = matches!(data.op, Op::CanOverwrite(..));
-            let mut at = graph.blocks[block]
-                .insts
-                .iter()
-                .position(|&i| i == inst)
-                .unwrap();
-            let mut insert = |op: Op, repr: Option<Repr>| {
-                let result = storage_value(graph, &data, block, at, op, repr);
-                at += 1;
-                result
-            };
+            let mut at = Cursor::before(graph, inst);
             let (address, old, addition_data) = if let Some((address, old)) = reuse {
                 (address, Some(old), None)
             } else {
-                let view = existing_view
-                    .unwrap_or_else(|| insert(Op::View(object), Some(Repr::Boxed)).unwrap());
-                let base = insert(
-                    Op::LowLevel(low_level::Op::Load {
-                        ty: types::I64,
-                        address: view,
-                        offset: crate::heap::DATA_OFFSET,
-                        flags: MemFlagsData::trusted(),
-                    }),
-                    Some(Repr::I64),
-                )
-                .unwrap();
+                let view = existing_view.unwrap_or_else(|| at.add(Op::View(object), Repr::Boxed));
+                let base = at.ins().load(
+                    types::I64,
+                    MemFlagsData::trusted(),
+                    view,
+                    crate::heap::DATA_OFFSET,
+                );
                 let index = if addition {
-                    let raw = insert(
-                        Op::LowLevel(low_level::Op::Load {
-                            ty: types::I32,
-                            address: key,
-                            offset: CACHE_ADDITION_INDEX_OFFSET,
-                            flags: MemFlagsData::trusted(),
-                        }),
-                        Some(Repr::I32),
-                    )
-                    .unwrap();
-                    insert(
-                        Op::LowLevel(low_level::Op::Unary {
-                            op: low_level::Unary::ZeroExtend,
-                            ty: types::I64,
-                            value: raw,
-                        }),
-                        Some(Repr::I64),
-                    )
-                    .unwrap()
+                    let raw = at.ins().load(
+                        types::I32,
+                        MemFlagsData::trusted(),
+                        key,
+                        CACHE_ADDITION_INDEX_OFFSET,
+                    );
+                    at.ins().uextend(types::I64, raw)
                 } else {
                     key
                 };
-                let shift = insert(
-                    Op::LowLevel(low_level::Op::Integer {
-                        ty: types::I64,
-                        bits: 3,
-                    }),
-                    Some(Repr::I64),
-                )
-                .unwrap();
-                let offset = insert(
-                    Op::LowLevel(low_level::Op::Binary {
-                        op: low_level::Binary::ShiftLeft,
-                        left: index,
-                        right: shift,
-                    }),
-                    Some(Repr::I64),
-                )
-                .unwrap();
-                let address = insert(
-                    Op::LowLevel(low_level::Op::Binary {
-                        op: low_level::Binary::Add,
-                        left: base,
-                        right: offset,
-                    }),
-                    Some(Repr::I64),
-                )
-                .unwrap();
+                let shift = at.ins().iconst(types::I64, 3);
+                let offset = at.ins().ishl(index, shift);
+                let address = at.ins().iadd(base, offset);
                 let old = (!addition).then(|| {
-                    insert(
-                        Op::LowLevel(low_level::Op::Load {
-                            ty: types::I64,
-                            address,
-                            offset: 0,
-                            flags: MemFlagsData::trusted(),
-                        }),
-                        Some(Repr::I64),
-                    )
-                    .unwrap()
+                    at.ins()
+                        .load(types::I64, MemFlagsData::trusted(), address, 0)
                 });
                 (address, old, Some((view, base, index)))
             };
             if checking {
                 let old = old.unwrap();
-                let shift = insert(
-                    Op::LowLevel(low_level::Op::Integer {
-                        ty: types::I64,
-                        bits: crate::value::TAG_SHIFT as u64,
-                    }),
-                    Some(Repr::I64),
-                )
-                .unwrap();
-                let tag = insert(
-                    Op::LowLevel(low_level::Op::Binary {
-                        op: low_level::Binary::ShiftRightUnsigned,
-                        left: old,
-                        right: shift,
-                    }),
-                    Some(Repr::I64),
-                )
-                .unwrap();
-                let first = insert(
-                    Op::LowLevel(low_level::Op::Integer {
-                        ty: types::I64,
-                        bits: crate::value::TAG_OBJECT >> crate::value::TAG_SHIFT,
-                    }),
-                    Some(Repr::I64),
-                )
-                .unwrap();
-                let tag = insert(
-                    Op::LowLevel(low_level::Op::Binary {
-                        op: low_level::Binary::Subtract,
-                        left: tag,
-                        right: first,
-                    }),
-                    Some(Repr::I64),
-                )
-                .unwrap();
-                let two = insert(
-                    Op::LowLevel(low_level::Op::Integer {
-                        ty: types::I64,
-                        bits: 2,
-                    }),
-                    Some(Repr::I64),
-                )
-                .unwrap();
-                let heap = insert(
-                    Op::LowLevel(low_level::Op::IntCompare {
-                        condition: IntCC::UnsignedLessThan,
-                        left: tag,
-                        right: two,
-                    }),
-                    Some(Repr::I8),
-                )
-                .unwrap();
-                let mask = insert(
-                    Op::LowLevel(low_level::Op::Integer {
-                        ty: types::I64,
-                        bits: (1 << crate::value::TAG_SHIFT) - 1,
-                    }),
-                    Some(Repr::I64),
-                )
-                .unwrap();
-                let raw_address = insert(
-                    Op::LowLevel(low_level::Op::Binary {
-                        op: low_level::Binary::And,
-                        left: old,
-                        right: mask,
-                    }),
-                    Some(Repr::I64),
-                )
-                .unwrap();
-                let zero = insert(
-                    Op::LowLevel(low_level::Op::Integer {
-                        ty: types::I64,
-                        bits: 0,
-                    }),
-                    Some(Repr::I64),
-                )
-                .unwrap();
-                let old_address = insert(
-                    Op::LowLevel(low_level::Op::Select {
-                        condition: heap,
-                        yes: raw_address,
-                        no: zero,
-                    }),
-                    Some(Repr::I64),
-                )
-                .unwrap();
-                let present = insert(
-                    Op::LowLevel(low_level::Op::IntCompare {
-                        condition: IntCC::NotEqual,
-                        left: old_address,
-                        right: zero,
-                    }),
-                    Some(Repr::I8),
-                )
-                .unwrap();
+                let shift = at.ins().iconst(types::I64, crate::value::TAG_SHIFT as i64);
+                let tag = at.ins().ushr(old, shift);
+                let first = at.ins().iconst(
+                    types::I64,
+                    (crate::value::TAG_OBJECT >> crate::value::TAG_SHIFT) as i64,
+                );
+                let tag = at.ins().isub(tag, first);
+                let two = at.ins().iconst(types::I64, 2);
+                let heap = at.ins().icmp(IntCC::UnsignedLessThan, tag, two);
+                let mask = at
+                    .ins()
+                    .iconst(types::I64, (1 << crate::value::TAG_SHIFT) - 1);
+                let raw_address = at.ins().band(old, mask);
+                let zero = at.ins().iconst(types::I64, 0);
+                let old_address = at.ins().select(heap, raw_address, zero);
+                let present = at.ins().icmp(IntCC::NotEqual, old_address, zero);
                 if let Some(store) = store {
                     checked.insert(store, (address, old));
                 }
@@ -405,18 +198,9 @@ pub(in crate::jit::semantic) fn lower_stores(function: &mut FunctionState) {
                 let result = graph.blocks[continuation].params[0];
                 graph.reprs[result] = Some(Repr::I8);
                 function.facts.set(result, ValueType::BOOLEAN);
-                let yes = storage_value(
-                    graph,
-                    &data,
-                    scalar,
-                    0,
-                    Op::LowLevel(low_level::Op::Integer {
-                        ty: types::I8,
-                        bits: 1,
-                    }),
-                    Some(Repr::I8),
-                )
-                .unwrap();
+                let yes = Cursor::at_end(graph, scalar, inst)
+                    .ins()
+                    .iconst(types::I8, 1);
                 graph.terminate(
                     scalar,
                     data.span,
@@ -425,43 +209,18 @@ pub(in crate::jit::semantic) fn lower_stores(function: &mut FunctionState) {
                         args: vec![yes],
                     }),
                 );
-                let mut at = 0;
-                let mut insert = |op, repr| {
-                    let result = storage_value(graph, &data, native, at, op, repr);
-                    at += 1;
-                    result.unwrap()
-                };
-                let kind = insert(
-                    Op::LowLevel(low_level::Op::Load {
-                        ty: types::I32,
-                        address: old_address,
-                        offset: crate::heap::KIND_OFFSET,
-                        flags: MemFlagsData::trusted(),
-                    }),
-                    Some(Repr::I32),
+                let mut at = Cursor::before(graph, inst);
+                let kind = at.ins().load(
+                    types::I32,
+                    MemFlagsData::trusted(),
+                    old_address,
+                    crate::heap::KIND_OFFSET,
                 );
-                let mask = insert(
-                    Op::LowLevel(low_level::Op::Integer {
-                        ty: types::I32,
-                        bits: crate::heap::kind::NATIVE as u64,
-                    }),
-                    Some(Repr::I32),
-                );
-                let native_kind = insert(
-                    Op::LowLevel(low_level::Op::Binary {
-                        op: low_level::Binary::And,
-                        left: kind,
-                        right: mask,
-                    }),
-                    Some(Repr::I32),
-                );
-                let zero = insert(
-                    Op::LowLevel(low_level::Op::Integer {
-                        ty: types::I32,
-                        bits: 0,
-                    }),
-                    Some(Repr::I32),
-                );
+                let mask = at
+                    .ins()
+                    .iconst(types::I32, crate::heap::kind::NATIVE as i64);
+                let native_kind = at.ins().band(kind, mask);
+                let zero = at.ins().iconst(types::I32, 0);
                 graph.insts[inst].op = Op::LowLevel(low_level::Op::IntCompare {
                     condition: IntCC::Equal,
                     left: native_kind,
@@ -470,121 +229,46 @@ pub(in crate::jit::semantic) fn lower_stores(function: &mut FunctionState) {
                 super::super::dispatch::extend_regions(graph, block, first_block);
                 continue;
             }
-            insert(
-                Op::LowLevel(low_level::Op::Reference {
-                    op: low_level::Reference::Retain,
-                    value,
-                }),
-                None,
-            );
-            let word = insert(Op::AsWord(value), Some(Repr::I64)).unwrap();
-            insert(
-                Op::LowLevel(low_level::Op::Store {
-                    value: word,
-                    address,
-                    offset: 0,
-                    flags: MemFlagsData::trusted(),
-                }),
-                None,
-            );
+            at.add_effect(Op::LowLevel(low_level::Op::Reference {
+                op: low_level::Reference::Retain,
+                value,
+            }));
+            let word = at.as_word(value);
+            at.ins().store(MemFlagsData::trusted(), word, address, 0);
             if let Some(old) = old {
-                insert(
-                    Op::LowLevel(low_level::Op::Reference {
-                        op: low_level::Reference::Release {
-                            heap: false,
-                            cold: false,
-                        },
-                        value: old,
-                    }),
-                    None,
-                );
+                at.add_effect(Op::LowLevel(low_level::Op::Reference {
+                    op: low_level::Reference::Release {
+                        heap: false,
+                        cold: false,
+                    },
+                    value: old,
+                }));
             } else {
                 let (view, base, index) = addition_data.unwrap();
-                let shape = insert(
-                    Op::LowLevel(low_level::Op::Load {
-                        ty: types::I32,
-                        address: key,
-                        offset: CACHE_ADDITION_DESTINATION_OFFSET,
-                        flags: MemFlagsData::trusted(),
-                    }),
-                    Some(Repr::I32),
-                )
-                .unwrap();
-                insert(
-                    Op::LowLevel(low_level::Op::Store {
-                        value: shape,
-                        address: view,
-                        offset: SHAPE_OFFSET,
-                        flags: MemFlagsData::trusted(),
-                    }),
-                    None,
+                let shape = at.ins().load(
+                    types::I32,
+                    MemFlagsData::trusted(),
+                    key,
+                    CACHE_ADDITION_DESTINATION_OFFSET,
                 );
-                let one = insert(
-                    Op::LowLevel(low_level::Op::Integer {
-                        ty: types::I64,
-                        bits: 1,
-                    }),
-                    Some(Repr::I64),
-                )
-                .unwrap();
-                let length = insert(
-                    Op::LowLevel(low_level::Op::Binary {
-                        op: low_level::Binary::Add,
-                        left: index,
-                        right: one,
-                    }),
-                    Some(Repr::I64),
-                )
-                .unwrap();
-                insert(
-                    Op::LowLevel(low_level::Op::Store {
-                        value: length,
-                        address: view,
-                        offset: LENGTH_OFFSET,
-                        flags: MemFlagsData::trusted(),
-                    }),
-                    None,
-                );
-                let small = insert(
-                    Op::LowLevel(low_level::Op::Unary {
-                        op: low_level::Unary::Reduce,
-                        ty: types::I8,
-                        value: length,
-                    }),
-                    Some(Repr::I8),
-                )
-                .unwrap();
-                insert(
-                    Op::LowLevel(low_level::Op::Store {
-                        value: small,
-                        address: base,
-                        offset: INLINE_PROPERTY_LENGTH_OFFSET,
-                        flags: MemFlagsData::trusted(),
-                    }),
-                    None,
+                at.ins()
+                    .store(MemFlagsData::trusted(), shape, view, SHAPE_OFFSET);
+                let one = at.ins().iconst(types::I64, 1);
+                let length = at.ins().iadd(index, one);
+                at.ins()
+                    .store(MemFlagsData::trusted(), length, view, LENGTH_OFFSET);
+                let small = at.ins().ireduce(types::I8, length);
+                at.ins().store(
+                    MemFlagsData::trusted(),
+                    small,
+                    base,
+                    INLINE_PROPERTY_LENGTH_OFFSET,
                 );
             }
             graph.detach_inst(inst);
         }
     }
     function.facts.cfg = Cfg::new(graph);
-}
-
-fn storage_value(
-    graph: &mut Graph,
-    source: &super::super::InstData,
-    block: super::super::Block,
-    at: usize,
-    op: Op,
-    repr: Option<Repr>,
-) -> Option<super::super::Value> {
-    let (inst, value) = graph.insert(block, at, source.span, op, repr.is_some());
-    graph.insts[inst].source_name = source.source_name;
-    graph.insts[inst].emission_location = source.emission_location;
-    if let Some(value) = value {
-        graph.reprs[value] = repr;
-    }
-    value
 }
 
 fn checked_store(

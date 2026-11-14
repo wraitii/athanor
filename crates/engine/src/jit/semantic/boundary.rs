@@ -4,6 +4,7 @@ use cranelift_codegen::entity::SecondaryMap;
 
 use super::{
     Binding, Block, BlockData, Cfg, Constant, Graph, Op, Scope, Target, TerminatorKind, Value,
+    ValueType,
 };
 
 pub(super) fn liveness(graph: &Graph, rpo: &[Block]) -> SecondaryMap<Block, FxHashSet<Value>> {
@@ -107,17 +108,21 @@ pub(super) fn enter(
     graph.arity = None;
     let mut definitions = FxHashMap::default();
     for (index, &value) in values.iter().enumerate() {
+        let input = facts.map(|facts| facts.of(value));
+        if input.is_some_and(|input| input.intersects(ValueType::UNINITIALIZED)) {
+            let restored = graph.append_value(entry, graph.span, Op::Restored(index));
+            definitions.insert(value, vec![restored]);
+            continue;
+        }
         let argument = graph.append_value(entry, graph.span, Op::Argument(index));
-        let argument = facts.map_or(argument, |facts| {
-            unbox(graph, entry, argument, facts.of(value))
-        });
+        let argument = input.map_or(argument, |input| unbox(graph, entry, argument, input));
         definitions.insert(value, vec![argument]);
     }
     for &scope in scopes {
         graph.append(entry, graph.span, Op::EnterScope(scope), false);
     }
     for (index, &binding) in bindings.iter().enumerate() {
-        let argument = graph.append_value(entry, graph.span, Op::Argument(values.len() + index));
+        let argument = graph.append_value(entry, graph.span, Op::Restored(values.len() + index));
         graph.append(
             entry,
             graph.span,

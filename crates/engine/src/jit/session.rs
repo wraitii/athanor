@@ -308,24 +308,6 @@ impl<'a> JitCtx<'a> {
             .release_frame(&mut self.locals.values_mut()[start..]);
     }
 
-    fn take_reference(&mut self, value: Value) -> bool {
-        if self.global.heap().retain(value) {
-            return true;
-        }
-        self.error = Some(Box::new(Error::Runtime("invalid heap value".into())));
-        false
-    }
-
-    pub(crate) fn local_replace(&mut self, slot: usize, value: Value, old: Value) -> Value {
-        if !self.take_reference(value) {
-            let index = self.locals.start + slot;
-            self.locals.values_mut()[index] = old;
-            return Value::UNDEFINED;
-        }
-        self.global.heap().release(old);
-        value
-    }
-
     #[cfg(test)]
     pub(crate) fn exit(&mut self, value: Value) -> Value {
         let value = if self.global.heap().retain(value) {

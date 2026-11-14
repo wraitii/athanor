@@ -203,11 +203,13 @@ impl Graph {
             }
             Op::ContinuationStore(values) => format!("continuation_store [{}]", list(values)),
             Op::Argument(index) => format!("argument {index}"),
+            Op::Restored(index) => format!("restored {index}"),
             Op::Arguments => "arguments".into(),
             Op::Constant(Constant::Undefined) => "undefined".into(),
             Op::Constant(Constant::Null) => "null".into(),
             Op::Rest(index) => format!("rest {index}"),
             Op::This => "this".into(),
+            Op::Callee => "callee".into(),
             Op::ClosureThis(value) => format!("closure_this {value}"),
             Op::Throw(value) => format!("throw {value}"),
             Op::Catch => "catch".into(),
@@ -215,6 +217,14 @@ impl Graph {
                 "closure {}..{} arrow={arrow} generator={generator} captures={captures:?}",
                 span.start, span.end
             ),
+            Op::ClosureCells(span, _, arrow, generator, _, cells, _) => format!(
+                "closure_cells {}..{} arrow={arrow} generator={generator} cells={cells:?}",
+                span.start, span.end
+            ),
+            Op::CellNew(value) => format!("cell_new {value}"),
+            Op::CellGet(cell) => format!("cell_get {cell}"),
+            Op::CellSet(cell, value) => format!("cell_set {cell}, {value}"),
+            Op::CaptureGet(closure, index) => format!("capture_get {closure}, {index}"),
             Op::Constant(Constant::Boolean(value)) => value.to_string(),
             Op::Constant(Constant::Number(value)) => format!("number {value}"),
             Op::Constant(Constant::String(value)) => format!("string {value:?}"),

@@ -12,9 +12,7 @@ pub(super) mod stubs;
 
 use crate::FxHashMap;
 
-use super::semantic::low_level::{
-    BlockArg, Builder as GraphBuilder, SignatureRef as SigRef, Variable,
-};
+use super::semantic::low_level::{BlockArg, Builder as GraphBuilder, SignatureRef as SigRef};
 use super::semantic::{Block, Inst, Value as LoweredValue};
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{MemFlagsData, Type, types};
@@ -68,11 +66,10 @@ pub(super) struct FunctionCompiler<'a, 'f> {
     handlers: Vec<Block>,
     terminated: bool,
     frame_size: Option<Inst>,
-    frame_roots: Option<Variable>,
     frame: Option<CallerFrame>,
     fixed_signatures: FxHashMap<u16, SigRef>,
     property_caches: FxHashMap<super::semantic::Inst, i64>,
-    slots: FxHashMap<u32, u32>,
+    slots: FxHashMap<LoweredValue, u32>,
     slot_count: u32,
     unchecked: Option<Inst>,
 }
@@ -115,6 +112,7 @@ pub(super) struct Output<'a, 'f> {
     pub(super) cells: &'a mut Vec<Box<u64>>,
     pub(super) data: &'a mut FunctionData,
     pub(super) source_name: (usize, usize),
+    pub(super) after: &'a mut dyn FnMut(&str, &super::semantic::Graph),
 }
 
 pub(super) fn build_function(
@@ -193,6 +191,7 @@ fn build_callable(
         cells,
         data,
         source_name,
+        after,
     } = out;
     let mut lowered = lower_callable(
         params,
@@ -207,6 +206,7 @@ fn build_callable(
         cells,
         data,
         source_name,
+        after,
     )?;
     if !clif {
         *output_graph = Some(lowered);
@@ -234,6 +234,7 @@ fn lower_callable(
     cells: &mut Vec<Box<u64>>,
     data: &mut FunctionData,
     source_name: (usize, usize),
+    after: &mut dyn FnMut(&str, &super::semantic::Graph),
 ) -> Result<super::semantic::Graph, Error> {
     let (mut lowered, body) = match body {
         CallableBody::Graph(mut graph, facts) => {
@@ -305,7 +306,6 @@ fn lower_callable(
         handlers: Vec::new(),
         terminated: false,
         frame_size: None,
-        frame_roots: None,
         frame: None,
         fixed_signatures: FxHashMap::default(),
         property_caches: FxHashMap::default(),
@@ -337,18 +337,17 @@ fn lower_callable(
         compiler.patch_frame_size();
     }
     drop(compiler);
-    super::semantic::scratch::resolve(&mut graph_builder, empty_owned).map_err(Error::Compile)?;
-    graph_builder.finish().map_err(Error::Compile)?;
-    super::semantic::repr::lower(&mut super::semantic::low_level::Builder::new(&mut lowered))
-        .map_err(Error::Compile)?;
-    super::semantic::runtime::cleanup::lower(&mut lowered);
-    super::semantic::runtime::ownership::lower(
+    after("emit", graph_builder.graph);
+    super::semantic::scratch::resolve(graph_builder.graph, empty_owned).map_err(Error::Compile)?;
+    after("scratch", &lowered);
+    super::semantic::lower_emitted(
         &mut lowered,
         ctx,
         module.target_config().default_call_conv,
         pointer,
-    );
-    lowered.verify().map_err(Error::Compile)?;
+        after,
+    )
+    .map_err(Error::Compile)?;
     Ok(lowered)
 }
 
@@ -486,11 +485,6 @@ impl FunctionCompiler<'_, '_> {
         let caller = self.frame.unwrap();
         self.increment(value);
         if self.slot_count > 0 {
-            let release = self.b.create_block();
-            let done = self.b.create_block();
-            let roots = self.b.use_var(self.frame_roots.unwrap());
-            self.brif(roots, release, &[], done, &[]);
-            self.switch(release);
             if self.slot_count <= INLINE_FRAME_RELEASES {
                 for slot in 0..self.slot_count {
                     self.release_slot(slot);
@@ -498,8 +492,6 @@ impl FunctionCompiler<'_, '_> {
             } else {
                 self.call_helper(Helper::FrameRelease, &[]);
             }
-            self.jump(done, &[]);
-            self.switch(done);
         }
         self.release_owned();
         let start = self.load_ctx(crate::jit::session::LOCALS_START_OFFSET);
@@ -526,10 +518,6 @@ impl FunctionCompiler<'_, '_> {
             LOCALS_LEN_OFFSET, LOCALS_LIMIT_OFFSET, LOCALS_OFFSET, LOCALS_START_OFFSET,
             STACK_LIMIT_OFFSET,
         };
-        let roots = self.b.declare_var(crate::jit::semantic::Repr::I8);
-        let clean = self.b.ins().iconst(types::I8, 0);
-        self.b.def_var(roots, clean);
-        self.frame_roots = Some(roots);
         let caller = CallerFrame {
             start: self.load_ctx(LOCALS_START_OFFSET),
             base: self.load_ctx(LOCALS_OFFSET),

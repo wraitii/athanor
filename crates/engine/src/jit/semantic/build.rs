@@ -1387,6 +1387,9 @@ impl<'a> Builder<'a> {
         self.graph.has_handlers = true;
         let catch = self.block();
         let done = self.block();
+        let body = self.block();
+        self.jump(span, body, Vec::new());
+        self.switch(body);
         self.handlers.push((catch, self.open.len()));
         let scope = self.open_scope(
             statement.block.span,

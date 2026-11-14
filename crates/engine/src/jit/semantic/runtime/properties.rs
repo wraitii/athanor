@@ -1,6 +1,7 @@
+use super::super::cursor::{Cursor, Insert};
 use super::super::{
-    Block, BlockData, Cfg, FunctionState, Graph, Inst, InstData, Op, Target, Terminator,
-    TerminatorKind, Value, low_level,
+    Block, BlockData, Cfg, FunctionState, Graph, Inst, Op, Repr, Target, Terminator,
+    TerminatorKind, Value,
 };
 
 pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) -> super::super::Result<bool> {
@@ -30,40 +31,27 @@ pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) -> super::su
             continue;
         }
         let object = *object;
-        let position = graph.blocks[data.block]
-            .insts
-            .iter()
-            .position(|&i| i == inst)
-            .unwrap();
-        let (allocation, cache) = graph.insert(
-            data.block,
-            position,
-            data.span,
-            Op::PropertyCache(inst, name.clone()),
-            true,
-        );
-        graph.insts[allocation].source_name = data.source_name;
-        let cache = cache.unwrap();
+        let cache =
+            Cursor::before(graph, inst).add_unassigned(Op::PropertyCache(inst, name.clone()));
         let first = graph.blocks.len();
         let (block, continuation, fallback) = super::super::dispatch::split(graph, inst);
         graph.insts[inst].op = Op::FillPropertyCache(object, cache, name.clone());
         let fast = graph.blocks.push(BlockData::default());
-        let check = graph.append_value(block, data.span, Op::IsIndexed(object));
+        let check = Cursor::at_end(graph, block, inst).add_unassigned(Op::IsIndexed(object));
         graph.blocks[block].terminator = Some(Terminator {
             source_name: data.source_name,
             emission_location: None,
             span: data.span,
             kind: TerminatorKind::Branch(check, Target::new(fast), Target::new(fallback)),
         });
-        let (load, value) = graph.append(fast, data.span, Op::IndexedLength(object), true);
-        graph.insts[load].source_name = data.source_name;
+        let value = Cursor::at_end(graph, fast, inst).add_unassigned(Op::IndexedLength(object));
         graph.blocks[fast].terminator = Some(Terminator {
             source_name: data.source_name,
             emission_location: None,
             span: data.span,
             kind: TerminatorKind::Jump(Target {
                 block: continuation,
-                args: vec![value.unwrap()],
+                args: vec![value],
             }),
         });
         let added: Vec<_> = graph.blocks.keys().skip(first).collect();
@@ -79,33 +67,16 @@ pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) -> super::su
             unreachable!()
         };
         let object = *object;
-        let position = graph.blocks[data.block]
-            .insts
-            .iter()
-            .position(|&i| i == inst)
-            .unwrap();
-        let (allocation, cache) = graph.insert(
-            data.block,
-            position,
-            data.span,
-            Op::PropertyCache(inst, name.clone()),
-            true,
-        );
-        graph.insts[allocation].source_name = data.source_name;
-        super::super::specialization::properties::lower_cache(
-            graph,
-            inst,
-            cache.unwrap(),
-            object,
-            name,
-        );
+        let cache =
+            Cursor::before(graph, inst).add_unassigned(Op::PropertyCache(inst, name.clone()));
+        super::super::specialization::properties::lower_cache(graph, inst, cache, object, name);
     }
     function.invalidate_cfg();
     Ok(changed)
 }
 
 fn lower_stores(graph: &mut Graph) -> bool {
-    use super::super::{Constant, low_level};
+    use super::super::Constant;
     use crate::heap::{KIND_OFFSET, SHAPE_OFFSET, kind};
     use crate::jit::helpers::{
         CACHE_ADDITION_SOURCE_OFFSET, CACHE_OVERWRITE_INDEX_OFFSET, CACHE_OVERWRITE_SHAPE_OFFSET,
@@ -136,107 +107,35 @@ fn lower_stores(graph: &mut Graph) -> bool {
             Op::ShapedSet(object, name, index, value) => (object, name, value, Some(index)),
             _ => unreachable!(),
         };
-        let position = graph.blocks[data.block]
-            .insts
-            .iter()
-            .position(|&i| i == inst)
-            .unwrap();
-        let (allocation, cache) = graph.insert(
-            data.block,
-            position,
-            data.span,
-            Op::PropertyCache(inst, name.clone()),
-            true,
-        );
-        graph.insts[allocation].source_name = data.source_name;
-        let cache = cache.unwrap();
+        let cache =
+            Cursor::before(graph, inst).add_unassigned(Op::PropertyCache(inst, name.clone()));
         let first = graph.blocks.len();
         let (block, done, fallback) = super::super::dispatch::split(graph, inst);
         graph.insts[inst].op = Op::FillPropertyStore(object, cache, name, value, write);
-        let view = graph.append_value(block, data.span, Op::View(object));
-        let mut append = |block, op| {
-            let (i, v) = graph.append(block, data.span, op, true);
-            graph.insts[i].source_name = data.source_name;
-            v.unwrap()
-        };
+        let view = Cursor::at_end(graph, block, inst).add_unassigned(Op::View(object));
+        let mut at = Cursor::at_end(graph, block, inst);
         let (overwrite, index) = if let Some(index) = shaped {
-            (
-                block,
-                append(block, Op::Constant(Constant::Number(index as f64))),
-            )
+            let index = at.add_unassigned(Op::Constant(Constant::Number(index as f64)));
+            (block, index)
         } else {
-            let mut load = |address, offset| {
-                append(
-                    block,
-                    Op::LowLevel(low_level::Op::Load {
-                        ty: types::I32,
-                        address,
-                        offset,
-                        flags: MemFlagsData::trusted(),
-                    }),
-                )
-            };
+            let flags = MemFlagsData::trusted();
+            let mut load = |address, offset| at.ins().load(types::I32, flags, address, offset);
             let actual_kind = load(view, KIND_OFFSET);
             let shape = load(view, SHAPE_OFFSET);
             let addition_shape = load(cache, CACHE_ADDITION_SOURCE_OFFSET);
             let overwrite_shape = load(cache, CACHE_OVERWRITE_SHAPE_OFFSET);
             let index = load(cache, CACHE_OVERWRITE_INDEX_OFFSET);
-            let inline_kind = append(
-                block,
-                Op::LowLevel(low_level::Op::Integer {
-                    ty: types::I32,
-                    bits: (kind::OBJECT | kind::INLINE) as u64,
-                }),
-            );
-            let inline = append(
-                block,
-                Op::LowLevel(low_level::Op::IntCompare {
-                    condition: IntCC::Equal,
-                    left: actual_kind,
-                    right: inline_kind,
-                }),
-            );
-            let matching = append(
-                block,
-                Op::LowLevel(low_level::Op::IntCompare {
-                    condition: IntCC::Equal,
-                    left: shape,
-                    right: addition_shape,
-                }),
-            );
-            let addition = append(block, Op::BooleanAnd(inline, matching));
-            let object_bits = append(
-                block,
-                Op::LowLevel(low_level::Op::Integer {
-                    ty: types::I32,
-                    bits: kind::OBJECT as u64,
-                }),
-            );
-            let bits = append(
-                block,
-                Op::LowLevel(low_level::Op::Binary {
-                    op: low_level::Binary::And,
-                    left: actual_kind,
-                    right: object_bits,
-                }),
-            );
-            let is_object = append(
-                block,
-                Op::LowLevel(low_level::Op::IntCompare {
-                    condition: IntCC::Equal,
-                    left: bits,
-                    right: object_bits,
-                }),
-            );
-            let matching = append(
-                block,
-                Op::LowLevel(low_level::Op::IntCompare {
-                    condition: IntCC::Equal,
-                    left: shape,
-                    right: overwrite_shape,
-                }),
-            );
-            let overwrite = append(block, Op::BooleanAnd(is_object, matching));
+            let inline_kind = at
+                .ins()
+                .iconst(types::I32, (kind::OBJECT | kind::INLINE) as i64);
+            let inline = at.ins().icmp(IntCC::Equal, actual_kind, inline_kind);
+            let matching = at.ins().icmp(IntCC::Equal, shape, addition_shape);
+            let addition = at.add_unassigned(Op::BooleanAnd(inline, matching));
+            let object_bits = at.ins().iconst(types::I32, kind::OBJECT as i64);
+            let bits = at.ins().band(actual_kind, object_bits);
+            let is_object = at.ins().icmp(IntCC::Equal, bits, object_bits);
+            let matching = at.ins().icmp(IntCC::Equal, shape, overwrite_shape);
+            let overwrite = at.add_unassigned(Op::BooleanAnd(is_object, matching));
             let add = graph.blocks.push(BlockData::default());
             let check = graph.blocks.push(BlockData::default());
             graph.terminate(
@@ -244,37 +143,23 @@ fn lower_stores(graph: &mut Graph) -> bool {
                 data.span,
                 TerminatorKind::Branch(addition, Target::new(add), Target::new(check)),
             );
-            let (store, _) = graph.append(
-                add,
-                data.span,
-                Op::PropertyAdd(object, cache, value, write),
-                false,
-            );
+            let store = Cursor::at_end(graph, add, inst)
+                .add_effect(Op::PropertyAdd(object, cache, value, write));
             graph.views.insert(store, view);
             graph.terminate(add, data.span, TerminatorKind::Jump(Target::new(done)));
             let fast = super::super::dispatch::branch(graph, inst, check, overwrite, fallback);
-            let index = graph.append_value(
-                fast,
-                data.span,
-                Op::LowLevel(low_level::Op::Unary {
-                    op: low_level::Unary::ZeroExtend,
-                    ty: types::I64,
-                    value: index,
-                }),
-            );
+            let index = Cursor::at_end(graph, fast, inst)
+                .ins()
+                .uextend(types::I64, index);
             (fast, index)
         };
-        let (check, writable) =
-            graph.append(overwrite, data.span, Op::CanOverwrite(object, index), true);
+        let mut at = Cursor::at_end(graph, overwrite, inst);
+        let (check, writable) = at.place(Op::CanOverwrite(object, index), true);
         graph.views.insert(check, view);
         let writable = writable.unwrap();
         let fast = super::super::dispatch::branch(graph, inst, overwrite, writable, fallback);
-        let (store, _) = graph.append(
-            fast,
-            data.span,
-            Op::PropertyStore(object, index, value, write),
-            false,
-        );
+        let store = Cursor::at_end(graph, fast, inst)
+            .add_effect(Op::PropertyStore(object, index, value, write));
         graph.views.insert(store, view);
         graph.terminate(fast, data.span, TerminatorKind::Jump(Target::new(done)));
         super::super::dispatch::extend_regions(graph, block, first);
@@ -285,7 +170,6 @@ fn lower_stores(graph: &mut Graph) -> bool {
 pub(in crate::jit::semantic) fn lower_accesses(
     function: &mut FunctionState,
 ) -> super::super::Result<()> {
-    use super::super::Repr;
     use crate::jit::helpers::Helper;
 
     function.ensure_facts();
@@ -318,25 +202,28 @@ pub(in crate::jit::semantic) fn lower_accesses(
                 graph.remove_inst(inst);
                 graph.cold.remove(&finish);
                 graph.blocks[finish].terminator = None;
-                let mut lowering = PropertyLowering {
-                    graph,
-                    source: data,
-                };
+                let mut lowering = PropertyLowering { graph, inst };
                 let (entry, view) =
                     lowering.entry(block, finish, object, cache, builtins, validate);
                 let (last, value) = if validate {
-                    let zero = lowering.integer(finish, cranelift_codegen::ir::types::I64, 0);
-                    let hit = lowering.compare(
-                        finish,
+                    let zero = lowering
+                        .at(finish)
+                        .ins()
+                        .iconst(cranelift_codegen::ir::types::I64, 0);
+                    let hit = lowering.at(finish).ins().icmp(
                         cranelift_codegen::ir::condcodes::IntCC::NotEqual,
                         entry,
                         zero,
                     );
-                    lowering.keep_alive(finish, object);
+                    lowering.at(finish).add_effect(Op::KeepAlive(object));
+                    let result = lowering.graph.blocks[continuation].params[0];
+                    lowering.graph.reprs[result] = Some(Repr::I8);
                     (finish, hit)
                 } else {
                     let (last, address) = lowering.slot(finish, view, entry, builtins);
-                    let value = lowering.value(last, Op::PropertyLoad(object, address));
+                    let value = lowering
+                        .at(last)
+                        .add_unassigned(Op::PropertyLoad(object, address));
                     (last, value)
                 };
                 lowering.jump(last, continuation, vec![value]);
@@ -377,110 +264,27 @@ pub(in crate::jit::semantic) fn lower_accesses(
 fn lower_shaped(graph: &mut Graph, inst: Inst, object: Value, index: u32) {
     use cranelift_codegen::ir::{MemFlagsData, types};
 
-    let data = graph.insts[inst].clone();
-    let mut at = graph.blocks[data.block]
-        .insts
-        .iter()
-        .position(|&i| i == inst)
-        .unwrap();
-    let mut insert = |op| {
-        let (inst, value) = graph.insert(data.block, at, data.span, op, true);
-        graph.insts[inst].source_name = data.source_name;
-        graph.insts[inst].emission_location = data.emission_location;
-        at += 1;
-        value.unwrap()
-    };
-    let view = insert(Op::View(object));
-    let values = insert(Op::LowLevel(low_level::Op::Load {
-        ty: types::I64,
-        address: view,
-        offset: crate::heap::DATA_OFFSET,
-        flags: MemFlagsData::trusted(),
-    }));
-    let offset = insert(Op::LowLevel(low_level::Op::Integer {
-        ty: types::I64,
-        bits: u64::from(index) * 8,
-    }));
-    let address = insert(Op::LowLevel(low_level::Op::Binary {
-        op: low_level::Binary::Add,
-        left: values,
-        right: offset,
-    }));
+    let mut at = Cursor::before(graph, inst);
+    let view = at.add_unassigned(Op::View(object));
+    let values = at.ins().load(
+        types::I64,
+        MemFlagsData::trusted(),
+        view,
+        crate::heap::DATA_OFFSET,
+    );
+    let offset = at.ins().iconst(types::I64, i64::from(index) * 8);
+    let address = at.ins().iadd(values, offset);
     graph.insts[inst].op = Op::PropertyLoad(object, address);
 }
 
 struct PropertyLowering<'a> {
     graph: &'a mut Graph,
-    source: InstData,
+    inst: Inst,
 }
 
 impl PropertyLowering<'_> {
-    fn value(&mut self, block: Block, op: Op) -> Value {
-        let (inst, value) = self.graph.append(block, self.source.span, op, true);
-        self.graph.insts[inst].source_name = self.source.source_name;
-        self.graph.insts[inst].emission_location = self.source.emission_location;
-        value.unwrap()
-    }
-
-    fn keep_alive(&mut self, block: Block, object: Value) {
-        let (inst, _) = self
-            .graph
-            .append(block, self.source.span, Op::KeepAlive(object), false);
-        self.graph.insts[inst].source_name = self.source.source_name;
-        self.graph.insts[inst].emission_location = self.source.emission_location;
-    }
-
-    fn integer(&mut self, block: Block, ty: cranelift_codegen::ir::Type, bits: u64) -> Value {
-        self.value(block, Op::LowLevel(low_level::Op::Integer { ty, bits }))
-    }
-
-    fn load(
-        &mut self,
-        block: Block,
-        ty: cranelift_codegen::ir::Type,
-        address: Value,
-        offset: i32,
-    ) -> Value {
-        self.value(
-            block,
-            Op::LowLevel(low_level::Op::Load {
-                ty,
-                address,
-                offset,
-                flags: cranelift_codegen::ir::MemFlagsData::trusted(),
-            }),
-        )
-    }
-
-    fn binary(&mut self, block: Block, op: low_level::Binary, left: Value, right: Value) -> Value {
-        self.value(
-            block,
-            Op::LowLevel(low_level::Op::Binary { op, left, right }),
-        )
-    }
-
-    fn compare(
-        &mut self,
-        block: Block,
-        condition: cranelift_codegen::ir::condcodes::IntCC,
-        left: Value,
-        right: Value,
-    ) -> Value {
-        self.value(
-            block,
-            Op::LowLevel(low_level::Op::IntCompare {
-                condition,
-                left,
-                right,
-            }),
-        )
-    }
-
-    fn select(&mut self, block: Block, condition: Value, yes: Value, no: Value) -> Value {
-        self.value(
-            block,
-            Op::LowLevel(low_level::Op::Select { condition, yes, no }),
-        )
+    fn at(&mut self, block: Block) -> Cursor<'_> {
+        Cursor::at_end(self.graph, block, self.inst)
     }
 
     fn block(&mut self) -> Block {
@@ -488,17 +292,16 @@ impl PropertyLowering<'_> {
     }
 
     fn branch(&mut self, block: Block, condition: Value, yes: Target, no: Target) {
-        self.graph.terminate(
-            block,
-            self.source.span,
-            TerminatorKind::Branch(condition, yes, no),
-        );
+        let span = self.graph.insts[self.inst].span;
+        self.graph
+            .terminate(block, span, TerminatorKind::Branch(condition, yes, no));
     }
 
     fn jump(&mut self, block: Block, target: Block, args: Vec<Value>) {
+        let span = self.graph.insts[self.inst].span;
         self.graph.terminate(
             block,
-            self.source.span,
+            span,
             TerminatorKind::Jump(Target {
                 block: target,
                 args,
@@ -507,24 +310,30 @@ impl PropertyLowering<'_> {
     }
 
     fn view(&mut self, block: Block, object: Value) -> Value {
-        use super::super::low_level::Binary;
         use crate::value::{TAG_OBJECT, TAG_SHIFT};
         use cranelift_codegen::ir::{condcodes::IntCC, types};
 
-        let bits = self.value(block, Op::AsWord(object));
-        let shift = self.integer(block, types::I64, TAG_SHIFT as u64);
-        let tag = self.binary(block, Binary::ShiftRightUnsigned, bits, shift);
-        let first = self.integer(block, types::I64, TAG_OBJECT >> TAG_SHIFT);
-        let offset = self.binary(block, Binary::Subtract, tag, first);
-        let two = self.integer(block, types::I64, 2);
-        let heap = self.compare(block, IntCC::UnsignedLessThan, offset, two);
-        let mask = self.integer(block, types::I64, (1u64 << TAG_SHIFT) - 1);
-        let address = self.binary(block, Binary::And, bits, mask);
-        let zero = self.integer(block, types::I64, 0);
-        let present = self.compare(block, IntCC::NotEqual, address, zero);
-        let valid = self.value(block, Op::BooleanAnd(heap, present));
-        let empty = self.integer(block, types::I64, crate::heap::NO_ELEMENTS.as_ptr() as u64);
-        self.select(block, valid, address, empty)
+        let mut at = self.at(block);
+        let bits = at.as_word(object);
+        let shift = at.ins().iconst(types::I64, TAG_SHIFT as i64);
+        let tag = at.ins().ushr(bits, shift);
+        let first = at
+            .ins()
+            .iconst(types::I64, (TAG_OBJECT >> TAG_SHIFT) as i64);
+        let offset = at.ins().isub(tag, first);
+        let two = at.ins().iconst(types::I64, 2);
+        let heap = at.ins().icmp(IntCC::UnsignedLessThan, offset, two);
+        let mask = at
+            .ins()
+            .iconst(types::I64, ((1u64 << TAG_SHIFT) - 1) as i64);
+        let address = at.ins().band(bits, mask);
+        let zero = at.ins().iconst(types::I64, 0);
+        let present = at.ins().icmp(IntCC::NotEqual, address, zero);
+        let valid = at.add_unassigned(Op::BooleanAnd(heap, present));
+        let empty = at
+            .ins()
+            .iconst(types::I64, crate::heap::NO_ELEMENTS.as_ptr() as i64);
+        at.ins().select(valid, address, empty)
     }
 
     fn entry(
@@ -542,46 +351,67 @@ impl PropertyLowering<'_> {
             CACHE_HOLDER_SHAPE_OFFSET, CACHE_LEN_OFFSET, CACHE_MEGAMORPHIC_OFFSET,
             CACHE_OVERFLOW_OFFSET, CACHE_SHAPE_OFFSET, PROPERTY_CACHE_LIMIT,
         };
-        use cranelift_codegen::ir::{condcodes::IntCC, types};
-        use low_level::Binary;
+        use cranelift_codegen::ir::{MemFlagsData, condcodes::IntCC, types};
 
+        let flags = MemFlagsData::trusted();
         let result = self.graph.add_param(done);
+        self.graph.reprs[result] = Some(Repr::I64);
         let miss = self.block();
         if validate {
-            let megamorphic = self.load(block, types::I32, cache, CACHE_MEGAMORPHIC_OFFSET);
+            let megamorphic =
+                self.at(block)
+                    .ins()
+                    .load(types::I32, flags, cache, CACHE_MEGAMORPHIC_OFFSET);
             let lookup = self.block();
             self.branch(block, megamorphic, Target::new(miss), Target::new(lookup));
             block = lookup;
         }
         let view = self.view(block, object);
-        let shape = self.load(block, types::I32, view, SHAPE_OFFSET);
-        let kind = builtins.then(|| self.load(block, types::I32, view, KIND_OFFSET));
-        let len = self.load(block, types::I32, cache, CACHE_LEN_OFFSET);
+        let shape = self
+            .at(block)
+            .ins()
+            .load(types::I32, flags, view, SHAPE_OFFSET);
+        let kind = builtins.then(|| {
+            self.at(block)
+                .ins()
+                .load(types::I32, flags, view, KIND_OFFSET)
+        });
+        let len = self
+            .at(block)
+            .ins()
+            .load(types::I32, flags, cache, CACHE_LEN_OFFSET);
         let mut overflow = None;
         for index in 0..PROPERTY_CACHE_LIMIT {
             let entry = if index == 0 {
-                let offset = self.integer(block, types::I64, CACHE_ENTRY_OFFSET as u64);
-                self.binary(block, Binary::Add, cache, offset)
+                let offset = self
+                    .at(block)
+                    .ins()
+                    .iconst(types::I64, CACHE_ENTRY_OFFSET as i64);
+                self.at(block).ins().iadd(cache, offset)
             } else {
                 let overflow = *overflow.get_or_insert_with(|| {
-                    self.load(block, types::I64, cache, CACHE_OVERFLOW_OFFSET)
+                    self.at(block)
+                        .ins()
+                        .load(types::I64, flags, cache, CACHE_OVERFLOW_OFFSET)
                 });
-                let offset = self.integer(
-                    block,
-                    types::I64,
-                    (index - 1) as u64 * CACHE_ENTRY_SIZE as u64,
-                );
-                self.binary(block, Binary::Add, overflow, offset)
+                let bits = (index - 1) as u64 * CACHE_ENTRY_SIZE as u64;
+                let offset = self.at(block).ins().iconst(types::I64, bits as i64);
+                self.at(block).ins().iadd(overflow, offset)
             };
             let next = self.block();
             let mut shaped_kind = None;
             if let Some(kind) = kind {
-                let expected = self.load(block, types::I32, entry, CACHE_BUILTIN_KIND_OFFSET);
-                let zero = self.integer(block, types::I32, 0);
-                let cached = self.compare(block, IntCC::NotEqual, expected, zero);
-                shaped_kind = Some(self.compare(block, IntCC::Equal, expected, zero));
-                let matches = self.compare(block, IntCC::Equal, kind, expected);
-                let hit = self.value(block, Op::BooleanAnd(cached, matches));
+                let expected =
+                    self.at(block)
+                        .ins()
+                        .load(types::I32, flags, entry, CACHE_BUILTIN_KIND_OFFSET);
+                let zero = self.at(block).ins().iconst(types::I32, 0);
+                let cached = self.at(block).ins().icmp(IntCC::NotEqual, expected, zero);
+                shaped_kind = Some(self.at(block).ins().icmp(IntCC::Equal, expected, zero));
+                let matches = self.at(block).ins().icmp(IntCC::Equal, kind, expected);
+                let hit = self
+                    .at(block)
+                    .add_unassigned(Op::BooleanAnd(cached, matches));
                 let shaped = self.block();
                 self.branch(
                     block,
@@ -594,22 +424,36 @@ impl PropertyLowering<'_> {
                 );
                 block = shaped;
             }
-            let expected = self.load(block, types::I32, entry, CACHE_SHAPE_OFFSET);
-            let mut matches = self.compare(block, IntCC::Equal, shape, expected);
+            let expected = self
+                .at(block)
+                .ins()
+                .load(types::I32, flags, entry, CACHE_SHAPE_OFFSET);
+            let mut matches = self.at(block).ins().icmp(IntCC::Equal, shape, expected);
             if let Some(shaped) = shaped_kind {
-                matches = self.value(block, Op::BooleanAnd(matches, shaped));
+                matches = self
+                    .at(block)
+                    .add_unassigned(Op::BooleanAnd(matches, shaped));
             }
             if validate {
                 let holder_check = self.block();
                 self.branch(block, matches, Target::new(holder_check), Target::new(next));
                 block = holder_check;
-                let holder = self.load(block, types::I64, entry, CACHE_HOLDER_OFFSET);
-                let zero = self.integer(block, types::I64, 0);
-                let own = self.compare(block, IntCC::Equal, holder, zero);
-                let holder = self.select(block, own, view, holder);
-                let actual = self.load(block, types::I32, holder, SHAPE_OFFSET);
-                let expected = self.load(block, types::I32, entry, CACHE_HOLDER_SHAPE_OFFSET);
-                matches = self.compare(block, IntCC::Equal, actual, expected);
+                let holder =
+                    self.at(block)
+                        .ins()
+                        .load(types::I64, flags, entry, CACHE_HOLDER_OFFSET);
+                let zero = self.at(block).ins().iconst(types::I64, 0);
+                let own = self.at(block).ins().icmp(IntCC::Equal, holder, zero);
+                let holder = self.at(block).ins().select(own, view, holder);
+                let actual = self
+                    .at(block)
+                    .ins()
+                    .load(types::I32, flags, holder, SHAPE_OFFSET);
+                let expected =
+                    self.at(block)
+                        .ins()
+                        .load(types::I32, flags, entry, CACHE_HOLDER_SHAPE_OFFSET);
+                matches = self.at(block).ins().icmp(IntCC::Equal, actual, expected);
             }
             self.branch(
                 block,
@@ -622,8 +466,11 @@ impl PropertyLowering<'_> {
             );
             block = next;
             if index + 1 < PROPERTY_CACHE_LIMIT {
-                let count = self.integer(block, types::I32, (index + 1) as u64);
-                let more = self.compare(block, IntCC::UnsignedGreaterThan, len, count);
+                let count = self.at(block).ins().iconst(types::I32, (index + 1) as i64);
+                let more = self
+                    .at(block)
+                    .ins()
+                    .icmp(IntCC::UnsignedGreaterThan, len, count);
                 let lookup = self.block();
                 self.branch(block, more, Target::new(lookup), Target::new(miss));
                 block = lookup;
@@ -631,7 +478,7 @@ impl PropertyLowering<'_> {
                 self.jump(block, miss, Vec::new());
             }
         }
-        let zero = self.integer(miss, types::I64, 0);
+        let zero = self.at(miss).ins().iconst(types::I64, 0);
         self.jump(miss, done, vec![zero]);
         (result, view)
     }
@@ -648,38 +495,50 @@ impl PropertyLowering<'_> {
             CACHE_BUILTIN_KIND_OFFSET, CACHE_BUILTIN_VALUE_OFFSET, CACHE_HOLDER_OFFSET,
             CACHE_INDEX_OFFSET,
         };
-        use cranelift_codegen::ir::{condcodes::IntCC, types};
-        use low_level::{Binary, Op as Low, Unary};
+        use cranelift_codegen::ir::{MemFlagsData, condcodes::IntCC, types};
 
+        let flags = MemFlagsData::trusted();
         let ready = builtins.then(|| self.block());
-        let address = ready.map(|ready| self.graph.add_param(ready));
+        let address = ready.map(|ready| {
+            let address = self.graph.add_param(ready);
+            self.graph.reprs[address] = Some(Repr::I64);
+            address
+        });
         if let Some(ready) = ready {
-            let kind = self.load(block, types::I32, entry, CACHE_BUILTIN_KIND_OFFSET);
+            let kind =
+                self.at(block)
+                    .ins()
+                    .load(types::I32, flags, entry, CACHE_BUILTIN_KIND_OFFSET);
             let builtin = self.block();
             let shaped = self.block();
             self.branch(block, kind, Target::new(builtin), Target::new(shaped));
-            let offset = self.integer(builtin, types::I64, CACHE_BUILTIN_VALUE_OFFSET as u64);
-            let slot = self.binary(builtin, Binary::Add, entry, offset);
+            let offset = self
+                .at(builtin)
+                .ins()
+                .iconst(types::I64, CACHE_BUILTIN_VALUE_OFFSET as i64);
+            let slot = self.at(builtin).ins().iadd(entry, offset);
             self.jump(builtin, ready, vec![slot]);
             block = shaped;
         }
-        let holder = self.load(block, types::I64, entry, CACHE_HOLDER_OFFSET);
-        let zero = self.integer(block, types::I64, 0);
-        let own = self.compare(block, IntCC::Equal, holder, zero);
-        let holder = self.select(block, own, view, holder);
-        let index = self.load(block, types::I32, entry, CACHE_INDEX_OFFSET);
-        let index = self.value(
-            block,
-            Op::LowLevel(Low::Unary {
-                op: Unary::ZeroExtend,
-                ty: types::I64,
-                value: index,
-            }),
-        );
-        let shift = self.integer(block, types::I64, 3);
-        let offset = self.binary(block, Binary::ShiftLeft, index, shift);
-        let data = self.load(block, types::I64, holder, DATA_OFFSET);
-        let slot = self.binary(block, Binary::Add, data, offset);
+        let holder = self
+            .at(block)
+            .ins()
+            .load(types::I64, flags, entry, CACHE_HOLDER_OFFSET);
+        let zero = self.at(block).ins().iconst(types::I64, 0);
+        let own = self.at(block).ins().icmp(IntCC::Equal, holder, zero);
+        let holder = self.at(block).ins().select(own, view, holder);
+        let index = self
+            .at(block)
+            .ins()
+            .load(types::I32, flags, entry, CACHE_INDEX_OFFSET);
+        let index = self.at(block).ins().uextend(types::I64, index);
+        let shift = self.at(block).ins().iconst(types::I64, 3);
+        let offset = self.at(block).ins().ishl(index, shift);
+        let data = self
+            .at(block)
+            .ins()
+            .load(types::I64, flags, holder, DATA_OFFSET);
+        let slot = self.at(block).ins().iadd(data, offset);
         if let Some(ready) = ready {
             self.jump(block, ready, vec![slot]);
             (ready, address.unwrap())
@@ -690,7 +549,6 @@ impl PropertyLowering<'_> {
 }
 
 pub(in crate::jit::semantic) fn lower_loads(function: &mut FunctionState) {
-    use super::super::low_level;
     use cranelift_codegen::ir::{MemFlagsData, types};
 
     let graph = &mut function.graph;
@@ -699,16 +557,12 @@ pub(in crate::jit::semantic) fn lower_loads(function: &mut FunctionState) {
             let Op::PropertyLoad(_, address) = graph.insts[inst].op else {
                 continue;
             };
-            let load = low_level::Op::Load {
-                ty: types::I64,
+            let word = Cursor::before(graph, inst).ins().load(
+                types::I64,
+                MemFlagsData::trusted(),
                 address,
-                offset: 0,
-                flags: MemFlagsData::trusted(),
-            };
-            let word =
-                super::helpers::insert_before(graph, inst, load, Some(super::super::Repr::I64))
-                    .1
-                    .unwrap();
+                0,
+            );
             graph.insts[inst].op = Op::AsBoxed(word);
         }
     }

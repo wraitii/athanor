@@ -425,7 +425,8 @@ impl Facts {
                 for &inst in &graph.blocks[block].insts {
                     let data = &graph.insts[inst];
                     for &result in &data.results {
-                        if let Op::Closure(_, target, _, false, _, _, _) = data.op
+                        if let Op::Closure(_, target, _, false, _, _, _)
+                        | Op::ClosureCells(_, target, _, false, _, _, _) = data.op
                             && !marked.contains(&result)
                         {
                             changed |= facts.join_identity(result, Identity::Code(target));
@@ -790,7 +791,8 @@ fn result_types(graph: &Graph, op: &Op, facts: &Facts) -> ValueType {
     match op {
         Op::OsrStart(..) => ValueType::INT32,
         Op::Continuation(body, _) => body.result,
-        Op::ContinuationOutput(..) | Op::BindingLoad(_) => ValueType::ALL,
+        Op::ContinuationOutput(..) | Op::BindingLoad(_) | Op::Restored(_) => ValueType::ALL,
+        Op::CellGet(_) => ValueType::VALUE,
         Op::BindingRestore(..)
         | Op::ContinuationStore(..)
         | Op::Observe(..)

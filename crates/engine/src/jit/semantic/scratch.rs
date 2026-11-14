@@ -1,9 +1,12 @@
-use super::{Block, Inst, Op, Value, low_level};
+use super::variables::{Variable, Variables};
+use super::{Block, Graph, Inst, InstData, Op, Value, low_level};
 use crate::FxHashMap;
-use low_level::{Builder, Scratch, Variable};
+use low_level::Scratch;
 
-struct Resolver<'a, 'g> {
-    b: &'a mut Builder<'g>,
+struct Resolver<'g> {
+    graph: &'g mut Graph,
+    variables: Variables,
+    at: InstData,
     empty: Value,
     active: Vec<Variable>,
     free: Vec<Variable>,
@@ -12,13 +15,36 @@ struct Resolver<'a, 'g> {
     owners: FxHashMap<u32, Vec<Variable>>,
 }
 
-impl Resolver<'_, '_> {
+impl Resolver<'_> {
+    fn define(&mut self, variable: Variable, value: Value) {
+        self.variables
+            .define(self.graph, self.at.block, variable, value);
+    }
+
+    fn read(&mut self, variable: Variable) -> Value {
+        self.variables
+            .read(self.graph, self.at.block, self.at.span, variable)
+    }
+
+    fn cleanup(&mut self, values: Vec<Value>, unwind: bool) {
+        if values.is_empty() {
+            return;
+        }
+        let op = Op::LowLevel(low_level::Op::Cleanup { values, unwind });
+        let (inst, _) = self.graph.append(self.at.block, self.at.span, op, false);
+        self.graph.insts[inst].source_name = self.at.source_name;
+        self.graph.insts[inst].emission_location = self.at.emission_location;
+    }
+
     fn own(&mut self, token: Inst, value: Value) {
-        let variable = self
-            .free
-            .pop()
-            .unwrap_or_else(|| self.b.declare_var_with_entry_value(self.empty));
-        self.b.def_var(variable, value);
+        let variable = match self.free.pop() {
+            Some(variable) => variable,
+            None => {
+                let repr = self.graph.repr(self.empty);
+                self.variables.declare(self.graph, self.empty, repr)
+            }
+        };
+        self.define(variable, value);
         self.active.push(variable);
         self.tokens.insert(token, variable);
         self.values.insert(value, vec![variable]);
@@ -42,25 +68,25 @@ impl Resolver<'_, '_> {
     fn release(&mut self, variables: &[Variable]) {
         let values = variables
             .iter()
-            .map(|&variable| self.b.use_var(variable))
+            .map(|&variable| self.read(variable))
             .collect();
-        self.b.cleanup(values, false);
+        self.cleanup(values, false);
         for &variable in variables {
-            self.b.def_var(variable, self.empty);
+            self.define(variable, self.empty);
         }
         self.retire(variables);
     }
 
     fn move_to_slot(&mut self, variables: &[Variable]) {
         for &variable in variables {
-            self.b.def_var(variable, self.empty);
+            self.define(variable, self.empty);
         }
         self.retire(variables);
     }
 
     // Incoming tokens are mutually exclusive; untaken paths keep empty holders.
     fn forward(&mut self, target: Block, args: &[Value]) {
-        for (&param, value) in self.b.block_params(target).iter().zip(args) {
+        for (&param, value) in self.graph.blocks[target].params.iter().zip(args) {
             let Some(tokens) = self.values.get(value).cloned() else {
                 continue;
             };
@@ -100,9 +126,9 @@ impl Resolver<'_, '_> {
         let values = live
             .into_iter()
             .filter(|&token| Some(token) != excluded)
-            .map(|token| self.b.use_var(token))
+            .map(|token| self.read(token))
             .collect();
-        self.b.cleanup(values, true);
+        self.cleanup(values, true);
     }
 
     fn apply(&mut self, inst: Inst, op: Scratch, values: &[Value]) -> Result<(), String> {
@@ -154,9 +180,8 @@ impl Resolver<'_, '_> {
 }
 
 // Resolve emission scopes into SSA cleanup operands before allowing graph rewrites.
-pub(in crate::jit) fn resolve(b: &mut Builder<'_>, empty: Value) -> Result<(), String> {
-    let events: Vec<_> = b
-        .graph
+pub(in crate::jit) fn resolve(graph: &mut Graph, empty: Value) -> Result<(), String> {
+    let events: Vec<_> = graph
         .insts
         .iter()
         .filter_map(|(inst, data)| {
@@ -167,8 +192,14 @@ pub(in crate::jit) fn resolve(b: &mut Builder<'_>, empty: Value) -> Result<(), S
             .then_some(inst)
         })
         .collect();
+    let Some(&first) = events.first() else {
+        return Variables::default().finish(graph);
+    };
+    let at = graph.insts[first].clone();
     let mut planner = Resolver {
-        b,
+        graph,
+        variables: Variables::default(),
+        at,
         empty,
         active: Vec::new(),
         free: Vec::new(),
@@ -178,43 +209,35 @@ pub(in crate::jit) fn resolve(b: &mut Builder<'_>, empty: Value) -> Result<(), S
     };
     let mut replacements = FxHashMap::default();
     for inst in events {
-        if let Op::AsBoxed(word) = planner.b.graph.insts[inst].op {
+        if let Op::AsBoxed(word) = planner.graph.insts[inst].op {
             if let Some(tokens) = planner.values.get(&word).cloned() {
-                let result = planner.b.graph.insts[inst].result().unwrap();
+                let result = planner.graph.insts[inst].result().unwrap();
                 planner.values.insert(result, tokens);
             }
             continue;
         }
-        let data = &mut planner.b.graph.insts[inst];
+        let data = &mut planner.graph.insts[inst];
         let Op::LowLevel(low_level::Op::Scratch { op, values }) =
             std::mem::replace(&mut data.op, Op::LowLevel(low_level::Op::VariableRead))
         else {
             unreachable!()
         };
-        let (block, span, source_name, location) = (
-            data.block,
-            data.span,
-            data.source_name,
-            data.emission_location,
-        );
-        let original_len = planner.b.graph.blocks[block].insts.len();
-        planner.b.switch_to_block(block);
-        planner.b.set_span(span);
-        planner.b.set_source_name(source_name);
-        planner.b.set_location(location);
+        planner.at = data.clone();
+        let block = planner.at.block;
+        let original_len = planner.graph.blocks[block].insts.len();
         planner.apply(inst, op, &values)?;
-        let added = planner.b.graph.blocks[block].insts.split_off(original_len);
+        let added = planner.graph.blocks[block].insts.split_off(original_len);
         replacements.insert(inst, added);
     }
-    for block in planner.b.graph.blocks.keys().collect::<Vec<_>>() {
-        if !planner.b.graph.blocks[block]
+    for block in planner.graph.blocks.keys().collect::<Vec<_>>() {
+        if !planner.graph.blocks[block]
             .insts
             .iter()
             .any(|inst| replacements.contains_key(inst))
         {
             continue;
         }
-        let insts = std::mem::take(&mut planner.b.graph.blocks[block].insts);
+        let insts = std::mem::take(&mut planner.graph.blocks[block].insts);
         let mut rebuilt = Vec::with_capacity(insts.len());
         for inst in insts {
             if let Some(added) = replacements.remove(&inst) {
@@ -223,9 +246,12 @@ pub(in crate::jit) fn resolve(b: &mut Builder<'_>, empty: Value) -> Result<(), S
                 rebuilt.push(inst);
             }
         }
-        planner.b.graph.blocks[block].insts = rebuilt;
+        planner.graph.blocks[block].insts = rebuilt;
     }
     debug_assert!(replacements.is_empty());
     debug_assert!(planner.active.is_empty());
-    Ok(())
+    let Resolver {
+        graph, variables, ..
+    } = planner;
+    variables.finish(graph)
 }

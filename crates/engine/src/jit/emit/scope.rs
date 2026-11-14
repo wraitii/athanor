@@ -1,4 +1,4 @@
-use super::{Block, BlockArg, GraphBuilder as FunctionBuilder, Inst, Variable};
+use super::{Block, BlockArg, GraphBuilder as FunctionBuilder, Inst};
 use super::{FunctionCompiler, LoweredValue};
 use crate::jit::helpers::Helper;
 use crate::jit::semantic::Repr;
@@ -25,40 +25,6 @@ pub(super) fn is_heap(b: &mut FunctionBuilder<'_>, value: LoweredValue) -> Lower
 }
 
 impl FunctionCompiler<'_, '_> {
-    // Binding slots are not reused by SSA temporaries, so the variable tracks their contents.
-    pub(super) fn initialize_binding(&mut self, variable: Variable, value: LoweredValue) {
-        let old = self.b.use_var(variable);
-        self.initialize_local_with_old(variable, value, Some(old));
-    }
-
-    fn initialize_local_with_old(
-        &mut self,
-        variable: Variable,
-        value: LoweredValue,
-        known_old: Option<LoweredValue>,
-    ) {
-        let (index, stored) = self.store_local(variable, value);
-        let old = known_old.unwrap_or(stored);
-        let new_heap = self.is_heap(value);
-        let old_heap = self.is_heap(old);
-        let heap = self.b.ins().bor(new_heap, old_heap);
-        let split = self.b.create_block();
-        let transfer = self.b.create_block();
-        let release = self.b.create_block();
-        let done = self.b.create_block();
-        self.brif(heap, split, &[], done, &[]);
-        self.switch(split);
-        self.brif(new_heap, transfer, &[], release, &[]);
-        self.switch(transfer);
-        let slot = self.b.ins().iconst(types::I64, index as i64);
-        self.call_helper(Helper::LocalReplace, &[slot, value, old]);
-        self.jump(done, &[]);
-        self.switch(release);
-        self.release_inline(old, done, false);
-        self.switch(done);
-        self.b.def_var(variable, value);
-    }
-
     pub(super) fn increment(&mut self, value: LoweredValue) {
         self.b.reference(Reference::Retain, value);
     }
@@ -181,13 +147,12 @@ impl FunctionCompiler<'_, '_> {
     /// when the slot may already hold one.
     pub(super) fn replace_local(
         &mut self,
-        variable: Variable,
+        local: LoweredValue,
         value: LoweredValue,
         repeated: bool,
     ) {
-        let (_, old) = self.store_local(variable, value);
+        let (_, old) = self.store_local(local, value);
         if !repeated {
-            self.b.def_var(variable, value);
             return;
         }
         let heap = self.is_heap(old);
@@ -197,22 +162,16 @@ impl FunctionCompiler<'_, '_> {
         self.switch(release);
         self.release_inline(old, done, true);
         self.switch(done);
-        self.b.def_var(variable, value);
     }
 
     /// Empties a slot whose reference has moved elsewhere.
-    pub(super) fn clear_local(&mut self, variable: Variable) {
+    pub(super) fn clear_local(&mut self, local: LoweredValue) {
         let undefined = self.constant(Value::UNDEFINED);
-        self.store_local(variable, undefined);
+        self.store_local(local, undefined);
     }
 
-    fn store_local(&mut self, variable: Variable, value: LoweredValue) -> (u32, LoweredValue) {
-        // Even scalar stores conservatively require the normal frame cleanup.
-        if let Some(roots) = self.frame_roots {
-            let dirty = self.b.ins().iconst(types::I8, 1);
-            self.b.def_var(roots, dirty);
-        }
-        let index = *self.slots.entry(variable.as_u32()).or_insert_with(|| {
+    fn store_local(&mut self, local: LoweredValue, value: LoweredValue) -> (u32, LoweredValue) {
+        let index = *self.slots.entry(local).or_insert_with(|| {
             self.slot_count += 1;
             self.slot_count - 1
         });

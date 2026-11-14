@@ -42,6 +42,10 @@ pub(super) struct Inspection {
     planner: Option<String>,
 }
 
+pub(super) fn graph_text(graph: &semantic::Graph) -> String {
+    semantic_text(graph.listing(&semantic::Facts::compute(graph)).lines())
+}
+
 fn semantic_text(lines: Vec<semantic::ListingLine>) -> String {
     let mut text = String::new();
     for (id, _, line) in lines {
@@ -69,6 +73,7 @@ pub(super) fn prepare_for_emission(
     })?;
     if let Some(pass) = pass
         && snapshot.is_none()
+        && !semantic::LOWERING_PASSES.contains(&pass)
     {
         return Err(format!("unknown pass {pass}"));
     }
@@ -102,9 +107,7 @@ impl Inspection {
             return Self::default();
         };
         Self {
-            semantic: options
-                .semantic_ir
-                .then(|| semantic_text(graph.listing(&semantic::Facts::compute(graph)).lines())),
+            semantic: options.semantic_ir.then(|| graph_text(graph)),
             ..Self::default()
         }
     }
@@ -116,6 +119,13 @@ impl Inspection {
 
     pub(super) fn after(mut self, snapshot: Option<(String, String)>) -> Self {
         self.after = snapshot;
+        self
+    }
+
+    pub(super) fn lowered(mut self, snapshot: Option<(String, String)>) -> Self {
+        if snapshot.is_some() {
+            self.after = snapshot;
+        }
         self
     }
 

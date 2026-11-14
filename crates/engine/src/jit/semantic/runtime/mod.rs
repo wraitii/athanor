@@ -1,4 +1,5 @@
 pub(in crate::jit::semantic) mod arrays;
+pub(in crate::jit::semantic) mod cells;
 pub(in crate::jit) mod cleanup;
 pub(in crate::jit::semantic) mod helpers;
 pub(in crate::jit::semantic) mod numeric;
