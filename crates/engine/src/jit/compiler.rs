@@ -471,7 +471,7 @@ impl Compiler {
         }
         if self.context.func.layout.entry_block().is_none() {
             let mut graph = graph.clone();
-            super::semantic::cranelift::lower_memory(&mut graph);
+            super::semantic::cranelift::split_indexed_loads(&mut graph);
             graph.verify().map_err(Error::Compile)?;
             let mut builder = cranelift_frontend::FunctionBuilder::new(
                 &mut self.context.func,
@@ -802,7 +802,7 @@ impl Compiler {
             if callable.generator {
                 continue;
             }
-            let canonical = super::semantic::canonical_for_emission(
+            let canonical = super::semantic::build_canonical(
                 callable.params,
                 callable.statements,
                 callable.expression,
@@ -900,7 +900,7 @@ impl Compiler {
             )
             .map_err(Error::Unsupported)?;
             if self.ssa_opt {
-                graph.lower_memory().map_err(Error::Unsupported)?;
+                graph.lower_typed_storage().map_err(Error::Unsupported)?;
             }
             let continuations = self.compile_continuations(
                 &graph.graph,
@@ -933,9 +933,8 @@ impl Compiler {
             };
             let mut after = None;
             if baseline.is_none() {
-                after =
-                    super::inspect::prepare_for_emission(self.inspection.as_deref(), &mut graph)
-                        .map_err(Error::Unsupported)?;
+                after = super::inspect::lower_runtime(self.inspection.as_deref(), &mut graph)
+                    .map_err(Error::Unsupported)?;
             }
             let inspection = super::inspect::Inspection::new(
                 self.inspection.as_deref(),
@@ -1529,7 +1528,7 @@ impl Compiler {
         } else {
             self.recompile_inline_multiplier
         };
-        let planned = super::semantic::plan_canonical_with_budget(
+        let planned = super::semantic::specialize_with_budget(
             canonical,
             self.ssa_opt,
             Some((&self.canonical, source)),
@@ -1604,13 +1603,13 @@ impl Compiler {
         emission.tier = tier;
         emission.specialized = matches!(versioning, super::semantic::Versioning::Speculate { .. });
         let mut graph =
-            super::semantic::optimize_planned(planned, versioning, self.report_regions())
+            super::semantic::optimize_specialized(planned, versioning, self.report_regions())
                 .map_err(Error::Unsupported)?;
         if self.osr && region.is_none() && !self.canonical.is_region(code) {
             graph.prepare_osr(source).map_err(Error::Unsupported)?;
         }
         if self.ssa_opt {
-            graph.lower_memory().map_err(Error::Unsupported)?;
+            graph.lower_typed_storage().map_err(Error::Unsupported)?;
         }
         let continuations = self.compile_continuations(
             &graph.graph,
@@ -1650,7 +1649,7 @@ impl Compiler {
         if baseline.is_some() {
             self.data.push(baseline_data);
         } else {
-            after = super::inspect::prepare_for_emission(self.inspection.as_deref(), &mut graph)
+            after = super::inspect::lower_runtime(self.inspection.as_deref(), &mut graph)
                 .map_err(Error::Unsupported)?;
         }
         let listing = self.listing().then(|| graph.listing_lines());
@@ -1903,7 +1902,7 @@ impl Compiler {
     ) -> Result<FunctionBody, Error> {
         let mut state = super::semantic::FunctionState::from_graph(graph.clone());
         if self.ssa_opt {
-            state.lower_memory().map_err(Error::Unsupported)?;
+            state.lower_typed_storage().map_err(Error::Unsupported)?;
         }
         let mut data = FunctionData::new();
         let baseline = if !self.ssa_opt
@@ -1931,7 +1930,7 @@ impl Compiler {
         if baseline.is_some() {
             self.data.push(data);
         } else {
-            after = super::inspect::prepare_for_emission(self.inspection.as_deref(), &mut state)
+            after = super::inspect::lower_runtime(self.inspection.as_deref(), &mut state)
                 .map_err(Error::Unsupported)?;
         }
         let inspection =
@@ -2013,7 +2012,7 @@ impl Compiler {
             return Ok(body);
         }
         super::generator::validate(statements)?;
-        let canonical = super::semantic::canonical_for_emission(
+        let canonical = super::semantic::build_canonical(
             params,
             statements,
             expression,
@@ -2125,7 +2124,7 @@ impl Compiler {
             .map(|span| {
                 let canonical = match self.canonical.function(self.source_name.0, span.start) {
                     Some(function) => Ok(function),
-                    None => super::semantic::canonical_for_emission(
+                    None => super::semantic::build_canonical(
                         params,
                         statements,
                         expression,
@@ -2140,7 +2139,7 @@ impl Compiler {
                         self.ssa_opt,
                     ),
                 }?;
-                let planned = super::semantic::plan_canonical_with_budget(
+                let planned = super::semantic::specialize_with_budget(
                     canonical,
                     self.ssa_opt,
                     Some((&self.canonical, self.source_name.0)),
@@ -2152,7 +2151,7 @@ impl Compiler {
                     &planned.plan,
                     self.source_name.0,
                 );
-                super::semantic::optimize_planned(
+                super::semantic::optimize_specialized(
                     planned,
                     super::semantic::Versioning::Speculate {
                         fallback: None,
@@ -2173,7 +2172,7 @@ impl Compiler {
         if self.ssa_opt
             && let Some(graph) = &mut graph
         {
-            graph.lower_memory().map_err(Error::Unsupported)?;
+            graph.lower_typed_storage().map_err(Error::Unsupported)?;
         }
         let feedback = if self.ssa_opt && matches!(kind, emit::FunctionKind::Ordinary) {
             semantic_function.and_then(|span| self.canonical.code(self.source_name.0, span.start))
@@ -2251,7 +2250,7 @@ impl Compiler {
         if baseline.is_none()
             && let Some(graph) = &mut graph
         {
-            after = super::inspect::prepare_for_emission(self.inspection.as_deref(), graph)
+            after = super::inspect::lower_runtime(self.inspection.as_deref(), graph)
                 .map_err(Error::Unsupported)?;
         }
         let inspection = graph.as_ref().map_or_else(Default::default, |graph| {

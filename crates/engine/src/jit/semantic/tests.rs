@@ -1487,8 +1487,8 @@ fn trusted_numeric_inputs_do_not_acquire_speculative_entry_guards() {
             crate::jit::variants::Fact::Number,
         )],
     );
-    let function = plan_canonical(function, true, None).unwrap();
-    let function = optimize_planned(
+    let function = specialize(function, true, None).unwrap();
+    let function = optimize_specialized(
         function,
         Versioning::Speculate {
             fallback: None,
@@ -1598,8 +1598,8 @@ fn trusted_input_shapes_remove_redundant_callee_checks() {
             crate::jit::variants::Fact::Shape(10),
         )],
     );
-    let function = plan_canonical(function, true, Some((&repository, 0))).unwrap();
-    let function = optimize_planned(
+    let function = specialize(function, true, Some((&repository, 0))).unwrap();
+    let function = optimize_specialized(
         function,
         Versioning::Speculate {
             fallback: None,
@@ -1688,8 +1688,8 @@ fn caller_shapes_select_useful_polymorphic_callee_contracts() {
             }
             let mut specialized = FunctionState::from_graph(function.graph.clone());
             call_variants::assume(&mut specialized.graph, &contract);
-            let specialized = plan_canonical(specialized, true, Some((&repository, 0))).unwrap();
-            let specialized = optimize_planned(
+            let specialized = specialize(specialized, true, Some((&repository, 0))).unwrap();
+            let specialized = optimize_specialized(
                 specialized,
                 Versioning::Speculate {
                     fallback: None,
@@ -1852,7 +1852,7 @@ fn arithmetic_lowering_preserves_value_contracts_before_legalization() {
         assert!(function.facts.of(result).intersects(types));
         assert!(function.facts.of(result).within(types));
         function.graph.verify().unwrap();
-        function.prepare_for_emission().unwrap();
+        function.lower_runtime().unwrap();
     }
 
     let graph = lower_source("function f(a,b){return a+b;}").unwrap();
@@ -1906,7 +1906,7 @@ fn lowered_comparisons_and_steps_preserve_loop_facts() {
                 .any(|op| matches!(op, Op::LowLevel(low_level::Op::IntCompare { .. })))
         );
         assert!(function.graph.reprs.values().all(Option::is_none));
-        function.prepare_for_emission().unwrap();
+        function.lower_runtime().unwrap();
     }
 }
 
@@ -2261,7 +2261,7 @@ fn property_lowering_exposes_named_reads_and_leaves_computed_reads_generic() {
     assert!(operations.iter().any(|op| matches!(op, Op::GetIndex(..))));
     assert!(!operations.iter().any(|op| matches!(op, Op::ArrayLoad(..))));
     assert!(!properties::lower(&mut function).unwrap());
-    function.prepare_for_emission().unwrap();
+    function.lower_runtime().unwrap();
 }
 
 #[test]
@@ -2291,7 +2291,7 @@ fn array_storage_lowering_preserves_planned_ownership() {
             }
             let (inst, result) = load.unwrap();
             let mut function = FunctionState::new(graph, Vec::new(), true);
-            function.lower_memory().unwrap();
+            function.lower_typed_storage().unwrap();
             assert!(matches!(function.graph.insts[inst].op, Op::ArrayLoad(..)));
             assert_eq!(function.graph.borrowed.contains(&result), !mutate);
             assert!(
@@ -2410,7 +2410,7 @@ fn typed_loads_lower_to_explicit_memory_operations() {
                 .any(|&i| matches!(graph.insts[i].op, Op::KeepAlive(value) if value == object))
         );
         let mut fallback = graph.clone();
-        cranelift::lower_memory(&mut fallback);
+        cranelift::split_indexed_loads(&mut fallback);
         fallback.verify().unwrap();
         assert!(
             matches!(fallback.defining_op(raw), Some(Op::Memory(MemoryOp::Load { format: actual, .. })) if *actual == format)
@@ -3214,7 +3214,7 @@ fn write_lowering_keeps_generic_keys_and_materializes_selected_stores() {
         let mut function = FunctionState::new(graph, Vec::new(), true);
         typed::lower(&mut function).unwrap();
         array_checks::lower_array_kinds(&mut function);
-        function.prepare_for_emission().unwrap();
+        function.lower_runtime().unwrap();
         assert!(
             !ops(&function.graph)
                 .iter()
@@ -3232,7 +3232,7 @@ fn write_lowering_keeps_generic_keys_and_materializes_selected_stores() {
         }
     }
     let mut function = FunctionState::new(graph, Vec::new(), true);
-    function.prepare_for_emission().unwrap();
+    function.lower_runtime().unwrap();
     assert!(
         !ops(&function.graph)
             .iter()
@@ -3289,7 +3289,7 @@ fn property_write_lowering_exposes_addition_and_overwrite() {
             .iter()
             .all(|&inst| !function.facts.memory(inst).writes_data())
     );
-    function.prepare_for_emission().unwrap();
+    function.lower_runtime().unwrap();
     assert!(
         !ops(&function.graph)
             .iter()
@@ -3577,7 +3577,7 @@ fn property_access_lowering_preserves_boxed_loads_until_ownership_planning() {
                 }
             )));
         }
-        function.prepare_for_emission().unwrap();
+        function.lower_runtime().unwrap();
         assert!(
             !ops(&function.graph)
                 .iter()

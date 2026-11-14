@@ -155,8 +155,8 @@ Result-reference tokens follow values through internal lowering joins, separatel
 from scratch references created by the same instruction. Moving a result into a
 slot clears its tokens without releasing them.
 
-Implementation selection in `semantic/selection.rs` describes operand/result
-representations and selects result-reference delivery for allocations and borrowed
+Representation contracts in `semantic/contracts.rs` describe operand/result
+representations and select result-reference delivery for allocations and borrowed
 reads. After slot assignment, the ownership plan records the chosen helper variant
 and whether its result is borrowed, emitter-managed, delivered directly to a
 frame slot, or moved from an emitter temporary into the slot. Both retain insertion

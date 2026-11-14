@@ -172,7 +172,7 @@ readers. Deferred to step 7, where the readers change anyway.
 Today (`semantic/mod.rs`):
 
 ```
-plan_canonical_with_budget
+specialize_with_budget
   expansions, specialise/inline rounds, js::simplify
   prove_closed_calls -> graph.closed_calls
   direct_calls
@@ -183,7 +183,7 @@ plan_canonical_with_budget
   arrays::push_calls
   => SpecializationPlan { conditional, inlines, reads, shapes, numbers }
 
-optimize_planned
+optimize_specialized
   caches::apply, reads::apply, comparisons::expose, sink/lazy captures, ...
   version_with_report  (optimize/planning.rs + optimize/versioning.rs)
   js::simplify, reuse_loads, hoist per region, ...
@@ -205,9 +205,9 @@ specialise   duplicate where collected gain pays off; Assumes become entry check
 lower        per check failure: continuation (today) / inline recovery (later)
 ```
 
-The current `plan_canonical_with_budget` / `optimize_planned` split no longer matches: only inlining
+The current `specialize_with_budget` / `optimize_specialized` split no longer matches: only inlining
 stays before optimisation. `SpecializationPlan` stops being a precomputed bundle handed to
-`optimize_planned`; the planner runs between optimisation rounds instead.
+`optimize_specialized`; the planner runs between optimisation rounds instead.
 
 ## Where today's code goes
 
@@ -288,7 +288,7 @@ iteration it enables are not done.
      to move with their branch.
 7. **Planner candidates and `Assume`.** Guard table x profile, evaluated with `Facts::assuming` on
    the normalised graph, recorded as inert `Assume` ops; placement hoists and merges them with the
-   6a machinery. The planner moves from `plan_canonical_with_budget` to after normalisation.
+   6a machinery. The planner moves from `specialize_with_budget` to after normalisation.
    Today's versioning consumes the `Assume`s that reach a region entry instead of `entry_checks`,
    `invariant_guards`, typed receivers, bounds, requirements and identities; `reads::plan`,
    `shapes::plan`, `observations::plan` and `conditional_plan` fold in. Output should stay close

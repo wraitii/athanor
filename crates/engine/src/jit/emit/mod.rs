@@ -214,7 +214,7 @@ fn build_callable(
     if native {
         *output_graph = Some(lowered.clone());
     }
-    super::semantic::cranelift::lower_memory(&mut lowered);
+    super::semantic::cranelift::split_indexed_loads(&mut lowered);
     lowered.verify().map_err(Error::Compile)?;
     cranelift::emit(clif_builder, module, &lowered, Some(annotations))?;
     Ok(())
@@ -332,14 +332,14 @@ fn lower_callable(
         let result = compiler.b.block_params(return_block)[0];
         compiler.return_value(result);
     } else if let Body::Graph(context) = body {
-        compiler.emit_semantic_graph(context, closure, continuations)?;
+        compiler.finalize_runtime_lowering(context, closure, continuations)?;
         compiler.patch_frame_size();
     }
     drop(compiler);
-    after("emit", graph_builder.graph);
+    after("finalize-runtime", graph_builder.graph);
     super::semantic::scratch::resolve(graph_builder.graph, empty_owned).map_err(Error::Compile)?;
     after("scratch", &lowered);
-    super::semantic::lower_emitted(
+    super::semantic::lower_low_level(
         &mut lowered,
         ctx,
         module.target_config().default_call_conv,

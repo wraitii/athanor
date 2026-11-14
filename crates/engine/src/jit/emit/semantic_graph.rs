@@ -21,8 +21,8 @@ use super::FunctionCompiler;
 use super::ops::{self, BinaryOp, UnaryOp as EmitUnaryOp};
 use super::repr::Operand;
 use crate::jit::semantic::Repr;
+use crate::jit::semantic::contracts::ResultReference;
 use crate::jit::semantic::ownership::{Holder, Plan};
-use crate::jit::semantic::selection::ResultReference;
 
 pub(super) struct Context<'a> {
     entry: Block,
@@ -192,7 +192,7 @@ impl FunctionCompiler<'_, '_> {
         Ok(result)
     }
 
-    pub(super) fn emit_semantic_graph(
+    pub(super) fn finalize_runtime_lowering(
         &mut self,
         cx: Context<'_>,
         closure: LoweredValue,
@@ -316,7 +316,8 @@ impl FunctionCompiler<'_, '_> {
                         let result = match &data.op {
                             Op::LowLevel(_) => {
                                 return Err(Error::Compile(
-                                    "low-level operation reached semantic emission".into(),
+                                    "low-level operation reached runtime lowering finalization"
+                                        .into(),
                                 ));
                             }
                             Op::Continuation(target, inputs) => {
@@ -1054,7 +1055,7 @@ impl FunctionCompiler<'_, '_> {
                 | TerminatorKind::ReturnValues(..)
                 | TerminatorKind::TailCall { .. } => {
                     return Err(Error::Compile(
-                        "low-level terminator reached semantic emission".into(),
+                        "low-level terminator reached runtime lowering finalization".into(),
                     ));
                 }
                 TerminatorKind::Yield(..) => {

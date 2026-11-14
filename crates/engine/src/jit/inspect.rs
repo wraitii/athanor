@@ -58,7 +58,7 @@ fn semantic_text(lines: Vec<semantic::ListingLine>) -> String {
     text
 }
 
-pub(super) fn prepare_for_emission(
+pub(super) fn lower_runtime(
     options: Option<&CompileOptions>,
     state: &mut semantic::FunctionState,
 ) -> Result<Option<(String, String)>, String> {
@@ -66,14 +66,14 @@ pub(super) fn prepare_for_emission(
         .filter(|options| options.semantic_ir)
         .and_then(|options| options.after.as_deref());
     let mut snapshot = None;
-    state.prepare_for_emission_observed(&mut |name, state| {
+    state.lower_runtime_observed(&mut |name, state| {
         if pass == Some(name) {
             snapshot = Some((name.to_owned(), semantic_text(state.listing_lines())));
         }
     })?;
     if let Some(pass) = pass
         && snapshot.is_none()
-        && !semantic::LOWERING_PASSES.contains(&pass)
+        && !semantic::LOW_LEVEL_PASSES.contains(&pass)
     {
         return Err(format!("unknown pass {pass}"));
     }

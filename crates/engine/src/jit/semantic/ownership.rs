@@ -4,7 +4,7 @@ use cranelift_codegen::entity::SecondaryMap;
 use oxc_span::Span;
 
 use super::borrow::receiver as borrowed_receiver;
-use super::selection::{self, ResultReference};
+use super::contracts::{self, ResultReference};
 use super::{
     Block, BlockData, Cfg, Facts, Graph, Inst, InstData, Op, Ownership, Target, Terminator,
     TerminatorKind, Value, ValueType,
@@ -132,7 +132,7 @@ pub(super) fn plan(graph: &mut Graph, facts: &mut Facts) -> Plan {
                 | Op::GlobalRead(_)
                 | Op::GlobalReadOptional(_),
             ) => true,
-            Some(op) => super::selection::fresh_reference(op),
+            Some(op) => super::contracts::fresh_reference(op),
             _ => false,
         },
     );
@@ -156,7 +156,7 @@ pub(super) fn plan(graph: &mut Graph, facts: &mut Facts) -> Plan {
             let slot = graph.insts[inst]
                 .result()
                 .is_some_and(|value| holders[value] == Holder::Slot);
-            results[inst] = selection::result_reference(graph, facts, inst, slot);
+            results[inst] = contracts::result_reference(graph, facts, inst, slot);
         }
     }
     let mut releases = releases(graph, facts, cfg);

@@ -5,6 +5,7 @@ mod borrow;
 pub(in crate::jit) mod boundary;
 mod build;
 pub(in crate::jit) mod continuation;
+pub(in crate::jit) mod contracts;
 pub(in crate::jit) mod cranelift;
 pub(in crate::jit) mod cursor;
 mod dispatch;
@@ -21,18 +22,17 @@ mod pipeline;
 pub(in crate::jit) mod repr;
 pub(in crate::jit) mod runtime;
 pub(in crate::jit) mod scratch;
-pub(in crate::jit) mod selection;
 pub(in crate::jit) mod specialization;
 pub(in crate::jit) mod suspension;
 mod transforms;
 pub(in crate::jit) mod variables;
 
 pub(super) use pipeline::{
-    LOWERING_PASSES, Versioning, canonical_for_emission, canonicalize_graph, lower_emitted,
-    lower_global, optimize_planned, plan_canonical_with_budget,
+    LOW_LEVEL_PASSES, Versioning, build_canonical, canonicalize_graph, lower_global,
+    lower_low_level, optimize_specialized, specialize_with_budget,
 };
 #[cfg(test)]
-use pipeline::{analyze, optimize_canonical, plan_canonical};
+use pipeline::{analyze, optimize_canonical, specialize};
 
 use crate::{FxHashMap, FxHashSet};
 use std::fmt;

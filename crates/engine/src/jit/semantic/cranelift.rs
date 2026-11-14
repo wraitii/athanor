@@ -1,6 +1,6 @@
 use super::{Graph, Op};
 
-pub(in crate::jit) fn lower_memory(graph: &mut Graph) {
+pub(in crate::jit) fn split_indexed_loads(graph: &mut Graph) {
     use super::MemoryOp;
 
     for block in super::Cfg::new(graph).rpo {

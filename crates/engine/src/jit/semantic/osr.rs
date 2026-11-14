@@ -528,7 +528,7 @@ mod tests {
         );
         let mut function = FunctionState::from_graph(graph);
         function.prepare_osr(0).unwrap();
-        function.lower_memory().unwrap();
+        function.lower_typed_storage().unwrap();
         let plan = function.osr.as_ref().unwrap();
         assert!(
             plan.graph

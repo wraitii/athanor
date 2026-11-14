@@ -21,7 +21,7 @@ use super::{
 };
 
 impl FunctionState {
-    pub(in crate::jit) fn lower_memory(&mut self) -> Result<()> {
+    pub(in crate::jit) fn lower_typed_storage(&mut self) -> Result<()> {
         let typed = typed::lower_memory(self);
         let metadata = storage::lower_metadata(self);
         if typed || metadata {
@@ -33,11 +33,11 @@ impl FunctionState {
     }
 
     #[cfg(test)]
-    pub(in crate::jit) fn prepare_for_emission(&mut self) -> Result<()> {
-        self.prepare_for_emission_observed(&mut |_, _| {})
+    pub(in crate::jit) fn lower_runtime(&mut self) -> Result<()> {
+        self.lower_runtime_observed(&mut |_, _| {})
     }
 
-    pub(in crate::jit) fn prepare_for_emission_observed(
+    pub(in crate::jit) fn lower_runtime_observed(
         &mut self,
         after: &mut dyn FnMut(&str, &FunctionState),
     ) -> Result<()> {
@@ -56,7 +56,7 @@ impl FunctionState {
         after("properties", self);
         properties::lower_accesses(self)?;
         after("property-accesses", self);
-        self.lower_memory()?;
+        self.lower_typed_storage()?;
         after("memory", self);
         let lowered = numeric::operations(self);
         let dispatched = numeric::dispatch(self);
@@ -114,8 +114,8 @@ impl FunctionState {
     }
 }
 
-pub(in crate::jit) const LOWERING_PASSES: &[&str] = &[
-    "emit",
+pub(in crate::jit) const LOW_LEVEL_PASSES: &[&str] = &[
+    "finalize-runtime",
     "scratch",
     "repr-lower",
     "cleanup",
@@ -123,7 +123,7 @@ pub(in crate::jit) const LOWERING_PASSES: &[&str] = &[
     "bits",
 ];
 
-pub(in crate::jit) fn lower_emitted(
+pub(in crate::jit) fn lower_low_level(
     graph: &mut Graph,
     ctx: Value,
     call_conv: CallConv,
@@ -162,15 +162,15 @@ pub(in crate::jit) fn lower_global(
     )?;
     let mut function = FunctionState::new(graph, Vec::new(), ssa_opt);
     canonicalize(&mut function)?;
-    let planned = plan_canonical(function, ssa_opt, None)?;
+    let planned = specialize(function, ssa_opt, None)?;
     let versioning = Versioning::Speculate {
         fallback: None,
         continuations,
     };
-    optimize_planned(planned, versioning, report_regions)
+    optimize_specialized(planned, versioning, report_regions)
 }
 
-pub(in crate::jit) fn canonical_for_emission(
+pub(in crate::jit) fn build_canonical(
     params: &FormalParameters<'_>,
     statements: &[Statement<'_>],
     expression: Option<&Expression<'_>>,
@@ -240,8 +240,8 @@ pub(in crate::jit) fn optimize_canonical(
     ssa_opt: bool,
     specialization: Option<(&calls::Repository, usize)>,
 ) -> Result<FunctionState> {
-    optimize_planned(
-        plan_canonical(function, ssa_opt, specialization)?,
+    optimize_specialized(
+        specialize(function, ssa_opt, specialization)?,
         Versioning::Speculate {
             fallback: None,
             continuations: true,
@@ -270,24 +270,24 @@ impl Expansions {
     }
 }
 
-pub(in crate::jit) fn plan_canonical(
+pub(in crate::jit) fn specialize(
     function: FunctionState,
     ssa_opt: bool,
     specialization: Option<(&calls::Repository, usize)>,
 ) -> Result<FunctionState> {
-    plan_canonical_with_budget(function, ssa_opt, specialization, 1)
+    specialize_with_budget(function, ssa_opt, specialization, 1)
 }
 
-pub(in crate::jit) fn plan_canonical_with_budget(
+pub(in crate::jit) fn specialize_with_budget(
     function: FunctionState,
     ssa_opt: bool,
     specialization: Option<(&calls::Repository, usize)>,
     inline_multiplier: usize,
 ) -> Result<FunctionState> {
-    plan_canonical_inner(function, ssa_opt, specialization, inline_multiplier, true)
+    specialize_inner(function, ssa_opt, specialization, inline_multiplier, true)
 }
 
-pub(super) fn plan_canonical_inner(
+pub(super) fn specialize_inner(
     mut function: FunctionState,
     ssa_opt: bool,
     specialization: Option<(&calls::Repository, usize)>,
@@ -404,7 +404,7 @@ pub(in crate::jit) enum Versioning {
     },
 }
 
-pub(in crate::jit) fn optimize_planned(
+pub(in crate::jit) fn optimize_specialized(
     mut function: FunctionState,
     versioning: Versioning,
     report_regions: bool,

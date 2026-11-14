@@ -1,7 +1,7 @@
 use crate::FxHashMap;
 use oxc_span::Span;
 
-use super::selection::{Use, repr_contract as contract};
+use super::contracts::{Use, repr_contract as contract};
 use super::{
     Block, BlockData, Cfg, Facts, Graph, Inst, InstData, Op, Repr, Target, Terminator,
     TerminatorKind, Value, ValueDef,

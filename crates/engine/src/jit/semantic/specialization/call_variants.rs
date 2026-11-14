@@ -31,14 +31,9 @@ pub(in crate::jit::semantic) fn contextual_requirements(
     offered: &Requirements,
 ) -> super::super::Result<Requirements> {
     assume(&mut function.graph, offered);
-    let planned = super::super::pipeline::plan_canonical_inner(
-        function,
-        true,
-        Some((bodies, source)),
-        0,
-        false,
-    )?;
-    let optimized = super::super::optimize_planned(
+    let planned =
+        super::super::pipeline::specialize_inner(function, true, Some((bodies, source)), 0, false)?;
+    let optimized = super::super::optimize_specialized(
         planned,
         super::super::Versioning::Speculate {
             fallback: None,
