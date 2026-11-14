@@ -844,17 +844,7 @@ fn result_types(graph: &Graph, op: &Op, facts: &Facts) -> ValueType {
             | LowOp::InRange { .. }
             | LowOp::TestMask { .. },
         ) => ValueType::BOOLEAN,
-        Op::LowLevel(LowOp::Binary {
-            op: super::low_level::Binary::And,
-            left,
-            right,
-        }) if [*left, *right].iter().all(|&value| {
-            let types = facts.of(value);
-            types != ValueType::default() && types.within(ValueType::BOOLEAN)
-        }) =>
-        {
-            ValueType::BOOLEAN
-        }
+        Op::LowLevel(LowOp::Binary { op, .. }) if op.is_boolean() => ValueType::BOOLEAN,
         Op::LowLevel(LowOp::Binary {
             op:
                 super::low_level::Binary::And

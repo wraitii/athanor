@@ -134,7 +134,6 @@ impl Repr {
     /// family those types overwhelmingly mean there.
     pub(in crate::jit) fn from_machine(ty: Type) -> Self {
         match ty {
-            types::I8 => Self::Boolean,
             types::I64 => Self::Word,
             _ => Self::numeric(ty),
         }
@@ -154,6 +153,14 @@ impl Repr {
             (Self::INTEGER | Self::FLOAT, concrete) => self.fits(concrete.machine()),
             (concrete, open) => open.fits(concrete.machine()),
         }
+    }
+
+    pub(in crate::jit) fn accepts(self, required: Self) -> bool {
+        self == required
+            || matches!(
+                (self, required),
+                (Self::Word, Self::I64) | (Self::I64, Self::Word)
+            )
     }
 
     pub(in crate::jit) fn widest(self) -> Self {
@@ -238,6 +245,7 @@ pub(in crate::jit) fn intrinsic(op: &Op) -> Option<Repr> {
             | LowOp::TestMask { .. },
         ) => Repr::Boolean,
         Op::LowLevel(LowOp::Binary { op, .. }) if op.is_float() => Repr::F64,
+        Op::LowLevel(LowOp::Binary { op, .. }) if op.is_boolean() => Repr::Boolean,
         Op::TypedData(_) | Op::Memory(MemoryOp::Address { .. }) => Repr::Word,
         Op::Memory(MemoryOp::IndexedLoad { format, .. } | MemoryOp::Load { format, .. }) => {
             format.repr()
@@ -476,7 +484,7 @@ fn verify_words(graph: &Graph) -> Result<(), String> {
         for target in terminator.kind.targets() {
             let params = &graph.blocks[target.block].params;
             for (&arg, &param) in target.args.iter().zip(params) {
-                if graph.reprs[arg] != graph.reprs[param] {
+                if !graph.repr(arg).accepts(graph.repr(param)) {
                     return Err(format!(
                         "{block} passes {arg}:{:?} to {param}:{:?}",
                         graph.reprs[arg], graph.reprs[param]
@@ -672,7 +680,7 @@ fn convert(builder: &mut Builder<'_>, value: Value, from: Repr, to: Repr) -> Val
             let zero = ins.f64const(0.0);
             let negative = ins.fcmp(FloatCC::LessThan, value, zero);
             let positive = ins.fcmp(FloatCC::GreaterThan, value, zero);
-            ins.bor(negative, positive)
+            ins.boolean_or(negative, positive)
         }
         (Repr::I32, Repr::I64) => ins.sextend(types::I64, value),
         (Repr::F64, Repr::I64) => ins.fcvt_to_sint_sat(types::I64, value),

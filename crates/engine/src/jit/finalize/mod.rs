@@ -526,7 +526,7 @@ impl FunctionCompiler<'_, '_> {
             .b
             .ins()
             .icmp(IntCC::UnsignedLessThan, stack_pointer, stack_limit);
-        let overflow = self.b.ins().bor(full, deep);
+        let overflow = self.b.ins().boolean_or(full, deep);
         let fail = self.b.create_block();
         let enter = self.b.create_block();
         self.b.set_cold_block(fail);

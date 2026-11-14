@@ -1,5 +1,4 @@
 use crate::FxHashMap;
-use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_module::FuncId;
 
 use super::facts::ValueType;
@@ -123,8 +122,8 @@ pub(super) fn implies(op: &Op) -> Option<(Value, Fact)> {
 pub(super) fn negated(graph: &Graph, value: Value) -> Option<Value> {
     match *graph.defining_op(value)? {
         Op::Unary(UnaryOp::Not, value) => Some(value),
-        Op::LowLevel(low_level::Op::IntCompare {
-            condition: IntCC::Equal,
+        Op::LowLevel(low_level::Op::Binary {
+            op: low_level::Binary::BooleanEqual,
             left,
             right,
         }) => {

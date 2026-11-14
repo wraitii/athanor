@@ -1216,6 +1216,9 @@ impl Lower<'_> {
                 B::FloatDivide => Opcode::Fdiv,
                 B::FloatMin => Opcode::Fmin,
                 B::FloatMax => Opcode::Fmax,
+                B::BooleanAnd | B::BooleanOr | B::BooleanXor | B::BooleanEqual => {
+                    return Err(Unsupported("unexpanded boolean operation".into()));
+                }
             },
             L::IntCompare { .. } => Opcode::Icmp,
             L::FloatCompare { .. } => Opcode::Fcmp,

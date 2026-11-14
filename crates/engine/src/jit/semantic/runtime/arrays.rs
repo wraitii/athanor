@@ -44,7 +44,7 @@ pub(in crate::jit::semantic) fn lower_checks(function: &mut FunctionState) -> bo
         for inst in graph.blocks[block].insts.clone() {
             let op = match graph.insts[inst].op {
                 Op::BooleanAnd(left, right) => low_level::Op::Binary {
-                    op: low_level::Binary::And,
+                    op: low_level::Binary::BooleanAnd,
                     left,
                     right,
                 },

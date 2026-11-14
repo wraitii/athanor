@@ -81,7 +81,7 @@ impl Legalizer<'_> {
                 let Some(repr) = contract(self.graph, inst).produces else {
                     continue;
                 };
-                if repr != self.graph.repr(value) {
+                if !self.graph.repr(value).accepts(repr) {
                     produced.insert(inst, repr);
                 }
             }
@@ -142,7 +142,7 @@ impl Legalizer<'_> {
                     replaced.push(value);
                     continue;
                 };
-                if self.graph.repr(value) == repr {
+                if self.graph.repr(value).accepts(repr) {
                     replaced.push(value);
                     continue;
                 }
@@ -174,7 +174,7 @@ impl Legalizer<'_> {
         let (span, source_name) = (terminator.span, terminator.source_name);
         let location = terminator.emission_location;
         let mut tail = |this: &mut Self, value: Value, repr: Repr| {
-            if this.graph.repr(value) == repr {
+            if this.graph.repr(value).accepts(repr) {
                 return value;
             }
             if let Some(&converted) = cache.get(&(value, repr)) {
@@ -234,7 +234,7 @@ impl Legalizer<'_> {
             .args
             .iter()
             .zip(params)
-            .any(|(&arg, &param)| self.graph.repr(arg) != self.graph.repr(param));
+            .any(|(&arg, &param)| !self.graph.repr(arg).accepts(self.graph.repr(param)));
         if !mismatched {
             return target;
         }
@@ -248,7 +248,7 @@ impl Legalizer<'_> {
             let repr = self
                 .graph
                 .repr(self.graph.blocks[target.block].params[index]);
-            if self.graph.repr(arg) == repr {
+            if self.graph.repr(arg).accepts(repr) {
                 args.push(arg);
                 continue;
             }

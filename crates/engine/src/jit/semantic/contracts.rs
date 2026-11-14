@@ -68,26 +68,14 @@ fn specific(graph: &Graph, inst: Inst) -> Option<Representations> {
         Op::LowLevel(super::low_level::Op::Binary { op, .. }) if op.is_float() => {
             exact(&[Repr::F64, Repr::F64], Repr::F64)
         }
-        Op::LowLevel(super::low_level::Op::Binary { op, .. }) => {
-            let repr = target.expect("integer arithmetic result representation");
-            if op.is_width_agnostic() && matches!(repr, Repr::Integer(_)) {
-                exact(&[Repr::INTEGER, Repr::INTEGER], Repr::INTEGER)
-            } else {
-                exact(&[repr, repr], repr)
-            }
+        Op::LowLevel(super::low_level::Op::Binary { op, .. }) if op.is_boolean() => {
+            exact(&[Repr::Boolean, Repr::Boolean], Repr::Boolean)
         }
-        Op::LowLevel(super::low_level::Op::IntCompare { left, right, .. }) => {
-            let (left, right) = (graph.repr(*left), graph.repr(*right));
-            match (left, right) {
-                (Repr::Boolean, Repr::Boolean | Repr::Boxed) | (Repr::Boxed, Repr::Boolean) => {
-                    exact(&[Repr::Boolean, Repr::Boolean], Repr::Boolean)
-                }
-                (Repr::Integer(_), Repr::Integer(_)) | (Repr::Boxed, _) | (_, Repr::Boxed) => {
-                    exact(&[Repr::INTEGER, Repr::INTEGER], Repr::Boolean)
-                }
-                _ if left.machine() == right.machine() => exact(&[left, right], Repr::Boolean),
-                _ => exact(&[Repr::I64, Repr::I64], Repr::Boolean),
-            }
+        Op::LowLevel(super::low_level::Op::Binary { .. }) => {
+            exact(&[Repr::INTEGER, Repr::INTEGER], Repr::INTEGER)
+        }
+        Op::LowLevel(super::low_level::Op::IntCompare { .. }) => {
+            exact(&[Repr::INTEGER, Repr::INTEGER], Repr::Boolean)
         }
         Op::LowLevel(super::low_level::Op::FloatCompare { .. }) => {
             exact(&[Repr::FLOAT, Repr::FLOAT], Repr::Boolean)
@@ -103,12 +91,8 @@ fn specific(graph: &Graph, inst: Inst) -> Option<Representations> {
         }) => exact(&[Repr::FLOAT], Repr::FLOAT),
         Op::LowLevel(super::low_level::Op::Unary {
             op: super::low_level::Unary::BitNot,
-            value,
             ..
-        }) => {
-            let repr = graph.repr(*value);
-            exact(&[repr], repr)
-        }
+        }) => exact(&[Repr::INTEGER], Repr::INTEGER),
         Op::Convert(_, repr) | Op::Unbox(_, repr) => any(1, Some(*repr)),
         Op::Box(_) | Op::AsBoxed(_) => any(1, Some(Repr::Boxed)),
         Op::AsWord(_) => exact(&[Repr::Boxed], Repr::Word),
@@ -261,6 +245,7 @@ fn open(repr: Repr) -> bool {
 fn within(open: Repr, repr: Repr) -> bool {
     match (open, repr) {
         (Repr::Integer(_), Repr::Integer(width)) => width != IntegerWidth::Any,
+        (Repr::Integer(_), Repr::Word) => true,
         (Repr::Float(_), Repr::Float(width)) => width != FloatWidth::Any,
         _ => false,
     }
@@ -290,6 +275,7 @@ fn instantiate(graph: &Graph, inst: Inst, mut contract: Representations) -> Repr
                     .filter(|&repr| within(family, repr))
                     .max_by_key(|repr| repr.machine().bits())
             })
+            .map(|repr| if repr == Repr::Word { Repr::I64 } else { repr })
             .unwrap_or(default)
     };
     let integer = bind(Repr::INTEGER, Repr::I64);

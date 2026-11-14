@@ -292,11 +292,12 @@ fn comparisons_and_unary(function: &mut FunctionState) -> bool {
                         continue;
                     }
                     if booleans {
-                        Op::LowLevel(LowLevel::IntCompare {
-                            condition: integer_condition,
-                            left: boolean(&mut at, left),
-                            right: boolean(&mut at, right),
-                        })
+                        let op = if integer_condition == IntCC::Equal {
+                            Binary::BooleanEqual
+                        } else {
+                            Binary::BooleanXor
+                        };
+                        Op::LowLevel(LowLevel::Binary { op, left, right })
                     } else if known(left, ValueType::INTEGER) && known(right, ValueType::INTEGER) {
                         Op::LowLevel(LowLevel::IntCompare {
                             condition: integer_condition,
@@ -368,9 +369,9 @@ fn comparisons_and_unary(function: &mut FunctionState) -> bool {
                 {
                     if known(value, ValueType::BOOLEAN) {
                         let zero = at.add_unassigned(Op::Constant(Constant::Boolean(false)));
-                        Op::LowLevel(LowLevel::IntCompare {
-                            condition: IntCC::Equal,
-                            left: boolean(&mut at, value),
+                        Op::LowLevel(LowLevel::Binary {
+                            op: Binary::BooleanEqual,
+                            left: value,
                             right: zero,
                         })
                     } else if known(value, ValueType::INTEGER) {
@@ -532,13 +533,6 @@ pub(in crate::jit::semantic) fn dispatch(function: &mut FunctionState) -> bool {
         function.invalidate_cfg();
     }
     !candidates.is_empty()
-}
-
-fn boolean(at: &mut Cursor<'_>, value: Value) -> Value {
-    if at.graph().reprs[value] == Some(Repr::Boolean) {
-        return value;
-    }
-    at.add(Op::Convert(value, Repr::Boolean), Repr::Boolean)
 }
 
 fn numeric_operands(op: &Op) -> Option<Vec<Value>> {

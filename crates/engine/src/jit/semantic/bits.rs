@@ -28,6 +28,7 @@ pub(in crate::jit) fn expand(graph: &mut Graph) {
                     let masked = at.ins().band_imm_u(value, mask as i64);
                     compare(&mut at, IntCC::NotEqual, masked, 0)
                 }
+                LowOp::Binary { op, left, right } if op.is_boolean() => boolean(op, left, right),
                 _ => continue,
             };
             graph.insts[inst].op = Op::LowLevel(replacement);
@@ -79,6 +80,23 @@ fn range(at: &mut Cursor, value: Value, low: u64, high: u64, inside: bool) -> Lo
         IntCC::UnsignedGreaterThan
     };
     compare(at, condition, offset, high - low)
+}
+
+fn boolean(op: Binary, left: Value, right: Value) -> LowOp {
+    let op = match op {
+        Binary::BooleanAnd => Binary::And,
+        Binary::BooleanOr => Binary::Or,
+        Binary::BooleanXor => Binary::Xor,
+        Binary::BooleanEqual => {
+            return LowOp::IntCompare {
+                condition: IntCC::Equal,
+                left,
+                right,
+            };
+        }
+        _ => unreachable!(),
+    };
+    LowOp::Binary { op, left, right }
 }
 
 fn compare(at: &mut Cursor, condition: IntCC, left: Value, right: u64) -> LowOp {

@@ -6,7 +6,7 @@ use cranelift_module::FuncId;
 use oxc_span::Span;
 
 use super::cursor::Insert;
-use super::{Block, Graph, Inst, Op as GraphOp, Repr, Value};
+use super::{Block, Constant, Graph, Inst, Op as GraphOp, Repr, Value};
 use crate::jit::helpers::Helper;
 
 #[derive(Clone, Debug)]
@@ -52,18 +52,15 @@ pub(in crate::jit) enum Binary {
     FloatDivide,
     FloatMin,
     FloatMax,
+    BooleanAnd,
+    BooleanOr,
+    BooleanXor,
+    BooleanEqual,
 }
 
 impl Binary {
     pub(in crate::jit) fn is_integer_arithmetic(self) -> bool {
         matches!(self, Self::Add | Self::Subtract | Self::Multiply)
-    }
-
-    pub(in crate::jit) fn is_width_agnostic(self) -> bool {
-        matches!(
-            self,
-            Self::Add | Self::Subtract | Self::Multiply | Self::And | Self::Or | Self::Xor
-        )
     }
 
     pub(in crate::jit) fn is_float(self) -> bool {
@@ -75,6 +72,13 @@ impl Binary {
                 | Self::FloatDivide
                 | Self::FloatMin
                 | Self::FloatMax
+        )
+    }
+
+    pub(in crate::jit) fn is_boolean(self) -> bool {
+        matches!(
+            self,
+            Self::BooleanAnd | Self::BooleanOr | Self::BooleanXor | Self::BooleanEqual
         )
     }
 }
@@ -672,6 +676,10 @@ impl<I: Insert + ?Sized> Instructions<'_, I> {
             .add(GraphOp::LowLevel(op), Repr::from_machine(ty))
     }
 
+    fn predicate(&mut self, op: Op) -> Value {
+        self.inserter.add(GraphOp::LowLevel(op), Repr::Boolean)
+    }
+
     fn derived(&mut self, op: Op, first: Value, second: Value) -> Value {
         let graph = self.inserter.graph();
         let typed = |value: Value| graph.reprs[value].filter(|&repr| repr != Repr::Boxed);
@@ -699,11 +707,23 @@ impl<I: Insert + ?Sized> Instructions<'_, I> {
     }
 
     pub(in crate::jit) fn binary(&mut self, op: Binary, left: Value, right: Value) -> Value {
-        self.derived(Op::Binary { op, left, right }, left, right)
+        let binary = Op::Binary { op, left, right };
+        if op.is_boolean() {
+            return self.inserter.add(GraphOp::LowLevel(binary), Repr::Boolean);
+        }
+        let graph = self.inserter.graph();
+        assert!(
+            [left, right]
+                .iter()
+                .all(|&value| graph.reprs[value] != Some(Repr::Boolean)),
+            "boolean operand to {op:?}"
+        );
+        self.derived(binary, left, right)
     }
 
-    binary_methods!(isub => Subtract, band => And, bor => Or, ishl => ShiftLeft,
-        fsub => FloatSubtract, fmul => FloatMultiply);
+    binary_methods!(isub => Subtract, band => And, ishl => ShiftLeft,
+        fsub => FloatSubtract, fmul => FloatMultiply, boolean_and => BooleanAnd,
+        boolean_or => BooleanOr, boolean_equal => BooleanEqual);
     immediate_methods!(iadd_imm_s => Add, iadd_imm_u => Add, imul_imm_s => Multiply,
         band_imm_s => And, band_imm_u => And, ishl_imm_s => ShiftLeft,
         ushr_imm_s => ShiftRightUnsigned);
@@ -712,6 +732,11 @@ impl<I: Insert + ?Sized> Instructions<'_, I> {
     conversion_methods!(ireduce => Reduce, sextend => SignExtend, uextend => ZeroExtend,
         fpromote => FloatPromote, fcvt_from_sint => FloatFromSigned,
         fcvt_from_uint => FloatFromUnsigned, fcvt_to_sint_sat => SignedSaturatingFromFloat);
+
+    pub(in crate::jit) fn boolean(&mut self, value: bool) -> Value {
+        self.inserter
+            .add(GraphOp::Constant(Constant::Boolean(value)), Repr::Boolean)
+    }
 
     pub(in crate::jit) fn f64const(&mut self, value: f64) -> Value {
         self.value(
@@ -733,14 +758,11 @@ impl<I: Insert + ?Sized> Instructions<'_, I> {
     }
 
     pub(in crate::jit) fn icmp(&mut self, condition: IntCC, left: Value, right: Value) -> Value {
-        self.value(
-            Op::IntCompare {
-                condition,
-                left,
-                right,
-            },
-            cranelift_codegen::ir::types::I8,
-        )
+        self.predicate(Op::IntCompare {
+            condition,
+            left,
+            right,
+        })
     }
 
     pub(in crate::jit) fn icmp_imm_s(
@@ -766,14 +788,11 @@ impl<I: Insert + ?Sized> Instructions<'_, I> {
     }
 
     pub(in crate::jit) fn fcmp(&mut self, condition: FloatCC, left: Value, right: Value) -> Value {
-        self.value(
-            Op::FloatCompare {
-                condition,
-                left,
-                right,
-            },
-            cranelift_codegen::ir::types::I8,
-        )
+        self.predicate(Op::FloatCompare {
+            condition,
+            left,
+            right,
+        })
     }
 
     pub(in crate::jit) fn select(&mut self, condition: Value, yes: Value, no: Value) -> Value {
@@ -809,14 +828,11 @@ impl<I: Insert + ?Sized> Instructions<'_, I> {
             high,
             inside,
         };
-        self.value(op, cranelift_codegen::ir::types::I8)
+        self.predicate(op)
     }
 
     pub(in crate::jit) fn test_mask(&mut self, value: Value, mask: u64) -> Value {
-        self.value(
-            Op::TestMask { value, mask },
-            cranelift_codegen::ir::types::I8,
-        )
+        self.predicate(Op::TestMask { value, mask })
     }
 
     pub(in crate::jit) fn atomic_load(

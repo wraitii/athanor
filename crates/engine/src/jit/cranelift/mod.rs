@@ -153,6 +153,10 @@ pub(in crate::jit) fn emit(
                         Binary::FloatDivide => builder.ins().fdiv(left, right),
                         Binary::FloatMin => builder.ins().fmin(left, right),
                         Binary::FloatMax => builder.ins().fmax(left, right),
+                        Binary::BooleanAnd
+                        | Binary::BooleanOr
+                        | Binary::BooleanXor
+                        | Binary::BooleanEqual => unreachable!("unexpanded boolean operation"),
                     }]
                 }
                 Op::IntCompare {

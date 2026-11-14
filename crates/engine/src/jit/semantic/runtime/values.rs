@@ -92,9 +92,9 @@ fn integer_check(at: &mut Cursor, value: Value, float: Value, exact: Value) -> V
     let safe = at.ins().fcmp(FloatCC::LessThanOrEqual, magnitude, limit);
     let negative_zero = at.ins().iconst(types::I64, i64::MIN);
     let positive_zero = at.ins().icmp(IntCC::NotEqual, word, negative_zero);
-    let valid = at.ins().band(numeric, integral);
-    let valid = at.ins().band(valid, safe);
-    at.ins().band(valid, positive_zero)
+    let valid = at.ins().boolean_and(numeric, integral);
+    let valid = at.ins().boolean_and(valid, safe);
+    at.ins().boolean_and(valid, positive_zero)
 }
 
 fn scalar(types: ValueType) -> bool {
@@ -123,15 +123,15 @@ fn predicate(graph: &mut Graph, facts: &Facts, inst: Inst) -> Option<Value> {
             layout::is_number(&mut at, word)
         }
         Op::IsNumber(value) => {
-            let bits = i64::from(!facts.of(value).within(ValueType::BOOLEAN));
+            let number = !facts.of(value).within(ValueType::BOOLEAN);
             let mut at = Cursor::before(graph, inst);
-            at.ins().iconst(types::I8, bits)
+            at.ins().boolean(number)
         }
         Op::IsUninitialized(value) | Op::IsUndefined(value) | Op::IsNullish(value)
             if !boxed(graph, value) =>
         {
             let mut at = Cursor::before(graph, inst);
-            at.ins().iconst(types::I8, 0)
+            at.ins().boolean(false)
         }
         Op::IsUninitialized(value) => equals(
             &mut Cursor::before(graph, inst),
@@ -150,7 +150,7 @@ fn predicate(graph: &mut Graph, facts: &Facts, inst: Inst) -> Option<Value> {
             let null = at
                 .ins()
                 .icmp_imm_s(IntCC::Equal, word, JsValue::NULL.bits() as i64);
-            at.ins().bor(undefined, null)
+            at.ins().boolean_or(undefined, null)
         }
         Op::IsString(value) => {
             let mut at = Cursor::before(graph, inst);

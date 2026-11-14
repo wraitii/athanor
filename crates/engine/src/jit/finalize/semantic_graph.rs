@@ -125,7 +125,7 @@ impl FunctionCompiler<'_, '_> {
             let word = self.b.as_word(value);
             let same = self.b.ins().icmp(IntCC::Equal, word, last);
             let complete = self.b.ins().icmp_imm_s(IntCC::NotEqual, complete, 0);
-            self.b.ins().bor(complete, same)
+            self.b.ins().boolean_or(complete, same)
         } else {
             complete
         };
@@ -434,7 +434,7 @@ impl FunctionCompiler<'_, '_> {
                                         crate::jit::osr::ENTRY_OFFSET,
                                     );
                                     let ready = self.b.ins().icmp_imm_s(IntCC::NotEqual, entry, 0);
-                                    let poll = self.b.ins().bor(tick, ready);
+                                    let poll = self.b.ins().boolean_or(tick, ready);
                                     let slow = self.b.create_block();
                                     let done = self.b.create_block();
                                     self.b.append_block_param_repr(done, Repr::Boxed);

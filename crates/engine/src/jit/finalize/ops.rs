@@ -190,7 +190,7 @@ impl FunctionCompiler<'_, '_> {
         let string_block = self.b.create_block();
         let primitive_block = self.b.create_block();
         let done = self.b.create_block();
-        self.b.append_block_param(done, types::I8);
+        self.b.append_block_param_repr(done, Repr::Boolean);
         self.brif(number, number_block, &[], other_block, &[]);
 
         self.switch(number_block);
@@ -198,7 +198,7 @@ impl FunctionCompiler<'_, '_> {
         let zero = self.b.ins().f64const(0.0);
         let negative = self.b.ins().fcmp(FloatCC::LessThan, float, zero);
         let positive = self.b.ins().fcmp(FloatCC::GreaterThan, float, zero);
-        let truth = self.b.ins().bor(negative, positive);
+        let truth = self.b.ins().boolean_or(negative, positive);
         self.jump(done, &[BlockArg::Value(truth)]);
 
         self.switch(other_block);
@@ -227,9 +227,10 @@ impl FunctionCompiler<'_, '_> {
             .b
             .ins()
             .icmp_imm_s(IntCC::Equal, word, Value::FALSE.bits() as i64);
-        let falsy = self.b.ins().bor(undefined, null);
-        let falsy = self.b.ins().bor(falsy, false_value);
-        let truth = self.b.ins().icmp_imm_s(IntCC::Equal, falsy, 0);
+        let falsy = self.b.ins().boolean_or(undefined, null);
+        let falsy = self.b.ins().boolean_or(falsy, false_value);
+        let no = self.b.ins().boolean(false);
+        let truth = self.b.ins().boolean_equal(falsy, no);
         self.jump(done, &[BlockArg::Value(truth)]);
 
         self.switch(done);
@@ -595,7 +596,7 @@ impl FunctionCompiler<'_, '_> {
             published
         } else {
             let expected = self.is_code(callee, target.code);
-            self.b.ins().band(expected, published)
+            self.b.ins().boolean_and(expected, published)
         };
         (entry, direct)
     }
@@ -687,7 +688,7 @@ impl FunctionCompiler<'_, '_> {
             let exact = self.b.ins().fcvt_from_sint(types::F64, position);
             let integral = self.b.ins().fcmp(FloatCC::Equal, exact, number);
             let inside = self.b.ins().icmp(IntCC::UnsignedLessThan, position, length);
-            self.b.ins().band(integral, inside)
+            self.b.ins().boolean_and(integral, inside)
         };
         let read = self.b.create_block();
         let done = self.b.create_block();
@@ -771,7 +772,7 @@ impl FunctionCompiler<'_, '_> {
             std::mem::offset_of!(GlobalCache, revision) as i32,
         );
         let valid = self.b.ins().icmp(IntCC::Equal, revision, expected_revision);
-        let valid = self.b.ins().band(same, valid);
+        let valid = self.b.ins().boolean_and(same, valid);
         let slot = self.b.ins().load(
             self.pointer,
             flags,
@@ -779,7 +780,7 @@ impl FunctionCompiler<'_, '_> {
             std::mem::offset_of!(GlobalCache, slot) as i32,
         );
         let present = self.b.ins().icmp_imm_s(IntCC::NotEqual, slot, 0);
-        let valid = self.b.ins().band(valid, present);
+        let valid = self.b.ins().boolean_and(valid, present);
         let hit = self.b.create_block();
         let ready = self.b.create_block();
         let slow = self.b.create_block();
@@ -930,7 +931,7 @@ impl FunctionCompiler<'_, '_> {
                 let cached = self.b.ins().icmp_imm_s(IntCC::NotEqual, expected, 0);
                 shaped_kind = Some(self.b.ins().icmp_imm_s(IntCC::Equal, expected, 0));
                 let matches = self.b.ins().icmp(IntCC::Equal, kind, expected);
-                let hit = self.b.ins().band(cached, matches);
+                let hit = self.b.ins().boolean_and(cached, matches);
                 let shaped = self.b.create_block();
                 self.brif(hit, done, &[BlockArg::Value(entry)], shaped, &[]);
                 self.switch(shaped);
@@ -941,7 +942,7 @@ impl FunctionCompiler<'_, '_> {
                 .load(types::I32, flags, entry, CACHE_SHAPE_OFFSET);
             let mut matches = self.b.ins().icmp(IntCC::Equal, shape, expected);
             if let Some(shaped) = shaped_kind {
-                matches = self.b.ins().band(matches, shaped);
+                matches = self.b.ins().boolean_and(matches, shaped);
             }
             if validate {
                 let holder_check = self.b.create_block();

@@ -59,7 +59,7 @@ pub(in crate::jit) fn heap_view<I: Insert>(at: &mut I, word: Value) -> Value {
 fn view<I: Insert>(at: &mut I, word: Value, tagged: Value) -> Value {
     let address = address(at, word);
     let present = at.ins().icmp_imm_s(IntCC::NotEqual, address, 0);
-    let valid = at.ins().band(tagged, present);
+    let valid = at.ins().boolean_and(tagged, present);
     let empty = at
         .ins()
         .iconst(types::I64, crate::heap::NO_ELEMENTS.as_ptr() as i64);
