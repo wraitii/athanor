@@ -1,4 +1,7 @@
+mod legalize;
 pub(super) mod stubs;
+
+pub(in crate::jit) use legalize::split_indexed_loads;
 
 use cranelift_codegen::entity::SecondaryMap;
 use cranelift_codegen::ir::{

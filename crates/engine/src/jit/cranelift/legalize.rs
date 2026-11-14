@@ -1,9 +1,7 @@
-use super::{Graph, Op};
+use crate::jit::semantic::{Cfg, Graph, MemoryOp, Op};
 
 pub(in crate::jit) fn split_indexed_loads(graph: &mut Graph) {
-    use super::MemoryOp;
-
-    for block in super::Cfg::new(graph).rpo {
+    for block in Cfg::new(graph).rpo {
         for inst in graph.blocks[block].insts.clone() {
             let data = graph.insts[inst].clone();
             if data.block != block {

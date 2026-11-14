@@ -471,7 +471,7 @@ impl Compiler {
         }
         if self.context.func.layout.entry_block().is_none() {
             let mut graph = graph.clone();
-            super::semantic::cranelift::split_indexed_loads(&mut graph);
+            cranelift::split_indexed_loads(&mut graph);
             graph.verify().map_err(Error::Compile)?;
             let mut builder = cranelift_frontend::FunctionBuilder::new(
                 &mut self.context.func,

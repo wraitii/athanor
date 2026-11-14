@@ -6,7 +6,6 @@ pub(in crate::jit) mod boundary;
 mod build;
 pub(in crate::jit) mod continuation;
 pub(in crate::jit) mod contracts;
-pub(in crate::jit) mod cranelift;
 pub(in crate::jit) mod cursor;
 mod dispatch;
 pub(in crate::jit) mod facts;
@@ -1536,7 +1535,7 @@ impl Graph {
         }
     }
 
-    pub(super) fn insert(
+    pub(in crate::jit) fn insert(
         &mut self,
         block: Block,
         position: usize,

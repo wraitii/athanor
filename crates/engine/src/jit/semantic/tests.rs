@@ -2410,7 +2410,7 @@ fn typed_loads_lower_to_explicit_memory_operations() {
                 .any(|&i| matches!(graph.insts[i].op, Op::KeepAlive(value) if value == object))
         );
         let mut fallback = graph.clone();
-        cranelift::split_indexed_loads(&mut fallback);
+        crate::jit::cranelift::split_indexed_loads(&mut fallback);
         fallback.verify().unwrap();
         assert!(
             matches!(fallback.defining_op(raw), Some(Op::Memory(MemoryOp::Load { format: actual, .. })) if *actual == format)
