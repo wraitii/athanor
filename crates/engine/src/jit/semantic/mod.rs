@@ -3,6 +3,7 @@ mod available;
 mod bits;
 mod borrow;
 pub(in crate::jit) mod boundary;
+mod boxing;
 mod build;
 pub(in crate::jit) mod continuation;
 pub(in crate::jit) mod contracts;
@@ -29,7 +30,7 @@ pub(in crate::jit) mod widths;
 
 pub(super) use pipeline::{
     LOW_LEVEL_PASSES, Versioning, build_canonical, canonicalize_graph, lower_global,
-    lower_low_level, lower_machine, optimize_specialized, specialize_with_budget,
+    lower_low_level, optimize_specialized, specialize_with_budget,
 };
 #[cfg(test)]
 use pipeline::{analyze, optimize_canonical, specialize};
@@ -2092,6 +2093,14 @@ impl Graph {
     }
 
     pub(super) fn verify(&self) -> Result<()> {
+        self.verify_representations(false)
+    }
+
+    pub(super) fn verify_machine(&self) -> Result<()> {
+        self.verify_representations(true)
+    }
+
+    fn verify_representations(&self, machine: bool) -> Result<()> {
         let mut stacks: SecondaryMap<Block, Option<Vec<Scope>>> = SecondaryMap::new();
         stacks[self.entry] = Some(Vec::new());
         let mut worklist = vec![self.entry];
@@ -2143,6 +2152,12 @@ impl Graph {
             {
                 return Err(format!("{block} returns with open scopes"));
             }
+            if machine
+                && let TerminatorKind::Branch(value, ..) = terminator.kind
+                && self.repr(value) != Repr::Boolean
+            {
+                return Err(format!("{block} branches on a non-boolean scalar"));
+            }
             if let TerminatorKind::ReturnValues(values) = &terminator.kind {
                 let Some(signature) = &self.low_level_signature else {
                     return Err(format!("{block} has no low-level signature"));
@@ -2186,7 +2201,10 @@ impl Graph {
                 for (&arg, &param) in target.args.iter().zip(&self.blocks[target.block].params) {
                     let compatible = match (self.reprs[arg], self.reprs[param]) {
                         (_, None) => true,
-                        (Some(arg), Some(param)) => arg.compatible(param),
+                        (Some(arg), Some(param)) => {
+                            arg.compatible(param)
+                                || (!machine && arg != Repr::Boxed && param != Repr::Boxed)
+                        }
                         (None, Some(_)) => false,
                     };
                     if !compatible {
@@ -2229,6 +2247,14 @@ impl Graph {
                         || signature.returns.len() != instruction.results.len()
                     {
                         return Err(format!("{inst} has an invalid call signature"));
+                    }
+                    if machine
+                        && args
+                            .iter()
+                            .zip(&signature.params)
+                            .any(|(&value, param)| !self.repr(value).fits(param.value_type))
+                    {
+                        return Err(format!("{inst} has an invalid call argument type"));
                     }
                     for (&value, ty) in instruction.results.iter().zip(&signature.returns) {
                         if !self.reprs[value].is_some_and(|repr| repr.fits(ty.value_type)) {

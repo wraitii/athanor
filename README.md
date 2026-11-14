@@ -70,6 +70,14 @@ budget; it does not execute initializers or collect warmup feedback.
 cargo run -p js-runner -- --compile --filter paint --planner --clif --asm SCRIPT
 ```
 
+Use `--after PASS` to inspect runtime lowering boundaries, including `boxing`,
+`finalize-runtime`, `scratch`, `cleanup`, `ownership-lower`, `unbox`,
+`legalize-convert`, `bits`, and `cranelift-memory`. Scalar conversions remain
+pending through `unbox`; `legalize-convert` resolves them after runtime lowering.
+`cranelift-memory` shows the CLIF-specific memory expansion, constructing that
+view even when compiling with the native backend. An unknown pass reports the
+available pass names.
+
 Add `--execute 'JS'` to run the source initializer and then a JavaScript setup/call
 snippet. The snippet runs inside an immediately invoked arrow function appended
 to the source, so it can use loops and local variables. Host functions are available.

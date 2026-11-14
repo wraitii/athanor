@@ -378,7 +378,10 @@ pub(in crate::jit) fn lower(builder: &mut Builder<'_>) -> Result<(), String> {
         .keys()
         .find(|&value| builder.graph.reprs[value] == Some(Repr::Boxed))
     {
-        return Err(format!("{value} is still boxed after runtime lowering"));
+        return Err(format!(
+            "{value} ({:?}) is still boxed after runtime lowering",
+            builder.graph.defining_op(value)
+        ));
     }
     rewrite(builder, Stage::Machine)
 }
@@ -468,7 +471,7 @@ fn verify_words(graph: &Graph) -> Result<(), String> {
         for target in terminator.kind.targets() {
             let params = &graph.blocks[target.block].params;
             for (&arg, &param) in target.args.iter().zip(params) {
-                if !graph.repr(arg).accepts(graph.repr(param)) {
+                if (graph.repr(arg) == Repr::Boxed) != (graph.repr(param) == Repr::Boxed) {
                     return Err(format!(
                         "{block} passes {arg}:{:?} to {param}:{:?}",
                         graph.reprs[arg], graph.reprs[param]
@@ -541,7 +544,10 @@ fn apply(builder: &mut Builder<'_>, value: Value, from: Repr, step: Step) -> Res
                 .ins()
                 .icmp_imm_s(IntCC::Equal, value, JsValue::TRUE.bits() as i64)
         }
-        Step::Unbox(repr) => unreachable!("unbox to {repr:?}"),
+        Step::Unbox(repr) => {
+            let float = builder.ins().bitcast(types::F64, flags, value);
+            builder.semantic(Op::Convert(float, repr), repr)
+        }
         Step::Box => box_value(builder, value),
         Step::Convert(to) => {
             if from != to && (from == Repr::Boxed || to == Repr::Boxed) {
@@ -556,6 +562,12 @@ fn apply(builder: &mut Builder<'_>, value: Value, from: Repr, step: Step) -> Res
 
 fn box_value(builder: &mut Builder<'_>, value: Value) -> Value {
     let flags = MemFlagsData::new();
+    let value = match builder.graph.repr(value) {
+        Repr::Word | Repr::Integer(_) | Repr::FLOAT | Repr::F32 => {
+            builder.semantic(Op::Convert(value, Repr::F64), Repr::F64)
+        }
+        _ => value,
+    };
     match builder.graph.repr(value) {
         Repr::Boolean => {
             let mut ins = builder.ins();
@@ -659,7 +671,7 @@ fn convert(builder: &mut Builder<'_>, value: Value, from: Repr, to: Repr) -> Val
             let wide = ins.uextend(types::I32, value);
             ins.fcvt_from_uint(types::F64, wide)
         }
-        (Repr::I64 | Repr::I32, Repr::Boolean) => ins.icmp_imm_s(IntCC::NotEqual, value, 0),
+        (Repr::Integer(_), Repr::Boolean) => ins.icmp_imm_s(IntCC::NotEqual, value, 0),
         (Repr::F64, Repr::Boolean) => {
             let zero = ins.f64const(0.0);
             let negative = ins.fcmp(FloatCC::LessThan, value, zero);

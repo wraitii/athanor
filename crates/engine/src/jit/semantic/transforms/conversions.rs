@@ -1,6 +1,5 @@
 use crate::FxHashMap;
 
-use super::super::repr::{Step, steps};
 use super::super::{Facts, Graph, Op, Repr, ValueDef, ValueType};
 
 fn lossless(from: Repr, through: Repr) -> bool {
@@ -42,39 +41,6 @@ pub(in crate::jit::semantic) fn simplify(graph: &mut Graph, facts: &Facts) {
     for inst in removed {
         graph.remove_inst(inst);
     }
-}
-
-pub(in crate::jit::semantic) fn split(graph: &mut Graph, facts: &Facts) {
-    let mut aliases = FxHashMap::default();
-    for &block in &facts.cfg.rpo {
-        for inst in graph.blocks[block].insts.clone() {
-            let Op::Convert(source, to) = graph.insts[inst].op else {
-                continue;
-            };
-            let steps = steps(graph.repr(source), to);
-            if matches!(steps.as_slice(), [] | [Step::Convert(_)]) {
-                continue;
-            }
-            let data = &graph.insts[inst];
-            let (span, source_name) = (data.span, data.source_name);
-            let at = graph.blocks[block]
-                .insts
-                .iter()
-                .position(|&i| i == inst)
-                .unwrap();
-            let mut value = source;
-            for (offset, step) in steps.into_iter().enumerate() {
-                let (op, repr) = step.op(value);
-                let (inserted, result) = graph.insert(block, at + offset, span, op, true);
-                graph.insts[inserted].source_name = source_name;
-                value = result.unwrap();
-                graph.reprs[value] = Some(repr);
-            }
-            aliases.insert(graph.insts[inst].result().unwrap(), value);
-            graph.detach_inst(inst);
-        }
-    }
-    graph.replace_uses(&aliases);
 }
 
 pub(in crate::jit::semantic) fn hoist(graph: &mut Graph, facts: &Facts) {

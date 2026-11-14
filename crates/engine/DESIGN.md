@@ -169,9 +169,10 @@ representation assignment. Floating operands use `NumericFloat`, including
 conversion of undefined to NaN. Numeric unary plus becomes an alias when no
 conversion is required. Boolean negation compares with false; numeric negation
 of truthiness tests for zero or NaN. Loop facts and predicate propagation recognize
-both JS operations and their lowered forms. Legalization reconciles operand and
-result representations, and emission forwards the concrete operations. This
-lowering also runs when semantic optimization is disabled. Coercing operations
+both JS operations and their lowered forms. Boxing insertion reconciles runtime
+representation boundaries before final runtime lowering. Scalar legalization and
+conversion expansion run afterward, and emission forwards the concrete operations.
+This lowering also runs when semantic optimization is disabled. Coercing operations
 retain their runtime paths. Binary bitwise operations and inline Math calls still
 use representation contracts to select typed or generic implementations during
 preparation for emission.
@@ -1245,9 +1246,10 @@ Oxc AST -> build -> promote -> simplify -> canonical graph
         -> rewrite property/read accesses -> coercions and bit tests -> reuse loads -> hoist
         -> numeric/array/typed checks -> property writes/reads -> views -> simplify
         -> numeric lowering -> borrow -> OSR instrumentation
-        -> property/typed/metadata/numeric lowering -> representation/legalization
-        -> ownership planning -> array loads and slot stores
-        -> shared runtime emission -> scratch/cleanup/reference lowering
+        -> property/typed/metadata/numeric lowering -> ownership planning
+        -> array loads and slot stores -> representation assignment -> boxing insertion
+        -> shared runtime emission -> scratch/cleanup/reference lowering -> unboxing
+        -> scalar legalization/conversion -> bit expansion
         -> native backend, or Cranelift memory expansion -> CLIF
 ```
 
@@ -1276,6 +1278,13 @@ alongside slot stores while preserving scheduled reference operations. Continuat
 use their own preparation sequence in the same pipeline module. Runtime lowering
 finalization in `finalize/semantic_graph.rs` still expands calls, captures, observations,
 OSR protocols, helper invocations and other remaining runtime operations.
+
+Boxing insertion emits `Box` and `Unbox` at runtime representation boundaries,
+leaving scalar operand, edge and branch conversions pending. Final runtime
+lowering expands these operations into word operations and scalar conversions.
+The combined late legalization/conversion pass chooses widths, reconciles scalar
+uses and edges, converts branch conditions to booleans, and expands conversions.
+The final machine verifier requires compatible edges and ABI arguments.
 
 Canonicalization, planning and optimization operate on the same `FunctionState`,
 containing the working graph, its facts, specialization plan, OSR plan and

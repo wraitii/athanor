@@ -16,8 +16,8 @@ use oxc_syntax::symbol::SymbolId;
 use transforms::{conversions, reuse};
 
 use super::{
-    FunctionState, Graph, Inst, RegionFallback, Result, SpecializationPlan, Value, borrow, build,
-    js, legalize, low_level, osr, ownership, repr, transforms,
+    FunctionState, Graph, Inst, RegionFallback, Result, SpecializationPlan, Value, borrow, boxing,
+    build, js, legalize, low_level, osr, ownership, repr, transforms,
 };
 
 impl FunctionState {
@@ -88,15 +88,14 @@ impl FunctionState {
         values::lower(self);
         after("values", self);
         self.ensure_facts();
-        legalize::conditions(&mut self.graph, &mut self.facts);
+        boxing::conditions(&mut self.graph, &mut self.facts);
         after("conditions", self);
         repr::assign(&mut self.graph, &self.facts);
         after("repr", self);
-        legalize::legalize(&mut self.graph, &mut self.facts);
-        after("legalize", self);
+        boxing::insert(&mut self.graph, &mut self.facts);
+        after("boxing", self);
         conversions::simplify(&mut self.graph, &self.facts);
         conversions::hoist(&mut self.graph, &self.facts);
-        conversions::split(&mut self.graph, &self.facts);
         after("conversions", self);
         self.graph.verify()?;
         Ok(())
@@ -120,6 +119,9 @@ pub(in crate::jit) const LOW_LEVEL_PASSES: &[&str] = &[
     "cleanup",
     "ownership-lower",
     "unbox",
+    "legalize-convert",
+    "bits",
+    "cranelift-memory",
 ];
 
 pub(in crate::jit) fn lower_low_level(
@@ -135,14 +137,12 @@ pub(in crate::jit) fn lower_low_level(
     after("ownership-lower", graph);
     repr::unbox(&mut low_level::Builder::new(graph))?;
     after("unbox", graph);
-    graph.verify()
-}
-
-pub(in crate::jit) fn lower_machine(graph: &mut Graph) -> Result<()> {
-    super::widths::choose(graph);
-    repr::lower(&mut low_level::Builder::new(graph))?;
+    graph.verify()?;
+    legalize::convert(graph)?;
+    after("legalize-convert", graph);
     super::bits::expand(graph);
-    graph.verify()
+    after("bits", graph);
+    graph.verify_machine()
 }
 
 pub(in crate::jit) fn lower_global(

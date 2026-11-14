@@ -66,7 +66,11 @@ pub(super) fn lower_runtime(
         .filter(|options| options.semantic_ir)
         .and_then(|options| options.after.as_deref());
     let mut snapshot = None;
+    let mut passes = Vec::new();
     state.lower_runtime_observed(&mut |name, state| {
+        if pass.is_some() {
+            passes.push(name.to_owned());
+        }
         if pass == Some(name) {
             snapshot = Some((name.to_owned(), semantic_text(state.listing_lines())));
         }
@@ -75,7 +79,15 @@ pub(super) fn lower_runtime(
         && snapshot.is_none()
         && !semantic::LOW_LEVEL_PASSES.contains(&pass)
     {
-        return Err(format!("unknown pass {pass}"));
+        passes.extend(
+            semantic::LOW_LEVEL_PASSES
+                .iter()
+                .map(|pass| (*pass).to_owned()),
+        );
+        return Err(format!(
+            "unknown pass {pass}; available passes: {}",
+            passes.join(", ")
+        ));
     }
     Ok(snapshot)
 }

@@ -2299,7 +2299,7 @@ fn array_storage_lowering_preserves_planned_ownership() {
             );
             function.ensure_facts();
             repr::assign(&mut function.graph, &function.facts);
-            legalize::legalize(&mut function.graph, &mut function.facts);
+            boxing::insert(&mut function.graph, &mut function.facts);
             let plan = ownership::plan(&mut function.graph, &mut function.facts);
             ownership::verify(&function.graph, &function.facts, &plan).unwrap();
             function.graph.ownership = Some(plan);

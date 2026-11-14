@@ -38,7 +38,7 @@ fn position(graph: &Graph, value: Value) -> Use {
 
 fn specific(graph: &Graph, inst: Inst) -> Option<Representations> {
     let data = &graph.insts[inst];
-    let target = data.result().map(|value| graph.repr(value));
+    let target = data.results.first().map(|&value| graph.repr(value));
     let exact = |reprs: &[Repr], produces: Repr| Representations {
         uses: reprs.iter().map(|&repr| Use::Exact(repr)).collect(),
         produces: Some(produces),
@@ -52,6 +52,29 @@ fn specific(graph: &Graph, inst: Inst) -> Option<Representations> {
             uses: uses.iter().copied().map(Use::Exact).collect(),
             produces: *produces,
         },
+        Op::LowLevel(super::low_level::Op::Call {
+            target,
+            signature,
+            args,
+            ..
+        }) => {
+            let mut uses = Vec::with_capacity(args.len() + 1);
+            if matches!(target, super::low_level::CallTarget::Indirect(_)) {
+                uses.push(Use::Exact(Repr::Word));
+            }
+            uses.extend(args.iter().zip(&signature.params).map(|(&value, param)| {
+                let repr = graph.repr(value);
+                Use::Exact(if repr.fits(param.value_type) {
+                    repr
+                } else {
+                    Repr::from_machine(param.value_type)
+                })
+            }));
+            Representations {
+                uses,
+                produces: data.results.first().map(|&value| graph.repr(value)),
+            }
+        }
         Op::PropertyLoad(..) => exact(&[Repr::Boxed, Repr::Word], Repr::Boxed),
         Op::LowLevel(super::low_level::Op::Load { ty, .. }) => {
             any(1, Some(Repr::from_machine(*ty)))
@@ -227,7 +250,7 @@ fn generic(graph: &Graph, inst: Inst) -> Representations {
         _ => vec![Use::Exact(Repr::Boxed); count],
     };
     let produces = match &data.op {
-        Op::LowLevel(_) => data.result().map(|value| graph.repr(value)),
+        Op::LowLevel(_) => data.results.first().map(|&value| graph.repr(value)),
         _ => data.result().map(|_| Repr::Boxed),
     };
     Representations { uses, produces }

@@ -1021,15 +1021,10 @@ impl FunctionCompiler<'_, '_> {
             };
             self.b.set_srcloc(location);
             let target = |this: &mut Self, target: &crate::jit::semantic::Target| {
-                let params = this.b.graph.blocks[target.block].params.clone();
                 let args: Vec<_> = target
                     .args
                     .iter()
-                    .zip(&params)
-                    .map(|(&value, &param)| {
-                        debug_assert_eq!(this.b.graph.repr(value), this.b.graph.repr(param));
-                        BlockArg::Value(this.operand(&cx, value).value)
-                    })
+                    .map(|&value| BlockArg::Value(this.operand(&cx, value).value))
                     .collect();
                 (target.block, args)
             };
@@ -1040,12 +1035,6 @@ impl FunctionCompiler<'_, '_> {
                 }
                 TerminatorKind::Branch(value, yes, no) => {
                     let condition = self.operand(&cx, *value);
-                    if condition.repr != Repr::Boolean {
-                        return Err(Error::Compile(format!(
-                            "{block}: branch on {:?} condition",
-                            condition.repr
-                        )));
-                    }
                     let condition = condition.value;
                     let (yes_block, yes_args) = target(self, yes);
                     let (no_block, no_args) = target(self, no);

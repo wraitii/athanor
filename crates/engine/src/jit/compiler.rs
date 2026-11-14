@@ -410,7 +410,10 @@ impl Compiler {
         let mut lowered = None;
         let native =
             self.backend != crate::Backend::Cranelift && self.module.isa().name() == "aarch64";
-        let clif = !native || self.inspection.as_ref().is_some_and(|options| options.clif);
+        let clif = !native
+            || self.inspection.as_ref().is_some_and(|options| {
+                options.clif || options.after.as_deref() == Some("cranelift-memory")
+            });
         build(finalize::Output {
             b: &mut builder,
             clif,
@@ -471,8 +474,8 @@ impl Compiler {
         }
         if self.context.func.layout.entry_block().is_none() {
             let mut graph = graph.clone();
-            cranelift::legalize(&mut graph).map_err(Error::Compile)?;
-            graph.verify().map_err(Error::Compile)?;
+            cranelift::split_indexed_loads(&mut graph);
+            graph.verify_machine().map_err(Error::Compile)?;
             let mut builder = cranelift_frontend::FunctionBuilder::new(
                 &mut self.context.func,
                 &mut self.builder_context,
