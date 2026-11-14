@@ -140,6 +140,30 @@ impl Repr {
         }
     }
 
+    pub(in crate::jit) fn fits(self, ty: Type) -> bool {
+        match self {
+            Self::INTEGER => ty.is_int(),
+            Self::FLOAT => ty.is_float(),
+            repr => repr.machine() == ty,
+        }
+    }
+
+    pub(in crate::jit) fn compatible(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::INTEGER | Self::FLOAT, Self::INTEGER | Self::FLOAT) => self == other,
+            (Self::INTEGER | Self::FLOAT, concrete) => self.fits(concrete.machine()),
+            (concrete, open) => open.fits(concrete.machine()),
+        }
+    }
+
+    pub(in crate::jit) fn widest(self) -> Self {
+        match self {
+            Self::INTEGER => Self::I64,
+            Self::FLOAT => Self::F64,
+            repr => repr,
+        }
+    }
+
     /// Transitional: low-level 64-bit integers are still typed as words until low-level ops
     /// stop carrying machine types.
     fn as_integer(self) -> Self {
@@ -162,6 +186,12 @@ impl MemoryFormat {
     }
 }
 
+pub(in crate::jit) fn widen(graph: &mut Graph) {
+    for repr in graph.reprs.values_mut().flatten() {
+        *repr = repr.widest();
+    }
+}
+
 pub(super) fn assign(graph: &mut Graph, facts: &Facts) {
     for value in graph.values.keys() {
         if graph.reprs[value].is_none() {
@@ -170,27 +200,41 @@ pub(super) fn assign(graph: &mut Graph, facts: &Facts) {
     }
 }
 
+pub(in crate::jit) fn intrinsic(op: &Op) -> Option<Repr> {
+    Some(match op {
+        Op::LowLevel(
+            LowOp::Load { ty, .. }
+            | LowOp::AtomicLoad { ty, .. }
+            | LowOp::Integer { ty, .. }
+            | LowOp::Unary { ty, .. }
+            | LowOp::StackAddress { ty, .. }
+            | LowOp::StackPointer { ty },
+        ) => Repr::from_machine(*ty),
+        Op::LowLevel(LowOp::Float64(_)) => Repr::F64,
+        Op::LowLevel(
+            LowOp::IntCompare { .. }
+            | LowOp::FloatCompare { .. }
+            | LowOp::InRange { .. }
+            | LowOp::TestMask { .. },
+        ) => Repr::Boolean,
+        Op::LowLevel(LowOp::Binary { op, .. }) if op.is_float() => Repr::F64,
+        Op::TypedData(_) | Op::Memory(MemoryOp::Address { .. }) => Repr::Word,
+        Op::Memory(MemoryOp::IndexedLoad { format, .. } | MemoryOp::Load { format, .. }) => {
+            format.repr()
+        }
+        Op::SaturatingInteger(_) => Repr::I64,
+        _ => return None,
+    })
+}
+
 fn representation(graph: &Graph, facts: &Facts, value: super::Value) -> Repr {
     let repr =
         |value: Value| graph.reprs[value].unwrap_or_else(|| representation(graph, facts, value));
+    if let Some(repr) = graph.defining_op(value).and_then(intrinsic) {
+        return repr;
+    }
     match graph.defining_op(value) {
-        Some(Op::LowLevel(
-            super::low_level::Op::Load { ty, .. }
-            | super::low_level::Op::AtomicLoad { ty, .. }
-            | super::low_level::Op::Integer { ty, .. }
-            | super::low_level::Op::Unary { ty, .. }
-            | super::low_level::Op::StackAddress { ty, .. }
-            | super::low_level::Op::StackPointer { ty },
-        )) => Repr::from_machine(*ty),
-        Some(Op::LowLevel(super::low_level::Op::Float64(_))) => Repr::F64,
-        Some(Op::LowLevel(
-            super::low_level::Op::IntCompare { .. }
-            | super::low_level::Op::FloatCompare { .. }
-            | super::low_level::Op::InRange { .. }
-            | super::low_level::Op::TestMask { .. },
-        )) => Repr::Boolean,
         Some(Op::LowLevel(super::low_level::Op::ExtractBits { value, .. })) => repr(*value),
-        Some(Op::LowLevel(super::low_level::Op::Binary { op, .. })) if op.is_float() => Repr::F64,
         Some(Op::LowLevel(super::low_level::Op::Binary { op, left, .. }))
             if !op.is_integer_arithmetic() =>
         {
@@ -201,11 +245,6 @@ fn representation(graph: &Graph, facts: &Facts, value: super::Value) -> Repr {
             debug_assert_eq!(yes, no, "select arms disagree");
             yes
         }
-        Some(Op::TypedData(_) | Op::Memory(MemoryOp::Address { .. })) => Repr::Word,
-        Some(Op::Memory(MemoryOp::IndexedLoad { format, .. } | MemoryOp::Load { format, .. })) => {
-            format.repr()
-        }
-        Some(Op::SaturatingInteger(_)) => Repr::I64,
         _ => Repr::of(facts.of(value)),
     }
 }

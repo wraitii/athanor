@@ -1,7 +1,5 @@
-use cranelift_codegen::ir::types;
-
 use super::super::low_level::{self, BlockArg, Builder, Reference};
-use super::super::{Block, Cfg, Graph, Op, TerminatorKind, Value};
+use super::super::{Block, Cfg, Graph, Op, Repr, TerminatorKind, Value};
 use crate::FxHashMap;
 
 pub(in crate::jit) fn lower(graph: &mut Graph) {
@@ -21,12 +19,7 @@ pub(in crate::jit) fn lower(graph: &mut Graph) {
             let values: Vec<_> = values
                 .iter()
                 .copied()
-                .filter(|&value| {
-                    !matches!(
-                        b.graph.defining_op(value),
-                        Some(Op::LowLevel(low_level::Op::Integer { bits: 0, .. }))
-                    )
-                })
+                .filter(|&value| !empty(b.graph, value))
                 .collect();
             let (span, source_name, location) =
                 (data.span, data.source_name, data.emission_location);
@@ -44,10 +37,10 @@ pub(in crate::jit) fn lower(graph: &mut Graph) {
                 panic!("unwind cleanup requires a jump");
             };
             let destination = target.block;
-            let argument_types: Vec<_> = b.graph.blocks[destination]
+            let argument_reprs: Vec<_> = b.graph.blocks[destination]
                 .params
                 .iter()
-                .map(|&param| b.graph.repr(param).machine())
+                .map(|&param| b.graph.repr(param))
                 .collect();
             let ladder = ladders.entry(destination).or_default();
             let built = ladder.len();
@@ -69,12 +62,12 @@ pub(in crate::jit) fn lower(graph: &mut Graph) {
                 } else {
                     ladder[depth - 2]
                 };
-                for ty in argument_types
+                for repr in argument_reprs
                     .iter()
                     .copied()
-                    .chain(std::iter::repeat_n(types::I64, depth))
+                    .chain(std::iter::repeat_n(Repr::Boxed, depth))
                 {
-                    b.append_block_param(exit, ty);
+                    b.append_block_param_repr(exit, repr);
                 }
                 b.switch_to_block(exit);
                 let params = b.block_params(exit).to_vec();
@@ -86,6 +79,14 @@ pub(in crate::jit) fn lower(graph: &mut Graph) {
             }
             b.switch_to_block(block);
         }
+    }
+}
+
+fn empty(graph: &Graph, value: Value) -> bool {
+    match graph.defining_op(value) {
+        Some(Op::AsBoxed(word)) => empty(graph, *word),
+        Some(Op::LowLevel(low_level::Op::Integer { bits: 0, .. })) => true,
+        _ => false,
     }
 }
 
@@ -103,7 +104,7 @@ fn release(b: &mut Builder<'_>, value: Value) {
 mod tests {
     use super::*;
     use crate::jit::semantic::variables::Variables;
-    use cranelift_codegen::ir::{AbiParam, Signature};
+    use cranelift_codegen::ir::{AbiParam, Signature, types};
     use cranelift_codegen::isa::CallConv;
     use oxc_span::Span;
 

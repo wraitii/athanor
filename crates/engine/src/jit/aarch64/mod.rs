@@ -12,7 +12,9 @@ use super::machine::MachineCode;
 pub(super) struct Unsupported(pub String);
 
 pub(super) fn compile_graph(graph: &super::semantic::Graph) -> Result<MachineCode, Unsupported> {
-    lower::lower(graph)
+    let mut graph = graph.clone();
+    super::semantic::lower_machine(&mut graph).map_err(Unsupported)?;
+    lower::lower(&graph)
 }
 
 pub(super) fn compile_baseline(

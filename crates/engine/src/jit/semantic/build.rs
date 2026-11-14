@@ -166,6 +166,9 @@ impl<'a> Builder<'a> {
         let block = self.current.expect("emission into unreachable code");
         let inst = self.graph.insts.next_key();
         let result = has_result.then(|| self.graph.values.push(ValueDef::Result(inst, 0)));
+        if let Some(result) = result {
+            self.graph.reprs[result] = super::repr::intrinsic(&op);
+        }
         self.graph.insts.push(InstData {
             source_name: None,
             emission_location: None,

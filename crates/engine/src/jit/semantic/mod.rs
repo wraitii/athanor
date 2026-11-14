@@ -28,7 +28,7 @@ pub(in crate::jit) mod variables;
 
 pub(super) use pipeline::{
     LOW_LEVEL_PASSES, Versioning, build_canonical, canonicalize_graph, lower_global,
-    lower_low_level, optimize_specialized, specialize_with_budget,
+    lower_low_level, lower_machine, optimize_specialized, specialize_with_budget,
 };
 #[cfg(test)]
 use pipeline::{analyze, optimize_canonical, specialize};
@@ -1550,6 +1550,9 @@ impl Graph {
             .get(position)
             .and_then(|&next| self.insts[next].source_name);
         self.has_assumes |= matches!(op, Op::Assume(..));
+        if let Some(result) = result {
+            self.reprs[result] = repr::intrinsic(&op);
+        }
         self.insts.push(InstData {
             source_name,
             emission_location: None,
@@ -2134,7 +2137,7 @@ impl Graph {
                         .iter()
                         .zip(&signature.returns)
                         .any(|(&value, param)| {
-                            self.reprs[value].map(Repr::machine) != Some(param.value_type)
+                            !self.reprs[value].is_some_and(|repr| repr.fits(param.value_type))
                         })
                 {
                     return Err(format!("{block} has incompatible return values"));
@@ -2146,7 +2149,7 @@ impl Graph {
             {
                 if args.len() != signature.params.len()
                     || args.iter().zip(&signature.params).any(|(&value, param)| {
-                        self.reprs[value].map(Repr::machine) != Some(param.value_type)
+                        !self.reprs[value].is_some_and(|repr| repr.fits(param.value_type))
                     })
                 {
                     return Err(format!("{block} has incompatible tail-call arguments"));
@@ -2167,7 +2170,10 @@ impl Graph {
                 }
                 for (&arg, &param) in target.args.iter().zip(&self.blocks[target.block].params) {
                     let compatible = if self.low_level_signature.is_some() {
-                        self.reprs[arg].map(Repr::machine) == self.reprs[param].map(Repr::machine)
+                        match (self.reprs[arg], self.reprs[param]) {
+                            (Some(arg), Some(param)) => arg.compatible(param),
+                            (arg, param) => arg == param,
+                        }
                     } else {
                         self.reprs[arg] == self.reprs[param]
                     };
@@ -2213,7 +2219,7 @@ impl Graph {
                         return Err(format!("{inst} has an invalid call signature"));
                     }
                     for (&value, ty) in instruction.results.iter().zip(&signature.returns) {
-                        if self.reprs[value].map(Repr::machine) != Some(ty.value_type) {
+                        if !self.reprs[value].is_some_and(|repr| repr.fits(ty.value_type)) {
                             return Err(format!("{inst} has an invalid call result type"));
                         }
                     }
@@ -2268,7 +2274,18 @@ impl Graph {
                         continue;
                     }
                     if self.lowered_memory_scalar(value)
-                        && matches!(self.insts[inst].op, Op::LowLevel(_))
+                        && matches!(
+                            self.insts[inst].op,
+                            Op::LowLevel(_)
+                                | Op::Box(_)
+                                | Op::Convert(..)
+                                | Op::NumericFloat(_)
+                                | Op::SaturatingInteger(_)
+                                | Op::AsInteger(_)
+                                | Op::ArrayPosition(_)
+                                | Op::ToInt32(_)
+                                | Op::AsNumber(_)
+                        )
                     {
                         continue;
                     }

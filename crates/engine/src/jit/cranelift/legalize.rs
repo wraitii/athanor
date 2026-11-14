@@ -1,4 +1,10 @@
-use crate::jit::semantic::{Cfg, Graph, MemoryOp, Op};
+use crate::jit::semantic::{Cfg, Graph, MemoryOp, Op, lower_machine};
+
+pub(in crate::jit) fn legalize(graph: &mut Graph) -> Result<(), String> {
+    lower_machine(graph)?;
+    split_indexed_loads(graph);
+    Ok(())
+}
 
 pub(in crate::jit) fn split_indexed_loads(graph: &mut Graph) {
     for block in Cfg::new(graph).rpo {

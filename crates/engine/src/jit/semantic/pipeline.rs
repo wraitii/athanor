@@ -114,14 +114,8 @@ impl FunctionState {
     }
 }
 
-pub(in crate::jit) const LOW_LEVEL_PASSES: &[&str] = &[
-    "finalize-runtime",
-    "scratch",
-    "repr-lower",
-    "cleanup",
-    "ownership-lower",
-    "bits",
-];
+pub(in crate::jit) const LOW_LEVEL_PASSES: &[&str] =
+    &["finalize-runtime", "scratch", "cleanup", "ownership-lower"];
 
 pub(in crate::jit) fn lower_low_level(
     graph: &mut Graph,
@@ -130,14 +124,17 @@ pub(in crate::jit) fn lower_low_level(
     pointer: Type,
     after: &mut dyn FnMut(&str, &Graph),
 ) -> Result<()> {
-    repr::lower(&mut low_level::Builder::new(graph))?;
-    after("repr-lower", graph);
     super::runtime::cleanup::lower(graph);
     after("cleanup", graph);
     super::runtime::ownership::lower(graph, ctx, call_conv, pointer);
     after("ownership-lower", graph);
+    graph.verify()
+}
+
+pub(in crate::jit) fn lower_machine(graph: &mut Graph) -> Result<()> {
+    repr::lower(&mut low_level::Builder::new(graph))?;
     super::bits::expand(graph);
-    after("bits", graph);
+    repr::widen(graph);
     graph.verify()
 }
 

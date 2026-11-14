@@ -2,7 +2,7 @@ use cranelift_codegen::ir::{MemFlagsData, Type, condcodes::IntCC, types};
 use cranelift_codegen::isa::CallConv;
 
 use super::super::low_level::{Builder, Reference, SignatureRef};
-use super::super::{Block, Cfg, Graph, Op, Value, low_level};
+use super::super::{Block, Cfg, Graph, Op, Repr, Value, low_level};
 use super::layout;
 use crate::FxHashMap;
 use crate::heap::REFERENCES_OFFSET;
@@ -18,6 +18,13 @@ struct Lowering<'a, 'g> {
 }
 
 impl Lowering<'_, '_> {
+    fn word(&mut self, value: Value) -> Value {
+        if self.b.graph.repr(value) == Repr::Boxed {
+            return self.b.as_word(value);
+        }
+        value
+    }
+
     fn helper(&mut self, helper: Helper, value: Value) {
         let signature = *self.signatures.entry(helper).or_insert_with(|| {
             self.b
@@ -40,8 +47,9 @@ impl Lowering<'_, '_> {
         let base = self.b.ins().load(types::I64, flags, ctx, LOCALS_OFFSET);
         let offset = slot as i32 * 8;
         let old = self.b.ins().load(types::I64, flags, base, offset);
+        let value = self.word(value);
         self.b.ins().store(flags, value, base, offset);
-        old
+        self.b.as_boxed(old)
     }
 
     fn heap(&mut self, value: Value) -> Value {
@@ -65,6 +73,7 @@ impl Lowering<'_, '_> {
     }
 
     fn retain(&mut self, value: Value) -> Block {
+        let value = self.word(value);
         let address = layout::heap_address(self.b, value);
         let increment = self.b.create_block();
         let done = self.b.create_block();
@@ -77,6 +86,7 @@ impl Lowering<'_, '_> {
     }
 
     fn release(&mut self, value: Value, heap: bool, cold: bool) -> Block {
+        let value = self.word(value);
         let done = self.b.create_block();
         if !heap {
             let is_heap = self.heap(value);
@@ -126,7 +136,19 @@ impl Lowering<'_, '_> {
 fn pure(op: &Op) -> bool {
     matches!(
         op,
-        Op::LowLevel(
+        Op::Constant(_)
+            | Op::AsBoxed(_)
+            | Op::AsWord(_)
+            | Op::Box(_)
+            | Op::Unbox(..)
+            | Op::Convert(..)
+            | Op::NumericFloat(_)
+            | Op::SaturatingInteger(_)
+            | Op::AsInteger(_)
+            | Op::ArrayPosition(_)
+            | Op::ToInt32(_)
+            | Op::AsNumber(_)
+            | Op::LowLevel(
             low_level::Op::Integer { .. }
                 | low_level::Op::Float64(_)
                 | low_level::Op::Unary { .. }
