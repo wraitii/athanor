@@ -59,6 +59,13 @@ impl Binary {
         matches!(self, Self::Add | Self::Subtract | Self::Multiply)
     }
 
+    pub(in crate::jit) fn is_width_agnostic(self) -> bool {
+        matches!(
+            self,
+            Self::Add | Self::Subtract | Self::Multiply | Self::And | Self::Or | Self::Xor
+        )
+    }
+
     pub(in crate::jit) fn is_float(self) -> bool {
         matches!(
             self,

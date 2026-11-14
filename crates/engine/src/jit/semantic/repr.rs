@@ -9,16 +9,18 @@ use super::{
 use crate::FxHashMap;
 use crate::value::Value as JsValue;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(in crate::jit) enum IntegerWidth {
+    Any,
     W8,
     W16,
     W32,
     W64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(in crate::jit) enum FloatWidth {
+    Any,
     W32,
     W64,
 }
@@ -44,6 +46,8 @@ impl std::fmt::Debug for Repr {
             Self::I64 => "I64",
             Self::F32 => "F32",
             Self::F64 => "F64",
+            Self::Integer(IntegerWidth::Any) => "Integer",
+            Self::Float(FloatWidth::Any) => "Float",
         })
     }
 }
@@ -55,6 +59,8 @@ impl Repr {
     pub(in crate::jit) const I64: Self = Self::Integer(IntegerWidth::W64);
     pub(in crate::jit) const F32: Self = Self::Float(FloatWidth::W32);
     pub(in crate::jit) const F64: Self = Self::Float(FloatWidth::W64);
+    pub(in crate::jit) const INTEGER: Self = Self::Integer(IntegerWidth::Any);
+    pub(in crate::jit) const FLOAT: Self = Self::Float(FloatWidth::Any);
 
     pub(in crate::jit) fn of(types: ValueType) -> Self {
         if types == ValueType::default() {
@@ -79,7 +85,7 @@ impl Repr {
             Self::I32 => types.within(ValueType::INT32),
             Self::I64 => types.within(ValueType::INTEGER),
             Self::F64 => types.within(ValueType::NUMBER),
-            Self::Word | Self::I8 | Self::I16 | Self::F32 => false,
+            Self::Word | Self::Integer(_) | Self::Float(_) => false,
         }
     }
 
@@ -90,7 +96,7 @@ impl Repr {
         match self {
             Self::Boxed => types,
             Self::Boolean => ValueType::BOOLEAN,
-            Self::Word | Self::I64 => ValueType::INT64,
+            Self::Word | Self::I64 | Self::INTEGER => ValueType::INT64,
             Self::Integer(_) => ValueType::INT32,
             Self::Float(_) => ValueType::NUMBER,
         }
@@ -106,6 +112,9 @@ impl Repr {
             Self::Integer(IntegerWidth::W64) => types::I64,
             Self::Float(FloatWidth::W32) => types::F32,
             Self::Float(FloatWidth::W64) => types::F64,
+            Self::Integer(IntegerWidth::Any) | Self::Float(FloatWidth::Any) => {
+                panic!("{self:?} has no machine type before its width is chosen")
+            }
         }
     }
 

@@ -1,5 +1,6 @@
 use crate::jit::helpers::Helper;
 
+use super::repr::{FloatWidth, IntegerWidth};
 use super::{
     Constant, Facts, Graph, Inst, MemoryFormat, MemoryOp, Op, Ownership, Repr, TypedRead, Value,
 };
@@ -68,26 +69,45 @@ fn specific(graph: &Graph, inst: Inst) -> Option<Representations> {
             any(0, Some(Repr::from_machine(*ty)))
         }
         Op::LowLevel(super::low_level::Op::Select { .. }) => any(3, target),
+        Op::LowLevel(super::low_level::Op::Binary {
+            op: super::low_level::Binary::FloatMin | super::low_level::Binary::FloatMax,
+            ..
+        }) => exact(&[Repr::FLOAT, Repr::FLOAT], Repr::FLOAT),
         Op::LowLevel(super::low_level::Op::Binary { op, .. }) if op.is_float() => {
             exact(&[Repr::F64, Repr::F64], Repr::F64)
         }
-        Op::LowLevel(super::low_level::Op::Binary { op, .. }) if !op.is_float() => {
+        Op::LowLevel(super::low_level::Op::Binary { op, .. }) => {
             let repr = target.expect("integer arithmetic result representation");
-            exact(&[repr, repr], repr)
+            if op.is_width_agnostic() && matches!(repr, Repr::Integer(_)) {
+                exact(&[Repr::INTEGER, Repr::INTEGER], Repr::INTEGER)
+            } else {
+                exact(&[repr, repr], repr)
+            }
         }
         Op::LowLevel(super::low_level::Op::IntCompare { left, right, .. }) => {
             let (left, right) = (graph.repr(*left), graph.repr(*right));
-            if left.machine() == right.machine() {
+            if matches!((left, right), (Repr::Integer(_), Repr::Integer(_))) {
+                exact(&[Repr::INTEGER, Repr::INTEGER], Repr::Boolean)
+            } else if left.machine() == right.machine() {
                 exact(&[left, right], Repr::Boolean)
             } else {
                 exact(&[Repr::I64, Repr::I64], Repr::Boolean)
             }
         }
         Op::LowLevel(super::low_level::Op::FloatCompare { .. }) => {
-            exact(&[Repr::F64, Repr::F64], Repr::Boolean)
+            exact(&[Repr::FLOAT, Repr::FLOAT], Repr::Boolean)
         }
         Op::LowLevel(super::low_level::Op::Unary {
-            op: super::low_level::Unary::FloatNeg | super::low_level::Unary::BitNot,
+            op:
+                super::low_level::Unary::FloatNeg
+                | super::low_level::Unary::FloatAbs
+                | super::low_level::Unary::Trunc
+                | super::low_level::Unary::Floor
+                | super::low_level::Unary::Ceil,
+            ..
+        }) => exact(&[Repr::FLOAT], Repr::FLOAT),
+        Op::LowLevel(super::low_level::Op::Unary {
+            op: super::low_level::Unary::BitNot,
             value,
             ..
         }) => {
@@ -145,11 +165,7 @@ fn specific(graph: &Graph, inst: Inst) -> Option<Representations> {
             }],
             produces: Some(match op {
                 super::low_level::Unary::Bitcast => Repr::from_machine(*ty),
-                super::low_level::Unary::Trunc
-                | super::low_level::Unary::Floor
-                | super::low_level::Unary::Ceil
-                | super::low_level::Unary::Sqrt
-                | super::low_level::Unary::FloatAbs => graph.repr(*value),
+                super::low_level::Unary::Sqrt => graph.repr(*value),
                 _ => Repr::numeric(*ty),
             }),
         },
@@ -243,7 +259,62 @@ fn generic(graph: &Graph, inst: Inst) -> Representations {
 }
 
 pub(in crate::jit) fn repr_contract(graph: &Graph, inst: Inst) -> Representations {
-    specific(graph, inst).unwrap_or_else(|| generic(graph, inst))
+    let contract = specific(graph, inst).unwrap_or_else(|| generic(graph, inst));
+    instantiate(graph, inst, contract)
+}
+
+fn open(repr: Repr) -> bool {
+    matches!(repr, Repr::INTEGER | Repr::FLOAT)
+}
+
+fn within(open: Repr, repr: Repr) -> bool {
+    match (open, repr) {
+        (Repr::Integer(_), Repr::Integer(width)) => width != IntegerWidth::Any,
+        (Repr::Float(_), Repr::Float(width)) => width != FloatWidth::Any,
+        _ => false,
+    }
+}
+
+/// Resolves the open widths of a contract against the representations currently assigned,
+/// so that representation passes keep seeing concrete widths. Each family binds one width
+/// per instruction: the result's when it is open, the widest operand's otherwise.
+fn instantiate(graph: &Graph, inst: Inst, mut contract: Representations) -> Representations {
+    let opens = |use_: &Use| matches!(use_, Use::Exact(repr) if open(*repr));
+    if !contract.produces.is_some_and(open) && !contract.uses.iter().any(opens) {
+        return contract;
+    }
+    let data = &graph.insts[inst];
+    let bind = |family: Repr, default: Repr| {
+        let target = data
+            .result()
+            .map(|value| graph.repr(value))
+            .filter(|&repr| contract.produces == Some(family) && within(family, repr));
+        target
+            .or_else(|| {
+                data.op
+                    .operands_iter()
+                    .zip(&contract.uses)
+                    .filter(|&(_, use_)| *use_ == Use::Exact(family))
+                    .map(|(value, _)| graph.repr(value))
+                    .filter(|&repr| within(family, repr))
+                    .max_by_key(|repr| repr.machine().bits())
+            })
+            .unwrap_or(default)
+    };
+    let integer = bind(Repr::INTEGER, Repr::I64);
+    let float = bind(Repr::FLOAT, Repr::F64);
+    let resolve = |repr: Repr| match repr {
+        Repr::INTEGER => integer,
+        Repr::FLOAT => float,
+        repr => repr,
+    };
+    for use_ in &mut contract.uses {
+        if let Use::Exact(repr) = use_ {
+            *repr = resolve(*repr);
+        }
+    }
+    contract.produces = contract.produces.map(resolve);
+    contract
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
