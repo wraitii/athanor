@@ -515,6 +515,10 @@ pub(super) enum Op {
     IsTypeof(Value, u8),
     AsNumber(Value),
     Convert(Value, Repr),
+    Box(Value),
+    AsBoxed(Value),
+    AsWord(Value),
+    Unbox(Value, Repr),
     Release(Value),
     Retain(Value),
     SlotStore(Value),
@@ -725,6 +729,10 @@ impl Op {
             | Op::AsObject(value)
             | Op::AsNumber(value)
             | Op::Convert(value, _)
+            | Op::Box(value)
+            | Op::AsBoxed(value)
+            | Op::AsWord(value)
+            | Op::Unbox(value, _)
             | Op::Release(value)
             | Op::Retain(value)
             | Op::SlotStore(value)
@@ -951,6 +959,10 @@ impl Op {
             | Op::AsObject(value)
             | Op::AsNumber(value)
             | Op::Convert(value, _)
+            | Op::Box(value)
+            | Op::AsBoxed(value)
+            | Op::AsWord(value)
+            | Op::Unbox(value, _)
             | Op::Release(value)
             | Op::Retain(value)
             | Op::SlotStore(value)
@@ -1596,6 +1608,16 @@ impl Graph {
         self.has_assumes = false;
     }
 
+    pub(super) fn strip_hints(&mut self) {
+        for block in self.blocks.keys().collect::<Vec<_>>() {
+            let insts = std::mem::take(&mut self.blocks[block].insts);
+            self.blocks[block].insts = insts
+                .into_iter()
+                .filter(|&inst| !matches!(self.insts[inst].op, Op::ReadHint(..)))
+                .collect();
+        }
+    }
+
     pub(super) fn detach_inst(&mut self, inst: Inst) {
         let block = self.insts[inst].block;
         self.blocks[block].insts.retain(|&i| i != inst);
@@ -1651,7 +1673,11 @@ impl Graph {
                 if let Some(&view) = self.views.get(&inst) {
                     counts[view] += 1;
                 }
-                if let Some(cache) = self.property_accesses.get(&inst).and_then(|read| read.cache) {
+                if let Some(cache) = self
+                    .property_accesses
+                    .get(&inst)
+                    .and_then(|read| read.cache)
+                {
                     counts[cache] += 1;
                 }
             }
@@ -1958,7 +1984,9 @@ impl Graph {
             | Op::IsString(_) => closed(0, Unowned),
             Op::IsTypeof(..) => closed(HEAP_READ, Unowned),
             Op::AsNumber(_) => closed(INTERNAL, Unowned),
-            Op::Convert(..) => closed(0, Unowned),
+            Op::Convert(..) | Op::Box(_) | Op::AsBoxed(_) | Op::AsWord(_) | Op::Unbox(..) => {
+                closed(0, Unowned)
+            }
             Op::Release(_)
             | Op::Retain(_)
             | Op::SlotStore(_)
@@ -2004,6 +2032,15 @@ impl Graph {
             for &inst in &self.blocks[block].insts {
                 if self.insts[inst].block != block {
                     return Err(format!("{inst} is listed in the wrong block"));
+                }
+                if let Op::LowLevel(op) = &self.insts[inst].op
+                    && !matches!(op, low_level::Op::FrameStore { .. })
+                    && self.insts[inst]
+                        .results
+                        .iter()
+                        .any(|&value| self.reprs[value] == Some(Repr::Boxed))
+                {
+                    return Err(format!("{inst} ({op:?}) produces a boxed word"));
                 }
                 match self.insts[inst].op {
                     Op::EnterScope(scope) | Op::EnterCaptures(scope, _) => {
@@ -2218,7 +2255,11 @@ impl Graph {
                 if let Some(&view) = self.views.get(&inst) {
                     check(view, index)?;
                 }
-                if let Some(cache) = self.property_accesses.get(&inst).and_then(|read| read.cache) {
+                if let Some(cache) = self
+                    .property_accesses
+                    .get(&inst)
+                    .and_then(|read| read.cache)
+                {
                     check(cache, index)?;
                 }
             }

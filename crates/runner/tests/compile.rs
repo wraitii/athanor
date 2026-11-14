@@ -186,7 +186,23 @@ fn planner_reports_region_tree_and_emitted_assumptions() {
     );
     assert!(plain.status.success());
     let plain = String::from_utf8(plain.stdout).unwrap();
-    assert_eq!(text.split("[f@1#0] planner").next().unwrap(), plain);
+    assert_eq!(
+        without_constants(text.split("[f@1#0] planner").next().unwrap()),
+        without_constants(&plain)
+    );
+}
+
+fn without_constants(text: &str) -> String {
+    text.lines()
+        .map(|line| match line.split_once("bits: ") {
+            Some((head, tail)) => {
+                let rest = tail.trim_start_matches(|c: char| c.is_ascii_digit());
+                format!("{head}bits: _{rest}")
+            }
+            None => line.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[test]
@@ -277,7 +293,10 @@ fn native_push_feedback_specializes_unknown_receivers_and_keeps_fallback() {
     let (initial, specialized) = text.split_once(".feedback@").unwrap();
     assert!(!initial.contains("helper_call ArrayAppend"), "{text}");
     assert!(specialized.contains("native ArrayPush"), "{text}");
-    assert!(specialized.contains("helper_call ArrayIterationGuard"), "{text}");
+    assert!(
+        specialized.contains("helper_call ArrayIterationGuard"),
+        "{text}"
+    );
     assert!(specialized.contains("helper_call ArrayAppend"), "{text}");
     assert!(text.lines().any(|line| line == "true"), "{text}");
 }

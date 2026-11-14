@@ -4,11 +4,12 @@ use cranelift_codegen::entity::SecondaryMap;
 use oxc_span::Span;
 
 use super::borrow::receiver as borrowed_receiver;
-use super::selection::{self, Implementation, ResultReference};
+use super::selection::{self, ResultReference};
 use super::{
     Block, BlockData, Cfg, Facts, Graph, Inst, InstData, Op, Ownership, Target, Terminator,
     TerminatorKind, Value, ValueType,
 };
+use crate::jit::helpers::Helper;
 
 const HEAP: ValueType = ValueType::STRING
     .union(ValueType::OBJECT)
@@ -99,7 +100,7 @@ pub(in crate::jit) enum Holder {
 pub(in crate::jit) struct Plan {
     pub(in crate::jit) holders: SecondaryMap<Value, Holder>,
     pub(in crate::jit) slots: Slots,
-    pub(in crate::jit) implementations: SecondaryMap<Inst, Implementation>,
+    pub(in crate::jit) results: SecondaryMap<Inst, ResultReference>,
 }
 
 impl Plan {
@@ -124,9 +125,11 @@ pub(super) fn plan(graph: &mut Graph, facts: &mut Facts) -> Plan {
                 !graph.bindings[*binding].captured && !graph.lazy_captures.contains(binding)
             }
             Some(
-                Op::GetIndex(..)
-                | Op::TypedIndex(..)
-                | Op::ArrayGet(..)
+                Op::TypedIndex(..)
+                | Op::HelperCall {
+                    helper: Helper::IndexGet | Helper::IndexGetNumeric,
+                    ..
+                }
                 | Op::ArrayLoad(..)
                 | Op::GlobalRead(_)
                 | Op::GlobalReadOptional(_),
@@ -149,13 +152,13 @@ pub(super) fn plan(graph: &mut Graph, facts: &mut Facts) -> Plan {
             Holder::Temporary
         };
     }
-    let mut implementations = SecondaryMap::new();
+    let mut results = SecondaryMap::new();
     for &block in &cfg.rpo {
         for &inst in &graph.blocks[block].insts {
             let slot = graph.insts[inst]
                 .result()
                 .is_some_and(|value| holders[value] == Holder::Slot);
-            implementations[inst] = selection::implementation(graph, facts, inst, slot);
+            results[inst] = selection::result_reference(graph, facts, inst, slot);
         }
     }
     let mut releases = releases(graph, facts, cfg);
@@ -163,14 +166,21 @@ pub(super) fn plan(graph: &mut Graph, facts: &mut Facts) -> Plan {
         values.retain(|&value| holders[value] == Holder::Temporary);
     }
     let rpo = cfg.rpo.clone();
-    insert(graph, &rpo, &holders, &slots, &releases, &implementations);
+    insert(graph, &rpo, &holders, &slots, &releases, &results);
     if transfer(graph, &rpo, &holders, &slots, &live_out) {
         facts.cfg = Cfg::new(graph);
+    }
+    for &block in &rpo {
+        let insts = std::mem::take(&mut graph.blocks[block].insts);
+        graph.blocks[block].insts = insts
+            .into_iter()
+            .filter(|&inst| !matches!(graph.insts[inst].op, Op::KeepAlive(_)))
+            .collect();
     }
     Plan {
         holders,
         slots,
-        implementations,
+        results,
     }
 }
 
@@ -506,7 +516,7 @@ fn insert(
     holders: &SecondaryMap<Value, Holder>,
     slots: &Slots,
     releases: &FxHashMap<Inst, Vec<Value>>,
-    implementations: &SecondaryMap<Inst, Implementation>,
+    results: &SecondaryMap<Inst, ResultReference>,
 ) {
     for &block in rpo {
         let insts = std::mem::take(&mut graph.blocks[block].insts);
@@ -529,17 +539,12 @@ fn insert(
             if let Some(result) = data.result() {
                 match holders[result] {
                     Holder::Slot => {
-                        if !matches!(
-                            implementations[inst].result,
-                            ResultReference::Slot | ResultReference::Move
-                        ) {
+                        if !matches!(results[inst], ResultReference::Slot | ResultReference::Move) {
                             ops.push(Op::Retain(result));
                         }
                         ops.push(Op::SlotStore(result));
                     }
-                    Holder::Temporary
-                        if implementations[inst].result == ResultReference::Borrowed =>
-                    {
+                    Holder::Temporary if results[inst] == ResultReference::Borrowed => {
                         ops.push(Op::Retain(result));
                     }
                     _ => {}

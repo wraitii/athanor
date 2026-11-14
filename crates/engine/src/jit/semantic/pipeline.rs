@@ -30,33 +30,59 @@ impl FunctionState {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(in crate::jit) fn prepare_for_emission(&mut self) -> Result<()> {
+        self.prepare_for_emission_observed(&mut |_, _| {})
+    }
+
+    pub(in crate::jit) fn prepare_for_emission_observed(
+        &mut self,
+        after: &mut dyn FnMut(&str, &FunctionState),
+    ) -> Result<()> {
+        after("input", self);
+        self.graph.strip_hints();
         if properties::lower(self)? {
             self.ensure_facts();
             borrow::borrows(&mut self.graph, &self.facts, &mut self.notes);
         }
+        after("properties", self);
         properties::lower_accesses(self)?;
+        after("property-accesses", self);
         self.lower_memory()?;
+        after("memory", self);
         if numeric::operations(self) {
             self.ensure_facts();
             borrow::borrows(&mut self.graph, &self.facts, &mut self.notes);
         }
+        after("numeric", self);
+        array_checks::lower_checks(self);
+        after("array-checks", self);
         self.ensure_facts();
+        helpers::lower(self);
+        after("helpers", self);
         repr::assign(&mut self.graph, &self.facts);
+        after("repr", self);
         legalize::legalize(&mut self.graph, &mut self.facts);
+        after("legalize", self);
         conversions::simplify(&mut self.graph, &self.facts);
         conversions::hoist(&mut self.graph, &self.facts);
-        helpers::lower(self);
+        conversions::split(&mut self.graph, &self.facts);
+        after("conversions", self);
         self.graph.verify()?;
         let plan = ownership::plan(&mut self.graph, &mut self.facts);
         if cfg!(debug_assertions) {
             ownership::verify(&self.graph, &self.facts, &plan)?;
         }
         self.graph.ownership = Some(plan);
+        after("ownership", self);
         properties::lower_loads(self);
+        after("property-loads", self);
         storage::lower_array_loads(self);
+        after("array-loads", self);
         storage::lower_stores(self);
+        after("stores", self);
         values::lower(self);
+        after("values", self);
         self.graph.verify()?;
         Ok(())
     }

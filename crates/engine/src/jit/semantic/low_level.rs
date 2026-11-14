@@ -229,11 +229,12 @@ pub(in crate::jit) struct Builder<'a> {
     pub(in crate::jit) graph: &'a mut Graph,
     definitions: FxHashMap<(Block, usize), Value>,
     reads: Vec<(Block, usize, Inst, Value)>,
-    types: FxHashMap<usize, Type>,
+    types: FxHashMap<usize, Repr>,
     location: Option<u32>,
     source_name: Option<(usize, usize)>,
     current: Option<Block>,
-    variable_types: Vec<Type>,
+    cursor: Option<usize>,
+    variable_types: Vec<Repr>,
     signatures: Vec<Signature>,
     functions: Vec<(FuncId, Signature)>,
     span: Span,
@@ -250,6 +251,7 @@ impl<'a> Builder<'a> {
             location: None,
             source_name: None,
             current: None,
+            cursor: None,
             variable_types: Vec::new(),
             signatures: Vec::new(),
             functions: Vec::new(),
@@ -263,6 +265,40 @@ impl<'a> Builder<'a> {
 
     pub(in crate::jit) fn switch_to_block(&mut self, block: Block) {
         self.current = Some(block);
+        self.cursor = None;
+    }
+
+    pub(in crate::jit) fn insert_at(&mut self, block: Block, position: usize) {
+        self.current = Some(block);
+        self.cursor = Some(position);
+    }
+
+    pub(in crate::jit) fn cursor(&self) -> Option<usize> {
+        self.cursor
+    }
+
+    fn place(
+        &mut self,
+        block: Block,
+        span: Span,
+        op: GraphOp,
+        has_result: bool,
+    ) -> (Inst, Option<Value>) {
+        let Some(position) = self.cursor.filter(|_| self.current == Some(block)) else {
+            return self.graph.append(block, span, op, has_result);
+        };
+        self.cursor = Some(position + 1);
+        self.graph.insert(block, position, span, op, has_result)
+    }
+
+    pub(in crate::jit) fn semantic(&mut self, op: GraphOp, repr: Repr) -> Value {
+        let block = self.current.expect("no current block");
+        let (inst, value) = self.place(block, self.span, op, true);
+        self.graph.insts[inst].emission_location = self.location;
+        self.graph.insts[inst].source_name = self.source_name;
+        let value = value.unwrap();
+        self.graph.reprs[value] = Some(repr);
+        value
     }
 
     pub(in crate::jit) fn create_sized_stack_slot(
@@ -304,7 +340,7 @@ impl<'a> Builder<'a> {
         let inst = *self.graph.blocks[block].insts.iter().rev().find(|&&inst| {
             !matches!(
                 self.graph.insts[inst].op,
-                GraphOp::LowLevel(Op::Scratch { .. })
+                GraphOp::LowLevel(Op::Scratch { .. }) | GraphOp::AsBoxed(_) | GraphOp::AsWord(_)
             )
         })?;
         match self.graph.insts[inst].op {
@@ -399,28 +435,39 @@ impl<'a> Builder<'a> {
     }
 
     pub(in crate::jit) fn append_block_param(&mut self, block: Block, ty: Type) -> Value {
+        self.append_block_param_repr(block, Repr::from_machine(ty))
+    }
+
+    pub(in crate::jit) fn append_block_param_repr(&mut self, block: Block, repr: Repr) -> Value {
         let value = self.graph.add_param(block);
-        self.graph.reprs[value] = Some(Repr::from_machine(ty));
+        self.graph.reprs[value] = Some(repr);
         value
+    }
+
+    #[track_caller]
+    pub(in crate::jit) fn as_boxed(&mut self, word: Value) -> Value {
+        debug_assert_eq!(self.graph.repr(word), Repr::I64);
+        self.semantic(GraphOp::AsBoxed(word), Repr::Boxed)
+    }
+
+    #[track_caller]
+    pub(in crate::jit) fn as_word(&mut self, value: Value) -> Value {
+        debug_assert_eq!(self.graph.repr(value), Repr::Boxed);
+        self.semantic(GraphOp::AsWord(value), Repr::I64)
     }
 
     pub(in crate::jit) fn block_params(&self, block: Block) -> &[Value] {
         &self.graph.blocks[block].params
     }
 
-    pub(in crate::jit) fn declare_var(&mut self, ty: Type) -> Variable {
+    pub(in crate::jit) fn declare_var(&mut self, repr: Repr) -> Variable {
         let variable = Variable(self.variable_types.len());
-        self.variable_types.push(ty);
+        self.variable_types.push(repr);
         variable
     }
 
-    pub(in crate::jit) fn declare_var_with_entry_value(
-        &mut self,
-        ty: Type,
-        value: Value,
-    ) -> Variable {
-        assert_eq!(self.graph.reprs[value].map(Repr::machine), Some(ty));
-        let variable = self.declare_var(ty);
+    pub(in crate::jit) fn declare_var_with_entry_value(&mut self, value: Value) -> Variable {
+        let variable = self.declare_var(self.graph.repr(value));
         self.definitions
             .insert((self.graph.entry, variable.0), value);
         variable
@@ -468,11 +515,9 @@ impl<'a> Builder<'a> {
     }
 
     pub(in crate::jit) fn store_frame(&mut self, ctx: Value, value: Value, slot: u32) -> Value {
-        self.value(
-            self.current.expect("no current block"),
-            self.span,
-            Op::FrameStore { ctx, value, slot },
-            cranelift_codegen::ir::types::I64,
+        self.semantic(
+            GraphOp::LowLevel(Op::FrameStore { ctx, value, slot }),
+            Repr::Boxed,
         )
     }
 
@@ -509,7 +554,7 @@ impl<'a> Builder<'a> {
     }
 
     pub(in crate::jit) fn value(&mut self, block: Block, span: Span, op: Op, ty: Type) -> Value {
-        let (inst, value) = self.graph.append(block, span, GraphOp::LowLevel(op), true);
+        let (inst, value) = self.place(block, span, GraphOp::LowLevel(op), true);
         self.graph.insts[inst].emission_location = self.location;
         self.graph.insts[inst].source_name = self.source_name;
         let value = value.unwrap();
@@ -518,10 +563,7 @@ impl<'a> Builder<'a> {
     }
 
     pub(in crate::jit) fn effect(&mut self, block: Block, span: Span, op: Op) -> Inst {
-        let inst = self
-            .graph
-            .append(block, span, GraphOp::LowLevel(op), false)
-            .0;
+        let inst = self.place(block, span, GraphOp::LowLevel(op), false).0;
         self.graph.insts[inst].emission_location = self.location;
         self.graph.insts[inst].source_name = self.source_name;
         inst
@@ -576,13 +618,21 @@ impl<'a> Builder<'a> {
         inst
     }
 
-    pub(in crate::jit) fn write(&mut self, block: Block, variable: usize, value: Value, ty: Type) {
-        if let Some(previous) = self.types.insert(variable, ty) {
-            assert_eq!(previous, ty);
+    pub(in crate::jit) fn write(
+        &mut self,
+        block: Block,
+        variable: usize,
+        value: Value,
+        repr: Repr,
+    ) {
+        if let Some(previous) = self.types.insert(variable, repr) {
+            assert_eq!(previous, repr);
         }
         match self.graph.reprs[value] {
-            Some(existing) => assert_eq!(existing.machine(), ty),
-            None => self.graph.reprs[value] = Some(Repr::from_machine(ty)),
+            Some(existing) => {
+                assert_eq!(existing, repr, "variable {variable} written with {value}")
+            }
+            None => self.graph.reprs[value] = Some(repr),
         }
         self.definitions.insert((block, variable), value);
     }
@@ -591,11 +641,11 @@ impl<'a> Builder<'a> {
         &mut self,
         block: Block,
         variable: usize,
-        ty: Type,
+        repr: Repr,
         span: Span,
     ) -> Value {
-        if let Some(previous) = self.types.insert(variable, ty) {
-            assert_eq!(previous, ty);
+        if let Some(previous) = self.types.insert(variable, repr) {
+            assert_eq!(previous, repr);
         }
         if let Some(&value) = self.definitions.get(&(block, variable)) {
             return value;
@@ -604,7 +654,7 @@ impl<'a> Builder<'a> {
             self.graph
                 .append(block, span, GraphOp::LowLevel(Op::VariableRead), true);
         let value = result.unwrap();
-        self.graph.reprs[value] = Some(Repr::from_machine(ty));
+        self.graph.reprs[value] = Some(repr);
         self.reads.push((block, variable, inst, value));
         self.definitions.insert((block, variable), value);
         value
@@ -659,7 +709,7 @@ impl<'a> Builder<'a> {
                         // Backedges must find this phi before its inputs are resolved.
                         let param = self.graph.add_param(current);
                         entries.insert((current, variable), param);
-                        self.graph.reprs[param] = Some(Repr::from_machine(self.types[&variable]));
+                        self.graph.reprs[param] = Some(self.types[&variable]);
                     }
                     work.last_mut().unwrap().1 = Some(0);
                     0
@@ -778,8 +828,7 @@ impl Instructions<'_, '_> {
         band_imm_s => And, band_imm_u => And, ishl_imm_s => ShiftLeft,
         ushr_imm_s => ShiftRightUnsigned);
 
-    unary_methods!(fabs => FloatAbs,
-        ceil => Ceil, floor => Floor, trunc => Trunc, sqrt => Sqrt);
+    unary_methods!(ceil => Ceil, floor => Floor, trunc => Trunc, sqrt => Sqrt);
     conversion_methods!(ireduce => Reduce, sextend => SignExtend, uextend => ZeroExtend,
         fpromote => FloatPromote, fcvt_from_sint => FloatFromSigned,
         fcvt_from_uint => FloatFromUnsigned, fcvt_to_sint_sat => SignedSaturatingFromFloat);

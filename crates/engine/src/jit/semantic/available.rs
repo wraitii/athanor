@@ -353,7 +353,9 @@ impl Solved {
             value
         };
         let value = original(value);
-        state.iter().any(|(key, entry)| matches!(key, LoadKey::Check(known, established)
-            if original(*known) == value && established.implies(fact) && entry.truth == Some(true)))
+        state.iter().any(|(key, entry)| {
+            matches!(key, LoadKey::Check(known, established)
+            if original(*known) == value && established.implies(fact) && entry.truth == Some(true))
+        })
     }
 }

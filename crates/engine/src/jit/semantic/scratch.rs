@@ -1,5 +1,3 @@
-use cranelift_codegen::ir::types;
-
 use super::{Block, Inst, Op, Value, low_level};
 use crate::FxHashMap;
 use low_level::{Builder, Scratch, Variable};
@@ -19,7 +17,7 @@ impl Resolver<'_, '_> {
         let variable = self
             .free
             .pop()
-            .unwrap_or_else(|| self.b.declare_var_with_entry_value(types::I64, self.empty));
+            .unwrap_or_else(|| self.b.declare_var_with_entry_value(self.empty));
         self.b.def_var(variable, value);
         self.active.push(variable);
         self.tokens.insert(token, variable);
@@ -162,7 +160,11 @@ pub(in crate::jit) fn resolve(b: &mut Builder<'_>, empty: Value) -> Result<(), S
         .insts
         .iter()
         .filter_map(|(inst, data)| {
-            matches!(data.op, Op::LowLevel(low_level::Op::Scratch { .. })).then_some(inst)
+            matches!(
+                data.op,
+                Op::LowLevel(low_level::Op::Scratch { .. }) | Op::AsBoxed(_)
+            )
+            .then_some(inst)
         })
         .collect();
     let mut planner = Resolver {
@@ -176,6 +178,13 @@ pub(in crate::jit) fn resolve(b: &mut Builder<'_>, empty: Value) -> Result<(), S
     };
     let mut replacements = FxHashMap::default();
     for inst in events {
+        if let Op::AsBoxed(word) = planner.b.graph.insts[inst].op {
+            if let Some(tokens) = planner.values.get(&word).cloned() {
+                let result = planner.b.graph.insts[inst].result().unwrap();
+                planner.values.insert(result, tokens);
+            }
+            continue;
+        }
         let data = &mut planner.b.graph.insts[inst];
         let Op::LowLevel(low_level::Op::Scratch { op, values }) =
             std::mem::replace(&mut data.op, Op::LowLevel(low_level::Op::VariableRead))

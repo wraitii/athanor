@@ -17,30 +17,49 @@ use cranelift_frontend::FunctionBuilder;
 use crate::heap::{IndexRead, PropertyRead};
 use crate::value::Value;
 
+use super::osr::Site;
 use super::session::{HELPERS_OFFSET, JitCtx};
+use super::variants::Variant;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum HelperShape {
-    Nullary,
-    Binary,
-    NumericIndex,
-    Unary,
+pub(crate) enum HelperKind {
+    Value,
+    Integer,
+    Float,
     Pointer,
-    GlobalSet,
-    PropertyGet,
-    PropertySet,
-    PropertySetCached,
-    ArrayNew,
-    Rest,
-    IndexSet,
-    Callable,
-    MethodCallable,
-    Quaternary,
-    SourceLocation,
+}
+
+pub(crate) trait HelperType {
+    const KIND: HelperKind;
+}
+
+impl HelperType for Value {
+    const KIND: HelperKind = HelperKind::Value;
+}
+
+impl HelperType for u64 {
+    const KIND: HelperKind = HelperKind::Integer;
+}
+
+impl HelperType for usize {
+    const KIND: HelperKind = HelperKind::Integer;
+}
+
+impl HelperType for f64 {
+    const KIND: HelperKind = HelperKind::Float;
+}
+
+impl<T> HelperType for *const T {
+    const KIND: HelperKind = HelperKind::Pointer;
+}
+
+impl<T> HelperType for *mut T {
+    const KIND: HelperKind = HelperKind::Pointer;
 }
 
 pub(crate) struct HelperSpec {
-    pub(crate) shape: HelperShape,
+    pub(crate) params: &'static [HelperKind],
+    pub(crate) returns: HelperKind,
     pub(crate) pointer: *const u8,
     pub(crate) reference: bool,
 }
@@ -48,7 +67,7 @@ pub(crate) struct HelperSpec {
 macro_rules! define_helpers {
     (@reference) => { false };
     (@reference reference) => { true };
-    ($($variant:ident => $shape:ident, $function:ident $(, $reference:ident)?;)*) => {
+    ($($variant:ident => $function:ident($($param:ty),*) -> $result:ty $(, $reference:ident)?;)*) => {
         #[repr(usize)]
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
         pub(crate) enum Helper {
@@ -57,8 +76,12 @@ macro_rules! define_helpers {
 
         pub(crate) const HELPERS: &[HelperSpec] = &[
             $(HelperSpec {
-                shape: HelperShape::$shape,
-                pointer: $function as *const () as *const u8,
+                params: &[$(<$param as HelperType>::KIND),*],
+                returns: <$result as HelperType>::KIND,
+                pointer: {
+                    const FUNCTION: extern "C" fn(*mut JitCtx $(, $param)*) -> $result = $function;
+                    FUNCTION as *const () as *const u8
+                },
                 reference: define_helpers!(@reference $($reference)?),
             }),*
         ];
@@ -66,122 +89,122 @@ macro_rules! define_helpers {
 }
 
 define_helpers! {
-    PackInit => Unary, js_pack_init;
-    PackRelease => Unary, js_pack_release;
-    NewPack => Unary, js_new_pack, reference;
-    Spread => Binary, js_spread, reference;
-    PackAppend => Binary, js_pack_append;
-    PackExtend => Binary, js_pack_extend;
-    PackTake => Binary, js_pack_take, reference;
-    CompilePoll => Nullary, js_compile_poll;
-    VariantEntry => Pointer, js_variant_entry;
-    OsrPoll => Callable, js_osr_poll;
-    CompileLeave => Unary, js_compile_leave;
-    Instanceof => Binary, js_instanceof;
-    In => Binary, js_in;
-    GeneratorNew => Quaternary, js_generator_new, reference;
-    CellNew => Unary, js_cell_new, reference;
-    CellGet => Unary, js_cell_get, reference;
-    CellSet => Binary, js_cell_set;
-    CaptureGet => Binary, js_capture_get, reference;
-    BindThis => Binary, js_bind_this;
-    DisableConstructor => Unary, js_disable_constructor;
-    MarkClass => Unary, js_mark_class;
-    ClosureNew => Callable, js_closure_new, reference;
-    Construct => Callable, js_construct, reference;
-    ConstructorPrototype => Unary, js_constructor_prototype;
-    NewInstance => Unary, js_new_instance, reference;
-    ConstructorCall => MethodCallable, js_constructor_call, reference;
-    ConstructorCallPack => IndexSet, js_constructor_call_pack, reference;
-    ConstructResolved => MethodCallable, js_construct_resolved, reference;
-    ConstructPackResolved => IndexSet, js_construct_pack_resolved, reference;
-    ConstructPack => Binary, js_construct_pack, reference;
-    CallPack => IndexSet, js_call_pack, reference;
-    ArrayAppend => Binary, js_array_append;
-    ArrayExtend => Binary, js_array_extend;
-    Call => MethodCallable, js_call, reference;
-    ObserveCall => Binary, js_observe_call;
-    ObserveGet => Binary, js_observe_get;
-    ObserveIndex => Binary, js_observe_index;
-    ObserveNumber => Binary, js_observe_number;
-    ObserveNumberFailure => Binary, js_observe_number_failure;
-    SemanticGlobalProbe => Pointer, js_semantic_global_probe;
-    SemanticPropertyProbeCached => Binary, js_semantic_property_probe_cached;
-    SemanticIndexProbe => Binary, js_semantic_index_probe;
-    SemanticMathNative => Binary, js_semantic_math_native;
-    ClosureThis => Unary, js_closure_this;
-    LexicalReceiver => Binary, js_lexical_receiver;
-    ArrayIterationGuard => IndexSet, js_array_iteration_guard;
-    IsStringSplit => Unary, js_is_string_split;
-    StringSplitParts => MethodCallable, js_string_split_parts, reference;
-    StringSplit => MethodCallable, js_string_split, reference;
-    ArrayMapNew => Unary, js_array_map_new, reference;
-    ArrayMapElement => Binary, js_array_map_element, reference;
-    MathDirect => MethodCallable, js_math_direct;
-    FrameOverflow => Nullary, js_frame_overflow;
-    FrameRelease => Nullary, js_frame_release;
-    LocalReplace => IndexSet, js_local_replace;
-    Release => Unary, js_release;
-    RetainAddress => Unary, js_retain_address;
-    Bailout => Unary, js_bailout;
-    Retain => Unary, js_retain, reference;
-    IterateNew => Unary, js_iterate_new, reference;
-    IterateNext => Unary, js_iterate_next, reference;
-    EnumerateNew => Unary, js_enumerate_new, reference;
-    EnumerateNext => Unary, js_enumerate_next, reference;
-    Typeof => Unary, js_typeof, reference;
-    IsTypeof => Binary, js_is_typeof;
-    Truthy => Unary, js_truthy;
-    ObjectNew => Unary, js_object_new, reference;
-    PropertyKey => Unary, js_property_key, reference;
-    StringConstant => SourceLocation, js_string_constant;
-    RegExpNew => PropertyGet, js_regexp_new, reference;
-    ArrayNew => ArrayNew, js_array_new, reference;
-    Rest => Rest, js_rest, reference;
-    IndexGet => Binary, js_index_get, reference;
-    IndexGetNumeric => NumericIndex, js_index_get_numeric, reference;
-    IndexSet => IndexSet, js_index_set;
-    PropertyGet => PropertyGet, js_property_get, reference;
-    PropertySet => PropertySet, js_property_set;
-    PropertyGetCached => Binary, js_property_get_cached, reference;
-    PropertyGetBaseline => Binary, js_property_get_baseline, reference;
-    PropertyCachePrime => Binary, js_property_cache_prime;
-    PropertySetCached => PropertySetCached, js_property_set_cached;
-    PropertyDefineHidden => PropertySet, js_property_define_hidden;
-    GlobalGet => Pointer, js_global_get, reference;
-    GlobalGetOptional => Pointer, js_global_get_optional, reference;
-    GlobalGetBorrowed => Pointer, js_global_get_borrowed;
-    GlobalGetOptionalBorrowed => Pointer, js_global_get_optional_borrowed;
-    GlobalSet => GlobalSet, js_global_set;
-    GlobalInitialize => GlobalSet, js_global_initialize;
-    Throw => Unary, js_throw;
-    Catch => Unary, js_catch, reference;
-    ErrorOrigin => SourceLocation, js_error_origin;
-    CallProfileFlush => Nullary, js_call_profile_flush;
-    BitwiseAnd => Binary, js_bitwise_and;
-    BitwiseOr => Binary, js_bitwise_or;
-    BitwiseXor => Binary, js_bitwise_xor;
-    ShiftLeft => Binary, js_shift_left;
-    ShiftRight => Binary, js_shift_right;
-    ShiftRightUnsigned => Binary, js_shift_right_unsigned;
-    Add => Binary, js_add, reference;
-    Sub => Binary, js_sub;
-    Mul => Binary, js_mul;
-    Div => Binary, js_div;
-    Rem => Binary, js_rem;
-    Pow => Binary, js_pow;
-    LooseEqual => Binary, js_loose_equal;
-    LooseNotEqual => Binary, js_loose_not_equal;
-    StrictEqual => Binary, js_strict_equal;
-    StrictNotEqual => Binary, js_strict_not_equal;
-    Less => Binary, js_less;
-    LessEqual => Binary, js_less_equal;
-    Greater => Binary, js_greater;
-    GreaterEqual => Binary, js_greater_equal;
-    UnaryPlus => Unary, js_unary_plus;
-    UnaryNegation => Unary, js_unary_negation;
-    LogicalNot => Unary, js_logical_not;
-    BitwiseNot => Unary, js_bitwise_not;
+    PackInit => js_pack_init(Value) -> Value;
+    PackRelease => js_pack_release(Value) -> Value;
+    NewPack => js_new_pack(Value) -> Value, reference;
+    Spread => js_spread(Value, Value) -> Value, reference;
+    PackAppend => js_pack_append(Value, Value) -> Value;
+    PackExtend => js_pack_extend(Value, Value) -> Value;
+    PackTake => js_pack_take(Value, Value) -> Value, reference;
+    CompilePoll => js_compile_poll() -> Value;
+    VariantEntry => js_variant_entry(*const Variant) -> u64;
+    OsrPoll => js_osr_poll(Value, *mut Value, *const Site) -> Value;
+    CompileLeave => js_compile_leave(u64) -> Value;
+    Instanceof => js_instanceof(Value, Value) -> Value;
+    In => js_in(Value, Value) -> Value;
+    GeneratorNew => js_generator_new(Value, Value, Value, u64) -> Value, reference;
+    CellNew => js_cell_new(Value) -> Value, reference;
+    CellGet => js_cell_get(Value) -> Value, reference;
+    CellSet => js_cell_set(Value, Value) -> Value;
+    CaptureGet => js_capture_get(Value, u64) -> Value, reference;
+    BindThis => js_bind_this(Value, Value) -> Value;
+    DisableConstructor => js_disable_constructor(Value) -> Value;
+    MarkClass => js_mark_class(Value) -> Value;
+    ClosureNew => js_closure_new(u64, *const Value, u64) -> Value, reference;
+    Construct => js_construct(Value, *const Value, u64) -> Value, reference;
+    ConstructorPrototype => js_constructor_prototype(Value) -> Value;
+    NewInstance => js_new_instance(Value) -> Value, reference;
+    ConstructorCall => js_constructor_call(Value, Value, *const Value, u64) -> Value, reference;
+    ConstructorCallPack => js_constructor_call_pack(Value, Value, Value) -> Value, reference;
+    ConstructResolved => js_construct_resolved(Value, Value, *const Value, u64) -> Value, reference;
+    ConstructPackResolved => js_construct_pack_resolved(Value, Value, Value) -> Value, reference;
+    ConstructPack => js_construct_pack(Value, Value) -> Value, reference;
+    CallPack => js_call_pack(Value, Value, Value) -> Value, reference;
+    ArrayAppend => js_array_append(Value, Value) -> Value;
+    ArrayExtend => js_array_extend(Value, Value) -> Value;
+    Call => js_call(Value, Value, *const Value, u64) -> Value, reference;
+    ObserveCall => js_observe_call(Value, u64) -> Value;
+    ObserveGet => js_observe_get(Value, u64) -> Value;
+    ObserveIndex => js_observe_index(Value, u64) -> Value;
+    ObserveNumber => js_observe_number(Value, u64) -> Value;
+    ObserveNumberFailure => js_observe_number_failure(Value, u64) -> Value;
+    SemanticGlobalProbe => js_semantic_global_probe(*mut GlobalCache) -> Value;
+    SemanticPropertyProbeCached => js_semantic_property_probe_cached(Value, *mut PropertyCache) -> Value;
+    SemanticIndexProbe => js_semantic_index_probe(Value, Value) -> Value;
+    SemanticMathNative => js_semantic_math_native(Value, u64) -> Value;
+    ClosureThis => js_closure_this(Value) -> Value;
+    LexicalReceiver => js_lexical_receiver(Value, Value) -> Value;
+    ArrayIterationGuard => js_array_iteration_guard(Value, Value, u64) -> Value;
+    IsStringSplit => js_is_string_split(Value) -> Value;
+    StringSplitParts => js_string_split_parts(Value, Value, *const Value, u64) -> Value, reference;
+    StringSplit => js_string_split(u64, Value, *const Value, u64) -> Value, reference;
+    ArrayMapNew => js_array_map_new(Value) -> Value, reference;
+    ArrayMapElement => js_array_map_element(Value, usize) -> Value, reference;
+    MathDirect => js_math_direct(u64, Value, *const Value, u64) -> Value;
+    FrameOverflow => js_frame_overflow() -> Value;
+    FrameRelease => js_frame_release() -> Value;
+    LocalReplace => js_local_replace(u64, Value, Value) -> Value;
+    Release => js_release(Value) -> Value;
+    RetainAddress => js_retain_address(u64) -> Value;
+    Bailout => js_bailout(u64) -> Value;
+    Retain => js_retain(Value) -> Value, reference;
+    IterateNew => js_iterate_new(Value) -> Value, reference;
+    IterateNext => js_iterate_next(Value) -> Value, reference;
+    EnumerateNew => js_enumerate_new(Value) -> Value, reference;
+    EnumerateNext => js_enumerate_next(Value) -> Value, reference;
+    Typeof => js_typeof(Value) -> Value, reference;
+    IsTypeof => js_is_typeof(Value, Value) -> Value;
+    Truthy => js_truthy(Value) -> Value;
+    ObjectNew => js_object_new(Value) -> Value, reference;
+    PropertyKey => js_property_key(Value) -> Value, reference;
+    StringConstant => js_string_constant(*mut u64, *const u8, u64) -> Value;
+    RegExpNew => js_regexp_new(u64, *const u8, u64) -> Value, reference;
+    ArrayNew => js_array_new(*const Value, u64) -> Value, reference;
+    Rest => js_rest(*const Value, u64, u64) -> Value, reference;
+    IndexGet => js_index_get(Value, Value) -> Value, reference;
+    IndexGetNumeric => js_index_get_numeric(Value, f64) -> Value, reference;
+    IndexSet => js_index_set(Value, Value, Value) -> Value;
+    PropertyGet => js_property_get(Value, *const u8, u64) -> Value, reference;
+    PropertySet => js_property_set(Value, *const u8, u64, Value) -> Value;
+    PropertyGetCached => js_property_get_cached(Value, *mut PropertyCache) -> Value, reference;
+    PropertyGetBaseline => js_property_get_baseline(Value, *mut PropertyCache) -> Value, reference;
+    PropertyCachePrime => js_property_cache_prime(Value, *mut PropertyCache) -> Value;
+    PropertySetCached => js_property_set_cached(Value, *mut PropertyCache, Value) -> Value;
+    PropertyDefineHidden => js_property_define_hidden(Value, *const u8, u64, Value) -> Value;
+    GlobalGet => js_global_get(*mut GlobalCache) -> Value, reference;
+    GlobalGetOptional => js_global_get_optional(*mut GlobalCache) -> Value, reference;
+    GlobalGetBorrowed => js_global_get_borrowed(*mut GlobalCache) -> Value;
+    GlobalGetOptionalBorrowed => js_global_get_optional_borrowed(*mut GlobalCache) -> Value;
+    GlobalSet => js_global_set(*const u8, u64, Value) -> Value;
+    GlobalInitialize => js_global_initialize(*const u8, u64, Value) -> Value;
+    Throw => js_throw(Value) -> Value;
+    Catch => js_catch(Value) -> Value, reference;
+    ErrorOrigin => js_error_origin(*const (usize, usize), u64, u64) -> Value;
+    CallProfileFlush => js_call_profile_flush() -> Value;
+    BitwiseAnd => js_bitwise_and(Value, Value) -> Value;
+    BitwiseOr => js_bitwise_or(Value, Value) -> Value;
+    BitwiseXor => js_bitwise_xor(Value, Value) -> Value;
+    ShiftLeft => js_shift_left(Value, Value) -> Value;
+    ShiftRight => js_shift_right(Value, Value) -> Value;
+    ShiftRightUnsigned => js_shift_right_unsigned(Value, Value) -> Value;
+    Add => js_add(Value, Value) -> Value, reference;
+    Sub => js_sub(Value, Value) -> Value;
+    Mul => js_mul(Value, Value) -> Value;
+    Div => js_div(Value, Value) -> Value;
+    Rem => js_rem(Value, Value) -> Value;
+    Pow => js_pow(Value, Value) -> Value;
+    LooseEqual => js_loose_equal(Value, Value) -> Value;
+    LooseNotEqual => js_loose_not_equal(Value, Value) -> Value;
+    StrictEqual => js_strict_equal(Value, Value) -> Value;
+    StrictNotEqual => js_strict_not_equal(Value, Value) -> Value;
+    Less => js_less(Value, Value) -> Value;
+    LessEqual => js_less_equal(Value, Value) -> Value;
+    Greater => js_greater(Value, Value) -> Value;
+    GreaterEqual => js_greater_equal(Value, Value) -> Value;
+    UnaryPlus => js_unary_plus(Value) -> Value;
+    UnaryNegation => js_unary_negation(Value) -> Value;
+    LogicalNot => js_logical_not(Value) -> Value;
+    BitwiseNot => js_bitwise_not(Value) -> Value;
 }
 
 extern "C" fn js_variant_entry(ctx: *mut JitCtx, variant: *const super::variants::Variant) -> u64 {
@@ -300,11 +323,7 @@ pub(crate) fn call(
     helper: Helper,
     args: &[ClifValue],
 ) -> Inst {
-    let signature = b.import_signature(signature(
-        HELPERS[helper as usize].shape,
-        call_conv,
-        pointer,
-    ));
+    let signature = b.import_signature(signature(helper, call_conv, pointer));
     let callee = address(b.ins(), pointer, ctx, helper);
     let mut call_args = Vec::with_capacity(args.len() + 1);
     call_args.push(ctx);
@@ -312,71 +331,22 @@ pub(crate) fn call(
     b.ins().call_indirect(signature, callee, &call_args)
 }
 
-pub(crate) fn signature(shape: HelperShape, call_conv: CallConv, pointer: Type) -> Signature {
+fn abi(kind: HelperKind, pointer: Type) -> AbiParam {
+    AbiParam::new(match kind {
+        HelperKind::Value | HelperKind::Integer => types::I64,
+        HelperKind::Float => types::F64,
+        HelperKind::Pointer => pointer,
+    })
+}
+
+pub(crate) fn signature(helper: Helper, call_conv: CallConv, pointer: Type) -> Signature {
+    let spec = &HELPERS[helper as usize];
     let mut signature = Signature::new(call_conv);
     signature.params.push(AbiParam::new(pointer));
-    match shape {
-        HelperShape::MethodCallable => {
-            signature.params.push(AbiParam::new(types::I64));
-            signature.params.push(AbiParam::new(types::I64));
-            signature.params.push(AbiParam::new(pointer));
-            signature.params.push(AbiParam::new(types::I64));
-        }
-        HelperShape::Callable => {
-            signature.params.push(AbiParam::new(types::I64));
-            signature.params.push(AbiParam::new(pointer));
-            signature.params.push(AbiParam::new(types::I64));
-        }
-        HelperShape::NumericIndex => {
-            signature.params.push(AbiParam::new(types::I64));
-            signature.params.push(AbiParam::new(types::F64));
-        }
-        HelperShape::Binary => {
-            signature.params.push(AbiParam::new(types::I64));
-            signature.params.push(AbiParam::new(types::I64));
-        }
-        HelperShape::Nullary => {}
-        HelperShape::Unary => signature.params.push(AbiParam::new(types::I64)),
-        HelperShape::ArrayNew | HelperShape::Rest => {
-            signature.params.push(AbiParam::new(pointer));
-            signature.params.push(AbiParam::new(types::I64));
-            if shape == HelperShape::Rest {
-                signature.params.push(AbiParam::new(types::I64));
-            }
-        }
-        HelperShape::SourceLocation => {
-            signature.params.push(AbiParam::new(pointer));
-            signature.params.push(AbiParam::new(types::I64));
-            signature.params.push(AbiParam::new(types::I64));
-        }
-        HelperShape::Quaternary => {
-            for _ in 0..4 {
-                signature.params.push(AbiParam::new(types::I64));
-            }
-        }
-        HelperShape::PropertySetCached => {
-            signature.params.push(AbiParam::new(types::I64));
-            signature.params.push(AbiParam::new(pointer));
-            signature.params.push(AbiParam::new(types::I64));
-        }
-        HelperShape::IndexSet => {
-            for _ in 0..3 {
-                signature.params.push(AbiParam::new(types::I64));
-            }
-        }
-        HelperShape::Pointer => signature.params.push(AbiParam::new(pointer)),
-        HelperShape::GlobalSet | HelperShape::PropertyGet | HelperShape::PropertySet => {
-            if matches!(shape, HelperShape::PropertyGet | HelperShape::PropertySet) {
-                signature.params.push(AbiParam::new(types::I64));
-            }
-            signature.params.push(AbiParam::new(pointer));
-            signature.params.push(AbiParam::new(types::I64));
-            if matches!(shape, HelperShape::GlobalSet | HelperShape::PropertySet) {
-                signature.params.push(AbiParam::new(types::I64));
-            }
-        }
-    }
-    signature.returns.push(AbiParam::new(types::I64));
+    signature
+        .params
+        .extend(spec.params.iter().map(|&kind| abi(kind, pointer)));
+    signature.returns.push(abi(spec.returns, pointer));
     signature
 }
 
@@ -411,20 +381,17 @@ extern "C" fn js_frame_release(ctx: *mut JitCtx) -> Value {
     unsafe { &mut *ctx }.release_frame_locals();
     Value::UNDEFINED
 }
-extern "C" fn js_bailout(_: *mut JitCtx, site: Value) -> Value {
-    crate::jit::bailouts::hit(site.bits());
+extern "C" fn js_bailout(_: *mut JitCtx, site: u64) -> Value {
+    crate::jit::bailouts::hit(site);
     Value::UNDEFINED
 }
 extern "C" fn js_release(ctx: *mut JitCtx, value: Value) -> Value {
     unsafe { &*ctx }.global.heap().release(value);
     Value::UNDEFINED
 }
-extern "C" fn js_retain_address(ctx: *mut JitCtx, address: Value) -> Value {
+extern "C" fn js_retain_address(ctx: *mut JitCtx, address: u64) -> Value {
     assert!(
-        unsafe { &*ctx }
-            .global
-            .heap()
-            .retain_address(address.bits()),
+        unsafe { &*ctx }.global.heap().retain_address(address),
         "retain of a freed value"
     );
     Value::UNDEFINED

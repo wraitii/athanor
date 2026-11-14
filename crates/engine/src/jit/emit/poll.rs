@@ -2,7 +2,7 @@ use cranelift_codegen::ir::{MemFlagsData, types};
 use cranelift_jit::JITModule;
 use cranelift_module::Module;
 
-use crate::jit::helpers::{self, HELPERS, Helper};
+use crate::jit::helpers::{self, Helper};
 use crate::jit::semantic::{Inst, Value, low_level::Builder};
 use crate::jit::session::HELPERS_OFFSET;
 
@@ -39,7 +39,7 @@ pub(super) fn emit(
         Helper::CompilePoll
     };
     let signature = b.import_signature(helpers::signature(
-        HELPERS[helper as usize].shape,
+        helper,
         target.default_call_conv,
         pointer,
     ));

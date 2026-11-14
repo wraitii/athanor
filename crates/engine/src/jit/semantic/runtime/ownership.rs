@@ -5,7 +5,7 @@ use super::super::low_level::{Builder, Reference, SignatureRef};
 use super::super::{Block, Cfg, Graph, Op, Value, low_level};
 use crate::FxHashMap;
 use crate::heap::REFERENCES_OFFSET;
-use crate::jit::helpers::{self, HELPERS, Helper};
+use crate::jit::helpers::{self, Helper};
 use crate::jit::session::{HELPERS_OFFSET, LOCALS_OFFSET};
 use crate::value::{TAG_OBJECT, TAG_SHIFT, TAG_STRING};
 
@@ -23,11 +23,8 @@ struct Lowering<'a, 'g> {
 impl Lowering<'_, '_> {
     fn helper(&mut self, helper: Helper, value: Value) {
         let signature = *self.signatures.entry(helper).or_insert_with(|| {
-            self.b.import_signature(helpers::signature(
-                HELPERS[helper as usize].shape,
-                self.convention,
-                self.pointer,
-            ))
+            self.b
+                .import_signature(helpers::signature(helper, self.convention, self.pointer))
         });
         let offset = HELPERS_OFFSET + helper as i32 * std::mem::size_of::<usize>() as i32;
         let callee = self

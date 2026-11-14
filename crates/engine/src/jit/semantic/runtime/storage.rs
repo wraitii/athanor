@@ -1,7 +1,6 @@
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{MemFlagsData, types};
 
-use super::super::selection::{Implementation, Lowering};
 use super::super::{ArrayLayout, Cfg, FunctionState, Graph, Op, Repr, ValueType, low_level};
 
 pub(in crate::jit::semantic) fn lower_metadata(function: &mut FunctionState) -> bool {
@@ -62,10 +61,6 @@ pub(in crate::jit::semantic) fn lower_metadata(function: &mut FunctionState) -> 
 pub(in crate::jit::semantic) fn lower_array_loads(function: &mut FunctionState) {
     // Ownership is fixed: preserve result identities and the scheduled reference operations.
     let graph = &mut function.graph;
-    let mut plan = graph
-        .ownership
-        .take()
-        .expect("array storage lowering requires ownership planning");
     for block in Cfg::new(graph).rpo {
         for inst in graph.blocks[block].insts.clone() {
             let data = graph.insts[inst].clone();
@@ -85,14 +80,6 @@ pub(in crate::jit::semantic) fn lower_array_loads(function: &mut FunctionState) 
                 graph.insts[inserted].emission_location = data.emission_location;
                 graph.reprs[value] = Some(repr);
                 function.facts.set(value, value_type);
-                plan.implementations[inserted] = Implementation {
-                    lowering: if matches!(graph.insts[inserted].op, Op::View(_)) {
-                        Lowering::Generic
-                    } else {
-                        Lowering::Typed(Some(repr))
-                    },
-                    ..Default::default()
-                };
                 at += 1;
                 value
             };
@@ -144,10 +131,10 @@ pub(in crate::jit::semantic) fn lower_array_loads(function: &mut FunctionState) 
                 offset: 0,
                 flags: MemFlagsData::trusted(),
             };
-            graph.insts[inst].op = if layout == ArrayLayout::Packed {
-                Op::LowLevel(load)
+            let raw = insert(graph, Op::LowLevel(load), Repr::I64, ValueType::INT64);
+            let word = if layout == ArrayLayout::Packed {
+                raw
             } else {
-                let raw = insert(graph, Op::LowLevel(load), Repr::I64, ValueType::INT64);
                 let hole = insert(
                     graph,
                     Op::LowLevel(low_level::Op::Integer {
@@ -176,22 +163,20 @@ pub(in crate::jit::semantic) fn lower_array_loads(function: &mut FunctionState) 
                     Repr::I64,
                     ValueType::INT64,
                 );
-                Op::LowLevel(low_level::Op::Select {
-                    condition: absent,
-                    yes: undefined,
-                    no: raw,
-                })
+                insert(
+                    graph,
+                    Op::LowLevel(low_level::Op::Select {
+                        condition: absent,
+                        yes: undefined,
+                        no: raw,
+                    }),
+                    Repr::I64,
+                    ValueType::INT64,
+                )
             };
-            plan.implementations[inst].lowering = Lowering::Typed(Some(Repr::Boxed));
-            let (keep, _) = graph.insert(block, at + 1, data.span, Op::KeepAlive(object), false);
-            graph.insts[keep].source_name = data.source_name;
-            plan.implementations[keep] = Implementation {
-                lowering: Lowering::Typed(None),
-                ..Default::default()
-            };
+            graph.insts[inst].op = Op::AsBoxed(word);
         }
     }
-    graph.ownership = Some(plan);
 }
 
 pub(in crate::jit::semantic) fn lower_stores(function: &mut FunctionState) {
@@ -199,7 +184,6 @@ pub(in crate::jit::semantic) fn lower_stores(function: &mut FunctionState) {
     use crate::heap::{INLINE_PROPERTY_LENGTH_OFFSET, LENGTH_OFFSET, SHAPE_OFFSET};
     use crate::jit::helpers::{CACHE_ADDITION_DESTINATION_OFFSET, CACHE_ADDITION_INDEX_OFFSET};
     let graph = &mut function.graph;
-    let mut plan = graph.ownership.take().unwrap();
     let mut checked = crate::FxHashMap::default();
     for block in Cfg::new(graph).rpo {
         for inst in graph.blocks[block].insts.clone() {
@@ -222,7 +206,7 @@ pub(in crate::jit::semantic) fn lower_stores(function: &mut FunctionState) {
                 .position(|&i| i == inst)
                 .unwrap();
             let mut insert = |op: Op, repr: Option<Repr>| {
-                let result = storage_value(graph, &mut plan, &data, block, at, op, repr);
+                let result = storage_value(graph, &data, block, at, op, repr);
                 at += 1;
                 result
             };
@@ -298,7 +282,7 @@ pub(in crate::jit::semantic) fn lower_stores(function: &mut FunctionState) {
                             offset: 0,
                             flags: MemFlagsData::trusted(),
                         }),
-                        Some(Repr::Boxed),
+                        Some(Repr::I64),
                     )
                     .unwrap()
                 });
@@ -423,7 +407,6 @@ pub(in crate::jit::semantic) fn lower_stores(function: &mut FunctionState) {
                 function.facts.set(result, ValueType::BOOLEAN);
                 let yes = storage_value(
                     graph,
-                    &mut plan,
                     &data,
                     scalar,
                     0,
@@ -444,7 +427,7 @@ pub(in crate::jit::semantic) fn lower_stores(function: &mut FunctionState) {
                 );
                 let mut at = 0;
                 let mut insert = |op, repr| {
-                    let result = storage_value(graph, &mut plan, &data, native, at, op, repr);
+                    let result = storage_value(graph, &data, native, at, op, repr);
                     at += 1;
                     result.unwrap()
                 };
@@ -484,7 +467,6 @@ pub(in crate::jit::semantic) fn lower_stores(function: &mut FunctionState) {
                     left: native_kind,
                     right: zero,
                 });
-                plan.implementations[inst].lowering = Lowering::Typed(Some(Repr::I8));
                 super::super::dispatch::extend_regions(graph, block, first_block);
                 continue;
             }
@@ -495,9 +477,10 @@ pub(in crate::jit::semantic) fn lower_stores(function: &mut FunctionState) {
                 }),
                 None,
             );
+            let word = insert(Op::AsWord(value), Some(Repr::I64)).unwrap();
             insert(
                 Op::LowLevel(low_level::Op::Store {
-                    value,
+                    value: word,
                     address,
                     offset: 0,
                     flags: MemFlagsData::trusted(),
@@ -581,20 +564,14 @@ pub(in crate::jit::semantic) fn lower_stores(function: &mut FunctionState) {
                     None,
                 );
             }
-            graph.insts[inst].op = Op::KeepAlive(object);
-            plan.implementations[inst] = Implementation {
-                lowering: Lowering::Typed(None),
-                ..Default::default()
-            };
+            graph.detach_inst(inst);
         }
     }
-    graph.ownership = Some(plan);
     function.facts.cfg = Cfg::new(graph);
 }
 
 fn storage_value(
     graph: &mut Graph,
-    plan: &mut super::super::ownership::Plan,
     source: &super::super::InstData,
     block: super::super::Block,
     at: usize,
@@ -607,10 +584,6 @@ fn storage_value(
     if let Some(value) = value {
         graph.reprs[value] = repr;
     }
-    plan.implementations[inst] = Implementation {
-        lowering: Lowering::Typed(repr),
-        ..Default::default()
-    };
     value
 }
 
@@ -640,11 +613,14 @@ fn checked_store(
                 return Some(inst);
             }
             Op::Convert(..)
+            | Op::Box(_)
+            | Op::AsBoxed(_)
+            | Op::AsWord(_)
+            | Op::Unbox(..)
             | Op::Retain(_)
             | Op::Release(_)
             | Op::SlotStore(_)
-            | Op::SlotClear(_)
-            | Op::KeepAlive(_) => {}
+            | Op::SlotClear(_) => {}
             _ => return None,
         }
     }

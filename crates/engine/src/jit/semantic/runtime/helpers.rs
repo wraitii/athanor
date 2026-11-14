@@ -1,6 +1,8 @@
 use cranelift_codegen::ir::{MemFlagsData, types};
 
-use super::super::{Cfg, FunctionState, Graph, Inst, Op, Repr, Value, low_level};
+use super::super::{
+    Cfg, Facts, FunctionState, Graph, Inst, Op, Repr, TypedRead, Value, ValueType, low_level,
+};
 use crate::jit::helpers::Helper;
 use crate::value::Value as JsValue;
 
@@ -39,8 +41,25 @@ fn call(helper: Helper, args: Vec<Arg>, produces: bool) -> Option<Call> {
     })
 }
 
-fn select(op: &Op) -> Option<Call> {
+fn key(facts: &Facts, key: Value) -> (Helper, Arg) {
+    let types = facts.of(key);
+    if types != ValueType::default() && types.within(ValueType::NUMBER) {
+        return (Helper::IndexGetNumeric, Arg::Value(key, Repr::F64));
+    }
+    (Helper::IndexGet, Arg::Value(key, Repr::Boxed))
+}
+
+fn select(op: &Op, facts: &Facts) -> Option<Call> {
     match op {
+        Op::GetIndex(object, index)
+        | Op::ArrayGet(object, index)
+        | Op::TypedIndex(object, index, TypedRead { element: None, .. }) => {
+            let (helper, index) = key(facts, *index);
+            call(helper, vec![Arg::Value(*object, Repr::Boxed), index], true)
+        }
+        Op::SetIndex(object, index, value) => {
+            call(Helper::IndexSet, boxed(&[*object, *index, *value]), false)
+        }
         Op::ClosureThis(value) => call(Helper::ClosureThis, boxed(&[*value]), true),
         Op::IsArrayIteration(callee, receiver, method) => {
             let mut args = boxed(&[*callee, *receiver]);
@@ -58,9 +77,7 @@ fn select(op: &Op) -> Option<Call> {
         Op::Throw(value) => call(Helper::Throw, boxed(&[*value]), false),
         Op::PropertyKey(value) => call(Helper::PropertyKey, boxed(&[*value]), true),
         Op::MarkClass(value) => call(Helper::MarkClass, boxed(&[*value]), false),
-        Op::DisableConstructor(value) => {
-            call(Helper::DisableConstructor, boxed(&[*value]), false)
-        }
+        Op::DisableConstructor(value) => call(Helper::DisableConstructor, boxed(&[*value]), false),
         Op::IsTypeof(value, kind) => {
             let mut args = boxed(&[*value]);
             args.push(Arg::Boxed(JsValue::number(*kind as f64)));
@@ -148,7 +165,11 @@ fn select(op: &Op) -> Option<Call> {
         Op::NewArray(args) => call(Helper::ArrayNew, vector(args).into(), true),
         Op::NewHoleyArray(length) => call(Helper::ArrayMapNew, boxed(&[*length]), true),
         Op::NewInstance(prototype) => call(Helper::NewInstance, boxed(&[*prototype]), true),
-        Op::NewObject => call(Helper::ObjectNew, vec![Arg::Boxed(JsValue::UNDEFINED)], true),
+        Op::NewObject => call(
+            Helper::ObjectNew,
+            vec![Arg::Boxed(JsValue::UNDEFINED)],
+            true,
+        ),
         Op::PackTake(pack, index) => call(Helper::PackTake, boxed(&[*pack, *index]), true),
         _ => None,
     }
@@ -162,16 +183,20 @@ pub(super) fn insert_before(
 ) -> (Inst, Option<Value>) {
     let data = &graph.insts[inst];
     let (block, span) = (data.block, data.span);
-    let at = graph.blocks[block]
-        .insts
-        .iter()
-        .position(|&i| i == inst)
-        .unwrap();
+    let at = position(graph, inst);
     let (inserted, value) = graph.insert(block, at, span, Op::LowLevel(op), repr.is_some());
     if let (Some(value), Some(repr)) = (value, repr) {
         graph.reprs[value] = Some(repr);
     }
     (inserted, value)
+}
+
+fn position(graph: &Graph, inst: Inst) -> usize {
+    graph.blocks[graph.insts[inst].block]
+        .insts
+        .iter()
+        .position(|&i| i == inst)
+        .unwrap()
 }
 
 pub(super) fn integer(bits: u64) -> low_level::Op {
@@ -182,7 +207,31 @@ pub(super) fn integer(bits: u64) -> low_level::Op {
 }
 
 fn constant(graph: &mut Graph, inst: Inst, bits: u64, repr: Repr) -> Value {
-    insert_before(graph, inst, integer(bits), Some(repr)).1.unwrap()
+    insert_before(graph, inst, integer(bits), Some(repr))
+        .1
+        .unwrap()
+}
+
+pub(super) fn as_boxed(graph: &mut Graph, inst: Inst, word: Value) -> Value {
+    let data = &graph.insts[inst];
+    let (block, span, source_name) = (data.block, data.span, data.source_name);
+    let at = position(graph, inst);
+    let (inserted, value) = graph.insert(block, at, span, Op::AsBoxed(word), true);
+    graph.insts[inserted].source_name = source_name;
+    let value = value.unwrap();
+    graph.reprs[value] = Some(Repr::Boxed);
+    value
+}
+
+pub(super) fn word(graph: &mut Graph, inst: Inst, value: Value) -> Value {
+    let data = &graph.insts[inst];
+    let (block, span, source_name) = (data.block, data.span, data.source_name);
+    let at = position(graph, inst);
+    let (inserted, word) = graph.insert(block, at, span, Op::AsWord(value), true);
+    graph.insts[inserted].source_name = source_name;
+    let word = word.unwrap();
+    graph.reprs[word] = Some(Repr::I64);
+    word
 }
 
 fn stack_vector(graph: &mut Graph, inst: Inst, values: &[Value]) -> Value {
@@ -199,8 +248,19 @@ fn stack_vector(graph: &mut Graph, inst: Inst, values: &[Value]) -> Value {
         offset: 0,
         ty: types::I64,
     };
-    let address = insert_before(graph, inst, address, Some(Repr::I64)).1.unwrap();
+    let address = insert_before(graph, inst, address, Some(Repr::I64))
+        .1
+        .unwrap();
     for (index, &value) in values.iter().enumerate() {
+        let (convert, _) = graph.insert(
+            graph.insts[inst].block,
+            position(graph, inst),
+            graph.insts[inst].span,
+            Op::Convert(value, Repr::Boxed),
+            true,
+        );
+        let value = graph.insts[convert].result().unwrap();
+        let value = word(graph, inst, value);
         let store = low_level::Op::Store {
             value,
             address,
@@ -216,7 +276,7 @@ pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) {
     let graph = &mut function.graph;
     for block in Cfg::new(graph).rpo {
         for inst in graph.blocks[block].insts.clone() {
-            let Some(call) = select(&graph.insts[inst].op) else {
+            let Some(call) = select(&graph.insts[inst].op, &function.facts) else {
                 continue;
             };
             let contract = graph.contract(&graph.insts[inst].op, &function.facts);
@@ -226,11 +286,13 @@ pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) {
             for arg in call.args {
                 let (value, repr) = match arg {
                     Arg::Value(value, repr) => (value, repr),
-                    Arg::Integer(bits) => (constant(graph, inst, bits as u64, Repr::I64), Repr::I64),
-                    Arg::Boxed(value) => (
-                        constant(graph, inst, value.bits(), Repr::Boxed),
-                        Repr::Boxed,
-                    ),
+                    Arg::Integer(bits) => {
+                        (constant(graph, inst, bits as u64, Repr::I64), Repr::I64)
+                    }
+                    Arg::Boxed(value) => {
+                        let word = constant(graph, inst, value.bits(), Repr::I64);
+                        (as_boxed(graph, inst, word), Repr::Boxed)
+                    }
                     Arg::Vector(values) => {
                         let address = stack_vector(graph, inst, &values);
                         kept.extend(values);
@@ -247,11 +309,7 @@ pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) {
                 produces: call.produces,
                 contract,
             };
-            let at = graph.blocks[block]
-                .insts
-                .iter()
-                .position(|&i| i == inst)
-                .unwrap();
+            let at = position(graph, inst);
             let span = graph.insts[inst].span;
             for value in kept {
                 graph.insert(block, at + 1, span, Op::KeepAlive(value), false);

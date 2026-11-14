@@ -1,6 +1,7 @@
 use super::{Block, BlockArg, GraphBuilder as FunctionBuilder, Inst, Variable};
 use super::{FunctionCompiler, LoweredValue};
 use crate::jit::helpers::Helper;
+use crate::jit::semantic::Repr;
 use crate::jit::semantic::low_level::{Reference, Scratch};
 use crate::value::{TAG_OBJECT, TAG_SHIFT, TAG_STRING, Value};
 use cranelift_codegen::ir::condcodes::IntCC;
@@ -16,6 +17,7 @@ const _: () = assert!(TAG_STRING - TAG_OBJECT == 1 << TAG_SHIFT);
 pub(super) const ADDRESS_MASK: i64 = (1 << TAG_SHIFT) - 1;
 
 pub(super) fn is_heap(b: &mut FunctionBuilder<'_>, value: LoweredValue) -> LoweredValue {
+    let value = b.as_word(value);
     let tag = b.ins().ushr_imm_s(value, TAG_SHIFT as i64);
     let first = (TAG_OBJECT >> TAG_SHIFT) as i64;
     let offset = b.ins().iadd_imm_s(tag, -first);
@@ -62,10 +64,11 @@ impl FunctionCompiler<'_, '_> {
     }
 
     pub(super) fn checked_temporary(&mut self, value: LoweredValue, retain: bool) -> LoweredValue {
+        let word = self.b.as_word(value);
         let missing =
             self.b
                 .ins()
-                .icmp_imm_s(IntCC::Equal, value, Value::UNINITIALIZED.bits() as i64);
+                .icmp_imm_s(IntCC::Equal, word, Value::UNINITIALIZED.bits() as i64);
         let error = self.b.create_block();
         let valid = self.b.create_block();
         self.b.set_cold_block(error);
@@ -152,9 +155,10 @@ impl FunctionCompiler<'_, '_> {
             .load(types::I64, MemFlagsData::trusted(), cache, 0);
         let create = self.b.create_block();
         let done = self.b.create_block();
-        self.b.append_block_param(done, types::I64);
+        self.b.append_block_param_repr(done, Repr::Boxed);
         self.b.set_cold_block(create);
-        self.brif(cached, done, &[BlockArg::Value(cached)], create, &[]);
+        let hit = self.b.as_boxed(cached);
+        self.brif(cached, done, &[BlockArg::Value(hit)], create, &[]);
         self.switch(create);
         let text: Box<str> = value.into();
         let ptr = self.b.ins().iconst(self.pointer, text.as_ptr() as i64);

@@ -119,6 +119,8 @@ fn integer_failure_replans_other_numeric_sites_as_numbers() {
         let output = command
             .args([
                 "--compile",
+                "--after",
+                "ownership",
                 "--planner",
                 "--filter",
                 "accumulate",
@@ -601,7 +603,8 @@ fn whole_function_guards_expose_closed_inlined_arithmetic() {
         .args([
             "--compile",
             "--no-ir",
-            "--semantic-ir",
+            "--after",
+            "ownership",
             "--planner",
             "--eval",
             source,
@@ -615,7 +618,7 @@ fn whole_function_guards_expose_closed_inlined_arithmetic() {
     );
     let dump = String::from_utf8(output.stdout).unwrap();
     let function = dump
-        .split("semantic IR distance\n")
+        .split("semantic IR distance after ownership\n")
         .nth(1)
         .unwrap()
         .split("semantic IR")
@@ -707,7 +710,8 @@ fn spread_constructor_has_guarded_inline_and_generic_fallback() {
         .args([
             "--compile",
             "--no-ir",
-            "--semantic-ir",
+            "--after",
+            "ownership",
             "--planner",
             "--eval",
             source,
@@ -720,7 +724,10 @@ fn spread_constructor_has_guarded_inline_and_generic_fallback() {
         String::from_utf8_lossy(&output.stderr)
     );
     let dump = String::from_utf8(output.stdout).unwrap();
-    let caller = dump.split("semantic IR main\n").nth(1).unwrap();
+    let caller = dump
+        .split("semantic IR main after ownership\n")
+        .nth(1)
+        .unwrap();
     assert!(caller.contains("helper_call ConstructorCallPack("));
     assert!(caller.contains("inline funcid"));
     assert!(caller.contains("is_code"));
@@ -753,8 +760,12 @@ fn recursively_inlined_bodies_expand_arrays_and_constructors_once() {
         .split("semantic IR")
         .next()
         .unwrap();
-    let maps = caller.matches(" = helper_call ArrayIterationGuard(").count();
-    let constructors = caller.matches(" = helper_call ConstructPackResolved(").count();
+    let maps = caller
+        .matches(" = helper_call ArrayIterationGuard(")
+        .count();
+    let constructors = caller
+        .matches(" = helper_call ConstructPackResolved(")
+        .count();
     assert!((2..=4).contains(&maps), "{maps}");
     assert!((2..=4).contains(&constructors), "{constructors}");
     assert!(!caller.contains(" = helper_call ConstructPack("));

@@ -14,6 +14,7 @@ pub struct CompileOptions {
     pub clif: bool,
     pub ast: bool,
     pub semantic_ir: bool,
+    pub after: Option<String>,
     pub planner: bool,
     pub asm: bool,
 }
@@ -25,6 +26,7 @@ impl Default for CompileOptions {
             clif: false,
             ast: false,
             semantic_ir: true,
+            after: None,
             planner: false,
             asm: false,
         }
@@ -36,7 +38,41 @@ pub(super) struct Inspection {
     label: Option<String>,
     ast: Option<String>,
     semantic: Option<String>,
+    after: Option<(String, String)>,
     planner: Option<String>,
+}
+
+fn semantic_text(lines: Vec<semantic::ListingLine>) -> String {
+    let mut text = String::new();
+    for (id, _, line) in lines {
+        if id == 0 {
+            writeln!(text, "{line}").unwrap();
+        } else {
+            writeln!(text, "{line}  @{id:04x}").unwrap();
+        }
+    }
+    text
+}
+
+pub(super) fn prepare_for_emission(
+    options: Option<&CompileOptions>,
+    state: &mut semantic::FunctionState,
+) -> Result<Option<(String, String)>, String> {
+    let pass = options
+        .filter(|options| options.semantic_ir)
+        .and_then(|options| options.after.as_deref());
+    let mut snapshot = None;
+    state.prepare_for_emission_observed(&mut |name, state| {
+        if pass == Some(name) {
+            snapshot = Some((name.to_owned(), semantic_text(state.listing_lines())));
+        }
+    })?;
+    if let Some(pass) = pass
+        && snapshot.is_none()
+    {
+        return Err(format!("unknown pass {pass}"));
+    }
+    Ok(snapshot)
 }
 
 impl Inspection {
@@ -51,17 +87,9 @@ impl Inspection {
             return Self::default();
         };
         Self {
-            semantic: options.semantic_ir.then(|| {
-                let mut text = String::new();
-                for (id, _, line) in graph.listing_lines() {
-                    if id == 0 {
-                        writeln!(text, "{line}").unwrap();
-                    } else {
-                        writeln!(text, "{line}  @{id:04x}").unwrap();
-                    }
-                }
-                text
-            }),
+            semantic: options
+                .semantic_ir
+                .then(|| semantic_text(graph.listing_lines())),
             planner: options
                 .planner
                 .then(|| graph.plan_report(repository, source, inline_multiplier)),
@@ -74,23 +102,20 @@ impl Inspection {
             return Self::default();
         };
         Self {
-            semantic: options.semantic_ir.then(|| {
-                let mut text = String::new();
-                for (id, _, line) in graph.listing(&semantic::Facts::compute(graph)).lines() {
-                    if id == 0 {
-                        writeln!(text, "{line}").unwrap();
-                    } else {
-                        writeln!(text, "{line}  @{id:04x}").unwrap();
-                    }
-                }
-                text
-            }),
+            semantic: options
+                .semantic_ir
+                .then(|| semantic_text(graph.listing(&semantic::Facts::compute(graph)).lines())),
             ..Self::default()
         }
     }
 
     pub(super) fn named(mut self, label: &str) -> Self {
         self.label = Some(label.to_owned());
+        self
+    }
+
+    pub(super) fn after(mut self, snapshot: Option<(String, String)>) -> Self {
+        self.after = snapshot;
         self
     }
 
@@ -121,8 +146,12 @@ impl CompileOptions {
         if let Some(ast) = &body.ast {
             println!("[{name}] analyzed AST {label}\n{ast}");
         }
-        if let Some(semantic) = &body.semantic {
-            println!("[{name}] semantic IR {label}\n{semantic}");
+        match (&body.after, &body.semantic) {
+            (Some((pass, semantic)), _) => {
+                println!("[{name}] semantic IR {label} after {pass}\n{semantic}")
+            }
+            (None, Some(semantic)) => println!("[{name}] semantic IR {label}\n{semantic}"),
+            (None, None) => {}
         }
         if let Some(planner) = &body.planner {
             println!("[{name}] planner {label}\n{planner}");

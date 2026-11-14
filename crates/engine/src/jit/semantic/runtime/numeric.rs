@@ -120,7 +120,142 @@ pub(in crate::jit::semantic) fn arithmetic(function: &mut FunctionState) -> bool
 
 pub(in crate::jit::semantic) fn operations(function: &mut FunctionState) -> bool {
     let arithmetic = arithmetic(function);
-    comparisons_and_unary(function) || arithmetic
+    let integers = integer_operations(function);
+    let natives = natives(function);
+    comparisons_and_unary(function) || arithmetic || integers || natives
+}
+
+fn integer_operations(function: &mut FunctionState) -> bool {
+    function.ensure_values();
+    let facts = &function.facts;
+    let graph = &mut function.graph;
+    let numeric = ValueType::NUMBER.union(ValueType::UNDEFINED);
+    let mut changed = false;
+    for block in facts.cfg.rpo.clone() {
+        for inst in graph.blocks[block].insts.clone() {
+            let data = graph.insts[inst].clone();
+            let Op::Binary(operator, left, right) = data.op else {
+                continue;
+            };
+            let op = match operator {
+                BinaryOperator::BitwiseAnd => Binary::And,
+                BinaryOperator::BitwiseOR => Binary::Or,
+                BinaryOperator::BitwiseXOR => Binary::Xor,
+                BinaryOperator::ShiftLeft => Binary::ShiftLeft,
+                BinaryOperator::ShiftRight => Binary::ShiftRightSigned,
+                BinaryOperator::ShiftRightZeroFill => Binary::ShiftRightUnsigned,
+                _ => continue,
+            };
+            if !facts.of(left).within(numeric) || !facts.of(right).within(numeric) {
+                continue;
+            }
+            let mut at = graph.blocks[block]
+                .insts
+                .iter()
+                .position(|&i| i == inst)
+                .unwrap();
+            let mut integer = |graph: &mut Graph, value: Value| {
+                let types = facts.of(value);
+                if types != ValueType::default() && types.within(ValueType::INT32) {
+                    return value;
+                }
+                at += 1;
+                insert(graph, block, at - 1, &data, Op::ToInt32(value))
+            };
+            let left = integer(graph, left);
+            let right = integer(graph, right);
+            let binary = LowLevel::Binary { op, left, right };
+            graph.insts[inst].op = if operator == BinaryOperator::ShiftRightZeroFill {
+                let value = insert(graph, block, at, &data, Op::LowLevel(binary));
+                Op::LowLevel(LowLevel::Unary {
+                    op: Unary::FloatFromUnsigned,
+                    ty: types::F64,
+                    value,
+                })
+            } else {
+                Op::LowLevel(binary)
+            };
+            changed = true;
+        }
+    }
+    if changed {
+        function.invalidate_values();
+    }
+    changed
+}
+
+fn natives(function: &mut FunctionState) -> bool {
+    use crate::heap::MathFunction;
+
+    function.ensure_values();
+    let facts = &function.facts;
+    let graph = &mut function.graph;
+    let numeric = ValueType::NUMBER.union(ValueType::UNDEFINED);
+    let mut changed = false;
+    for block in facts.cfg.rpo.clone() {
+        for inst in graph.blocks[block].insts.clone() {
+            let data = graph.insts[inst].clone();
+            let Op::CallNative(native, ref args) = data.op else {
+                continue;
+            };
+            let function = crate::jit::math::METHODS[native.index()].1;
+            let unary = match (function, args.len()) {
+                (MathFunction::Floor, 1) => Some(Unary::Floor),
+                (MathFunction::Ceil, 1) => Some(Unary::Ceil),
+                (MathFunction::Sqrt, 1) => Some(Unary::Sqrt),
+                (MathFunction::Min | MathFunction::Max, 1..) => None,
+                _ => continue,
+            };
+            if !args.iter().all(|&arg| facts.of(arg).within(numeric)) {
+                continue;
+            }
+            changed = true;
+            if unary.is_none() && args.len() == 1 {
+                graph.insts[inst].op = Op::NumericFloat(args[0]);
+                continue;
+            }
+            let at = graph.blocks[block]
+                .insts
+                .iter()
+                .position(|&i| i == inst)
+                .unwrap();
+            let floats: Vec<_> = args
+                .iter()
+                .enumerate()
+                .map(|(index, &arg)| insert(graph, block, at + index, &data, Op::NumericFloat(arg)))
+                .collect();
+            let at = at + floats.len();
+            graph.insts[inst].op = match unary {
+                Some(op) => Op::LowLevel(LowLevel::Unary {
+                    op,
+                    ty: types::F64,
+                    value: floats[0],
+                }),
+                None => {
+                    let op = if function == MathFunction::Min {
+                        Binary::FloatMin
+                    } else {
+                        Binary::FloatMax
+                    };
+                    let (&last, rest) = floats.split_last().unwrap();
+                    let mut left = floats[0];
+                    for (offset, &right) in rest.iter().skip(1).enumerate() {
+                        let binary = LowLevel::Binary { op, left, right };
+                        left = insert(graph, block, at + offset, &data, Op::LowLevel(binary));
+                    }
+                    Op::LowLevel(LowLevel::Binary {
+                        op,
+                        left,
+                        right: last,
+                    })
+                }
+            };
+        }
+    }
+    if changed {
+        function.invalidate_values();
+    }
+    changed
 }
 
 fn comparisons_and_unary(function: &mut FunctionState) -> bool {

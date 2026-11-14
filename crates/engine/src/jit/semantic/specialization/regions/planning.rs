@@ -645,9 +645,8 @@ fn plan_region(
     checks.extend(requirements.iter().map(native_of));
     let mut overwrites = shaped_overwrites(&planning, &written, &assumes);
     let preserved = loop {
-        let writes = Writes::with_facts(&planning, &written, &shared).preserving_shapes(
-            &overwrites.iter().map(|&(inst, _)| inst).collect(),
-        );
+        let writes = Writes::with_facts(&planning, &written, &shared)
+            .preserving_shapes(&overwrites.iter().map(|&(inst, _)| inst).collect());
         let preserved: Vec<_> = assumes
             .iter()
             .copied()
@@ -1588,7 +1587,12 @@ pub(in crate::jit::semantic) fn materialize_properties(graph: &mut Graph) -> Res
             );
             value
         });
-        graph.property_accesses.get_mut(&inst).unwrap().shapes.clear();
+        graph
+            .property_accesses
+            .get_mut(&inst)
+            .unwrap()
+            .shapes
+            .clear();
         dispatch::extend_regions(graph, data.block, first);
     }
     graph.verify()

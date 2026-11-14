@@ -735,13 +735,25 @@ fn range(
         return (n, n);
     }
     match graph.defining_op(value) {
-        Some(&Op::Binary(BinaryOperator::BitwiseAnd, left, right)) => {
-            match constant(left).or(constant(right)) {
-                Some(mask) if mask >= 0 => (0, mask),
-                _ => FULL,
-            }
-        }
-        Some(&Op::Binary(BinaryOperator::ShiftRight, _, count)) => match constant(count) {
+        Some(
+            &Op::Binary(BinaryOperator::BitwiseAnd, left, right)
+            | &Op::LowLevel(LowOp::Binary {
+                op: super::low_level::Binary::And,
+                left,
+                right,
+            }),
+        ) => match constant(left).or(constant(right)) {
+            Some(mask) if mask >= 0 => (0, mask),
+            _ => FULL,
+        },
+        Some(
+            &Op::Binary(BinaryOperator::ShiftRight, _, count)
+            | &Op::LowLevel(LowOp::Binary {
+                op: super::low_level::Binary::ShiftRightSigned,
+                right: count,
+                ..
+            }),
+        ) => match constant(count) {
             Some(count) => (FULL.0 >> (count & 31), FULL.1 >> (count & 31)),
             None => FULL,
         },
@@ -818,12 +830,48 @@ fn result_types(graph: &Graph, op: &Op, facts: &Facts) -> ValueType {
             produces.map_or(ValueType::default(), |repr| repr.coerce(ValueType::ALL))
         }
         Op::View(_) => ValueType::VIEW,
-        Op::Convert(value, repr) => repr.coerce(facts.of(*value)),
+        Op::Convert(value, repr) | Op::Unbox(value, repr) => repr.coerce(facts.of(*value)),
+        Op::Box(value) => facts.of(*value),
+        Op::AsBoxed(_) => ValueType::ALL,
+        Op::AsWord(_) => ValueType::INT64,
         Op::LowLevel(LowOp::Binary { op, .. }) if op.is_float() => ValueType::NUMBER,
         Op::LowLevel(LowOp::Binary { op, .. }) if op.is_integer_arithmetic() => ValueType::INT64,
         Op::LowLevel(LowOp::IntCompare { .. } | LowOp::FloatCompare { .. }) => ValueType::BOOLEAN,
+        Op::LowLevel(LowOp::Binary {
+            op: super::low_level::Binary::And,
+            left,
+            right,
+        }) if [*left, *right].iter().all(|&value| {
+            let types = facts.of(value);
+            types != ValueType::default() && types.within(ValueType::BOOLEAN)
+        }) =>
+        {
+            ValueType::BOOLEAN
+        }
+        Op::LowLevel(LowOp::Binary {
+            op:
+                super::low_level::Binary::And
+                | super::low_level::Binary::Or
+                | super::low_level::Binary::Xor
+                | super::low_level::Binary::ShiftLeft
+                | super::low_level::Binary::ShiftRightSigned,
+            left,
+            right,
+        }) if [*left, *right].iter().all(|&value| {
+            let types = facts.of(value);
+            types != ValueType::default() && types.within(ValueType::INT32)
+        }) =>
+        {
+            ValueType::INT32
+        }
         Op::LowLevel(LowOp::Unary {
-            op: super::low_level::Unary::FloatNeg,
+            op:
+                super::low_level::Unary::FloatNeg
+                | super::low_level::Unary::FloatFromUnsigned
+                | super::low_level::Unary::Floor
+                | super::low_level::Unary::Ceil
+                | super::low_level::Unary::Sqrt,
+            ty: cranelift_codegen::ir::types::F64,
             ..
         }) => ValueType::NUMBER,
         Op::LowLevel(LowOp::Unary {

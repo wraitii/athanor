@@ -4,10 +4,11 @@ use cranelift_codegen::ir::{MemFlagsData, condcodes::IntCC, types};
 
 pub(super) fn unbox_int32(b: &mut FunctionBuilder<'_>, value: Value) -> (Value, Value) {
     // Saturation keeps every boxed bit pattern safe; only exact round trips pass.
-    let float = b.ins().bitcast(types::F64, MemFlagsData::new(), value);
+    let word = b.as_word(value);
+    let float = b.ins().bitcast(types::F64, MemFlagsData::new(), word);
     let integer = b.ins().fcvt_to_sint_sat(types::I32, float);
     let boxed = box_int32(b, integer);
-    let exact = b.ins().icmp(IntCC::Equal, boxed, value);
+    let exact = b.ins().icmp(IntCC::Equal, boxed, word);
     (integer, exact)
 }
 

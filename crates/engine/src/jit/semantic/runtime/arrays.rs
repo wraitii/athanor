@@ -2,7 +2,8 @@
 use super::super::TerminatorKind;
 #[cfg(test)]
 use super::super::dispatch::append;
-use super::super::{Constant, FunctionState, Op, ValueType};
+use super::super::{Constant, FunctionState, Graph, Inst, Op, Repr, Value, ValueType, low_level};
+use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 
 pub(in crate::jit::semantic) fn lower_arrays(function: &mut FunctionState) -> bool {
     function.ensure_values();
@@ -43,6 +44,53 @@ pub(in crate::jit::semantic) fn lower_arrays(function: &mut FunctionState) -> bo
         function.invalidate_values();
     }
     changed
+}
+
+pub(in crate::jit::semantic) fn lower_checks(function: &mut FunctionState) -> bool {
+    let graph = &mut function.graph;
+    let mut changed = false;
+    for block in graph.blocks.keys().collect::<Vec<_>>() {
+        for inst in graph.blocks[block].insts.clone() {
+            let op = match graph.insts[inst].op {
+                Op::BooleanAnd(left, right) => low_level::Op::Binary {
+                    op: low_level::Binary::And,
+                    left,
+                    right,
+                },
+                Op::IsExactPosition(left, right) => low_level::Op::FloatCompare {
+                    condition: FloatCC::Equal,
+                    left,
+                    right,
+                },
+                Op::IsInBounds(position, length) => low_level::Op::IntCompare {
+                    condition: IntCC::UnsignedLessThan,
+                    left: integer(graph, inst, position),
+                    right: integer(graph, inst, length),
+                },
+                _ => continue,
+            };
+            graph.insts[inst].op = Op::LowLevel(op);
+            changed = true;
+        }
+    }
+    if changed {
+        function.invalidate_values();
+    }
+    changed
+}
+
+fn integer(graph: &mut Graph, inst: Inst, value: Value) -> Value {
+    let data = &graph.insts[inst];
+    let (block, span) = (data.block, data.span);
+    let at = graph.blocks[block]
+        .insts
+        .iter()
+        .position(|&i| i == inst)
+        .unwrap();
+    let (_, converted) = graph.insert(block, at, span, Op::Convert(value, Repr::I64), true);
+    let converted = converted.unwrap();
+    graph.reprs[converted] = Some(Repr::I64);
+    converted
 }
 
 pub(in crate::jit::semantic) fn lower_array_kinds(function: &mut FunctionState) -> bool {

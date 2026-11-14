@@ -1,12 +1,8 @@
 use crate::jit::helpers::Helper;
-use crate::heap::MathFunction;
-use oxc_syntax::operator::BinaryOperator;
 
 use super::{
     Constant, Facts, Graph, Inst, MemoryFormat, MemoryOp, Op, Ownership, Repr, TypedRead, Value,
-    ValueType,
 };
-use crate::jit::math::METHODS;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(in crate::jit) enum Use {
@@ -19,8 +15,6 @@ pub(in crate::jit) struct Representations {
     pub(in crate::jit) produces: Option<Repr>,
 }
 
-const NUMERIC: ValueType = ValueType::NUMBER.union(ValueType::UNDEFINED);
-
 fn integer(repr: Repr) -> bool {
     matches!(repr, Repr::I32 | Repr::I64)
 }
@@ -30,14 +24,6 @@ fn view_object(graph: &Graph, inst: Inst) -> Use {
         Use::Any
     } else {
         Use::Exact(Repr::Boxed)
-    }
-}
-
-fn key(graph: &Graph, value: Value) -> Use {
-    if graph.repr(value) == Repr::I8 {
-        Use::Exact(Repr::Boxed)
-    } else {
-        Use::Any
     }
 }
 
@@ -57,10 +43,9 @@ fn element(kind: crate::heap::TypedKind) -> Repr {
     }
 }
 
-fn typed(graph: &Graph, facts: &Facts, inst: Inst) -> Option<Representations> {
+fn specific(graph: &Graph, inst: Inst) -> Option<Representations> {
     let data = &graph.insts[inst];
     let target = data.result().map(|value| graph.repr(value));
-    let numeric = |value: Value| facts.of(value).within(NUMERIC);
     let exact = |reprs: &[Repr], produces: Repr| Representations {
         uses: reprs.iter().map(|&repr| Use::Exact(repr)).collect(),
         produces: Some(produces),
@@ -106,33 +91,14 @@ fn typed(graph: &Graph, facts: &Facts, inst: Inst) -> Option<Representations> {
             let repr = Repr::from_machine(*ty);
             exact(&[repr], repr)
         }
-        Op::Convert(_, repr) => any(1, Some(*repr)),
+        Op::Convert(_, repr) | Op::Unbox(_, repr) => any(1, Some(*repr)),
+        Op::Box(_) | Op::AsBoxed(_) => any(1, Some(Repr::Boxed)),
+        Op::AsWord(_) => exact(&[Repr::Boxed], Repr::I64),
         Op::Constant(Constant::Number(_)) => match target {
             Some(repr @ (Repr::F64 | Repr::I64 | Repr::I32)) => any(0, Some(repr)),
             _ => return None,
         },
         Op::Constant(Constant::Boolean(_)) if target == Some(Repr::I8) => any(0, Some(Repr::I8)),
-        Op::Binary(operator, left, right)
-            if matches!(
-                operator,
-                BinaryOperator::BitwiseAnd
-                    | BinaryOperator::BitwiseOR
-                    | BinaryOperator::BitwiseXOR
-                    | BinaryOperator::ShiftLeft
-                    | BinaryOperator::ShiftRight
-                    | BinaryOperator::ShiftRightZeroFill
-            ) && numeric(*left)
-                && numeric(*right) =>
-        {
-            exact(
-                &[Repr::I32, Repr::I32],
-                if *operator == BinaryOperator::ShiftRightZeroFill {
-                    Repr::F64
-                } else {
-                    Repr::I32
-                },
-            )
-        }
         Op::TypedData(_) => any(1, Some(Repr::I64)),
         Op::Memory(MemoryOp::Address { .. }) => any(2, Some(Repr::I64)),
         Op::Memory(MemoryOp::Load { format, .. }) => any(1, Some(format.repr())),
@@ -187,23 +153,7 @@ fn typed(graph: &Graph, facts: &Facts, inst: Inst) -> Option<Representations> {
         Op::IsNumber(_) | Op::IsUninitialized(_) | Op::IsUndefined(_) | Op::IsNullish(_) => {
             any(1, Some(Repr::I8))
         }
-        Op::CallNative(native, args) if args.iter().all(|&arg| numeric(arg)) => {
-            let inline = matches!(
-                (METHODS[native.index()].1, args.len()),
-                (
-                    MathFunction::Floor | MathFunction::Ceil | MathFunction::Sqrt,
-                    1
-                ) | (MathFunction::Min | MathFunction::Max, 1..)
-            );
-            if !inline {
-                return None;
-            }
-            exact(&vec![Repr::F64; args.len()], Repr::F64)
-        }
-        Op::IsExactPosition(..) => exact(&[Repr::F64, Repr::F64], Repr::I8),
-        Op::IsInBounds(..) => exact(&[Repr::I64, Repr::I64], Repr::I8),
         Op::ArrayPosition(_) => exact(&[Repr::I64], Repr::I64),
-        Op::BooleanAnd(..) => exact(&[Repr::I8, Repr::I8], Repr::I8),
         Op::ArrayKind(_) => Representations {
             uses: vec![view_object(graph, inst)],
             produces: Some(Repr::I32),
@@ -239,16 +189,6 @@ fn typed(graph: &Graph, facts: &Facts, inst: Inst) -> Option<Representations> {
                 Repr::Boxed
             }),
         },
-        Op::GetIndex(_, index) | Op::TypedIndex(_, index, _) | Op::ArrayGet(_, index) => {
-            Representations {
-                uses: vec![Use::Exact(Repr::Boxed), key(graph, *index)],
-                produces: Some(Repr::Boxed),
-            }
-        }
-        Op::SetIndex(_, index, _) => Representations {
-            uses: vec![Use::Exact(Repr::Boxed), key(graph, *index), Use::Any],
-            produces: None,
-        },
         _ => return None,
     })
 }
@@ -276,8 +216,8 @@ fn generic(graph: &Graph, inst: Inst) -> Representations {
     }
 }
 
-pub(in crate::jit) fn representations(graph: &Graph, facts: &Facts, inst: Inst) -> Representations {
-    typed(graph, facts, inst).unwrap_or_else(|| generic(graph, inst))
+pub(in crate::jit) fn repr_contract(graph: &Graph, inst: Inst) -> Representations {
+    specific(graph, inst).unwrap_or_else(|| generic(graph, inst))
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -287,19 +227,6 @@ pub(in crate::jit) enum ResultReference {
     Borrowed,
     Slot,
     Move,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub(in crate::jit) enum Lowering {
-    #[default]
-    Generic,
-    Typed(Option<Repr>),
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub(in crate::jit) struct Implementation {
-    pub(in crate::jit) result: ResultReference,
-    pub(in crate::jit) lowering: Lowering,
 }
 
 pub(super) fn fresh_reference(op: &Op) -> bool {
@@ -320,36 +247,19 @@ pub(super) fn fresh_reference(op: &Op) -> bool {
     )
 }
 
-fn reference_implementation(
+pub(in crate::jit) fn result_reference(
     graph: &Graph,
     facts: &Facts,
     inst: Inst,
     slot: bool,
-) -> Implementation {
+) -> ResultReference {
     let op = &graph.insts[inst].op;
     let allocation = fresh_reference(op) || matches!(op, Op::StringSplitParts(..));
-    let result = match graph.contract(op, facts).result {
+    match graph.contract(op, facts).result {
         Ownership::Owned if allocation && slot => ResultReference::Slot,
         Ownership::Owned if allocation => ResultReference::Managed,
         Ownership::Borrowed => ResultReference::Borrowed,
         Ownership::Owned if slot => ResultReference::Move,
         _ => ResultReference::Managed,
-    };
-    Implementation {
-        result,
-        ..Default::default()
     }
-}
-
-pub(in crate::jit) fn implementation(
-    graph: &Graph,
-    facts: &Facts,
-    inst: Inst,
-    slot: bool,
-) -> Implementation {
-    let mut implementation = reference_implementation(graph, facts, inst, slot);
-    if let Some(contract) = typed(graph, facts, inst) {
-        implementation.lowering = Lowering::Typed(contract.produces);
-    }
-    implementation
 }

@@ -44,7 +44,11 @@ pub(in crate::jit::semantic) fn assume(graph: &mut Graph, shapes: &super::shapes
                     .or_else(|| shapes.read(graph, inst).map(|access| vec![access]))
                     .unwrap_or_default(),
             ),
-            Op::Set(object, name, _) => (object, name, shapes.write(graph, inst).into_iter().collect()),
+            Op::Set(object, name, _) => (
+                object,
+                name,
+                shapes.write(graph, inst).into_iter().collect(),
+            ),
             _ => unreachable!(),
         };
         let origin = Origin {
@@ -107,12 +111,14 @@ pub(in crate::jit::semantic) fn shape_writes(graph: &mut Graph) {
         let facts = Facts::compute(graph);
         let solved = available::solve(graph, &facts, &facts.cfg, Default::default(), false);
         let (proven, failed): (Vec<_>, Vec<_>) =
-            candidates.into_iter().partition(|&(inst, object, shape, _)| {
-                solved.as_ref().is_some_and(|solved| {
-                    let state = solved.before(graph, &facts, &facts.cfg, inst);
-                    solved.holds(graph, &state, object, Fact::Shape(shape))
-                })
-            });
+            candidates
+                .into_iter()
+                .partition(|&(inst, object, shape, _)| {
+                    solved.as_ref().is_some_and(|solved| {
+                        let state = solved.before(graph, &facts, &facts.cfg, inst);
+                        solved.holds(graph, &state, object, Fact::Shape(shape))
+                    })
+                });
         candidates = proven;
         if failed.is_empty() {
             break;

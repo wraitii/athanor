@@ -7,13 +7,13 @@ use oxc_syntax::operator::BinaryOperator;
 use crate::error::Error;
 use crate::heap::{
     CODE_OFFSET, DATA_OFFSET, KIND_OFFSET, LENGTH_OFFSET, MathFunction, NO_ELEMENTS, SHAPE_OFFSET,
-    TypedKind, kind,
+    TypedKind,
 };
 use crate::jit::helpers::{
     self, CACHE_BUILTIN_KIND_OFFSET, CACHE_BUILTIN_VALUE_OFFSET, CACHE_ENTRY_OFFSET,
     CACHE_ENTRY_SIZE, CACHE_HOLDER_OFFSET, CACHE_HOLDER_SHAPE_OFFSET, CACHE_INDEX_OFFSET,
     CACHE_LEN_OFFSET, CACHE_MEGAMORPHIC_OFFSET, CACHE_OVERFLOW_OFFSET, CACHE_SHAPE_OFFSET, HELPERS,
-    Helper, PROPERTY_CACHE_LIMIT, PropertyCache,
+    Helper, HelperKind, PROPERTY_CACHE_LIMIT, PropertyCache,
 };
 use crate::jit::profile::{CallSite, Site};
 use crate::jit::semantic::DirectTarget;
@@ -42,20 +42,6 @@ use super::scope::ADDRESS_MASK;
 impl Element {
     fn bytes(self) -> u32 {
         Type::from(self).bytes()
-    }
-
-    fn kind(self) -> u32 {
-        kind::TYPED
-            | match self {
-                Self::U8 => 0,
-                Self::U16 => 1,
-                Self::U32 => 2,
-                Self::I8 => kind::ELEMENT_SIGNED,
-                Self::I16 => kind::ELEMENT_SIGNED | 1,
-                Self::I32 => kind::ELEMENT_SIGNED | 2,
-                Self::F32 => kind::ELEMENT_FLOAT | 2,
-                Self::F64 => kind::ELEMENT_FLOAT | 3,
-            }
     }
 }
 
@@ -192,28 +178,12 @@ pub(super) fn binary_operator(operator: BinaryOperator) -> BinaryOp {
 
 impl FunctionCompiler<'_, '_> {
     pub(super) fn constant(&mut self, value: Value) -> LoweredValue {
-        self.b.ins().iconst(types::I64, value.bits() as i64)
-    }
-
-    pub(super) fn is_integer(&mut self, value: LoweredValue) -> LoweredValue {
-        let numeric = self.is_number(value);
-        let float = self.b.ins().bitcast(types::F64, MemFlagsData::new(), value);
-        let integer = self.b.ins().fcvt_to_sint_sat(types::I64, float);
-        let exact = self.b.ins().fcvt_from_sint(types::F64, integer);
-        let integral = self.b.ins().fcmp(FloatCC::Equal, float, exact);
-        let magnitude = self.b.ins().fabs(float);
-        let limit = self.b.ins().f64const(9007199254740991.0);
-        let safe = self
-            .b
-            .ins()
-            .fcmp(FloatCC::LessThanOrEqual, magnitude, limit);
-        let positive_zero = self.b.ins().icmp_imm_s(IntCC::NotEqual, value, i64::MIN);
-        let valid = self.b.ins().band(numeric, integral);
-        let valid = self.b.ins().band(valid, safe);
-        self.b.ins().band(valid, positive_zero)
+        let word = self.b.ins().iconst(types::I64, value.bits() as i64);
+        self.b.as_boxed(word)
     }
 
     pub(super) fn is_number(&mut self, value: LoweredValue) -> LoweredValue {
+        let value = self.b.as_word(value);
         let top = self.b.ins().ushr_imm_s(value, TAG_SHIFT as i64);
         let offset = self.b.ins().iadd_imm_s(top, -(TAG_FIRST as i64));
 
@@ -224,6 +194,7 @@ impl FunctionCompiler<'_, '_> {
 
     pub(super) fn truthy(&mut self, value: LoweredValue) -> LoweredValue {
         let number = self.is_number(value);
+        let word = self.b.as_word(value);
         let number_block = self.b.create_block();
         let other_block = self.b.create_block();
         let string_block = self.b.create_block();
@@ -233,7 +204,7 @@ impl FunctionCompiler<'_, '_> {
         self.brif(number, number_block, &[], other_block, &[]);
 
         self.switch(number_block);
-        let float = self.b.ins().bitcast(types::F64, MemFlagsData::new(), value);
+        let float = self.b.ins().bitcast(types::F64, MemFlagsData::new(), word);
         let zero = self.b.ins().f64const(0.0);
         let negative = self.b.ins().fcmp(FloatCC::LessThan, float, zero);
         let positive = self.b.ins().fcmp(FloatCC::GreaterThan, float, zero);
@@ -241,7 +212,7 @@ impl FunctionCompiler<'_, '_> {
         self.jump(done, &[BlockArg::Value(truth)]);
 
         self.switch(other_block);
-        let tag = self.b.ins().ushr_imm_s(value, TAG_SHIFT as i64);
+        let tag = self.b.ins().ushr_imm_s(word, TAG_SHIFT as i64);
         let is_string =
             self.b
                 .ins()
@@ -250,6 +221,7 @@ impl FunctionCompiler<'_, '_> {
 
         self.switch(string_block);
         let truth = self.call_helper(Helper::Truthy, &[value]);
+        let truth = self.b.as_word(truth);
         let truth = self
             .b
             .ins()
@@ -257,18 +229,18 @@ impl FunctionCompiler<'_, '_> {
         self.jump(done, &[BlockArg::Value(truth)]);
 
         self.switch(primitive_block);
-        let undefined =
-            self.b
-                .ins()
-                .icmp_imm_s(IntCC::Equal, value, Value::UNDEFINED.bits() as i64);
+        let undefined = self
+            .b
+            .ins()
+            .icmp_imm_s(IntCC::Equal, word, Value::UNDEFINED.bits() as i64);
         let null = self
             .b
             .ins()
-            .icmp_imm_s(IntCC::Equal, value, Value::NULL.bits() as i64);
+            .icmp_imm_s(IntCC::Equal, word, Value::NULL.bits() as i64);
         let false_value = self
             .b
             .ins()
-            .icmp_imm_s(IntCC::Equal, value, Value::FALSE.bits() as i64);
+            .icmp_imm_s(IntCC::Equal, word, Value::FALSE.bits() as i64);
         let falsy = self.b.ins().bor(undefined, null);
         let falsy = self.b.ins().bor(falsy, false_value);
         let truth = self.b.ins().icmp_imm_s(IntCC::Equal, falsy, 0);
@@ -276,18 +248,6 @@ impl FunctionCompiler<'_, '_> {
 
         self.switch(done);
         self.b.block_params(done)[0]
-    }
-
-    pub(super) fn is_nullish(&mut self, value: LoweredValue) -> LoweredValue {
-        let undefined =
-            self.b
-                .ins()
-                .icmp_imm_s(IntCC::Equal, value, Value::UNDEFINED.bits() as i64);
-        let null = self
-            .b
-            .ins()
-            .icmp_imm_s(IntCC::Equal, value, Value::NULL.bits() as i64);
-        self.b.ins().bor(undefined, null)
     }
 
     pub(super) fn unary_helper(&mut self, op: UnaryOp, value: LoweredValue) -> LoweredValue {
@@ -377,7 +337,7 @@ impl FunctionCompiler<'_, '_> {
         let target = self.module.target_config();
         let signature = *self.helper_signatures.entry(helper).or_insert_with(|| {
             self.b.import_signature(helpers::signature(
-                HELPERS[helper as usize].shape,
+                helper,
                 target.default_call_conv,
                 self.pointer,
             ))
@@ -393,7 +353,10 @@ impl FunctionCompiler<'_, '_> {
         call_args.extend_from_slice(args);
         let call = self.b.ins().call_indirect(signature, callee, &call_args);
         self.b.mark_helper(call, helper);
-        let result = self.b.inst_results(call)[0];
+        let mut result = self.b.inst_results(call)[0];
+        if HELPERS[helper as usize].returns == HelperKind::Value {
+            result = self.b.as_boxed(result);
+        }
         self.unchecked = None;
         if track {
             self.unchecked = Some(
@@ -416,7 +379,7 @@ impl FunctionCompiler<'_, '_> {
         let fast = self.b.create_block();
         let slow = self.b.create_block();
         let done = self.b.create_block();
-        self.b.append_block_param(done, types::I64);
+        self.b.append_block_param_repr(done, Repr::Boxed);
         self.brif(both, fast, &[], slow, &[]);
 
         self.switch(fast);
@@ -435,6 +398,7 @@ impl FunctionCompiler<'_, '_> {
         } else {
             ir_helpers::box_int32(self.b, integer)
         };
+        let result = self.b.as_boxed(result);
         self.jump(done, &[BlockArg::Value(result)]);
 
         self.switch(slow);
@@ -469,13 +433,16 @@ impl FunctionCompiler<'_, '_> {
         let fast_block = self.b.create_block();
         let slow_block = self.b.create_block();
         let done = self.b.create_block();
-        self.b.append_block_param(done, types::I64);
+        self.b.append_block_param_repr(done, Repr::Boxed);
         self.brif(numbers, fast_block, &[], slow_block, &[]);
 
         self.switch(fast_block);
         let floats: Vec<_> = args
             .iter()
-            .map(|&arg| self.b.ins().bitcast(types::F64, MemFlagsData::new(), arg))
+            .map(|&arg| {
+                let word = self.b.as_word(arg);
+                self.b.ins().bitcast(types::F64, MemFlagsData::new(), word)
+            })
             .collect();
         let result = match function {
             MathFunction::Floor => self.b.ins().floor(floats[0]),
@@ -493,8 +460,12 @@ impl FunctionCompiler<'_, '_> {
             .b
             .ins()
             .bitcast(types::I64, MemFlagsData::new(), result);
-        let nan = self.constant(Value::number(f64::NAN));
-        let boxed = self.b.ins().select(unordered, nan, bits);
+        let nan = self
+            .b
+            .ins()
+            .iconst(types::I64, Value::number(f64::NAN).bits() as i64);
+        let word = self.b.ins().select(unordered, nan, bits);
+        let boxed = self.b.as_boxed(word);
         self.jump(done, &[BlockArg::Value(boxed)]);
 
         self.switch(slow_block);
@@ -519,11 +490,14 @@ impl FunctionCompiler<'_, '_> {
         let fast_block = self.b.create_block();
         let slow_block = self.b.create_block();
         let done = self.b.create_block();
-        self.b.append_block_param(done, types::I64);
+        self.b.append_block_param_repr(done, Repr::Boxed);
         self.brif(both, fast_block, &[], slow_block, &[]);
 
         self.switch(fast_block);
-        let fast_result = fast(self, left, right);
+        let left_word = self.b.as_word(left);
+        let right_word = self.b.as_word(right);
+        let fast_result = fast(self, left_word, right_word);
+        let fast_result = self.b.as_boxed(fast_result);
         self.jump(done, &[BlockArg::Value(fast_result)]);
 
         self.switch(slow_block);
@@ -565,8 +539,10 @@ impl FunctionCompiler<'_, '_> {
                     .b
                     .ins()
                     .bitcast(types::I64, MemFlagsData::new(), result);
-                let nan = compiler.constant(Value::number(f64::NAN));
-
+                let nan = compiler
+                    .b
+                    .ins()
+                    .iconst(types::I64, Value::number(f64::NAN).bits() as i64);
                 compiler.b.ins().select(unordered, nan, bits)
             },
             |compiler| compiler.binary_helper(op, left, right),
@@ -603,8 +579,14 @@ impl FunctionCompiler<'_, '_> {
                     _ => unreachable!(),
                 };
                 let condition = compiler.b.ins().fcmp(condition, left_float, right_float);
-                let true_value = compiler.constant(Value::TRUE);
-                let false_value = compiler.constant(Value::FALSE);
+                let true_value = compiler
+                    .b
+                    .ins()
+                    .iconst(types::I64, Value::TRUE.bits() as i64);
+                let false_value = compiler
+                    .b
+                    .ins()
+                    .iconst(types::I64, Value::FALSE.bits() as i64);
                 compiler.b.ins().select(condition, true_value, false_value)
             },
             |compiler| compiler.binary_helper(op, left, right),
@@ -620,7 +602,7 @@ pub(super) fn to_number(
     let fast_block = compiler.b.create_block();
     let slow_block = compiler.b.create_block();
     let done = compiler.b.create_block();
-    compiler.b.append_block_param(done, types::I64);
+    compiler.b.append_block_param_repr(done, Repr::Boxed);
     compiler.brif(is_number, fast_block, &[], slow_block, &[]);
 
     compiler.switch(fast_block);
@@ -636,31 +618,10 @@ pub(super) fn to_number(
 }
 
 impl FunctionCompiler<'_, '_> {
-    pub(super) fn index_access(
-        &mut self,
-        object: LoweredValue,
-        index: Operand,
-        value: Option<LoweredValue>,
-    ) -> LoweredValue {
-        if let Some(value) = value {
-            let index = self.convert(index, Repr::Boxed);
-            let result = self.call_helper(Helper::IndexSet, &[object, index, value]);
-            self.check_error();
-            return result;
-        }
-        let (helper, index) = if matches!(index.repr, Repr::F64 | Repr::I32 | Repr::I64) {
-            (Helper::IndexGetNumeric, self.convert(index, Repr::F64))
-        } else {
-            (Helper::IndexGet, self.convert(index, Repr::Boxed))
-        };
-        let result = self.call_helper(helper, &[object, index]);
-        self.check_error();
-        result
-    }
-
     // Non-objects and the global object (address zero) see an all-zero slot, so every
     // kind check fails and the length reads as zero.
     pub(super) fn view(&mut self, object: LoweredValue) -> LoweredValue {
+        let object = self.b.as_word(object);
         let tag = self.b.ins().ushr_imm_s(object, TAG_SHIFT as i64);
         let is_object =
             self.b
@@ -739,8 +700,8 @@ impl FunctionCompiler<'_, '_> {
         let slow = self.b.create_block();
         let check = self.b.create_block();
         let done = self.b.create_block();
-        self.b.append_block_param(check, types::I64);
-        self.b.append_block_param(done, types::I64);
+        self.b.append_block_param_repr(check, Repr::Boxed);
+        self.b.append_block_param_repr(done, Repr::Boxed);
         self.b.set_cold_block(slow);
         self.b.set_cold_block(check);
         self.brif(direct, fast, &[], slow, &[]);
@@ -839,7 +800,7 @@ impl FunctionCompiler<'_, '_> {
         }
         let call = self.b.ins().call_indirect(signature, entry, &call_args);
         let [result, status] = self.b.inst_results(call).try_into().unwrap();
-        (result, status)
+        (self.b.as_boxed(result), status)
     }
 
     fn owned_result(&mut self, result: LoweredValue, owned: bool) -> LoweredValue {
@@ -942,20 +903,6 @@ impl FunctionCompiler<'_, '_> {
             .load(types::I32, MemFlagsData::trusted(), view, KIND_OFFSET)
     }
 
-    pub(super) fn has_kind(&mut self, view: LoweredValue, mask: u32) -> LoweredValue {
-        let kind = self.view_kind(view);
-        let masked = self.b.ins().band_imm_s(kind, mask as i64);
-        self.b.ins().icmp_imm_s(IntCC::NotEqual, masked, 0)
-    }
-
-    pub(super) fn typed_kind_is(&mut self, view: LoweredValue, kind: TypedKind) -> LoweredValue {
-        let actual = self.view_kind(view);
-        let expected = Element::from(kind).kind();
-        self.b
-            .ins()
-            .icmp_imm_s(IntCC::Equal, actual, expected as i64)
-    }
-
     /// Reads an element of a typed array of known kind at an index known to be in bounds.
     pub(super) fn bounded_element_read(
         &mut self,
@@ -1015,7 +962,7 @@ impl FunctionCompiler<'_, '_> {
         };
         let read = self.b.create_block();
         let done = self.b.create_block();
-        self.b.append_block_param(done, types::I64);
+        self.b.append_block_param_repr(done, Repr::Boxed);
         let undefined = self.constant(Value::UNDEFINED);
         self.brif(inside, read, &[], done, &[undefined.into()]);
         self.switch(read);
@@ -1108,16 +1055,17 @@ impl FunctionCompiler<'_, '_> {
         let ready = self.b.create_block();
         let slow = self.b.create_block();
         let done = self.b.create_block();
-        self.b.append_block_param(done, types::I64);
+        self.b.append_block_param_repr(done, Repr::Boxed);
         self.b.set_cold_block(slow);
         self.brif(valid, hit, &[], slow, &[]);
         self.switch(hit);
         // No reentry occurs between validating resolution and loading the current binding value.
-        let value = self.b.ins().load(types::I64, flags, slot, 0);
+        let word = self.b.ins().load(types::I64, flags, slot, 0);
+        let value = self.b.as_boxed(word);
         let uninitialized =
             self.b
                 .ins()
-                .icmp_imm_s(IntCC::Equal, value, Value::UNINITIALIZED.bits() as i64);
+                .icmp_imm_s(IntCC::Equal, word, Value::UNINITIALIZED.bits() as i64);
         self.brif(uninitialized, slow, &[], ready, &[]);
         self.switch(ready);
         if retain {
@@ -1182,7 +1130,7 @@ impl FunctionCompiler<'_, '_> {
         let inline = self.b.create_block();
         let slow = self.b.create_block();
         let done = self.b.create_block();
-        self.b.append_block_param(done, types::I64);
+        self.b.append_block_param_repr(done, Repr::Boxed);
         self.brif(hit, inline, &[], slow, &[]);
         self.switch(inline);
         let value = self.cached_property_entry_load(object, entry, builtins);
@@ -1215,6 +1163,7 @@ impl FunctionCompiler<'_, '_> {
             self.switch(lookup);
         }
         let heap = self.is_heap(object);
+        let object = self.b.as_word(object);
         let bits = self.b.ins().band_imm_s(object, ADDRESS_MASK);
         let present = self.b.ins().icmp_imm_s(IntCC::NotEqual, bits, 0);
         let valid = self.b.ins().band(heap, present);
@@ -1338,6 +1287,7 @@ impl FunctionCompiler<'_, '_> {
             self.jump(ready, &[BlockArg::Value(value)]);
             self.switch(shaped);
         }
+        let object = self.b.as_word(object);
         let view = self.b.ins().band_imm_s(object, ADDRESS_MASK);
         let view = if self.pointer == types::I64 {
             view
@@ -1365,7 +1315,8 @@ impl FunctionCompiler<'_, '_> {
         let value = self.b.ins().load(types::I64, flags, slot, 0);
         self.jump(ready, &[BlockArg::Value(value)]);
         self.switch(ready);
-        self.b.block_params(ready)[0]
+        let word = self.b.block_params(ready)[0];
+        self.b.as_boxed(word)
     }
 
     pub(super) fn shape_hit(&mut self, object: LoweredValue, shape: u32) -> LoweredValue {
@@ -1387,7 +1338,7 @@ impl FunctionCompiler<'_, '_> {
         let fast = self.b.create_block();
         let miss = self.b.create_block();
         let done = self.b.create_block();
-        self.b.append_block_param(done, types::I64);
+        self.b.append_block_param_repr(done, Repr::Boxed);
         self.brif(hit, fast, &[], miss, &[]);
         self.switch(fast);
         let value = self.shaped_property_get(object, index);
@@ -1401,11 +1352,14 @@ impl FunctionCompiler<'_, '_> {
 
     pub(super) fn shaped_property_get(&mut self, object: LoweredValue, index: u32) -> LoweredValue {
         let flags = MemFlagsData::trusted();
+        let object = self.b.as_word(object);
         let view = self.b.ins().band_imm_s(object, ADDRESS_MASK);
         let data = self.b.ins().load(self.pointer, flags, view, DATA_OFFSET);
-        self.b
+        let word = self
+            .b
             .ins()
-            .load(types::I64, flags, data, (index as i32) * 8)
+            .load(types::I64, flags, data, (index as i32) * 8);
+        self.b.as_boxed(word)
     }
 
     pub(super) fn shaped_property_set(

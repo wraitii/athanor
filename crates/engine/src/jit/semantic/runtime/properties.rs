@@ -507,22 +507,11 @@ impl PropertyLowering<'_> {
     }
 
     fn view(&mut self, block: Block, object: Value) -> Value {
-        use super::super::{
-            Repr,
-            low_level::{Binary, Op as Low, Unary},
-        };
+        use super::super::low_level::Binary;
         use crate::value::{TAG_OBJECT, TAG_SHIFT};
         use cranelift_codegen::ir::{condcodes::IntCC, types};
 
-        let boxed = self.value(block, Op::Convert(object, Repr::Boxed));
-        let bits = self.value(
-            block,
-            Op::LowLevel(Low::Unary {
-                op: Unary::Bitcast,
-                ty: types::I64,
-                value: boxed,
-            }),
-        );
+        let bits = self.value(block, Op::AsWord(object));
         let shift = self.integer(block, types::I64, TAG_SHIFT as u64);
         let tag = self.binary(block, Binary::ShiftRightUnsigned, bits, shift);
         let first = self.integer(block, types::I64, TAG_OBJECT >> TAG_SHIFT);
@@ -701,37 +690,26 @@ impl PropertyLowering<'_> {
 }
 
 pub(in crate::jit::semantic) fn lower_loads(function: &mut FunctionState) {
-    use super::super::{Repr, low_level, selection::Lowering};
+    use super::super::low_level;
     use cranelift_codegen::ir::{MemFlagsData, types};
 
     let graph = &mut function.graph;
-    let mut plan = graph
-        .ownership
-        .take()
-        .expect("property loads require ownership planning");
     for block in Cfg::new(graph).rpo {
         for inst in graph.blocks[block].insts.clone() {
-            let Op::PropertyLoad(object, address) = graph.insts[inst].op else {
+            let Op::PropertyLoad(_, address) = graph.insts[inst].op else {
                 continue;
             };
-            graph.insts[inst].op = Op::LowLevel(low_level::Op::Load {
+            let load = low_level::Op::Load {
                 ty: types::I64,
                 address,
                 offset: 0,
                 flags: MemFlagsData::trusted(),
-            });
-            plan.implementations[inst].lowering = Lowering::Typed(Some(Repr::Boxed));
-            let at = graph.blocks[block]
-                .insts
-                .iter()
-                .position(|&i| i == inst)
-                .unwrap();
-            let data = graph.insts[inst].clone();
-            let (keep, _) = graph.insert(block, at + 1, data.span, Op::KeepAlive(object), false);
-            graph.insts[keep].source_name = data.source_name;
-            graph.insts[keep].emission_location = data.emission_location;
-            plan.implementations[keep].lowering = Lowering::Typed(None);
+            };
+            let word =
+                super::helpers::insert_before(graph, inst, load, Some(super::super::Repr::I64))
+                    .1
+                    .unwrap();
+            graph.insts[inst].op = Op::AsBoxed(word);
         }
     }
-    graph.ownership = Some(plan);
 }

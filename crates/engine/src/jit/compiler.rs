@@ -918,8 +918,11 @@ impl Compiler {
             } else {
                 None
             };
+            let mut after = None;
             if baseline.is_none() {
-                graph.prepare_for_emission().map_err(Error::Unsupported)?;
+                after =
+                    super::inspect::prepare_for_emission(self.inspection.as_deref(), &mut graph)
+                        .map_err(Error::Unsupported)?;
             }
             let inspection = super::inspect::Inspection::new(
                 self.inspection.as_deref(),
@@ -928,6 +931,7 @@ impl Compiler {
                 self.source_name.0,
                 1,
             )
+            .after(after)
             .ast(self.inspection.as_deref(), &program);
             let listing = self.listing().then(|| graph.listing_lines());
             let (function, annotations, lowered) = if baseline.is_some() {
@@ -1627,10 +1631,12 @@ impl Compiler {
         } else {
             None
         };
+        let mut after = None;
         if baseline.is_some() {
             self.data.push(baseline_data);
         } else {
-            graph.prepare_for_emission().map_err(Error::Unsupported)?;
+            after = super::inspect::prepare_for_emission(self.inspection.as_deref(), &mut graph)
+                .map_err(Error::Unsupported)?;
         }
         let listing = self.listing().then(|| graph.listing_lines());
         let inspection = super::inspect::Inspection::new(
@@ -1639,7 +1645,8 @@ impl Compiler {
             &self.canonical,
             source,
             inline_multiplier,
-        );
+        )
+        .after(after);
         let (function, annotations, lowered) = if baseline.is_some() {
             let mut function = cranelift_codegen::ir::Function::new();
             function.signature = signature;
@@ -1903,13 +1910,16 @@ impl Compiler {
         } else {
             None
         };
+        let mut after = None;
         if baseline.is_some() {
             self.data.push(data);
         } else {
-            state.prepare_for_emission().map_err(Error::Unsupported)?;
+            after = super::inspect::prepare_for_emission(self.inspection.as_deref(), &mut state)
+                .map_err(Error::Unsupported)?;
         }
         let inspection =
-            super::inspect::Inspection::from_graph(self.inspection.as_deref(), &state.graph);
+            super::inspect::Inspection::from_graph(self.inspection.as_deref(), &state.graph)
+                .after(after);
         let listing = self
             .listing()
             .then(|| state.graph.listing(&state.facts).lines());
@@ -2218,10 +2228,12 @@ impl Compiler {
         };
         let signature = self.graph_signature(graph.as_ref().map(|graph| &graph.graph));
         let feedback = feedback.map(|owner| self.feedback(owner, true));
+        let mut after = None;
         if baseline.is_none()
             && let Some(graph) = &mut graph
         {
-            graph.prepare_for_emission().map_err(Error::Unsupported)?;
+            after = super::inspect::prepare_for_emission(self.inspection.as_deref(), graph)
+                .map_err(Error::Unsupported)?;
         }
         let inspection = graph.as_ref().map_or_else(Default::default, |graph| {
             super::inspect::Inspection::new(
@@ -2231,6 +2243,7 @@ impl Compiler {
                 self.source_name.0,
                 usize::from(self.inlining),
             )
+            .after(after)
         });
         let listing = self
             .listing()

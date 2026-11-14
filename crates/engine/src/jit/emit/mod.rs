@@ -259,6 +259,10 @@ fn lower_callable(
     b.append_block_params_for_function_params(entry);
     let values = b.block_params(entry).to_vec();
     let (ctx, closure, receiver) = (values[0], values[1], values[2]);
+    let words = if fixed { &values[1..] } else { &values[1..3] };
+    for &word in words {
+        b.graph.reprs[word] = Some(super::semantic::Repr::Boxed);
+    }
     let arguments = if fixed {
         Arguments::Fixed(values[3..].to_vec())
     } else {
@@ -268,7 +272,7 @@ fn lower_callable(
         }
     };
     let return_block = b.create_block();
-    b.append_block_param(return_block, types::I64);
+    b.append_block_param_repr(return_block, super::semantic::Repr::Boxed);
     if matches!(arguments, Arguments::Fixed(_)) {
         b.append_block_param(return_block, types::I8);
     }
@@ -276,6 +280,7 @@ fn lower_callable(
     let pointer = module.target_config().pointer_type();
     let data_base = data_base(b, pointer, data);
     let empty_owned = b.ins().iconst(types::I64, 0);
+    let empty_owned = b.as_boxed(empty_owned);
     let mut compiler = FunctionCompiler {
         feedback,
         names,
@@ -334,6 +339,8 @@ fn lower_callable(
     drop(compiler);
     super::semantic::scratch::resolve(&mut graph_builder, empty_owned).map_err(Error::Compile)?;
     graph_builder.finish().map_err(Error::Compile)?;
+    super::semantic::repr::lower(&mut super::semantic::low_level::Builder::new(&mut lowered))
+        .map_err(Error::Compile)?;
     super::semantic::runtime::cleanup::lower(&mut lowered);
     super::semantic::runtime::ownership::lower(
         &mut lowered,
@@ -519,7 +526,7 @@ impl FunctionCompiler<'_, '_> {
             LOCALS_LEN_OFFSET, LOCALS_LIMIT_OFFSET, LOCALS_OFFSET, LOCALS_START_OFFSET,
             STACK_LIMIT_OFFSET,
         };
-        let roots = self.b.declare_var(types::I8);
+        let roots = self.b.declare_var(crate::jit::semantic::Repr::I8);
         let clean = self.b.ins().iconst(types::I8, 0);
         self.b.def_var(roots, clean);
         self.frame_roots = Some(roots);
@@ -597,16 +604,18 @@ impl FunctionCompiler<'_, '_> {
         let load_block = self.b.create_block();
         let missing_block = self.b.create_block();
         let done = self.b.create_block();
-        self.b.append_block_param(done, types::I64);
+        self.b
+            .append_block_param_repr(done, crate::jit::semantic::Repr::Boxed);
         self.brif(present, load_block, &[], missing_block, &[]);
 
         self.switch(load_block);
-        let value = self.b.ins().load(
+        let word = self.b.ins().load(
             types::I64,
             MemFlagsData::trusted(),
             argv,
             (index * 8) as i32,
         );
+        let value = self.b.as_boxed(word);
         self.jump(done, &[BlockArg::Value(value)]);
 
         self.switch(missing_block);

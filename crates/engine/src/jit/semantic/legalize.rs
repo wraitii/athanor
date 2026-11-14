@@ -1,7 +1,7 @@
 use crate::FxHashMap;
 use oxc_span::Span;
 
-use super::selection::{Use, representations as contract};
+use super::selection::{Use, repr_contract as contract};
 use super::{
     Block, BlockData, Cfg, Facts, Graph, Inst, InstData, Op, Repr, Target, Terminator,
     TerminatorKind, Value, ValueDef,
@@ -53,7 +53,7 @@ impl Legalizer<'_> {
                 let Some(value) = self.graph.insts[inst].result() else {
                     continue;
                 };
-                let Some(repr) = contract(self.graph, self.facts, inst).produces else {
+                let Some(repr) = contract(self.graph, inst).produces else {
                     continue;
                 };
                 if repr != self.graph.repr(value) {
@@ -108,7 +108,7 @@ impl Legalizer<'_> {
         let insts = std::mem::take(&mut self.graph.blocks[block].insts);
         let mut rebuilt = Vec::with_capacity(insts.len());
         for inst in insts {
-            let uses = contract(self.graph, self.facts, inst).uses;
+            let uses = contract(self.graph, inst).uses;
             let operands: Vec<_> = self.graph.insts[inst].op.operands_iter().collect();
             debug_assert_eq!(uses.len(), operands.len());
             let mut replaced = Vec::with_capacity(operands.len());

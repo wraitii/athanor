@@ -33,6 +33,10 @@ impl Options {
             "--ast" => self.dump.ast = true,
             "--semantic-ir" => self.dump.semantic_ir = true,
             "--planner" => self.dump.planner = true,
+            "--after" => {
+                self.dump.semantic_ir = true;
+                self.dump.after = Some(arguments.next().ok_or("--after expects a pass name")?)
+            }
             "--asm" => self.dump.asm = true,
             "--filter" => {
                 self.dump.filter = Some(arguments.next().ok_or("--filter expects a function name")?)
@@ -45,7 +49,7 @@ impl Options {
 
     pub fn validate(&self) -> Result<(), String> {
         if self.output && !self.enabled {
-            return Err("--clif, --no-ir, --no-semantic-ir, --ast, --semantic-ir, --planner, --asm, --filter and --execute require --compile".into());
+            return Err("--clif, --no-ir, --no-semantic-ir, --ast, --semantic-ir, --after, --planner, --asm, --filter and --execute require --compile".into());
         }
         Ok(())
     }

@@ -28,9 +28,10 @@ impl FunctionCompiler<'_, '_> {
                 .b
                 .ins()
                 .stack_addr(self.pointer, slot, (index * 8) as i32);
+            let word = self.b.as_word(*value);
             self.b
                 .ins()
-                .store(MemFlagsData::trusted(), *value, address, 0);
+                .store(MemFlagsData::trusted(), word, address, 0);
         }
         Ok(self.b.ins().stack_addr(self.pointer, slot, 0))
     }

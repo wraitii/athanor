@@ -2341,13 +2341,16 @@ fn array_storage_lowering_preserves_planned_ownership() {
                     .iter()
                     .any(|op| matches!(op, Op::ArrayLoad(..)))
             );
+            let Op::AsBoxed(word) = function.graph.insts[inst].op else {
+                panic!("{inst} is not reinterpreted as boxed");
+            };
             assert!(matches!(
-                (&function.graph.insts[inst].op, layout),
+                (function.graph.defining_op(word), layout),
                 (
-                    Op::LowLevel(low_level::Op::Load { .. }),
+                    Some(Op::LowLevel(low_level::Op::Load { .. })),
                     ArrayLayout::Packed
                 ) | (
-                    Op::LowLevel(low_level::Op::Select { .. }),
+                    Some(Op::LowLevel(low_level::Op::Select { .. })),
                     ArrayLayout::Holey
                 )
             ));
@@ -2447,20 +2450,20 @@ fn low_level_variables_forward_through_chains_and_loop() {
     let body = builder.create_block();
     let backedge = builder.create_block();
     let exit = builder.create_block();
-    builder.write(entry, 0, input, types::I64);
-    builder.write(entry, 1, input, types::I64);
+    builder.write(entry, 0, input, super::Repr::I64);
+    builder.write(entry, 1, input, super::Repr::I64);
     builder.terminate(entry, span, TerminatorKind::Jump(Target::new(first)));
     builder.terminate(first, span, TerminatorKind::Jump(Target::new(second)));
     builder.terminate(second, span, TerminatorKind::Jump(Target::new(header)));
-    let invariant = builder.read(header, 0, types::I64, span);
-    let induction = builder.read(header, 1, types::I64, span);
+    let invariant = builder.read(header, 0, super::Repr::I64, span);
+    let induction = builder.read(header, 1, super::Repr::I64, span);
     builder.terminate(
         header,
         span,
         TerminatorKind::Branch(condition, Target::new(body), Target::new(exit)),
     );
     builder.terminate(body, span, TerminatorKind::Jump(Target::new(backedge)));
-    let prior = builder.read(backedge, 1, types::I64, span);
+    let prior = builder.read(backedge, 1, super::Repr::I64, span);
     let one = builder.value(
         backedge,
         span,
@@ -2480,7 +2483,7 @@ fn low_level_variables_forward_through_chains_and_loop() {
         },
         types::I64,
     );
-    builder.write(backedge, 1, next, types::I64);
+    builder.write(backedge, 1, next, super::Repr::I64);
     builder.terminate(backedge, span, TerminatorKind::Jump(Target::new(header)));
     builder.terminate(
         exit,
@@ -2529,11 +2532,11 @@ fn low_level_variables_resolve_diamond_and_loop() {
     );
     graph.terminate(body, span, TerminatorKind::Jump(Target::new(join)));
     let mut builder = low_level::Builder::new(&mut graph);
-    builder.write(entry, 0, initial, cranelift_codegen::ir::types::I64);
-    builder.write(left, 0, changed, cranelift_codegen::ir::types::I64);
-    let joined = builder.read(join, 0, cranelift_codegen::ir::types::I64, span);
-    builder.write(body, 0, joined, cranelift_codegen::ir::types::I64);
-    let result = builder.read(exit, 0, cranelift_codegen::ir::types::I64, span);
+    builder.write(entry, 0, initial, super::Repr::I64);
+    builder.write(left, 0, changed, super::Repr::I64);
+    let joined = builder.read(join, 0, super::Repr::I64, span);
+    builder.write(body, 0, joined, super::Repr::I64);
+    let result = builder.read(exit, 0, super::Repr::I64, span);
     builder
         .graph
         .terminate(exit, span, TerminatorKind::Return(result));
@@ -2652,7 +2655,6 @@ fn low_level_call_results_keep_types_and_operands() {
 
 #[test]
 fn low_level_ssa_rejects_undefined_cycle() {
-    use cranelift_codegen::ir::types;
     let mut graph = lower_source("function f(a){return a;}").unwrap();
     let entry = graph.entry;
     let span = graph.span;
@@ -2674,14 +2676,13 @@ fn low_level_ssa_rejects_undefined_cycle() {
     );
     graph.terminate(body, span, TerminatorKind::Jump(Target::new(header)));
     let mut builder = low_level::Builder::new(&mut graph);
-    let value = builder.read(header, 0, types::I64, span);
-    builder.write(body, 0, value, types::I64);
+    let value = builder.read(header, 0, super::Repr::I64, span);
+    builder.write(body, 0, value, super::Repr::I64);
     assert!(builder.finish().is_err());
 }
 
 #[test]
 fn low_level_ssa_same_target_edges_receive_one_argument() {
-    use cranelift_codegen::ir::types;
     let mut graph = lower_source("function f(a){return a;}").unwrap();
     let entry = graph.entry;
     let span = graph.span;
@@ -2709,9 +2710,9 @@ fn low_level_ssa_same_target_edges_receive_one_argument() {
     );
     graph.terminate(body, span, TerminatorKind::Jump(Target::new(join)));
     let mut builder = low_level::Builder::new(&mut graph);
-    builder.write(entry, 0, initial, types::I64);
-    let value = builder.read(join, 0, types::I64, span);
-    builder.write(body, 0, changed, types::I64);
+    builder.write(entry, 0, initial, super::Repr::I64);
+    let value = builder.read(join, 0, super::Repr::I64, span);
+    builder.write(body, 0, changed, super::Repr::I64);
     builder
         .graph
         .terminate(exit, span, TerminatorKind::Return(value));
@@ -2787,11 +2788,11 @@ fn low_level_graph_emits_executable_cranelift() {
         },
         types::I64,
     );
-    builder.write(entry, 0, zero, types::I64);
-    builder.write(entry, 1, zero, types::I64);
+    builder.write(entry, 0, zero, super::Repr::I64);
+    builder.write(entry, 1, zero, super::Repr::I64);
     builder.terminate(entry, span, TerminatorKind::Jump(Target::new(header)));
-    let index = builder.read(header, 0, types::I64, span);
-    let sum = builder.read(header, 1, types::I64, span);
+    let index = builder.read(header, 0, super::Repr::I64, span);
+    let sum = builder.read(header, 1, super::Repr::I64, span);
     let condition = builder.value(
         header,
         span,
@@ -2858,8 +2859,8 @@ fn low_level_graph_emits_executable_cranelift() {
         },
         types::I64,
     );
-    builder.write(body, 0, next_index, types::I64);
-    builder.write(body, 1, next_sum, types::I64);
+    builder.write(body, 0, next_index, super::Repr::I64);
+    builder.write(body, 1, next_sum, super::Repr::I64);
     builder.terminate(body, span, TerminatorKind::Jump(Target::new(header)));
     builder.terminate(exit, span, TerminatorKind::ReturnValues(vec![sum]));
     builder.finish().unwrap();
@@ -2949,14 +2950,14 @@ fn low_level_variables_resolve_long_forwarding_chain() {
     let mut builder = low_level::Builder::new(&mut graph);
     builder.append_block_params_for_function_params(entry);
     let input = builder.block_params(entry)[0];
-    builder.write(entry, 0, input, types::I64);
+    builder.write(entry, 0, input, super::Repr::I64);
     let mut block = entry;
     for _ in 0..10_000 {
         let next = builder.create_block();
         builder.terminate(block, span, TerminatorKind::Jump(Target::new(next)));
         block = next;
     }
-    let result = builder.read(block, 0, types::I64, span);
+    let result = builder.read(block, 0, super::Repr::I64, span);
     builder.terminate(block, span, TerminatorKind::ReturnValues(vec![result]));
     builder.finish().unwrap();
     graph.verify().unwrap();
@@ -3611,9 +3612,12 @@ fn property_access_lowering_preserves_boxed_loads_until_ownership_planning() {
                 .any(|op| matches!(op, Op::PropertyLoad(..)))
         );
         for inst in loads {
+            let Op::AsBoxed(word) = function.graph.insts[inst].op else {
+                panic!("{inst} is not reinterpreted as boxed");
+            };
             assert!(matches!(
-                function.graph.insts[inst].op,
-                Op::LowLevel(low_level::Op::Load { .. })
+                function.graph.defining_op(word),
+                Some(Op::LowLevel(low_level::Op::Load { .. }))
             ));
             assert_eq!(
                 function
@@ -3628,7 +3632,11 @@ fn property_access_lowering_preserves_boxed_loads_until_ownership_planning() {
 
 fn optimize_with_shapes(
     source: &str,
-    feedback: &[(&str, crate::jit::profile::PropertyAccess, crate::jit::profile::ShapeAccess)],
+    feedback: &[(
+        &str,
+        crate::jit::profile::PropertyAccess,
+        crate::jit::profile::ShapeAccess,
+    )],
 ) -> FunctionState {
     use crate::jit::profile::{PropertyAccess, Site};
 
@@ -3693,17 +3701,53 @@ fn shaped_overwrites_share_hoisted_guards_with_reads() {
     let function = optimize_with_shapes(
         "function f(o,n){for(let i=0;i<n;++i)o.x=o.x+o.y;return o.x;}",
         &[
-            ("x", Get, Read { shape: 10, index: 0 }),
-            ("y", Get, Read { shape: 10, index: 1 }),
-            ("x", Set, Overwrite { shape: 10, index: 0 }),
+            (
+                "x",
+                Get,
+                Read {
+                    shape: 10,
+                    index: 0,
+                },
+            ),
+            (
+                "y",
+                Get,
+                Read {
+                    shape: 10,
+                    index: 1,
+                },
+            ),
+            (
+                "x",
+                Set,
+                Overwrite {
+                    shape: 10,
+                    index: 0,
+                },
+            ),
         ],
     );
     let graph = &function.graph;
     let body = loop_ops(graph);
-    assert!(!body.iter().any(|op| generic_property_access(op)), "{function}");
-    assert_eq!(count(&body, |op| matches!(op, Op::IsShape(..))), 0, "{function}");
-    assert_eq!(count(&body, |op| matches!(op, Op::ShapedGet(..))), 1, "{function}");
-    assert_eq!(count(&body, |op| matches!(op, Op::PropertyStore(..))), 1, "{function}");
+    assert!(
+        !body.iter().any(|op| generic_property_access(op)),
+        "{function}"
+    );
+    assert_eq!(
+        count(&body, |op| matches!(op, Op::IsShape(..))),
+        0,
+        "{function}"
+    );
+    assert_eq!(
+        count(&body, |op| matches!(op, Op::ShapedGet(..))),
+        1,
+        "{function}"
+    );
+    assert_eq!(
+        count(&body, |op| matches!(op, Op::PropertyStore(..))),
+        1,
+        "{function}"
+    );
     assert_eq!(
         count(&ops(graph), |op| matches!(op, Op::IsShape(_, 10))),
         1,
@@ -3719,19 +3763,52 @@ fn shaped_overwrites_keep_one_entry_guard_across_reads() {
     let function = optimize_with_shapes(
         "function f(o){o.x=1;o.y=o.x+1;return o.y;}",
         &[
-            ("x", Get, Read { shape: 10, index: 0 }),
-            ("y", Get, Read { shape: 10, index: 1 }),
-            ("x", Set, Overwrite { shape: 10, index: 0 }),
-            ("y", Set, Overwrite { shape: 10, index: 1 }),
+            (
+                "x",
+                Get,
+                Read {
+                    shape: 10,
+                    index: 0,
+                },
+            ),
+            (
+                "y",
+                Get,
+                Read {
+                    shape: 10,
+                    index: 1,
+                },
+            ),
+            (
+                "x",
+                Set,
+                Overwrite {
+                    shape: 10,
+                    index: 0,
+                },
+            ),
+            (
+                "y",
+                Set,
+                Overwrite {
+                    shape: 10,
+                    index: 1,
+                },
+            ),
         ],
     );
     let graph = &function.graph;
-    let Some(TerminatorKind::Branch(condition, guarded, _)) =
-        graph.blocks[graph.entry].terminator.as_ref().map(|t| &t.kind)
+    let Some(TerminatorKind::Branch(condition, guarded, _)) = graph.blocks[graph.entry]
+        .terminator
+        .as_ref()
+        .map(|t| &t.kind)
     else {
         panic!("{function}")
     };
-    assert!(matches!(graph.defining_op(*condition), Some(Op::IsShape(_, 10))));
+    assert!(matches!(
+        graph.defining_op(*condition),
+        Some(Op::IsShape(_, 10))
+    ));
     let mut pending = vec![guarded.block];
     let mut seen = FxHashSet::default();
     let mut speculative = Vec::new();
@@ -3739,15 +3816,35 @@ fn shaped_overwrites_keep_one_entry_guard_across_reads() {
         if !seen.insert(block) || graph.cold.contains(&block) {
             continue;
         }
-        speculative.extend(graph.blocks[block].insts.iter().map(|&inst| &graph.insts[inst].op));
+        speculative.extend(
+            graph.blocks[block]
+                .insts
+                .iter()
+                .map(|&inst| &graph.insts[inst].op),
+        );
         if let Some(terminator) = &graph.blocks[block].terminator {
             pending.extend(terminator.kind.targets().map(|target| target.block));
         }
     }
-    assert!(!speculative.iter().any(|op| generic_property_access(op)), "{function}");
-    assert_eq!(count(&speculative, |op| matches!(op, Op::IsShape(..))), 0, "{function}");
-    assert_eq!(count(&speculative, |op| matches!(op, Op::ShapedGet(..))), 2, "{function}");
-    assert_eq!(count(&speculative, |op| matches!(op, Op::PropertyStore(..))), 2, "{function}");
+    assert!(
+        !speculative.iter().any(|op| generic_property_access(op)),
+        "{function}"
+    );
+    assert_eq!(
+        count(&speculative, |op| matches!(op, Op::IsShape(..))),
+        0,
+        "{function}"
+    );
+    assert_eq!(
+        count(&speculative, |op| matches!(op, Op::ShapedGet(..))),
+        2,
+        "{function}"
+    );
+    assert_eq!(
+        count(&speculative, |op| matches!(op, Op::PropertyStore(..))),
+        2,
+        "{function}"
+    );
     graph.verify().unwrap();
 }
 
@@ -3758,14 +3855,40 @@ fn property_additions_keep_shape_guards_inside_loops() {
     let function = optimize_with_shapes(
         "function f(o,n){for(let i=0;i<n;++i){o.x=o.x+1;o.z=i;}return o.x;}",
         &[
-            ("x", Get, Read { shape: 10, index: 0 }),
-            ("x", Set, Overwrite { shape: 10, index: 0 }),
+            (
+                "x",
+                Get,
+                Read {
+                    shape: 10,
+                    index: 0,
+                },
+            ),
+            (
+                "x",
+                Set,
+                Overwrite {
+                    shape: 10,
+                    index: 0,
+                },
+            ),
         ],
     );
     let body = loop_ops(&function.graph);
-    assert_eq!(count(&body, |op| matches!(op, Op::IsShape(_, 10))), 1, "{function}");
-    assert_eq!(count(&body, |op| matches!(op, Op::ShapedGet(..))), 1, "{function}");
-    assert_eq!(count(&body, |op| matches!(op, Op::PropertyAdd(..))), 1, "{function}");
+    assert_eq!(
+        count(&body, |op| matches!(op, Op::IsShape(_, 10))),
+        1,
+        "{function}"
+    );
+    assert_eq!(
+        count(&body, |op| matches!(op, Op::ShapedGet(..))),
+        1,
+        "{function}"
+    );
+    assert_eq!(
+        count(&body, |op| matches!(op, Op::PropertyAdd(..))),
+        1,
+        "{function}"
+    );
     assert!(
         !body
             .iter()
@@ -3782,21 +3905,82 @@ fn shaped_accesses_on_two_receivers_hoist_both_guards() {
     let function = optimize_with_shapes(
         "function f(a,b,n){for(let i=0;i<n;++i){a.p=b.r;b.s=a.q+a.p;}return b.s;}",
         &[
-            ("p", Get, Read { shape: 10, index: 0 }),
-            ("q", Get, Read { shape: 10, index: 1 }),
-            ("p", Set, Overwrite { shape: 10, index: 0 }),
-            ("r", Get, Read { shape: 20, index: 0 }),
-            ("s", Get, Read { shape: 20, index: 1 }),
-            ("s", Set, Overwrite { shape: 20, index: 1 }),
+            (
+                "p",
+                Get,
+                Read {
+                    shape: 10,
+                    index: 0,
+                },
+            ),
+            (
+                "q",
+                Get,
+                Read {
+                    shape: 10,
+                    index: 1,
+                },
+            ),
+            (
+                "p",
+                Set,
+                Overwrite {
+                    shape: 10,
+                    index: 0,
+                },
+            ),
+            (
+                "r",
+                Get,
+                Read {
+                    shape: 20,
+                    index: 0,
+                },
+            ),
+            (
+                "s",
+                Get,
+                Read {
+                    shape: 20,
+                    index: 1,
+                },
+            ),
+            (
+                "s",
+                Set,
+                Overwrite {
+                    shape: 20,
+                    index: 1,
+                },
+            ),
         ],
     );
     let graph = &function.graph;
     let body = loop_ops(graph);
-    assert!(!body.iter().any(|op| generic_property_access(op)), "{function}");
-    assert_eq!(count(&body, |op| matches!(op, Op::IsShape(..))), 0, "{function}");
-    assert_eq!(count(&body, |op| matches!(op, Op::PropertyStore(..))), 2, "{function}");
+    assert!(
+        !body.iter().any(|op| generic_property_access(op)),
+        "{function}"
+    );
+    assert_eq!(
+        count(&body, |op| matches!(op, Op::IsShape(..))),
+        0,
+        "{function}"
+    );
+    assert_eq!(
+        count(&body, |op| matches!(op, Op::PropertyStore(..))),
+        2,
+        "{function}"
+    );
     let all = ops(graph);
-    assert_eq!(count(&all, |op| matches!(op, Op::IsShape(_, 10))), 1, "{function}");
-    assert_eq!(count(&all, |op| matches!(op, Op::IsShape(_, 20))), 1, "{function}");
+    assert_eq!(
+        count(&all, |op| matches!(op, Op::IsShape(_, 10))),
+        1,
+        "{function}"
+    );
+    assert_eq!(
+        count(&all, |op| matches!(op, Op::IsShape(_, 20))),
+        1,
+        "{function}"
+    );
     graph.verify().unwrap();
 }
