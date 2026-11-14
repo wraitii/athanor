@@ -277,8 +277,31 @@ pub(in crate::jit) fn steps(from: Repr, to: Repr) -> Vec<Step> {
     }
 }
 
-pub(in crate::jit) fn lower(builder: &mut Builder<'_>) -> Result<(), String> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    Words,
+    Machine,
+}
+
+pub(in crate::jit) fn unbox(builder: &mut Builder<'_>) -> Result<(), String> {
     verify_words(builder.graph)?;
+    rewrite(builder, Stage::Words)?;
+    words(builder.graph)
+}
+
+pub(in crate::jit) fn lower(builder: &mut Builder<'_>) -> Result<(), String> {
+    if let Some(value) = builder
+        .graph
+        .values
+        .keys()
+        .find(|&value| builder.graph.reprs[value] == Some(Repr::Boxed))
+    {
+        return Err(format!("{value} is still boxed after runtime lowering"));
+    }
+    rewrite(builder, Stage::Machine)
+}
+
+fn rewrite(builder: &mut Builder<'_>, stage: Stage) -> Result<(), String> {
     let mut aliases = FxHashMap::default();
     for block in builder.graph.blocks.keys().collect::<Vec<_>>() {
         let mut position = 0;
@@ -287,10 +310,11 @@ pub(in crate::jit) fn lower(builder: &mut Builder<'_>) -> Result<(), String> {
             if let Op::Constant(constant) = &builder.graph.insts[inst].op {
                 let result = builder.graph.insts[inst].result().unwrap();
                 let repr = builder.graph.repr(result);
-                let op = constant_op(constant, repr);
-                builder.graph.insts[inst].op = Op::LowLevel(op);
-                if repr == Repr::Boxed {
-                    builder.graph.reprs[result] = Some(Repr::Word);
+                if (stage == Stage::Words) == (repr == Repr::Boxed) {
+                    builder.graph.insts[inst].op = Op::LowLevel(constant_op(constant, repr));
+                    if repr == Repr::Boxed {
+                        builder.graph.reprs[result] = Some(Repr::Word);
+                    }
                 }
                 position += 1;
                 continue;
@@ -301,7 +325,7 @@ pub(in crate::jit) fn lower(builder: &mut Builder<'_>) -> Result<(), String> {
                 builder.graph.blocks[block].insts.remove(position);
                 continue;
             }
-            let Some((input, step)) = expansion(builder.graph, inst) else {
+            let Some((input, step)) = expansion(builder.graph, inst, stage) else {
                 position += 1;
                 continue;
             };
@@ -321,7 +345,7 @@ pub(in crate::jit) fn lower(builder: &mut Builder<'_>) -> Result<(), String> {
         }
     }
     builder.graph.replace_uses(&aliases);
-    words(builder.graph)
+    Ok(())
 }
 
 fn runtime(op: &LowOp) -> bool {
@@ -380,6 +404,10 @@ fn words(graph: &mut Graph) -> Result<(), String> {
             live.extend(graph.insts[inst].results.iter().copied());
         }
     }
+    let reprs = std::mem::take(&mut graph.reprs);
+    for &value in &live {
+        graph.reprs[value] = reprs[value];
+    }
     for value in live {
         if graph.reprs[value] != Some(Repr::Boxed) {
             continue;
@@ -401,18 +429,25 @@ fn words(graph: &mut Graph) -> Result<(), String> {
     Ok(())
 }
 
-fn expansion(graph: &Graph, inst: Inst) -> Option<(Value, Step)> {
+fn expansion(graph: &Graph, inst: Inst, stage: Stage) -> Option<(Value, Step)> {
     let data = &graph.insts[inst];
-    match data.op {
-        Op::Box(input) => Some((input, Step::Box)),
-        Op::Unbox(input, to) => Some((input, Step::Unbox(to))),
-        Op::Convert(input, to) => Some((input, Step::Convert(to))),
-        Op::NumericFloat(input)
-        | Op::SaturatingInteger(input)
-        | Op::AsInteger(input)
-        | Op::ArrayPosition(input)
-        | Op::ToInt32(input)
-        | Op::AsNumber(input) => Some((input, Step::Convert(graph.repr(data.result()?)))),
+    match (stage, &data.op) {
+        (Stage::Words, &Op::Box(input)) => Some((input, Step::Box)),
+        (Stage::Words, &Op::Unbox(input, to)) => Some((input, Step::Unbox(to))),
+        (Stage::Words, &Op::AsNumber(input)) if graph.repr(input) == Repr::Boxed => {
+            Some((input, Step::Convert(Repr::Boxed)))
+        }
+        (Stage::Words, _) => None,
+        (Stage::Machine, &Op::Convert(input, to)) => Some((input, Step::Convert(to))),
+        (
+            Stage::Machine,
+            &(Op::NumericFloat(input)
+            | Op::SaturatingInteger(input)
+            | Op::AsInteger(input)
+            | Op::ArrayPosition(input)
+            | Op::ToInt32(input)
+            | Op::AsNumber(input)),
+        ) => Some((input, Step::Convert(graph.repr(data.result()?)))),
         _ => None,
     }
 }
@@ -453,10 +488,13 @@ fn box_value(builder: &mut Builder<'_>, value: Value) -> Value {
                 let bits = JsValue::number(f64::from_bits(*bits)).bits();
                 builder.ins().iconst(types::I64, bits as i64)
             }
-            Some(Op::LowLevel(LowOp::Unary {
-                op: Unary::FloatFromSigned | Unary::FloatFromUnsigned,
-                ..
-            })) => builder.ins().bitcast(types::I64, flags, value),
+            Some(Op::Constant(Constant::Number(number))) => {
+                let bits = JsValue::number(*number).bits();
+                builder.ins().iconst(types::I64, bits as i64)
+            }
+            _ if from_integer(builder.graph, value) => {
+                builder.ins().bitcast(types::I64, flags, value)
+            }
             _ => {
                 let mut ins = builder.ins();
                 let unordered = ins.fcmp(FloatCC::Unordered, value, value);
@@ -467,6 +505,18 @@ fn box_value(builder: &mut Builder<'_>, value: Value) -> Value {
         },
         repr => unreachable!("box from {repr:?}"),
     }
+}
+
+fn from_integer(graph: &Graph, value: Value) -> bool {
+    let input = match graph.defining_op(value) {
+        Some(Op::LowLevel(LowOp::Unary {
+            op: Unary::FloatFromSigned | Unary::FloatFromUnsigned,
+            ..
+        })) => return true,
+        Some(Op::Convert(input, _) | Op::NumericFloat(input) | Op::AsNumber(input)) => *input,
+        _ => return false,
+    };
+    matches!(graph.repr(input), Repr::Integer(_) | Repr::Boolean)
 }
 
 fn constant_op(constant: &Constant, repr: Repr) -> LowOp {

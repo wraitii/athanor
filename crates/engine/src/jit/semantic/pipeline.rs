@@ -114,8 +114,13 @@ impl FunctionState {
     }
 }
 
-pub(in crate::jit) const LOW_LEVEL_PASSES: &[&str] =
-    &["finalize-runtime", "scratch", "cleanup", "ownership-lower"];
+pub(in crate::jit) const LOW_LEVEL_PASSES: &[&str] = &[
+    "finalize-runtime",
+    "scratch",
+    "cleanup",
+    "ownership-lower",
+    "unbox",
+];
 
 pub(in crate::jit) fn lower_low_level(
     graph: &mut Graph,
@@ -128,6 +133,8 @@ pub(in crate::jit) fn lower_low_level(
     after("cleanup", graph);
     super::runtime::ownership::lower(graph, ctx, call_conv, pointer);
     after("ownership-lower", graph);
+    repr::unbox(&mut low_level::Builder::new(graph))?;
+    after("unbox", graph);
     graph.verify()
 }
 
