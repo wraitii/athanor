@@ -1,3 +1,5 @@
+pub(super) mod stubs;
+
 use cranelift_codegen::entity::SecondaryMap;
 use cranelift_codegen::ir::{
     BlockArg, InstBuilder, StackSlotData, StackSlotKind, Value as ClifValue, types,

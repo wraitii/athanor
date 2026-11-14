@@ -85,7 +85,7 @@ Oxc AST -> semantic optimization -> runtime lowering into graph operations
 Shared runtime lowering builds `Op::LowLevel` operations and retained memory
 operations using ordinary graph values and block parameters. It owns runtime
 layout, helper-address calculation, representation conversion and reference
-lifetimes. `jit/emit/cranelift.rs` translates the resulting graph to CLIF.
+lifetimes. `jit/cranelift/mod.rs` translates the resulting graph to CLIF.
 `jit/clif.rs` pairs that function with emission annotations; source locations
 also remain available for profiling. The current implementation rebuilds the
 graph during runtime lowering. That is an implementation choice, not a separate
@@ -1273,8 +1273,8 @@ purpose of a pass rather than a single point at which all its operations run:
 Typed accesses and metadata lower before representation assignment and ownership
 planning. Borrowed array element loads survive ownership planning, then expand
 alongside slot stores while preserving scheduled reference operations. Continuations
-use their own preparation sequence in the same pipeline module. Shared runtime
-emission in `emit/semantic_graph.rs` still expands calls, captures, observations,
+use their own preparation sequence in the same pipeline module. Runtime lowering
+finalization in `finalize/semantic_graph.rs` still expands calls, captures, observations,
 OSR protocols, helper invocations and other remaining runtime operations.
 
 Canonicalization, planning and optimization operate on the same `FunctionState`,

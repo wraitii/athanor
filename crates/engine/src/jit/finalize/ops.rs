@@ -604,7 +604,7 @@ impl FunctionCompiler<'_, '_> {
         if let Some(&signature) = self.fixed_signatures.get(&arity) {
             return signature;
         }
-        let signature = super::stubs::fixed_signature(self.pointer, arity);
+        let signature = crate::jit::cranelift::stubs::fixed_signature(self.pointer, arity);
         let signature = self.b.import_signature(signature);
         self.fixed_signatures.insert(arity, signature);
         signature

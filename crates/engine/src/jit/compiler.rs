@@ -25,7 +25,7 @@ use super::clif::{Annotations, FunctionBody};
 use super::entries::{Entry, VariantId};
 use super::function_data::FunctionData;
 use super::machine::MachineCode;
-use super::{analysis::CaptureAnalysis, emit, jitdump, syntax};
+use super::{analysis::CaptureAnalysis, cranelift, finalize, jitdump, syntax};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum CompilationTier {
@@ -196,7 +196,7 @@ pub(crate) struct Compiler {
     fixed: FxHashMap<FuncId, u16>,
     adapters: FxHashMap<u16, usize>,
     stats: Option<CompileStats>,
-    stubs: emit::Stubs,
+    stubs: cranelift::stubs::Stubs,
     functions: FxHashMap<String, FuncId>,
     function_names: FxHashMap<FuncId, String>,
     dump: Option<jitdump::Writer>,
@@ -290,7 +290,7 @@ impl Compiler {
         signature.returns.push(AbiParam::new(types::I64));
 
         let mut dump = options.jitdump.then(jitdump::Writer::new).flatten();
-        let stubs = emit::Stubs::new(
+        let stubs = cranelift::stubs::Stubs::new(
             &mut module,
             &signature,
             direct_entries,
@@ -343,7 +343,7 @@ impl Compiler {
     }
 
     fn fixed_signature(&self, arity: u16) -> Signature {
-        emit::stubs::fixed_signature(self.module.target_config().pointer_type(), arity)
+        cranelift::stubs::fixed_signature(self.module.target_config().pointer_type(), arity)
     }
 
     fn graph_signature(&self, graph: Option<&super::semantic::Graph>) -> Signature {
@@ -363,8 +363,8 @@ impl Compiler {
             .is_some_and(|options| options.planner)
     }
 
-    fn feedback(&self, owner: FuncId, function_return: bool) -> emit::Feedback {
-        emit::Feedback {
+    fn feedback(&self, owner: FuncId, function_return: bool) -> finalize::Feedback {
+        finalize::Feedback {
             function_return,
             get_refinement: self.get_refinement,
             owner: owner.as_u32() as u64,
@@ -375,7 +375,7 @@ impl Compiler {
         &mut self,
         signature: Signature,
         source_name: (usize, usize),
-        build: impl FnOnce(emit::Output<'_, '_>) -> Result<(), Error>,
+        build: impl FnOnce(finalize::Output<'_, '_>) -> Result<(), Error>,
     ) -> Result<
         (
             cranelift_codegen::ir::Function,
@@ -411,7 +411,7 @@ impl Compiler {
         let native =
             self.backend != crate::Backend::Cranelift && self.module.isa().name() == "aarch64";
         let clif = !native || self.inspection.as_ref().is_some_and(|options| options.clif);
-        build(emit::Output {
+        build(finalize::Output {
             b: &mut builder,
             clif,
             native,
@@ -477,7 +477,7 @@ impl Compiler {
                 &mut self.context.func,
                 &mut self.builder_context,
             );
-            emit::cranelift::emit(&mut builder, &mut self.module, &graph, Some(annotations))?;
+            cranelift::emit(&mut builder, &mut self.module, &graph, Some(annotations))?;
             builder.seal_all_blocks();
             builder.finalize(self.module.target_config());
         }
@@ -506,7 +506,7 @@ impl Compiler {
         if let Some(&adapter) = self.adapters.get(&arity) {
             return Ok(adapter);
         }
-        let stub = emit::stubs::build_adapter(&mut self.module, &self.signature, arity)?;
+        let stub = cranelift::stubs::build_adapter(&mut self.module, &self.signature, arity)?;
         self.module
             .finalize_definitions()
             .map_err(|error| Error::Compile(error.to_string()))?;
@@ -964,7 +964,7 @@ impl Compiler {
                 )
             } else {
                 self.emit_body(self.signature.clone(), self.source_name, |out| {
-                    emit::build_global(out, graph.graph, &graph.facts, &continuations)
+                    finalize::build_global(out, graph.graph, &graph.facts, &continuations)
                 })?
             };
             let inspection = inspection.lowered(snapshot);
@@ -1678,7 +1678,7 @@ impl Compiler {
             )
         } else {
             self.emit_body(signature, emission.source_name, |out| {
-                emit::build_function(
+                finalize::build_function(
                     out,
                     emission.params,
                     graph.graph,
@@ -1850,7 +1850,7 @@ impl Compiler {
         source_name: (usize, usize),
         params: oxc_span::Span,
         name: (&str, u32),
-        feedback: Option<emit::Feedback>,
+        feedback: Option<finalize::Feedback>,
     ) -> Result<FxHashMap<usize, FuncId>, Error> {
         let mut ids = FxHashMap::default();
         self.compile_continuations_inner(graph, source_name, params, name, feedback, &mut ids)?;
@@ -1863,7 +1863,7 @@ impl Compiler {
         source_name: (usize, usize),
         params: oxc_span::Span,
         name: (&str, u32),
-        feedback: Option<emit::Feedback>,
+        feedback: Option<finalize::Feedback>,
         ids: &mut FxHashMap<usize, FuncId>,
     ) -> Result<(), Error> {
         let cfg = super::semantic::Cfg::new(graph);
@@ -1901,7 +1901,7 @@ impl Compiler {
         source_name: (usize, usize),
         params: oxc_span::Span,
         continuations: &FxHashMap<usize, FuncId>,
-        feedback: Option<emit::Feedback>,
+        feedback: Option<finalize::Feedback>,
     ) -> Result<FunctionBody, Error> {
         let mut state = super::semantic::FunctionState::from_graph(graph.clone());
         if self.ssa_opt {
@@ -1956,7 +1956,7 @@ impl Compiler {
             )
         } else {
             self.emit_body(self.signature.clone(), source_name, |out| {
-                emit::build_function(
+                finalize::build_function(
                     out,
                     params,
                     state.graph,
@@ -2004,7 +2004,7 @@ impl Compiler {
                 captured,
                 closures,
                 scoping,
-                emit::FunctionKind::Ordinary,
+                finalize::FunctionKind::Ordinary,
                 (label, line),
                 semantic_function,
             )?;
@@ -2097,7 +2097,7 @@ impl Compiler {
             captured,
             closures,
             scoping,
-            emit::FunctionKind::Factory(layout),
+            finalize::FunctionKind::Factory(layout),
             (label, line),
             None,
         )?;
@@ -2118,7 +2118,7 @@ impl Compiler {
         captured: &FxHashSet<SymbolId>,
         closures: &FxHashMap<u32, (FuncId, Vec<SymbolId>, bool)>,
         scoping: &Scoping,
-        kind: emit::FunctionKind,
+        kind: finalize::FunctionKind,
         name: (&str, u32),
         semantic_function: Option<oxc_span::Span>,
     ) -> Result<FunctionBody, Error> {
@@ -2177,7 +2177,7 @@ impl Compiler {
         {
             graph.lower_typed_storage().map_err(Error::Unsupported)?;
         }
-        let feedback = if self.ssa_opt && matches!(kind, emit::FunctionKind::Ordinary) {
+        let feedback = if self.ssa_opt && matches!(kind, finalize::FunctionKind::Ordinary) {
             semantic_function.and_then(|span| self.canonical.code(self.source_name.0, span.start))
         } else {
             None
@@ -2211,7 +2211,7 @@ impl Compiler {
         let baseline = if std::env::var_os("JS_JIT_BASELINE").is_some()
             && self.module.isa().name() == "aarch64"
             && !self.ssa_opt
-            && matches!(kind, emit::FunctionKind::Ordinary)
+            && matches!(kind, finalize::FunctionKind::Ordinary)
         {
             graph
                 .as_ref()
@@ -2284,7 +2284,7 @@ impl Compiler {
             )
         } else {
             self.emit_body(signature, self.source_name, |out| match graph {
-                Some(graph) => emit::build_function(
+                Some(graph) => finalize::build_function(
                     out,
                     params.span,
                     graph.graph,
@@ -2293,8 +2293,8 @@ impl Compiler {
                     feedback,
                 ),
                 None => match &kind {
-                    emit::FunctionKind::Factory(resume) => {
-                        emit::build_factory(out, params.span, resume.clone())
+                    finalize::FunctionKind::Factory(resume) => {
+                        finalize::build_factory(out, params.span, resume.clone())
                     }
                     _ => Ok(()),
                 },

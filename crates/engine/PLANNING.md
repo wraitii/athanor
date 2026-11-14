@@ -67,7 +67,7 @@ runtime            jit/profile.rs (today jit/planner.rs)
 6. failure mode    per check in a copy: continuation to the generic copy, or inline recovery
                    (slow path inline, merge back; the region ends at the merge, which is an IC)
                       |
-emit               emit/
+finalize + emit    finalize/, cranelift/
 ```
 
 The line between lowering and planning is what justifies a rewrite: facts already proven (no

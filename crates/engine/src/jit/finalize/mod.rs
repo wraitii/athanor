@@ -1,10 +1,8 @@
-pub(super) mod cranelift;
 mod ops;
 mod poll;
 mod repr;
 mod scope;
 mod semantic_graph;
-pub(super) mod stubs;
 
 use crate::FxHashMap;
 
@@ -19,11 +17,10 @@ use oxc_span::Span;
 
 use crate::error::Error;
 use crate::jit::clif::Annotations;
+use crate::jit::cranelift::stubs::Stubs;
 use crate::jit::function_data::{FUNCTION_DATA_BASE_OFFSET, FunctionData};
 use crate::jit::helpers::Helper;
 use crate::value::Value;
-
-pub(super) use stubs::Stubs;
 
 pub(super) enum FunctionKind {
     Ordinary,
@@ -212,7 +209,7 @@ fn build_callable(
     }
     super::semantic::cranelift::split_indexed_loads(&mut lowered);
     lowered.verify().map_err(Error::Compile)?;
-    cranelift::emit(clif_builder, module, &lowered, Some(annotations))?;
+    super::cranelift::emit(clif_builder, module, &lowered, Some(annotations))?;
     Ok(())
 }
 
