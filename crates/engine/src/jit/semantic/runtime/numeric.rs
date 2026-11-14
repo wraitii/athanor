@@ -98,10 +98,6 @@ pub(in crate::jit::semantic) fn arithmetic(function: &mut FunctionState) -> bool
                 right = at.add_unassigned(Op::NumericFloat(right));
             }
             graph.set_op(inst, Op::LowLevel(LowLevel::Binary { op, left, right }));
-            if integer {
-                let result = data.result().unwrap();
-                graph.reprs[result] = Some(Repr::of(facts.of(result)));
-            }
             changed = true;
         }
     }

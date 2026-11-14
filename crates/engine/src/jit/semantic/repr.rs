@@ -246,6 +246,7 @@ pub(in crate::jit) fn intrinsic(op: &Op) -> Option<Repr> {
         ) => Repr::Boolean,
         Op::LowLevel(LowOp::Binary { op, .. }) if op.is_float() => Repr::F64,
         Op::LowLevel(LowOp::Binary { op, .. }) if op.is_boolean() => Repr::Boolean,
+        Op::LowLevel(LowOp::Binary { .. }) => Repr::I64,
         Op::TypedData(_) | Op::Memory(MemoryOp::Address { .. }) => Repr::Word,
         Op::Memory(MemoryOp::IndexedLoad { format, .. } | MemoryOp::Load { format, .. }) => {
             format.repr()
@@ -310,41 +311,15 @@ pub(super) fn element(kind: crate::heap::TypedKind) -> Repr {
     }
 }
 
-fn follows(op: &Op) -> Option<[Value; 2]> {
-    match *op {
-        Op::LowLevel(LowOp::ExtractBits { value, .. }) => Some([value, value]),
-        Op::LowLevel(LowOp::Select { yes, no, .. }) => Some([yes, no]),
-        Op::LowLevel(LowOp::Binary { op, left, right }) if !op.is_integer_arithmetic() => {
-            Some([left, right])
-        }
-        _ => None,
-    }
-}
-
 fn representation(graph: &Graph, facts: &Facts, value: super::Value) -> Repr {
-    let repr =
-        |value: Value| graph.reprs[value].unwrap_or_else(|| representation(graph, facts, value));
     let op = graph.defining_op(value);
     if let Some(repr) = op.and_then(intrinsic) {
         return repr;
     }
-    if let Some(inputs) = op.and_then(follows) {
-        let constant = |input: Value| matches!(graph.defining_op(input), Some(Op::Constant(_)));
-        let typed = inputs
-            .into_iter()
-            .map(|input| (constant(input), repr(input)))
-            .filter(|&(_, repr)| repr != Repr::Boxed);
-        if let Some((_, repr)) = typed.clone().min_by_key(|&(constant, _)| constant) {
-            return repr;
-        }
-    }
     if let Some(&Op::AsNumber(input)) = op {
-        return repr(input);
+        return graph.reprs[input].unwrap_or_else(|| representation(graph, facts, input));
     }
-    match (op, Repr::of(facts.of(value))) {
-        (Some(Op::LowLevel(_)), Repr::Boxed) => Repr::I64,
-        (_, repr) => repr,
-    }
+    Repr::of(facts.of(value))
 }
 
 #[derive(Clone, Copy)]
