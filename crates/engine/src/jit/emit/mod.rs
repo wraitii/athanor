@@ -1,7 +1,6 @@
 pub(super) mod class;
 pub(super) mod cranelift;
 pub(in crate::jit) mod expression;
-mod ir_helpers;
 mod ops;
 mod poll;
 mod repr;

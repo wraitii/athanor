@@ -838,7 +838,12 @@ fn result_types(graph: &Graph, op: &Op, facts: &Facts) -> ValueType {
         Op::AsWord(_) => ValueType::INT64,
         Op::LowLevel(LowOp::Binary { op, .. }) if op.is_float() => ValueType::NUMBER,
         Op::LowLevel(LowOp::Binary { op, .. }) if op.is_integer_arithmetic() => ValueType::INT64,
-        Op::LowLevel(LowOp::IntCompare { .. } | LowOp::FloatCompare { .. }) => ValueType::BOOLEAN,
+        Op::LowLevel(
+            LowOp::IntCompare { .. }
+            | LowOp::FloatCompare { .. }
+            | LowOp::InRange { .. }
+            | LowOp::TestMask { .. },
+        ) => ValueType::BOOLEAN,
         Op::LowLevel(LowOp::Binary {
             op: super::low_level::Binary::And,
             left,
@@ -914,6 +919,7 @@ fn result_types(graph: &Graph, op: &Op, facts: &Facts) -> ValueType {
         | Op::IsInteger(_)
         | Op::IntegerCheck(..)
         | Op::IsString(_)
+        | Op::Truthy(_)
         | Op::IsStringSplit(_)
         | Op::IsTypeof(..) => ValueType::BOOLEAN,
         Op::NewPack | Op::Spread(_) | Op::StringSplitParts(..) => ValueType::PACK,

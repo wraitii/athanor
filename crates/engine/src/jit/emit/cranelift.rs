@@ -223,6 +223,9 @@ pub(in crate::jit) fn emit(
                 Op::VariableRead => {
                     return Err(Error::Compile("unresolved low-level variable".into()));
                 }
+                Op::ExtractBits { .. } | Op::InRange { .. } | Op::TestMask { .. } => {
+                    return Err(Error::Compile("unexpanded bit operation".into()));
+                }
             };
             if result.len() != data.results.len() {
                 return Err(Error::Compile(format!("wrong result count at {inst}")));

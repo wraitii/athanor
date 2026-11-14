@@ -58,7 +58,12 @@ impl FunctionState {
         after("property-accesses", self);
         self.lower_memory()?;
         after("memory", self);
-        if numeric::operations(self) {
+        let lowered = numeric::operations(self);
+        let dispatched = numeric::dispatch(self);
+        if dispatched {
+            numeric::operations(self);
+        }
+        if lowered || dispatched {
             self.ensure_facts();
             borrow::borrows(&mut self.graph, &self.facts, &mut self.notes);
         }
@@ -68,6 +73,8 @@ impl FunctionState {
         self.ensure_facts();
         helpers::lower(self);
         after("helpers", self);
+        legalize::conditions(&mut self.graph, &mut self.facts);
+        after("conditions", self);
         repr::assign(&mut self.graph, &self.facts);
         after("repr", self);
         legalize::legalize(&mut self.graph, &mut self.facts);
@@ -113,6 +120,7 @@ pub(in crate::jit) const LOWERING_PASSES: &[&str] = &[
     "repr-lower",
     "cleanup",
     "ownership-lower",
+    "bits",
 ];
 
 pub(in crate::jit) fn lower_emitted(
@@ -128,6 +136,8 @@ pub(in crate::jit) fn lower_emitted(
     after("cleanup", graph);
     super::runtime::ownership::lower(graph, ctx, call_conv, pointer);
     after("ownership-lower", graph);
+    super::bits::expand(graph);
+    after("bits", graph);
     graph.verify()
 }
 

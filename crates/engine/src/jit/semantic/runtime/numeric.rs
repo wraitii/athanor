@@ -462,3 +462,118 @@ pub(in crate::jit::semantic) fn bitwise(function: &mut FunctionState) -> bool {
     }
     !candidates.is_empty()
 }
+
+pub(in crate::jit::semantic) fn dispatch(function: &mut FunctionState) -> bool {
+    function.ensure_values();
+    let facts = &function.facts;
+    let graph = &mut function.graph;
+    let candidates: Vec<_> = facts
+        .cfg
+        .rpo
+        .iter()
+        .flat_map(|&block| graph.blocks[block].insts.iter().copied())
+        .filter(|&inst| {
+            numeric_operands(&graph.insts[inst].op).is_some_and(|operands| {
+                operands
+                    .iter()
+                    .all(|&value| facts.of(value).intersects(ValueType::NUMBER))
+            })
+        })
+        .collect();
+    for &inst in &candidates {
+        let data = graph.insts[inst].clone();
+        let operands = numeric_operands(&data.op).unwrap();
+        let first = graph.blocks.len();
+        let (block, continuation, fallback) = super::super::dispatch::split(graph, inst);
+        let fast = graph.blocks.push(BlockData::default());
+        let mut at = Cursor::at_end(graph, block, inst);
+        let condition = match data.op {
+            Op::GuardedCompare { numbers, .. } => {
+                at.add_unassigned(Op::BooleanAnd(numbers[0], numbers[1]))
+            }
+            _ => {
+                let checks: Vec<_> = operands
+                    .iter()
+                    .map(|&value| at.add_unassigned(Op::IsNumber(value)))
+                    .collect();
+                let mut condition = checks[0];
+                for &check in &checks[1..] {
+                    condition = at.add_unassigned(Op::BooleanAnd(condition, check));
+                }
+                condition
+            }
+        };
+        at.terminate_current(TerminatorKind::Branch(
+            condition,
+            Target::new(fast),
+            Target::new(fallback),
+        ));
+        let mut at = Cursor::at_end(graph, fast, inst);
+        let numbers: Vec<_> = operands
+            .iter()
+            .map(|&value| at.add_unassigned(Op::AsNumber(value)))
+            .collect();
+        let result = at.add_unassigned(numeric_op(&data.op, numbers));
+        at.terminate_current(TerminatorKind::Jump(Target {
+            block: continuation,
+            args: vec![result],
+        }));
+        super::super::dispatch::extend_regions(graph, block, first);
+    }
+    if !candidates.is_empty() {
+        function.invalidate_cfg();
+    }
+    !candidates.is_empty()
+}
+
+fn numeric_operands(op: &Op) -> Option<Vec<Value>> {
+    use BinaryOperator as B;
+    Some(match op {
+        Op::Binary(
+            B::Addition
+            | B::Subtraction
+            | B::Multiplication
+            | B::Division
+            | B::LessThan
+            | B::LessEqualThan
+            | B::GreaterThan
+            | B::GreaterEqualThan
+            | B::Equality
+            | B::Inequality
+            | B::StrictEquality
+            | B::StrictInequality
+            | B::BitwiseAnd
+            | B::BitwiseOR
+            | B::BitwiseXOR
+            | B::ShiftLeft
+            | B::ShiftRight
+            | B::ShiftRightZeroFill,
+            left,
+            right,
+        )
+        | Op::GuardedCompare { left, right, .. } => vec![*left, *right],
+        Op::Unary(UnaryOp::Increment | UnaryOp::Decrement, value) => vec![*value],
+        Op::CallNative(native, args) if inline_math(*native, args.len()) => args.clone(),
+        _ => return None,
+    })
+}
+
+fn inline_math(native: super::super::Native, arguments: usize) -> bool {
+    use crate::heap::MathFunction;
+    matches!(
+        (crate::jit::math::METHODS[native.index()].1, arguments),
+        (MathFunction::Floor | MathFunction::Ceil | MathFunction::Sqrt, 1)
+            | (MathFunction::Min | MathFunction::Max, 1..)
+    )
+}
+
+fn numeric_op(op: &Op, numbers: Vec<Value>) -> Op {
+    match *op {
+        Op::Binary(operator, ..) | Op::GuardedCompare { operator, .. } => {
+            Op::Binary(operator, numbers[0], numbers[1])
+        }
+        Op::Unary(operator, _) => Op::Unary(operator, numbers[0]),
+        Op::CallNative(native, _) => Op::CallNative(native, numbers),
+        _ => unreachable!(),
+    }
+}

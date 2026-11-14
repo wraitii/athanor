@@ -13,7 +13,7 @@ use crate::error::Error;
 use crate::jit::helpers::Helper;
 use crate::jit::semantic::{
     Block, Constant, Facts, Graph, Inst, InstData, MemoryFormat, MemoryOp, Op, TerminatorKind,
-    TypedRead, UnaryOp, Value as GraphValue, ValueType,
+    TypedRead, UnaryOp, Value as GraphValue,
 };
 use crate::value::Value;
 
@@ -23,8 +23,6 @@ use super::repr::Operand;
 use crate::jit::semantic::Repr;
 use crate::jit::semantic::ownership::{Holder, Plan};
 use crate::jit::semantic::selection::ResultReference;
-
-const NUMERIC: ValueType = ValueType::NUMBER.union(ValueType::UNDEFINED);
 
 pub(super) struct Context<'a> {
     entry: Block,
@@ -77,10 +75,6 @@ impl<'a> Context<'a> {
 
     fn define(&self, value: GraphValue, clif: LoweredValue) {
         self.direct.borrow_mut()[value] = Some(clif);
-    }
-
-    fn numeric(&self, value: GraphValue) -> bool {
-        self.facts.of(value).within(NUMERIC)
     }
 }
 
@@ -309,7 +303,8 @@ impl FunctionCompiler<'_, '_> {
                 self.b.set_srcloc(location);
                 let get = |this: &mut Self, value: GraphValue| {
                     let operand = this.operand(&cx, value);
-                    this.convert(operand, Repr::Boxed)
+                    debug_assert_eq!(operand.repr, Repr::Boxed, "{inst} uses unboxed {value}");
+                    operand.value
                 };
                 let result = if deferred(&data.op) {
                     self.adopt(&cx, inst);
@@ -696,6 +691,7 @@ impl FunctionCompiler<'_, '_> {
                             | Op::GetIndex(..)
                             | Op::ArrayGet(..)
                             | Op::SetIndex(..)
+                            | Op::Truthy(..)
                             | Op::TypedIndex(..) => {
                                 break 'lowered self.typed_op(&cx, inst, data, target)?;
                             }
@@ -766,22 +762,11 @@ impl FunctionCompiler<'_, '_> {
                                 operator,
                                 left,
                                 right,
-                                numbers,
+                                ..
                             } => {
                                 let left = get(self, *left);
                                 let right = get(self, *right);
-                                let first = self.operand(&cx, numbers[0]);
-                                let first = self.convert(first, Repr::I8);
-                                let second = self.operand(&cx, numbers[1]);
-                                let second = self.convert(second, Repr::I8);
-                                let value = self.numeric_comparison(
-                                    ops::binary_operator(*operator),
-                                    left,
-                                    right,
-                                    Some((first, second)),
-                                );
-                                self.check_error();
-                                Some(value)
+                                Some(self.binary(ops::binary_operator(*operator), left, right))
                             }
                             Op::DefineHidden(object, name, value) => {
                                 let object = get(self, *object);
@@ -976,19 +961,16 @@ impl FunctionCompiler<'_, '_> {
                             Op::CallNative(native, args) => {
                                 let args: Vec<_> = args.iter().map(|&v| get(self, v)).collect();
                                 let argv = self.stack_values(&args, data.span)?;
-                                let function = crate::jit::math::METHODS[native.index()].1;
-                                Some(self.native_math(function, &args, |this| {
-                                    let argc = this.b.ins().iconst(types::I64, args.len() as i64);
-                                    let operation =
-                                        this.b.ins().iconst(types::I64, native.index() as i64);
-                                    let receiver = this.constant(Value::UNDEFINED);
-                                    let value = this.call_helper(
-                                        Helper::MathDirect,
-                                        &[operation, receiver, argv, argc],
-                                    );
-                                    this.check_error();
-                                    value
-                                }))
+                                let argc = self.b.ins().iconst(types::I64, args.len() as i64);
+                                let operation =
+                                    self.b.ins().iconst(types::I64, native.index() as i64);
+                                let receiver = self.constant(Value::UNDEFINED);
+                                let value = self.call_helper(
+                                    Helper::MathDirect,
+                                    &[operation, receiver, argv, argc],
+                                );
+                                self.check_error();
+                                Some(value)
                             }
                             Op::EnterScope(_)
                             | Op::EnterCaptures(..)
@@ -1006,8 +988,7 @@ impl FunctionCompiler<'_, '_> {
                         "{inst} produced {:?}",
                         result.repr
                     );
-                    let repr = self.b.graph.repr(value);
-                    let result = self.convert(result, repr);
+                    let result = result.value;
                     cx.define(value, result);
                     let required = cx.plan.results[inst] == ResultReference::Move;
                     if required || cx.plan.holder(value) == Holder::Temporary {
@@ -1057,8 +1038,14 @@ impl FunctionCompiler<'_, '_> {
                     self.jump(block, &args);
                 }
                 TerminatorKind::Branch(value, yes, no) => {
-                    let operand = self.operand(&cx, *value);
-                    let condition = self.condition(operand, cx.numeric(*value));
+                    let condition = self.operand(&cx, *value);
+                    if condition.repr != Repr::I8 {
+                        return Err(Error::Compile(format!(
+                            "{block}: branch on {:?} condition",
+                            condition.repr
+                        )));
+                    }
+                    let condition = condition.value;
                     let (yes_block, yes_args) = target(self, yes);
                     let (no_block, no_args) = target(self, no);
                     self.brif(condition, yes_block, &yes_args, no_block, &no_args);
@@ -1096,8 +1083,8 @@ impl FunctionCompiler<'_, '_> {
                 }
                 TerminatorKind::Return(value) => {
                     let operand = self.operand(&cx, *value);
-                    let value = self.convert(operand, Repr::Boxed);
-                    let args = self.return_args(value, false);
+                    debug_assert_eq!(operand.repr, Repr::Boxed, "{block} returns unboxed {value}");
+                    let args = self.return_args(operand.value, false);
                     self.jump(self.return_block, &args);
                 }
             }
@@ -1172,6 +1159,10 @@ impl FunctionCompiler<'_, '_> {
                 }
                 produces.map(|repr| Operand::new(value, repr))
             }
+            Op::Truthy(value) => {
+                let value = self.operand(cx, *value).value;
+                boolean(self.truthy(value))
+            }
             Op::TypedData(..) => unreachable!("data pointer must be lowered before emission"),
             Op::Memory(MemoryOp::Address {
                 base,
@@ -1228,8 +1219,7 @@ impl FunctionCompiler<'_, '_> {
                 let view = match self.b.graph.views.get(&inst).copied() {
                     Some(view) => self.operand(cx, view).value,
                     None => {
-                        let object = self.operand(cx, *object);
-                        let object = self.convert(object, Repr::Boxed);
+                        let object = self.operand(cx, *object).value;
                         self.view(object)
                     }
                 };
@@ -1248,8 +1238,7 @@ impl FunctionCompiler<'_, '_> {
                 let view = match self.b.graph.views.get(&inst).copied() {
                     Some(view) => self.operand(cx, view).value,
                     None => {
-                        let object = self.operand(cx, *object);
-                        let object = self.convert(object, Repr::Boxed);
+                        let object = self.operand(cx, *object).value;
                         self.view(object)
                     }
                 };

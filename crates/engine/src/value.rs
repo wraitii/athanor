@@ -3,7 +3,6 @@ use std::fmt;
 pub(crate) const TAG_SHIFT: u32 = 48;
 pub(crate) const TAG_FIRST: u64 = 0x7ff9;
 pub(crate) const TAG_LAST: u64 = 0x7fff;
-pub(crate) const TAG_SPAN: u64 = TAG_LAST - TAG_FIRST;
 const CANONICAL_NAN: u64 = 0x7ff8_0000_0000_0000;
 
 pub(crate) const TAG_UNDEFINED: u64 = 0x7ff9_0000_0000_0000;

@@ -3,6 +3,7 @@ use super::super::{
     Block, BlockData, Cfg, FunctionState, Graph, Inst, Op, Repr, Target, Terminator,
     TerminatorKind, Value,
 };
+use super::layout;
 
 pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) -> super::super::Result<bool> {
     let shapes = &function.plan.shapes;
@@ -310,30 +311,9 @@ impl PropertyLowering<'_> {
     }
 
     fn view(&mut self, block: Block, object: Value) -> Value {
-        use crate::value::{TAG_OBJECT, TAG_SHIFT};
-        use cranelift_codegen::ir::{condcodes::IntCC, types};
-
         let mut at = self.at(block);
         let bits = at.as_word(object);
-        let shift = at.ins().iconst(types::I64, TAG_SHIFT as i64);
-        let tag = at.ins().ushr(bits, shift);
-        let first = at
-            .ins()
-            .iconst(types::I64, (TAG_OBJECT >> TAG_SHIFT) as i64);
-        let offset = at.ins().isub(tag, first);
-        let two = at.ins().iconst(types::I64, 2);
-        let heap = at.ins().icmp(IntCC::UnsignedLessThan, offset, two);
-        let mask = at
-            .ins()
-            .iconst(types::I64, ((1u64 << TAG_SHIFT) - 1) as i64);
-        let address = at.ins().band(bits, mask);
-        let zero = at.ins().iconst(types::I64, 0);
-        let present = at.ins().icmp(IntCC::NotEqual, address, zero);
-        let valid = at.add_unassigned(Op::BooleanAnd(heap, present));
-        let empty = at
-            .ins()
-            .iconst(types::I64, crate::heap::NO_ELEMENTS.as_ptr() as i64);
-        at.ins().select(valid, address, empty)
+        layout::heap_view(&mut at, bits)
     }
 
     fn entry(

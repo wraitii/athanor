@@ -6,8 +6,7 @@ use oxc_syntax::operator::BinaryOperator;
 
 use crate::error::Error;
 use crate::heap::{
-    CODE_OFFSET, DATA_OFFSET, KIND_OFFSET, LENGTH_OFFSET, MathFunction, NO_ELEMENTS, SHAPE_OFFSET,
-    TypedKind,
+    CODE_OFFSET, DATA_OFFSET, KIND_OFFSET, LENGTH_OFFSET, SHAPE_OFFSET, TypedKind,
 };
 use crate::jit::helpers::{
     self, CACHE_BUILTIN_KIND_OFFSET, CACHE_BUILTIN_VALUE_OFFSET, CACHE_ENTRY_OFFSET,
@@ -19,11 +18,11 @@ use crate::jit::profile::{CallSite, Site};
 use crate::jit::semantic::DirectTarget;
 use crate::jit::session::CALL_SITE_OFFSET;
 use crate::value::Value;
-use crate::value::{TAG_FIRST, TAG_OBJECT, TAG_SHIFT, TAG_SPAN, TAG_STRING};
 
 use super::repr::Operand;
-use super::{BlockArg, FunctionCompiler, LoweredValue, SigRef, ir_helpers};
+use super::{BlockArg, FunctionCompiler, LoweredValue, SigRef};
 use crate::jit::semantic::Repr;
+use crate::jit::semantic::runtime::layout;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Element {
@@ -36,8 +35,6 @@ enum Element {
     F32,
     F64,
 }
-
-use super::scope::ADDRESS_MASK;
 
 impl Element {
     fn bytes(self) -> u32 {
@@ -184,12 +181,7 @@ impl FunctionCompiler<'_, '_> {
 
     pub(super) fn is_number(&mut self, value: LoweredValue) -> LoweredValue {
         let value = self.b.as_word(value);
-        let top = self.b.ins().ushr_imm_s(value, TAG_SHIFT as i64);
-        let offset = self.b.ins().iadd_imm_s(top, -(TAG_FIRST as i64));
-
-        self.b
-            .ins()
-            .icmp_imm_s(IntCC::UnsignedGreaterThan, offset, TAG_SPAN as i64)
+        layout::is_number(self.b, value)
     }
 
     pub(super) fn truthy(&mut self, value: LoweredValue) -> LoweredValue {
@@ -212,11 +204,7 @@ impl FunctionCompiler<'_, '_> {
         self.jump(done, &[BlockArg::Value(truth)]);
 
         self.switch(other_block);
-        let tag = self.b.ins().ushr_imm_s(word, TAG_SHIFT as i64);
-        let is_string =
-            self.b
-                .ins()
-                .icmp_imm_s(IntCC::Equal, tag, (TAG_STRING >> TAG_SHIFT) as i64);
+        let is_string = layout::is_string(self.b, word);
         self.brif(is_string, string_block, &[], primitive_block, &[]);
 
         self.switch(string_block);
@@ -273,26 +261,7 @@ impl FunctionCompiler<'_, '_> {
         left: LoweredValue,
         right: LoweredValue,
     ) -> LoweredValue {
-        match op {
-            BinaryOp::BitwiseAnd
-            | BinaryOp::BitwiseOr
-            | BinaryOp::BitwiseXor
-            | BinaryOp::ShiftLeft
-            | BinaryOp::ShiftRight
-            | BinaryOp::ShiftRightUnsigned => self.integer_binary(op, left, right),
-            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
-                self.numeric_binary(op, left, right)
-            }
-            BinaryOp::Less
-            | BinaryOp::LessEqual
-            | BinaryOp::Greater
-            | BinaryOp::GreaterEqual
-            | BinaryOp::LooseEqual
-            | BinaryOp::LooseNotEqual
-            | BinaryOp::StrictEqual
-            | BinaryOp::StrictNotEqual => self.numeric_comparison(op, left, right, None),
-            _ => self.binary_helper(op, left, right),
-        }
+        self.binary_helper(op, left, right)
     }
 
     pub(super) fn data_address(&mut self, offset: i64) -> LoweredValue {
@@ -366,232 +335,6 @@ impl FunctionCompiler<'_, '_> {
         }
         result
     }
-
-    fn integer_binary(
-        &mut self,
-        op: BinaryOp,
-        left: LoweredValue,
-        right: LoweredValue,
-    ) -> LoweredValue {
-        let (left_int, left_guard) = ir_helpers::unbox_int32(self.b, left);
-        let (right_int, right_guard) = ir_helpers::unbox_int32(self.b, right);
-        let both = self.b.ins().band(left_guard, right_guard);
-        let fast = self.b.create_block();
-        let slow = self.b.create_block();
-        let done = self.b.create_block();
-        self.b.append_block_param_repr(done, Repr::Boxed);
-        self.brif(both, fast, &[], slow, &[]);
-
-        self.switch(fast);
-        let integer = match op {
-            BinaryOp::BitwiseAnd => self.b.ins().band(left_int, right_int),
-            BinaryOp::BitwiseOr => self.b.ins().bor(left_int, right_int),
-            BinaryOp::BitwiseXor => self.b.ins().bxor(left_int, right_int),
-            BinaryOp::ShiftLeft => self.b.ins().ishl(left_int, right_int),
-            BinaryOp::ShiftRight => self.b.ins().sshr(left_int, right_int),
-            BinaryOp::ShiftRightUnsigned => self.b.ins().ushr(left_int, right_int),
-            _ => unreachable!(),
-        };
-        let result = if matches!(op, BinaryOp::ShiftRightUnsigned) {
-            let float = self.b.ins().fcvt_from_uint(types::F64, integer);
-            self.b.ins().bitcast(types::I64, MemFlagsData::new(), float)
-        } else {
-            ir_helpers::box_int32(self.b, integer)
-        };
-        let result = self.b.as_boxed(result);
-        self.jump(done, &[BlockArg::Value(result)]);
-
-        self.switch(slow);
-        let result = self.binary_helper(op, left, right);
-        self.jump(done, &[BlockArg::Value(result)]);
-
-        self.switch(done);
-        self.b.block_params(done)[0]
-    }
-
-    pub(super) fn native_math(
-        &mut self,
-        function: MathFunction,
-        args: &[LoweredValue],
-        slow: impl FnOnce(&mut Self) -> LoweredValue,
-    ) -> LoweredValue {
-        let inline = matches!(
-            (function, args.len()),
-            (
-                MathFunction::Floor | MathFunction::Ceil | MathFunction::Sqrt,
-                1
-            ) | (MathFunction::Min | MathFunction::Max, 1..)
-        );
-        if !inline {
-            return slow(self);
-        }
-        let mut numbers = self.b.ins().iconst(types::I8, 1);
-        for &arg in args {
-            let number = self.is_number(arg);
-            numbers = self.b.ins().band(numbers, number);
-        }
-        let fast_block = self.b.create_block();
-        let slow_block = self.b.create_block();
-        let done = self.b.create_block();
-        self.b.append_block_param_repr(done, Repr::Boxed);
-        self.brif(numbers, fast_block, &[], slow_block, &[]);
-
-        self.switch(fast_block);
-        let floats: Vec<_> = args
-            .iter()
-            .map(|&arg| {
-                let word = self.b.as_word(arg);
-                self.b.ins().bitcast(types::F64, MemFlagsData::new(), word)
-            })
-            .collect();
-        let result = match function {
-            MathFunction::Floor => self.b.ins().floor(floats[0]),
-            MathFunction::Ceil => self.b.ins().ceil(floats[0]),
-            MathFunction::Sqrt => self.b.ins().sqrt(floats[0]),
-            MathFunction::Min => floats[1..]
-                .iter()
-                .fold(floats[0], |left, &right| self.b.ins().fmin(left, right)),
-            _ => floats[1..]
-                .iter()
-                .fold(floats[0], |left, &right| self.b.ins().fmax(left, right)),
-        };
-        let unordered = self.b.ins().fcmp(FloatCC::Unordered, result, result);
-        let bits = self
-            .b
-            .ins()
-            .bitcast(types::I64, MemFlagsData::new(), result);
-        let nan = self
-            .b
-            .ins()
-            .iconst(types::I64, Value::number(f64::NAN).bits() as i64);
-        let word = self.b.ins().select(unordered, nan, bits);
-        let boxed = self.b.as_boxed(word);
-        self.jump(done, &[BlockArg::Value(boxed)]);
-
-        self.switch(slow_block);
-        let slow_result = slow(self);
-        self.jump(done, &[BlockArg::Value(slow_result)]);
-
-        self.switch(done);
-        self.b.block_params(done)[0]
-    }
-
-    fn numeric_fast_path(
-        &mut self,
-        left: LoweredValue,
-        right: LoweredValue,
-        guards: Option<(LoweredValue, LoweredValue)>,
-        fast: impl FnOnce(&mut Self, LoweredValue, LoweredValue) -> LoweredValue,
-        slow: impl FnOnce(&mut Self) -> LoweredValue,
-    ) -> LoweredValue {
-        let (left_number, right_number) =
-            guards.unwrap_or_else(|| (self.is_number(left), self.is_number(right)));
-        let both = self.b.ins().band(left_number, right_number);
-        let fast_block = self.b.create_block();
-        let slow_block = self.b.create_block();
-        let done = self.b.create_block();
-        self.b.append_block_param_repr(done, Repr::Boxed);
-        self.brif(both, fast_block, &[], slow_block, &[]);
-
-        self.switch(fast_block);
-        let left_word = self.b.as_word(left);
-        let right_word = self.b.as_word(right);
-        let fast_result = fast(self, left_word, right_word);
-        let fast_result = self.b.as_boxed(fast_result);
-        self.jump(done, &[BlockArg::Value(fast_result)]);
-
-        self.switch(slow_block);
-        let slow_result = slow(self);
-        self.jump(done, &[BlockArg::Value(slow_result)]);
-
-        self.switch(done);
-        self.b.block_params(done)[0]
-    }
-
-    fn numeric_binary(
-        &mut self,
-        op: BinaryOp,
-        left: LoweredValue,
-        right: LoweredValue,
-    ) -> LoweredValue {
-        self.numeric_fast_path(
-            left,
-            right,
-            None,
-            |compiler, left, right| {
-                let left_float = compiler
-                    .b
-                    .ins()
-                    .bitcast(types::F64, MemFlagsData::new(), left);
-                let right_float = compiler
-                    .b
-                    .ins()
-                    .bitcast(types::F64, MemFlagsData::new(), right);
-                let result = match op {
-                    BinaryOp::Add => compiler.b.ins().fadd(left_float, right_float),
-                    BinaryOp::Sub => compiler.b.ins().fsub(left_float, right_float),
-                    BinaryOp::Mul => compiler.b.ins().fmul(left_float, right_float),
-                    BinaryOp::Div => compiler.b.ins().fdiv(left_float, right_float),
-                    _ => unreachable!(),
-                };
-                let unordered = compiler.b.ins().fcmp(FloatCC::Unordered, result, result);
-                let bits = compiler
-                    .b
-                    .ins()
-                    .bitcast(types::I64, MemFlagsData::new(), result);
-                let nan = compiler
-                    .b
-                    .ins()
-                    .iconst(types::I64, Value::number(f64::NAN).bits() as i64);
-                compiler.b.ins().select(unordered, nan, bits)
-            },
-            |compiler| compiler.binary_helper(op, left, right),
-        )
-    }
-
-    pub(super) fn numeric_comparison(
-        &mut self,
-        op: BinaryOp,
-        left: LoweredValue,
-        right: LoweredValue,
-        guards: Option<(LoweredValue, LoweredValue)>,
-    ) -> LoweredValue {
-        self.numeric_fast_path(
-            left,
-            right,
-            guards,
-            |compiler, left, right| {
-                let left_float = compiler
-                    .b
-                    .ins()
-                    .bitcast(types::F64, MemFlagsData::new(), left);
-                let right_float = compiler
-                    .b
-                    .ins()
-                    .bitcast(types::F64, MemFlagsData::new(), right);
-                let condition = match op {
-                    BinaryOp::Less => FloatCC::LessThan,
-                    BinaryOp::LessEqual => FloatCC::LessThanOrEqual,
-                    BinaryOp::Greater => FloatCC::GreaterThan,
-                    BinaryOp::GreaterEqual => FloatCC::GreaterThanOrEqual,
-                    BinaryOp::LooseEqual | BinaryOp::StrictEqual => FloatCC::Equal,
-                    BinaryOp::LooseNotEqual | BinaryOp::StrictNotEqual => FloatCC::NotEqual,
-                    _ => unreachable!(),
-                };
-                let condition = compiler.b.ins().fcmp(condition, left_float, right_float);
-                let true_value = compiler
-                    .b
-                    .ins()
-                    .iconst(types::I64, Value::TRUE.bits() as i64);
-                let false_value = compiler
-                    .b
-                    .ins()
-                    .iconst(types::I64, Value::FALSE.bits() as i64);
-                compiler.b.ins().select(condition, true_value, false_value)
-            },
-            |compiler| compiler.binary_helper(op, left, right),
-        )
-    }
 }
 
 pub(super) fn to_number(
@@ -622,19 +365,7 @@ impl FunctionCompiler<'_, '_> {
     // kind check fails and the length reads as zero.
     pub(super) fn view(&mut self, object: LoweredValue) -> LoweredValue {
         let object = self.b.as_word(object);
-        let tag = self.b.ins().ushr_imm_s(object, TAG_SHIFT as i64);
-        let is_object =
-            self.b
-                .ins()
-                .icmp_imm_s(IntCC::Equal, tag, (TAG_OBJECT >> TAG_SHIFT) as i64);
-        let address = self.b.ins().band_imm_s(object, ADDRESS_MASK);
-        let present = self.b.ins().icmp_imm_s(IntCC::NotEqual, address, 0);
-        let valid = self.b.ins().band(is_object, present);
-        let empty = self
-            .b
-            .ins()
-            .iconst(self.pointer, NO_ELEMENTS.as_ptr() as i64);
-        self.b.ins().select(valid, address, empty)
+        layout::object_view(self.b, object)
     }
 
     pub(super) fn generic_call(
@@ -912,11 +643,10 @@ impl FunctionCompiler<'_, '_> {
     ) -> Operand {
         let element = Element::from(kind);
         let flags = MemFlagsData::trusted();
-        let position = if matches!(key.repr, Repr::I32 | Repr::I64) {
-            self.convert(key, Repr::I64)
+        let position = if key.repr == Repr::I64 {
+            key.value
         } else {
-            let key = self.convert(key, Repr::F64);
-            self.b.ins().fcvt_to_sint_sat(types::I64, key)
+            self.b.ins().fcvt_to_sint_sat(types::I64, key.value)
         };
         let data = self.b.ins().load(self.pointer, flags, view, DATA_OFFSET);
         let offset = self.b.ins().imul_imm_s(position, element.bytes() as i64);
@@ -949,11 +679,10 @@ impl FunctionCompiler<'_, '_> {
             .b
             .ins()
             .load(types::I64, MemFlagsData::trusted(), view, LENGTH_OFFSET);
-        let inside = if matches!(key.repr, Repr::I32 | Repr::I64) {
-            let position = self.convert(key, Repr::I64);
-            self.b.ins().icmp(IntCC::UnsignedLessThan, position, length)
+        let inside = if key.repr == Repr::I64 {
+            self.b.ins().icmp(IntCC::UnsignedLessThan, key.value, length)
         } else {
-            let number = self.convert(key, Repr::F64);
+            let number = key.value;
             let position = self.b.ins().fcvt_to_sint_sat(types::I64, number);
             let exact = self.b.ins().fcvt_from_sint(types::F64, position);
             let integral = self.b.ins().fcmp(FloatCC::Equal, exact, number);
@@ -1162,21 +891,13 @@ impl FunctionCompiler<'_, '_> {
             self.brif(megamorphic, miss, &[], lookup, &[]);
             self.switch(lookup);
         }
-        let heap = self.is_heap(object);
         let object = self.b.as_word(object);
-        let bits = self.b.ins().band_imm_s(object, ADDRESS_MASK);
-        let present = self.b.ins().icmp_imm_s(IntCC::NotEqual, bits, 0);
-        let valid = self.b.ins().band(heap, present);
-        let empty = self
-            .b
-            .ins()
-            .iconst(self.pointer, NO_ELEMENTS.as_ptr() as i64);
-        let bits = if self.pointer == types::I64 {
-            bits
+        let view = layout::heap_view(self.b, object);
+        let view = if self.pointer == types::I64 {
+            view
         } else {
-            self.b.ins().ireduce(self.pointer, bits)
+            self.b.ins().ireduce(self.pointer, view)
         };
-        let view = self.b.ins().select(valid, bits, empty);
         let shape = self.b.ins().load(types::I32, flags, view, SHAPE_OFFSET);
         let kind = builtins.then(|| self.view_kind(view));
         let len = self
@@ -1288,7 +1009,7 @@ impl FunctionCompiler<'_, '_> {
             self.switch(shaped);
         }
         let object = self.b.as_word(object);
-        let view = self.b.ins().band_imm_s(object, ADDRESS_MASK);
+        let view = layout::address(self.b, object);
         let view = if self.pointer == types::I64 {
             view
         } else {
@@ -1353,7 +1074,7 @@ impl FunctionCompiler<'_, '_> {
     pub(super) fn shaped_property_get(&mut self, object: LoweredValue, index: u32) -> LoweredValue {
         let flags = MemFlagsData::trusted();
         let object = self.b.as_word(object);
-        let view = self.b.ins().band_imm_s(object, ADDRESS_MASK);
+        let view = layout::address(self.b, object);
         let data = self.b.ins().load(self.pointer, flags, view, DATA_OFFSET);
         let word = self
             .b

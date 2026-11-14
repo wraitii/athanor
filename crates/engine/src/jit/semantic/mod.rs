@@ -1,6 +1,7 @@
 mod access;
 mod available;
 mod borrow;
+mod bits;
 pub(in crate::jit) mod boundary;
 mod build;
 pub(in crate::jit) mod continuation;
@@ -526,6 +527,7 @@ pub(super) enum Op {
     SaturatingInteger(Value),
     IntegerCheck(Value, Value, Value),
     IsString(Value),
+    Truthy(Value),
     IsStringSplit(Value),
     StringSplit(Value, Vec<Value>),
     StringSplitParts(Value, Vec<Value>),
@@ -627,6 +629,9 @@ impl Op {
             Op::LowLevel(
                 low_level::Op::Unary { value, .. }
                 | low_level::Op::Reference { value, .. }
+                | low_level::Op::ExtractBits { value, .. }
+                | low_level::Op::InRange { value, .. }
+                | low_level::Op::TestMask { value, .. }
                 | low_level::Op::Load { address: value, .. }
                 | low_level::Op::AtomicLoad { address: value, .. },
             ) => ([Some(*value), None, None], &[]),
@@ -750,6 +755,7 @@ impl Op {
             | Op::NumericFloat(value)
             | Op::SaturatingInteger(value)
             | Op::IsString(value)
+            | Op::Truthy(value)
             | Op::IsStringSplit(value)
             | Op::IsTypeof(value, _)
             | Op::AsObject(value)
@@ -866,6 +872,9 @@ impl Op {
             Op::LowLevel(
                 low_level::Op::Unary { value, .. }
                 | low_level::Op::Reference { value, .. }
+                | low_level::Op::ExtractBits { value, .. }
+                | low_level::Op::InRange { value, .. }
+                | low_level::Op::TestMask { value, .. }
                 | low_level::Op::Load { address: value, .. }
                 | low_level::Op::AtomicLoad { address: value, .. },
             ) => ([Some(value), None, None], &mut []),
@@ -989,6 +998,7 @@ impl Op {
             | Op::NumericFloat(value)
             | Op::SaturatingInteger(value)
             | Op::IsString(value)
+            | Op::Truthy(value)
             | Op::IsStringSplit(value)
             | Op::IsTypeof(value, _)
             | Op::AsObject(value)
@@ -2023,7 +2033,7 @@ impl Graph {
             | Op::SaturatingInteger(_)
             | Op::IntegerCheck(..)
             | Op::IsString(_) => closed(0, Unowned),
-            Op::IsTypeof(..) => closed(HEAP_READ, Unowned),
+            Op::IsTypeof(..) | Op::Truthy(_) => closed(HEAP_READ, Unowned),
             Op::AsNumber(_) => closed(INTERNAL, Unowned),
             Op::Convert(..) | Op::Box(_) | Op::AsBoxed(_) | Op::AsWord(_) | Op::Unbox(..) => {
                 closed(0, Unowned)

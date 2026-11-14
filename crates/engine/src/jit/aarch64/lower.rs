@@ -1229,6 +1229,9 @@ impl Lower<'_> {
                 return Err(Unsupported("unlowered runtime operation".into()));
             }
             L::VariableRead => return Err(Unsupported("unresolved variable".into())),
+            L::ExtractBits { .. } | L::InRange { .. } | L::TestMask { .. } => {
+                return Err(Unsupported("unexpanded bit operation".into()));
+            }
             L::Call { .. } => unreachable!(),
         };
         match opcode {

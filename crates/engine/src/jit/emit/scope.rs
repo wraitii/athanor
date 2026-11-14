@@ -3,7 +3,8 @@ use super::{FunctionCompiler, LoweredValue};
 use crate::jit::helpers::Helper;
 use crate::jit::semantic::Repr;
 use crate::jit::semantic::low_level::{Reference, Scratch};
-use crate::value::{TAG_OBJECT, TAG_SHIFT, TAG_STRING, Value};
+use crate::jit::semantic::runtime::layout;
+use crate::value::Value;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{MemFlagsData, types};
 use oxc_ast::ast::{
@@ -12,16 +13,9 @@ use oxc_ast::ast::{
 };
 use oxc_syntax::symbol::SymbolId;
 
-const _: () = assert!(TAG_STRING - TAG_OBJECT == 1 << TAG_SHIFT);
-
-pub(super) const ADDRESS_MASK: i64 = (1 << TAG_SHIFT) - 1;
-
 pub(super) fn is_heap(b: &mut FunctionBuilder<'_>, value: LoweredValue) -> LoweredValue {
     let value = b.as_word(value);
-    let tag = b.ins().ushr_imm_s(value, TAG_SHIFT as i64);
-    let first = (TAG_OBJECT >> TAG_SHIFT) as i64;
-    let offset = b.ins().iadd_imm_s(tag, -first);
-    b.ins().icmp_imm_s(IntCC::UnsignedLessThan, offset, 2)
+    layout::is_heap(b, value)
 }
 
 impl FunctionCompiler<'_, '_> {

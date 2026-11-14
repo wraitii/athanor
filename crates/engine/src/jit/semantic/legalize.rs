@@ -9,11 +9,30 @@ use super::{
 
 const NUMERIC: super::ValueType = super::ValueType::NUMBER.union(super::ValueType::UNDEFINED);
 
-fn branch_condition(graph: &Graph, facts: &Facts, value: Value) -> Use {
-    if graph.repr(value) == Repr::Boxed && facts.of(value).within(NUMERIC) {
-        Use::Exact(Repr::F64)
-    } else {
-        Use::Any
+pub(super) fn conditions(graph: &mut Graph, facts: &mut Facts) {
+    for block in facts.cfg.rpo.clone() {
+        let terminator = graph.blocks[block].terminator.as_ref().unwrap();
+        let TerminatorKind::Branch(value, ..) = terminator.kind else {
+            continue;
+        };
+        let types = facts.of(value);
+        if types.within(NUMERIC) || types.within(super::ValueType::BOOLEAN) {
+            continue;
+        }
+        let (span, source_name) = (terminator.span, terminator.source_name);
+        let end = graph.blocks[block].insts.len();
+        let (inst, truth) = graph.insert(block, end, span, Op::Truthy(value), true);
+        graph.insts[inst].source_name = source_name;
+        let truth = truth.unwrap();
+        facts.set(truth, super::ValueType::BOOLEAN);
+        let Some(Terminator {
+            kind: TerminatorKind::Branch(condition, ..),
+            ..
+        }) = &mut graph.blocks[block].terminator
+        else {
+            unreachable!()
+        };
+        *condition = truth;
     }
 }
 
@@ -167,10 +186,14 @@ impl Legalizer<'_> {
             }
             TerminatorKind::Return(value) => TerminatorKind::Return(tail(self, value, Repr::Boxed)),
             TerminatorKind::Branch(value, yes, no) => {
-                let value = match branch_condition(self.graph, self.facts, value) {
-                    Use::Exact(repr) => tail(self, value, repr),
-                    Use::Any => value,
+                let value = if self.graph.repr(value) == Repr::Boxed
+                    && self.facts.of(value).within(NUMERIC)
+                {
+                    tail(self, value, Repr::F64)
+                } else {
+                    value
                 };
+                let value = tail(self, value, Repr::I8);
                 let yes = self.edge(block, (span, source_name, location), yes);
                 let no = self.edge(block, (span, source_name, location), no);
                 TerminatorKind::Branch(value, yes, no)

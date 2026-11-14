@@ -455,6 +455,7 @@ impl Graph {
             }
             Op::IsNumber(value) => format!("is_number {value}"),
             Op::IsString(value) => format!("is_string {value}"),
+            Op::Truthy(value) => format!("truthy {value}"),
             Op::IsStringSplit(value) => format!("is_string_split {value}"),
             Op::StringSplitParts(receiver, args) => format!(
                 "split_parts {receiver}({})",

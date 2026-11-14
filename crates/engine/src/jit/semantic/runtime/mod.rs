@@ -2,6 +2,7 @@ pub(in crate::jit::semantic) mod arrays;
 pub(in crate::jit::semantic) mod cells;
 pub(in crate::jit) mod cleanup;
 pub(in crate::jit::semantic) mod helpers;
+pub(in crate::jit) mod layout;
 pub(in crate::jit::semantic) mod numeric;
 pub(in crate::jit) mod ownership;
 pub(in crate::jit::semantic) mod properties;

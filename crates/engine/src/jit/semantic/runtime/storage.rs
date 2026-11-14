@@ -3,6 +3,7 @@ use cranelift_codegen::ir::{MemFlagsData, types};
 
 use super::super::cursor::{Cursor, Insert};
 use super::super::{ArrayLayout, Cfg, FunctionState, Graph, Op, Repr, ValueType, low_level};
+use super::layout;
 
 pub(in crate::jit::semantic) fn lower_metadata(function: &mut FunctionState) -> bool {
     let graph = &mut function.graph;
@@ -161,22 +162,8 @@ pub(in crate::jit::semantic) fn lower_stores(function: &mut FunctionState) {
             };
             if checking {
                 let old = old.unwrap();
-                let shift = at.ins().iconst(types::I64, crate::value::TAG_SHIFT as i64);
-                let tag = at.ins().ushr(old, shift);
-                let first = at.ins().iconst(
-                    types::I64,
-                    (crate::value::TAG_OBJECT >> crate::value::TAG_SHIFT) as i64,
-                );
-                let tag = at.ins().isub(tag, first);
-                let two = at.ins().iconst(types::I64, 2);
-                let heap = at.ins().icmp(IntCC::UnsignedLessThan, tag, two);
-                let mask = at
-                    .ins()
-                    .iconst(types::I64, (1 << crate::value::TAG_SHIFT) - 1);
-                let raw_address = at.ins().band(old, mask);
-                let zero = at.ins().iconst(types::I64, 0);
-                let old_address = at.ins().select(heap, raw_address, zero);
-                let present = at.ins().icmp(IntCC::NotEqual, old_address, zero);
+                let old_address = layout::heap_address(&mut at, old);
+                let present = at.ins().icmp_imm_s(IntCC::NotEqual, old_address, 0);
                 if let Some(store) = store {
                     checked.insert(store, (address, old));
                 }

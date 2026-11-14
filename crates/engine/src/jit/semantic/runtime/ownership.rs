@@ -3,14 +3,11 @@ use cranelift_codegen::isa::CallConv;
 
 use super::super::low_level::{Builder, Reference, SignatureRef};
 use super::super::{Block, Cfg, Graph, Op, Value, low_level};
+use super::layout;
 use crate::FxHashMap;
 use crate::heap::REFERENCES_OFFSET;
 use crate::jit::helpers::{self, Helper};
 use crate::jit::session::{HELPERS_OFFSET, LOCALS_OFFSET};
-use crate::value::{TAG_OBJECT, TAG_SHIFT, TAG_STRING};
-
-const ADDRESS_MASK: i64 = (1 << TAG_SHIFT) - 1;
-const _: () = assert!(TAG_STRING - TAG_OBJECT == 1 << TAG_SHIFT);
 
 struct Lowering<'a, 'g> {
     b: &'a mut Builder<'g>,
@@ -48,12 +45,7 @@ impl Lowering<'_, '_> {
     }
 
     fn heap(&mut self, value: Value) -> Value {
-        let tag = self.b.ins().ushr_imm_s(value, TAG_SHIFT as i64);
-        let offset = self
-            .b
-            .ins()
-            .iadd_imm_s(tag, -((TAG_OBJECT >> TAG_SHIFT) as i64));
-        self.b.ins().icmp_imm_s(IntCC::UnsignedLessThan, offset, 2)
+        layout::is_heap(self.b, value)
     }
 
     fn retain_address(&mut self, address: Value) {
@@ -73,10 +65,7 @@ impl Lowering<'_, '_> {
     }
 
     fn retain(&mut self, value: Value) -> Block {
-        let heap = self.heap(value);
-        let address = self.b.ins().band_imm_s(value, ADDRESS_MASK);
-        let zero = self.b.ins().iconst(types::I64, 0);
-        let address = self.b.ins().select(heap, address, zero);
+        let address = layout::heap_address(self.b, value);
         let increment = self.b.create_block();
         let done = self.b.create_block();
         self.b.ins().brif(address, increment, &[], done, &[]);
@@ -101,7 +90,7 @@ impl Lowering<'_, '_> {
             self.b.switch_to_block(done);
             return done;
         }
-        let address = self.b.ins().band_imm_s(value, ADDRESS_MASK);
+        let address = layout::address(self.b, value);
         let load = self.b.create_block();
         let decrement = self.b.create_block();
         let last = self.b.create_block();

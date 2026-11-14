@@ -164,6 +164,21 @@ pub(in crate::jit) enum Op {
         yes: Value,
         no: Value,
     },
+    ExtractBits {
+        value: Value,
+        shift: u8,
+        width: u8,
+    },
+    InRange {
+        value: Value,
+        low: u64,
+        high: u64,
+        inside: bool,
+    },
+    TestMask {
+        value: Value,
+        mask: u64,
+    },
     Load {
         ty: Type,
         address: Value,
@@ -668,15 +683,13 @@ impl<I: Insert + ?Sized> Instructions<'_, I> {
         self.derived(Op::Binary { op, left, right }, left, right)
     }
 
-    binary_methods!(isub => Subtract, band => And, bor => Or, bxor => Xor,
-        ishl => ShiftLeft, sshr => ShiftRightSigned, ushr => ShiftRightUnsigned,
-        fadd => FloatAdd, fsub => FloatSubtract, fmul => FloatMultiply,
-        fdiv => FloatDivide, fmin => FloatMin, fmax => FloatMax);
+    binary_methods!(isub => Subtract, band => And, bor => Or, ishl => ShiftLeft,
+        fsub => FloatSubtract, fmul => FloatMultiply);
     immediate_methods!(iadd_imm_s => Add, iadd_imm_u => Add, imul_imm_s => Multiply,
         band_imm_s => And, band_imm_u => And, ishl_imm_s => ShiftLeft,
         ushr_imm_s => ShiftRightUnsigned);
 
-    unary_methods!(ceil => Ceil, floor => Floor, trunc => Trunc, sqrt => Sqrt);
+    unary_methods!(trunc => Trunc);
     conversion_methods!(ireduce => Reduce, sextend => SignExtend, uextend => ZeroExtend,
         fpromote => FloatPromote, fcvt_from_sint => FloatFromSigned,
         fcvt_from_uint => FloatFromUnsigned, fcvt_to_sint_sat => SignedSaturatingFromFloat);
@@ -746,6 +759,40 @@ impl<I: Insert + ?Sized> Instructions<'_, I> {
 
     pub(in crate::jit) fn select(&mut self, condition: Value, yes: Value, no: Value) -> Value {
         self.derived(Op::Select { condition, yes, no }, yes, no)
+    }
+
+    pub(in crate::jit) fn extract_bits(&mut self, value: Value, shift: u8, width: u8) -> Value {
+        let ty = self.inserter.graph().reprs[value]
+            .map(Repr::machine)
+            .expect("untyped low-level operand");
+        assert!(u32::from(shift) + u32::from(width) <= ty.bits() && width > 0);
+        self.value(Op::ExtractBits { value, shift, width }, ty)
+    }
+
+    pub(in crate::jit) fn in_range(&mut self, value: Value, low: u64, high: u64) -> Value {
+        self.range(value, low, high, true)
+    }
+
+    pub(in crate::jit) fn outside_range(&mut self, value: Value, low: u64, high: u64) -> Value {
+        self.range(value, low, high, false)
+    }
+
+    fn range(&mut self, value: Value, low: u64, high: u64, inside: bool) -> Value {
+        assert!(low <= high);
+        let op = Op::InRange {
+            value,
+            low,
+            high,
+            inside,
+        };
+        self.value(op, cranelift_codegen::ir::types::I8)
+    }
+
+    pub(in crate::jit) fn test_mask(&mut self, value: Value, mask: u64) -> Value {
+        self.value(
+            Op::TestMask { value, mask },
+            cranelift_codegen::ir::types::I8,
+        )
     }
 
     pub(in crate::jit) fn atomic_load(

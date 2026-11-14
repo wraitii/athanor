@@ -122,6 +122,12 @@ fn specific(graph: &Graph, inst: Inst) -> Option<Representations> {
             produces: None,
         },
         Op::LowLevel(super::low_level::Op::Store { .. }) => any(2, None),
+        Op::LowLevel(super::low_level::Op::ExtractBits { value, .. }) => {
+            any(1, Some(graph.repr(*value)))
+        }
+        Op::LowLevel(
+            super::low_level::Op::InRange { .. } | super::low_level::Op::TestMask { .. },
+        ) => any(1, Some(Repr::I8)),
         Op::LowLevel(super::low_level::Op::Reference { .. }) => any(1, None),
         Op::LowLevel(super::low_level::Op::Unary { op, ty, .. }) => Representations {
             uses: vec![match op {
@@ -149,7 +155,7 @@ fn specific(graph: &Graph, inst: Inst) -> Option<Representations> {
             uses: vec![Use::Exact(Repr::Boxed), Use::Exact(Repr::I64)],
             produces: None,
         },
-        Op::IsIndexed(_) | Op::IsString(_) => exact(&[Repr::Boxed], Repr::I8),
+        Op::IsIndexed(_) | Op::IsString(_) | Op::Truthy(_) => exact(&[Repr::Boxed], Repr::I8),
         Op::IsNumber(_) | Op::IsUninitialized(_) | Op::IsUndefined(_) | Op::IsNullish(_) => {
             any(1, Some(Repr::I8))
         }
@@ -201,7 +207,6 @@ fn generic(graph: &Graph, inst: Inst) -> Representations {
         | Op::ReadHint(..)
         | Op::Assume(..)
         | Op::ContinuationOutput(..)
-        | Op::OsrStart(..)
         | Op::LowLevel(_) => vec![Use::Any; count],
         Op::MapElement(..) => vec![Use::Exact(Repr::Boxed), Use::Exact(Repr::I64)],
         Op::GuardedCompare { numbers, .. } => [Use::Exact(Repr::Boxed); 2]
