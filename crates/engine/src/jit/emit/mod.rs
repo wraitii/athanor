@@ -1,12 +1,9 @@
-pub(super) mod class;
 pub(super) mod cranelift;
-pub(in crate::jit) mod expression;
 mod ops;
 mod poll;
 mod repr;
-pub(in crate::jit) mod scope;
+mod scope;
 mod semantic_graph;
-mod statement;
 pub(super) mod stubs;
 
 use crate::FxHashMap;
@@ -26,7 +23,6 @@ use crate::jit::function_data::{FUNCTION_DATA_BASE_OFFSET, FunctionData};
 use crate::jit::helpers::Helper;
 use crate::value::Value;
 
-pub(crate) use statement::statement_kind;
 pub(super) use stubs::Stubs;
 
 pub(super) enum FunctionKind {

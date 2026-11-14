@@ -421,7 +421,7 @@ impl<'a> Builder<'a> {
                 if flags.intersects(RegExpFlags::Y | RegExpFlags::D | RegExpFlags::V) {
                     return unsupported("regular expression flags y, d, and v", span);
                 }
-                if crate::jit::emit::expression::has_named_capture(pattern) {
+                if crate::jit::syntax::has_named_capture(pattern) {
                     return unsupported("named regular expression capture", span);
                 }
                 let bits = u8::from(flags.contains(RegExpFlags::I))
@@ -598,10 +598,7 @@ impl<'a> Builder<'a> {
             Expression::UpdateExpression(x) => return self.update(x),
             _ => {
                 return unsupported(
-                    &format!(
-                        "{} expression",
-                        crate::jit::emit::expression::expression_kind(expr)
-                    ),
+                    &format!("{} expression", crate::jit::syntax::expression_kind(expr)),
                     span,
                 );
             }
@@ -1879,7 +1876,7 @@ pub(super) fn lower_parts(
         builder.bind_pattern(&rest.rest.argument, value)?;
     }
     let mut var_symbols = Vec::new();
-    super::super::emit::scope::collect_var_symbols(statements, &mut var_symbols);
+    crate::jit::syntax::collect_var_symbols(statements, &mut var_symbols);
     var_symbols.sort_unstable();
     var_symbols.dedup();
     var_symbols.retain(|symbol| !builder.symbols.contains_key(symbol));

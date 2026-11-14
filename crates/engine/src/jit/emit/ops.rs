@@ -1,10 +1,10 @@
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
-use cranelift_codegen::ir::{MemFlagsData, Type, types};
+use cranelift_codegen::ir::{MemFlagsData, StackSlotData, StackSlotKind, Type, types};
 use cranelift_module::Module;
 use oxc_span::Span;
 use oxc_syntax::operator::BinaryOperator;
 
-use crate::error::Error;
+use crate::error::{Error, compile_at};
 use crate::heap::{CODE_OFFSET, DATA_OFFSET, KIND_OFFSET, LENGTH_OFFSET, SHAPE_OFFSET, TypedKind};
 use crate::jit::helpers::{
     self, CACHE_BUILTIN_KIND_OFFSET, CACHE_BUILTIN_VALUE_OFFSET, CACHE_ENTRY_OFFSET,
@@ -1212,5 +1212,38 @@ impl FunctionCompiler<'_, '_> {
         self.unwind(target, &[]);
         self.switch(done);
         self.unchecked = None;
+    }
+}
+
+impl FunctionCompiler<'_, '_> {
+    pub(super) fn stack_values(
+        &mut self,
+        values: &[LoweredValue],
+        span: Span,
+    ) -> Result<LoweredValue, Error> {
+        if values.is_empty() {
+            return Ok(self.b.ins().iconst(self.pointer, 0));
+        }
+        let size = values
+            .len()
+            .checked_mul(8)
+            .filter(|size| *size <= i32::MAX as usize)
+            .ok_or_else(|| compile_at(span, "too many stack values"))?;
+        let slot = self.b.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            size as u32,
+            3,
+        ));
+        for (index, value) in values.iter().enumerate() {
+            let address = self
+                .b
+                .ins()
+                .stack_addr(self.pointer, slot, (index * 8) as i32);
+            let word = self.b.as_word(*value);
+            self.b
+                .ins()
+                .store(MemFlagsData::trusted(), word, address, 0);
+        }
+        Ok(self.b.ins().stack_addr(self.pointer, slot, 0))
     }
 }

@@ -7,11 +7,6 @@ use crate::jit::semantic::runtime::layout;
 use crate::value::Value;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{MemFlagsData, types};
-use oxc_ast::ast::{
-    BindingPattern, ForStatementInit, ForStatementLeft, Statement, VariableDeclaration,
-    VariableDeclarationKind,
-};
-use oxc_syntax::symbol::SymbolId;
 
 pub(super) fn is_heap(b: &mut FunctionBuilder<'_>, value: LoweredValue) -> LoweredValue {
     let value = b.as_word(value);
@@ -187,94 +182,5 @@ impl FunctionCompiler<'_, '_> {
 
     pub(super) fn is_heap(&mut self, value: LoweredValue) -> LoweredValue {
         is_heap(self.b, value)
-    }
-}
-
-pub(in crate::jit) fn collect_var_symbols(
-    statements: &[Statement<'_>],
-    symbols: &mut Vec<SymbolId>,
-) {
-    for statement in statements {
-        match statement {
-            Statement::VariableDeclaration(declaration)
-                if declaration.kind == VariableDeclarationKind::Var =>
-            {
-                collect_declaration_symbols(declaration, symbols);
-            }
-            Statement::BlockStatement(block) => collect_var_symbols(&block.body, symbols),
-            Statement::SwitchStatement(statement) => {
-                for case in &statement.cases {
-                    collect_var_symbols(&case.consequent, symbols);
-                }
-            }
-            Statement::IfStatement(statement) => {
-                collect_var_symbols(std::slice::from_ref(&statement.consequent), symbols);
-                if let Some(alternate) = &statement.alternate {
-                    collect_var_symbols(std::slice::from_ref(alternate), symbols);
-                }
-            }
-            Statement::DoWhileStatement(statement) => {
-                collect_var_symbols(std::slice::from_ref(&statement.body), symbols);
-            }
-            Statement::WhileStatement(statement) => {
-                collect_var_symbols(std::slice::from_ref(&statement.body), symbols);
-            }
-            Statement::TryStatement(statement) => {
-                collect_var_symbols(&statement.block.body, symbols);
-                if let Some(handler) = &statement.handler {
-                    collect_var_symbols(&handler.body.body, symbols);
-                }
-            }
-            Statement::ForInStatement(statement) => {
-                if let ForStatementLeft::VariableDeclaration(declaration) = &statement.left
-                    && declaration.kind == VariableDeclarationKind::Var
-                {
-                    collect_declaration_symbols(declaration, symbols);
-                }
-                collect_var_symbols(std::slice::from_ref(&statement.body), symbols);
-            }
-            Statement::ForOfStatement(statement) => {
-                if let ForStatementLeft::VariableDeclaration(declaration) = &statement.left
-                    && declaration.kind == VariableDeclarationKind::Var
-                {
-                    collect_declaration_symbols(declaration, symbols);
-                }
-                collect_var_symbols(std::slice::from_ref(&statement.body), symbols);
-            }
-            Statement::ForStatement(statement) => {
-                if let Some(ForStatementInit::VariableDeclaration(declaration)) = &statement.init
-                    && declaration.kind == VariableDeclarationKind::Var
-                {
-                    collect_declaration_symbols(declaration, symbols);
-                }
-                collect_var_symbols(std::slice::from_ref(&statement.body), symbols);
-            }
-            _ => {}
-        }
-    }
-}
-
-fn collect_declaration_symbols(declaration: &VariableDeclaration<'_>, symbols: &mut Vec<SymbolId>) {
-    for declarator in &declaration.declarations {
-        match &declarator.id {
-            BindingPattern::BindingIdentifier(identifier) => {
-                symbols.push(identifier.symbol_id.get().unwrap())
-            }
-            BindingPattern::ArrayPattern(pattern) => {
-                for element in pattern.elements.iter().flatten() {
-                    if let BindingPattern::BindingIdentifier(identifier) = element {
-                        symbols.push(identifier.symbol_id.get().unwrap());
-                    }
-                }
-            }
-            BindingPattern::ObjectPattern(pattern) => {
-                for property in &pattern.properties {
-                    if let BindingPattern::BindingIdentifier(identifier) = &property.value {
-                        symbols.push(identifier.symbol_id.get().unwrap());
-                    }
-                }
-            }
-            _ => {}
-        }
     }
 }

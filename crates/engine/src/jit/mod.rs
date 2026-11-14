@@ -23,6 +23,7 @@ pub(crate) mod profile;
 pub(crate) mod recompile;
 mod semantic;
 mod session;
+mod syntax;
 mod tiering;
 mod variants;
 

@@ -25,7 +25,7 @@ use super::clif::{Annotations, FunctionBody};
 use super::entries::{Entry, VariantId};
 use super::function_data::FunctionData;
 use super::machine::MachineCode;
-use super::{analysis::CaptureAnalysis, emit, jitdump};
+use super::{analysis::CaptureAnalysis, emit, jitdump, syntax};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum CompilationTier {
@@ -600,7 +600,7 @@ impl Compiler {
                     declarations.push((name, function));
                 }
                 Statement::ClassDeclaration(class) => {
-                    emit::class::validate_class(class)?;
+                    syntax::validate_class(class)?;
                     globals.push(class.id.as_ref().unwrap().name.to_string());
                 }
                 Statement::EmptyStatement(_) | Statement::ExpressionStatement(_) => {}
@@ -623,7 +623,10 @@ impl Compiler {
                 | Statement::ExportNamedDeclaration(_) => {
                     return Err(unsupported_at(
                         statement.span(),
-                        format!("{} statement at top level", emit::statement_kind(statement)),
+                        format!(
+                            "{} statement at top level",
+                            syntax::statement_kind(statement)
+                        ),
                     ));
                 }
                 _ => {}
@@ -758,7 +761,7 @@ impl Compiler {
         let mut pending = Vec::new();
         for node in nodes.iter() {
             if let AstKind::Class(class) = node.kind() {
-                emit::class::validate_class(class)?;
+                syntax::validate_class(class)?;
                 if class.body.body.iter().any(|element| {
                     matches!(element,
                     oxc_ast::ast::ClassElement::MethodDefinition(method)
