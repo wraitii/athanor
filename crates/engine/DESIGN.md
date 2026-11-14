@@ -441,7 +441,7 @@ remain future work.
 
 ## Loop lowering
 
-`jit/emit/loops.rs` lowers loops directly into Cranelift blocks, preserving Oxc
+`jit/semantic/build.rs` lowers loops directly into semantic graph blocks, preserving Oxc
 binding identities and capture analysis. While, do-while, and for loops share a
 stack of break and optional continue targets. Break selects the innermost
 loop or switch; continue selects the innermost loop. Continue targets the test for while/do-while and the update for for loops.
@@ -1191,8 +1191,8 @@ Shared ArrayBuffer storage, views, offsets, detachment, typed-array prototypes,
 custom properties, and other constructor or method forms are unsupported.
 This initial implementation stores each typed array independently.
 
-Bitwise and shift operators have guarded int32 IR paths emitted through shared boxing and
-unboxing routines in `jit/emit/ir_helpers.rs`. Unboxing uses saturating conversion
+Bitwise and shift operators have guarded int32 IR paths built from the integer checks in
+`jit/semantic/runtime/values.rs` and boxing in `jit/semantic/repr.rs`. Unboxing uses saturating conversion
 and compares the boxed round trip, rejecting nonnumeric values, fractions,
 out-of-range numbers, and negative zero. Semantic Int32 operands use typed
 emission without a boxed guard. Unknown operands keep the guard, fallback
