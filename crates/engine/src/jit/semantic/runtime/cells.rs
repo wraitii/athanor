@@ -195,7 +195,7 @@ fn lower_inst(
         _ => None,
     };
     if let Some(op) = lowered_op {
-        graph.insts[inst].op = op;
+        graph.set_op(inst, op);
     }
 }
 

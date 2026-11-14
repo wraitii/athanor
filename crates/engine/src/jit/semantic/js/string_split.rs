@@ -305,7 +305,7 @@ pub(in crate::jit::semantic) fn forward_packs(graph: &mut Graph) {
             let Op::StringSplit(receiver, args) = graph.insts[producer].op.clone() else {
                 continue;
             };
-            graph.insts[producer].op = Op::StringSplitParts(receiver, args);
+            graph.set_op(producer, Op::StringSplitParts(receiver, args));
             aliases.insert(graph.insts[inst].result().unwrap(), array);
             graph.remove_inst(inst);
         }
@@ -348,7 +348,7 @@ mod tests {
                 } = graph.insts[inst].op.clone()
                     && matches!(graph.defining_op(callee), Some(Op::Get(_, name)) if name == "split")
                 {
-                    graph.insts[inst].op = Op::StringSplit(receiver, args);
+                    graph.set_op(inst, Op::StringSplit(receiver, args));
                 }
             }
         }
@@ -374,7 +374,7 @@ mod tests {
             let Op::GetIndex(array, index) = graph.insts[read].op else {
                 panic!()
             };
-            graph.insts[read].op = Op::PackTake(array, index);
+            graph.set_op(read, Op::PackTake(array, index));
             let facts = super::super::super::Facts::compute(&graph);
             assert!(facts.indexed(array));
             assert_eq!(facts.of(graph.insts[read].result().unwrap()), expected);

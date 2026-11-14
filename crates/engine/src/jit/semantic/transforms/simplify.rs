@@ -31,10 +31,10 @@ pub(in crate::jit::semantic) fn simplify(function: &mut FunctionState, folder: &
         let mut cfg_changed = folder.refine(graph, cfg);
         let mut changed = cfg_changed;
         for &block in &cfg.rpo {
-            for &inst in &graph.blocks[block].insts {
+            for inst in graph.blocks[block].insts.clone() {
                 match folder.fold(graph, facts, inst) {
                     Some(Fold::Op(op)) => {
-                        graph.insts[inst].op = op;
+                        graph.set_op(inst, op);
                         changed = true;
                         continue;
                     }

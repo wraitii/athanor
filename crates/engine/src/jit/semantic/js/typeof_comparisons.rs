@@ -43,7 +43,7 @@ pub(in crate::jit::semantic) fn typeof_comparisons(graph: &mut Graph) {
                 unreachable!();
             };
             // Keep TDZ errors at the original typeof evaluation point.
-            graph.insts[typeof_inst].op = Op::CheckInitialized(operand);
+            graph.set_op(typeof_inst, Op::CheckInitialized(operand));
             graph.insts[typeof_inst].results.clear();
             if uses[literal] == 1 {
                 let ValueDef::Result(literal_inst, _) = graph.values[literal] else {
@@ -58,7 +58,7 @@ pub(in crate::jit::semantic) fn typeof_comparisons(graph: &mut Graph) {
             } else {
                 Op::IsTypeof(operand, kind)
             };
-            graph.insts[inst].op = if operator == BinaryOperator::StrictEquality {
+            let op = if operator == BinaryOperator::StrictEquality {
                 test
             } else {
                 let position = graph.blocks[block]
@@ -70,6 +70,7 @@ pub(in crate::jit::semantic) fn typeof_comparisons(graph: &mut Graph) {
                 let (_, result) = graph.insert(block, position, span, test, true);
                 Op::Unary(UnaryOp::Not, result.unwrap())
             };
+            graph.set_op(inst, op);
         }
     }
 }

@@ -1535,6 +1535,20 @@ impl Graph {
         }
     }
 
+    pub(in crate::jit) fn set_op(&mut self, inst: Inst, op: Op) {
+        let kept = match (&op, self.insts[inst].result()) {
+            (Op::Constant(constant), Some(value)) => {
+                self.reprs[value].filter(|&repr| repr == Repr::Boxed || repr::fits(constant, repr))
+            }
+            _ => None,
+        };
+        let repr = kept.or_else(|| repr::intrinsic(&op));
+        for &value in &self.insts[inst].results {
+            self.reprs[value] = repr;
+        }
+        self.insts[inst].op = op;
+    }
+
     pub(in crate::jit) fn insert(
         &mut self,
         block: Block,
@@ -2169,13 +2183,10 @@ impl Graph {
                     return Err(format!("{block} passes wrong arity to {}", target.block));
                 }
                 for (&arg, &param) in target.args.iter().zip(&self.blocks[target.block].params) {
-                    let compatible = if self.low_level_signature.is_some() {
-                        match (self.reprs[arg], self.reprs[param]) {
-                            (Some(arg), Some(param)) => arg.compatible(param),
-                            (arg, param) => arg == param,
-                        }
-                    } else {
-                        self.reprs[arg] == self.reprs[param]
+                    let compatible = match (self.reprs[arg], self.reprs[param]) {
+                        (_, None) => true,
+                        (Some(arg), Some(param)) => arg.compatible(param),
+                        (None, Some(_)) => false,
                     };
                     if !compatible {
                         return Err(format!(

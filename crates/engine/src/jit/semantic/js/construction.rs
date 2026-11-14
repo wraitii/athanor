@@ -24,17 +24,20 @@ pub(in crate::jit::semantic) fn resolve(graph: &mut Graph) {
             );
             graph.insts[probe].source_name = graph.insts[inst].source_name;
             let prototype = prototype.unwrap();
-            graph.insts[inst].op = match graph.insts[inst].op.clone() {
-                Op::Construct { callee, args } => Op::ConstructResolved {
-                    callee,
-                    prototype,
-                    args,
+            graph.set_op(
+                inst,
+                match graph.insts[inst].op.clone() {
+                    Op::Construct { callee, args } => Op::ConstructResolved {
+                        callee,
+                        prototype,
+                        args,
+                    },
+                    Op::ConstructPack(callee, args) => {
+                        Op::ConstructPackResolved(callee, prototype, args)
+                    }
+                    _ => unreachable!(),
                 },
-                Op::ConstructPack(callee, args) => {
-                    Op::ConstructPackResolved(callee, prototype, args)
-                }
-                _ => unreachable!(),
-            };
+            );
         }
     }
 }

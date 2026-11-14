@@ -8,7 +8,7 @@ use oxc_syntax::operator::BinaryOperator;
 
 use super::super::cursor::{Cursor, Insert};
 use super::super::low_level::{Binary, Op as LowLevel, Unary};
-use super::super::{Constant, FunctionState, Op, UnaryOp, Value, ValueType};
+use super::super::{Constant, FunctionState, Op, Repr, UnaryOp, Value, ValueType};
 use crate::FxHashMap;
 
 pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) -> bool {
@@ -44,7 +44,7 @@ fn lower_checks(function: &mut FunctionState) -> bool {
                 Op::AsInteger(_) => Op::AsInteger(integer),
                 _ => unreachable!(),
             };
-            graph.insts[inst].op = op;
+            graph.set_op(inst, op);
         }
     }
     if changed {
@@ -97,7 +97,11 @@ pub(in crate::jit::semantic) fn arithmetic(function: &mut FunctionState) -> bool
                 left = at.add_unassigned(Op::NumericFloat(left));
                 right = at.add_unassigned(Op::NumericFloat(right));
             }
-            graph.insts[inst].op = Op::LowLevel(LowLevel::Binary { op, left, right });
+            graph.set_op(inst, Op::LowLevel(LowLevel::Binary { op, left, right }));
+            if integer {
+                let result = data.result().unwrap();
+                graph.reprs[result] = Some(Repr::of(facts.of(result)));
+            }
             changed = true;
         }
     }
@@ -149,17 +153,18 @@ fn integer_operations(function: &mut FunctionState) -> bool {
             let left = integer(left);
             let right = integer(right);
             let binary = LowLevel::Binary { op, left, right };
-            let replacement = if operator == BinaryOperator::ShiftRightZeroFill {
-                let value = at.add_unassigned(Op::LowLevel(binary));
-                Op::LowLevel(LowLevel::Unary {
+            if operator == BinaryOperator::ShiftRightZeroFill {
+                let value = at.add(Op::LowLevel(binary), Repr::I32);
+                let unsigned = LowLevel::Unary {
                     op: Unary::FloatFromUnsigned,
                     ty: types::F64,
                     value,
-                })
+                };
+                graph.set_op(inst, Op::LowLevel(unsigned));
             } else {
-                Op::LowLevel(binary)
-            };
-            graph.insts[inst].op = replacement;
+                graph.set_op(inst, Op::LowLevel(binary));
+                graph.reprs[data.result().unwrap()] = Some(Repr::I32);
+            }
             changed = true;
         }
     }
@@ -196,7 +201,7 @@ fn natives(function: &mut FunctionState) -> bool {
             }
             changed = true;
             if unary.is_none() && args.len() == 1 {
-                graph.insts[inst].op = Op::NumericFloat(args[0]);
+                graph.set_op(inst, Op::NumericFloat(args[0]));
                 continue;
             }
             let mut at = Cursor::before(graph, inst);
@@ -229,7 +234,7 @@ fn natives(function: &mut FunctionState) -> bool {
                     })
                 }
             };
-            graph.insts[inst].op = replacement;
+            graph.set_op(inst, replacement);
         }
     }
     if changed {
@@ -251,7 +256,6 @@ fn comparisons_and_unary(function: &mut FunctionState) -> bool {
         for inst in graph.blocks[block].insts.clone() {
             let data = graph.insts[inst].clone();
             let mut at = Cursor::before(graph, inst);
-            let mut insert = |op| at.add_unassigned(op);
             let replacement = match data.op {
                 Op::Binary(operator, left, right)
                 | Op::GuardedCompare {
@@ -287,17 +291,21 @@ fn comparisons_and_unary(function: &mut FunctionState) -> bool {
                     if !booleans && !(known(left, required) && known(right, required)) {
                         continue;
                     }
-                    if booleans
-                        || known(left, ValueType::INTEGER) && known(right, ValueType::INTEGER)
-                    {
+                    if booleans {
+                        Op::LowLevel(LowLevel::IntCompare {
+                            condition: integer_condition,
+                            left: boolean(&mut at, left),
+                            right: boolean(&mut at, right),
+                        })
+                    } else if known(left, ValueType::INTEGER) && known(right, ValueType::INTEGER) {
                         Op::LowLevel(LowLevel::IntCompare {
                             condition: integer_condition,
                             left,
                             right,
                         })
                     } else {
-                        let left = insert(Op::NumericFloat(left));
-                        let right = insert(Op::NumericFloat(right));
+                        let left = at.add_unassigned(Op::NumericFloat(left));
+                        let right = at.add_unassigned(Op::NumericFloat(right));
                         Op::LowLevel(LowLevel::FloatCompare {
                             condition: float_condition,
                             left,
@@ -324,9 +332,9 @@ fn comparisons_and_unary(function: &mut FunctionState) -> bool {
                     let value = if integer {
                         value
                     } else {
-                        insert(Op::NumericFloat(value))
+                        at.add_unassigned(Op::NumericFloat(value))
                     };
-                    let one = insert(Op::Constant(Constant::Number(1.0)));
+                    let one = at.add_unassigned(Op::Constant(Constant::Number(1.0)));
                     let op = match (integer, increment) {
                         (true, true) => Binary::Add,
                         (true, false) => Binary::Subtract,
@@ -340,7 +348,7 @@ fn comparisons_and_unary(function: &mut FunctionState) -> bool {
                     })
                 }
                 Op::Unary(UnaryOp::Negate, value) if known(value, numeric) => {
-                    let value = insert(Op::NumericFloat(value));
+                    let value = at.add_unassigned(Op::NumericFloat(value));
                     Op::LowLevel(LowLevel::Unary {
                         op: Unary::FloatNeg,
                         ty: types::F64,
@@ -348,7 +356,7 @@ fn comparisons_and_unary(function: &mut FunctionState) -> bool {
                     })
                 }
                 Op::Unary(UnaryOp::BitwiseNot, value) if known(value, numeric) => {
-                    let value = insert(Op::ToInt32(value));
+                    let value = at.add_unassigned(Op::ToInt32(value));
                     Op::LowLevel(LowLevel::Unary {
                         op: Unary::BitNot,
                         ty: types::I32,
@@ -359,22 +367,22 @@ fn comparisons_and_unary(function: &mut FunctionState) -> bool {
                     if known(value, numeric) || known(value, ValueType::BOOLEAN) =>
                 {
                     if known(value, ValueType::BOOLEAN) {
-                        let zero = insert(Op::Constant(Constant::Boolean(false)));
+                        let zero = at.add_unassigned(Op::Constant(Constant::Boolean(false)));
                         Op::LowLevel(LowLevel::IntCompare {
                             condition: IntCC::Equal,
-                            left: value,
+                            left: boolean(&mut at, value),
                             right: zero,
                         })
                     } else if known(value, ValueType::INTEGER) {
-                        let zero = insert(Op::Constant(Constant::Number(0.0)));
+                        let zero = at.add_unassigned(Op::Constant(Constant::Number(0.0)));
                         Op::LowLevel(LowLevel::IntCompare {
                             condition: IntCC::Equal,
                             left: value,
                             right: zero,
                         })
                     } else {
-                        let value = insert(Op::NumericFloat(value));
-                        let zero = insert(Op::Constant(Constant::Number(0.0)));
+                        let value = at.add_unassigned(Op::NumericFloat(value));
+                        let zero = at.add_unassigned(Op::Constant(Constant::Number(0.0)));
                         Op::LowLevel(LowLevel::FloatCompare {
                             condition: FloatCC::UnorderedOrEqual,
                             left: value,
@@ -384,7 +392,7 @@ fn comparisons_and_unary(function: &mut FunctionState) -> bool {
                 }
                 _ => continue,
             };
-            graph.insts[inst].op = replacement;
+            graph.set_op(inst, replacement);
             changed = true;
         }
     }
@@ -524,6 +532,13 @@ pub(in crate::jit::semantic) fn dispatch(function: &mut FunctionState) -> bool {
         function.invalidate_cfg();
     }
     !candidates.is_empty()
+}
+
+fn boolean(at: &mut Cursor<'_>, value: Value) -> Value {
+    if at.graph().reprs[value] == Some(Repr::Boolean) {
+        return value;
+    }
+    at.add(Op::Convert(value, Repr::Boolean), Repr::Boolean)
 }
 
 fn numeric_operands(op: &Op) -> Option<Vec<Value>> {

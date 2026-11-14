@@ -222,7 +222,7 @@ pub(in crate::jit::semantic) fn place_assumes(
                 if let Op::Call { callee, args, .. } = &graph.insts[*call].op
                     && *callee == value
                 {
-                    planning.insts[*call].op = Op::CallNative(native, args.clone());
+                    planning.set_op(*call, Op::CallNative(native, args.clone()));
                 }
             }
         }

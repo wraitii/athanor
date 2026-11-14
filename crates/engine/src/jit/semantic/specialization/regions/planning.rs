@@ -500,7 +500,10 @@ fn plan_region(
             let Op::Call { args, .. } = &planning.insts[requirement.call].op else {
                 unreachable!()
             };
-            planning.insts[requirement.call].op = Op::CallNative(requirement.native, args.clone());
+            planning.set_op(
+                requirement.call,
+                Op::CallNative(requirement.native, args.clone()),
+            );
         }
         let assumed: FxHashMap<Value, cranelift_module::FuncId> = calls
             .iter()
@@ -1664,7 +1667,7 @@ fn property_assumptions(graph: &mut Graph, notes: &mut Vec<String>) {
             !matches!(fact, Fact::Shape(_)) || !conflicting.contains(&canonical(object))
         });
         if let Some(fact) = fact {
-            graph.insts[inst].op = Op::Assume(object, fact, origin);
+            graph.set_op(inst, Op::Assume(object, fact, origin));
         } else {
             graph.detach_inst(inst);
         }

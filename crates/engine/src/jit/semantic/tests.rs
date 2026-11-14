@@ -1841,7 +1841,6 @@ fn arithmetic_lowering_preserves_value_contracts_before_legalization() {
             std::mem::discriminant(op),
             std::mem::discriminant(&expected)
         );
-        assert!(function.graph.reprs.values().all(Option::is_none));
         assert!(!numeric::arithmetic(&mut function));
         function.ensure_facts();
         let types = if expected.is_float() {
@@ -1905,7 +1904,6 @@ fn lowered_comparisons_and_steps_preserve_loop_facts() {
                 .iter()
                 .any(|op| matches!(op, Op::LowLevel(low_level::Op::IntCompare { .. })))
         );
-        assert!(function.graph.reprs.values().all(Option::is_none));
         function.lower_runtime().unwrap();
     }
 }
@@ -2534,7 +2532,7 @@ fn low_level_variables_resolve_diamond_and_loop() {
     );
     graph.terminate(body, span, TerminatorKind::Jump(Target::new(join)));
     let mut variables = Variables::default();
-    let variable = variables.declare(&mut graph, initial, super::Repr::Word);
+    let variable = variables.declare(&mut graph, initial, super::Repr::Boxed);
     variables.define(&mut graph, left, variable, changed);
     let joined = variables.read(&mut graph, join, span, variable);
     variables.define(&mut graph, body, variable, joined);
@@ -2682,7 +2680,7 @@ fn low_level_ssa_same_target_edges_receive_one_argument() {
     );
     graph.terminate(body, span, TerminatorKind::Jump(Target::new(join)));
     let mut variables = Variables::default();
-    let variable = variables.declare(&mut graph, initial, super::Repr::Word);
+    let variable = variables.declare(&mut graph, initial, super::Repr::Boxed);
     let value = variables.read(&mut graph, join, span, variable);
     variables.define(&mut graph, body, variable, changed);
     graph.terminate(exit, span, TerminatorKind::Return(value));

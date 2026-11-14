@@ -228,7 +228,7 @@ pub(in crate::jit::semantic) fn apply(
             )
             && facts.of(key).within(ValueType::NUMBER)
         {
-            graph.insts[read.inst].op = Op::ArrayGet(object, key);
+            graph.set_op(read.inst, Op::ArrayGet(object, key));
         }
         if read.typed
             && super::super::guards::holds(
@@ -240,13 +240,16 @@ pub(in crate::jit::semantic) fn apply(
             )
             && facts.of(key).within(ValueType::NUMBER)
         {
-            graph.insts[read.inst].op = Op::TypedIndex(
-                object,
-                key,
-                TypedRead {
-                    element: read.element,
-                    bounded: false,
-                },
+            graph.set_op(
+                read.inst,
+                Op::TypedIndex(
+                    object,
+                    key,
+                    TypedRead {
+                        element: read.element,
+                        bounded: false,
+                    },
+                ),
             );
             continue;
         }

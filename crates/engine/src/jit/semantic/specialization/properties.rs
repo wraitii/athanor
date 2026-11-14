@@ -124,7 +124,7 @@ pub(in crate::jit::semantic) fn shape_writes(graph: &mut Graph) {
             break;
         }
         for (inst, _, _, set) in failed {
-            graph.insts[inst].op = set;
+            graph.set_op(inst, set);
         }
     }
     for (inst, object, shape, _) in candidates {
@@ -179,7 +179,7 @@ pub(in crate::jit::semantic) fn rewrite(graph: &mut Graph) -> super::super::Resu
             if data.block == graph.entry {
                 super::super::guards::record_entry(graph, object, Fact::Shape(shape));
             }
-            graph.insts[inst].op = Op::ShapedGet(object, name, index);
+            graph.set_op(inst, Op::ShapedGet(object, name, index));
             continue;
         }
         let cache = read.cache.unwrap_or_else(|| {
@@ -220,7 +220,7 @@ pub(in crate::jit::semantic) fn lower_cache(
     let first = graph.blocks.len();
     let (block, done, fallback) = dispatch::split(graph, inst);
     graph.cold.remove(&fallback);
-    graph.insts[inst].op = Op::FillPropertyCache(object, cache, name.to_owned());
+    graph.set_op(inst, Op::FillPropertyCache(object, cache, name.to_owned()));
     let check = dispatch::append(
         graph,
         &data,

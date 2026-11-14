@@ -55,7 +55,7 @@ pub(in crate::jit::semantic) fn expose(function: &mut super::super::FunctionStat
                 if let Some(value) = value {
                     changed = true;
                     if operator == BinaryOperator::StrictEquality {
-                        graph.insts[inst].op = Op::IsUndefined(value);
+                        graph.set_op(inst, Op::IsUndefined(value));
                     } else {
                         let position = graph.blocks[block]
                             .insts
@@ -113,12 +113,15 @@ pub(in crate::jit::semantic) fn expose(function: &mut super::super::FunctionStat
                 checks.entry(value).or_default().push((block, *number));
             }
             changed = true;
-            graph.insts[inst].op = Op::GuardedCompare {
-                operator,
-                left,
-                right,
-                numbers,
-            };
+            graph.set_op(
+                inst,
+                Op::GuardedCompare {
+                    operator,
+                    left,
+                    right,
+                    numbers,
+                },
+            );
         }
     }
     graph.replace_uses(&aliases);

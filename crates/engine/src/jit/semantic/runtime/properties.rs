@@ -36,7 +36,7 @@ pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) -> super::su
             Cursor::before(graph, inst).add_unassigned(Op::PropertyCache(inst, name.clone()));
         let first = graph.blocks.len();
         let (block, continuation, fallback) = super::super::dispatch::split(graph, inst);
-        graph.insts[inst].op = Op::FillPropertyCache(object, cache, name.clone());
+        graph.set_op(inst, Op::FillPropertyCache(object, cache, name.clone()));
         let fast = graph.blocks.push(BlockData::default());
         let check = Cursor::at_end(graph, block, inst).add_unassigned(Op::IsIndexed(object));
         graph.blocks[block].terminator = Some(Terminator {
@@ -112,7 +112,10 @@ fn lower_stores(graph: &mut Graph) -> bool {
             Cursor::before(graph, inst).add_unassigned(Op::PropertyCache(inst, name.clone()));
         let first = graph.blocks.len();
         let (block, done, fallback) = super::super::dispatch::split(graph, inst);
-        graph.insts[inst].op = Op::FillPropertyStore(object, cache, name, value, write);
+        graph.set_op(
+            inst,
+            Op::FillPropertyStore(object, cache, name, value, write),
+        );
         let view = Cursor::at_end(graph, block, inst).add_unassigned(Op::View(object));
         let mut at = Cursor::at_end(graph, block, inst);
         let (overwrite, index) = if let Some(index) = shaped {
@@ -233,27 +236,33 @@ pub(in crate::jit::semantic) fn lower_accesses(
             Op::FillPropertyCache(object, cache, _) | Op::PrimePropertyCache(object, cache) => {
                 let fill = matches!(data.op, Op::FillPropertyCache(..));
                 let contract = graph.contract(&data.op, &function.facts);
-                graph.insts[inst].op = Op::HelperCall {
-                    helper: if fill {
-                        Helper::PropertyGetCached
-                    } else {
-                        Helper::PropertyCachePrime
+                graph.set_op(
+                    inst,
+                    Op::HelperCall {
+                        helper: if fill {
+                            Helper::PropertyGetCached
+                        } else {
+                            Helper::PropertyCachePrime
+                        },
+                        args: vec![object, cache],
+                        uses: vec![Repr::Boxed, Repr::Word],
+                        produces: fill.then_some(Repr::Boxed),
+                        contract,
                     },
-                    args: vec![object, cache],
-                    uses: vec![Repr::Boxed, Repr::Word],
-                    produces: fill.then_some(Repr::Boxed),
-                    contract,
-                };
+                );
             }
             Op::FillPropertyStore(object, cache, _, value, _) => {
                 let contract = graph.contract(&data.op, &function.facts);
-                graph.insts[inst].op = Op::HelperCall {
-                    helper: Helper::PropertySetCached,
-                    args: vec![object, cache, value],
-                    uses: vec![Repr::Boxed, Repr::Word, Repr::Boxed],
-                    produces: None,
-                    contract,
-                };
+                graph.set_op(
+                    inst,
+                    Op::HelperCall {
+                        helper: Helper::PropertySetCached,
+                        args: vec![object, cache, value],
+                        uses: vec![Repr::Boxed, Repr::Word, Repr::Boxed],
+                        produces: None,
+                        contract,
+                    },
+                );
             }
             _ => unreachable!(),
         }
@@ -275,7 +284,7 @@ fn lower_shaped(graph: &mut Graph, inst: Inst, object: Value, index: u32) {
     );
     let offset = at.ins().iconst(types::I64, i64::from(index) * 8);
     let address = at.ins().iadd(values, offset);
-    graph.insts[inst].op = Op::PropertyLoad(object, address);
+    graph.set_op(inst, Op::PropertyLoad(object, address));
 }
 
 struct PropertyLowering<'a> {
@@ -543,7 +552,7 @@ pub(in crate::jit::semantic) fn lower_loads(function: &mut FunctionState) {
                 address,
                 0,
             );
-            graph.insts[inst].op = Op::AsBoxed(word);
+            graph.set_op(inst, Op::AsBoxed(word));
         }
     }
 }

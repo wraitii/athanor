@@ -50,7 +50,7 @@ pub(in crate::jit::semantic) fn coercions(function: &mut super::super::FunctionS
                 *operand = graph.insert_value(block, position, span, Op::ToInt32(*operand));
                 position += 1;
             }
-            graph.insts[inst].op = op;
+            graph.set_op(inst, op);
             changed = true;
         }
     }

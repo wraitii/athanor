@@ -16,7 +16,7 @@ pub(in crate::jit::semantic) fn repair(graph: &mut Graph, values: &FxHashMap<Val
                     *value = repair.entering(graph, block, *value);
                 }
             }
-            graph.insts[inst].op = op;
+            graph.set_op(inst, op);
             if let Some(cache) = graph
                 .property_accesses
                 .get(&inst)

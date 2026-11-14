@@ -50,6 +50,12 @@ impl Legalizer<'_> {
         value: Value,
         repr: Repr,
     ) -> (Inst, Value) {
+        let op = match self.graph.defining_op(value) {
+            Some(Op::Constant(constant)) if super::repr::fits(constant, repr) => {
+                Op::Constant(constant.clone())
+            }
+            _ => Op::Convert(value, repr),
+        };
         let inst = self.graph.insts.next_key();
         let result = self.graph.values.push(ValueDef::Result(inst, 0));
         self.graph.insts.push(InstData {
@@ -58,7 +64,7 @@ impl Legalizer<'_> {
             span,
             block,
             results: vec![result],
-            op: Op::Convert(value, repr),
+            op,
         });
         self.graph.reprs[result] = Some(repr);
         self.facts.set(result, repr.coerce(self.facts.of(value)));
@@ -266,8 +272,28 @@ impl Legalizer<'_> {
     }
 }
 
+fn numbers(graph: &mut Graph, rpo: &[Block]) {
+    let mut aliases = FxHashMap::default();
+    for &block in rpo {
+        for inst in graph.blocks[block].insts.clone() {
+            let Op::AsNumber(input) = graph.insts[inst].op else {
+                continue;
+            };
+            let result = graph.insts[inst].result().unwrap();
+            if graph.repr(input) == graph.repr(result) {
+                aliases.insert(result, input);
+                graph.remove_inst(inst);
+            } else {
+                graph.set_op(inst, Op::Convert(input, graph.repr(result)));
+            }
+        }
+    }
+    graph.replace_uses(&aliases);
+}
+
 pub(super) fn legalize(graph: &mut Graph, facts: &mut Facts) {
     let rpo = facts.cfg.rpo.clone();
+    numbers(graph, &rpo);
     let blocks = graph.blocks.len();
     let mut legalizer = Legalizer { graph, facts };
     legalizer.results(&rpo);

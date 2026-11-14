@@ -27,7 +27,7 @@ pub(in crate::jit::semantic) fn lower_arrays(function: &mut FunctionState) -> bo
             let length = at.add_unassigned(Op::IndexedLength(object));
             let inside = at.add_unassigned(Op::IsInBounds(position, length));
             let valid = at.add_unassigned(Op::BooleanAnd(exact, inside));
-            graph.insts[inst].op = Op::BooleanAnd(matching, valid);
+            graph.set_op(inst, Op::BooleanAnd(matching, valid));
             changed = true;
         }
     }
@@ -60,7 +60,7 @@ pub(in crate::jit::semantic) fn lower_checks(function: &mut FunctionState) -> bo
                 },
                 _ => continue,
             };
-            graph.insts[inst].op = Op::LowLevel(op);
+            graph.set_op(inst, Op::LowLevel(op));
             changed = true;
         }
     }
@@ -86,10 +86,13 @@ pub(in crate::jit::semantic) fn lower_array_kinds(function: &mut FunctionState) 
             let mut at = Cursor::before(graph, inst);
             let kind = at.add_unassigned(Op::ArrayKind(object));
             let expected = at.add_unassigned(Op::Constant(Constant::Number(layout.kind() as f64)));
-            graph.insts[inst].op = Op::Binary(
-                oxc_syntax::operator::BinaryOperator::StrictEquality,
-                kind,
-                expected,
+            graph.set_op(
+                inst,
+                Op::Binary(
+                    oxc_syntax::operator::BinaryOperator::StrictEquality,
+                    kind,
+                    expected,
+                ),
             );
             changed = true;
         }
@@ -151,11 +154,14 @@ mod tests {
                 .position(|&i| i == inst)
                 .unwrap();
             let position = graph.insert_value(block, at, data.span, Op::ArrayPosition(key));
-            graph.insts[inst].op = Op::IsArrayIndex(
-                object,
-                key,
-                position,
-                super::super::super::ArrayLayout::Packed,
+            graph.set_op(
+                inst,
+                Op::IsArrayIndex(
+                    object,
+                    key,
+                    position,
+                    super::super::super::ArrayLayout::Packed,
+                ),
             );
             if mutate {
                 graph.append(block, data.span, Op::ArrayAppend(object, key, false), false);

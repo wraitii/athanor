@@ -149,16 +149,16 @@ fn pure(op: &Op) -> bool {
             | Op::ToInt32(_)
             | Op::AsNumber(_)
             | Op::LowLevel(
-            low_level::Op::Integer { .. }
-                | low_level::Op::Float64(_)
-                | low_level::Op::Unary { .. }
-                | low_level::Op::Binary { .. }
-                | low_level::Op::IntCompare { .. }
-                | low_level::Op::FloatCompare { .. }
-                | low_level::Op::Select { .. }
-                | low_level::Op::StackAddress { .. }
-                | low_level::Op::StackPointer { .. }
-        )
+                low_level::Op::Integer { .. }
+                    | low_level::Op::Float64(_)
+                    | low_level::Op::Unary { .. }
+                    | low_level::Op::Binary { .. }
+                    | low_level::Op::IntCompare { .. }
+                    | low_level::Op::FloatCompare { .. }
+                    | low_level::Op::Select { .. }
+                    | low_level::Op::StackAddress { .. }
+                    | low_level::Op::StackPointer { .. }
+            )
     )
 }
 

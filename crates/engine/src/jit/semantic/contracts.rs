@@ -1,6 +1,6 @@
 use crate::jit::helpers::Helper;
 
-use super::repr::{FloatWidth, IntegerWidth};
+use super::repr::{FloatWidth, IntegerWidth, element};
 use super::{
     Constant, Facts, Graph, Inst, MemoryFormat, MemoryOp, Op, Ownership, Repr, TypedRead, Value,
 };
@@ -33,14 +33,6 @@ fn position(graph: &Graph, value: Value) -> Use {
         Use::Exact(Repr::I64)
     } else {
         Use::Exact(Repr::F64)
-    }
-}
-
-fn element(kind: crate::heap::TypedKind) -> Repr {
-    use crate::heap::TypedKind as K;
-    match kind {
-        K::Float64 | K::Float32 | K::Uint32 => Repr::F64,
-        _ => Repr::I32,
     }
 }
 
@@ -86,12 +78,15 @@ fn specific(graph: &Graph, inst: Inst) -> Option<Representations> {
         }
         Op::LowLevel(super::low_level::Op::IntCompare { left, right, .. }) => {
             let (left, right) = (graph.repr(*left), graph.repr(*right));
-            if matches!((left, right), (Repr::Integer(_), Repr::Integer(_))) {
-                exact(&[Repr::INTEGER, Repr::INTEGER], Repr::Boolean)
-            } else if left.machine() == right.machine() {
-                exact(&[left, right], Repr::Boolean)
-            } else {
-                exact(&[Repr::I64, Repr::I64], Repr::Boolean)
+            match (left, right) {
+                (Repr::Boolean, Repr::Boolean | Repr::Boxed) | (Repr::Boxed, Repr::Boolean) => {
+                    exact(&[Repr::Boolean, Repr::Boolean], Repr::Boolean)
+                }
+                (Repr::Integer(_), Repr::Integer(_)) | (Repr::Boxed, _) | (_, Repr::Boxed) => {
+                    exact(&[Repr::INTEGER, Repr::INTEGER], Repr::Boolean)
+                }
+                _ if left.machine() == right.machine() => exact(&[left, right], Repr::Boolean),
+                _ => exact(&[Repr::I64, Repr::I64], Repr::Boolean),
             }
         }
         Op::LowLevel(super::low_level::Op::FloatCompare { .. }) => {
@@ -177,10 +172,8 @@ fn specific(graph: &Graph, inst: Inst) -> Option<Representations> {
         },
         Op::IsInteger(_) => exact(&[Repr::Boxed], Repr::Boolean),
         Op::ToInt32(_) => exact(&[Repr::I32], Repr::I32),
-        Op::AsNumber(value) => any(1, Some(graph.repr(*value))),
-        Op::IsCode(..) | Op::IsShape(..) | Op::IsTyped(..) => {
-            exact(&[Repr::Boxed], Repr::Boolean)
-        }
+        Op::AsNumber(_) => any(1, target),
+        Op::IsCode(..) | Op::IsShape(..) | Op::IsTyped(..) => exact(&[Repr::Boxed], Repr::Boolean),
         Op::IsPropertyCached(..) => exact(&[Repr::Boxed, Repr::Word], Repr::Boolean),
         Op::CachedProperty(..) | Op::FillPropertyCache(..) => {
             exact(&[Repr::Boxed, Repr::Word], Repr::Boxed)
@@ -189,9 +182,7 @@ fn specific(graph: &Graph, inst: Inst) -> Option<Representations> {
             uses: vec![Use::Exact(Repr::Boxed), Use::Exact(Repr::Word)],
             produces: None,
         },
-        Op::IsIndexed(_) | Op::IsString(_) | Op::Truthy(_) => {
-            exact(&[Repr::Boxed], Repr::Boolean)
-        }
+        Op::IsIndexed(_) | Op::IsString(_) | Op::Truthy(_) => exact(&[Repr::Boxed], Repr::Boolean),
         Op::IsNumber(_) | Op::IsUninitialized(_) | Op::IsUndefined(_) | Op::IsNullish(_) => {
             any(1, Some(Repr::Boolean))
         }

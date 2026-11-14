@@ -58,7 +58,7 @@ pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) -> super::su
             kind: TerminatorKind::Branch(inside, Target::new(load), Target::new(failure)),
         });
         read.bounded = true;
-        graph.insts[inst].op = Op::TypedIndex(object, position, read);
+        graph.set_op(inst, Op::TypedIndex(object, position, read));
         let undefined =
             Cursor::at_end(graph, failure, inst).add_unassigned(Op::Constant(Constant::Undefined));
         graph.blocks[failure].terminator = Some(Terminator {
@@ -121,7 +121,7 @@ pub(in crate::jit::semantic) fn lower_memory(function: &mut FunctionState) -> bo
                 index,
                 format,
             }));
-            graph.insts[inst].op = Op::MemoryNumber(raw, format);
+            graph.set_op(inst, Op::MemoryNumber(raw, format));
             Cursor::after(graph, inst).add_effect(Op::KeepAlive(object));
             changed = true;
         }

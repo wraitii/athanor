@@ -518,13 +518,16 @@ mod tests {
         let Op::GetIndex(object, index) = graph.insts[inst].op else {
             unreachable!()
         };
-        graph.insts[inst].op = Op::TypedIndex(
-            object,
-            index,
-            TypedRead {
-                element: Some(TypedKind::Uint16),
-                bounded: true,
-            },
+        graph.set_op(
+            inst,
+            Op::TypedIndex(
+                object,
+                index,
+                TypedRead {
+                    element: Some(TypedKind::Uint16),
+                    bounded: true,
+                },
+            ),
         );
         let mut function = FunctionState::from_graph(graph);
         function.prepare_osr(0).unwrap();

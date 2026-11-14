@@ -1350,7 +1350,7 @@ mod tests {
         else {
             panic!();
         };
-        graph.insts[inst].op = Op::GlobalRead("other".into());
+        graph.set_op(inst, Op::GlobalRead("other".into()));
         let regions =
             super::super::regions::version(&mut graph, &plan, None, &mut Vec::new()).unwrap();
         assert!(regions.is_empty());
@@ -1384,14 +1384,17 @@ mod tests {
         let super::super::super::ValueDef::Result(def, _) = graph.values[callee] else {
             panic!()
         };
-        graph.insts[def].op = Op::Closure(
-            graph.insts[def].span,
-            request.target,
-            false,
-            false,
-            false,
-            vec![],
-            None,
+        graph.set_op(
+            def,
+            Op::Closure(
+                graph.insts[def].span,
+                request.target,
+                false,
+                false,
+                false,
+                vec![],
+                None,
+            ),
         );
         install_summaries(&mut graph, &bodies, &mut Vec::new());
         assert!(!closed_calls(&graph).contains(&request.call));
@@ -1411,14 +1414,17 @@ mod tests {
         let super::super::super::ValueDef::Result(def, _) = graph.values[callee] else {
             panic!()
         };
-        graph.insts[def].op = Op::Closure(
-            graph.insts[def].span,
-            request.target,
-            false,
-            false,
-            false,
-            vec![],
-            None,
+        graph.set_op(
+            def,
+            Op::Closure(
+                graph.insts[def].span,
+                request.target,
+                false,
+                false,
+                false,
+                vec![],
+                None,
+            ),
         );
         install_summaries(&mut graph, &bodies, &mut Vec::new());
         assert!(closed_calls(&graph).contains(&request.call));

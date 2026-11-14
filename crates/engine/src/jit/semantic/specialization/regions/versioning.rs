@@ -236,7 +236,7 @@ pub(in crate::jit::semantic) fn apply_version(
             let copy = insts[&inst];
             if let Op::Call { callee, args, .. } = &graph.insts[copy].op {
                 callees.push(*callee);
-                graph.insts[copy].op = Op::CallNative(requirement.native, args.clone());
+                graph.set_op(copy, Op::CallNative(requirement.native, args.clone()));
             }
         }
     }
@@ -374,7 +374,7 @@ fn duplicate(
                 *value = values.get(value).copied().unwrap_or(*value);
             }
             let (copy, results) = if reuse {
-                graph.insts[inst].op = op;
+                graph.set_op(inst, op);
                 (inst, data.results.clone())
             } else {
                 graph.append_results(blocks[&block], data.span, op, data.results.len())
@@ -694,7 +694,7 @@ fn entry_checks(
             let ValueDef::Result(inst, _) = graph.values[condition] else {
                 unreachable!();
             };
-            graph.insts[insts[&inst]].op = Op::Constant(Constant::Boolean(true));
+            graph.set_op(insts[&inst], Op::Constant(Constant::Boolean(true)));
             (Some(op), key)
         } else {
             let key = graph

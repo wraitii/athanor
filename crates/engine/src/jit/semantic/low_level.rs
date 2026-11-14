@@ -674,7 +674,8 @@ impl<I: Insert + ?Sized> Instructions<'_, I> {
 
     fn derived(&mut self, op: Op, first: Value, second: Value) -> Value {
         let graph = self.inserter.graph();
-        let (first_repr, second_repr) = (graph.reprs[first], graph.reprs[second]);
+        let typed = |value: Value| graph.reprs[value].filter(|&repr| repr != Repr::Boxed);
+        let (first_repr, second_repr) = (typed(first), typed(second));
         if let (Some(first), Some(second)) = (first_repr, second_repr) {
             assert_eq!(
                 first.machine(),

@@ -37,7 +37,7 @@ pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) {
             let instance = at.as_word(instance);
             let condition = layout::is_object(&mut at, result);
             let select = at.ins().select(condition, result, instance);
-            graph.insts[inst].op = Op::AsBoxed(select);
+            graph.set_op(inst, Op::AsBoxed(select));
         }
     }
     graph.replace_uses(&aliases);

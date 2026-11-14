@@ -140,7 +140,7 @@ fn refine_string_guards(graph: &mut Graph, cfg: &Cfg) -> bool {
     }
     let mut changed = false;
     for &block in &cfg.rpo {
-        for &inst in &graph.blocks[block].insts {
+        for inst in graph.blocks[block].insts.clone() {
             let key = match graph.insts[inst].op {
                 Op::IsString(value) => (false, value),
                 Op::IsStringSplit(value) => (true, value),
@@ -152,7 +152,7 @@ fn refine_string_guards(graph: &mut Graph, cfg: &Cfg) -> bool {
             else {
                 continue;
             };
-            graph.insts[inst].op = Op::Constant(Constant::Boolean(*result));
+            graph.set_op(inst, Op::Constant(Constant::Boolean(*result)));
             changed = true;
         }
     }

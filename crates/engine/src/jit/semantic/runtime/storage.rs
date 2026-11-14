@@ -38,12 +38,15 @@ pub(in crate::jit::semantic) fn lower_metadata(function: &mut FunctionState) -> 
                     .1
                     .unwrap()
             });
-            graph.insts[inst].op = Op::LowLevel(low_level::Op::Load {
-                ty,
-                address: view,
-                offset,
-                flags: MemFlagsData::trusted(),
-            });
+            graph.set_op(
+                inst,
+                Op::LowLevel(low_level::Op::Load {
+                    ty,
+                    address: view,
+                    offset,
+                    flags: MemFlagsData::trusted(),
+                }),
+            );
             Cursor::after(graph, inst).add_effect(Op::KeepAlive(object));
             changed = true;
         }
@@ -103,7 +106,7 @@ pub(in crate::jit::semantic) fn lower_array_loads(function: &mut FunctionState) 
                 );
                 typed(at.ins().select(absent, undefined, raw), ValueType::INT64)
             };
-            graph.insts[inst].op = Op::AsBoxed(word);
+            graph.set_op(inst, Op::AsBoxed(word));
         }
     }
 }
@@ -208,11 +211,14 @@ pub(in crate::jit::semantic) fn lower_stores(function: &mut FunctionState) {
                     .iconst(types::I32, crate::heap::kind::NATIVE as i64);
                 let native_kind = at.ins().band(kind, mask);
                 let zero = at.ins().iconst(types::I32, 0);
-                graph.insts[inst].op = Op::LowLevel(low_level::Op::IntCompare {
-                    condition: IntCC::Equal,
-                    left: native_kind,
-                    right: zero,
-                });
+                graph.set_op(
+                    inst,
+                    Op::LowLevel(low_level::Op::IntCompare {
+                        condition: IntCC::Equal,
+                        left: native_kind,
+                        right: zero,
+                    }),
+                );
                 super::super::dispatch::extend_regions(graph, block, first_block);
                 continue;
             }

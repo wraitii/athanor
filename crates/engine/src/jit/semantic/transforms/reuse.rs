@@ -24,7 +24,7 @@ pub(in crate::jit::semantic) fn reuse_loads(function: &mut FunctionState) {
         .collect();
     graph.replace_uses(&aliases);
     for &(inst, value) in &solved.folded {
-        graph.insts[inst].op = Op::Constant(super::super::Constant::Boolean(value));
+        graph.set_op(inst, Op::Constant(super::super::Constant::Boolean(value)));
     }
     for &(inst, value) in &solved.reused {
         notes.push(format!("{} reuses {value}", graph.note_inst(inst)));

@@ -234,13 +234,16 @@ pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) {
                 args.push(value);
                 uses.push(repr);
             }
-            graph.insts[inst].op = Op::HelperCall {
-                helper: call.helper,
-                args,
-                uses,
-                produces: call.produces,
-                contract,
-            };
+            graph.set_op(
+                inst,
+                Op::HelperCall {
+                    helper: call.helper,
+                    args,
+                    uses,
+                    produces: call.produces,
+                    contract,
+                },
+            );
             let mut at = Cursor::after(graph, inst);
             for value in kept.into_iter().rev() {
                 at.add_effect(Op::KeepAlive(value));

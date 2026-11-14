@@ -3,8 +3,8 @@ use cranelift_codegen::ir::{MemFlagsData, Type, types};
 
 use super::low_level::{Builder, Op as LowOp, Unary};
 use super::{
-    Constant, Facts, Graph, Inst, MemoryFormat, MemoryOp, Op, TerminatorKind, Value, ValueDef,
-    ValueType, resolve,
+    Constant, Facts, Graph, Inst, MemoryFormat, MemoryOp, Op, TerminatorKind, TypedRead, Value,
+    ValueDef, ValueType, resolve,
 };
 use crate::FxHashMap;
 use crate::value::Value as JsValue;
@@ -195,7 +195,22 @@ pub(in crate::jit) fn widen(graph: &mut Graph) {
 pub(super) fn assign(graph: &mut Graph, facts: &Facts) {
     for value in graph.values.keys() {
         if graph.reprs[value].is_none() {
-            graph.reprs[value] = Some(representation(graph, facts, value));
+            let repr = representation(graph, facts, value);
+            if std::env::var_os("JS_JIT_REPR_ASSIGN").is_some() {
+                let kind = match graph.defining_op(value) {
+                    None => "param".to_owned(),
+                    Some(op) => {
+                        let text = format!("{op:?}");
+                        let end = text
+                            .match_indices(|c: char| !c.is_alphanumeric())
+                            .nth(if matches!(op, Op::LowLevel(_)) { 1 } else { 0 })
+                            .map_or(text.len(), |(i, _)| i);
+                        text[..end].to_owned()
+                    }
+                };
+                eprintln!("repr-assign {kind} {repr:?}");
+            }
+            graph.reprs[value] = Some(repr);
         }
     }
 }
@@ -206,10 +221,15 @@ pub(in crate::jit) fn intrinsic(op: &Op) -> Option<Repr> {
             LowOp::Load { ty, .. }
             | LowOp::AtomicLoad { ty, .. }
             | LowOp::Integer { ty, .. }
-            | LowOp::Unary { ty, .. }
+            | LowOp::Unary {
+                op: Unary::Bitcast,
+                ty,
+                ..
+            }
             | LowOp::StackAddress { ty, .. }
             | LowOp::StackPointer { ty },
         ) => Repr::from_machine(*ty),
+        Op::LowLevel(LowOp::Unary { ty, .. }) => Repr::numeric(*ty),
         Op::LowLevel(LowOp::Float64(_)) => Repr::F64,
         Op::LowLevel(
             LowOp::IntCompare { .. }
@@ -222,30 +242,107 @@ pub(in crate::jit) fn intrinsic(op: &Op) -> Option<Repr> {
         Op::Memory(MemoryOp::IndexedLoad { format, .. } | MemoryOp::Load { format, .. }) => {
             format.repr()
         }
-        Op::SaturatingInteger(_) => Repr::I64,
-        _ => return None,
+        Op::LowLevel(_) => return None,
+        Op::PropertyCache(..) | Op::AsWord(_) => Repr::Word,
+        Op::MemoryNumber(_, format) => match format {
+            MemoryFormat::U32 | MemoryFormat::F32 | MemoryFormat::F64 => Repr::F64,
+            _ => Repr::I32,
+        },
+        Op::Convert(_, repr) | Op::Unbox(_, repr) => *repr,
+        Op::NumericFloat(_) => Repr::F64,
+        Op::AsNumber(_) => return None,
+        Op::SaturatingInteger(_) | Op::AsInteger(_) | Op::ArrayPosition(_) => Repr::I64,
+        Op::ToInt32(_) | Op::ArrayKind(_) => Repr::I32,
+        Op::HelperCall { produces, .. } => produces.unwrap_or(Repr::Boxed),
+        Op::IntegerCheck(..)
+        | Op::IsInteger(_)
+        | Op::IsCode(..)
+        | Op::IsShape(..)
+        | Op::IsTyped(..)
+        | Op::IsPropertyCached(..)
+        | Op::IsIndexed(_)
+        | Op::IsString(_)
+        | Op::Truthy(_)
+        | Op::IsNumber(_)
+        | Op::IsUninitialized(_)
+        | Op::IsUndefined(_)
+        | Op::IsNullish(_)
+        | Op::CanOverwrite(..)
+        | Op::IsArray(..) => Repr::Boolean,
+        Op::TypedIndex(
+            _,
+            _,
+            TypedRead {
+                element: Some(kind),
+                bounded: true,
+            },
+        ) => element(*kind),
+        _ => Repr::Boxed,
     })
+}
+
+pub(in crate::jit) fn fits(constant: &Constant, repr: Repr) -> bool {
+    match (constant, repr) {
+        (Constant::Number(_), Repr::F64) | (Constant::Boolean(_), Repr::Boolean) => true,
+        (&Constant::Number(number), Repr::I32) => {
+            number == f64::from(number as i32) && !(number == 0.0 && number.is_sign_negative())
+        }
+        (&Constant::Number(number), Repr::I64) => {
+            number == number as i64 as f64 && !(number == 0.0 && number.is_sign_negative())
+        }
+        _ => false,
+    }
+}
+
+pub(super) fn element(kind: crate::heap::TypedKind) -> Repr {
+    use crate::heap::TypedKind as K;
+    match kind {
+        K::Float64 | K::Float32 | K::Uint32 => Repr::F64,
+        _ => Repr::I32,
+    }
+}
+
+fn follows(op: &Op) -> Option<[Value; 2]> {
+    match *op {
+        Op::LowLevel(LowOp::ExtractBits { value, .. }) => Some([value, value]),
+        Op::LowLevel(LowOp::Select { yes, no, .. }) => Some([yes, no]),
+        Op::LowLevel(LowOp::Binary { op, left, right }) if !op.is_integer_arithmetic() => {
+            Some([left, right])
+        }
+        _ => None,
+    }
 }
 
 fn representation(graph: &Graph, facts: &Facts, value: super::Value) -> Repr {
     let repr =
         |value: Value| graph.reprs[value].unwrap_or_else(|| representation(graph, facts, value));
-    if let Some(repr) = graph.defining_op(value).and_then(intrinsic) {
+    let op = graph.defining_op(value);
+    if let Some(repr) = op.and_then(intrinsic) {
         return repr;
     }
-    match graph.defining_op(value) {
-        Some(Op::LowLevel(super::low_level::Op::ExtractBits { value, .. })) => repr(*value),
-        Some(Op::LowLevel(super::low_level::Op::Binary { op, left, .. }))
-            if !op.is_integer_arithmetic() =>
-        {
-            repr(*left)
+    if let Some(inputs) = op.and_then(follows) {
+        let constant = |input: Value| matches!(graph.defining_op(input), Some(Op::Constant(_)));
+        let typed = inputs
+            .into_iter()
+            .map(|input| (constant(input), repr(input)))
+            .filter(|&(_, repr)| repr != Repr::Boxed);
+        if let Some((_, repr)) = typed.clone().min_by_key(|&(constant, _)| constant) {
+            return repr;
         }
-        Some(Op::LowLevel(super::low_level::Op::Select { yes, no, .. })) => {
-            let (yes, no) = (repr(*yes), repr(*no));
-            debug_assert_eq!(yes, no, "select arms disagree");
-            yes
+    }
+    if let Some(&Op::AsNumber(input)) = op {
+        let input = graph.reprs[input].unwrap_or_else(|| representation(graph, facts, input));
+        if matches!(input, Repr::Integer(_) | Repr::Float(_)) {
+            return input;
         }
-        _ => Repr::of(facts.of(value)),
+        return match Repr::of(facts.of(value)) {
+            repr @ (Repr::Integer(_) | Repr::Float(_)) => repr,
+            _ => Repr::F64,
+        };
+    }
+    match (op, Repr::of(facts.of(value))) {
+        (Some(Op::LowLevel(_)), Repr::Boxed) => Repr::I64,
+        (_, repr) => repr,
     }
 }
 
@@ -434,9 +531,6 @@ fn expansion(graph: &Graph, inst: Inst, stage: Stage) -> Option<(Value, Step)> {
     match (stage, &data.op) {
         (Stage::Words, &Op::Box(input)) => Some((input, Step::Box)),
         (Stage::Words, &Op::Unbox(input, to)) => Some((input, Step::Unbox(to))),
-        (Stage::Words, &Op::AsNumber(input)) if graph.repr(input) == Repr::Boxed => {
-            Some((input, Step::Convert(Repr::Boxed)))
-        }
         (Stage::Words, _) => None,
         (Stage::Machine, &Op::Convert(input, to)) => Some((input, Step::Convert(to))),
         (
@@ -445,8 +539,7 @@ fn expansion(graph: &Graph, inst: Inst, stage: Stage) -> Option<(Value, Step)> {
             | Op::SaturatingInteger(input)
             | Op::AsInteger(input)
             | Op::ArrayPosition(input)
-            | Op::ToInt32(input)
-            | Op::AsNumber(input)),
+            | Op::ToInt32(input)),
         ) => Some((input, Step::Convert(graph.repr(data.result()?)))),
         _ => None,
     }
@@ -513,7 +606,7 @@ fn from_integer(graph: &Graph, value: Value) -> bool {
             op: Unary::FloatFromSigned | Unary::FloatFromUnsigned,
             ..
         })) => return true,
-        Some(Op::Convert(input, _) | Op::NumericFloat(input) | Op::AsNumber(input)) => *input,
+        Some(Op::Convert(input, _) | Op::NumericFloat(input)) => *input,
         _ => return false,
     };
     matches!(graph.repr(input), Repr::Integer(_) | Repr::Boolean)
