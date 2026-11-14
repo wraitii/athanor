@@ -4,6 +4,7 @@ pub(in crate::jit::semantic) mod captures;
 mod coercions;
 pub(in crate::jit::semantic) mod comparisons;
 pub(in crate::jit::semantic) mod construction;
+pub(in crate::jit::semantic) mod conversions;
 mod folding;
 pub(in crate::jit::semantic) mod string_split;
 mod typeof_comparisons;

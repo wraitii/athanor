@@ -254,7 +254,7 @@ pub(in crate::jit) fn intrinsic(op: &Op) -> Option<Repr> {
         Op::Memory(MemoryOp::IndexedLoad { format, .. } | MemoryOp::Load { format, .. }) => {
             format.repr()
         }
-        Op::LowLevel(_) => return None,
+        Op::LowLevel(_) | Op::Aarch64(_) => return None,
         Op::PropertyCache(..) | Op::AsWord(_) => Repr::Word,
         Op::MemoryNumber(_, format) => match format {
             MemoryFormat::U32 | MemoryFormat::F32 | MemoryFormat::F64 => Repr::F64,
@@ -362,6 +362,7 @@ pub(in crate::jit) fn steps(from: Repr, to: Repr) -> Vec<Step> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Stage {
     Words,
+    Runtime,
     Machine,
 }
 
@@ -386,6 +387,10 @@ pub(in crate::jit) fn lower(builder: &mut Builder<'_>) -> Result<(), String> {
     rewrite(builder, Stage::Machine)
 }
 
+pub(super) fn lower_conversions(builder: &mut Builder<'_>) -> Result<(), String> {
+    rewrite(builder, Stage::Runtime)
+}
+
 fn rewrite(builder: &mut Builder<'_>, stage: Stage) -> Result<(), String> {
     let mut aliases = FxHashMap::default();
     for block in builder.graph.blocks.keys().collect::<Vec<_>>() {
@@ -395,7 +400,7 @@ fn rewrite(builder: &mut Builder<'_>, stage: Stage) -> Result<(), String> {
             if let Op::Constant(constant) = &builder.graph.insts[inst].op {
                 let result = builder.graph.insts[inst].result().unwrap();
                 let repr = builder.graph.repr(result);
-                if (stage == Stage::Words) == (repr == Repr::Boxed) {
+                if stage != Stage::Runtime && (stage == Stage::Words) == (repr == Repr::Boxed) {
                     builder.graph.insts[inst].op = Op::LowLevel(constant_op(constant, repr));
                     if repr == Repr::Boxed {
                         builder.graph.reprs[result] = Some(Repr::Word);
@@ -427,7 +432,13 @@ fn rewrite(builder: &mut Builder<'_>, stage: Stage) -> Result<(), String> {
             builder.set_span(span);
             builder.set_location(location);
             builder.set_source_name(source_name);
-            aliases.insert(result, apply(builder, input, from, step)?);
+            let converted = match (stage, step) {
+                (Stage::Runtime, Step::Convert(to)) => {
+                    super::js::conversions::convert(builder, input, from, to)
+                }
+                _ => apply(builder, input, from, step)?,
+            };
+            aliases.insert(result, converted);
             position = builder.cursor().unwrap();
         }
     }
@@ -522,9 +533,14 @@ fn expansion(graph: &Graph, inst: Inst, stage: Stage) -> Option<(Value, Step)> {
         (Stage::Words, &Op::Box(input)) => Some((input, Step::Box)),
         (Stage::Words, &Op::Unbox(input, to)) => Some((input, Step::Unbox(to))),
         (Stage::Words, _) => None,
+        (Stage::Runtime, &Op::Convert(input, to))
+            if super::js::conversions::required(graph.repr(input), to) =>
+        {
+            Some((input, Step::Convert(to)))
+        }
         (Stage::Machine, &Op::Convert(input, to)) => Some((input, Step::Convert(to))),
         (
-            Stage::Machine,
+            Stage::Runtime,
             &(Op::NumericFloat(input)
             | Op::SaturatingInteger(input)
             | Op::AsInteger(input)
@@ -635,21 +651,16 @@ fn boxed(constant: &Constant) -> JsValue {
 }
 
 fn fold(builder: &mut Builder<'_>, value: Value, from: Repr, to: Repr) -> Option<Value> {
-    let constant = match (builder.graph.defining_op(value)?, from) {
-        (Op::LowLevel(LowOp::Integer { bits, .. }), Repr::I32) => Ok(i64::from(*bits as i32)),
-        (Op::LowLevel(LowOp::Integer { bits, .. }), Repr::I64) => Ok(*bits as i64),
-        (Op::LowLevel(LowOp::Float64(bits)), Repr::F64) => Err(f64::from_bits(*bits)),
+    let integer = match (builder.graph.defining_op(value)?, from) {
+        (Op::LowLevel(LowOp::Integer { bits, .. }), Repr::I32) => i64::from(*bits as i32),
+        (Op::LowLevel(LowOp::Integer { bits, .. }), Repr::I64) => *bits as i64,
         _ => return None,
     };
     let mut ins = builder.ins();
-    Some(match (constant, to) {
-        (Ok(integer), Repr::I64) => ins.iconst(types::I64, integer),
-        (Ok(integer), Repr::I32) => ins.iconst(types::I32, i64::from(integer as i32)),
-        (Ok(integer), Repr::F64) => ins.f64const(integer as f64),
-        (Err(number), Repr::I64) => ins.iconst(types::I64, number as i64),
-        (Err(number), Repr::I32) => {
-            ins.iconst(types::I32, i64::from(crate::jit::helpers::to_int32(number)))
-        }
+    Some(match to {
+        Repr::I64 => ins.iconst(types::I64, integer),
+        Repr::I32 => ins.iconst(types::I32, i64::from(integer as i32)),
+        Repr::F64 => ins.f64const(integer as f64),
         _ => return None,
     })
 }
@@ -665,34 +676,13 @@ fn convert(builder: &mut Builder<'_>, value: Value, from: Repr, to: Repr) -> Val
     let mut ins = builder.ins();
     match (from, to) {
         (Repr::I64 | Repr::I32, Repr::F64) => ins.fcvt_from_sint(types::F64, value),
-        (Repr::F64, Repr::I32) => to_int32(builder, value),
         (Repr::Boolean, Repr::I32) => ins.uextend(types::I32, value),
         (Repr::Boolean, Repr::F64) => {
             let wide = ins.uextend(types::I32, value);
             ins.fcvt_from_uint(types::F64, wide)
         }
-        (Repr::Integer(_), Repr::Boolean) => ins.icmp_imm_s(IntCC::NotEqual, value, 0),
-        (Repr::F64, Repr::Boolean) => {
-            let zero = ins.f64const(0.0);
-            let negative = ins.fcmp(FloatCC::LessThan, value, zero);
-            let positive = ins.fcmp(FloatCC::GreaterThan, value, zero);
-            ins.boolean_or(negative, positive)
-        }
         (Repr::I32, Repr::I64) => ins.sextend(types::I64, value),
-        (Repr::F64, Repr::I64) => ins.fcvt_to_sint_sat(types::I64, value),
         (Repr::I64, Repr::I32) => ins.ireduce(types::I32, value),
         _ => unreachable!("conversion from {from:?} to {to:?}"),
     }
-}
-
-pub(in crate::jit) fn to_int32(builder: &mut Builder<'_>, float: Value) -> Value {
-    let mut ins = builder.ins();
-    let scale = ins.f64const(1.0 / 4294967296.0);
-    let scaled = ins.fmul(float, scale);
-    let wraps = ins.trunc(scaled);
-    let modulus = ins.f64const(4294967296.0);
-    let wrapped = ins.fmul(wraps, modulus);
-    let remainder = ins.fsub(float, wrapped);
-    let integer = ins.fcvt_to_sint_sat(types::I64, remainder);
-    ins.ireduce(types::I32, integer)
 }

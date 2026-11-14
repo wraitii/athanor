@@ -13,6 +13,39 @@ fn compile(arguments: &[&str], source: &str) -> Output {
 }
 
 #[test]
+#[cfg(target_arch = "aarch64")]
+fn native_selection_view_preserves_clif_inspection() {
+    let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
+        .env("JS_JIT_BACKEND", "native-only")
+        .env("JS_JIT_SSA", "1")
+        .env("JS_JIT_OSR", "0")
+        .env_remove("JS_JIT_JITDUMP")
+        .args([
+            "--compile",
+            "--filter",
+            "f",
+            "--after",
+            "aarch64-select",
+            "--clif",
+            "--asm",
+            "--eval",
+            "function f(a,b){return a*b+1;}",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("semantic IR f after aarch64-select"));
+    assert!(text.contains("aarch64-branch"));
+    assert!(text.contains("Cranelift IR before optimization"));
+    assert!(text.contains("machine code ("));
+}
+
+#[test]
 fn filter_selects_all_views_without_removing_inline_candidates() {
     let output = compile(
         &[

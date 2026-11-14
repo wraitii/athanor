@@ -1,4 +1,4 @@
-use crate::jit::semantic::{Block, Cfg, Graph, Inst, Op, Value, low_level};
+use crate::jit::semantic::{Block, Cfg, Graph, Value};
 use cranelift_codegen::entity::{EntityRef, SecondaryMap};
 
 #[derive(Clone, Copy, Debug)]
@@ -53,18 +53,15 @@ pub(super) fn compute(
     order: &[Block],
     cfg: &Cfg,
     cold: &SecondaryMap<Block, bool>,
-    remat: &SecondaryMap<Value, u32>,
-    operands: &dyn Fn(Inst, &mut Vec<Value>),
-    terminator_operands: &dyn Fn(Block, &mut Vec<Value>),
-    is_call: &dyn Fn(Inst) -> bool,
+    input: &super::graph::Input,
 ) -> Result<Liveness, String> {
+    let remat = &input.remat;
     let mut header = SecondaryMap::<Block, u32>::new();
     let mut last = SecondaryMap::<Block, u32>::new();
     let mut definition = SecondaryMap::<Value, Option<(Block, u32)>>::new();
     let mut uses = Vec::new();
     let mut recent = SecondaryMap::<Value, Option<(Block, usize)>>::new();
     let mut calls = Vec::new();
-    let mut values = Vec::new();
     let mut next = 0;
     for &block in order {
         header[block] = next;
@@ -75,9 +72,7 @@ pub(super) fn compute(
         for inst in graph.blocks[block].insts.iter().copied() {
             let index = next;
             next += 1;
-            values.clear();
-            operands(inst, &mut values);
-            for &value in &values {
+            for value in graph.insts[inst].op.operands_iter() {
                 if remat[value] == 1 {
                     continue;
                 }
@@ -92,11 +87,7 @@ pub(super) fn compute(
                     }
                 }
             }
-            if matches!(
-                graph.insts[inst].op,
-                Op::LowLevel(low_level::Op::Call { .. })
-            ) && is_call(inst)
-            {
+            if input.calls[inst] {
                 calls.push(call_position(index));
             }
             for &result in &graph.insts[inst].results {
@@ -108,9 +99,11 @@ pub(super) fn compute(
         let index = next;
         next += 1;
         {
-            values.clear();
-            terminator_operands(block, &mut values);
-            for &value in &values {
+            for value in graph.blocks[block]
+                .terminator
+                .iter()
+                .flat_map(|term| term.kind.operands_iter())
+            {
                 if remat[value] == 1 {
                     continue;
                 }
@@ -218,7 +211,10 @@ pub(super) fn compute(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jit::semantic::{Target, TerminatorKind, low_level::Builder};
+    use crate::jit::semantic::{
+        Target, TerminatorKind,
+        low_level::{self, Builder},
+    };
     use cranelift_codegen::ir::{AbiParam, Signature, types};
     use cranelift_codegen::isa::CallConv;
     use oxc_span::Span;
@@ -273,32 +269,20 @@ mod tests {
         drop(builder);
         let cfg = Cfg::new(&graph);
         let cold = SecondaryMap::new();
-        let remat = SecondaryMap::new();
-        let operands = |inst, values: &mut Vec<Value>| {
-            values.clear();
-            values.extend(graph.insts[inst].op.operands_iter());
-        };
-        let terminators = |block: Block, out: &mut Vec<Value>| {
-            out.extend(
-                graph.blocks[block]
-                    .terminator
-                    .as_ref()
-                    .unwrap()
-                    .kind
-                    .operands_iter(),
+        let mut input = super::super::graph::Input::default();
+        for value in graph.values.keys() {
+            input.classes[value] =
+                graph.reprs[value].and_then(|repr| super::super::RegClass::of(repr.machine()));
+        }
+        for (inst, data) in graph.insts.iter() {
+            input.calls[inst] = matches!(
+                data.op,
+                crate::jit::semantic::Op::LowLevel(
+                    crate::jit::semantic::low_level::Op::Call { .. }
+                )
             );
-        };
-        let live = compute(
-            &graph,
-            &cfg.rpo,
-            &cfg,
-            &cold,
-            &remat,
-            &operands,
-            &terminators,
-            &|_| true,
-        )
-        .unwrap();
+        }
+        let live = compute(&graph, &cfg.rpo, &cfg, &cold, &input).unwrap();
         assert_eq!(live.calls.len(), 1);
         assert!(live.of(results[0]).iter().any(|s| s.block == entry));
         assert!(
@@ -321,18 +305,8 @@ mod tests {
                 callee_saved: &[],
             },
         };
-        let allocation = super::super::graph::allocate(
-            &graph,
-            &cfg,
-            &cfg.rpo,
-            &target,
-            &[],
-            &operands,
-            &terminators,
-            &remat,
-            &|_| true,
-        )
-        .unwrap();
+        let allocation =
+            super::super::graph::allocate(&graph, &cfg, &cfg.rpo, &target, &input).unwrap();
         assert_ne!(
             allocation.place(carried, loop_block),
             allocation.place(results[1], loop_block)

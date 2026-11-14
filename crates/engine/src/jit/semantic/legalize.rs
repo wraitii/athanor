@@ -1,12 +1,15 @@
 use super::contracts::{Use, repr_contract};
 use super::{Block, Cfg, Graph, Op, Repr, TerminatorKind, low_level, repr, widths};
 
-pub(super) fn convert(graph: &mut Graph) -> Result<(), String> {
+pub(super) fn prepare(graph: &mut Graph) {
     widths::choose(graph);
     let cfg = Cfg::new(graph);
     operands(graph, &cfg.rpo);
     edges(graph, &cfg.rpo);
     conditions(graph, &cfg.rpo);
+}
+
+pub(in crate::jit) fn convert(graph: &mut Graph) -> Result<(), String> {
     repr::lower(&mut low_level::Builder::new(graph))
 }
 

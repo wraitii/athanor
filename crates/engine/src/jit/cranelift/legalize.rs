@@ -1,5 +1,18 @@
 use crate::jit::semantic::{Cfg, Graph, MemoryOp, Op};
 
+pub(in crate::jit) fn prepare(
+    graph: &mut Graph,
+    after: &mut dyn FnMut(&str, &Graph),
+) -> Result<(), String> {
+    crate::jit::semantic::legalize::convert(graph)?;
+    after("legalize-convert", graph);
+    crate::jit::semantic::bits::expand(graph);
+    after("bits", graph);
+    split_indexed_loads(graph);
+    after("cranelift-memory", graph);
+    graph.verify_machine()
+}
+
 pub(in crate::jit) fn split_indexed_loads(graph: &mut Graph) {
     for block in Cfg::new(graph).rpo {
         for inst in graph.blocks[block].insts.clone() {

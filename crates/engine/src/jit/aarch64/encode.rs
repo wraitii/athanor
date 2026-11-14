@@ -3,7 +3,7 @@ pub(super) const ZR: u8 = 31;
 pub(super) const FP: u8 = 29;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum Cond {
+pub(in crate::jit) enum Cond {
     Eq = 0,
     Ne = 1,
     Hs = 2,
@@ -42,7 +42,7 @@ impl Cond {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum Width {
+pub(in crate::jit) enum Width {
     W,
     X,
 }
@@ -57,7 +57,7 @@ impl Width {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum Float {
+pub(in crate::jit) enum Float {
     S,
     D,
 }
@@ -80,11 +80,12 @@ fn rd_rn_rm(rd: u8, rn: u8, rm: u8) -> u32 {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum Alu {
+pub(in crate::jit) enum Alu {
     Add,
     Sub,
     Subs,
     And,
+    Ands,
     Orr,
     Orn,
     Eor,
@@ -96,16 +97,12 @@ pub(super) fn alu(op: Alu, width: Width, rd: u8, rn: u8, rm: u8) -> u32 {
         Alu::Sub => 0x4B00_0000,
         Alu::Subs => 0x6B00_0000,
         Alu::And => 0x0A00_0000,
+        Alu::Ands => 0x6A00_0000,
         Alu::Orr => 0x2A00_0000,
         Alu::Orn => 0x2A20_0000,
         Alu::Eor => 0x4A00_0000,
     };
     base | width.sf() | rd_rn_rm(rd, rn, rm)
-}
-
-pub(super) fn add_lsl(width: Width, rd: u8, rn: u8, rm: u8, amount: u32) -> u32 {
-    debug_assert!(amount < 64);
-    alu(Alu::Add, width, rd, rn, rm) | (amount << 10)
 }
 
 pub(super) fn add_imm(width: Width, rd: u8, rn: u8, imm12: u32, shift12: bool) -> u32 {
@@ -137,8 +134,9 @@ pub(super) fn arith_imm(value: i64) -> Option<(u32, bool)> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum Logical {
+pub(in crate::jit) enum Logical {
     And,
+    Ands,
     Orr,
     Eor,
 }
@@ -193,6 +191,7 @@ fn bitmask(width: Width, value: u64) -> Option<u32> {
 pub(super) fn logical_imm(op: Logical, width: Width, rd: u8, rn: u8, value: u64) -> Option<u32> {
     let base = match op {
         Logical::And => 0x1200_0000,
+        Logical::Ands => 0x7200_0000,
         Logical::Orr => 0x3200_0000,
         Logical::Eor => 0x5200_0000,
     };
@@ -202,6 +201,17 @@ pub(super) fn logical_imm(op: Logical, width: Width, rd: u8, rn: u8, value: u64)
 fn bitfield(base: u32, width: Width, rd: u8, rn: u8, immr: u32, imms: u32) -> u32 {
     let n = if width == Width::X { 1 << 22 } else { 0 };
     base | width.sf() | n | (immr << 16) | (imms << 10) | rd_rn(rd, rn)
+}
+
+pub(super) fn extract_bits(width: Width, rd: u8, rn: u8, shift: u8, bits: u8) -> u32 {
+    bitfield(
+        0x5300_0000,
+        width,
+        rd,
+        rn,
+        u32::from(shift),
+        u32::from(shift) + u32::from(bits) - 1,
+    )
 }
 
 pub(super) fn shift_imm(op: Shift, width: Width, rd: u8, rn: u8, amount: u32) -> u32 {
@@ -291,7 +301,7 @@ pub(super) fn mul(width: Width, rd: u8, rn: u8, rm: u8) -> u32 {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum Shift {
+pub(in crate::jit) enum Shift {
     Lsl,
     Lsr,
     Asr,
@@ -314,12 +324,8 @@ pub(super) fn cset(rd: u8, cond: Cond) -> u32 {
     0x1A80_0400 | rd_rn_rm(rd, ZR, ZR) | ((cond.invert() as u32) << 12)
 }
 
-pub(super) fn tst_low_byte(rn: u8) -> u32 {
-    0x7200_1C1F | (u32::from(rn) << 5)
-}
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum Extend {
+pub(in crate::jit) enum Extend {
     Uxtb,
     Uxth,
     Uxtw,
@@ -343,15 +349,12 @@ pub(super) fn extend(op: Extend, width: Width, rd: u8, rn: u8) -> u32 {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum Mem {
+pub(in crate::jit) enum Mem {
     Ldrb,
-    Ldrsb,
     Strb,
     Ldrh,
-    Ldrsh,
     Strh,
     LdrW,
-    Ldrsw,
     StrW,
     LdrX,
     StrX,
@@ -364,9 +367,9 @@ pub(super) enum Mem {
 impl Mem {
     pub(super) fn size(self) -> u32 {
         match self {
-            Self::Ldrb | Self::Ldrsb | Self::Strb => 1,
-            Self::Ldrh | Self::Ldrsh | Self::Strh => 2,
-            Self::LdrW | Self::Ldrsw | Self::StrW | Self::LdrS | Self::StrS => 4,
+            Self::Ldrb | Self::Strb => 1,
+            Self::Ldrh | Self::Strh => 2,
+            Self::LdrW | Self::StrW | Self::LdrS | Self::StrS => 4,
             Self::LdrX | Self::StrX | Self::LdrD | Self::StrD => 8,
         }
     }
@@ -374,13 +377,10 @@ impl Mem {
     fn scaled(self) -> u32 {
         match self {
             Self::Ldrb => 0x3940_0000,
-            Self::Ldrsb => 0x3980_0000,
             Self::Strb => 0x3900_0000,
             Self::Ldrh => 0x7940_0000,
-            Self::Ldrsh => 0x7980_0000,
             Self::Strh => 0x7900_0000,
             Self::LdrW => 0xB940_0000,
-            Self::Ldrsw => 0xB980_0000,
             Self::StrW => 0xB900_0000,
             Self::LdrX => 0xF940_0000,
             Self::StrX => 0xF900_0000,
@@ -413,7 +413,7 @@ pub(super) fn mem_register(op: Mem, rt: u8, rn: u8, rm: u8) -> u32 {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum Index {
+pub(in crate::jit) enum Index {
     Lsl,
     Uxtw,
     Sxtw,
@@ -489,7 +489,7 @@ pub(super) fn b_cond(cond: Cond) -> u32 {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum FloatOp {
+pub(in crate::jit) enum FloatOp {
     Add,
     Sub,
     Mul,
@@ -511,12 +511,11 @@ pub(super) fn float_binary(op: FloatOp, ty: Float, rd: u8, rn: u8, rm: u8) -> u3
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum FloatUnary {
+pub(in crate::jit) enum FloatUnary {
     Mov,
     Abs,
     Neg,
     Sqrt,
-    Nearest,
     Ceil,
     Floor,
     Trunc,
@@ -528,7 +527,6 @@ pub(super) fn float_unary(op: FloatUnary, ty: Float, rd: u8, rn: u8) -> u32 {
         FloatUnary::Abs => 0x1E20_C000,
         FloatUnary::Neg => 0x1E21_4000,
         FloatUnary::Sqrt => 0x1E21_C000,
-        FloatUnary::Nearest => 0x1E24_4000,
         FloatUnary::Ceil => 0x1E24_C000,
         FloatUnary::Floor => 0x1E25_4000,
         FloatUnary::Trunc => 0x1E25_C000,

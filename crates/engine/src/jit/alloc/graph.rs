@@ -3,7 +3,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap};
 
 use super::liveness::{self, Segment};
-use crate::jit::semantic::{Block, Cfg, Graph, Inst, Op, Repr, Value, ValueDef, low_level};
+use crate::jit::semantic::{Block, Cfg, Graph, Inst, Value, low_level};
 use cranelift_codegen::entity::SecondaryMap;
 
 use super::{RegClass, Target};
@@ -49,21 +49,6 @@ impl Allocation {
     pub(crate) fn boundary(&self, block: Block) -> &[Value] {
         &self.boundary[block]
     }
-}
-
-pub(crate) fn constant(graph: &Graph, value: Value) -> Option<u64> {
-    let ValueDef::Result(inst, _) = graph.values[value] else {
-        return None;
-    };
-    let Op::LowLevel(low_level::Op::Integer { bits, ty }) = graph.insts[inst].op else {
-        return None;
-    };
-    let width = ty.bits();
-    Some(if width >= 64 {
-        bits
-    } else {
-        bits & ((1 << width) - 1)
-    })
 }
 
 const REGISTERS: usize = 32;
@@ -186,59 +171,54 @@ fn block_weights(
     weights
 }
 
-pub(crate) type Operands<'a> = &'a dyn Fn(Inst, &mut Vec<Value>);
+#[derive(Default)]
+pub(crate) struct Input {
+    pub classes: SecondaryMap<Value, Option<RegClass>>,
+    pub remat: SecondaryMap<Value, u32>,
+    pub calls: SecondaryMap<Inst, bool>,
+    pub copies: Vec<(Value, Value, Block)>,
+    pub hints: Vec<Hint>,
+}
 
-fn value_weights(
-    graph: &Graph,
-    blocks: &SecondaryMap<Block, f64>,
-    operands: Operands,
-    terminator_operands: &dyn Fn(Block, &mut Vec<Value>),
-) -> SecondaryMap<Value, f64> {
+fn value_weights(graph: &Graph, blocks: &SecondaryMap<Block, f64>) -> SecondaryMap<Value, f64> {
     let mut weights = SecondaryMap::<Value, f64>::new();
-    let mut values = Vec::new();
-    for block in graph.blocks.keys() {
+    for (block, data) in graph.blocks.iter() {
         let weight = blocks[block];
-        for &param in &graph.blocks[block].params {
+        for &param in &data.params {
             weights[param] += weight;
         }
-        for inst in graph.blocks[block].insts.iter().copied() {
-            values.clear();
-            operands(inst, &mut values);
-            for &value in &values {
+        for &inst in &data.insts {
+            for value in graph.insts[inst].op.operands_iter() {
                 weights[value] += weight;
             }
             for &result in &graph.insts[inst].results {
                 weights[result] += weight;
             }
         }
-        values.clear();
-        terminator_operands(block, &mut values);
-        for &value in &values {
-            weights[value] += weight;
+        if let Some(term) = &data.terminator {
+            for value in term.kind.operands_iter() {
+                weights[value] += weight;
+            }
         }
     }
     weights
 }
 
-fn copies(graph: &Graph, blocks: &SecondaryMap<Block, f64>) -> Vec<(Value, Value, f64)> {
-    let mut copies = Vec::new();
-    for block in graph.blocks.keys() {
-        let weight = blocks[block];
-        for &inst in &graph.blocks[block].insts {
-            let data = &graph.insts[inst];
-            if let Op::LowLevel(low_level::Op::Unary {
-                op: low_level::Unary::Bitcast | low_level::Unary::Reduce,
-                value,
-                ..
-            }) = data.op
-            {
-                copies.push((value, data.results[0], weight));
-            }
-        }
-        if let Some(term) = &graph.blocks[block].terminator {
+fn copies(
+    graph: &Graph,
+    blocks: &SecondaryMap<Block, f64>,
+    input: &Input,
+) -> Vec<(Value, Value, f64)> {
+    let mut copies: Vec<_> = input
+        .copies
+        .iter()
+        .map(|&(from, to, block)| (from, to, blocks[block]))
+        .collect();
+    for (block, data) in graph.blocks.iter() {
+        if let Some(term) = &data.terminator {
             for target in term.kind.targets() {
                 for (&arg, &param) in target.args.iter().zip(&graph.blocks[target.block].params) {
-                    copies.push((arg, param, weight));
+                    copies.push((arg, param, blocks[block]));
                 }
             }
         }
@@ -332,29 +312,18 @@ pub(crate) fn allocate(
     cfg: &Cfg,
     order: &[Block],
     target: &Target,
-    hints: &[Hint],
-    operands: Operands,
-    terminator_operands: &dyn Fn(Block, &mut Vec<Value>),
-    remat: &SecondaryMap<Value, u32>,
-    is_call: &dyn Fn(Inst) -> bool,
+    input: &Input,
 ) -> Result<Allocation, String> {
+    let remat = &input.remat;
+    let hints = &input.hints;
     let entry = graph.entry;
     let mut cold = SecondaryMap::new();
     for block in graph.blocks.keys() {
         cold[block] = graph.cold.contains(&block) && block != entry;
     }
-    let liveness = liveness::compute(
-        graph,
-        order,
-        cfg,
-        &cold,
-        remat,
-        operands,
-        terminator_operands,
-        is_call,
-    )?;
+    let liveness = liveness::compute(graph, order, cfg, &cold, input)?;
     let blocks = block_weights(graph, cfg, &cold);
-    let mut weights = value_weights(graph, &blocks, operands, terminator_operands);
+    let mut weights = value_weights(graph, &blocks);
     for value in graph.values.keys() {
         if remat[value] > 1 {
             weights[value] *= f64::from(remat[value] - 1) / 2.0;
@@ -368,16 +337,14 @@ pub(crate) fn allocate(
         if liveness.of(value).is_empty() {
             continue;
         }
-        let ty = graph.reprs[value]
-            .map(Repr::machine)
-            .ok_or_else(|| format!("missing type for {value}"))?;
-        let class = RegClass::of(ty).ok_or_else(|| format!("value type {ty}"))?;
+        let class =
+            input.classes[value].ok_or_else(|| format!("missing register class for {value}"))?;
         bundle_of[value] = Some(bundles.len());
         bundles.push(Bundle::single(class, value, weights[value]));
     }
 
     let mut partners = Vec::new();
-    for (a, b, weight) in copies(graph, &blocks) {
+    for (a, b, weight) in copies(graph, &blocks, input) {
         let (Some(x), Some(y)) = (bundle_of[a], bundle_of[b]) else {
             continue;
         };

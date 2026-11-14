@@ -72,11 +72,19 @@ cargo run -p js-runner -- --compile --filter paint --planner --clif --asm SCRIPT
 
 Use `--after PASS` to inspect runtime lowering boundaries, including `boxing`,
 `finalize-runtime`, `scratch`, `cleanup`, `ownership-lower`, `unbox`,
-`legalize-convert`, `bits`, and `cranelift-memory`. Scalar conversions remain
-pending through `unbox`; `legalize-convert` resolves them after runtime lowering.
-`cranelift-memory` shows the CLIF-specific memory expansion, constructing that
-view even when compiling with the native backend. An unknown pass reports the
+`scalar-semantics`, `legalize-convert`, `bits`, and `cranelift-memory`.
+`scalar-semantics` materializes numeric truthiness, wrapping and saturating
+conversions before backend preparation. Ordinary scalar conversions and compound
+bit operations remain in the shared graph. `legalize-convert`, `bits`, and
+`cranelift-memory` show Cranelift preparation, constructing that view even when
+compiling with the native backend. Native preparation resolves scalar conversions
+and consumes compound bit operations directly. An unknown pass reports the
 available pass names.
+
+With `JS_JIT_BACKEND=native-only`, `--after aarch64-select` shows the graph after
+native instruction selection, before allocation. Selected operations expose their
+actual register operands, including folded addresses and comparisons. Constants
+absorbed into immediate operands and unused intermediate operations are removed.
 
 Add `--execute 'JS'` to run the source initializer and then a JavaScript setup/call
 snippet. The snippet runs inside an immediately invoked arrow function appended

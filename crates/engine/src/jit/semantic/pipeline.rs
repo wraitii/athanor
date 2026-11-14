@@ -119,6 +119,8 @@ pub(in crate::jit) const LOW_LEVEL_PASSES: &[&str] = &[
     "cleanup",
     "ownership-lower",
     "unbox",
+    "scalar-semantics",
+    "aarch64-select",
     "legalize-convert",
     "bits",
     "cranelift-memory",
@@ -138,11 +140,10 @@ pub(in crate::jit) fn lower_low_level(
     repr::unbox(&mut low_level::Builder::new(graph))?;
     after("unbox", graph);
     graph.verify()?;
-    legalize::convert(graph)?;
-    after("legalize-convert", graph);
-    super::bits::expand(graph);
-    after("bits", graph);
-    graph.verify_machine()
+    legalize::prepare(graph);
+    repr::lower_conversions(&mut low_level::Builder::new(graph))?;
+    after("scalar-semantics", graph);
+    graph.verify()
 }
 
 pub(in crate::jit) fn lower_global(

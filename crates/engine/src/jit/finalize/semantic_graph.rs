@@ -314,6 +314,7 @@ impl FunctionCompiler<'_, '_> {
                     let target = data.result().map(|value| self.b.graph.repr(value));
                     'lowered: {
                         let result = match &data.op {
+                            Op::Aarch64(_) => unreachable!("target operation before selection"),
                             Op::LowLevel(_) => {
                                 return Err(Error::Compile(
                                     "low-level operation reached runtime lowering finalization"
@@ -1029,6 +1030,7 @@ impl FunctionCompiler<'_, '_> {
                 (target.block, args)
             };
             match &terminator.kind {
+                TerminatorKind::Aarch64Branch(..) => unreachable!("target branch before selection"),
                 TerminatorKind::CheckException(to, _) | TerminatorKind::Jump(to) => {
                     let (block, args) = target(self, to);
                     self.jump(block, &args);

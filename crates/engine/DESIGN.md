@@ -170,8 +170,9 @@ conversion of undefined to NaN. Numeric unary plus becomes an alias when no
 conversion is required. Boolean negation compares with false; numeric negation
 of truthiness tests for zero or NaN. Loop facts and predicate propagation recognize
 both JS operations and their lowered forms. Boxing insertion reconciles runtime
-representation boundaries before final runtime lowering. Scalar legalization and
-conversion expansion run afterward, and emission forwards the concrete operations.
+representation boundaries before final runtime lowering. Scalar semantic
+conversion expansion runs afterward, before the backend split. Backend
+preparation resolves the remaining ordinary scalar conversions.
 This lowering also runs when semantic optimization is disabled. Coercing operations
 retain their runtime paths. Binary bitwise operations and inline Math calls still
 use representation contracts to select typed or generic implementations during
@@ -1249,8 +1250,9 @@ Oxc AST -> build -> promote -> simplify -> canonical graph
         -> property/typed/metadata/numeric lowering -> ownership planning
         -> array loads and slot stores -> representation assignment -> boxing insertion
         -> shared runtime emission -> scratch/cleanup/reference lowering -> unboxing
-        -> scalar legalization/conversion -> bit expansion
-        -> native backend, or Cranelift memory expansion -> CLIF
+        -> scalar width/edge reconciliation -> semantic conversion expansion
+        -> native scalar conversion preparation -> native backend
+        or Cranelift scalar conversion/bit/memory expansion -> CLIF
 ```
 
 `semantic/pipeline.rs` owns canonicalization, specialization rounds, optimization,
@@ -1282,9 +1284,42 @@ OSR protocols, helper invocations and other remaining runtime operations.
 Boxing insertion emits `Box` and `Unbox` at runtime representation boundaries,
 leaving scalar operand, edge and branch conversions pending. Final runtime
 lowering expands these operations into word operations and scalar conversions.
-The combined late legalization/conversion pass chooses widths, reconciles scalar
-uses and edges, converts branch conditions to booleans, and expands conversions.
-The final machine verifier requires compatible edges and ABI arguments.
+Shared scalar preparation chooses widths and reconciles operand, edge and branch
+representations. JS-aware conversion lowering then materializes wrapping float
+to int32 conversion, numeric truthiness and saturating integer conversion in
+ordinary graph operations. Backend preparation receives this graph with ordinary
+scalar conversions and compound bit operations still present. AArch64 resolves
+the scalar conversions and consumes the bit operations directly. Cranelift expands
+scalar conversions, bit operations and indexed memory accesses before CLIF
+emission. Native compilation, Cranelift inspection and fallback prepare separate
+copies, preserving the shared input. The final machine verifier requires
+compatible edges and ABI arguments.
+
+The native AArch64 backend has four stages:
+
+- `aarch64/select.rs` resolves scalar conversions and rewrites the shared graph
+  into `Op::Aarch64` operations defined in `aarch64/inst.rs`. Instruction forms,
+  immediates, addressing modes and comparison fusion are explicit. Switches become
+  branches, and unused pure instructions are removed. Original definitions remain
+  available until selection has finished choosing every consumer's operands.
+- `aarch64/prepare.rs` gathers ABI assignments, register classes, call markers,
+  copy preferences and constant rematerialization costs from the selected graph.
+  This is separate from instruction selection and the allocation algorithm.
+- `alloc/` computes liveness and allocation using that metadata and ordinary
+  graph operands, definitions and edges. It does not inspect operation families.
+- `aarch64/emit.rs` resolves allocated locations, lays out the frame, emits ABI and
+  edge moves and encodes selected instructions. Frame addresses, spills, parallel
+  moves and branch distances are resolved here. It performs no semantic pattern
+  matching. `aarch64/asm.rs` owns physical register and memory emission, constant
+  materialization, move sequencing and branch fixups, independently of the graph
+  and allocation. The baseline already uses this assembler and can reuse these
+  operations without constructing allocation metadata.
+
+Comparisons fused into branches or selects are compound target operations, so
+their flag production and consumption stay adjacent. They expose the comparison
+inputs directly rather than keeping a redundant boolean value alive. The selected
+graph retains source locations independently of instruction grouping. Inspect it
+with `JS_JIT_BACKEND=native-only` and `--after aarch64-select`.
 
 Canonicalization, planning and optimization operate on the same `FunctionState`,
 containing the working graph, its facts, specialization plan, OSR plan and

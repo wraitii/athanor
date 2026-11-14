@@ -1,6 +1,6 @@
 mod access;
 mod available;
-mod bits;
+pub(in crate::jit) mod bits;
 mod borrow;
 pub(in crate::jit) mod boundary;
 mod boxing;
@@ -13,7 +13,7 @@ pub(in crate::jit) mod facts;
 mod fresh;
 mod guards;
 mod js;
-mod legalize;
+pub(in crate::jit) mod legalize;
 mod listing;
 pub(in crate::jit) mod low_level;
 pub(super) mod osr;
@@ -339,6 +339,7 @@ pub(super) enum PropertyWrite {
 #[derive(Clone, Debug)]
 pub(super) enum Op {
     LowLevel(low_level::Op),
+    Aarch64(crate::jit::aarch64::inst::Op),
     Observe(Value, super::profile::Observation, super::profile::Site),
     ReadHint(
         Value,
@@ -564,6 +565,7 @@ pub(super) enum TerminatorKind {
     CheckException(Target, Target),
     Yield(Span, Value, Target),
     Branch(Value, Target, Target),
+    Aarch64Branch(crate::jit::aarch64::inst::Condition, Target, Target),
     Switch(Value, Vec<(u128, Target)>, Target),
     Return(Value),
     ReturnValues(Vec<Value>),
@@ -612,7 +614,12 @@ impl Op {
     }
 
     pub(super) fn operands_iter(&self) -> impl Iterator<Item = Value> + '_ {
+        let mut machine = None;
         let (fixed, rest): ([Option<Value>; 3], &[Value]) = match self {
+            Op::Aarch64(op) => {
+                machine = Some(op.operands());
+                ([None; 3], &[])
+            }
             Op::LowLevel(
                 low_level::Op::Scratch { values, .. } | low_level::Op::Cleanup { values, .. },
             ) => ([None; 3], values),
@@ -851,11 +858,20 @@ impl Op {
                 ..
             } => ([Some(*callee), *receiver, None], args),
         };
-        fixed.into_iter().flatten().chain(rest.iter().copied())
+        fixed
+            .into_iter()
+            .flatten()
+            .chain(rest.iter().copied())
+            .chain(machine.into_iter().flatten())
     }
 
     pub(super) fn operands_mut(&mut self) -> impl Iterator<Item = &mut Value> + '_ {
+        let mut machine = None;
         let (fixed, rest): ([Option<&mut Value>; 3], &mut [Value]) = match self {
+            Op::Aarch64(op) => {
+                machine = Some(op.operands_mut());
+                ([None, None, None], &mut [])
+            }
             Op::LowLevel(
                 low_level::Op::Scratch { values, .. } | low_level::Op::Cleanup { values, .. },
             ) => ([None, None, None], values),
@@ -1094,7 +1110,11 @@ impl Op {
                 ..
             } => ([Some(callee), receiver.as_mut(), None], args),
         };
-        fixed.into_iter().flatten().chain(rest.iter_mut())
+        fixed
+            .into_iter()
+            .flatten()
+            .chain(rest.iter_mut())
+            .chain(machine.into_iter().flatten())
     }
 
     pub(super) fn write_target(&self) -> Option<Value> {
@@ -1117,6 +1137,7 @@ impl Op {
 
 impl TerminatorKind {
     pub(super) fn operands_mut(&mut self) -> impl Iterator<Item = &mut Value> + '_ {
+        let mut machine = None;
         let (first, rest, tail, cases): (
             Option<&mut Value>,
             &mut [Value],
@@ -1126,6 +1147,10 @@ impl TerminatorKind {
             TerminatorKind::Jump(target) => (None, &mut target.args, &mut [], None),
             TerminatorKind::CheckException(normal, error) => {
                 (None, &mut normal.args, &mut error.args, None)
+            }
+            TerminatorKind::Aarch64Branch(condition, yes, no) => {
+                machine = Some(condition.operands_mut());
+                (None, &mut yes.args, &mut no.args, None)
             }
             TerminatorKind::Branch(condition, yes, no) => {
                 (Some(condition), &mut yes.args, &mut no.args, None)
@@ -1158,6 +1183,7 @@ impl TerminatorKind {
                     .iter_mut()
                     .flat_map(|(_, target)| target.args.iter_mut())
             }))
+            .chain(machine.into_iter().flatten())
     }
 
     pub(super) fn operands(&self) -> Vec<Value> {
@@ -1165,6 +1191,7 @@ impl TerminatorKind {
     }
 
     pub(super) fn operands_iter(&self) -> impl Iterator<Item = Value> + '_ {
+        let mut machine = None;
         let (first, rest, tail, cases): (
             Option<Value>,
             &[Value],
@@ -1174,6 +1201,10 @@ impl TerminatorKind {
             TerminatorKind::Jump(target) => (None, &target.args, &[], None),
             TerminatorKind::CheckException(normal, error) => {
                 (None, &normal.args, &error.args, None)
+            }
+            TerminatorKind::Aarch64Branch(condition, yes, no) => {
+                machine = Some(condition.operands());
+                (None, &yes.args, &no.args, None)
             }
             TerminatorKind::Branch(condition, yes, no) => {
                 (Some(*condition), &yes.args, &no.args, None)
@@ -1204,6 +1235,7 @@ impl TerminatorKind {
                     .iter()
                     .flat_map(|(_, target)| target.args.iter().copied())
             }))
+            .chain(machine.into_iter().flatten())
     }
 
     pub(super) fn targets(&self) -> impl Iterator<Item = &Target> {
@@ -1211,7 +1243,9 @@ impl TerminatorKind {
             match self {
                 TerminatorKind::Jump(target) => (Some(target), None, None),
                 TerminatorKind::CheckException(normal, error) => (Some(normal), Some(error), None),
-                TerminatorKind::Branch(_, yes, no) => (Some(yes), Some(no), None),
+                TerminatorKind::Branch(_, yes, no) | TerminatorKind::Aarch64Branch(_, yes, no) => {
+                    (Some(yes), Some(no), None)
+                }
                 TerminatorKind::Switch(_, cases, default) => (Some(default), None, Some(cases)),
                 TerminatorKind::Yield(_, _, target) => (Some(target), None, None),
                 TerminatorKind::Return(_)
@@ -1234,7 +1268,9 @@ impl TerminatorKind {
         ) = match self {
             TerminatorKind::Jump(target) => (Some(target), None, None),
             TerminatorKind::CheckException(normal, error) => (Some(normal), Some(error), None),
-            TerminatorKind::Branch(_, yes, no) => (Some(yes), Some(no), None),
+            TerminatorKind::Branch(_, yes, no) | TerminatorKind::Aarch64Branch(_, yes, no) => {
+                (Some(yes), Some(no), None)
+            }
             TerminatorKind::Switch(_, cases, default) => (Some(default), None, Some(cases)),
             TerminatorKind::Yield(_, _, target) => (Some(target), None, None),
             TerminatorKind::Return(_)
@@ -1822,6 +1858,7 @@ impl Graph {
             }
         };
         match op {
+            Op::Aarch64(op) => op.contract(),
             Op::LowLevel(low_level::Op::Scratch { .. }) => closed(INTERNAL, None),
             Op::LowLevel(low_level::Op::Reference { .. } | low_level::Op::Cleanup { .. }) => {
                 closed(INTERNAL | HEAP_WRITE, None)

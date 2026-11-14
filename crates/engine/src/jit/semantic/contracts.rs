@@ -48,6 +48,7 @@ fn specific(graph: &Graph, inst: Inst) -> Option<Representations> {
         produces,
     };
     Some(match &data.op {
+        Op::Aarch64(op) => any(op.operands().count(), target),
         Op::HelperCall { uses, produces, .. } => Representations {
             uses: uses.iter().copied().map(Use::Exact).collect(),
             produces: *produces,

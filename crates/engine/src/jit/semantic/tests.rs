@@ -2425,6 +2425,75 @@ fn typed_loads_lower_to_explicit_memory_operations() {
 }
 
 #[test]
+fn runtime_conversions_leave_backend_neutral_operations() {
+    use cranelift_codegen::ir::{AbiParam, Signature, types};
+    use cranelift_codegen::isa::CallConv;
+    let mut signature = Signature::new(CallConv::AppleAarch64);
+    signature.params.extend([
+        AbiParam::new(types::I64),
+        AbiParam::new(types::F64),
+        AbiParam::new(types::I32),
+    ]);
+    signature.returns.extend([
+        AbiParam::new(types::I32),
+        AbiParam::new(types::I8),
+        AbiParam::new(types::I64),
+        AbiParam::new(types::I8),
+    ]);
+    let mut graph = Graph::new_low_level("conversions".into(), Span::new(0, 0), signature);
+    let entry = graph.entry;
+    let mut builder = low_level::Builder::new(&mut graph);
+    builder.switch_to_block(entry);
+    builder.append_block_params_for_function_params(entry);
+    let ctx = builder.block_params(entry)[0];
+    let number = builder.block_params(entry)[1];
+    let integer = builder.block_params(entry)[2];
+    let wrapped = builder.semantic(Op::Convert(number, Repr::I32), Repr::I32);
+    let truth = builder.semantic(Op::Convert(number, Repr::Boolean), Repr::Boolean);
+    let wide = builder.semantic(Op::Convert(integer, Repr::I64), Repr::I64);
+    let masked = builder.ins().test_mask(integer, 0x80);
+    builder.ins().return_(&[wrapped, truth, wide, masked]);
+    let mut passes = Vec::new();
+    lower_low_level(
+        &mut graph,
+        ctx,
+        CallConv::AppleAarch64,
+        types::I64,
+        &mut |name, _| {
+            passes.push(name.to_owned());
+        },
+    )
+    .unwrap();
+    assert_eq!(passes.last().unwrap(), "scalar-semantics");
+    assert!(!ops(&graph).iter().any(|op| matches!(op,
+        Op::Convert(value, Repr::I32 | Repr::Boolean) if *value == number
+    )));
+    assert!(ops(&graph).iter().any(|op| matches!(
+        op,
+        Op::LowLevel(low_level::Op::Unary {
+            op: low_level::Unary::SignedSaturatingFromFloat,
+            ..
+        })
+    )));
+    assert!(
+        ops(&graph)
+            .iter()
+            .any(|op| matches!(op, Op::LowLevel(low_level::Op::FloatCompare { .. })))
+    );
+    let mut fallback = graph.clone();
+    crate::jit::cranelift::prepare(&mut fallback, &mut |_, _| {}).unwrap();
+    assert!(matches!(graph.defining_op(wide), Some(Op::Convert(..))));
+    assert!(matches!(
+        graph.defining_op(masked),
+        Some(Op::LowLevel(low_level::Op::TestMask { .. }))
+    ));
+    assert!(!ops(&fallback).iter().any(|op| matches!(
+        op,
+        Op::Convert(..) | Op::LowLevel(low_level::Op::TestMask { .. })
+    )));
+}
+
+#[test]
 fn low_level_variables_forward_through_chains_and_loop() {
     use cranelift_codegen::ir::{AbiParam, Signature, types};
     use cranelift_codegen::isa::CallConv;

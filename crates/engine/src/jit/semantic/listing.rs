@@ -190,6 +190,7 @@ impl Graph {
                 .join(", ")
         };
         match op {
+            Op::Aarch64(op) => format!("aarch64 {op:?}"),
             Op::LowLevel(op) => format!("low_level {op:?}"),
             Op::Observe(value, kind, site) => {
                 format!("observe {kind:?} {value} site={site}")
@@ -594,6 +595,9 @@ impl Listing<'_> {
                     }
                     TerminatorKind::Yield(_, value, target) => format!("yield {value}, {target}"),
                     TerminatorKind::Return(value) => format!("return {value}"),
+                    TerminatorKind::Aarch64Branch(condition, yes, no) => {
+                        format!("aarch64-branch {condition:?} {yes} {no}")
+                    }
                     TerminatorKind::Switch(value, cases, default) => format!(
                         "switch {} [{} cases] {}",
                         self.value(*value),

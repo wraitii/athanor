@@ -1112,7 +1112,8 @@ fn emit(
                 return refuse(reason, "exception check terminator");
             }
             TerminatorKind::Yield(..) => return refuse(reason, "yield terminator"),
-            TerminatorKind::Switch(..)
+            TerminatorKind::Aarch64Branch(..)
+            | TerminatorKind::Switch(..)
             | TerminatorKind::ReturnValues(..)
             | TerminatorKind::TailCall { .. } => {
                 return refuse(reason, "low-level terminator");

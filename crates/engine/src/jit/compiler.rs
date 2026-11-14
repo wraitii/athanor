@@ -410,9 +410,18 @@ impl Compiler {
         let mut lowered = None;
         let native =
             self.backend != crate::Backend::Cranelift && self.module.isa().name() == "aarch64";
+        if pass.as_deref() == Some("aarch64-select") && !native {
+            return Err(Error::Compile(
+                "aarch64-select requires the native AArch64 backend".into(),
+            ));
+        }
         let clif = !native
             || self.inspection.as_ref().is_some_and(|options| {
-                options.clif || options.after.as_deref() == Some("cranelift-memory")
+                options.clif
+                    || matches!(
+                        options.after.as_deref(),
+                        Some("legalize-convert" | "bits" | "cranelift-memory")
+                    )
             });
         build(finalize::Output {
             b: &mut builder,
@@ -430,6 +439,15 @@ impl Compiler {
         })?;
         builder.seal_all_blocks();
         builder.finalize(self.module.target_config());
+        if pass.as_deref() == Some("aarch64-select") {
+            let mut selected = lowered.as_ref().unwrap().clone();
+            super::aarch64::select_graph(&mut selected)
+                .map_err(|reason| Error::Compile(reason.0))?;
+            snapshot = Some((
+                "aarch64-select".into(),
+                super::inspect::graph_text(&selected),
+            ));
+        }
         data.seal();
         self.data.push(data);
         let function = std::mem::replace(
@@ -474,8 +492,7 @@ impl Compiler {
         }
         if self.context.func.layout.entry_block().is_none() {
             let mut graph = graph.clone();
-            cranelift::split_indexed_loads(&mut graph);
-            graph.verify_machine().map_err(Error::Compile)?;
+            cranelift::prepare(&mut graph, &mut |_, _| {}).map_err(Error::Compile)?;
             let mut builder = cranelift_frontend::FunctionBuilder::new(
                 &mut self.context.func,
                 &mut self.builder_context,
@@ -2586,10 +2603,129 @@ mod listing_tests {
 
 #[cfg(all(test, target_arch = "aarch64"))]
 mod native_fallback_tests {
-    use super::super::semantic::{Graph, low_level::Builder, variables::Variables};
+    use super::super::semantic::{Graph, Op, Repr, low_level::Builder, variables::Variables};
     use super::*;
     use cranelift_codegen::ir::{AbiParam, MemFlagsData, Signature, TrapCode, types};
     use cranelift_module::{Linkage, Module};
+
+    #[test]
+    fn compound_bits_match_cranelift() {
+        let mut reference = Vec::new();
+        for backend in [crate::Backend::Cranelift, crate::Backend::NativeOnly] {
+            let mut compiler = Compiler::new(
+                EngineOptions {
+                    backend,
+                    ..Default::default()
+                },
+                CompilationTier::Optimized,
+                std::ptr::null(),
+                0,
+                super::super::recompile::Log::new(false),
+            )
+            .unwrap();
+            let mut results = Vec::new();
+            for ty in [types::I8, types::I16, types::I32, types::I64] {
+                for operation in 0..8 {
+                    let mut signature = compiler.module.make_signature();
+                    signature.params.push(AbiParam::new(types::I64));
+                    signature.returns.push(AbiParam::new(types::I64));
+                    let name = format!("bits_{ty}_{operation}");
+                    let id = compiler
+                        .module
+                        .declare_function(&name, Linkage::Local, &signature)
+                        .unwrap();
+                    let mut graph = Graph::new_low_level(
+                        name.clone(),
+                        oxc_span::Span::new(0, 0),
+                        signature.clone(),
+                    );
+                    let entry = graph.entry;
+                    let mut builder = Builder::new(&mut graph);
+                    builder.switch_to_block(entry);
+                    builder.append_block_params_for_function_params(entry);
+                    let input = builder.block_params(entry)[0];
+                    let value = if ty == types::I64 {
+                        input
+                    } else {
+                        builder.ins().ireduce(ty, input)
+                    };
+                    let result = match operation {
+                        0 => builder.ins().extract_bits(value, 3, 5),
+                        1 => builder.ins().in_range(value, 17, 200),
+                        2 => builder.ins().outside_range(value, 0xf0, 0xff),
+                        3 => builder.ins().test_mask(value, u64::MAX),
+                        4 => builder.ins().test_mask(value, 0x8100_0180_0000_0001),
+                        5 => builder.ins().in_range(value, 0, 0),
+                        6 => builder.ins().in_range(value, u64::MAX - 100, u64::MAX),
+                        _ => {
+                            let a = builder.ins().in_range(value, 17, 200);
+                            let b = builder.ins().test_mask(value, 0x80);
+                            let different = builder.ins().binary(
+                                super::super::semantic::low_level::Binary::BooleanXor,
+                                a,
+                                b,
+                            );
+                            let same = builder.ins().boolean_equal(a, b);
+                            let either = builder.ins().boolean_or(different, same);
+                            builder.ins().boolean_and(either, a)
+                        }
+                    };
+                    let result = if operation == 0 && ty == types::I64 {
+                        result
+                    } else {
+                        builder.ins().uextend(types::I64, result)
+                    };
+                    builder.ins().return_(&[result]);
+                    Variables::default().finish(&mut graph).unwrap();
+                    compiler.context.clear();
+                    compiler.context.func.signature = signature;
+                    if backend == crate::Backend::Cranelift {
+                        let mut prepared = graph.clone();
+                        cranelift::prepare(&mut prepared, &mut |_, _| {}).unwrap();
+                        let mut builder = cranelift_frontend::FunctionBuilder::new(
+                            &mut compiler.context.func,
+                            &mut compiler.builder_context,
+                        );
+                        cranelift::emit(&mut builder, &mut compiler.module, &prepared, None)
+                            .unwrap();
+                        builder.seal_all_blocks();
+                        builder.finalize(compiler.module.target_config());
+                    }
+                    let machine = compiler
+                        .machine_code(id, &name, &mut Annotations::default(), Some(&graph))
+                        .unwrap();
+                    machine.define(&mut compiler.module, id).unwrap();
+                    compiler.module.finalize_definitions().unwrap();
+                    let run: extern "C" fn(u64) -> u64 =
+                        unsafe { std::mem::transmute(compiler.module.get_finalized_function(id)) };
+                    for input in [
+                        0,
+                        1,
+                        16,
+                        17,
+                        199,
+                        200,
+                        201,
+                        0xef,
+                        0xf0,
+                        0xff,
+                        0x100,
+                        u32::MAX as u64,
+                        i64::MAX as u64,
+                        u64::MAX - 100,
+                        u64::MAX,
+                    ] {
+                        results.push(run(input));
+                    }
+                }
+            }
+            if backend == crate::Backend::Cranelift {
+                reference = results;
+            } else {
+                assert_eq!(results, reference);
+            }
+        }
+    }
 
     #[test]
     fn unsupported_graph_operation_falls_back_to_cranelift() {
@@ -2606,7 +2742,7 @@ mod native_fallback_tests {
         .unwrap();
         let mut signature = Signature::new(compiler.module.target_config().default_call_conv);
         signature.params.push(AbiParam::new(types::I64));
-        signature.returns.push(AbiParam::new(types::I32));
+        signature.returns.push(AbiParam::new(types::I64));
         let id = compiler
             .module
             .declare_function("fallback_test", Linkage::Local, &signature)
@@ -2620,7 +2756,9 @@ mod native_fallback_tests {
         let pointer = builder.block_params(entry)[0];
         let flags = MemFlagsData::new().with_trap_code(Some(TrapCode::HEAP_OUT_OF_BOUNDS));
         let value = builder.ins().load(types::I32, flags, pointer, 0);
-        builder.ins().return_(&[value]);
+        let wide = builder.semantic(Op::Convert(value, Repr::I64), Repr::I64);
+        let extracted = builder.ins().extract_bits(wide, 4, 8);
+        builder.ins().return_(&[extracted]);
         Variables::default().finish(&mut graph).unwrap();
         assert!(super::super::aarch64::compile_graph(&graph).is_err());
         compiler.context.func.signature = signature;
@@ -2635,9 +2773,10 @@ mod native_fallback_tests {
         assert!(compiler.context.compiled_code().is_some());
         machine.define(&mut compiler.module, id).unwrap();
         compiler.module.finalize_definitions().unwrap();
-        let load: extern "C" fn(*const u32) -> u32 =
+        let load: extern "C" fn(*const u32) -> u64 =
             unsafe { std::mem::transmute(compiler.module.get_finalized_function(id)) };
-        let value = 257;
-        assert_eq!(load(&value), value);
+        let value = 0x1234;
+        assert_eq!(load(&value), 0x23);
+        assert!(matches!(graph.defining_op(wide), Some(Op::Convert(..))));
     }
 }

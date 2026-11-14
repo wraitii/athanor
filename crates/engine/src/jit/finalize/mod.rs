@@ -207,9 +207,7 @@ fn build_callable(
     if native {
         *output_graph = Some(lowered.clone());
     }
-    super::cranelift::split_indexed_loads(&mut lowered);
-    after("cranelift-memory", &lowered);
-    lowered.verify_machine().map_err(Error::Compile)?;
+    super::cranelift::prepare(&mut lowered, after).map_err(Error::Compile)?;
     super::cranelift::emit(clif_builder, module, &lowered, Some(annotations))?;
     Ok(())
 }
