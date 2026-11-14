@@ -220,7 +220,7 @@ pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) {
             for arg in call.args {
                 let (value, repr) = match arg {
                     Arg::Value(value, repr) => (value, repr),
-                    Arg::Integer(bits) => (at.ins().iconst(types::I64, bits), Repr::I64),
+                    Arg::Integer(bits) => (at.ins().iconst(types::I64, bits), Repr::Word),
                     Arg::Boxed(value) => {
                         let word = at.ins().iconst(types::I64, value.bits() as i64);
                         (at.as_boxed(word), Repr::Boxed)
@@ -228,7 +228,7 @@ pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) {
                     Arg::Vector(values) => {
                         let address = stack_vector(&mut at, &values);
                         kept.extend(values);
-                        (address, Repr::I64)
+                        (address, Repr::Word)
                     }
                 };
                 args.push(value);

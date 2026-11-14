@@ -24,7 +24,7 @@ pub(in crate::jit) trait Insert {
     }
 
     fn as_word(&mut self, value: Value) -> Value {
-        self.add(GraphOp::AsWord(value), Repr::I64)
+        self.add(GraphOp::AsWord(value), Repr::Word)
     }
 
     fn as_boxed(&mut self, word: Value) -> Value {

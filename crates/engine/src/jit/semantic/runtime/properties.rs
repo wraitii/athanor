@@ -218,7 +218,7 @@ pub(in crate::jit::semantic) fn lower_accesses(
                     );
                     lowering.at(finish).add_effect(Op::KeepAlive(object));
                     let result = lowering.graph.blocks[continuation].params[0];
-                    lowering.graph.reprs[result] = Some(Repr::I8);
+                    lowering.graph.reprs[result] = Some(Repr::Boolean);
                     (finish, hit)
                 } else {
                     let (last, address) = lowering.slot(finish, view, entry, builtins);
@@ -240,7 +240,7 @@ pub(in crate::jit::semantic) fn lower_accesses(
                         Helper::PropertyCachePrime
                     },
                     args: vec![object, cache],
-                    uses: vec![Repr::Boxed, Repr::I64],
+                    uses: vec![Repr::Boxed, Repr::Word],
                     produces: fill.then_some(Repr::Boxed),
                     contract,
                 };
@@ -250,7 +250,7 @@ pub(in crate::jit::semantic) fn lower_accesses(
                 graph.insts[inst].op = Op::HelperCall {
                     helper: Helper::PropertySetCached,
                     args: vec![object, cache, value],
-                    uses: vec![Repr::Boxed, Repr::I64, Repr::Boxed],
+                    uses: vec![Repr::Boxed, Repr::Word, Repr::Boxed],
                     produces: None,
                     contract,
                 };
@@ -335,7 +335,7 @@ impl PropertyLowering<'_> {
 
         let flags = MemFlagsData::trusted();
         let result = self.graph.add_param(done);
-        self.graph.reprs[result] = Some(Repr::I64);
+        self.graph.reprs[result] = Some(Repr::Word);
         let miss = self.block();
         if validate {
             let megamorphic =
@@ -481,7 +481,7 @@ impl PropertyLowering<'_> {
         let ready = builtins.then(|| self.block());
         let address = ready.map(|ready| {
             let address = self.graph.add_param(ready);
-            self.graph.reprs[address] = Some(Repr::I64);
+            self.graph.reprs[address] = Some(Repr::Word);
             address
         });
         if let Some(ready) = ready {

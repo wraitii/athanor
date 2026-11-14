@@ -361,7 +361,7 @@ impl<'a> Builder<'a> {
         self.graph.insts[inst].emission_location = self.location;
         self.graph.insts[inst].source_name = self.source_name;
         let result = result.unwrap();
-        self.graph.reprs[result] = Some(Repr::from_machine(ty));
+        self.graph.reprs[result] = Some(Repr::numeric(ty));
         result
     }
 
@@ -437,7 +437,7 @@ impl<'a> Builder<'a> {
 
     #[track_caller]
     pub(in crate::jit) fn as_boxed(&mut self, word: Value) -> Value {
-        debug_assert_eq!(self.graph.repr(word), Repr::I64);
+        debug_assert_eq!(self.graph.repr(word), Repr::Word);
         Insert::as_boxed(self, word)
     }
 
@@ -644,8 +644,9 @@ macro_rules! immediate_methods {
 macro_rules! unary_methods {
     ($($name:ident => $op:ident),* $(,)?) => { $(
         pub(in crate::jit) fn $name(&mut self, value: Value) -> Value {
-            let ty = self.inserter.graph().reprs[value].map(Repr::machine).expect("untyped low-level operand");
-            self.value(Op::Unary { op: Unary::$op, ty, value }, ty)
+            let repr = self.inserter.graph().reprs[value].expect("untyped low-level operand");
+            let ty = repr.machine();
+            self.inserter.add(GraphOp::LowLevel(Op::Unary { op: Unary::$op, ty, value }), repr)
         }
     )* };
 }
@@ -653,7 +654,7 @@ macro_rules! unary_methods {
 macro_rules! conversion_methods {
     ($($name:ident => $op:ident),* $(,)?) => { $(
         pub(in crate::jit) fn $name(&mut self, ty: Type, value: Value) -> Value {
-            self.value(Op::Unary { op: Unary::$op, ty, value }, ty)
+            self.inserter.add(GraphOp::LowLevel(Op::Unary { op: Unary::$op, ty, value }), Repr::numeric(ty))
         }
     )* };
 }
@@ -665,16 +666,26 @@ impl<I: Insert + ?Sized> Instructions<'_, I> {
     }
 
     fn derived(&mut self, op: Op, first: Value, second: Value) -> Value {
-        let reprs = &self.inserter.graph().reprs;
-        let (first, second) = (
-            reprs[first].map(Repr::machine),
-            reprs[second].map(Repr::machine),
-        );
-        if let (Some(first), Some(second)) = (first, second) {
-            assert_eq!(first, second, "mismatched low-level operands");
+        let graph = self.inserter.graph();
+        let (first_repr, second_repr) = (graph.reprs[first], graph.reprs[second]);
+        if let (Some(first), Some(second)) = (first_repr, second_repr) {
+            assert_eq!(
+                first.machine(),
+                second.machine(),
+                "mismatched low-level operands"
+            );
         }
-        match first.or(second) {
-            Some(ty) => self.value(op, ty),
+        let constant = matches!(
+            graph.defining_op(first),
+            Some(GraphOp::LowLevel(Op::Integer { .. } | Op::Float64(_)))
+        );
+        let repr = if constant {
+            second_repr.or(first_repr)
+        } else {
+            first_repr.or(second_repr)
+        };
+        match repr {
+            Some(repr) => self.inserter.add(GraphOp::LowLevel(op), repr),
             None => self.inserter.place(GraphOp::LowLevel(op), true).1.unwrap(),
         }
     }
@@ -762,17 +773,15 @@ impl<I: Insert + ?Sized> Instructions<'_, I> {
     }
 
     pub(in crate::jit) fn extract_bits(&mut self, value: Value, shift: u8, width: u8) -> Value {
-        let ty = self.inserter.graph().reprs[value]
-            .map(Repr::machine)
-            .expect("untyped low-level operand");
-        assert!(u32::from(shift) + u32::from(width) <= ty.bits() && width > 0);
-        self.value(
-            Op::ExtractBits {
+        let repr = self.inserter.graph().reprs[value].expect("untyped low-level operand");
+        assert!(u32::from(shift) + u32::from(width) <= repr.machine().bits() && width > 0);
+        self.inserter.add(
+            GraphOp::LowLevel(Op::ExtractBits {
                 value,
                 shift,
                 width,
-            },
-            ty,
+            }),
+            repr,
         )
     }
 

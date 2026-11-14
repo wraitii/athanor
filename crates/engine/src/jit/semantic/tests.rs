@@ -2452,8 +2452,8 @@ fn low_level_variables_forward_through_chains_and_loop() {
     let backedge = builder.create_block();
     let exit = builder.create_block();
     let mut variables = Variables::default();
-    let variable0 = variables.declare(builder.graph, input, super::Repr::I64);
-    let variable1 = variables.declare(builder.graph, input, super::Repr::I64);
+    let variable0 = variables.declare(builder.graph, input, super::Repr::Word);
+    let variable1 = variables.declare(builder.graph, input, super::Repr::Word);
     builder.terminate(entry, span, TerminatorKind::Jump(Target::new(first)));
     builder.terminate(first, span, TerminatorKind::Jump(Target::new(second)));
     builder.terminate(second, span, TerminatorKind::Jump(Target::new(header)));
@@ -2534,7 +2534,7 @@ fn low_level_variables_resolve_diamond_and_loop() {
     );
     graph.terminate(body, span, TerminatorKind::Jump(Target::new(join)));
     let mut variables = Variables::default();
-    let variable = variables.declare(&mut graph, initial, super::Repr::I64);
+    let variable = variables.declare(&mut graph, initial, super::Repr::Word);
     variables.define(&mut graph, left, variable, changed);
     let joined = variables.read(&mut graph, join, span, variable);
     variables.define(&mut graph, body, variable, joined);
@@ -2682,7 +2682,7 @@ fn low_level_ssa_same_target_edges_receive_one_argument() {
     );
     graph.terminate(body, span, TerminatorKind::Jump(Target::new(join)));
     let mut variables = Variables::default();
-    let variable = variables.declare(&mut graph, initial, super::Repr::I64);
+    let variable = variables.declare(&mut graph, initial, super::Repr::Word);
     let value = variables.read(&mut graph, join, span, variable);
     variables.define(&mut graph, body, variable, changed);
     graph.terminate(exit, span, TerminatorKind::Return(value));
@@ -2759,8 +2759,8 @@ fn low_level_graph_emits_executable_cranelift() {
         types::I64,
     );
     let mut variables = Variables::default();
-    let index_variable = variables.declare(builder.graph, zero, super::Repr::I64);
-    let sum_variable = variables.declare(builder.graph, zero, super::Repr::I64);
+    let index_variable = variables.declare(builder.graph, zero, super::Repr::Word);
+    let sum_variable = variables.declare(builder.graph, zero, super::Repr::Word);
     builder.terminate(entry, span, TerminatorKind::Jump(Target::new(header)));
     let index = variables.read(builder.graph, header, span, index_variable);
     let sum = variables.read(builder.graph, header, span, sum_variable);
@@ -2922,7 +2922,7 @@ fn low_level_variables_resolve_long_forwarding_chain() {
     builder.append_block_params_for_function_params(entry);
     let input = builder.block_params(entry)[0];
     let mut variables = Variables::default();
-    let variable = variables.declare(builder.graph, input, super::Repr::I64);
+    let variable = variables.declare(builder.graph, input, super::Repr::Word);
     let mut block = entry;
     for _ in 0..10_000 {
         let next = builder.create_block();
@@ -2945,9 +2945,9 @@ fn conversion_round_trips_require_lossless_representations() {
         (Repr::I32, Repr::I64, Some(false), true),
         (Repr::I32, Repr::F64, Some(false), true),
         (Repr::I32, Repr::Boxed, Some(false), true),
-        (Repr::I8, Repr::Boxed, Some(true), true),
-        (Repr::I8, Repr::Boxed, Some(false), false),
-        (Repr::I8, Repr::Boxed, None, false),
+        (Repr::Boolean, Repr::Boxed, Some(true), true),
+        (Repr::Boolean, Repr::Boxed, Some(false), false),
+        (Repr::Boolean, Repr::Boxed, None, false),
         (Repr::I64, Repr::F64, Some(false), false),
         (Repr::I64, Repr::Boxed, Some(false), false),
         (Repr::Boxed, Repr::I32, Some(false), false),

@@ -183,7 +183,7 @@ pub(in crate::jit::semantic) fn lower_stores(function: &mut FunctionState) {
                     ),
                 );
                 let result = graph.blocks[continuation].params[0];
-                graph.reprs[result] = Some(Repr::I8);
+                graph.reprs[result] = Some(Repr::Boolean);
                 function.facts.set(result, ValueType::BOOLEAN);
                 let yes = Cursor::at_end(graph, scalar, inst)
                     .ins()

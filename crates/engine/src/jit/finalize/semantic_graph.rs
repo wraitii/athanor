@@ -1040,7 +1040,7 @@ impl FunctionCompiler<'_, '_> {
                 }
                 TerminatorKind::Branch(value, yes, no) => {
                     let condition = self.operand(&cx, *value);
-                    if condition.repr != Repr::I8 {
+                    if condition.repr != Repr::Boolean {
                         return Err(Error::Compile(format!(
                             "{block}: branch on {:?} condition",
                             condition.repr
@@ -1134,12 +1134,12 @@ impl FunctionCompiler<'_, '_> {
         data: &InstData,
         target: Option<Repr>,
     ) -> Result<Option<Operand>, Error> {
-        let boolean = |condition: LoweredValue| Some(Operand::new(condition, Repr::I8));
+        let boolean = |condition: LoweredValue| Some(Operand::new(condition, Repr::Boolean));
         let result = match &data.op {
             Op::PropertyCache(site, name) => {
                 let observer = self.property_observer(data);
                 let address = self.property_cache(*site, name, observer);
-                Some(Operand::new(address, Repr::I64))
+                Some(Operand::new(address, Repr::Word))
             }
             Op::HelperCall {
                 helper,
@@ -1174,7 +1174,7 @@ impl FunctionCompiler<'_, '_> {
                 let index = self.operand(cx, *index).value;
                 let offset = self.b.ins().imul_imm_s(index, format.bytes() as i64);
                 let address = self.b.ins().iadd(base, offset);
-                Some(Operand::new(address, Repr::I64))
+                Some(Operand::new(address, Repr::Word))
             }
             Op::Memory(MemoryOp::Load { address, .. }) => {
                 let address = self.operand(cx, *address).value;

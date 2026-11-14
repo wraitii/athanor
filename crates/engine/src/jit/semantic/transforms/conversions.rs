@@ -6,7 +6,7 @@ use super::super::{Facts, Graph, Op, Repr, ValueDef, ValueType};
 fn lossless(from: Repr, through: Repr) -> bool {
     matches!(
         (from, through),
-        (Repr::I32, Repr::I64 | Repr::F64 | Repr::Boxed) | (Repr::I8, Repr::Boxed)
+        (Repr::I32, Repr::I64 | Repr::F64 | Repr::Boxed) | (Repr::Boolean, Repr::Boxed)
     )
 }
 
@@ -26,7 +26,7 @@ pub(in crate::jit::semantic) fn simplify(graph: &mut Graph, facts: &Facts) {
             } else if let Some(Op::Convert(original, through)) = graph.defining_op(source)
                 && graph.repr(*original) == to
                 && lossless(to, *through)
-                && (to != Repr::I8 || facts.of(*original) == ValueType::BOOLEAN)
+                && (to != Repr::Boolean || facts.of(*original) == ValueType::BOOLEAN)
             {
                 Some(*original)
             } else {

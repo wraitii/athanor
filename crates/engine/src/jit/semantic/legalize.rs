@@ -193,7 +193,7 @@ impl Legalizer<'_> {
                 } else {
                     value
                 };
-                let value = tail(self, value, Repr::I8);
+                let value = tail(self, value, Repr::Boolean);
                 let yes = self.edge(block, (span, source_name, location), yes);
                 let no = self.edge(block, (span, source_name, location), no);
                 TerminatorKind::Branch(value, yes, no)

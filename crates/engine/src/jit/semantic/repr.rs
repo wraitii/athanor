@@ -10,22 +10,57 @@ use crate::FxHashMap;
 use crate::value::Value as JsValue;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(in crate::jit) enum IntegerWidth {
+    W8,
+    W16,
+    W32,
+    W64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(in crate::jit) enum FloatWidth {
+    W32,
+    W64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(in crate::jit) enum Repr {
     Boxed,
-    I8,
-    I16,
-    I32,
-    I64,
-    F32,
-    F64,
+    Word,
+    Boolean,
+    Integer(IntegerWidth),
+    Float(FloatWidth),
+}
+
+impl std::fmt::Debug for Repr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match *self {
+            Self::Boxed => "Boxed",
+            Self::Word => "Word",
+            Self::Boolean => "Boolean",
+            Self::I8 => "I8",
+            Self::I16 => "I16",
+            Self::I32 => "I32",
+            Self::I64 => "I64",
+            Self::F32 => "F32",
+            Self::F64 => "F64",
+        })
+    }
 }
 
 impl Repr {
+    pub(in crate::jit) const I8: Self = Self::Integer(IntegerWidth::W8);
+    pub(in crate::jit) const I16: Self = Self::Integer(IntegerWidth::W16);
+    pub(in crate::jit) const I32: Self = Self::Integer(IntegerWidth::W32);
+    pub(in crate::jit) const I64: Self = Self::Integer(IntegerWidth::W64);
+    pub(in crate::jit) const F32: Self = Self::Float(FloatWidth::W32);
+    pub(in crate::jit) const F64: Self = Self::Float(FloatWidth::W64);
+
     pub(in crate::jit) fn of(types: ValueType) -> Self {
         if types == ValueType::default() {
             Self::Boxed
         } else if types.within(ValueType::BOOLEAN) {
-            Self::I8
+            Self::Boolean
         } else if types.within(ValueType::INT32) {
             Self::I32
         } else if types.within(ValueType::INTEGER) {
@@ -40,11 +75,11 @@ impl Repr {
     pub(in crate::jit) fn admits(self, types: ValueType) -> bool {
         match self {
             Self::Boxed => true,
-            Self::I8 => types.within(ValueType::BOOLEAN),
+            Self::Boolean => types.within(ValueType::BOOLEAN),
             Self::I32 => types.within(ValueType::INT32),
             Self::I64 => types.within(ValueType::INTEGER),
             Self::F64 => types.within(ValueType::NUMBER),
-            Self::I16 | Self::F32 => false,
+            Self::Word | Self::I8 | Self::I16 | Self::F32 => false,
         }
     }
 
@@ -54,25 +89,27 @@ impl Repr {
         }
         match self {
             Self::Boxed => types,
-            Self::I8 => ValueType::BOOLEAN,
-            Self::I16 | Self::I32 => ValueType::INT32,
-            Self::I64 => ValueType::INT64,
-            Self::F32 | Self::F64 => ValueType::NUMBER,
+            Self::Boolean => ValueType::BOOLEAN,
+            Self::Word | Self::I64 => ValueType::INT64,
+            Self::Integer(_) => ValueType::INT32,
+            Self::Float(_) => ValueType::NUMBER,
         }
     }
 
     pub(in crate::jit) fn machine(self) -> Type {
         match self {
-            Self::Boxed | Self::I64 => types::I64,
-            Self::I8 => types::I8,
-            Self::I16 => types::I16,
-            Self::I32 => types::I32,
-            Self::F32 => types::F32,
-            Self::F64 => types::F64,
+            Self::Boxed | Self::Word => types::I64,
+            Self::Boolean => types::I8,
+            Self::Integer(IntegerWidth::W8) => types::I8,
+            Self::Integer(IntegerWidth::W16) => types::I16,
+            Self::Integer(IntegerWidth::W32) => types::I32,
+            Self::Integer(IntegerWidth::W64) => types::I64,
+            Self::Float(FloatWidth::W32) => types::F32,
+            Self::Float(FloatWidth::W64) => types::F64,
         }
     }
 
-    pub(in crate::jit) fn from_machine(ty: Type) -> Self {
+    pub(in crate::jit) fn numeric(ty: Type) -> Self {
         match ty {
             types::I8 => Self::I8,
             types::I16 => Self::I16,
@@ -81,6 +118,25 @@ impl Repr {
             types::F32 => Self::F32,
             types::F64 => Self::F64,
             _ => panic!("unsupported machine type {ty}"),
+        }
+    }
+
+    /// Transitional: low-level ops still carry machine types, so their values get the
+    /// family those types overwhelmingly mean there.
+    pub(in crate::jit) fn from_machine(ty: Type) -> Self {
+        match ty {
+            types::I8 => Self::Boolean,
+            types::I64 => Self::Word,
+            _ => Self::numeric(ty),
+        }
+    }
+
+    /// Transitional: low-level 64-bit integers are still typed as words until low-level ops
+    /// stop carrying machine types.
+    fn as_integer(self) -> Self {
+        match self {
+            Self::Word => Self::I64,
+            repr => repr,
         }
     }
 }
@@ -123,7 +179,7 @@ fn representation(graph: &Graph, facts: &Facts, value: super::Value) -> Repr {
             | super::low_level::Op::FloatCompare { .. }
             | super::low_level::Op::InRange { .. }
             | super::low_level::Op::TestMask { .. },
-        )) => Repr::I8,
+        )) => Repr::Boolean,
         Some(Op::LowLevel(super::low_level::Op::ExtractBits { value, .. })) => repr(*value),
         Some(Op::LowLevel(super::low_level::Op::Binary { op, .. })) if op.is_float() => Repr::F64,
         Some(Op::LowLevel(super::low_level::Op::Binary { op, left, .. }))
@@ -136,7 +192,7 @@ fn representation(graph: &Graph, facts: &Facts, value: super::Value) -> Repr {
             debug_assert_eq!(yes, no, "select arms disagree");
             yes
         }
-        Some(Op::TypedData(_) | Op::Memory(MemoryOp::Address { .. })) => Repr::I64,
+        Some(Op::TypedData(_) | Op::Memory(MemoryOp::Address { .. })) => Repr::Word,
         Some(Op::Memory(MemoryOp::IndexedLoad { format, .. } | MemoryOp::Load { format, .. })) => {
             format.repr()
         }
@@ -165,9 +221,9 @@ impl Step {
 pub(in crate::jit) fn steps(from: Repr, to: Repr) -> Vec<Step> {
     match (from, to) {
         _ if from == to => Vec::new(),
-        (Repr::Boxed, Repr::F64 | Repr::I8) => vec![Step::Unbox(to)],
+        (Repr::Boxed, Repr::F64 | Repr::Boolean) => vec![Step::Unbox(to)],
         (Repr::Boxed, _) => vec![Step::Unbox(Repr::F64), Step::Convert(to)],
-        (Repr::F64 | Repr::I8, Repr::Boxed) => vec![Step::Box],
+        (Repr::F64 | Repr::Boolean, Repr::Boxed) => vec![Step::Box],
         (_, Repr::Boxed) => vec![Step::Convert(Repr::F64), Step::Box],
         _ => vec![Step::Convert(to)],
     }
@@ -186,7 +242,7 @@ pub(in crate::jit) fn lower(builder: &mut Builder<'_>) -> Result<(), String> {
                 let op = constant_op(constant, repr);
                 builder.graph.insts[inst].op = Op::LowLevel(op);
                 if repr == Repr::Boxed {
-                    builder.graph.reprs[result] = Some(Repr::I64);
+                    builder.graph.reprs[result] = Some(Repr::Word);
                 }
                 position += 1;
                 continue;
@@ -292,7 +348,7 @@ fn words(graph: &mut Graph) -> Result<(), String> {
                 graph.defining_op(value)
             ));
         }
-        graph.reprs[value] = Some(Repr::I64);
+        graph.reprs[value] = Some(Repr::Word);
     }
     Ok(())
 }
@@ -317,7 +373,7 @@ fn apply(builder: &mut Builder<'_>, value: Value, from: Repr, step: Step) -> Res
     let flags = MemFlagsData::new();
     Ok(match step {
         Step::Unbox(Repr::F64) => builder.ins().bitcast(types::F64, flags, value),
-        Step::Unbox(Repr::I8) => {
+        Step::Unbox(Repr::Boolean) => {
             builder
                 .ins()
                 .icmp_imm_s(IntCC::Equal, value, JsValue::TRUE.bits() as i64)
@@ -338,7 +394,7 @@ fn apply(builder: &mut Builder<'_>, value: Value, from: Repr, step: Step) -> Res
 fn box_value(builder: &mut Builder<'_>, value: Value) -> Value {
     let flags = MemFlagsData::new();
     match builder.graph.repr(value) {
-        Repr::I8 => {
+        Repr::Boolean => {
             let mut ins = builder.ins();
             let yes = ins.iconst(types::I64, JsValue::TRUE.bits() as i64);
             let no = ins.iconst(types::I64, JsValue::FALSE.bits() as i64);
@@ -371,7 +427,7 @@ fn constant_op(constant: &Constant, repr: Repr) -> LowOp {
         (Constant::Number(number), Repr::F64) => LowOp::Float64(number.to_bits()),
         (Constant::Number(number), Repr::I64) => integer(types::I64, *number as i64 as u64),
         (Constant::Number(number), Repr::I32) => integer(types::I32, *number as i32 as i64 as u64),
-        (Constant::Boolean(value), Repr::I8) => integer(types::I8, u64::from(*value)),
+        (Constant::Boolean(value), Repr::Boolean) => integer(types::I8, u64::from(*value)),
         (constant, Repr::Boxed) => integer(types::I64, boxed(constant).bits()),
         (constant, repr) => unreachable!("constant {constant:?} as {repr:?}"),
     }
@@ -409,6 +465,7 @@ fn fold(builder: &mut Builder<'_>, value: Value, from: Repr, to: Repr) -> Option
 }
 
 fn convert(builder: &mut Builder<'_>, value: Value, from: Repr, to: Repr) -> Value {
+    let (from, to) = (from.as_integer(), to.as_integer());
     if from == to {
         return value;
     }
@@ -419,13 +476,13 @@ fn convert(builder: &mut Builder<'_>, value: Value, from: Repr, to: Repr) -> Val
     match (from, to) {
         (Repr::I64 | Repr::I32, Repr::F64) => ins.fcvt_from_sint(types::F64, value),
         (Repr::F64, Repr::I32) => to_int32(builder, value),
-        (Repr::I8, Repr::I32) => ins.uextend(types::I32, value),
-        (Repr::I8, Repr::F64) => {
+        (Repr::Boolean, Repr::I32) => ins.uextend(types::I32, value),
+        (Repr::Boolean, Repr::F64) => {
             let wide = ins.uextend(types::I32, value);
             ins.fcvt_from_uint(types::F64, wide)
         }
-        (Repr::I64 | Repr::I32, Repr::I8) => ins.icmp_imm_s(IntCC::NotEqual, value, 0),
-        (Repr::F64, Repr::I8) => {
+        (Repr::I64 | Repr::I32, Repr::Boolean) => ins.icmp_imm_s(IntCC::NotEqual, value, 0),
+        (Repr::F64, Repr::Boolean) => {
             let zero = ins.f64const(0.0);
             let negative = ins.fcmp(FloatCC::LessThan, value, zero);
             let positive = ins.fcmp(FloatCC::GreaterThan, value, zero);
