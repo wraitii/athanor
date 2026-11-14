@@ -159,8 +159,17 @@ impl Repr {
         self == required
             || matches!(
                 (self, required),
-                (Self::Word, Self::I64) | (Self::I64, Self::Word)
+                (Self::Word, Self::I64)
+                    | (Self::I64, Self::Word)
+                    | (Self::INTEGER, Self::Integer(_) | Self::Word)
+                    | (Self::Integer(_) | Self::Word, Self::INTEGER)
+                    | (Self::FLOAT, Self::Float(_))
+                    | (Self::Float(_), Self::FLOAT)
             )
+    }
+
+    pub(in crate::jit) fn is_open(self) -> bool {
+        matches!(self, Self::INTEGER | Self::FLOAT)
     }
 
     pub(in crate::jit) fn widest(self) -> Self {
@@ -190,12 +199,6 @@ impl MemoryFormat {
             Self::F32 => Repr::F32,
             Self::F64 => Repr::F64,
         }
-    }
-}
-
-pub(in crate::jit) fn widen(graph: &mut Graph) {
-    for repr in graph.reprs.values_mut().flatten() {
-        *repr = repr.widest();
     }
 }
 
@@ -292,11 +295,13 @@ pub(in crate::jit) fn intrinsic(op: &Op) -> Option<Repr> {
 
 pub(in crate::jit) fn fits(constant: &Constant, repr: Repr) -> bool {
     match (constant, repr) {
-        (Constant::Number(_), Repr::F64) | (Constant::Boolean(_), Repr::Boolean) => true,
+        (Constant::Number(_), Repr::F64 | Repr::FLOAT) | (Constant::Boolean(_), Repr::Boolean) => {
+            true
+        }
         (&Constant::Number(number), Repr::I32) => {
             number == f64::from(number as i32) && !(number == 0.0 && number.is_sign_negative())
         }
-        (&Constant::Number(number), Repr::I64) => {
+        (&Constant::Number(number), Repr::I64 | Repr::INTEGER) => {
             number == number as i64 as f64 && !(number == 0.0 && number.is_sign_negative())
         }
         _ => false,
@@ -319,7 +324,11 @@ fn representation(graph: &Graph, facts: &Facts, value: super::Value) -> Repr {
     if let Some(&Op::AsNumber(input)) = op {
         return graph.reprs[input].unwrap_or_else(|| representation(graph, facts, input));
     }
-    Repr::of(facts.of(value))
+    match Repr::of(facts.of(value)) {
+        Repr::Integer(_) => Repr::INTEGER,
+        Repr::Float(_) => Repr::FLOAT,
+        repr => repr,
+    }
 }
 
 #[derive(Clone, Copy)]

@@ -139,9 +139,9 @@ pub(in crate::jit) fn lower_low_level(
 }
 
 pub(in crate::jit) fn lower_machine(graph: &mut Graph) -> Result<()> {
+    super::widths::choose(graph);
     repr::lower(&mut low_level::Builder::new(graph))?;
     super::bits::expand(graph);
-    repr::widen(graph);
     graph.verify()
 }
 

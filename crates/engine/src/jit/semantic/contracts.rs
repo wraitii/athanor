@@ -17,7 +17,7 @@ pub(in crate::jit) struct Representations {
 }
 
 fn integer(repr: Repr) -> bool {
-    matches!(repr, Repr::I32 | Repr::I64)
+    matches!(repr, Repr::Integer(_))
 }
 
 fn view_object(graph: &Graph, inst: Inst) -> Use {
@@ -97,7 +97,7 @@ fn specific(graph: &Graph, inst: Inst) -> Option<Representations> {
         Op::Box(_) | Op::AsBoxed(_) => any(1, Some(Repr::Boxed)),
         Op::AsWord(_) => exact(&[Repr::Boxed], Repr::Word),
         Op::Constant(Constant::Number(_)) => match target {
-            Some(repr @ (Repr::F64 | Repr::I64 | Repr::I32)) => any(0, Some(repr)),
+            Some(repr @ (Repr::Float(_) | Repr::Integer(_))) => any(0, Some(repr)),
             _ => return None,
         },
         Op::Constant(Constant::Boolean(_)) if target == Some(Repr::Boolean) => {

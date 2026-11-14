@@ -25,6 +25,7 @@ pub(in crate::jit) mod specialization;
 pub(in crate::jit) mod suspension;
 mod transforms;
 pub(in crate::jit) mod variables;
+pub(in crate::jit) mod widths;
 
 pub(super) use pipeline::{
     LOW_LEVEL_PASSES, Versioning, build_canonical, canonicalize_graph, lower_global,
