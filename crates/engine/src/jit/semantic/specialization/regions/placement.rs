@@ -57,7 +57,8 @@ struct Hoister<'a> {
     graph: &'a Graph,
     cfg: &'a Cfg,
     assumed: &'a FxHashMap<Value, cranelift_module::FuncId>,
-    writes: FxHashMap<usize, Writes>,
+    facts: &'a std::cell::OnceCell<Facts>,
+    writes: FxHashMap<usize, Writes<&'a Facts>>,
     memo: FxHashMap<(usize, Value), Result<()>>,
 }
 
@@ -102,6 +103,7 @@ impl Hoister<'_> {
         }
         let graph = self.graph;
         let assumed = self.assumed;
+        let facts = self.facts;
         let writes = self.writes.entry(point).or_insert_with(|| {
             let written: FxHashSet<Block> = target
                 .body
@@ -109,10 +111,13 @@ impl Hoister<'_> {
                 .copied()
                 .filter(|block| !graph.cold.contains(block))
                 .collect();
-            Writes::collect_assuming(graph, &written, assumed)
+            let facts = facts.get_or_init(|| {
+                Facts::assuming(graph, &guards::assumed(&FxHashMap::default(), assumed))
+            });
+            Writes::with_facts(graph, &written, facts)
         });
         let read = as_read(&op);
-        let Some(access) = Access::read(&read, &writes.facts) else {
+        let Some(access) = Access::read(&read, writes.facts) else {
             return Err(format!("{value} has no access"));
         };
         match writes.killer(&access) {
@@ -227,10 +232,12 @@ pub(in crate::jit::semantic) fn place_assumes(
             }
         }
     }
+    let facts = std::cell::OnceCell::new();
     let mut hoister = Hoister {
         graph: &planning,
         cfg: &cfg,
         assumed,
+        facts: &facts,
         writes: FxHashMap::default(),
         memo: FxHashMap::default(),
     };

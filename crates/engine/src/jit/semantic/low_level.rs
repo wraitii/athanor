@@ -548,7 +548,7 @@ impl<'a> Builder<'a> {
         args: Vec<Value>,
     ) -> Vec<Value> {
         let inst = self.call_inst(block, span, target, signature, args);
-        self.graph.insts[inst].results.clone()
+        self.graph.insts[inst].results.to_vec()
     }
 
     fn call_inst(

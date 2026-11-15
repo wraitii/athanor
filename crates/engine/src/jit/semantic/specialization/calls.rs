@@ -1267,7 +1267,7 @@ mod tests {
         let regions = super::super::regions::version(&mut graph, &plan, None, &mut notes).unwrap();
         assert_eq!(regions.len(), 1);
         let closed = closed_calls(&graph);
-        assert!(!closed.contains(&generic));
+        assert!(closed.contains(&generic));
         assert_eq!(closed.len(), 1);
         assert!(
             notes

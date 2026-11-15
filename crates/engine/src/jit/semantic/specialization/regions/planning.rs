@@ -2,7 +2,7 @@ use super::super::super::guards::{Fact, Origin};
 use super::super::calls::{ConditionalCall, ConditionalPlan};
 use super::cost::{Candidate, Verdict, worth};
 use super::placement::Reach;
-use super::versioning::{Canonical, Version};
+use super::versioning::{Bailouts, materialize};
 use super::*;
 use crate::{FxHashMap, FxHashSet};
 
@@ -41,7 +41,6 @@ struct RegionPlan {
     calls: Vec<ConditionalCall>,
     identities: Vec<(String, cranelift_module::FuncId)>,
     reads: Vec<Inst>,
-    assumes: Vec<(Value, Fact)>,
     checks: Vec<(Value, Fact)>,
     guards: Vec<Block>,
     exits: Vec<Block>,
@@ -196,238 +195,6 @@ impl RegionPlan {
             || !self.checks.is_empty()
             || !self.guards.is_empty()
     }
-
-    fn covers(&self, child: &Self, facts: &Facts) -> bool {
-        child.locals.iter().all(|inst| self.locals.contains(inst))
-            && child
-                .checks
-                .iter()
-                .filter(|(_, fact)| matches!(fact, Fact::Type(_)))
-                .all(|&(value, fact)| Fact::Type(facts.of(value)).implies(fact))
-            && child
-                .checks
-                .iter()
-                .filter(|(_, fact)| {
-                    matches!(fact, Fact::Indexed | Fact::Cached(..) | Fact::Shape(_))
-                })
-                .all(|&(value, fact)| {
-                    self.checks
-                        .iter()
-                        .any(|&(parent, known)| parent == value && known.implies(fact))
-                })
-            && child
-                .calls
-                .iter()
-                .all(|call| self.calls.iter().any(|parent| parent == call))
-            && child.guards.iter().all(|guard| self.guards.contains(guard))
-            && child.requirements.iter().all(|requirement| {
-                self.requirements
-                    .iter()
-                    .any(|parent| parent.call == requirement.call)
-            })
-            && child.typed_reads.iter().all(|(inst, read)| {
-                self.typed_reads.iter().any(|(parent, specialized)| {
-                    parent == inst
-                        && specialized.element == read.element
-                        && (!read.bounded || specialized.bounded)
-                })
-            })
-    }
-
-    fn merge(&mut self, child: Self, facts: &Facts) {
-        if self.covers(&child, facts) {
-            for descendant in child.children {
-                self.merge(descendant, facts);
-            }
-        } else {
-            self.children.push(child);
-        }
-    }
-
-    fn remap(&mut self, version: &Version) {
-        for inst in &mut self.locals {
-            *inst = version.insts.get(inst).copied().unwrap_or(*inst);
-        }
-        let block = |old: Block| version.blocks.get(&old).copied().unwrap_or(old);
-        self.body = self.body.iter().map(|&old| block(old)).collect();
-        self.entry = self
-            .entry
-            .map(|(preheader, header)| (block(preheader), block(header)));
-        let value = |old: Value| {
-            let copied = version.values.get(&old).copied().unwrap_or(old);
-            version.aliases.get(&copied).copied().unwrap_or(copied)
-        };
-        for (subject, fact) in self.assumes.iter_mut().chain(self.checks.iter_mut()) {
-            *subject = value(*subject);
-            if let Fact::Bound(bound) | Fact::Cached(bound, _) = fact {
-                *bound = value(*bound);
-            }
-        }
-        for call in &mut self.calls {
-            call.inst = version.insts.get(&call.inst).copied().unwrap_or(call.inst);
-            call.callee = version
-                .values
-                .get(&call.callee)
-                .copied()
-                .unwrap_or(call.callee);
-        }
-        for child in &mut self.children {
-            child.remap(version);
-        }
-    }
-
-    fn emit(
-        mut self,
-        graph: &mut Graph,
-        fallback: Option<usize>,
-        continuations: bool,
-        regions: &mut Vec<RegionId>,
-        notes: &mut Vec<String>,
-        report_regions: bool,
-        canonical: &Canonical<'_>,
-        shapes: &super::super::shapes::Plan,
-    ) -> Result<()> {
-        let known = Facts::values(graph);
-        let live: FxHashSet<_> = known.cfg.rpo.iter().copied().collect();
-        self.body.retain(|block| live.contains(block));
-        if self.body.is_empty() {
-            return Ok(());
-        }
-        // Earlier copies can introduce exit phis or move a child's probes to parent entry.
-        let candidates = Candidates {
-            locals: std::mem::take(&mut self.locals),
-            facts: std::mem::take(&mut self.assumes),
-            codes: std::mem::take(&mut self.identities),
-            ..Default::default()
-        };
-        let (mut current, _) = plan_region(
-            graph,
-            &known,
-            self.body,
-            self.entry,
-            &self.calls,
-            &candidates,
-        )?;
-        current.children = self.children;
-        self = current;
-        if report_regions {
-            notes.push(format!(
-                "region emission:\n{}",
-                self.report(graph, 1, false)
-            ));
-        }
-        let label = self.entry.map_or_else(
-            || "function".to_owned(),
-            |(_, header)| format!("loop at {header}"),
-        );
-        let mut child_canonical = None;
-        let mut region_fallback = None;
-        if self.speculative() {
-            let blocks: Vec<_> = known
-                .cfg
-                .rpo
-                .iter()
-                .copied()
-                .filter(|block| self.body.contains(block))
-                .collect();
-            let fallback = fallback.filter(|_| self.entry.is_none());
-            let shaped_reads: Vec<_> = self
-                .reads
-                .iter()
-                .filter_map(|&inst| {
-                    let Op::Get(object, _) = graph.insts[inst].op else {
-                        return None;
-                    };
-                    shapes
-                        .read(graph, inst)
-                        .filter(|&(shape, _)| self.checks.contains(&(object, Fact::Shape(shape))))
-                        .map(|(shape, index)| (inst, shape, index))
-                })
-                .collect();
-            let speculation = Speculation {
-                locals: &self.locals,
-                fallback,
-                continuations,
-                reads: &self.reads,
-                shaped_reads: &shaped_reads,
-                assumes: &self.checks,
-                guards: &self.guards,
-                exits: &self.exits,
-                typed_reads: &self.typed_reads,
-                code_guards: &self.identities,
-                ..Default::default()
-            };
-            let version = apply_version(graph, &blocks, self.entry, &speculation, Some(canonical));
-            region_fallback = Some(if let Some(address) = fallback {
-                RegionFallback::CompiledEntry(address)
-            } else {
-                let source = graph.regions.push(Region {
-                    blocks: self.body.clone(),
-                    fallback: None,
-                });
-                RegionFallback::Region(source)
-            });
-            notes.extend(version.notes.iter().cloned());
-            graph.verify()?;
-            if let Some(previous) = fallback {
-                notes.push(format!(
-                    "function: entry guard failure reuses {previous:#x}"
-                ));
-            }
-            let probe_like = !self.identities.is_empty()
-                || self.requirements.iter().any(|r| r.captured.is_none());
-            if let Some(reason) = closure_failure(
-                graph,
-                &version.body,
-                &guarded_accesses(&self.requirements, &self.identities),
-                &FxHashMap::default(),
-            )
-            .filter(|_| probe_like)
-            {
-                return Err(format!("{label}: planned copy {reason}"));
-            }
-            notes.push(format!(
-                "{label}: combined entry guards: {} native calls, {} number assumptions, {} read probes, {} hoisted guards, {} typed receiver assumptions and {} length checks",
-                self.requirements.len(), self.numbers(), self.reads.len(), self.guards.len(), self.typed().len(), self.bounds().len()
-            ));
-            if !self.calls.is_empty() {
-                notes.push(format!(
-                    "{label}: {} global code checks prove {} read-only call(s)",
-                    self.identities.len(),
-                    self.calls.len()
-                ));
-            }
-            for child in &mut self.children {
-                child.remap(&version);
-            }
-            child_canonical = Some(canonical.copied(&version));
-            self.body = version.body;
-        } else {
-            notes.push(format!("{label}: closed without guards"));
-        }
-        for child in self.children {
-            let first = regions.len();
-            child.emit(
-                graph,
-                None,
-                continuations,
-                regions,
-                notes,
-                report_regions,
-                child_canonical.as_ref().unwrap_or(canonical),
-                shapes,
-            )?;
-            for region in &regions[first..] {
-                self.body
-                    .extend(graph.regions[*region].blocks.iter().copied());
-            }
-        }
-        regions.push(graph.regions.push(Region {
-            blocks: self.body,
-            fallback: region_fallback,
-        }));
-        Ok(())
-    }
 }
 
 fn plan_region(
@@ -437,7 +204,7 @@ fn plan_region(
     entry: Option<(Block, Block)>,
     conditional: &[ConditionalCall],
     candidates: &Candidates,
-) -> Result<(RegionPlan, Facts)> {
+) -> Result<(RegionPlan, Graph)> {
     let locals: Vec<_> = candidates
         .locals
         .iter()
@@ -741,7 +508,6 @@ fn plan_region(
             calls,
             identities,
             reads,
-            assumes,
             checks,
             guards,
             exits,
@@ -750,7 +516,7 @@ fn plan_region(
             reentry,
             children: Vec::new(),
         },
-        facts,
+        planning,
     ))
 }
 
@@ -759,7 +525,8 @@ fn plan(
     conditional: &ConditionalPlan,
     reached: &[Reach],
     notes: &mut Vec<String>,
-) -> Vec<RegionPlan> {
+    shapes: &super::super::shapes::Plan,
+) -> Result<(Graph, Vec<RegionPlan>)> {
     let known = Facts::values(graph);
     let cfg = &known.cfg;
     let mut candidates: Vec<_> = natural_loops(graph, cfg)
@@ -777,14 +544,27 @@ fn plan(
         .iter()
         .map(|(body, entry)| (entry.map(|(_, header)| header), body.clone()))
         .collect();
+    let mut working = graph.clone();
+    let mut values: FxHashMap<_, _> = graph.values.keys().map(|value| (value, value)).collect();
+    let mut bailouts = Bailouts::new(graph);
     let mut plans: Vec<RegionPlan> = Vec::new();
-    for (body, entry) in candidates {
+    for (mut body, entry) in candidates {
+        for child in &plans {
+            if bodies[&entry.map(|(_, header)| header)]
+                .is_superset(&bodies[&child.entry.map(|(_, header)| header)])
+            {
+                body.extend(&child.body);
+            }
+        }
+        let known = Facts::values(&working);
+        let live: FxHashSet<_> = known.cfg.rpo.iter().copied().collect();
+        body.retain(|block| live.contains(block));
         let mut proposals = Candidates::default();
         for reach in reached.iter().filter(|reach| {
             body.contains(&reach.use_block)
-                && bodies
-                    .get(&reach.header)
-                    .is_some_and(|outer| outer.is_superset(&body))
+                && bodies.get(&reach.header).is_some_and(|outer| {
+                    outer.is_superset(&bodies[&entry.map(|(_, header)| header)])
+                })
         }) {
             if reach.local {
                 proposals.locals.push(reach.inst);
@@ -798,58 +578,142 @@ fn plan(
                         .push((name.clone(), code, reach.origin));
                 }
                 (Fact::Code(_), None) => {}
-                (fact, _) => {
-                    proposals.facts.push((reach.value, fact));
-                    proposals.origins.push((reach.value, fact, reach.origin));
+                (mut fact, _) => {
+                    let value = values[&reach.value];
+                    if let Fact::Bound(bound) | Fact::Cached(bound, _) = &mut fact {
+                        *bound = values[bound];
+                    }
+                    proposals.facts.push((value, fact));
+                    proposals.origins.push((value, fact, reach.origin));
                 }
             }
         }
-        let (mut parent, facts) =
-            match plan_region(graph, &known, body, entry, &conditional.calls, &proposals) {
-                Ok(plan) => plan,
-                Err(reason) => {
-                    let label = entry.map_or_else(
-                        || "function".to_owned(),
-                        |(_, header)| format!("loop at {header}"),
-                    );
-                    notes.push(format!("{label}: not versioned: {reason}"));
-                    continue;
-                }
-            };
         let label = entry.map_or_else(
             || "function".to_owned(),
             |(_, header)| format!("loop at {header}"),
         );
-        let candidate = Candidate {
+        let (mut parent, mut candidate) = match plan_region(
+            &working,
+            &known,
+            body,
+            entry,
+            &conditional.calls,
+            &proposals,
+        ) {
+            Ok(plan) => plan,
+            Err(reason) => {
+                notes.push(format!("{label}: not versioned: {reason}"));
+                continue;
+            }
+        };
+        let cost = Candidate {
             size: parent
                 .body
                 .iter()
-                .filter(|block| !graph.cold.contains(block))
-                .map(|&block| graph.blocks[block].insts.len())
+                .filter(|block| !candidate.cold.contains(block))
+                .map(|&block| candidate.blocks[block].insts.len())
                 .sum(),
             checks: parent.checks.len() + parent.identities.len() + parent.locals.len(),
             reentry: parent.reentry.as_deref(),
             survivors: &parent.survivors,
         };
-        match worth(&candidate) {
-            Verdict::Open => notes.push(format!("{label}: gate open: {}", candidate.summary())),
+        match worth(&cost) {
+            Verdict::Open => notes.push(format!("{label}: gate open: {}", cost.summary())),
             Verdict::Skip(reason) => {
                 notes.push(format!("{label}: not versioned: {reason}"));
                 continue;
             }
         }
+        let blocks: Vec<_> = known
+            .cfg
+            .rpo
+            .iter()
+            .copied()
+            .filter(|block| parent.body.contains(block))
+            .collect();
+        let shaped_reads: Vec<_> = parent
+            .reads
+            .iter()
+            .filter_map(|&inst| {
+                let Op::Get(object, _) = candidate.insts[inst].op else {
+                    return None;
+                };
+                shapes
+                    .read(&candidate, inst)
+                    .filter(|&(shape, _)| parent.checks.contains(&(object, Fact::Shape(shape))))
+                    .map(|(shape, index)| (inst, shape, index))
+            })
+            .collect();
+        let speculation = Speculation {
+            locals: &parent.locals,
+            reads: &parent.reads,
+            shaped_reads: &shaped_reads,
+            assumes: &parent.checks,
+            guards: &parent.guards,
+            exits: &parent.exits,
+            typed_reads: &parent.typed_reads,
+            code_guards: &parent.identities,
+            ..Default::default()
+        };
+        let mut candidate_values = values.clone();
+        let mut candidate_notes = Vec::new();
+        let added = candidate.blocks.len();
+        if parent.speculative() {
+            materialize(
+                &mut candidate,
+                &blocks,
+                parent.entry,
+                &speculation,
+                &parent.requirements,
+                &mut candidate_values,
+                &mut bailouts,
+                &mut candidate_notes,
+            )
+            .map_err(|reason| format!("{label}: {reason}"))?;
+        }
+        parent.body.extend(candidate.blocks.keys().skip(added));
+        let live: FxHashSet<_> = Cfg::new(&candidate).rpo.into_iter().collect();
+        parent.body.retain(|block| live.contains(block));
+        if let Some(reason) = closure_failure(
+            &candidate,
+            &parent.body,
+            &guarded_accesses(&parent.requirements, &parent.identities),
+            &FxHashMap::default(),
+        ) {
+            notes.push(format!(
+                "{label}: not versioned: guarded candidate {reason}"
+            ));
+            continue;
+        }
+        candidate
+            .verify()
+            .map_err(|reason| format!("{label}: {reason}"))?;
+        notes.extend(candidate_notes);
+        if !parent.calls.is_empty() {
+            notes.push(format!(
+                "{label}: {} global code checks prove {} read-only call(s)",
+                parent.identities.len(),
+                parent.calls.len()
+            ));
+        }
+        notes.push(format!("{label}: combined entry guards: {} native calls, {} number assumptions, {} read probes, {} hoisted guards, {} typed receiver assumptions and {} length checks",
+            parent.requirements.len(), parent.numbers(), parent.reads.len(), parent.guards.len(), parent.typed().len(), parent.bounds().len()));
         let mut remaining = Vec::new();
         for child in plans {
-            if child.body.is_subset(&parent.body) {
-                parent.merge(child, &facts);
+            if bodies[&child.entry.map(|(_, header)| header)]
+                .is_subset(&bodies[&entry.map(|(_, header)| header)])
+            {
+                parent.children.push(child);
             } else {
                 remaining.push(child);
             }
         }
         remaining.push(parent);
         plans = remaining;
+        working = candidate;
+        values = candidate_values;
     }
-    plans
+    Ok((working, plans))
 }
 
 #[cfg(test)]
@@ -882,29 +746,34 @@ pub(in crate::jit::semantic) fn version_with_report(
 ) -> Result<Vec<RegionId>> {
     property_assumptions(graph, notes);
     let reached = super::propose::assume(graph, conditional);
-    let plans = plan(graph, conditional, &reached, notes);
     let original = graph.clone();
-    let canonical = Canonical::identity(&original);
+    let (mut candidate, plans) = plan(&original, conditional, &reached, notes, shapes)?;
     if report_regions {
-        let mut report = String::from("region plan before versioning:\n");
+        let mut report = String::from("region candidates after specialization:\n");
         for plan in &plans {
-            report.push_str(&plan.report(graph, 1, true));
+            report.push_str(&plan.report(&candidate, 1, true));
         }
         notes.push(report);
     }
     let mut regions = Vec::new();
-    for plan in plans {
-        plan.emit(
-            graph,
-            fallback,
-            continuations,
-            &mut regions,
-            notes,
-            report_regions,
-            &canonical,
-            shapes,
-        )?;
+    fn record(graph: &mut Graph, plan: RegionPlan, regions: &mut Vec<RegionId>) {
+        regions.push(graph.regions.push(Region {
+            blocks: plan.body,
+            fallback: None,
+        }));
     }
+    for plan in plans {
+        record(&mut candidate, plan, &mut regions);
+    }
+    super::versioning::finish(
+        &mut candidate,
+        &original,
+        fallback,
+        continuations,
+        &regions,
+        notes,
+    )?;
+    *graph = candidate;
     materialize_properties(graph)?;
     graph.strip_assumes();
     Ok(regions)
@@ -1193,26 +1062,37 @@ mod tests {
     }
 
     #[test]
-    fn nested_loop_assumptions_merge_to_function_entry_before_copying() {
+    fn nested_loop_candidates_keep_one_specialized_body() {
         let mut graph = graph(
             "function f(grid,width){let sum=0;for(let y=0;y<2;++y){const offset=y*width;for(let x=0;x<2;++x)sum+=Math.sqrt(grid[offset+x]);}return sum;}",
         );
         super::super::super::properties::assume_natives(&mut graph);
         let reached = super::propose::assume(&mut graph, &ConditionalPlan::default());
-        let plans = plan(
+        let (candidate, plans) = plan(
             &graph,
             &ConditionalPlan::default(),
             &reached,
             &mut Vec::new(),
-        );
+            &Default::default(),
+        )
+        .unwrap();
         assert_eq!(plans.len(), 1);
         let root = &plans[0];
         assert!(root.entry.is_none());
-        assert!(root.children.is_empty());
-        assert!(!root.requirements.is_empty());
-        assert!(!root.checks.is_empty());
-        assert!(root.typed_reads.is_empty());
-        assert_eq!(root.body.len(), Cfg::new(&graph).rpo.len());
+        assert!(!root.children.is_empty());
+        let cfg = Cfg::new(&candidate);
+        assert_eq!(natural_loops(&candidate, &cfg).len(), 2);
+        assert!(cfg.rpo.iter().any(|&block| {
+            candidate.blocks[block]
+                .insts
+                .iter()
+                .any(|&inst| matches!(candidate.insts[inst].op, Op::CallNative(..)))
+        }));
+        assert!(cfg.rpo.iter().any(|&block| matches!(
+            candidate.blocks[block].terminator.as_ref().unwrap().kind,
+            TerminatorKind::Bailout { .. }
+        )));
+        candidate.verify().unwrap();
         graph.verify().unwrap();
     }
 
@@ -1272,10 +1152,7 @@ mod tests {
         )
         .unwrap();
         assert!(!regions.is_empty());
-        assert!(regions.iter().any(|&id| match graph.regions[id].fallback {
-            Some(RegionFallback::Region(source)) => !graph.regions[source].blocks.is_empty(),
-            _ => false,
-        }));
+        assert!(!super::super::super::super::continuation::bodies(&graph).is_empty());
         assert!(Cfg::new(&graph).rpo.iter().all(|&block| {
             !matches!(
                 graph.blocks[block].terminator.as_ref().unwrap().kind,
@@ -1292,16 +1169,17 @@ mod tests {
         );
         super::super::super::properties::assume_natives(&mut graph);
         let reached = super::propose::assume(&mut graph, &ConditionalPlan::default());
-        let plans = plan(
+        let (_, plans) = plan(
             &graph,
             &ConditionalPlan::default(),
             &reached,
             &mut Vec::new(),
-        );
+            &Default::default(),
+        )
+        .unwrap();
         assert_eq!(plans.len(), 1);
         let root = &plans[0];
         assert!(root.entry.is_none());
-        assert!(root.children.is_empty());
         assert!(root.typed().is_empty());
         assert!(root.typed_reads.is_empty());
     }
@@ -1409,7 +1287,7 @@ mod tests {
             analysis
                 .notes
                 .iter()
-                .any(|note| note.starts_with("local assumption") && note.contains("resumes in"))
+                .any(|note| note.starts_with("local assumption") && note.contains("bailout"))
         );
         assert!(!super::super::super::super::continuation::bodies(graph).is_empty());
         graph.verify().unwrap();
@@ -1488,12 +1366,14 @@ mod tests {
             .unwrap();
         super::super::super::properties::assume_natives(&mut graph);
         let reached = super::propose::assume(&mut graph, &ConditionalPlan::default());
-        let plans = plan(
+        let (_, plans) = plan(
             &graph,
             &ConditionalPlan::default(),
             &reached,
             &mut Vec::new(),
-        );
+            &Default::default(),
+        )
+        .unwrap();
         assert!(plans[0].typed().iter().any(|&(object, _)| object == xs));
         assert!(
             plans[0]
@@ -1526,23 +1406,28 @@ mod tests {
         );
         super::super::super::properties::assume_natives(&mut graph);
         let reached = super::propose::assume(&mut graph, &ConditionalPlan::default());
-        let plans = plan(
+        let (candidate, plans) = plan(
             &graph,
             &ConditionalPlan::default(),
             &reached,
             &mut Vec::new(),
-        );
+            &Default::default(),
+        )
+        .unwrap();
         assert_eq!(plans.len(), 1);
         let root = &plans[0];
         assert!(root.entry.is_none());
-        assert_eq!(root.children.len(), 1);
-        let child = &root.children[0];
-        assert!(child.checks.iter().any(|&(value, _)| {
-            matches!(graph.defining_op(value), Some(Op::Get(_, name)) if name == "width")
-        }));
-        assert!(!root.checks.iter().any(|&(value, _)| {
-            matches!(graph.defining_op(value), Some(Op::Get(_, name)) if name == "width")
-        }));
+        let cfg = Cfg::new(&candidate);
+        let checks: Vec<_> = cfg.rpo.iter().copied().filter(|&block| candidate.blocks[block].insts.iter().any(|&inst| {
+            let (Op::IsNumber(value) | Op::IsInteger(value)) = candidate.insts[inst].op else { return false; };
+            matches!(candidate.defining_op(value), Some(Op::ProbeProperty(_, name)) if name == "width")
+        })).collect();
+        assert!(!checks.is_empty());
+        for block in checks {
+            assert!(cfg.rpo.iter().any(|&write| cfg.dominates(write, block) && candidate.blocks[write].insts.iter()
+                .any(|&inst| matches!(&candidate.insts[inst].op, Op::Set(_, name, _) if name == "width"))));
+        }
+        candidate.verify().unwrap();
     }
 
     #[test]

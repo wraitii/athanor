@@ -199,7 +199,7 @@ impl<'a> Builder<'a> {
                     emission_location: None,
                     span,
                     block,
-                    results: Vec::new(),
+                    results: Default::default(),
                     op: Op::LeaveScope(scope),
                 });
                 self.graph.blocks[block].insts.push(inst);

@@ -343,6 +343,12 @@ fn assign(
         }
     }
     let anchored = |value: Value, live: &mut FxHashSet<Value>| {
+        if !receivers.contains_key(&value) {
+            if owned(value) {
+                live.insert(value);
+            }
+            return;
+        }
         let mut pending = vec![value];
         let mut visited = FxHashSet::default();
         while let Some(current) = pending.pop() {
@@ -654,7 +660,7 @@ fn append(
         emission_location: None,
         span,
         block,
-        results: Vec::new(),
+        results: Default::default(),
         op,
     })
 }

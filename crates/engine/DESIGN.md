@@ -1230,8 +1230,8 @@ and script initializers through `jit/semantic/` before shared runtime lowering.
 `--compile` prints the graph actually passed to emission by default, with
 inferred types and semantic-location IDs. `--planner` prints specialization
 plans, available feedback, the region tree and per-region assumptions, and pass
-notes separately. Detailed region snapshots are captured before versioning and
-after replanning each emitted region, only when requested. `jit/inspect.rs` formats
+notes separately. Detailed region snapshots describe the retained candidates
+after child-first specialization, only when requested. `jit/inspect.rs` formats
 the function views; `--filter NAME` restricts their output by name substring.
 `--clif` adds Cranelift IR dumps before and after backend preparation; the native
 path constructs this view for inspection. Assembly includes
@@ -1291,8 +1291,8 @@ ordinary graph operations. Backend preparation receives this graph with ordinary
 scalar conversions and compound bit operations still present. AArch64 resolves
 the scalar conversions and consumes the bit operations directly. Cranelift expands
 scalar conversions, bit operations and indexed memory accesses before CLIF
-emission. Native compilation, Cranelift inspection and fallback prepare separate
-copies, preserving the shared input. The final machine verifier requires
+emission. Native compilation consumes the lowered graph; Cranelift inspection prepares a
+separate copy. The final machine verifier requires
 compatible edges and ABI arguments.
 
 The native AArch64 backend has four stages:
@@ -1580,13 +1580,13 @@ Exact local closure calls can use unconditional closed, read-only summaries.
 Conditional call proofs participate in the same bottom-up region planning as
 numeric, native and typed assumptions. Each call retains its transitive global
 code requirements. A candidate loop or function checks only its own requirements,
-merges covered child proofs and emits one combined guarded copy. The region must
+retains the specialized child graph and materializes its own guards. The region must
 remain closed and preserve the guarded identities; unrelated writes are allowed
 when the ordinary region stability checks permit them. Callee summaries still
 require read-only descendants and reject unresolved calls, native identity
 obligations, generators and handlers. Only calls in the validated copy receive
 the conditional proof; guard failure enters the original region before its
-effects execute. Value substitution and nested copying preserve those proofs.
+effects execute. Value substitution preserves those proofs in the retained graph.
 Feedback recompilation retains the native entry of the previously emitted
 version. A function specialization sends entry guard failure directly to that
 previous version, passing the original closure, receiver and arguments. When
@@ -1832,11 +1832,20 @@ Optimization works on regions: the whole function, or a loop whose body is
 closed. A region is closed when nothing in it reenters JavaScript and nothing
 writes state the region is guarded on. Typed versions of a region are selected
 by checks that run before it is entered. Varying inline guards can transfer to
-the original continuation before reentry. Each versioned region keeps exactly
-one generic sibling, which is not versioned
-further, so the result is a tree of loop versions that join again at loop exits.
-Values defined inside the version and used after it reach those exits through
-block parameters, placed by dominance-based SSA reconstruction.
+the original continuation before reentry. Planning constructs candidates
+child-first, retaining their specialized graphs rather than reconstructing them
+in a separate emission traversal. Parent analysis sees the specialized child's
+operations and explicit guards. Failed guards end in temporary `Bailout`
+terminators, which carry generic resume targets and the current SSA inputs but
+have no CFG successors. Generic execution therefore does not rejoin a
+specialized parent.
+
+Finalization lowers bailouts to generic continuations, a previous compiled entry,
+or a shared inline copy of the original generic graph when continuation
+extraction is unavailable or disabled. It repairs SSA where generic paths merge
+and splits generic loops into continuation functions when supported. It performs
+no specialization planning. Ordinary cleanup, load reuse, specialized lowering,
+and hoisting run after the complete candidate graph has been finalized.
 
 Versioning stores these block sets in graph-owned `Region` records, indexed by
 `RegionId`. Each record can identify its generic fallback as another region or an

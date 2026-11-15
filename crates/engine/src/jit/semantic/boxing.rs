@@ -64,7 +64,7 @@ impl Boxing<'_> {
             emission_location: None,
             span,
             block,
-            results: vec![result],
+            results: smallvec::smallvec![result],
             op,
         });
         self.graph.reprs[result] = Some(repr);

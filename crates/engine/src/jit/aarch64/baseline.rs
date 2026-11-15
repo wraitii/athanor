@@ -1117,6 +1117,7 @@ fn emit(
             | TerminatorKind::TailCall { .. } => {
                 return refuse(reason, "low-level terminator");
             }
+            TerminatorKind::Bailout { .. } => return refuse(reason, "unresolved bailout"),
             TerminatorKind::Fallback(..) => return refuse(reason, "fallback terminator"),
         }
         let end = asm.offset();

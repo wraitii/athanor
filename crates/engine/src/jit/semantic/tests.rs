@@ -3010,7 +3010,7 @@ fn scalar_cse_respects_dominance_and_canonicalizes_operands() {
         }
     }
     let facts = Facts::compute(&graph);
-    assert!(cse::eliminate(&mut graph, &facts, &mut Vec::new()));
+    assert!(cse::eliminate(&mut graph, &facts, None));
     graph.verify().unwrap();
     assert!(matches!(
         &graph.blocks[join].terminator.as_ref().unwrap().kind,
@@ -3348,7 +3348,17 @@ fn guarded_cache_loads_preserve_their_builtin_mode() {
         property_accesses::assume(&mut graph, &shapes::Plan::default());
         graph.strip_assumes();
         let cache = graph.property_accesses[&inst].cache.unwrap();
-        let (before, _, read) = dispatch::split(&mut graph, inst);
+        let original = graph.insts[inst].result().unwrap();
+        let (before, continuation, read) = dispatch::split(&mut graph, inst);
+        let fallback_result = graph.insts[inst].result().unwrap();
+        assert_ne!(original, fallback_result);
+        assert_eq!(graph.values[original], ValueDef::Param(continuation, 0));
+        assert_eq!(graph.values[fallback_result], ValueDef::Result(inst, 0));
+        assert_eq!(graph.blocks[continuation].params, vec![original]);
+        assert!(matches!(
+            &graph.blocks[read].terminator.as_ref().unwrap().kind,
+            TerminatorKind::Jump(target) if target.args == [fallback_result]
+        ));
         let failed = graph.blocks.push(BlockData::default());
         let undefined = graph.append_value(failed, span, Op::Constant(Constant::Undefined));
         graph.terminate(failed, span, TerminatorKind::Return(undefined));

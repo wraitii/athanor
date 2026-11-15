@@ -35,6 +35,10 @@ remain available for specialization and inlining. A filter with no matches is an
 error. Compilation options cannot be combined with `--load`, `--function`,
 `--arg`, `--map`, or `--repl`.
 
+Semantic graph verification is enabled in debug builds and unit tests. Release
+builds skip it by default; set `JS_JIT_VERIFY=1` to enable it. The setting is read
+once per process, on first verification.
+
 - Semantic IR is the default: the graph passed to runtime lowering, including
   OSR instrumentation when enabled. `--no-semantic-ir` (also `--no-ir`) suppresses
   it; `--semantic-ir` enables it again. `JS_JIT_SSA=0` selects the unoptimized
@@ -45,8 +49,8 @@ error. Compilation options cannot be combined with `--load`, `--function`,
   includes register allocation.
 - `--planner` prints the inline budget, available call/read feedback, selected
   inlines, read refinements, conditional effects/identity guards, OSR plans, and
-  optimization notes. It also shows the region tree before versioning and the
-  replanned regions immediately before their emission: block membership, native
+  optimization notes. It also shows the retained region candidates after
+  child-first specialization: block membership, native
   requirements, numeric assumptions, read probes, hoisted guards, fallback exits,
   typed receivers/reads, and length checks. Rejected regions remain in the notes.
   After versioning, it lists graph-local region IDs, their block sets and
@@ -277,8 +281,8 @@ the optimized tier. The former `JS_JIT_SYNC_OPT_LEVEL` and
 
 The native AArch64 path skips Cranelift optimization, including during background
 recompilation. It selects and allocates directly from the graph produced by shared
-runtime lowering. Cranelift optimization still runs for its own backend, including
-native backend fallbacks.
+runtime lowering. Cranelift optimization still runs for its own backend. Native
+compilation reports unsupported operations as errors.
 
 Set `JS_JIT_RECOMPILE_LOG=1` (`EngineOptions::recompile_log`) to trace recompilation
 to stderr in either mode. Events include feedback sites and types, requests,

@@ -28,6 +28,12 @@ mod transforms;
 pub(in crate::jit) mod variables;
 pub(in crate::jit) mod widths;
 
+fn verification_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("JS_JIT_VERIFY").as_deref() == Ok("1"));
+    cfg!(any(debug_assertions, test)) || *ENABLED
+}
+
 pub(super) use pipeline::{
     LOW_LEVEL_PASSES, Versioning, build_canonical, canonicalize_graph, lower_global,
     lower_low_level, optimize_specialized, specialize_with_budget,
@@ -150,7 +156,7 @@ pub(super) struct InstData {
     pub(super) emission_location: Option<u32>,
     pub(super) span: Span,
     pub(super) block: Block,
-    pub(super) results: Vec<Value>,
+    pub(super) results: smallvec::SmallVec<[Value; 1]>,
     pub(super) op: Op,
 }
 
@@ -572,6 +578,11 @@ pub(super) enum TerminatorKind {
         target: low_level::CallTarget,
         signature: cranelift_codegen::ir::Signature,
         args: Vec<Value>,
+    },
+    Bailout {
+        // The target belongs to the generic graph; only inputs are SSA operands.
+        target: Target,
+        inputs: Vec<Value>,
     },
     Fallback(usize),
 }
@@ -1151,7 +1162,8 @@ impl TerminatorKind {
             }
             TerminatorKind::Yield(_, value, target) => (Some(value), &mut target.args, &mut []),
             TerminatorKind::Return(value) => (Some(value), &mut [], &mut []),
-            TerminatorKind::ReturnValues(values) => (None, values, &mut []),
+            TerminatorKind::ReturnValues(values)
+            | TerminatorKind::Bailout { inputs: values, .. } => (None, values, &mut []),
             TerminatorKind::TailCall { target, args, .. } => (
                 match target {
                     low_level::CallTarget::Indirect(value) => Some(value),
@@ -1185,7 +1197,8 @@ impl TerminatorKind {
             TerminatorKind::Branch(condition, yes, no) => (Some(*condition), &yes.args, &no.args),
             TerminatorKind::Yield(_, value, target) => (Some(*value), &target.args, &[]),
             TerminatorKind::Return(value) => (Some(*value), &[], &[]),
-            TerminatorKind::ReturnValues(values) => (None, values, &[]),
+            TerminatorKind::ReturnValues(values)
+            | TerminatorKind::Bailout { inputs: values, .. } => (None, values, &[]),
             TerminatorKind::TailCall { target, args, .. } => (
                 match target {
                     low_level::CallTarget::Indirect(value) => Some(*value),
@@ -1215,6 +1228,7 @@ impl TerminatorKind {
             TerminatorKind::Return(_)
             | TerminatorKind::ReturnValues(_)
             | TerminatorKind::TailCall { .. }
+            | TerminatorKind::Bailout { .. }
             | TerminatorKind::Fallback(_) => (None, None),
         };
         first.into_iter().chain(second)
@@ -1232,6 +1246,7 @@ impl TerminatorKind {
             TerminatorKind::Return(_)
             | TerminatorKind::ReturnValues(_)
             | TerminatorKind::TailCall { .. }
+            | TerminatorKind::Bailout { .. }
             | TerminatorKind::Fallback(_) => (None, None),
         };
         first.into_iter().chain(second)
@@ -2098,6 +2113,9 @@ impl Graph {
     }
 
     fn verify_representations(&self, machine: bool) -> Result<()> {
+        if !verification_enabled() {
+            return Ok(());
+        }
         let mut stacks: SecondaryMap<Block, Option<Vec<Scope>>> = SecondaryMap::new();
         stacks[self.entry] = Some(Vec::new());
         let mut worklist = vec![self.entry];

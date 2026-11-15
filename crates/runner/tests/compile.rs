@@ -181,7 +181,7 @@ fn semantic_ir_is_default_and_clif_is_explicit() {
 }
 
 #[test]
-fn planner_reports_region_tree_and_emitted_assumptions() {
+fn planner_reports_materialized_region_candidates() {
     let output = compile(
         &["--planner"],
         "function f(rows){let sum=0;for(let y=0;y<2;++y){const row=new Float64Array(2);for(let x=0;x<2;++x)sum+=row[x];}return sum;}",
@@ -195,13 +195,12 @@ fn planner_reports_region_tree_and_emitted_assumptions() {
     let planner = text.split("planner f\n").nth(1).unwrap();
     for entry in [
         "regions:",
-        "region plan before versioning:",
+        "region candidates after specialization:",
         "region loop at block",
         "preheader=",
         "blocks:",
         "typed receiver ",
         "typed read ",
-        "region emission:",
     ] {
         assert!(planner.contains(entry), "{entry}\n{planner}");
     }
@@ -212,7 +211,7 @@ fn planner_reports_region_tree_and_emitted_assumptions() {
         .split("planner f")
         .next()
         .unwrap();
-    assert!(!semantic.contains("region plan before versioning"));
+    assert!(!semantic.contains("region candidates after specialization"));
     let plain = compile(
         &[],
         "function f(rows){let sum=0;for(let y=0;y<2;++y){const row=new Float64Array(2);for(let x=0;x<2;++x)sum+=row[x];}return sum;}",

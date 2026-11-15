@@ -627,7 +627,7 @@ fn whole_function_guards_expose_closed_inlined_arithmetic() {
         .next()
         .unwrap();
     assert!(function.contains("function: combined entry guards:"));
-    let fast = function.split("\nblock0:").next().unwrap();
+    let fast = function.split("\n  return ").next().unwrap();
     assert_eq!(fast.matches("probe_global square").count(), 1);
     assert_eq!(fast.matches(" = is_code ").count(), 1);
     assert_eq!(fast.matches(" = is_number ").count(), 4);

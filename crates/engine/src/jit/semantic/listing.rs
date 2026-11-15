@@ -613,6 +613,15 @@ impl Listing<'_> {
                             .collect::<Vec<_>>()
                             .join(", ")
                     ),
+                    TerminatorKind::Bailout { target, inputs } => format!(
+                        "bailout {} ({})",
+                        target.block,
+                        inputs
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
                     TerminatorKind::Fallback(entry) => format!("fallback {entry:#x}"),
                 };
                 let span = terminator.span;

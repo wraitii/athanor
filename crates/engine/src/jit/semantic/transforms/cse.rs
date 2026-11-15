@@ -89,7 +89,7 @@ fn expression(
 pub(in crate::jit::semantic) fn eliminate(
     graph: &mut Graph,
     facts: &Facts,
-    notes: &mut Vec<String>,
+    mut notes: Option<&mut Vec<String>>,
 ) -> bool {
     let cfg = &facts.cfg;
     let mut available = FxHashMap::default();
@@ -132,7 +132,9 @@ pub(in crate::jit::semantic) fn eliminate(
     }
     graph.replace_uses(&aliases);
     for &(inst, value) in &reused {
-        notes.push(format!("{} reuses {value}", graph.note_inst(inst)));
+        if let Some(notes) = &mut notes {
+            notes.push(format!("{} reuses {value}", graph.note_inst(inst)));
+        }
         graph.remove_inst(inst);
     }
     !reused.is_empty()

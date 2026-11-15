@@ -8,7 +8,7 @@ pub(in crate::jit::semantic) fn hoist(
     graph: &mut Graph,
     facts: &Facts,
     scope: Option<&FxHashSet<Block>>,
-    notes: &mut Vec<String>,
+    mut notes: Option<&mut Vec<String>>,
 ) -> bool {
     let loops = natural_loops(graph, &facts.cfg);
     let mut changed = false;
@@ -63,6 +63,9 @@ pub(in crate::jit::semantic) fn hoist(
         }
         changed |= !moved.is_empty();
         for inst in moved {
+            let Some(notes) = &mut notes else {
+                continue;
+            };
             let data = &graph.insts[inst];
             notes.push(format!(
                 "{} = {} hoisted from {header} to {preheader}",

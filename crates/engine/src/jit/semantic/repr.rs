@@ -367,7 +367,9 @@ enum Stage {
 }
 
 pub(in crate::jit) fn unbox(builder: &mut Builder<'_>) -> Result<(), String> {
-    verify_words(builder.graph)?;
+    if super::verification_enabled() {
+        verify_words(builder.graph)?;
+    }
     rewrite(builder, Stage::Words)?;
     words(builder.graph)
 }

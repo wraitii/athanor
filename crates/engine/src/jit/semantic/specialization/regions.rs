@@ -30,7 +30,7 @@ pub(in crate::jit::semantic) use analysis::{Writes, requirements};
 #[cfg(test)]
 pub(in crate::jit::semantic) use planning::version;
 pub(in crate::jit::semantic) use planning::{materialize_properties, version_with_report};
-use versioning::{Speculation, apply_version};
+use versioning::Speculation;
 
 pub(in crate::jit::semantic) fn version_string_leaves(
     graph: &mut Graph,
@@ -107,7 +107,7 @@ pub(in crate::jit::semantic) fn version_string_leaves(
         if cost > SPECIALIZATION_REGION_LIMIT {
             continue;
         }
-        let exits: Vec<_> = blocks
+        let mut exits: Vec<_> = blocks
             .iter()
             .copied()
             .filter(|&block| cold_exit(graph, block).is_some())
@@ -144,22 +144,36 @@ pub(in crate::jit::semantic) fn version_string_leaves(
         if exits.is_empty() && exits_true.is_empty() {
             continue;
         }
+        for &block in &cfg.preds[preheader] {
+            if matches!(&graph.blocks[block].terminator, Some(Terminator { kind: TerminatorKind::Branch(condition, yes, _), .. })
+                if yes.block == preheader && matches!(graph.defining_op(*condition), Some(Op::IsStringSplit(_))))
+            {
+                exits.push(block);
+            }
+        }
+        let original = graph.clone();
         let mut candidate = graph.clone();
         let speculation = Speculation {
-            continuations,
             exits: &exits,
             exits_true: &exits_true,
             ..Default::default()
         };
-        let version = apply_version(
+        let mut values = original.values.keys().map(|value| (value, value)).collect();
+        let mut bailouts = versioning::Bailouts::new(&original);
+        let mut candidate_notes = Vec::new();
+        let added = candidate.blocks.len();
+        versioning::materialize(
             &mut candidate,
             &blocks,
             Some((preheader, header)),
             &speculation,
-            None,
-        );
-        notes.extend(version.notes.iter().cloned());
-        let copy = version.body;
+            &[],
+            &mut values,
+            &mut bailouts,
+            &mut candidate_notes,
+        )?;
+        let mut copy: FxHashSet<_> = blocks.iter().copied().collect();
+        copy.extend(candidate.blocks.keys().skip(added));
         let mut function = FunctionState::new(candidate, Vec::new(), true);
         super::super::js::simplify(&mut function);
         let mut candidate = function.graph;
@@ -176,15 +190,21 @@ pub(in crate::jit::semantic) fn version_string_leaves(
             "string split continuation versioned after native identity check; {} guarded exits",
             exits.len() + exits_true.len()
         ));
-        let source = candidate.regions.push(Region {
-            blocks: blocks.iter().copied().collect(),
+        let region = candidate.regions.push(Region {
+            blocks: copy,
             fallback: None,
         });
+        versioning::finish(
+            &mut candidate,
+            &original,
+            None,
+            continuations,
+            &[region],
+            &mut candidate_notes,
+        )?;
+        notes.extend(candidate_notes);
         *graph = candidate;
-        regions.push(graph.regions.push(Region {
-            blocks: copy,
-            fallback: Some(RegionFallback::Region(source)),
-        }));
+        regions.push(region);
         break;
     }
     Ok(regions)
@@ -493,7 +513,7 @@ pub(in crate::jit::semantic) fn hoist(function: &mut FunctionState, region: Regi
         &mut function.graph,
         &function.facts,
         Some(&scope),
-        &mut function.notes,
+        Some(&mut function.notes),
     ) {
         function.invalidate_values();
     }

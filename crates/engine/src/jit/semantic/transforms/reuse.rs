@@ -13,37 +13,41 @@ pub(in crate::jit::semantic) fn reuse_loads(function: &mut FunctionState) {
         notes,
         ..
     } = function;
-    if cleanup(graph, facts, notes) {
-        function.invalidate_values();
-    }
+    cleanup(graph, facts, Some(notes));
     guarded_floats(function);
 }
 
 pub(in crate::jit::semantic) fn lowered(graph: &mut Graph) {
     let mut facts = Facts::compute(graph);
-    let mut notes = Vec::new();
-    cleanup(graph, &mut facts, &mut notes);
-    let facts = Facts::compute(graph);
-    if super::licm::hoist(graph, &facts, None, &mut notes) {
-        let mut facts = Facts::compute(graph);
-        cleanup(graph, &mut facts, &mut notes);
+    cleanup(graph, &mut facts, None);
+    if super::licm::hoist(graph, &facts, None, None) {
+        refresh(graph, &mut facts);
+        cleanup(graph, &mut facts, None);
     }
 }
 
-fn cleanup(graph: &mut Graph, facts: &mut Facts, notes: &mut Vec<String>) -> bool {
-    let expressions = super::cse::eliminate(graph, facts, notes);
+fn refresh(graph: &Graph, facts: &mut Facts) {
+    let cfg = std::mem::take(&mut facts.cfg);
+    *facts = Facts::values_with_cfg(graph, cfg);
+    facts.compute_effects(graph);
+}
+
+fn cleanup(graph: &mut Graph, facts: &mut Facts, mut notes: Option<&mut Vec<String>>) -> bool {
+    let expressions = super::cse::eliminate(graph, facts, notes.as_deref_mut());
     if expressions {
-        *facts = Facts::compute(graph);
+        refresh(graph, facts);
     }
-    if !reuse(graph, facts, notes) {
+    if !reuse(graph, facts, notes.as_deref_mut()) {
         return expressions;
     }
-    *facts = Facts::compute(graph);
-    super::cse::eliminate(graph, facts, notes);
+    refresh(graph, facts);
+    if super::cse::eliminate(graph, facts, notes) {
+        refresh(graph, facts);
+    }
     true
 }
 
-fn reuse(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>) -> bool {
+fn reuse(graph: &mut Graph, facts: &Facts, mut notes: Option<&mut Vec<String>>) -> bool {
     let cfg = &facts.cfg;
     let Some(solved) = available::solve(graph, facts, cfg, graph.cold.clone(), false) else {
         return false;
@@ -58,7 +62,9 @@ fn reuse(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>) -> bool {
         graph.set_op(inst, Op::Constant(super::super::Constant::Boolean(value)));
     }
     for &(inst, value) in &solved.reused {
-        notes.push(format!("{} reuses {value}", graph.note_inst(inst)));
+        if let Some(notes) = &mut notes {
+            notes.push(format!("{} reuses {value}", graph.note_inst(inst)));
+        }
         graph.remove_inst(inst);
     }
     !solved.reused.is_empty() || !solved.folded.is_empty()

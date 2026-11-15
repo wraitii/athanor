@@ -14,19 +14,20 @@ pub(super) use select::run as select_graph;
 #[derive(Debug)]
 pub(super) struct Unsupported(pub String);
 
-pub(super) fn compile_graph(graph: &super::semantic::Graph) -> Result<MachineCode, Unsupported> {
-    let mut graph = graph.clone();
-    select::run(&mut graph)?;
-    let prepared = prepare::run(&graph)?;
+pub(super) fn compile_graph(
+    graph: &mut super::semantic::Graph,
+) -> Result<MachineCode, Unsupported> {
+    select::run(graph)?;
+    let prepared = prepare::run(graph)?;
     let allocation = crate::jit::alloc::graph::allocate(
-        &graph,
+        graph,
         &prepared.cfg,
         &prepared.order,
         &alloc::TARGET,
         &prepared.input,
     )
     .map_err(Unsupported)?;
-    emit::emit(&graph, &prepared, &allocation)
+    emit::emit(graph, &prepared, &allocation)
 }
 
 pub(super) fn compile_baseline(

@@ -1,7 +1,7 @@
-use crate::FxHashMap;
-
 use super::guards::Fact;
-use super::{Block, BlockData, Graph, Inst, Op, Target, Terminator, TerminatorKind, Value};
+use super::{
+    Block, BlockData, Graph, Inst, Op, Target, Terminator, TerminatorKind, Value, ValueDef,
+};
 
 pub(super) struct Alternative<T> {
     pub(super) requirements: Vec<(Value, Fact)>,
@@ -20,10 +20,17 @@ pub(super) fn split(graph: &mut Graph, inst: Inst) -> (Block, Block, Block) {
     if graph.cold.contains(&block) {
         graph.cold.insert(continuation);
     }
-    if let Some(original) = call.result() {
-        let result = graph.add_param(continuation);
-        graph.replace_uses(&FxHashMap::from_iter([(original, result)]));
-    }
+    let fallback_result = call.result().map(|original| {
+        let result = graph.values.push(ValueDef::Result(inst, 0));
+        graph.insts[inst].results[0] = result;
+        graph.values[original] = ValueDef::Param(continuation, 0);
+        graph.blocks[continuation].params.push(original);
+        graph.reprs[result] = graph.reprs[original].take();
+        if graph.borrowed.remove(&original) {
+            graph.borrowed.insert(result);
+        }
+        result
+    });
     let tail = graph.blocks[block].insts.split_off(position + 1);
     graph.blocks[continuation].insts = tail;
     for &inst in &graph.blocks[continuation].insts {
@@ -38,7 +45,7 @@ pub(super) fn split(graph: &mut Graph, inst: Inst) -> (Block, Block, Block) {
         span: call.span,
         kind: TerminatorKind::Jump(Target {
             block: continuation,
-            args: call.result().into_iter().collect(),
+            args: fallback_result.into_iter().collect(),
         }),
     });
     graph.cold.insert(fallback);

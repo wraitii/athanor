@@ -73,7 +73,9 @@ fn extract(graph: &Graph, target: Target, facts: &Facts) -> super::Result<(Graph
         let data = &result.blocks[block];
         if matches!(
             data.terminator.as_ref().unwrap().kind,
-            TerminatorKind::Yield(..) | TerminatorKind::Fallback(..)
+            TerminatorKind::Yield(..)
+                | TerminatorKind::Fallback(..)
+                | TerminatorKind::Bailout { .. }
         ) {
             return Err("continuation requires normal control flow".into());
         }

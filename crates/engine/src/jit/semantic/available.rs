@@ -175,30 +175,40 @@ fn entering(
     if block == graph.entry {
         return AvailableLoads::default();
     }
-    let mut incoming = cfg.preds[block].iter().filter_map(|pred| {
-        let mut state = exits.get(pred)?.clone();
-        if let Some(terminator) = &graph.blocks[*pred].terminator
-            && let TerminatorKind::Branch(condition, yes, no) = &terminator.kind
-            && yes.block != no.block
-        {
-            let (condition, inverted) = match super::guards::negated(graph, *condition) {
-                Some(value) => (value, true),
-                _ => (*condition, false),
-            };
-            let condition = resolve(aliases, condition);
-            for entry in state.values_mut() {
-                if resolve(aliases, entry.value) == condition {
-                    entry.truth = Some((yes.block == block) != inverted);
-                }
-            }
-        }
-        Some(state)
-    });
-    let Some(first) = incoming.next() else {
+    let mut incoming = cfg.preds[block]
+        .iter()
+        .filter_map(|pred| exits.get(pred).map(|state| (*pred, state)));
+    let Some((first, mut state)) = incoming.next().map(|(pred, state)| (pred, state.clone()))
+    else {
         return AvailableLoads::default();
     };
-    let mut state = first;
-    for other in incoming {
+    let edge_truth = |pred: Block| {
+        let terminator = graph.blocks[pred].terminator.as_ref()?;
+        let TerminatorKind::Branch(condition, yes, no) = &terminator.kind else {
+            return None;
+        };
+        if yes.block == no.block {
+            return None;
+        }
+        let (condition, inverted) = match super::guards::negated(graph, *condition) {
+            Some(value) => (value, true),
+            _ => (*condition, false),
+        };
+        Some((
+            resolve(aliases, condition),
+            (yes.block == block) != inverted,
+        ))
+    };
+    let truth_on_edge = |entry: &Available, edge: Option<(Value, bool)>| match edge {
+        Some((condition, truth)) if resolve(aliases, entry.value) == condition => Some(truth),
+        _ => entry.truth,
+    };
+    let first_edge = edge_truth(first);
+    for entry in state.values_mut() {
+        entry.truth = truth_on_edge(entry, first_edge);
+    }
+    for (pred, other) in incoming {
+        let edge = edge_truth(pred);
         state.retain(|key, entry| {
             let Some(other) = other.get(key) else {
                 return false;
@@ -206,7 +216,7 @@ fn entering(
             if entry.value != other.value || entry.read != other.read {
                 return false;
             }
-            if entry.truth != other.truth {
+            if entry.truth != truth_on_edge(other, edge) {
                 entry.truth = None;
             }
             true

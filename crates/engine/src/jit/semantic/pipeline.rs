@@ -74,7 +74,7 @@ impl FunctionState {
         helpers::lower(self);
         after("helpers", self);
         let plan = ownership::plan(&mut self.graph, &mut self.facts);
-        if cfg!(debug_assertions) {
+        if super::verification_enabled() {
             ownership::verify(&self.graph, &self.facts, &plan)?;
         }
         self.graph.ownership = Some(plan);

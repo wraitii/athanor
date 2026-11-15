@@ -461,8 +461,7 @@ impl Compiler {
         &mut self,
         id: FuncId,
         name: &str,
-        annotations: &mut Annotations,
-        graph: Option<&super::semantic::Graph>,
+        graph: Option<&mut super::semantic::Graph>,
     ) -> Result<MachineCode, Error> {
         let native =
             self.backend != crate::Backend::Cranelift && self.module.isa().name() == "aarch64";
@@ -472,36 +471,13 @@ impl Compiler {
         let Some(graph) = graph else {
             return MachineCode::from_cranelift(&mut self.context, &self.module, id);
         };
-        let result = super::aarch64::compile_graph(graph);
-        let reason = match result {
-            Ok(machine) => {
-                if let Some(stats) = &mut self.stats {
-                    stats.native += 1;
-                }
-                return Ok(machine);
-            }
-            Err(super::aarch64::Unsupported(reason)) => reason,
-        };
-        if self.backend == crate::Backend::NativeOnly {
-            return Err(Error::Compile(format!(
-                "native backend cannot compile {name}: {reason}"
-            )));
+        let machine = super::aarch64::compile_graph(graph).map_err(|error| {
+            Error::Compile(format!("native backend cannot compile {name}: {}", error.0))
+        })?;
+        if let Some(stats) = &mut self.stats {
+            stats.native += 1;
         }
-        if self.inspection.as_deref().is_some_and(|o| o.matches(name)) {
-            println!("[{name}] native backend fallback: {reason}");
-        }
-        if self.context.func.layout.entry_block().is_none() {
-            let mut graph = graph.clone();
-            cranelift::prepare(&mut graph, &mut |_, _| {}).map_err(Error::Compile)?;
-            let mut builder = cranelift_frontend::FunctionBuilder::new(
-                &mut self.context.func,
-                &mut self.builder_context,
-            );
-            cranelift::emit(&mut builder, &mut self.module, &graph, Some(annotations))?;
-            builder.seal_all_blocks();
-            builder.finalize(self.module.target_config());
-        }
-        MachineCode::from_cranelift(&mut self.context, &self.module, id)
+        Ok(machine)
     }
 
     fn entry(&mut self, id: FuncId) -> Result<Entry, Error> {
@@ -1121,12 +1097,7 @@ impl Compiler {
             }
             let machine = match code.baseline {
                 Some(machine) => machine,
-                None => Arc::new(self.machine_code(
-                    id,
-                    &name,
-                    &mut code.annotations,
-                    code.lowered.as_ref(),
-                )?),
+                None => Arc::new(self.machine_code(id, &name, code.lowered.as_mut())?),
             };
             machine.define(&mut self.module, id)?;
             if let Some(stats) = &mut self.stats {
@@ -2602,7 +2573,7 @@ mod listing_tests {
 }
 
 #[cfg(all(test, target_arch = "aarch64"))]
-mod native_fallback_tests {
+mod native_tests {
     use super::super::semantic::{Graph, Op, Repr, low_level::Builder, variables::Variables};
     use super::*;
     use cranelift_codegen::ir::{AbiParam, MemFlagsData, Signature, TrapCode, types};
@@ -2691,9 +2662,7 @@ mod native_fallback_tests {
                         builder.seal_all_blocks();
                         builder.finalize(compiler.module.target_config());
                     }
-                    let machine = compiler
-                        .machine_code(id, &name, &mut Annotations::default(), Some(&graph))
-                        .unwrap();
+                    let machine = compiler.machine_code(id, &name, Some(&mut graph)).unwrap();
                     machine.define(&mut compiler.module, id).unwrap();
                     compiler.module.finalize_definitions().unwrap();
                     let run: extern "C" fn(u64) -> u64 =
@@ -2728,7 +2697,7 @@ mod native_fallback_tests {
     }
 
     #[test]
-    fn unsupported_graph_operation_falls_back_to_cranelift() {
+    fn unsupported_graph_operation_returns_error() {
         let mut compiler = Compiler::new(
             EngineOptions {
                 backend: crate::Backend::Native,
@@ -2745,7 +2714,7 @@ mod native_fallback_tests {
         signature.returns.push(AbiParam::new(types::I64));
         let id = compiler
             .module
-            .declare_function("fallback_test", Linkage::Local, &signature)
+            .declare_function("unsupported_test", Linkage::Local, &signature)
             .unwrap();
         let mut graph =
             Graph::new_low_level("test".into(), oxc_span::Span::new(0, 0), signature.clone());
@@ -2760,23 +2729,11 @@ mod native_fallback_tests {
         let extracted = builder.ins().extract_bits(wide, 4, 8);
         builder.ins().return_(&[extracted]);
         Variables::default().finish(&mut graph).unwrap();
-        assert!(super::super::aarch64::compile_graph(&graph).is_err());
         compiler.context.func.signature = signature;
-        let machine = compiler
-            .machine_code(
-                id,
-                "fallback_test",
-                &mut Annotations::default(),
-                Some(&graph),
-            )
-            .unwrap();
-        assert!(compiler.context.compiled_code().is_some());
-        machine.define(&mut compiler.module, id).unwrap();
-        compiler.module.finalize_definitions().unwrap();
-        let load: extern "C" fn(*const u32) -> u64 =
-            unsafe { std::mem::transmute(compiler.module.get_finalized_function(id)) };
-        let value = 0x1234;
-        assert_eq!(load(&value), 0x23);
-        assert!(matches!(graph.defining_op(wide), Some(Op::Convert(..))));
+        assert!(
+            compiler
+                .machine_code(id, "unsupported_test", Some(&mut graph),)
+                .is_err()
+        );
     }
 }

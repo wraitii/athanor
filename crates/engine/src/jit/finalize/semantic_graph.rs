@@ -1030,6 +1030,9 @@ impl FunctionCompiler<'_, '_> {
                 (target.block, args)
             };
             match &terminator.kind {
+                TerminatorKind::Bailout { .. } => {
+                    return Err(Error::Compile("unresolved specialization bailout".into()));
+                }
                 TerminatorKind::Aarch64Branch(..) => unreachable!("target branch before selection"),
                 TerminatorKind::CheckException(to, _) | TerminatorKind::Jump(to) => {
                     let (block, args) = target(self, to);
