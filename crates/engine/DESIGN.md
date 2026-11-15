@@ -1289,6 +1289,12 @@ order can use `Cfg::reverse_postorder` without computing dominance. Numeric runt
 operations share one traversal and one input value analysis. CSE refreshes effects
 while retaining value types; load reuse still refreshes value analysis.
 
+JS lowering groups cleanup at expansion boundaries: normalization and coercion
+rewrites share one load-reuse/hoisting round, and indexed checks, property caches
+and array-kind lowering share another load-reuse round. Final region hoisting
+runs after numeric cleanup. Guard relaxation triggers another simplification
+only when it changes the graph.
+
 Borrow analysis runs once before helper lowering erases receiver identities.
 Borrow and ownership liveness use block summaries, bitsets and a predecessor
 worklist. Ownership resolves borrowed receiver anchors before solving liveness.
@@ -1978,7 +1984,11 @@ directly.
 
 Within a region, a property, index or global read reuses an equal dominating
 read if no write in the region may alias it. Load availability and edge-dependent
-guard truth use a fixed-point analysis with per-block exit states. Expression CSE
+guard truth use a reverse-postorder priority worklist with per-block exit states.
+Only reads, checks and memory effects participate in block transfers. Exit-state
+changes queue successors; alias changes queue direct users and users of dependent
+aliases, even when no exit state changes. Provisional backedge states can only
+produce aliases to dominating values. Expression CSE
 is separate: a dominator-preorder walk maintains one scoped expression table for
 constants, scalar operations, deterministic conversions, `this` and argument
 reads. Expression keys include the result representation. CSE runs before load

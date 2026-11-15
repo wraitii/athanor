@@ -6,8 +6,8 @@ use super::{
     Constant, Facts, Graph, Inst, MemoryFormat, MemoryOp, Op, TerminatorKind, TypedRead, Value,
     ValueDef, ValueType, resolve,
 };
-use crate::FxHashMap;
 use crate::value::Value as JsValue;
+use cranelift_codegen::entity::SecondaryMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(in crate::jit) enum IntegerWidth {
@@ -394,11 +394,11 @@ pub(super) fn lower_conversions(builder: &mut Builder<'_>) -> Result<(), String>
 }
 
 fn rewrite(builder: &mut Builder<'_>, stage: Stage) -> Result<(), String> {
-    let mut aliases = FxHashMap::default();
+    let mut aliases = SecondaryMap::new();
     for block in builder.graph.blocks.keys().collect::<Vec<_>>() {
-        let mut position = 0;
-        while position < builder.graph.blocks[block].insts.len() {
-            let inst = builder.graph.blocks[block].insts[position];
+        let insts = std::mem::take(&mut builder.graph.blocks[block].insts);
+        builder.switch_to_block(block);
+        for inst in insts {
             if let Op::Constant(constant) = &builder.graph.insts[inst].op {
                 let result = builder.graph.insts[inst].result().unwrap();
                 let repr = builder.graph.repr(result);
@@ -408,19 +408,18 @@ fn rewrite(builder: &mut Builder<'_>, stage: Stage) -> Result<(), String> {
                         builder.graph.reprs[result] = Some(Repr::Word);
                     }
                 }
-                position += 1;
+                builder.graph.blocks[block].insts.push(inst);
                 continue;
             }
             if let Op::AsBoxed(word) | Op::AsWord(word) | Op::AsNumber(word) =
                 builder.graph.insts[inst].op
             {
                 let result = builder.graph.insts[inst].result().unwrap();
-                aliases.insert(result, resolve(&aliases, word));
-                builder.graph.blocks[block].insts.remove(position);
+                aliases[result] = Some(resolve(&aliases, word));
                 continue;
             }
             let Some((input, step)) = expansion(builder.graph, inst, stage) else {
-                position += 1;
+                builder.graph.blocks[block].insts.push(inst);
                 continue;
             };
             let from = builder.graph.repr(input);
@@ -429,8 +428,6 @@ fn rewrite(builder: &mut Builder<'_>, stage: Stage) -> Result<(), String> {
             let (span, location, source_name) =
                 (data.span, data.emission_location, data.source_name);
             let result = data.result().unwrap();
-            builder.graph.blocks[block].insts.remove(position);
-            builder.insert_at(block, position);
             builder.set_span(span);
             builder.set_location(location);
             builder.set_source_name(source_name);
@@ -440,11 +437,12 @@ fn rewrite(builder: &mut Builder<'_>, stage: Stage) -> Result<(), String> {
                 }
                 _ => apply(builder, input, from, step)?,
             };
-            aliases.insert(result, converted);
-            position = builder.cursor().unwrap();
+            aliases[result] = Some(converted);
         }
     }
-    builder.graph.replace_uses(&aliases);
+    if !aliases.is_empty() {
+        builder.graph.replace_uses(&aliases);
+    }
     Ok(())
 }
 

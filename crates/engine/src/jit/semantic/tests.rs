@@ -4230,3 +4230,77 @@ fn block_liveness_matches_instruction_liveness() {
         }
     }
 }
+
+#[test]
+fn load_availability_retracts_aliases_after_loop_writes() {
+    use cranelift_codegen::ir::{AbiParam, MemFlagsData, Signature, types};
+    use cranelift_codegen::isa::CallConv;
+    for write in [false, true] {
+        let mut signature = Signature::new(CallConv::SystemV);
+        signature.params.extend([AbiParam::new(types::I64); 2]);
+        signature.returns.extend([AbiParam::new(types::I64); 4]);
+        let mut graph = Graph::new_low_level("loop-aliases".into(), Span::new(0, 0), signature);
+        let entry = graph.entry;
+        let mut builder = low_level::Builder::new(&mut graph);
+        builder.append_block_params_for_function_params(entry);
+        let header = builder.create_block();
+        let body = builder.create_block();
+        let exit = builder.create_block();
+        builder.switch_to_block(entry);
+        let address = builder.block_params(entry)[0];
+        let input = builder.block_params(entry)[1];
+        let first = builder
+            .ins()
+            .load(types::I64, MemFlagsData::trusted(), address, 0);
+        let nested = builder
+            .ins()
+            .load(types::I64, MemFlagsData::trusted(), first, 0);
+        let condition =
+            builder
+                .ins()
+                .icmp_imm_s(cranelift_codegen::ir::condcodes::IntCC::NotEqual, input, 0);
+        builder.ins().jump(header, &[]);
+        builder.switch_to_block(header);
+        let repeated = builder
+            .ins()
+            .load(types::I64, MemFlagsData::trusted(), address, 0);
+        let repeated_nested = builder
+            .ins()
+            .load(types::I64, MemFlagsData::trusted(), repeated, 0);
+        builder.ins().brif(condition, body, &[], exit, &[]);
+        builder.switch_to_block(body);
+        if write {
+            builder
+                .ins()
+                .store(MemFlagsData::trusted(), input, address, 0);
+        }
+        builder.ins().jump(header, &[]);
+        builder.switch_to_block(exit);
+        let last = builder
+            .ins()
+            .load(types::I64, MemFlagsData::trusted(), address, 0);
+        let last_nested = builder
+            .ins()
+            .load(types::I64, MemFlagsData::trusted(), last, 0);
+        builder
+            .ins()
+            .return_(&[repeated, repeated_nested, last, last_nested]);
+        graph.verify().unwrap();
+        let facts = Facts::compute(&graph);
+        let solved =
+            available::solve(&graph, &facts, &facts.cfg, FxHashSet::default(), false).unwrap();
+        assert_eq!(
+            solved.canonical(repeated),
+            if write { repeated } else { first }
+        );
+        assert_eq!(
+            solved.canonical(repeated_nested),
+            if write { repeated_nested } else { nested }
+        );
+        assert_eq!(solved.canonical(last), solved.canonical(repeated));
+        assert_eq!(
+            solved.canonical(last_nested),
+            solved.canonical(repeated_nested)
+        );
+    }
+}

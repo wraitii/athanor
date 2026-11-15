@@ -596,7 +596,8 @@ impl FunctionState {
         writes::lower(&mut self.graph, &self.plan.stores)?;
         after("indexed-accesses", self);
         self.invalidate_cfg();
-        regions::normalise_regions(self, &regions)?;
+        js::simplify(self);
+        self.graph.verify()?;
         after("normalise", self);
         js::coercions(self);
         js::bit_tests(self);
@@ -611,16 +612,15 @@ impl FunctionState {
         let bits_changed = numeric::bitwise(self);
         let arrays_changed = array_checks::lower_arrays(self);
         let typed_changed = typed::lower(self)?;
-        if bits_changed || arrays_changed || typed_changed {
+        let indexed_changed = bits_changed || arrays_changed || typed_changed;
+        if indexed_changed {
             js::simplify(self);
-            reuse::reuse_loads(self);
         }
         after("indexed-checks", self);
         self.invalidate_cfg();
-        if properties::lower(self)? {
-            reuse::reuse_loads(self);
-        }
-        if array_checks::lower_array_kinds(self) {
+        let properties_changed = properties::lower(self)?;
+        let kinds_changed = array_checks::lower_array_kinds(self);
+        if indexed_changed || properties_changed || kinds_changed {
             reuse::reuse_loads(self);
         }
         after("property-caches", self);
@@ -637,20 +637,17 @@ impl FunctionState {
         transforms::trim(&mut self.graph);
         transforms::remove_trivial_params(&mut self.graph);
         self.graph.verify()?;
-        for region in &regions {
-            regions::hoist(self, *region);
-            self.graph.verify()?;
-        }
         after("js-cleanup", self);
         if numeric::lower(self) {
             reuse::reuse_loads(self);
             js::simplify(self);
-            numeric::relax_checks(self);
-            js::simplify(self);
-            for region in &regions {
-                regions::hoist(self, *region);
-                self.graph.verify()?;
+            if numeric::relax_checks(self) {
+                js::simplify(self);
             }
+        }
+        for region in &regions {
+            regions::hoist(self, *region);
+            self.graph.verify()?;
         }
         after("numeric-specialization", self);
         self.ensure_facts();

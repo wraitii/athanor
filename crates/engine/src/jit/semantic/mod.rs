@@ -659,6 +659,32 @@ impl Iterator for Operands<'_> {
 
 impl ExactSizeIterator for Operands<'_> {}
 
+pub(in crate::jit) struct OperandsMut<'a> {
+    fixed: std::array::IntoIter<Option<&'a mut Value>, 4>,
+    rest: std::slice::IterMut<'a, Value>,
+}
+
+impl<'a> OperandsMut<'a> {
+    pub(in crate::jit) fn new(fixed: [Option<&'a mut Value>; 4], rest: &'a mut [Value]) -> Self {
+        Self {
+            fixed: fixed.into_iter(),
+            rest: rest.iter_mut(),
+        }
+    }
+}
+
+impl<'a> Iterator for OperandsMut<'a> {
+    type Item = &'a mut Value;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.fixed
+            .by_ref()
+            .flatten()
+            .next()
+            .or_else(|| self.rest.next())
+    }
+}
+
 impl Op {
     pub(super) fn operands(&self) -> Vec<Value> {
         self.operands_iter().collect()
@@ -909,13 +935,9 @@ impl Op {
         Operands::new([a, b, c, None], rest)
     }
 
-    pub(super) fn operands_mut(&mut self) -> impl Iterator<Item = &mut Value> + '_ {
-        let mut machine = None;
+    pub(super) fn operands_mut(&mut self) -> OperandsMut<'_> {
         let (fixed, rest): ([Option<&mut Value>; 3], &mut [Value]) = match self {
-            Op::Aarch64(op) => {
-                machine = Some(op.operands_mut());
-                ([None, None, None], &mut [])
-            }
+            Op::Aarch64(op) => return op.operands_mut(),
             Op::LowLevel(
                 low_level::Op::Scratch { values, .. } | low_level::Op::Cleanup { values, .. },
             ) => ([None, None, None], values),
@@ -1154,11 +1176,8 @@ impl Op {
                 ..
             } => ([Some(callee), receiver.as_mut(), None], args),
         };
-        fixed
-            .into_iter()
-            .flatten()
-            .chain(rest.iter_mut())
-            .chain(machine.into_iter().flatten())
+        let [a, b, c] = fixed;
+        OperandsMut::new([a, b, c, None], rest)
     }
 
     pub(super) fn write_target(&self) -> Option<Value> {
@@ -1711,6 +1730,35 @@ impl Graph {
         }
     }
 
+    pub(super) fn remove_insts(&mut self, insts: impl IntoIterator<Item = Inst>) {
+        let mut removed = SecondaryMap::<Inst, bool>::new();
+        let mut results = SecondaryMap::<Value, bool>::new();
+        for inst in insts {
+            removed[inst] = true;
+            self.views.remove(&inst);
+            self.property_accesses.remove(&inst);
+            if self.has_assumes {
+                for &value in &self.insts[inst].results {
+                    results[value] = true;
+                }
+            }
+        }
+        if removed.is_empty() {
+            return;
+        }
+        for block in self.blocks.values_mut() {
+            block.insts.retain(|&inst| {
+                !removed[inst]
+                    && !(self.has_assumes
+                        && matches!(self.insts[inst].op, Op::Assume(..))
+                        && self.insts[inst]
+                            .op
+                            .operands_iter()
+                            .any(|value| results[value]))
+            });
+        }
+    }
+
     pub(super) fn strip_assumes(&mut self) {
         if !self.has_assumes {
             return;
@@ -1863,13 +1911,14 @@ impl Graph {
             result,
         };
         const COERCING: u16 = HEAP_READ | ALLOCATION | INTERNAL | ERROR;
-        let operands = op
-            .operands_iter()
-            .fold(ValueType::default(), |types, value| {
-                types.union(facts.of(value))
-            });
+        let operands = || {
+            op.operands_iter()
+                .fold(ValueType::default(), |types, value| {
+                    types.union(facts.of(value))
+                })
+        };
         let coercing = |result| {
-            if operands.within(ValueType::NUMBER) {
+            if operands().within(ValueType::NUMBER) {
                 closed(0, Unowned)
             } else {
                 closed(COERCING, result)
@@ -1959,7 +2008,7 @@ impl Graph {
             Op::CellGet(_) | Op::CaptureGet(..) => closed(HEAP_READ | INTERNAL | ERROR, Owned),
             Op::CellSet(..) => closed(HEAP_WRITE | INTERNAL | ERROR, None),
             Op::CheckInitialized(_) => {
-                if operands.intersects(ValueType::UNINITIALIZED) {
+                if operands().intersects(ValueType::UNINITIALIZED) {
                     closed(ERROR, None)
                 } else {
                     closed(0, None)
@@ -2018,7 +2067,7 @@ impl Graph {
             Op::Unary(UnaryOp::Not, _) => closed(HEAP_READ, Unowned),
             Op::Unary(UnaryOp::Typeof, _) => closed(HEAP_READ | ALLOCATION | ERROR, Owned),
             Op::Unary(UnaryOp::Increment | UnaryOp::Decrement, _) => {
-                if operands.within(ValueType::NUMBER) {
+                if operands().within(ValueType::NUMBER) {
                     closed(0, Unowned)
                 } else {
                     closed(ALLOCATION | INTERNAL | ERROR, Owned)
@@ -2034,7 +2083,7 @@ impl Graph {
             } => self.contract(&Op::Binary(*operator, *left, *right), facts),
             Op::Binary(operator, ..) => match operator {
                 BinaryOperator::StrictEquality | BinaryOperator::StrictInequality => closed(
-                    if operands.within(ValueType::NUMBER) {
+                    if operands().within(ValueType::NUMBER) {
                         0
                     } else {
                         HEAP_READ

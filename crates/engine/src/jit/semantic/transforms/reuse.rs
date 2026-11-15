@@ -18,18 +18,13 @@ pub(in crate::jit::semantic) fn reuse_loads(function: &mut FunctionState) {
 }
 
 pub(in crate::jit::semantic) fn lowered(graph: &mut Graph) {
-    let mut facts = Facts::compute(graph);
+    // Scalar operations have explicit effects and no longer need JS value inference.
+    let mut facts = Facts::effects(graph);
     cleanup(graph, &mut facts, None);
     if super::licm::hoist(graph, &facts, None, None) {
-        refresh(graph, &mut facts);
+        facts.refresh(graph);
         cleanup(graph, &mut facts, None);
     }
-}
-
-fn refresh(graph: &Graph, facts: &mut Facts) {
-    let cfg = std::mem::take(&mut facts.cfg);
-    *facts = Facts::values_with_cfg(graph, cfg);
-    facts.compute_effects(graph);
 }
 
 fn cleanup(graph: &mut Graph, facts: &mut Facts, mut notes: Option<&mut Vec<String>>) -> bool {
@@ -41,7 +36,7 @@ fn cleanup(graph: &mut Graph, facts: &mut Facts, mut notes: Option<&mut Vec<Stri
     if !reuse(graph, facts, notes.as_deref_mut()) {
         return expressions;
     }
-    refresh(graph, facts);
+    facts.refresh(graph);
     if super::cse::eliminate(graph, facts, notes) {
         facts.compute_effects(graph);
     }
@@ -66,8 +61,8 @@ fn reuse(graph: &mut Graph, facts: &Facts, mut notes: Option<&mut Vec<String>>) 
         if let Some(notes) = &mut notes {
             notes.push(format!("{} reuses {value}", graph.note_inst(inst)));
         }
-        graph.remove_inst(inst);
     }
+    graph.remove_insts(solved.reused.iter().map(|&(inst, _)| inst));
     !solved.reused.is_empty() || !solved.folded.is_empty()
 }
 

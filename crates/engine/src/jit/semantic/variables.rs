@@ -71,17 +71,18 @@ impl Variables {
         let mut aliases = SecondaryMap::new();
         let mut work = Vec::new();
         let mut changed = false;
+        let mut removed = Vec::with_capacity(self.reads.len());
         for (block, variable, inst, value) in std::mem::take(&mut self.reads) {
+            removed.push(inst);
             if !reachable[block] {
-                graph.remove_inst(inst);
                 continue;
             }
             let definition =
                 self.entry_value(graph, &cfg, &mut entries, &mut work, block, variable)?;
             aliases[value] = Some(definition);
-            graph.remove_inst(inst);
             changed = true;
         }
+        graph.remove_insts(removed);
         super::transforms::simplify_parameters(graph, &cfg.rpo, &mut aliases, changed);
         Ok(())
     }

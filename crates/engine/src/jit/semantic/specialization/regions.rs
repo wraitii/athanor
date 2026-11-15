@@ -1,5 +1,4 @@
 use super::super::transforms::loops::{natural_loops, preheader};
-use super::super::transforms::reuse::reuse_loads;
 use crate::{FxHashMap, FxHashSet};
 
 use oxc_syntax::operator::BinaryOperator;
@@ -488,22 +487,6 @@ fn entry_assumes(
     checks.sort_by_key(|&(value, _)| value);
     checks.dedup_by_key(|&mut (value, _)| value);
     checks
-}
-
-pub(in crate::jit::semantic) fn normalise_regions(
-    function: &mut FunctionState,
-    regions: &[RegionId],
-) -> Result<()> {
-    function.graph.verify()?;
-    super::super::js::simplify(function);
-    function.graph.verify()?;
-    reuse_loads(function);
-    function.graph.verify()?;
-    for &region in regions {
-        hoist(function, region);
-        function.graph.verify()?;
-    }
-    Ok(())
 }
 
 pub(in crate::jit::semantic) fn hoist(function: &mut FunctionState, region: RegionId) {

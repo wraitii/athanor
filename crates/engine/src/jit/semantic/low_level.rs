@@ -281,10 +281,6 @@ impl<'a> Builder<'a> {
         self.cursor = Some(position);
     }
 
-    pub(in crate::jit) fn cursor(&self) -> Option<usize> {
-        self.cursor
-    }
-
     fn place_in(
         &mut self,
         block: Block,

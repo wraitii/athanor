@@ -1,4 +1,8 @@
 use crate::{FxHashMap, FxHashSet};
+use cranelift_codegen::entity::SecondaryMap;
+use smallvec::SmallVec;
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 
 use super::access::Access;
 use super::guards::{Fact, implies};
@@ -36,7 +40,7 @@ pub(super) struct Available {
 pub(super) type AvailableLoads = FxHashMap<LoadKey, Available>;
 
 pub(super) struct Solved {
-    exits: FxHashMap<Block, AvailableLoads>,
+    exits: SecondaryMap<Block, Option<AvailableLoads>>,
     aliases: FxHashMap<Value, Value>,
     pub(super) reused: Vec<(Inst, Value)>,
     pub(super) folded: Vec<(Inst, bool)>,
@@ -168,7 +172,7 @@ fn step(
 fn entering(
     graph: &Graph,
     cfg: &Cfg,
-    exits: &FxHashMap<Block, AvailableLoads>,
+    exits: &SecondaryMap<Block, Option<AvailableLoads>>,
     block: Block,
     aliases: &FxHashMap<Value, Value>,
 ) -> AvailableLoads {
@@ -177,7 +181,7 @@ fn entering(
     }
     let mut incoming = cfg.preds[block]
         .iter()
-        .filter_map(|pred| exits.get(pred).map(|state| (*pred, state)));
+        .filter_map(|pred| exits[*pred].as_ref().map(|state| (*pred, state)));
     let Some((first, mut state)) = incoming.next().map(|(pred, state)| (pred, state.clone()))
     else {
         return AvailableLoads::default();
@@ -232,46 +236,149 @@ pub(super) fn solve(
     cold: FxHashSet<Block>,
     probes: bool,
 ) -> Option<Solved> {
-    let mut exits: FxHashMap<Block, AvailableLoads> = FxHashMap::default();
-    let mut previous = FxHashMap::default();
-    for _ in 0..16 {
-        let mut changed = false;
-        let mut aliases = FxHashMap::default();
-        let mut reused = Vec::new();
-        let mut folded = Vec::new();
-        for &block in &cfg.rpo {
-            let mut state = entering(graph, cfg, &exits, block, &aliases);
-            let is_cold = cold.contains(&block);
-            for &inst in &graph.blocks[block].insts {
-                if let Some(value) = step(graph, facts, inst, is_cold, probes, &aliases, &mut state)
-                {
-                    match value {
-                        Reuse::Value(value) => {
-                            aliases.insert(graph.insts[inst].result().unwrap(), value);
-                            reused.push((inst, value));
-                        }
-                        Reuse::Boolean(value) => folded.push((inst, value)),
-                    }
+    let mut scan = SecondaryMap::<Block, SmallVec<[Inst; 4]>>::new();
+    let mut users = SecondaryMap::<Value, SmallVec<[Block; 2]>>::new();
+    let mut ranks = SecondaryMap::<Block, usize>::new();
+    let mut aliases = FxHashMap::default();
+    for (rank, &block) in cfg.rpo.iter().enumerate() {
+        ranks[block] = rank;
+        for &inst in &graph.blocks[block].insts {
+            let data = &graph.insts[inst];
+            let memory = facts.memory(inst);
+            if !memory.reenters()
+                && !memory.writes_state()
+                && (cold.contains(&block)
+                    || data.results.len() != 1
+                    || load_key(&data.op, probes, &aliases).is_none())
+            {
+                continue;
+            }
+            scan[block].push(inst);
+            for value in data.op.operands_iter() {
+                if graph.def_block(value) != block && users[value].last() != Some(&block) {
+                    users[value].push(block);
                 }
             }
-            if exits.get(&block) != Some(&state) {
-                exits.insert(block, state);
-                changed = true;
+        }
+        if let Some(terminator) = &graph.blocks[block].terminator {
+            for value in terminator.kind.operands_iter() {
+                if graph.def_block(value) != block && users[value].last() != Some(&block) {
+                    users[value].push(block);
+                }
+            }
+            if let TerminatorKind::Branch(condition, yes, no) = &terminator.kind
+                && yes.block != no.block
+            {
+                let condition = super::guards::negated(graph, *condition).unwrap_or(*condition);
+                users[condition].extend([yes.block, no.block]);
             }
         }
-        if !changed && aliases == previous {
-            return Some(Solved {
-                exits,
-                aliases,
-                reused,
-                folded,
-                cold,
-                probes,
-            });
-        }
-        previous = aliases;
     }
-    None
+    let mut exits = SecondaryMap::<Block, Option<AvailableLoads>>::new();
+    let mut folded = SecondaryMap::<Inst, Option<bool>>::new();
+    let mut dependents = SecondaryMap::<Value, SmallVec<[Value; 2]>>::new();
+    let mut pending: BinaryHeap<_> = (0..cfg.rpo.len()).map(Reverse).collect();
+    let mut queued = vec![true; cfg.rpo.len()];
+    let mut visits = cfg.rpo.len().saturating_mul(16);
+    let mut changed_aliases = Vec::new();
+    let mut seen = SecondaryMap::<Value, usize>::new();
+    let mut generation = 0;
+    while let Some(Reverse(rank)) = pending.pop() {
+        if visits == 0 {
+            return None;
+        }
+        visits -= 1;
+        queued[rank] = false;
+        let block = cfg.rpo[rank];
+        let mut state = entering(graph, cfg, &exits, block, &aliases);
+        // Backedge states start optimistically; keep aliases dominating while they are revised.
+        state.retain(|_, entry| {
+            let owner = graph.def_block(entry.value);
+            owner != block && cfg.dominates(owner, block)
+        });
+        let is_cold = cold.contains(&block);
+        for &inst in &scan[block] {
+            let reuse = step(graph, facts, inst, is_cold, probes, &aliases, &mut state);
+            let replacement = match reuse {
+                Some(Reuse::Value(value)) => Some(value),
+                _ => None,
+            };
+            folded[inst] = match reuse {
+                Some(Reuse::Boolean(value)) => Some(value),
+                _ => None,
+            };
+            let [result] = graph.insts[inst].results.as_slice() else {
+                continue;
+            };
+            let result = *result;
+            if aliases.get(&result).copied() == replacement {
+                continue;
+            }
+            match replacement {
+                Some(value) => {
+                    aliases.insert(result, value);
+                    if !dependents[value].contains(&result) {
+                        dependents[value].push(result);
+                    }
+                }
+                None => {
+                    aliases.remove(&result);
+                }
+            }
+            changed_aliases.push(result);
+        }
+        let mut enqueue = |block: Block| {
+            let rank = ranks[block];
+            if !queued[rank] {
+                queued[rank] = true;
+                pending.push(Reverse(rank));
+            }
+        };
+        if exits[block].as_ref() != Some(&state) {
+            exits[block] = Some(state);
+            for successor in graph.successors(block) {
+                enqueue(successor);
+            }
+        }
+        // Alias changes can alter load keys without changing this block's exit state.
+        generation += 1;
+        while let Some(value) = changed_aliases.pop() {
+            if seen[value] == generation {
+                continue;
+            }
+            seen[value] = generation;
+            for &user in &users[value] {
+                enqueue(user);
+            }
+            for &dependent in &dependents[value] {
+                if aliases.get(&dependent) == Some(&value) {
+                    changed_aliases.push(dependent);
+                }
+            }
+        }
+    }
+    let mut reused = Vec::new();
+    let mut folded_values = Vec::new();
+    for &block in &cfg.rpo {
+        for &inst in &scan[block] {
+            if let [result] = graph.insts[inst].results.as_slice()
+                && let Some(&value) = aliases.get(result)
+            {
+                reused.push((inst, value));
+            }
+            if let Some(value) = folded[inst] {
+                folded_values.push((inst, value));
+            }
+        }
+    }
+    Some(Solved {
+        exits,
+        aliases,
+        reused,
+        folded: folded_values,
+        cold,
+        probes,
+    })
 }
 
 impl Solved {

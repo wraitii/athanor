@@ -1,5 +1,6 @@
 use crate::FxHashMap;
 
+use cranelift_codegen::entity::SecondaryMap;
 use cranelift_codegen::ir::Type;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use oxc_syntax::operator::BinaryOperator;
@@ -31,7 +32,7 @@ fn expression(
     graph: &Graph,
     op: &Op,
     pure: bool,
-    aliases: &FxHashMap<Value, Value>,
+    aliases: &SecondaryMap<Value, Option<Value>>,
 ) -> Option<Expression> {
     let at = |value: &Value| resolve(aliases, *value);
     Some(match op {
@@ -95,7 +96,7 @@ pub(in crate::jit::semantic) fn eliminate(
     let mut available = FxHashMap::default();
     let mut inserted = Vec::new();
     let mut scopes: Vec<(Block, usize)> = Vec::new();
-    let mut aliases = FxHashMap::default();
+    let mut aliases = SecondaryMap::new();
     let mut reused = Vec::new();
     for block in cfg.dominator_preorder() {
         while let Some(&(parent, start)) = scopes.last() {
@@ -122,7 +123,7 @@ pub(in crate::jit::semantic) fn eliminate(
             };
             let key = (expression, graph.repr(*result));
             if let Some(&value) = available.get(&key) {
-                aliases.insert(*result, value);
+                aliases[*result] = Some(value);
                 reused.push((inst, value));
             } else {
                 available.insert(key.clone(), *result);
@@ -130,12 +131,15 @@ pub(in crate::jit::semantic) fn eliminate(
             }
         }
     }
+    if reused.is_empty() {
+        return false;
+    }
     graph.replace_uses(&aliases);
     for &(inst, value) in &reused {
         if let Some(notes) = &mut notes {
             notes.push(format!("{} reuses {value}", graph.note_inst(inst)));
         }
-        graph.remove_inst(inst);
     }
-    !reused.is_empty()
+    graph.remove_insts(reused.iter().map(|&(inst, _)| inst));
+    true
 }

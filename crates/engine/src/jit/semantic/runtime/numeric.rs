@@ -16,7 +16,7 @@ pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) -> bool {
     arithmetic(function) || checks
 }
 
-pub(in crate::jit::semantic) fn relax_checks(function: &mut FunctionState) {
+pub(in crate::jit::semantic) fn relax_checks(function: &mut FunctionState) -> bool {
     function.ensure_cfg();
     let graph = &mut function.graph;
     let uses = graph.use_counts();
@@ -45,6 +45,7 @@ pub(in crate::jit::semantic) fn relax_checks(function: &mut FunctionState) {
     if changed {
         function.invalidate_values();
     }
+    changed
 }
 
 fn lower_checks(function: &mut FunctionState) -> bool {

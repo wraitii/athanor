@@ -286,6 +286,23 @@ impl Facts {
         facts
     }
 
+    pub(super) fn effects(graph: &Graph) -> Self {
+        let mut facts = Self {
+            cfg: Cfg::new(graph),
+            ..Self::default()
+        };
+        facts.compute_effects(graph);
+        facts
+    }
+
+    pub(super) fn refresh(&mut self, graph: &Graph) {
+        if self.known {
+            let cfg = std::mem::take(&mut self.cfg);
+            *self = Self::values_with_cfg(graph, cfg);
+        }
+        self.compute_effects(graph);
+    }
+
     // Effect queries remain conservative until compute_effects runs.
     pub(super) fn values(graph: &Graph) -> Self {
         Self::values_with_cfg(graph, Cfg::new(graph))
