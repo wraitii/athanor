@@ -1,4 +1,5 @@
 pub(in crate::jit::semantic) mod conversions;
+pub(in crate::jit::semantic) mod cse;
 pub(in crate::jit::semantic) mod licm;
 pub(in crate::jit::semantic) mod loops;
 mod parameters;

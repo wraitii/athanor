@@ -13,21 +13,34 @@ pub(in crate::jit::semantic) fn reuse_loads(function: &mut FunctionState) {
         notes,
         ..
     } = function;
-    if reuse(graph, facts, notes) {
+    if cleanup(graph, facts, notes) {
         function.invalidate_values();
     }
     guarded_floats(function);
 }
 
 pub(in crate::jit::semantic) fn lowered(graph: &mut Graph) {
-    let facts = Facts::compute(graph);
+    let mut facts = Facts::compute(graph);
     let mut notes = Vec::new();
-    reuse(graph, &facts, &mut notes);
+    cleanup(graph, &mut facts, &mut notes);
     let facts = Facts::compute(graph);
     if super::licm::hoist(graph, &facts, None, &mut notes) {
-        let facts = Facts::compute(graph);
-        reuse(graph, &facts, &mut notes);
+        let mut facts = Facts::compute(graph);
+        cleanup(graph, &mut facts, &mut notes);
     }
+}
+
+fn cleanup(graph: &mut Graph, facts: &mut Facts, notes: &mut Vec<String>) -> bool {
+    let expressions = super::cse::eliminate(graph, facts, notes);
+    if expressions {
+        *facts = Facts::compute(graph);
+    }
+    if !reuse(graph, facts, notes) {
+        return expressions;
+    }
+    *facts = Facts::compute(graph);
+    super::cse::eliminate(graph, facts, notes);
+    true
 }
 
 fn reuse(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>) -> bool {

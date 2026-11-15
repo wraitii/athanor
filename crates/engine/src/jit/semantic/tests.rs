@@ -4,7 +4,7 @@ use super::specialization::{
     call_variants, calls, observations, properties as property_accesses, reads, regions, shapes,
     writes,
 };
-use super::transforms::{conversions, loops, reuse};
+use super::transforms::{conversions, cse, loops, reuse};
 use super::variables::Variables;
 use super::*;
 use crate::FxHashSet;
@@ -2974,6 +2974,61 @@ fn low_level_variables_resolve_long_forwarding_chain() {
 }
 
 #[test]
+fn scalar_cse_respects_dominance_and_canonicalizes_operands() {
+    use cranelift_codegen::ir::condcodes::IntCC;
+    use cranelift_codegen::ir::{AbiParam, Signature, types};
+    use cranelift_codegen::isa::CallConv;
+    let mut signature = Signature::new(CallConv::SystemV);
+    signature.params.push(AbiParam::new(types::I64));
+    signature.returns.extend([AbiParam::new(types::I64); 2]);
+    let mut graph = Graph::new_low_level("cse".into(), Span::new(0, 0), signature);
+    let entry = graph.entry;
+    let mut builder = low_level::Builder::new(&mut graph);
+    builder.append_block_params_for_function_params(entry);
+    let left = builder.create_block();
+    let right = builder.create_block();
+    let join = builder.create_block();
+    builder.switch_to_block(entry);
+    let input = builder.block_params(entry)[0];
+    let one = builder.ins().iconst(types::I64, 1);
+    let sum = builder.ins().iadd(input, one);
+    let condition = builder.ins().icmp(IntCC::Equal, input, one);
+    builder.ins().brif(condition, left, &[], right, &[]);
+    let mut products = Vec::new();
+    for block in [left, right, join] {
+        builder.switch_to_block(block);
+        let repeated_one = builder.ins().iconst(types::I64, 1);
+        let repeated_sum = builder.ins().iadd(input, repeated_one);
+        let product = builder
+            .ins()
+            .binary(low_level::Binary::Multiply, repeated_sum, input);
+        products.push(product);
+        if block == join {
+            builder.ins().return_(&[repeated_sum, product]);
+        } else {
+            builder.ins().jump(join, &[]);
+        }
+    }
+    let facts = Facts::compute(&graph);
+    assert!(cse::eliminate(&mut graph, &facts, &mut Vec::new()));
+    graph.verify().unwrap();
+    assert!(matches!(
+        &graph.blocks[join].terminator.as_ref().unwrap().kind,
+        TerminatorKind::ReturnValues(values) if values == &[sum, products[2]]
+    ));
+    for (block, product) in [left, right, join].into_iter().zip(products) {
+        let ValueDef::Result(inst, _) = graph.values[product] else {
+            panic!()
+        };
+        assert!(graph.blocks[block].insts.contains(&inst));
+        assert!(matches!(
+            graph.defining_op(product),
+            Some(Op::LowLevel(low_level::Op::Binary { left, .. })) if *left == sum
+        ));
+    }
+}
+
+#[test]
 fn scalar_value_numbering_keeps_words_distinct_from_numbers() {
     use cranelift_codegen::ir::{AbiParam, Signature, types};
     use cranelift_codegen::isa::CallConv;
@@ -3005,7 +3060,7 @@ fn lowered_value_numbering_preserves_loads_across_effects() {
         signature
             .params
             .extend([AbiParam::new(types::I64), AbiParam::new(types::I64)]);
-        signature.returns.extend([AbiParam::new(types::I64); 4]);
+        signature.returns.extend([AbiParam::new(types::I64); 6]);
         let mut graph = Graph::new_low_level("reuse".into(), Span::new(0, 0), signature.clone());
         let entry = graph.entry;
         let mut builder = low_level::Builder::new(&mut graph);
@@ -3017,6 +3072,7 @@ fn lowered_value_numbering_preserves_loads_across_effects() {
             .ins()
             .load(types::I64, MemFlagsData::trusted(), address, 0);
         let sum = builder.ins().iadd(address, input);
+        let dependent = builder.ins().iadd(first, input);
         if boundary == 1 {
             builder
                 .ins()
@@ -3031,7 +3087,10 @@ fn lowered_value_numbering_preserves_loads_across_effects() {
             .ins()
             .load(types::I64, MemFlagsData::trusted(), address, 0);
         let repeated = builder.ins().iadd(address, input);
-        builder.ins().return_(&[first, second, sum, repeated]);
+        let repeated_dependent = builder.ins().iadd(second, input);
+        builder
+            .ins()
+            .return_(&[first, second, sum, repeated, dependent, repeated_dependent]);
         reuse::lowered(&mut graph);
         graph.verify().unwrap();
         let TerminatorKind::ReturnValues(values) =
@@ -3041,6 +3100,7 @@ fn lowered_value_numbering_preserves_loads_across_effects() {
         };
         assert_eq!(values[0] == values[1], boundary == 0);
         assert_eq!(values[2], values[3]);
+        assert_eq!(values[4] == values[5], boundary == 0);
     }
 }
 

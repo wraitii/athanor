@@ -1408,6 +1408,14 @@ impl Cfg {
         }
     }
 
+    pub(super) fn dominator_preorder(&self) -> Vec<Block> {
+        let mut blocks = self.rpo.clone();
+        for &block in &self.rpo {
+            blocks[self.dominance[block].0 as usize] = block;
+        }
+        blocks
+    }
+
     pub(super) fn dominates(&self, dominator: Block, block: Block) -> bool {
         let (position, _) = self.dominance[block];
         let (start, size) = self.dominance[dominator];

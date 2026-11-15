@@ -1,34 +1,17 @@
 use crate::{FxHashMap, FxHashSet};
 
-use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
-use oxc_syntax::operator::BinaryOperator;
-
 use super::access::Access;
 use super::guards::{Fact, implies};
 use super::{Block, Cfg, Facts, Graph, Inst, Op, TerminatorKind, Value, resolve};
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(super) enum LoadKey {
-    Integer(cranelift_codegen::ir::Type, u64),
-    Float64(u64),
-    ScalarBinary(super::low_level::Binary, Value, Value),
-    ScalarUnary(super::low_level::Unary, cranelift_codegen::ir::Type, Value),
-    Convert(Value, super::Repr),
     Load(
         cranelift_codegen::ir::Type,
         Value,
         i32,
         cranelift_codegen::ir::MemFlagsData,
     ),
-    ToInt32(Value),
-    NumericFloat(Value),
-    IntCompare(IntCC, Value, Value),
-    FloatCompare(FloatCC, Value, Value),
-    SaturatingInteger(Value),
-    Position(Value),
-    ExactPosition(Value, Value),
-    InBounds(Value, Value),
-    BooleanAnd(Value, Value),
     Length(Value),
     ArrayKind(Value),
     Array(Value, super::ArrayLayout),
@@ -40,7 +23,6 @@ pub(super) enum LoadKey {
     PropertyCache(Inst),
     This,
     Argument(usize),
-    Binary(BinaryOperator, Value, Value),
     Check(Value, Fact),
 }
 
@@ -67,17 +49,9 @@ enum Reuse {
     Boolean(bool),
 }
 
-fn load_key(
-    graph: &Graph,
-    op: &Op,
-    pure: bool,
-    probes: bool,
-    aliases: &FxHashMap<Value, Value>,
-) -> Option<LoadKey> {
+fn load_key(op: &Op, probes: bool, aliases: &FxHashMap<Value, Value>) -> Option<LoadKey> {
     let at = |value: &Value| resolve(aliases, *value);
     Some(match op {
-        Op::LowLevel(super::low_level::Op::Integer { ty, bits }) => LoadKey::Integer(*ty, *bits),
-        Op::LowLevel(super::low_level::Op::Float64(bits)) => LoadKey::Float64(*bits),
         Op::Get(object, name) | Op::ShapedGet(object, name, _) => {
             LoadKey::Property(at(object), name.clone())
         }
@@ -88,59 +62,15 @@ fn load_key(
         Op::ConstructorPrototype(callee) => LoadKey::Constructor(at(callee)),
         Op::GlobalRead(name) => LoadKey::Global(name.clone()),
         Op::ProbeGlobal(name) if probes => LoadKey::Probe(name.clone()),
-        Op::NumericFloat(value) => {
-            let value = at(value);
-            let value = match graph.defining_op(value) {
-                Some(Op::AsInteger(input))
-                    if matches!(graph.defining_op(at(input)), Some(Op::SaturatingInteger(_))) =>
-                {
-                    at(input)
-                }
-                _ => value,
-            };
-            LoadKey::NumericFloat(value)
-        }
-        Op::SaturatingInteger(value) => LoadKey::SaturatingInteger(at(value)),
-        Op::ToInt32(value) => LoadKey::ToInt32(at(value)),
-        Op::Convert(value, repr) if pure => LoadKey::Convert(at(value), *repr),
-        Op::LowLevel(super::low_level::Op::Binary { op, left, right }) if pure => {
-            LoadKey::ScalarBinary(*op, at(left), at(right))
-        }
-        Op::LowLevel(super::low_level::Op::Unary { op, ty, value }) if pure => {
-            LoadKey::ScalarUnary(*op, *ty, at(value))
-        }
         Op::LowLevel(super::low_level::Op::Load {
             ty,
             address,
             offset,
             flags,
         }) => LoadKey::Load(*ty, at(address), *offset, *flags),
-        Op::LowLevel(super::low_level::Op::IntCompare {
-            condition,
-            left,
-            right,
-        }) if pure => LoadKey::IntCompare(*condition, at(left), at(right)),
-        Op::LowLevel(super::low_level::Op::FloatCompare {
-            condition,
-            left,
-            right,
-        }) if pure => LoadKey::FloatCompare(*condition, at(left), at(right)),
-        Op::ArrayPosition(value) => LoadKey::Position(at(value)),
-        Op::IsExactPosition(key, position) => LoadKey::ExactPosition(at(key), at(position)),
-        Op::BooleanAnd(left, right) => LoadKey::BooleanAnd(at(left), at(right)),
-        Op::IsInBounds(position, length) => LoadKey::InBounds(at(position), at(length)),
         Op::IndexedLength(object) => LoadKey::Length(at(object)),
         Op::ArrayKind(object) => LoadKey::ArrayKind(at(object)),
         Op::IsArray(object, layout) => LoadKey::Array(at(object), *layout),
-        Op::This => LoadKey::This,
-        Op::Argument(index) => LoadKey::Argument(*index),
-        Op::Binary(operator, left, right)
-        | Op::GuardedCompare {
-            operator,
-            left,
-            right,
-            ..
-        } if pure => LoadKey::Binary(*operator, at(left), at(right)),
         _ => match implies(op)? {
             (
                 value,
@@ -195,21 +125,13 @@ fn step(
     if cold {
         return None;
     }
-    let key = load_key(graph, &data.op, facts.is_pure(inst), probes, aliases)?;
+    let key = load_key(&data.op, probes, aliases)?;
     let [result] = data.results.as_slice() else {
         return None;
     };
     let result = *result;
     if let Some(entry) = state.get(&key)
-        && (!matches!(
-            key,
-            LoadKey::Integer(..)
-                | LoadKey::Float64(..)
-                | LoadKey::ScalarBinary(..)
-                | LoadKey::ScalarUnary(..)
-                | LoadKey::Convert(..)
-                | LoadKey::Load(..)
-        ) || graph.repr(entry.value) == graph.repr(result))
+        && (!matches!(key, LoadKey::Load(..)) || graph.repr(entry.value) == graph.repr(result))
     {
         return Some(Reuse::Value(entry.value));
     }

@@ -1267,7 +1267,7 @@ purpose of a pass rather than a single point at which all its operations run:
   shape specialization, and cache assumptions. `regions/` contains region planning,
   assumption placement, cost decisions, versioning, and region-specific hoisting.
 - `transforms/` contains structural SSA transformations and repair, simplification,
-  loop discovery, load reuse, and conversion simplification and placement.
+  loop discovery, expression CSE, load reuse, and conversion simplification and placement.
 - `runtime/` exposes numeric operations, array checks, typed-array access, named
   properties, views, and storage operations. Cleanup and reference lowering run
   on the graph produced by shared runtime emission.
@@ -1949,8 +1949,17 @@ by an array literal without spreads or holes bind the evaluated elements
 directly.
 
 Within a region, a property, index or global read reuses an equal dominating
-read if no write in the region may alias it; `this`, argument reads and pure
-binary operations are reused too. Loop hoisting moves reads and pure operations
+read if no write in the region may alias it. Load availability and edge-dependent
+guard truth use a fixed-point analysis with per-block exit states. Expression CSE
+is separate: a dominator-preorder walk maintains one scoped expression table for
+constants, scalar operations, deterministic conversions, `this` and argument
+reads. Expression keys include the result representation. CSE runs before load
+reuse and again after it replaces reads, so newly equal operands can expose
+further common expressions. The same cleanup runs on the lowered scalar graph
+before and after loop hoisting, without propagating pure expressions through
+the load-availability states.
+
+Loop hoisting moves reads and pure operations
 with loop-invariant operands from a loop header to its single preheader,
 stopping at the first operation it cannot move. Other invariant reads use
 non-erroring probes before a versioned loop. Every probe must succeed to enter
