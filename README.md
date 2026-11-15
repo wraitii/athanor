@@ -18,6 +18,11 @@ results. The engine currently supports only a subset of JavaScript.
 The runner installs `hostReadFile`, `hostListFiles`, and `hostEvaluateSource`,
 and provides `print` plus a basic `console.log`. Source evaluation shares the
 active engine, including nested library loads.
+Set `JS_JIT_SAMPLY_MARKERS=1` when running under `samply` to add interval
+markers for source compilation and later function compilations, including
+background work. The tracing bridge currently omits filenames and function
+names from these markers. Markers are
+supported on macOS and Linux, and samply must be attached when the thread starts.
 Set `JS_JIT_JITDUMP=1` to write a `jit-<pid>-<timestamp>-js.dump` file to the
 temporary directory. `samply` and `perf` can consume the dump, and debug
 information points at the original JavaScript source so they show JavaScript

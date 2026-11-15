@@ -13,6 +13,13 @@ const DEFAULT_SETTINGS: &str =
 const DEFAULT_BOOTSTRAP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../bootstrap.js");
 
 fn main() {
+    if std::env::var_os("JS_JIT_SAMPLY_MARKERS").is_some() {
+        use tracing_subscriber::prelude::*;
+        match tracing_samply::SamplyLayer::new() {
+            Ok(layer) => tracing_subscriber::registry().with(layer).init(),
+            Err(error) => eprintln!("js-runner: could not enable samply markers: {error}"),
+        }
+    }
     if let Err(error) = run() {
         eprintln!("js-runner: {error}");
         std::process::exit(1);

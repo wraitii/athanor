@@ -333,6 +333,8 @@ impl Engine {
         source: &str,
         filename: &str,
     ) -> Result<Option<usize>, Error> {
+        let span = tracing::info_span!("Script compilation", filename);
+        let _entered = span.enter();
         let started = std::env::var_os("JS_JIT_STATS").map(|_| std::time::Instant::now());
         let allocator = Allocator::default();
         let program = parse::parse(&allocator, source, filename)?;

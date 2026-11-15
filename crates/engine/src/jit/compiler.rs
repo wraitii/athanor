@@ -1440,6 +1440,8 @@ impl Compiler {
     }
 
     pub(crate) fn recompile(&mut self, job: RecompileJob) -> Result<Option<Replacement>, Error> {
+        let span = tracing::info_span!("Function compilation", function = job.label.as_str());
+        let _entered = span.enter();
         let trace = self
             .log
             .enabled()
@@ -1778,6 +1780,8 @@ impl Compiler {
         let Some(job) = self.lazy_compilation(code) else {
             return Ok(None);
         };
+        let span = tracing::info_span!("Lazy function compilation", function = job.label.as_str());
+        let _entered = span.enter();
         // Initial emission uses the repository as it existed when the source was loaded,
         // before later sources and runtime feedback change its specialization decisions.
         let current = self.canonical.clone();
