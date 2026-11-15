@@ -22,7 +22,6 @@ pub(in crate::jit) mod ownership;
 mod pipeline;
 pub(in crate::jit) mod repr;
 pub(in crate::jit) mod runtime;
-pub(in crate::jit) mod scratch;
 pub(in crate::jit) mod specialization;
 pub(in crate::jit) mod suspension;
 mod transforms;
@@ -466,13 +465,15 @@ pub(super) enum Op {
     DisableConstructor(Value),
     Get(Value, String),
     PropertyCache(Inst, String),
+    GlobalCache(String),
     PropertyLoad(Value, Value),
     HelperCall {
         helper: super::helpers::Helper,
         args: Vec<Value>,
         uses: Vec<Repr>,
         produces: Option<Repr>,
-        contract: Contract,
+        result_type: ValueType,
+        effects: Effects,
     },
     IsPropertyCached(Value, Value, bool),
     CachedProperty(Value, Value, bool),
@@ -693,9 +694,7 @@ impl Op {
     pub(super) fn operands_iter(&self) -> Operands<'_> {
         let (fixed, rest): ([Option<Value>; 3], &[Value]) = match self {
             Op::Aarch64(op) => return op.operands(),
-            Op::LowLevel(
-                low_level::Op::Scratch { values, .. } | low_level::Op::Cleanup { values, .. },
-            ) => ([None; 3], values),
+            Op::LowLevel(low_level::Op::Cleanup { values, .. }) => ([None; 3], values),
             Op::LowLevel(low_level::Op::Call { target, args, .. }) => (
                 [
                     match target {
@@ -755,6 +754,7 @@ impl Op {
             ) => ([Some(*value), Some(*cache), None], &[]),
             Op::Assume(value, ..) => ([Some(*value), None, None], &[]),
             Op::PropertyCache(..)
+            | Op::GlobalCache(..)
             | Op::Argument(_)
             | Op::Restored(_)
             | Op::Arguments
@@ -938,9 +938,7 @@ impl Op {
     pub(super) fn operands_mut(&mut self) -> OperandsMut<'_> {
         let (fixed, rest): ([Option<&mut Value>; 3], &mut [Value]) = match self {
             Op::Aarch64(op) => return op.operands_mut(),
-            Op::LowLevel(
-                low_level::Op::Scratch { values, .. } | low_level::Op::Cleanup { values, .. },
-            ) => ([None, None, None], values),
+            Op::LowLevel(low_level::Op::Cleanup { values, .. }) => ([None, None, None], values),
             Op::LowLevel(low_level::Op::Call { target, args, .. }) => (
                 [
                     match target {
@@ -1000,6 +998,7 @@ impl Op {
             ) => ([Some(value), Some(cache), None], &mut []),
             Op::Assume(value, ..) => ([Some(value), None, None], &mut []),
             Op::PropertyCache(..)
+            | Op::GlobalCache(..)
             | Op::Argument(_)
             | Op::Restored(_)
             | Op::Arguments
@@ -1926,7 +1925,6 @@ impl Graph {
         };
         match op {
             Op::Aarch64(op) => op.contract(),
-            Op::LowLevel(low_level::Op::Scratch { .. }) => closed(INTERNAL, None),
             Op::LowLevel(low_level::Op::Reference { .. } | low_level::Op::Cleanup { .. }) => {
                 closed(INTERNAL | HEAP_WRITE, None)
             }
@@ -2043,9 +2041,21 @@ impl Graph {
                 HEAP_READ | GLOBAL_READ | ALLOCATION | INTERNAL | ERROR,
                 Borrowed,
             ),
-            Op::HelperCall { contract, .. } => *contract,
+            Op::HelperCall {
+                helper,
+                produces,
+                effects,
+                ..
+            } => Contract {
+                effects: *effects,
+                result: if produces.is_some() {
+                    helper.result_ownership()
+                } else {
+                    None
+                },
+            },
             Op::PropertyLoad(..) => closed(HEAP_READ, Borrowed),
-            Op::PropertyCache(..) => closed(0, Unowned),
+            Op::PropertyCache(..) | Op::GlobalCache(..) => closed(0, Unowned),
             Op::IsPropertyCached(..) | Op::IsShape(..) => closed(CODE_READ, Unowned),
             Op::ShapedGet(..) => closed(HEAP_READ | INTERNAL | ERROR, Borrowed),
             Op::ShapedSet(..) => {

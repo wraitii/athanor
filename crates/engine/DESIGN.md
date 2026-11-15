@@ -96,19 +96,19 @@ lossless int32/boolean round trips. Conversions of invariant non-heap values can
 move out of loops to their source's definition block. Slot coloring prefers an
 available slot already used by a connected block argument or parameter.
 
-Semantic results and helper/coercion references share one lifetime resolver.
-Runtime emission describes acquisitions, result bindings, moves, releases,
-forwarding across internal edges, and scope ends. `semantic/scratch.rs` resolves
-these emission requests before graph rewrites, using pooled holders initialized
-to zero on paths that never acquired a reference. Normal and exceptional cleanup
-then have explicit SSA operands in `Cleanup` graph operations. Operand replacement,
-block splitting and ordinary CFG liveness preserve those references without an
-external live-reference set. `semantic/cleanup.rs` consumes these operations in
-CFG order after variable resolution and builds shared cold unwind ladders.
-The emitter supplies obligations and identifies an unchecked helper result;
-it maintains no live-reference lists, result-token maps, or unwind ladders.
-Scratch references still live until their scope ends unless explicitly moved or
-released; this does not infer earlier last uses through borrowed helper results.
+Semantic results and helper/coercion references share one lifetime tracker in
+`finalize/references.rs`. Runtime lowering records acquisitions, result bindings,
+moves, releases, forwarding across internal edges, and scope ends directly in
+the tracker. Pooled holders are initialized to zero on paths that never acquired
+a reference. Normal and exceptional cleanup have explicit SSA operands in
+`Cleanup` graph operations as soon as they are emitted; mutable holders are
+resolved into SSA once runtime lowering has completed the CFG. Operand replacement,
+block splitting and ordinary CFG liveness then preserve those references.
+`semantic/runtime/cleanup.rs` consumes cleanup operations in CFG order and builds
+shared cold unwind ladders. Dedicated reference tokens identify acquisitions,
+including unchecked helper results, without introducing graph instructions.
+Temporary references still live until their scope ends unless explicitly moved
+or released; this does not infer earlier last uses through borrowed helper results.
 
 Runtime lowering leaves reference operations in the graph until mutable
 variables have been resolved. `semantic/ownership_lowering.rs` then expands boxed retains,
@@ -143,9 +143,22 @@ also constructs an expanded view. The baseline path keeps its existing direct
 implementation, and `JITModule` still handles symbols, relocation and executable
 memory.
 
-Helpers listed by `Helper::returns_reference` return heap results with a
-reference the generated code owns; inline fast paths take the same reference by
-incrementing the count. Lowering holds each such reference in a pooled graph
+Helper definitions declare whether their results are owned, borrowed, or
+unowned. Graph helper-call contracts derive result ownership from that same
+definition; they carry effects separately. Named property reads, stores, and
+probes, global reads and probes, and indexed helpers are selected before
+ownership planning. Symbolic `PropertyCache` and `GlobalCache` operations defer
+cache allocation and address materialization until final lowering. Baseline
+compilation skips inline property-cache expansion, while still selecting its
+helpers before ownership planning. Global and property-probe fast paths can
+still expand during final lowering without changing the selected helper's
+ownership contract.
+
+`PropertyGetCached` returns a borrowed value backed by the receiver, global
+environment, or native-function cache. The ownership plan inserts a retain
+only when the result needs its own reference. Owned-result helpers instead
+supply a reference the generated code must release or transfer.
+Lowering holds each such reference in a pooled graph
 variable, initialized to a non-reference zero on paths that never took it. A result's references
 are released right after its last use in its block, counting the uses of borrowed
 values that may alias it. Owned results carry a reference when heap-tagged.
@@ -1258,7 +1271,7 @@ Oxc AST -> build -> promote -> simplify -> canonical graph
            -> property writes/reads -> views -> simplify -> numeric lowering
            -> property/typed/metadata/numeric lowering -> borrow -> helpers -> ownership planning
         -> array loads and slot stores -> representation assignment -> boxing insertion
-        -> shared runtime emission -> scratch/cleanup/reference lowering -> unboxing
+        -> shared runtime emission -> cleanup/reference lowering -> unboxing
         -> scalar width/edge reconciliation -> semantic conversion expansion
         -> native scalar conversion preparation -> native backend
         or Cranelift scalar conversion/bit/memory expansion -> CLIF

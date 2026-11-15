@@ -99,42 +99,10 @@ pub(in crate::jit) enum Reference {
 }
 
 #[derive(Clone, Debug)]
-pub(in crate::jit) enum Scratch {
-    Begin,
-    Own,
-    Forward {
-        target: Block,
-    },
-    Bind {
-        owner: u32,
-        required: bool,
-        append: bool,
-    },
-    MoveOwner {
-        owner: u32,
-    },
-    ReleaseOwner {
-        owner: u32,
-    },
-    MoveValue,
-    ReleaseToken {
-        token: Inst,
-    },
-    End,
-    Unwind {
-        exclude: Option<Inst>,
-    },
-}
-
-#[derive(Clone, Debug)]
 pub(in crate::jit) enum Op {
     Cleanup {
         values: Vec<Value>,
         unwind: bool,
-    },
-    Scratch {
-        op: Scratch,
-        values: Vec<Value>,
     },
     FrameStore {
         ctx: Value,
@@ -334,11 +302,12 @@ impl<'a> Builder<'a> {
 
     pub(in crate::jit) fn last_helper(&self) -> Option<Helper> {
         let block = self.current?;
-        // Lifetime requests do not change which helper a status check belongs to.
         let inst = *self.graph.blocks[block].insts.iter().rev().find(|&&inst| {
             !matches!(
                 self.graph.insts[inst].op,
-                GraphOp::LowLevel(Op::Scratch { .. }) | GraphOp::AsBoxed(_) | GraphOp::AsWord(_)
+                GraphOp::LowLevel(Op::Cleanup { .. } | Op::VariableRead)
+                    | GraphOp::AsBoxed(_)
+                    | GraphOp::AsWord(_)
             )
         })?;
         match self.graph.insts[inst].op {
@@ -458,16 +427,16 @@ impl<'a> Builder<'a> {
         &self.graph.blocks[block].params
     }
 
-    pub(in crate::jit) fn scratch(&mut self, op: Scratch, values: &[Value]) -> Inst {
-        self.scratch_owned(op, values.to_vec())
+    pub(in crate::jit) fn current_span(&self) -> Span {
+        self.span
     }
 
-    pub(in crate::jit) fn scratch_owned(&mut self, op: Scratch, values: Vec<Value>) -> Inst {
+    pub(in crate::jit) fn cleanup(&mut self, values: Vec<Value>, unwind: bool) {
         self.effect(
-            self.current.expect("no current block"),
+            self.current.unwrap(),
             self.span,
-            Op::Scratch { op, values },
-        )
+            Op::Cleanup { values, unwind },
+        );
     }
 
     pub(in crate::jit) fn store_frame(&mut self, ctx: Value, value: Value, slot: u32) -> Value {

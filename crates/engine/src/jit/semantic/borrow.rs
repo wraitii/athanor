@@ -11,6 +11,13 @@ const HEAP: ValueType = ValueType::STRING
 
 pub(in crate::jit) fn receiver(op: &Op) -> Option<Value> {
     match op {
+        Op::HelperCall {
+            helper:
+                crate::jit::helpers::Helper::PropertyGetCached
+                | crate::jit::helpers::Helper::SemanticPropertyProbeCached,
+            args,
+            ..
+        } => args.first().copied(),
         Op::Get(object, _)
         | Op::PropertyLoad(object, _)
         | Op::CachedProperty(object, _, _)

@@ -1,5 +1,6 @@
 mod ops;
 mod poll;
+mod references;
 mod repr;
 mod scope;
 mod semantic_graph;
@@ -65,7 +66,8 @@ pub(super) struct FunctionCompiler<'a, 'f> {
     property_caches: FxHashMap<super::semantic::Inst, i64>,
     slots: FxHashMap<LoweredValue, u32>,
     slot_count: u32,
-    unchecked: Option<Inst>,
+    unchecked: Option<references::Token>,
+    references: references::References,
 }
 
 enum Arguments {
@@ -307,6 +309,7 @@ fn lower_callable(
         slots: FxHashMap::default(),
         slot_count: 0,
         unchecked: None,
+        references: references::References::new(empty_owned),
     };
 
     compiler.enter_frame();
@@ -319,7 +322,7 @@ fn lower_callable(
         let code = compiler.b.ins().iconst(types::I64, plan as i64);
         let generator =
             compiler.call_helper(Helper::GeneratorNew, &[closure, receiver, args, code]);
-        compiler.release_tracked(&[arguments]);
+        compiler.release_tracked(&[arguments])?;
         compiler.check_error();
         let args = compiler.return_args(generator, false);
         compiler.jump(return_block, &args);
@@ -331,10 +334,11 @@ fn lower_callable(
         compiler.finalize_runtime_lowering(context, closure, continuations)?;
         compiler.patch_frame_size();
     }
-    drop(compiler);
+    compiler
+        .references
+        .finish(compiler.b.graph)
+        .map_err(Error::Compile)?;
     after("finalize-runtime", graph_builder.graph);
-    super::semantic::scratch::resolve(graph_builder.graph, empty_owned).map_err(Error::Compile)?;
-    after("scratch", &lowered);
     super::semantic::lower_low_level(
         &mut lowered,
         ctx,

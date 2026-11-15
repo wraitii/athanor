@@ -1,8 +1,9 @@
-use super::{Block, BlockArg, GraphBuilder as FunctionBuilder, Inst};
+use super::{Block, BlockArg, GraphBuilder as FunctionBuilder};
 use super::{FunctionCompiler, LoweredValue};
+use crate::error::Error;
 use crate::jit::helpers::Helper;
 use crate::jit::semantic::Repr;
-use crate::jit::semantic::low_level::{Reference, Scratch};
+use crate::jit::semantic::low_level::Reference;
 use crate::jit::semantic::runtime::layout;
 use crate::value::Value;
 use cranelift_codegen::ir::condcodes::IntCC;
@@ -59,7 +60,7 @@ impl FunctionCompiler<'_, '_> {
     }
 
     pub(super) fn track(&mut self, value: LoweredValue) -> LoweredValue {
-        self.b.scratch(Scratch::Own, &[value]);
+        self.references.own(self.b, value);
         value
     }
 
@@ -67,34 +68,35 @@ impl FunctionCompiler<'_, '_> {
         if args.is_empty() {
             return;
         }
-        let values: Vec<_> = args.iter().map(|&BlockArg::Value(value)| value).collect();
-        self.b
-            .scratch_owned(Scratch::Forward { target: block }, values);
+        self.references.forward(self.b, block, args);
     }
 
-    pub(super) fn move_result_reference(&mut self, value: LoweredValue) {
-        self.b.scratch(Scratch::MoveValue, &[value]);
+    pub(super) fn move_result_reference(&mut self, value: LoweredValue) -> Result<(), Error> {
+        self.references
+            .move_value(self.b, value)
+            .map_err(Error::Compile)
     }
 
     pub(super) fn release_owned(&mut self) {
-        self.b.scratch(Scratch::End, &[]);
+        self.references.end(self.b);
         self.unchecked = None;
     }
 
-    pub(super) fn release_tracked(&mut self, tokens: &[Inst]) {
+    pub(super) fn release_tracked(
+        &mut self,
+        tokens: &[super::references::Token],
+    ) -> Result<(), Error> {
         for &token in tokens {
-            self.b.scratch(Scratch::ReleaseToken { token }, &[]);
+            self.references
+                .release_token(self.b, token)
+                .map_err(Error::Compile)?;
         }
         self.unchecked = self.unchecked.filter(|token| !tokens.contains(token));
+        Ok(())
     }
 
     pub(super) fn unwind(&mut self, target: Block, args: &[BlockArg]) {
-        self.b.scratch(
-            Scratch::Unwind {
-                exclude: self.unchecked,
-            },
-            &[],
-        );
+        self.references.unwind(self.b, self.unchecked);
         self.b.ins().jump(target, args);
         self.terminated = true;
     }

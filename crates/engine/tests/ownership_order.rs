@@ -361,3 +361,48 @@ fn failed_calls_release_scratch_references_from_local_writes() {
         }
     }
 }
+
+#[test]
+fn property_results_survive_receiver_replacement_without_leaking() {
+    for (ssa_opt, background_compile) in
+        [(false, false), (true, false), (false, true), (true, true)]
+    {
+        let mut engine = Engine::with_options(EngineOptions {
+            ssa_opt,
+            background_compile,
+            ..Default::default()
+        })
+        .unwrap();
+        engine
+            .compile(
+                "function make(){ return {child:{value:7}}; }
+             function take(parent){ const child=parent.child; parent.child=null; return child; }
+             function read(child){ return child.value; }
+             function method(){ return [].map; }
+             function prototype(){ function C(){} return C.prototype; }",
+                "borrowed_properties.js",
+            )
+            .unwrap();
+        for _ in 0..8 {
+            let parent = engine.call("make", &[]).unwrap();
+            let child = engine.call("take", &[parent.value()]).unwrap();
+            let stale = child.value();
+            drop(parent);
+            engine.drain_disposals(1000);
+            assert_eq!(
+                engine.call("read", &[stale]).unwrap().value(),
+                Value::number(7.0)
+            );
+            drop(child);
+            engine.drain_disposals(1000);
+            assert!(!engine.global().define("disposed", stale));
+            let method = engine.call("method", &[]).unwrap();
+            assert_ne!(method.value(), Value::UNDEFINED);
+            let prototype = engine.call("prototype", &[]).unwrap();
+            let stale = prototype.value();
+            drop(prototype);
+            engine.drain_disposals(1000);
+            assert!(!engine.global().define("disposed", stale));
+        }
+    }
+}

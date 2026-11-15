@@ -13,8 +13,8 @@ use crate::jit::helpers::{
     Helper, HelperKind, PROPERTY_CACHE_LIMIT, PropertyCache,
 };
 use crate::jit::profile::{CallSite, Site};
-use crate::jit::semantic::DirectTarget;
 use crate::jit::semantic::low_level::Binary;
+use crate::jit::semantic::{DirectTarget, ValueType};
 use crate::jit::session::CALL_SITE_OFFSET;
 use crate::value::Value;
 
@@ -183,59 +183,97 @@ impl FunctionCompiler<'_, '_> {
         layout::is_number(self.b, value)
     }
 
-    pub(super) fn truthy(&mut self, value: LoweredValue) -> LoweredValue {
-        let number = self.is_number(value);
-        let word = self.b.as_word(value);
-        let number_block = self.b.create_block();
-        let other_block = self.b.create_block();
-        let string_block = self.b.create_block();
-        let primitive_block = self.b.create_block();
+    pub(super) fn truthy(&mut self, value: LoweredValue, types: ValueType) -> LoweredValue {
+        if types.within(ValueType::NUMBER) {
+            return self.number_truthy(value);
+        }
+        if types.within(ValueType::STRING) {
+            return self.string_truthy(value);
+        }
+        if !types.intersects(ValueType::NUMBER.union(ValueType::STRING)) {
+            return self.primitive_truthy(value, types);
+        }
+
         let done = self.b.create_block();
         self.b.append_block_param_repr(done, Repr::Boolean);
-        self.brif(number, number_block, &[], other_block, &[]);
+        if types.intersects(ValueType::NUMBER) {
+            let number = self.is_number(value);
+            let number_block = self.b.create_block();
+            let other_block = self.b.create_block();
+            self.brif(number, number_block, &[], other_block, &[]);
+            self.switch(number_block);
+            let truth = self.number_truthy(value);
+            self.jump(done, &[BlockArg::Value(truth)]);
+            self.switch(other_block);
+        }
+        let types = types.without(ValueType::NUMBER);
+        if types.within(ValueType::STRING) {
+            let truth = self.string_truthy(value);
+            self.jump(done, &[BlockArg::Value(truth)]);
+        } else {
+            if types.intersects(ValueType::STRING) {
+                let word = self.b.as_word(value);
+                let is_string = layout::is_string(self.b, word);
+                let string_block = self.b.create_block();
+                let primitive_block = self.b.create_block();
+                self.brif(is_string, string_block, &[], primitive_block, &[]);
+                self.switch(string_block);
+                let truth = self.string_truthy(value);
+                self.jump(done, &[BlockArg::Value(truth)]);
+                self.switch(primitive_block);
+            }
+            let truth = self.primitive_truthy(value, types.without(ValueType::STRING));
+            self.jump(done, &[BlockArg::Value(truth)]);
+        }
+        self.switch(done);
+        self.b.block_params(done)[0]
+    }
 
-        self.switch(number_block);
+    fn number_truthy(&mut self, value: LoweredValue) -> LoweredValue {
+        let word = self.b.as_word(value);
         let float = self.b.ins().bitcast(types::F64, MemFlagsData::new(), word);
         let zero = self.b.ins().f64const(0.0);
         let negative = self.b.ins().fcmp(FloatCC::LessThan, float, zero);
         let positive = self.b.ins().fcmp(FloatCC::GreaterThan, float, zero);
-        let truth = self.b.ins().boolean_or(negative, positive);
-        self.jump(done, &[BlockArg::Value(truth)]);
+        self.b.ins().boolean_or(negative, positive)
+    }
 
-        self.switch(other_block);
-        let is_string = layout::is_string(self.b, word);
-        self.brif(is_string, string_block, &[], primitive_block, &[]);
-
-        self.switch(string_block);
+    fn string_truthy(&mut self, value: LoweredValue) -> LoweredValue {
         let truth = self.call_helper(Helper::Truthy, &[value]);
         let truth = self.b.as_word(truth);
-        let truth = self
-            .b
+        self.b
             .ins()
-            .icmp_imm_s(IntCC::Equal, truth, Value::TRUE.bits() as i64);
-        self.jump(done, &[BlockArg::Value(truth)]);
+            .icmp_imm_s(IntCC::Equal, truth, Value::TRUE.bits() as i64)
+    }
 
-        self.switch(primitive_block);
-        let undefined = self
-            .b
-            .ins()
-            .icmp_imm_s(IntCC::Equal, word, Value::UNDEFINED.bits() as i64);
-        let null = self
-            .b
-            .ins()
-            .icmp_imm_s(IntCC::Equal, word, Value::NULL.bits() as i64);
-        let false_value = self
-            .b
-            .ins()
-            .icmp_imm_s(IntCC::Equal, word, Value::FALSE.bits() as i64);
-        let falsy = self.b.ins().boolean_or(undefined, null);
-        let falsy = self.b.ins().boolean_or(falsy, false_value);
+    fn primitive_truthy(&mut self, value: LoweredValue, types: ValueType) -> LoweredValue {
+        if types.within(ValueType::UNDEFINED.union(ValueType::NULL)) {
+            return self.b.ins().boolean(false);
+        }
+        let word = self.b.as_word(value);
+        let mut falsy = None;
+        for (ty, value) in [
+            (ValueType::UNDEFINED, Value::UNDEFINED),
+            (ValueType::NULL, Value::NULL),
+            (ValueType::BOOLEAN, Value::FALSE),
+        ] {
+            if !types.intersects(ty) {
+                continue;
+            }
+            let check = self
+                .b
+                .ins()
+                .icmp_imm_s(IntCC::Equal, word, value.bits() as i64);
+            falsy = Some(match falsy {
+                Some(falsy) => self.b.ins().boolean_or(falsy, check),
+                None => check,
+            });
+        }
+        let Some(falsy) = falsy else {
+            return self.b.ins().boolean(true);
+        };
         let no = self.b.ins().boolean(false);
-        let truth = self.b.ins().boolean_equal(falsy, no);
-        self.jump(done, &[BlockArg::Value(truth)]);
-
-        self.switch(done);
-        self.b.block_params(done)[0]
+        self.b.ins().boolean_equal(falsy, no)
     }
 
     pub(super) fn unary_helper(&mut self, op: UnaryOp, value: LoweredValue) -> LoweredValue {
@@ -285,7 +323,16 @@ impl FunctionCompiler<'_, '_> {
         let offset = match self.property_caches.get(&site) {
             Some(&offset) => offset,
             None => {
-                let offset = self.data.push(PropertyCache::new(name, observer, false));
+                let data = &self.b.graph.insts[site];
+                let location = crate::jit::profile::Site {
+                    source: data.source_name.map_or(self.source_name.0, |name| name.0),
+                    start: data.span.start,
+                    end: data.span.end,
+                };
+                let megamorphic = self.b.graph.megamorphic_gets.contains(&location);
+                let offset = self
+                    .data
+                    .push(PropertyCache::new(name, observer, megamorphic));
                 self.property_caches.insert(site, offset);
                 offset
             }
@@ -294,7 +341,11 @@ impl FunctionCompiler<'_, '_> {
     }
 
     pub(super) fn call_helper(&mut self, helper: Helper, args: &[LoweredValue]) -> LoweredValue {
-        self.call_helper_tracked(helper, args, helper.returns_reference())
+        self.call_helper_tracked(
+            helper,
+            args,
+            helper.result_ownership() == crate::jit::semantic::Ownership::Owned,
+        )
     }
 
     pub(super) fn call_helper_tracked(
@@ -328,10 +379,7 @@ impl FunctionCompiler<'_, '_> {
         }
         self.unchecked = None;
         if track {
-            self.unchecked = Some(
-                self.b
-                    .scratch(crate::jit::semantic::low_level::Scratch::Own, &[result]),
-            );
+            self.unchecked = Some(self.references.own(self.b, result));
         }
         result
     }
@@ -415,7 +463,7 @@ impl FunctionCompiler<'_, '_> {
         {
             let result = self.generic_call(callee, receiver, args, span)?;
             if owned {
-                self.move_result_reference(result);
+                self.move_result_reference(result)?;
             }
             return Ok(result);
         }
@@ -451,7 +499,7 @@ impl FunctionCompiler<'_, '_> {
         let result = self.b.block_params(check)[0];
         self.check_error();
         if owned {
-            self.move_result_reference(result);
+            self.move_result_reference(result)?;
         }
         self.jump(done, &[BlockArg::Value(result)]);
         self.switch(done);
@@ -704,14 +752,7 @@ impl FunctionCompiler<'_, '_> {
         Operand::new(self.b.block_params(done)[0], Repr::Boxed)
     }
 
-    pub(super) fn global_access(
-        &mut self,
-        name: &str,
-        value: Option<LoweredValue>,
-    ) -> LoweredValue {
-        let Some(value) = value else {
-            return self.cached_global_get(name, false, true);
-        };
+    pub(super) fn global_set(&mut self, name: &str, value: LoweredValue) -> LoweredValue {
         let name: Box<str> = name.into();
         let ptr = self.b.ins().iconst(self.pointer, name.as_ptr() as i64);
         let len = self.b.ins().iconst(types::I64, name.len() as i64);
@@ -721,34 +762,10 @@ impl FunctionCompiler<'_, '_> {
         result
     }
 
-    pub(super) fn global_get_optional(&mut self, name: &str) -> LoweredValue {
-        self.cached_global_get(name, true, false)
-    }
-
-    pub(super) fn cached_global_get(
-        &mut self,
-        name: &str,
-        optional: bool,
-        retain: bool,
-    ) -> LoweredValue {
-        let helper = match (optional, retain) {
-            (false, true) => Helper::GlobalGet,
-            (true, true) => Helper::GlobalGetOptional,
-            (false, false) => Helper::GlobalGetBorrowed,
-            (true, false) => Helper::GlobalGetOptionalBorrowed,
-        };
-        self.cached_global(name, helper, retain)
-    }
-
-    pub(super) fn cached_global_probe(&mut self, name: &str) -> LoweredValue {
-        self.cached_global(name, Helper::SemanticGlobalProbe, false)
-    }
-
-    fn cached_global(&mut self, name: &str, helper: Helper, retain: bool) -> LoweredValue {
+    pub(super) fn cached_global(&mut self, address: LoweredValue, helper: Helper) -> LoweredValue {
         use crate::jit::helpers::GlobalCache;
         use crate::jit::session::{GLOBAL_IDENTITY_OFFSET, GLOBAL_REVISION_OFFSET};
 
-        let address = self.function_data(GlobalCache::new(name));
         let flags = MemFlagsData::trusted();
         let identity = self
             .b
@@ -799,16 +816,7 @@ impl FunctionCompiler<'_, '_> {
                 .icmp_imm_s(IntCC::Equal, word, Value::UNINITIALIZED.bits() as i64);
         self.brif(uninitialized, slow, &[], ready, &[]);
         self.switch(ready);
-        if retain {
-            let retain_block = self.b.create_block();
-            let heap = self.is_heap(value);
-            self.brif(heap, retain_block, &[], done, &[BlockArg::Value(value)]);
-            self.switch(retain_block);
-            let value = self.retain_temporary(value);
-            self.jump(done, &[BlockArg::Value(value)]);
-        } else {
-            self.jump(done, &[BlockArg::Value(value)]);
-        }
+        self.jump(done, &[BlockArg::Value(value)]);
         self.switch(slow);
         let value = self.call_helper(helper, &[address]);
         if helper != Helper::SemanticGlobalProbe {
@@ -828,34 +836,12 @@ impl FunctionCompiler<'_, '_> {
         self.check_error();
     }
 
-    pub(super) fn cached_property_get(
-        &mut self,
-        object: LoweredValue,
-        name: &str,
-        observer: Option<(u64, crate::jit::profile::Site)>,
-        megamorphic: bool,
-    ) -> LoweredValue {
-        if megamorphic {
-            return self.property_access(object, name, None, None);
-        }
-        let address = self.function_data(PropertyCache::new(name, observer, false));
-        let result = self.call_helper(Helper::PropertyGetCached, &[object, address]);
-        self.check_error();
-        result
-    }
-
     pub(super) fn cached_property_probe(
         &mut self,
         object: LoweredValue,
-        name: &str,
-        observer: Option<(u64, crate::jit::profile::Site)>,
-        megamorphic: bool,
+        address: LoweredValue,
+        builtins: bool,
     ) -> LoweredValue {
-        let address = self.function_data(PropertyCache::new(name, observer, megamorphic));
-        if megamorphic {
-            return self.call_helper(Helper::SemanticPropertyProbeCached, &[object, address]);
-        }
-        let builtins = crate::heap::builtin_method(name);
         let entry = self.property_cache_entry(object, address, builtins, true);
         let hit = self.b.ins().icmp_imm_s(IntCC::NotEqual, entry, 0);
         let inline = self.b.create_block();
@@ -1083,48 +1069,6 @@ impl FunctionCompiler<'_, '_> {
             .ins()
             .load(types::I64, flags, data, (index as i32) * 8);
         self.b.as_boxed(word)
-    }
-
-    pub(super) fn shaped_property_set(
-        &mut self,
-        object: LoweredValue,
-        name: &str,
-        _index: u32,
-        value: LoweredValue,
-    ) {
-        self.cached_property_set(object, name, value, None);
-    }
-
-    fn cached_property_set(
-        &mut self,
-        object: LoweredValue,
-        name: &str,
-        value: LoweredValue,
-        observer: Option<(u64, crate::jit::profile::Site)>,
-    ) -> LoweredValue {
-        let address = self.function_data(PropertyCache::new(name, observer, false));
-        let result = self.call_helper(Helper::PropertySetCached, &[object, address, value]);
-        self.check_error();
-        result
-    }
-
-    pub(super) fn property_access(
-        &mut self,
-        object: LoweredValue,
-        name: &str,
-        value: Option<LoweredValue>,
-        observer: Option<(u64, crate::jit::profile::Site)>,
-    ) -> LoweredValue {
-        if let Some(value) = value {
-            return self.cached_property_set(object, name, value, observer);
-        }
-        let name: Box<str> = name.into();
-        let ptr = self.b.ins().iconst(self.pointer, name.as_ptr() as i64);
-        let len = self.b.ins().iconst(types::I64, name.len() as i64);
-        self.names.push(name);
-        let result = self.call_helper(Helper::PropertyGet, &[object, ptr, len]);
-        self.check_error();
-        result
     }
 
     pub(super) fn define_hidden_property(

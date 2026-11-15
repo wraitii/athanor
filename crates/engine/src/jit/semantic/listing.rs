@@ -362,6 +362,7 @@ impl Graph {
                     .join(", ")
             ),
             Op::PropertyLoad(object, address) => format!("property_load {object} {address}"),
+            Op::GlobalCache(name) => format!("global_cache {name}"),
             Op::PropertyCache(site, name) => format!("property_cache {site} {name}"),
             Op::FillPropertyStore(object, cache, name, value, _) => {
                 format!("fill_property_store {object}.{name}, {value} {cache}")

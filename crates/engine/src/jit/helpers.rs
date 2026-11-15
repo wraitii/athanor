@@ -61,13 +61,14 @@ pub(crate) struct HelperSpec {
     pub(crate) params: &'static [HelperKind],
     pub(crate) returns: HelperKind,
     pub(crate) pointer: *const u8,
-    pub(crate) reference: bool,
+    pub(crate) ownership: super::semantic::Ownership,
 }
 
 macro_rules! define_helpers {
-    (@reference) => { false };
-    (@reference reference) => { true };
-    ($($variant:ident => $function:ident($($param:ty),*) -> $result:ty $(, $reference:ident)?;)*) => {
+    (@ownership) => { super::semantic::Ownership::Unowned };
+    (@ownership owned) => { super::semantic::Ownership::Owned };
+    (@ownership borrowed) => { super::semantic::Ownership::Borrowed };
+    ($($variant:ident => $function:ident($($param:ty),*) -> $result:ty $(, $ownership:ident)?;)*) => {
         #[repr(usize)]
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
         pub(crate) enum Helper {
@@ -82,7 +83,7 @@ macro_rules! define_helpers {
                     const FUNCTION: extern "C" fn(*mut JitCtx $(, $param)*) -> $result = $function;
                     FUNCTION as *const () as *const u8
                 },
-                reference: define_helpers!(@reference $($reference)?),
+                ownership: define_helpers!(@ownership $($ownership)?),
             }),*
         ];
     };
@@ -91,93 +92,90 @@ macro_rules! define_helpers {
 define_helpers! {
     PackInit => js_pack_init(Value) -> Value;
     PackRelease => js_pack_release(Value) -> Value;
-    NewPack => js_new_pack(Value) -> Value, reference;
-    Spread => js_spread(Value, Value) -> Value, reference;
+    NewPack => js_new_pack(Value) -> Value, owned;
+    Spread => js_spread(Value, Value) -> Value, owned;
     PackAppend => js_pack_append(Value, Value) -> Value;
     PackExtend => js_pack_extend(Value, Value) -> Value;
-    PackTake => js_pack_take(Value, Value) -> Value, reference;
+    PackTake => js_pack_take(Value, Value) -> Value, owned;
     CompilePoll => js_compile_poll() -> Value;
     VariantEntry => js_variant_entry(*const Variant) -> u64;
     OsrPoll => js_osr_poll(Value, *mut Value, *const Site) -> Value;
     CompileLeave => js_compile_leave(u64) -> Value;
     Instanceof => js_instanceof(Value, Value) -> Value;
     In => js_in(Value, Value) -> Value;
-    GeneratorNew => js_generator_new(Value, Value, Value, u64) -> Value, reference;
-    CellNew => js_cell_new(Value) -> Value, reference;
-    CellGet => js_cell_get(Value) -> Value, reference;
+    GeneratorNew => js_generator_new(Value, Value, Value, u64) -> Value, owned;
+    CellNew => js_cell_new(Value) -> Value, owned;
+    CellGet => js_cell_get(Value) -> Value, owned;
     CellSet => js_cell_set(Value, Value) -> Value;
-    CaptureGet => js_capture_get(Value, u64) -> Value, reference;
+    CaptureGet => js_capture_get(Value, u64) -> Value, owned;
     BindThis => js_bind_this(Value, Value) -> Value;
     DisableConstructor => js_disable_constructor(Value) -> Value;
     MarkClass => js_mark_class(Value) -> Value;
-    ClosureNew => js_closure_new(u64, *const Value, u64) -> Value, reference;
-    Construct => js_construct(Value, *const Value, u64) -> Value, reference;
-    ConstructorPrototype => js_constructor_prototype(Value) -> Value;
-    NewInstance => js_new_instance(Value) -> Value, reference;
-    ConstructorCall => js_constructor_call(Value, Value, *const Value, u64) -> Value, reference;
-    ConstructorCallPack => js_constructor_call_pack(Value, Value, Value) -> Value, reference;
-    ConstructResolved => js_construct_resolved(Value, Value, *const Value, u64) -> Value, reference;
-    ConstructPackResolved => js_construct_pack_resolved(Value, Value, Value) -> Value, reference;
-    ConstructPack => js_construct_pack(Value, Value) -> Value, reference;
-    CallPack => js_call_pack(Value, Value, Value) -> Value, reference;
+    ClosureNew => js_closure_new(u64, *const Value, u64) -> Value, owned;
+    Construct => js_construct(Value, *const Value, u64) -> Value, owned;
+    ConstructorPrototype => js_constructor_prototype(Value) -> Value, borrowed;
+    NewInstance => js_new_instance(Value) -> Value, owned;
+    ConstructorCall => js_constructor_call(Value, Value, *const Value, u64) -> Value, owned;
+    ConstructorCallPack => js_constructor_call_pack(Value, Value, Value) -> Value, owned;
+    ConstructResolved => js_construct_resolved(Value, Value, *const Value, u64) -> Value, owned;
+    ConstructPackResolved => js_construct_pack_resolved(Value, Value, Value) -> Value, owned;
+    ConstructPack => js_construct_pack(Value, Value) -> Value, owned;
+    CallPack => js_call_pack(Value, Value, Value) -> Value, owned;
     ArrayAppend => js_array_append(Value, Value) -> Value;
     ArrayExtend => js_array_extend(Value, Value) -> Value;
-    Call => js_call(Value, Value, *const Value, u64) -> Value, reference;
+    Call => js_call(Value, Value, *const Value, u64) -> Value, owned;
     ObserveCall => js_observe_call(Value, u64) -> Value;
     ObserveGet => js_observe_get(Value, u64) -> Value;
     ObserveIndex => js_observe_index(Value, u64) -> Value;
     ObserveNumber => js_observe_number(Value, u64) -> Value;
     ObserveNumberFailure => js_observe_number_failure(Value, u64) -> Value;
-    SemanticGlobalProbe => js_semantic_global_probe(*mut GlobalCache) -> Value;
-    SemanticPropertyProbeCached => js_semantic_property_probe_cached(Value, *mut PropertyCache) -> Value;
-    SemanticIndexProbe => js_semantic_index_probe(Value, Value) -> Value;
+    SemanticGlobalProbe => js_semantic_global_probe(*mut GlobalCache) -> Value, borrowed;
+    SemanticPropertyProbeCached => js_semantic_property_probe_cached(Value, *mut PropertyCache) -> Value, borrowed;
+    SemanticIndexProbe => js_semantic_index_probe(Value, Value) -> Value, borrowed;
     SemanticMathNative => js_semantic_math_native(Value, u64) -> Value;
-    ClosureThis => js_closure_this(Value) -> Value;
-    LexicalReceiver => js_lexical_receiver(Value, Value) -> Value;
+    ClosureThis => js_closure_this(Value) -> Value, borrowed;
+    LexicalReceiver => js_lexical_receiver(Value, Value) -> Value, borrowed;
     ArrayIterationGuard => js_array_iteration_guard(Value, Value, u64) -> Value;
     IsStringSplit => js_is_string_split(Value) -> Value;
-    StringSplitParts => js_string_split_parts(Value, Value, *const Value, u64) -> Value, reference;
-    StringSplit => js_string_split(u64, Value, *const Value, u64) -> Value, reference;
-    ArrayMapNew => js_array_map_new(Value) -> Value, reference;
-    ArrayMapElement => js_array_map_element(Value, usize) -> Value, reference;
+    StringSplitParts => js_string_split_parts(Value, Value, *const Value, u64) -> Value, owned;
+    StringSplit => js_string_split(u64, Value, *const Value, u64) -> Value, owned;
+    ArrayMapNew => js_array_map_new(Value) -> Value, owned;
+    ArrayMapElement => js_array_map_element(Value, usize) -> Value, owned;
     MathDirect => js_math_direct(u64, Value, *const Value, u64) -> Value;
     FrameOverflow => js_frame_overflow() -> Value;
     FrameRelease => js_frame_release() -> Value;
     Release => js_release(Value) -> Value;
     RetainAddress => js_retain_address(u64) -> Value;
     Bailout => js_bailout(u64) -> Value;
-    Retain => js_retain(Value) -> Value, reference;
-    IterateNew => js_iterate_new(Value) -> Value, reference;
-    IterateNext => js_iterate_next(Value) -> Value, reference;
-    EnumerateNew => js_enumerate_new(Value) -> Value, reference;
-    EnumerateNext => js_enumerate_next(Value) -> Value, reference;
-    Typeof => js_typeof(Value) -> Value, reference;
+    Retain => js_retain(Value) -> Value, owned;
+    IterateNew => js_iterate_new(Value) -> Value, owned;
+    IterateNext => js_iterate_next(Value) -> Value, owned;
+    EnumerateNew => js_enumerate_new(Value) -> Value, owned;
+    EnumerateNext => js_enumerate_next(Value) -> Value, owned;
+    Typeof => js_typeof(Value) -> Value, owned;
     IsTypeof => js_is_typeof(Value, Value) -> Value;
     Truthy => js_truthy(Value) -> Value;
-    ObjectNew => js_object_new(Value) -> Value, reference;
-    PropertyKey => js_property_key(Value) -> Value, reference;
+    ObjectNew => js_object_new(Value) -> Value, owned;
+    PropertyKey => js_property_key(Value) -> Value, owned;
     StringConstant => js_string_constant(*mut u64, *const u8, u64) -> Value;
-    RegExpNew => js_regexp_new(u64, *const u8, u64) -> Value, reference;
-    ArrayNew => js_array_new(*const Value, u64) -> Value, reference;
-    Rest => js_rest(*const Value, u64, u64) -> Value, reference;
-    IndexGet => js_index_get(Value, Value) -> Value, reference;
-    IndexGetNumeric => js_index_get_numeric(Value, f64) -> Value, reference;
+    RegExpNew => js_regexp_new(u64, *const u8, u64) -> Value, owned;
+    ArrayNew => js_array_new(*const Value, u64) -> Value, owned;
+    Rest => js_rest(*const Value, u64, u64) -> Value, owned;
+    IndexGet => js_index_get(Value, Value) -> Value, owned;
+    IndexGetNumeric => js_index_get_numeric(Value, f64) -> Value, owned;
     IndexSet => js_index_set(Value, Value, Value) -> Value;
-    PropertyGet => js_property_get(Value, *const u8, u64) -> Value, reference;
     PropertySet => js_property_set(Value, *const u8, u64, Value) -> Value;
-    PropertyGetCached => js_property_get_cached(Value, *mut PropertyCache) -> Value, reference;
-    PropertyGetBaseline => js_property_get_baseline(Value, *mut PropertyCache) -> Value, reference;
+    PropertyGetCached => js_property_get_cached(Value, *mut PropertyCache) -> Value, borrowed;
+    PropertyGetBaseline => js_property_get_baseline(Value, *mut PropertyCache) -> Value, owned;
     PropertyCachePrime => js_property_cache_prime(Value, *mut PropertyCache) -> Value;
     PropertySetCached => js_property_set_cached(Value, *mut PropertyCache, Value) -> Value;
     PropertyDefineHidden => js_property_define_hidden(Value, *const u8, u64, Value) -> Value;
-    GlobalGet => js_global_get(*mut GlobalCache) -> Value, reference;
-    GlobalGetOptional => js_global_get_optional(*mut GlobalCache) -> Value, reference;
-    GlobalGetBorrowed => js_global_get_borrowed(*mut GlobalCache) -> Value;
-    GlobalGetOptionalBorrowed => js_global_get_optional_borrowed(*mut GlobalCache) -> Value;
+    GlobalGetBorrowed => js_global_get_borrowed(*mut GlobalCache) -> Value, borrowed;
+    GlobalGetOptionalBorrowed => js_global_get_optional_borrowed(*mut GlobalCache) -> Value, borrowed;
     GlobalSet => js_global_set(*const u8, u64, Value) -> Value;
     GlobalInitialize => js_global_initialize(*const u8, u64, Value) -> Value;
     Throw => js_throw(Value) -> Value;
-    Catch => js_catch(Value) -> Value, reference;
+    Catch => js_catch(Value) -> Value, owned;
     ErrorOrigin => js_error_origin(*const (usize, usize), u64, u64) -> Value;
     CallProfileFlush => js_call_profile_flush() -> Value;
     BitwiseAnd => js_bitwise_and(Value, Value) -> Value;
@@ -186,7 +184,7 @@ define_helpers! {
     ShiftLeft => js_shift_left(Value, Value) -> Value;
     ShiftRight => js_shift_right(Value, Value) -> Value;
     ShiftRightUnsigned => js_shift_right_unsigned(Value, Value) -> Value;
-    Add => js_add(Value, Value) -> Value, reference;
+    Add => js_add(Value, Value) -> Value, owned;
     Sub => js_sub(Value, Value) -> Value;
     Mul => js_mul(Value, Value) -> Value;
     Div => js_div(Value, Value) -> Value;
@@ -250,9 +248,8 @@ extern "C" fn js_compile_leave(ctx: *mut JitCtx, code: u64) -> Value {
 }
 
 impl Helper {
-    /// Whether a heap result carries a reference the generated code must release.
-    pub(crate) fn returns_reference(self) -> bool {
-        HELPERS[self as usize].reference
+    pub(crate) fn result_ownership(self) -> super::semantic::Ownership {
+        HELPERS[self as usize].ownership
     }
 
     pub(crate) fn can_throw(self) -> bool {
@@ -270,10 +267,7 @@ impl Helper {
                 | Self::FrameRelease
                 | Self::IndexGet
                 | Self::IndexGetNumeric
-                | Self::PropertyGet
                 | Self::PropertyGetCached
-                | Self::GlobalGet
-                | Self::GlobalGetOptional
                 | Self::GlobalGetBorrowed
                 | Self::GlobalGetOptionalBorrowed
                 | Self::BitwiseAnd

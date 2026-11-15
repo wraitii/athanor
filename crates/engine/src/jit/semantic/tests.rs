@@ -54,7 +54,8 @@ fn ops(graph: &Graph) -> Vec<&Op> {
 
 #[test]
 fn baseline_keeps_generic_property_accesses() {
-    let graph = lower_source("function f(a, k, v) { a.x = v; return a.y + a[k]; }").unwrap();
+    let graph =
+        lower_source("function f(a, k, v) { a.x = v; return a.y + a[k] + shared; }").unwrap();
     let function = canonicalize_graph(graph, true).unwrap();
     let planned = inline_and_plan_specialization(function, true, None, 1).unwrap();
     let mut function = specialize_observed(
@@ -67,8 +68,47 @@ fn baseline_keeps_generic_property_accesses() {
     )
     .unwrap();
     let mut checked = false;
+    let mut checked_helpers = false;
     function
         .lower_runtime_observed(true, &mut |stage, function| {
+            if stage == "helpers" {
+                assert!(
+                    !ops(&function.graph)
+                        .iter()
+                        .any(|op| matches!(op, Op::Get(..)))
+                );
+                let helper = ops(&function.graph)
+                    .into_iter()
+                    .find(|op| {
+                        matches!(
+                            op,
+                            Op::HelperCall {
+                                helper: crate::jit::helpers::Helper::PropertyGetCached,
+                                ..
+                            }
+                        )
+                    })
+                    .unwrap();
+                assert_eq!(
+                    function.graph.contract(helper, &function.facts).result,
+                    Ownership::Borrowed
+                );
+                for helper in [
+                    crate::jit::helpers::Helper::PropertySetCached,
+                    crate::jit::helpers::Helper::GlobalGetBorrowed,
+                ] {
+                    assert!(ops(&function.graph).iter().any(|op| matches!(
+                        op, Op::HelperCall { helper: selected, .. } if *selected == helper
+                    )));
+                }
+                assert!(
+                    !ops(&function.graph).iter().any(|op| matches!(
+                        op,
+                        Op::Set(..) | Op::ShapedSet(..) | Op::GlobalRead(..)
+                    ))
+                );
+                checked_helpers = true;
+            }
             if stage != "property-accesses" {
                 return;
             }
@@ -93,6 +133,7 @@ fn baseline_keeps_generic_property_accesses() {
         })
         .unwrap();
     assert!(checked);
+    assert!(checked_helpers);
 }
 
 #[test]

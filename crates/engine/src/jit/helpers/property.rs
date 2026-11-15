@@ -31,37 +31,21 @@ impl GlobalCache {
     }
 }
 
-pub(super) extern "C" fn js_global_get(ctx: *mut JitCtx, cache: *mut GlobalCache) -> Value {
-    global_get(ctx, cache, false, true)
-}
-
-pub(super) extern "C" fn js_global_get_optional(
-    ctx: *mut JitCtx,
-    cache: *mut GlobalCache,
-) -> Value {
-    global_get(ctx, cache, true, true)
-}
-
 pub(super) extern "C" fn js_global_get_borrowed(
     ctx: *mut JitCtx,
     cache: *mut GlobalCache,
 ) -> Value {
-    global_get(ctx, cache, false, false)
+    global_get(ctx, cache, false)
 }
 
 pub(super) extern "C" fn js_global_get_optional_borrowed(
     ctx: *mut JitCtx,
     cache: *mut GlobalCache,
 ) -> Value {
-    global_get(ctx, cache, true, false)
+    global_get(ctx, cache, true)
 }
 
-pub(super) fn global_get(
-    ctx: *mut JitCtx,
-    cache: *mut GlobalCache,
-    optional: bool,
-    retain: bool,
-) -> Value {
+pub(super) fn global_get(ctx: *mut JitCtx, cache: *mut GlobalCache, optional: bool) -> Value {
     let ctx = unsafe { &mut *ctx };
     let cache = unsafe { &mut *cache };
     match cache.resolve(&ctx.global) {
@@ -72,7 +56,6 @@ pub(super) fn global_get(
             ))));
             Value::UNDEFINED
         }
-        Some(value) if retain => ctx.retain(value),
         Some(value) => value,
         None if optional => Value::UNDEFINED,
         None => {
@@ -128,15 +111,25 @@ pub(super) extern "C" fn js_property_get(
     let ctx = unsafe { &mut *ctx };
     let name =
         unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len as usize)) };
+    property_get(ctx, object, name, true)
+}
+
+fn property_get(ctx: &mut JitCtx, object: Value, name: &str, owned: bool) -> Value {
     if object == Value::GLOBAL_OBJECT {
         let value = ctx.global.get_object_raw(name).unwrap_or(Value::UNDEFINED);
-        return ctx.retain(value);
+        return if owned { ctx.retain(value) } else { value };
     }
     match ctx.global.heap().read_property(object, name) {
-        Some(PropertyRead::Value(value)) => return ctx.retain(value),
+        Some(PropertyRead::Value(value)) => return if owned { ctx.retain(value) } else { value },
         Some(PropertyRead::Native(function)) => {
             return match ctx.global.heap().native_function(function) {
-                Some(value) => value,
+                Some(value) => {
+                    if !owned {
+                        // The native-function cache keeps its own reference.
+                        ctx.global.heap().release(value);
+                    }
+                    value
+                }
                 None => {
                     ctx.error = Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
                     Value::UNDEFINED
@@ -145,7 +138,7 @@ pub(super) extern "C" fn js_property_get(
         }
         Some(PropertyRead::Prototype) => {
             if let Some(value) = ctx.global.heap().property(object, name) {
-                return ctx.retain(value);
+                return if owned { ctx.retain(value) } else { value };
             }
         }
         None => {}
@@ -360,9 +353,9 @@ pub(super) extern "C" fn js_property_get_cached(
     let cache = unsafe { &mut *cache };
     let context = unsafe { &*ctx };
     if let Some(value) = cache.fill(context.engine, context.global.heap(), object) {
-        return unsafe { &mut *ctx }.retain(value);
+        return value;
     }
-    js_property_get(ctx, object, cache.name.as_ptr(), cache.name.len() as u64)
+    property_get(unsafe { &mut *ctx }, object, &cache.name, false)
 }
 
 pub(super) extern "C" fn js_property_get_baseline(
@@ -396,7 +389,8 @@ pub(super) extern "C" fn js_property_get_baseline(
             }
         }
     }
-    js_property_get_cached(ctx, object, cache)
+    let value = js_property_get_cached(ctx, object, cache);
+    unsafe { &mut *ctx }.retain(value)
 }
 
 pub(super) extern "C" fn js_property_cache_prime(

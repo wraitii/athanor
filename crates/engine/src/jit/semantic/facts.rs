@@ -845,9 +845,7 @@ fn result_types(graph: &Graph, op: &Op, facts: &Facts) -> ValueType {
         | Op::CachedProperty(..)
         | Op::ShapedGet(..)
         | Op::FillPropertyCache(..) => ValueType::ALL,
-        Op::HelperCall { produces, .. } => {
-            produces.map_or(ValueType::default(), |repr| repr.coerce(ValueType::ALL))
-        }
+        Op::HelperCall { result_type, .. } => *result_type,
         Op::View(_) => ValueType::VIEW,
         Op::Convert(value, repr) | Op::Unbox(value, repr) => repr.coerce(facts.of(*value)),
         Op::Box(value) => facts.of(*value),
@@ -918,7 +916,7 @@ fn result_types(graph: &Graph, op: &Op, facts: &Facts) -> ValueType {
         | Op::IsExactPosition(..)
         | Op::IsInBounds(..)
         | Op::BooleanAnd(..) => ValueType::BOOLEAN,
-        Op::PropertyCache(..) => ValueType::INT64,
+        Op::PropertyCache(..) | Op::GlobalCache(..) => ValueType::INT64,
         Op::CanOverwrite(..) => ValueType::BOOLEAN,
         Op::IndexedLength(_) => ValueType::INT64,
         Op::ArrayKind(_) => ValueType::INT32,

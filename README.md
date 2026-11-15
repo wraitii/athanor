@@ -80,7 +80,7 @@ Specialization exposes `inline` (inlining and plan collection), `captures`,
 `property-specialization`, `indexed-accesses`, `normalise`, `load-reuse`,
 `indexed-checks`, `property-caches`, `js-cleanup`, `numeric-specialization`,
 `js`, and `typed-storage` before the remaining runtime stages, including `boxing`,
-`finalize-runtime`, `scratch`, `cleanup`, `ownership-lower`, `unbox`,
+`finalize-runtime`, `cleanup`, `ownership-lower`, `unbox`,
 `scalar-semantics`, `scalar-cleanup`, `legalize-convert`, `bits`, and `cranelift-memory`.
 `scalar-cleanup` reuses lowered scalar expressions and loads, and hoists pure
 loop invariants. Calls and writes invalidate memory reads.

@@ -123,10 +123,21 @@ pub(super) fn plan(graph: &mut Graph, facts: &mut Facts) -> Plan {
         |value| match graph.defining_op(value) {
             Some(Op::Get(_, name)) => name != "length",
             Some(Op::Read(binding)) => !graph.bindings[*binding].captured,
+            Some(Op::HelperCall {
+                helper: Helper::PropertyGetCached,
+                args,
+                ..
+            }) => {
+                matches!(graph.defining_op(args[1]), Some(Op::PropertyCache(_, name)) if name != "length")
+            }
             Some(
                 Op::TypedIndex(..)
                 | Op::HelperCall {
-                    helper: Helper::IndexGet | Helper::IndexGetNumeric,
+                    helper:
+                        Helper::IndexGet
+                        | Helper::IndexGetNumeric
+                        | Helper::GlobalGetBorrowed
+                        | Helper::GlobalGetOptionalBorrowed,
                     ..
                 }
                 | Op::ArrayLoad(..)

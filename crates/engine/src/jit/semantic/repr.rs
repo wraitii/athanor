@@ -255,7 +255,7 @@ pub(in crate::jit) fn intrinsic(op: &Op) -> Option<Repr> {
             format.repr()
         }
         Op::LowLevel(_) | Op::Aarch64(_) => return None,
-        Op::PropertyCache(..) | Op::AsWord(_) => Repr::Word,
+        Op::PropertyCache(..) | Op::GlobalCache(..) | Op::AsWord(_) => Repr::Word,
         Op::MemoryNumber(_, format) => match format {
             MemoryFormat::U32 | MemoryFormat::F32 | MemoryFormat::F64 => Repr::F64,
             _ => Repr::I32,
@@ -452,7 +452,6 @@ fn runtime(op: &LowOp) -> bool {
         LowOp::Reference { .. }
             | LowOp::FrameStore { .. }
             | LowOp::Cleanup { .. }
-            | LowOp::Scratch { .. }
             | LowOp::Call { .. }
     )
 }

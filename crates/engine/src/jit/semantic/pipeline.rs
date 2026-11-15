@@ -150,7 +150,6 @@ pub(in crate::jit) const RUNTIME_PASSES: &[&str] = &[
 
 pub(in crate::jit) const LOW_LEVEL_PASSES: &[&str] = &[
     "finalize-runtime",
-    "scratch",
     "cleanup",
     "ownership-lower",
     "unbox",

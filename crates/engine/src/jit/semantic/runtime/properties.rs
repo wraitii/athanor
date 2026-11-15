@@ -1,7 +1,7 @@
 use super::super::cursor::{Cursor, Insert};
 use super::super::{
     Block, BlockData, Cfg, FunctionState, Graph, Inst, Op, Repr, Target, Terminator,
-    TerminatorKind, Value,
+    TerminatorKind, Value, ValueType,
 };
 use super::layout;
 
@@ -258,7 +258,12 @@ pub(in crate::jit::semantic) fn lower_accesses(
                         args: vec![object, cache],
                         uses: vec![Repr::Boxed, Repr::Word],
                         produces: fill.then_some(Repr::Boxed),
-                        contract,
+                        result_type: if fill {
+                            ValueType::ALL
+                        } else {
+                            ValueType::default()
+                        },
+                        effects: contract.effects,
                     },
                 );
             }
@@ -271,7 +276,8 @@ pub(in crate::jit::semantic) fn lower_accesses(
                         args: vec![object, cache, value],
                         uses: vec![Repr::Boxed, Repr::Word, Repr::Boxed],
                         produces: None,
-                        contract,
+                        result_type: ValueType::default(),
+                        effects: contract.effects,
                     },
                 );
             }

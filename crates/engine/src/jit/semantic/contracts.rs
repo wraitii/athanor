@@ -139,7 +139,7 @@ fn specific(graph: &Graph, inst: Inst) -> Option<Representations> {
             }),
         ),
         Op::KeepAlive(_) => any(1, None),
-        Op::PropertyCache(..) => any(0, Some(Repr::Word)),
+        Op::PropertyCache(..) | Op::GlobalCache(..) => any(0, Some(Repr::Word)),
         Op::CanOverwrite(..) => exact(&[Repr::Boxed, Repr::I64], Repr::Boolean),
         Op::ArrayStore(..) | Op::PropertyStore(..) | Op::PropertyAdd(..) => Representations {
             uses: vec![

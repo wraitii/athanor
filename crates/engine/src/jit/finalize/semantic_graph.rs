@@ -2,7 +2,6 @@ use crate::{FxHashMap, FxHashSet};
 use std::cell::RefCell;
 
 use super::{BlockArg, LoweredValue};
-use crate::jit::semantic::low_level::Scratch;
 use cranelift_codegen::entity::{EntityRef, SecondaryMap};
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{MemFlagsData, types};
@@ -279,7 +278,7 @@ impl FunctionCompiler<'_, '_> {
                 cx.define(value, value);
             }
             for &inst in &insts {
-                self.b.scratch(Scratch::Begin, &[]);
+                self.references.begin();
                 let handler = match &terminator.kind {
                     TerminatorKind::CheckException(_, error) => Some(error.block),
                     _ => None,
@@ -537,14 +536,9 @@ impl FunctionCompiler<'_, '_> {
                                 self.retain_temporary(value);
                                 self.jump(done, &[]);
                                 self.switch(done);
-                                self.b.scratch(
-                                    Scratch::Bind {
-                                        owner: graph_value.index() as u32,
-                                        required: true,
-                                        append: true,
-                                    },
-                                    &[value],
-                                );
+                                self.references
+                                    .bind(self.b, graph_value.index() as u32, value, true, true)
+                                    .map_err(Error::Compile)?;
                                 None
                             }
                             Op::Retain(value) => {
@@ -553,12 +547,7 @@ impl FunctionCompiler<'_, '_> {
                                 None
                             }
                             Op::SlotStore(value) => {
-                                self.b.scratch(
-                                    Scratch::MoveOwner {
-                                        owner: value.index() as u32,
-                                    },
-                                    &[],
-                                );
+                                self.references.move_owner(self.b, value.index() as u32);
                                 let repeated = repeated(block) || cx.plan.slots.shared(*value);
                                 let slot = *value;
                                 let value = get(self, slot);
@@ -575,12 +564,7 @@ impl FunctionCompiler<'_, '_> {
                                 None
                             }
                             Op::Release(value) => {
-                                self.b.scratch(
-                                    Scratch::ReleaseOwner {
-                                        owner: value.index() as u32,
-                                    },
-                                    &[],
-                                );
+                                self.references.release_owner(self.b, value.index() as u32);
                                 None
                             }
                             Op::Observe(value, kind, site) => {
@@ -671,6 +655,7 @@ impl FunctionCompiler<'_, '_> {
                             | Op::IsArray(..)
                             | Op::ArrayKind(..)
                             | Op::ArrayLoad(..)
+                            | Op::GlobalCache(..)
                             | Op::PropertyCache(..)
                             | Op::IsPropertyCached(..)
                             | Op::ArrayAppend(..)
@@ -729,10 +714,9 @@ impl FunctionCompiler<'_, '_> {
                             Op::Constant(Constant::String(value)) => {
                                 Some(self.string_constant(value))
                             }
-                            Op::GlobalRead(name) => {
-                                Some(self.cached_global_get(name, false, false))
+                            Op::GlobalRead(..) | Op::GlobalReadOptional(..) => {
+                                unreachable!("global reads must be lowered before ownership")
                             }
-                            Op::GlobalReadOptional(name) => Some(self.global_get_optional(name)),
                             Op::RegExp(pattern, flags) => {
                                 let pattern: Box<str> = pattern.as_str().into();
                                 let ptr =
@@ -752,7 +736,7 @@ impl FunctionCompiler<'_, '_> {
                             }
                             Op::GlobalWrite(name, value) => {
                                 let value = get(self, *value);
-                                self.global_access(name, Some(value));
+                                self.global_set(name, value);
                                 None
                             }
                             Op::CheckInitialized(value) => {
@@ -776,31 +760,8 @@ impl FunctionCompiler<'_, '_> {
                                 self.define_hidden_property(object, name, value);
                                 None
                             }
-                            Op::Define(object, name, value) | Op::Set(object, name, value) => {
-                                let object = get(self, *object);
-                                let value = get(self, *value);
-                                let observer = self.property_observer(data);
-                                self.property_access(object, name, Some(value), observer);
-                                None
-                            }
-                            Op::ShapedSet(object, name, index, value) => {
-                                let object = get(self, *object);
-                                let value = get(self, *value);
-                                self.shaped_property_set(object, name, *index, value);
-                                None
-                            }
-                            Op::Get(object, name) => {
-                                let object = get(self, *object);
-                                let observer = self.property_observer(data);
-                                let site = crate::jit::profile::Site {
-                                    source: data
-                                        .source_name
-                                        .map_or(self.source_name.0, |name| name.0),
-                                    start: data.span.start,
-                                    end: data.span.end,
-                                };
-                                let megamorphic = self.b.graph.megamorphic_gets.contains(&site);
-                                Some(self.cached_property_get(object, name, observer, megamorphic))
+                            Op::Set(..) | Op::Define(..) | Op::ShapedSet(..) | Op::Get(..) => {
+                                unreachable!("property accesses must be lowered before ownership")
                             }
                             Op::NewPack => {
                                 let destination = pack_slots[inst]
@@ -900,24 +861,8 @@ impl FunctionCompiler<'_, '_> {
                                 };
                                 Some(value)
                             }
-                            Op::ProbeGlobal(name) => Some(self.cached_global_probe(name)),
-                            Op::ProbeProperty(object, name) => {
-                                let object = get(self, *object);
-                                let observer = self.property_observer(data);
-                                let site = crate::jit::profile::Site {
-                                    source: data
-                                        .source_name
-                                        .map_or(self.source_name.0, |name| name.0),
-                                    start: data.span.start,
-                                    end: data.span.end,
-                                };
-                                let megamorphic = self.b.graph.megamorphic_gets.contains(&site);
-                                Some(self.cached_property_probe(
-                                    object,
-                                    name,
-                                    observer,
-                                    megamorphic,
-                                ))
+                            Op::ProbeGlobal(..) | Op::ProbeProperty(..) => {
+                                unreachable!("cache probes must be lowered before ownership")
                             }
                             Op::ProbeShapeProperty(object, _, shape, index) => {
                                 let object = get(self, *object);
@@ -994,14 +939,9 @@ impl FunctionCompiler<'_, '_> {
                     cx.define(value, result);
                     let required = cx.plan.results[inst] == ResultReference::Move;
                     if required || cx.plan.holder(value) == Holder::Temporary {
-                        self.b.scratch(
-                            Scratch::Bind {
-                                owner: value.index() as u32,
-                                required,
-                                append: false,
-                            },
-                            &[result],
-                        );
+                        self.references
+                            .bind(self.b, value.index() as u32, result, required, false)
+                            .map_err(Error::Compile)?;
                     }
                 }
                 if handler.is_some() {
@@ -1128,6 +1068,10 @@ impl FunctionCompiler<'_, '_> {
     ) -> Result<Option<Operand>, Error> {
         let boolean = |condition: LoweredValue| Some(Operand::new(condition, Repr::Boolean));
         let result = match &data.op {
+            Op::GlobalCache(name) => {
+                let address = self.function_data(crate::jit::helpers::GlobalCache::new(name));
+                Some(Operand::new(address, Repr::Word))
+            }
             Op::PropertyCache(site, name) => {
                 let observer = self.property_observer(data);
                 let address = self.property_cache(*site, name, observer);
@@ -1137,24 +1081,46 @@ impl FunctionCompiler<'_, '_> {
                 helper,
                 args,
                 produces,
-                contract,
+                effects,
                 ..
             } => {
+                let builtins = if *helper == Helper::SemanticPropertyProbeCached {
+                    match self.b.graph.defining_op(args[1]) {
+                        Some(Op::PropertyCache(_, name)) => crate::heap::builtin_method(name),
+                        _ => unreachable!("property probe requires a cache"),
+                    }
+                } else {
+                    false
+                };
                 let args: Vec<_> = args
                     .iter()
                     .map(|&value| self.operand(cx, value).value)
                     .collect();
-                let track =
-                    helper.returns_reference() && cx.plan.results[inst] != ResultReference::Slot;
+                if matches!(
+                    helper,
+                    Helper::GlobalGetBorrowed
+                        | Helper::GlobalGetOptionalBorrowed
+                        | Helper::SemanticGlobalProbe
+                ) {
+                    let value = self.cached_global(args[0], *helper);
+                    return Ok(produces.map(|repr| Operand::new(value, repr)));
+                }
+                if *helper == Helper::SemanticPropertyProbeCached {
+                    let value = self.cached_property_probe(args[0], args[1], builtins);
+                    return Ok(produces.map(|repr| Operand::new(value, repr)));
+                }
+                let track = helper.result_ownership() == crate::jit::semantic::Ownership::Owned
+                    && cx.plan.results[inst] != ResultReference::Slot;
                 let value = self.call_helper_tracked(*helper, &args, track);
-                if contract.effects.control.throws {
+                if effects.control.throws {
                     self.check_error();
                 }
                 produces.map(|repr| Operand::new(value, repr))
             }
             Op::Truthy(value) => {
+                let types = cx.facts.of(*value);
                 let value = self.operand(cx, *value).value;
-                boolean(self.truthy(value))
+                boolean(self.truthy(value, types))
             }
             Op::TypedData(..) => unreachable!("data pointer must be lowered before emission"),
             Op::Memory(MemoryOp::Address {

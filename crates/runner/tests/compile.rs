@@ -439,3 +439,43 @@ fn generator_regions_are_inspectable_and_published_for_execution() {
     );
     assert!(text.lines().any(|line| line == "82"), "{text}");
 }
+
+#[test]
+fn truthiness_lowering_uses_type_facts() {
+    for (source, helper, numeric) in [
+        (
+            "function selected(){if({})return 1;return 0;}",
+            false,
+            false,
+        ),
+        (
+            "function selected(x){if(''+x)return 1;return 0;}",
+            true,
+            false,
+        ),
+        (
+            "function selected(n,b){let value=n>0?+n:b>0;if(value)return 1;return 0;}",
+            false,
+            true,
+        ),
+        (
+            "function selected(n){let value=n>0?{}:null;if(value)return 1;return 0;}",
+            false,
+            true,
+        ),
+        ("function selected(x){if(x)return 1;return 0;}", true, true),
+    ] {
+        let output = compile(
+            &["--filter", "selected", "--after", "finalize-runtime"],
+            source,
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(text.contains("helper: Some(Truthy)"), helper, "{text}");
+        assert_eq!(text.contains("FloatCompare"), numeric, "{text}");
+    }
+}

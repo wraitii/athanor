@@ -8,6 +8,8 @@ use crate::value::Value as JsValue;
 enum Arg {
     Value(Value, Repr),
     Integer(i64),
+    PropertyCache(super::super::Inst, String),
+    GlobalCache(String),
     Boxed(JsValue),
     Vector(Vec<Value>),
 }
@@ -48,8 +50,44 @@ fn key(facts: &Facts, key: Value) -> (Helper, Arg) {
     (Helper::IndexGet, Arg::Value(key, Repr::Boxed))
 }
 
-fn select(op: &Op, facts: &Facts) -> Option<Call> {
+fn select(inst: super::super::Inst, op: &Op, facts: &Facts) -> Option<Call> {
     match op {
+        Op::Get(object, name) => call(
+            Helper::PropertyGetCached,
+            vec![
+                Arg::Value(*object, Repr::Boxed),
+                Arg::PropertyCache(inst, name.clone()),
+            ],
+            true,
+        ),
+        Op::Set(object, name, value)
+        | Op::Define(object, name, value)
+        | Op::ShapedSet(object, name, _, value) => call(
+            Helper::PropertySetCached,
+            vec![
+                Arg::Value(*object, Repr::Boxed),
+                Arg::PropertyCache(inst, name.clone()),
+                Arg::Value(*value, Repr::Boxed),
+            ],
+            false,
+        ),
+        Op::ProbeProperty(object, name) => call(
+            Helper::SemanticPropertyProbeCached,
+            vec![
+                Arg::Value(*object, Repr::Boxed),
+                Arg::PropertyCache(inst, name.clone()),
+            ],
+            true,
+        ),
+        Op::GlobalRead(name) | Op::GlobalReadOptional(name) | Op::ProbeGlobal(name) => call(
+            match op {
+                Op::GlobalRead(_) => Helper::GlobalGetBorrowed,
+                Op::GlobalReadOptional(_) => Helper::GlobalGetOptionalBorrowed,
+                _ => Helper::SemanticGlobalProbe,
+            },
+            vec![Arg::GlobalCache(name.clone())],
+            true,
+        ),
         Op::GetIndex(object, index)
         | Op::ArrayGet(object, index)
         | Op::TypedIndex(object, index, TypedRead { element: None, .. }) => {
@@ -212,10 +250,13 @@ pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) {
     for &block in &function.facts.cfg.rpo {
         insts.clone_from(&graph.blocks[block].insts);
         for &inst in &insts {
-            let Some(call) = select(&graph.insts[inst].op, &function.facts) else {
+            let Some(call) = select(inst, &graph.insts[inst].op, &function.facts) else {
                 continue;
             };
             let contract = graph.contract(&graph.insts[inst].op, &function.facts);
+            let result_type = graph.insts[inst]
+                .result()
+                .map_or(ValueType::default(), |value| function.facts.of(value));
             let mut args = Vec::with_capacity(call.args.len());
             let mut uses = Vec::with_capacity(call.args.len());
             let mut kept = Vec::new();
@@ -223,6 +264,12 @@ pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) {
             for arg in call.args {
                 let (value, repr) = match arg {
                     Arg::Value(value, repr) => (value, repr),
+                    Arg::GlobalCache(name) => {
+                        (at.add_unassigned(Op::GlobalCache(name)), Repr::Word)
+                    }
+                    Arg::PropertyCache(site, name) => {
+                        (at.add_unassigned(Op::PropertyCache(site, name)), Repr::Word)
+                    }
                     Arg::Integer(bits) => (at.ins().iconst(types::I64, bits), Repr::Word),
                     Arg::Boxed(value) => {
                         let word = at.ins().iconst(types::I64, value.bits() as i64);
@@ -244,7 +291,8 @@ pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) {
                     args,
                     uses,
                     produces: call.produces,
-                    contract,
+                    result_type,
+                    effects: contract.effects,
                 },
             );
             let mut at = Cursor::after(graph, inst);

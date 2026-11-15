@@ -3,8 +3,8 @@ use oxc_span::Span;
 
 use super::contracts::{Use, repr_contract as contract};
 use super::{
-    Block, BlockData, Cfg, Facts, Graph, Inst, InstData, Op, Repr, Target, Terminator,
-    TerminatorKind, Value, ValueDef,
+    Block, BlockData, Cfg, Constant, Facts, Graph, Inst, InstData, Op, Repr, Target, Terminator,
+    TerminatorKind, Value, ValueDef, ValueType,
 };
 
 const NUMERIC: super::ValueType = super::ValueType::NUMBER.union(super::ValueType::UNDEFINED);
@@ -21,7 +21,14 @@ pub(super) fn conditions(graph: &mut Graph, facts: &mut Facts) {
         }
         let (span, source_name) = (terminator.span, terminator.source_name);
         let end = graph.blocks[block].insts.len();
-        let (inst, truth) = graph.insert(block, end, span, Op::Truthy(value), true);
+        let op = if types.within(ValueType::OBJECT.union(ValueType::OTHER)) {
+            Op::Constant(Constant::Boolean(true))
+        } else if types.within(ValueType::NULL.union(ValueType::UNDEFINED)) {
+            Op::Constant(Constant::Boolean(false))
+        } else {
+            Op::Truthy(value)
+        };
+        let (inst, truth) = graph.insert(block, end, span, op, true);
         graph.insts[inst].source_name = source_name;
         let truth = truth.unwrap();
         facts.set(truth, super::ValueType::BOOLEAN);
