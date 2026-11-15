@@ -603,33 +603,6 @@ impl Insert for Builder<'_> {
     }
 }
 
-#[derive(Default)]
-pub(in crate::jit) struct Switch {
-    entries: Vec<(u128, Block)>,
-}
-
-impl Switch {
-    pub(in crate::jit) fn new() -> Self {
-        Self::default()
-    }
-    pub(in crate::jit) fn set_entry(&mut self, index: u128, block: Block) {
-        self.entries.push((index, block));
-    }
-    pub(in crate::jit) fn emit(self, builder: &mut Builder<'_>, value: Value, default: Block) {
-        let block = builder.current.expect("no current block");
-        let cases = self
-            .entries
-            .into_iter()
-            .map(|(index, block)| (index, super::Target::new(block)))
-            .collect();
-        builder.terminate(
-            block,
-            builder.span,
-            super::TerminatorKind::Switch(value, cases, super::Target::new(default)),
-        );
-    }
-}
-
 pub(in crate::jit) struct Instructions<'b, I: Insert + ?Sized> {
     pub(super) inserter: &'b mut I,
 }

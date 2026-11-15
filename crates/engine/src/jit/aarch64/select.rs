@@ -414,8 +414,7 @@ pub(in crate::jit) fn run(graph: &mut Graph) -> Result<(), Unsupported> {
     graph.verify_machine().map_err(Unsupported)?;
     let cfg = crate::jit::semantic::Cfg::new(graph);
     check_function(graph, &cfg.rpo)?;
-    expand_switches(graph, &cfg.rpo);
-    let order = crate::jit::semantic::Cfg::new(graph).rpo;
+    let order = cfg.rpo;
     let patterns = Patterns::new(graph);
     let mut replacements = Vec::new();
     let mut branches = Vec::new();
@@ -1116,47 +1115,6 @@ fn remove_unused(graph: &mut Graph) {
     }
     for block in graph.blocks.values_mut() {
         block.insts.retain(|&inst| !removed[inst]);
-    }
-}
-
-fn expand_switches(graph: &mut Graph, order: &[Block]) {
-    for &block in order {
-        let Some(term) = graph.blocks[block].terminator.clone() else {
-            continue;
-        };
-        let TerminatorKind::Switch(value, cases, default) = term.kind.clone() else {
-            continue;
-        };
-        let ty = graph.repr(value).machine();
-        let mut current = block;
-        for (key, yes) in cases {
-            if key >= (1u128 << ty.bits()) {
-                continue;
-            }
-            let next = graph.blocks.push(Default::default());
-            if graph.cold.contains(&block) {
-                graph.cold.insert(next);
-            }
-            let mut b = Builder::new(graph);
-            b.switch_to_block(current);
-            b.set_span(term.span);
-            b.set_source_name(term.source_name);
-            b.set_location(term.emission_location);
-            let condition = b.ins().icmp_imm_u(IntCC::Equal, value, key as i64);
-            b.graph.blocks[current].terminator = Some(crate::jit::semantic::Terminator {
-                kind: TerminatorKind::Branch(
-                    condition,
-                    yes,
-                    crate::jit::semantic::Target::new(next),
-                ),
-                ..term.clone()
-            });
-            current = next;
-        }
-        graph.blocks[current].terminator = Some(crate::jit::semantic::Terminator {
-            kind: TerminatorKind::Jump(default),
-            ..term
-        });
     }
 }
 

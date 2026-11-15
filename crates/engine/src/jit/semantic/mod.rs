@@ -566,7 +566,6 @@ pub(super) enum TerminatorKind {
     Yield(Span, Value, Target),
     Branch(Value, Target, Target),
     Aarch64Branch(crate::jit::aarch64::inst::Condition, Target, Target),
-    Switch(Value, Vec<(u128, Target)>, Target),
     Return(Value),
     ReturnValues(Vec<Value>),
     TailCall {
@@ -1138,31 +1137,21 @@ impl Op {
 impl TerminatorKind {
     pub(super) fn operands_mut(&mut self) -> impl Iterator<Item = &mut Value> + '_ {
         let mut machine = None;
-        let (first, rest, tail, cases): (
-            Option<&mut Value>,
-            &mut [Value],
-            &mut [Value],
-            Option<&mut Vec<(u128, Target)>>,
-        ) = match self {
-            TerminatorKind::Jump(target) => (None, &mut target.args, &mut [], None),
+        let (first, rest, tail): (Option<&mut Value>, &mut [Value], &mut [Value]) = match self {
+            TerminatorKind::Jump(target) => (None, &mut target.args, &mut []),
             TerminatorKind::CheckException(normal, error) => {
-                (None, &mut normal.args, &mut error.args, None)
+                (None, &mut normal.args, &mut error.args)
             }
             TerminatorKind::Aarch64Branch(condition, yes, no) => {
                 machine = Some(condition.operands_mut());
-                (None, &mut yes.args, &mut no.args, None)
+                (None, &mut yes.args, &mut no.args)
             }
             TerminatorKind::Branch(condition, yes, no) => {
-                (Some(condition), &mut yes.args, &mut no.args, None)
+                (Some(condition), &mut yes.args, &mut no.args)
             }
-            TerminatorKind::Switch(value, cases, default) => {
-                (Some(value), &mut default.args, &mut [], Some(cases))
-            }
-            TerminatorKind::Yield(_, value, target) => {
-                (Some(value), &mut target.args, &mut [], None)
-            }
-            TerminatorKind::Return(value) => (Some(value), &mut [], &mut [], None),
-            TerminatorKind::ReturnValues(values) => (None, values, &mut [], None),
+            TerminatorKind::Yield(_, value, target) => (Some(value), &mut target.args, &mut []),
+            TerminatorKind::Return(value) => (Some(value), &mut [], &mut []),
+            TerminatorKind::ReturnValues(values) => (None, values, &mut []),
             TerminatorKind::TailCall { target, args, .. } => (
                 match target {
                     low_level::CallTarget::Indirect(value) => Some(value),
@@ -1170,19 +1159,13 @@ impl TerminatorKind {
                 },
                 args,
                 &mut [],
-                None,
             ),
-            TerminatorKind::Fallback(_) => (None, &mut [], &mut [], None),
+            TerminatorKind::Fallback(_) => (None, &mut [], &mut []),
         };
         first
             .into_iter()
             .chain(rest.iter_mut())
             .chain(tail.iter_mut())
-            .chain(cases.into_iter().flat_map(|cases| {
-                cases
-                    .iter_mut()
-                    .flat_map(|(_, target)| target.args.iter_mut())
-            }))
             .chain(machine.into_iter().flatten())
     }
 
@@ -1192,29 +1175,17 @@ impl TerminatorKind {
 
     pub(super) fn operands_iter(&self) -> impl Iterator<Item = Value> + '_ {
         let mut machine = None;
-        let (first, rest, tail, cases): (
-            Option<Value>,
-            &[Value],
-            &[Value],
-            Option<&[(u128, Target)]>,
-        ) = match self {
-            TerminatorKind::Jump(target) => (None, &target.args, &[], None),
-            TerminatorKind::CheckException(normal, error) => {
-                (None, &normal.args, &error.args, None)
-            }
+        let (first, rest, tail): (Option<Value>, &[Value], &[Value]) = match self {
+            TerminatorKind::Jump(target) => (None, &target.args, &[]),
+            TerminatorKind::CheckException(normal, error) => (None, &normal.args, &error.args),
             TerminatorKind::Aarch64Branch(condition, yes, no) => {
                 machine = Some(condition.operands());
-                (None, &yes.args, &no.args, None)
+                (None, &yes.args, &no.args)
             }
-            TerminatorKind::Branch(condition, yes, no) => {
-                (Some(*condition), &yes.args, &no.args, None)
-            }
-            TerminatorKind::Switch(value, cases, default) => {
-                (Some(*value), &default.args, &[], Some(cases))
-            }
-            TerminatorKind::Yield(_, value, target) => (Some(*value), &target.args, &[], None),
-            TerminatorKind::Return(value) => (Some(*value), &[], &[], None),
-            TerminatorKind::ReturnValues(values) => (None, values, &[], None),
+            TerminatorKind::Branch(condition, yes, no) => (Some(*condition), &yes.args, &no.args),
+            TerminatorKind::Yield(_, value, target) => (Some(*value), &target.args, &[]),
+            TerminatorKind::Return(value) => (Some(*value), &[], &[]),
+            TerminatorKind::ReturnValues(values) => (None, values, &[]),
             TerminatorKind::TailCall { target, args, .. } => (
                 match target {
                     low_level::CallTarget::Indirect(value) => Some(*value),
@@ -1222,67 +1193,48 @@ impl TerminatorKind {
                 },
                 args,
                 &[],
-                None,
             ),
-            TerminatorKind::Fallback(_) => (None, &[], &[], None),
+            TerminatorKind::Fallback(_) => (None, &[], &[]),
         };
         first
             .into_iter()
             .chain(rest.iter().copied())
             .chain(tail.iter().copied())
-            .chain(cases.into_iter().flat_map(|cases| {
-                cases
-                    .iter()
-                    .flat_map(|(_, target)| target.args.iter().copied())
-            }))
             .chain(machine.into_iter().flatten())
     }
 
     pub(super) fn targets(&self) -> impl Iterator<Item = &Target> {
-        let (first, second, cases): (Option<&Target>, Option<&Target>, Option<&[(u128, Target)]>) =
-            match self {
-                TerminatorKind::Jump(target) => (Some(target), None, None),
-                TerminatorKind::CheckException(normal, error) => (Some(normal), Some(error), None),
-                TerminatorKind::Branch(_, yes, no) | TerminatorKind::Aarch64Branch(_, yes, no) => {
-                    (Some(yes), Some(no), None)
-                }
-                TerminatorKind::Switch(_, cases, default) => (Some(default), None, Some(cases)),
-                TerminatorKind::Yield(_, _, target) => (Some(target), None, None),
-                TerminatorKind::Return(_)
-                | TerminatorKind::ReturnValues(_)
-                | TerminatorKind::TailCall { .. }
-                | TerminatorKind::Fallback(_) => (None, None, None),
-            };
-        first.into_iter().chain(second).chain(
-            cases
-                .into_iter()
-                .flat_map(|cases| cases.iter().map(|(_, target)| target)),
-        )
-    }
-
-    pub(super) fn targets_mut(&mut self) -> impl Iterator<Item = &mut Target> {
-        let (first, second, cases): (
-            Option<&mut Target>,
-            Option<&mut Target>,
-            Option<&mut [(u128, Target)]>,
-        ) = match self {
-            TerminatorKind::Jump(target) => (Some(target), None, None),
-            TerminatorKind::CheckException(normal, error) => (Some(normal), Some(error), None),
-            TerminatorKind::Branch(_, yes, no) | TerminatorKind::Aarch64Branch(_, yes, no) => {
-                (Some(yes), Some(no), None)
+        let (first, second) = match self {
+            TerminatorKind::Jump(target) | TerminatorKind::Yield(_, _, target) => {
+                (Some(target), None)
             }
-            TerminatorKind::Switch(_, cases, default) => (Some(default), None, Some(cases)),
-            TerminatorKind::Yield(_, _, target) => (Some(target), None, None),
+            TerminatorKind::CheckException(normal, error) => (Some(normal), Some(error)),
+            TerminatorKind::Branch(_, yes, no) | TerminatorKind::Aarch64Branch(_, yes, no) => {
+                (Some(yes), Some(no))
+            }
             TerminatorKind::Return(_)
             | TerminatorKind::ReturnValues(_)
             | TerminatorKind::TailCall { .. }
-            | TerminatorKind::Fallback(_) => (None, None, None),
+            | TerminatorKind::Fallback(_) => (None, None),
         };
-        first.into_iter().chain(second).chain(
-            cases
-                .into_iter()
-                .flat_map(|cases| cases.iter_mut().map(|(_, target)| target)),
-        )
+        first.into_iter().chain(second)
+    }
+
+    pub(super) fn targets_mut(&mut self) -> impl Iterator<Item = &mut Target> {
+        let (first, second) = match self {
+            TerminatorKind::Jump(target) | TerminatorKind::Yield(_, _, target) => {
+                (Some(target), None)
+            }
+            TerminatorKind::CheckException(normal, error) => (Some(normal), Some(error)),
+            TerminatorKind::Branch(_, yes, no) | TerminatorKind::Aarch64Branch(_, yes, no) => {
+                (Some(yes), Some(no))
+            }
+            TerminatorKind::Return(_)
+            | TerminatorKind::ReturnValues(_)
+            | TerminatorKind::TailCall { .. }
+            | TerminatorKind::Fallback(_) => (None, None),
+        };
+        first.into_iter().chain(second)
     }
 }
 

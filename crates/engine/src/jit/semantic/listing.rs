@@ -598,12 +598,6 @@ impl Listing<'_> {
                     TerminatorKind::Aarch64Branch(condition, yes, no) => {
                         format!("aarch64-branch {condition:?} {yes} {no}")
                     }
-                    TerminatorKind::Switch(value, cases, default) => format!(
-                        "switch {} [{} cases] {}",
-                        self.value(*value),
-                        cases.len(),
-                        default
-                    ),
                     TerminatorKind::ReturnValues(values) => format!(
                         "return_values {}",
                         values

@@ -1042,9 +1042,7 @@ impl FunctionCompiler<'_, '_> {
                     let (no_block, no_args) = target(self, no);
                     self.brif(condition, yes_block, &yes_args, no_block, &no_args);
                 }
-                TerminatorKind::Switch(..)
-                | TerminatorKind::ReturnValues(..)
-                | TerminatorKind::TailCall { .. } => {
+                TerminatorKind::ReturnValues(..) | TerminatorKind::TailCall { .. } => {
                     return Err(Error::Compile(
                         "low-level terminator reached runtime lowering finalization".into(),
                     ));

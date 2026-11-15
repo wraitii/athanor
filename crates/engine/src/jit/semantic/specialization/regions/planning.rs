@@ -945,6 +945,67 @@ mod tests {
     }
 
     #[test]
+    fn property_dispatch_uses_updated_receivers() {
+        for source in [
+            "function f(object){return object.child.value;}",
+            "function f(object){object.child.value=1;return object;}",
+        ] {
+            let mut graph = graph(source);
+            let accesses: Vec<_> = graph
+                .insts
+                .iter()
+                .filter_map(|(inst, data)| {
+                    matches!(data.op, Op::Get(..) | Op::Set(..)).then_some(inst)
+                })
+                .collect();
+            for inst in accesses {
+                graph.property_accesses.insert(
+                    inst,
+                    super::super::super::properties::Access {
+                        cache: None,
+                        shapes: vec![(10, 0), (20, 1)],
+                    },
+                );
+            }
+            materialize_properties(&mut graph).unwrap();
+            super::super::super::properties::rewrite(&mut graph).unwrap();
+            graph.verify().unwrap();
+        }
+    }
+
+    #[test]
+    fn native_calls_survive_entry_probe_replacement() {
+        for fallback in [None, Some(0x1234)] {
+            let mut graph = graph(
+                "function f(object){const floor=Math.floor;return [floor(object.x),floor(object.y),floor];}",
+            );
+            let regions = version(
+                &mut graph,
+                &ConditionalPlan::default(),
+                fallback,
+                &mut Vec::new(),
+            )
+            .unwrap();
+            assert!(!regions.is_empty());
+            let facts = Facts::compute(&graph);
+            assert!(regions.iter().all(|&region| {
+                closure_failure_with(&graph, &graph.regions[region].blocks, &[], &facts).is_none()
+            }));
+            assert_eq!(
+                facts
+                    .cfg
+                    .rpo
+                    .iter()
+                    .flat_map(|&block| &graph.blocks[block].insts)
+                    .filter(|&&inst| matches!(graph.insts[inst].op, Op::CallNative(..)))
+                    .count(),
+                2
+            );
+            graph.verify().unwrap();
+        }
+    }
+
+    #[test]
     fn entry_numeric_observations_replace_copied_loop_observations() {
         use crate::jit::profile::{Observation, ReadKind};
 
@@ -1564,11 +1625,14 @@ pub(in crate::jit::semantic) fn materialize_properties(graph: &mut Graph) -> Res
             }) {
                 return None;
             }
-            Some((inst, object, access.shapes.clone()))
+            Some((inst, access.shapes.clone()))
         })
         .collect();
-    for (inst, object, shapes) in accesses {
+    for (inst, shapes) in accesses {
         let data = graph.insts[inst].clone();
+        let (Op::Get(object, _) | Op::Set(object, ..)) = data.op else {
+            unreachable!()
+        };
         let alternatives = shapes
             .into_iter()
             .map(|(shape, index)| dispatch::Alternative {

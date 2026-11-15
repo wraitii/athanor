@@ -184,6 +184,19 @@ pub(in crate::jit::semantic) fn apply_version(
             })
         })
         .collect();
+    let native_calls: Vec<_> = region
+        .iter()
+        .flat_map(|&block| &graph.blocks[block].insts)
+        .filter_map(|&inst| {
+            let Op::Call { callee, .. } = graph.insts[inst].op else {
+                return None;
+            };
+            requirements
+                .iter()
+                .find(|requirement| requirement.callee == callee)
+                .map(|requirement| (inst, requirement.native))
+        })
+        .collect();
     let local_generic = canonical.is_none().then(|| graph.clone());
     let local_canonical = local_generic.as_ref().map(Canonical::identity);
     let canonical = canonical.or(local_canonical.as_ref()).unwrap();
@@ -225,19 +238,11 @@ pub(in crate::jit::semantic) fn apply_version(
     } = copy;
 
     let mut callees = Vec::new();
-    for &block in region {
-        for &inst in &graph.blocks[block].insts.clone() {
-            let Op::Call { callee, .. } = graph.insts[inst].op else {
-                continue;
-            };
-            let Some(requirement) = requirements.iter().find(|r| r.callee == callee) else {
-                continue;
-            };
-            let copy = insts[&inst];
-            if let Op::Call { callee, args, .. } = &graph.insts[copy].op {
-                callees.push(*callee);
-                graph.set_op(copy, Op::CallNative(requirement.native, args.clone()));
-            }
+    for (inst, native) in native_calls {
+        let copy = insts[&inst];
+        if let Op::Call { callee, args, .. } = &graph.insts[copy].op {
+            callees.push(*callee);
+            graph.set_op(copy, Op::CallNative(native, args.clone()));
         }
     }
     let inside: FxHashSet<Block> = region.iter().chain(&copies).copied().collect();

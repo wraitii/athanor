@@ -274,34 +274,6 @@ pub(in crate::jit) fn emit(
                     .ins()
                     .brif(get(*condition), yes, &yes_args, no, &no_args);
             }
-            TerminatorKind::Switch(value, cases, default) => {
-                let mut switch = cranelift_frontend::Switch::new();
-                let mut edges = Vec::new();
-                for (index, destination) in cases {
-                    let (target, args) = target(destination);
-                    let edge = if args.is_empty() {
-                        target
-                    } else {
-                        let edge = builder.create_block();
-                        edges.push((edge, target, args));
-                        edge
-                    };
-                    switch.set_entry(*index, edge);
-                }
-                let (target, args) = target(default);
-                let fallback = if args.is_empty() {
-                    target
-                } else {
-                    let edge = builder.create_block();
-                    edges.push((edge, target, args));
-                    edge
-                };
-                switch.emit(builder, get(*value), fallback);
-                for (edge, target, args) in edges {
-                    builder.switch_to_block(edge);
-                    builder.ins().jump(target, &args);
-                }
-            }
             TerminatorKind::ReturnValues(results) => {
                 let results: Vec<_> = results.iter().map(|&value| get(value)).collect();
                 builder.ins().return_(&results);

@@ -809,7 +809,7 @@ mod cache_tests {
 
     #[test]
     fn prototype_updates_refresh_an_entry_without_spending_another_shape() {
-        let mut engine = engine(
+        let engine = engine(
             "function C(){} C.prototype.x=1; var a=new C(); function update(){C.prototype.pad=0;C.prototype.x=2;}",
         );
         let object = engine.global().get_raw("a").unwrap();

@@ -2943,51 +2943,6 @@ fn low_level_graph_emits_executable_cranelift() {
 }
 
 #[test]
-fn switch_cfg_visits_every_distinct_destination() {
-    use cranelift_codegen::ir::{Signature, types};
-    let span = oxc_span::Span::default();
-    let signature = Signature::new(cranelift_codegen::isa::CallConv::SystemV);
-    let mut graph = Graph::new_low_level("switch".into(), span, signature);
-    let entry = graph.entry;
-    let condition = graph.append_value(
-        entry,
-        span,
-        Op::LowLevel(low_level::Op::Integer {
-            ty: types::I64,
-            bits: 2,
-        }),
-    );
-    graph.reprs[condition] = Some(Repr::from_machine(types::I64));
-    let destinations: Vec<_> = (0..4)
-        .map(|_| graph.blocks.push(BlockData::default()))
-        .collect();
-    for &block in &destinations {
-        graph.terminate(block, span, TerminatorKind::ReturnValues(Vec::new()));
-    }
-    graph.terminate(
-        entry,
-        span,
-        TerminatorKind::Switch(
-            condition,
-            vec![
-                (1, Target::new(destinations[1])),
-                (2, Target::new(destinations[2])),
-                (3, Target::new(destinations[1])),
-                (4, Target::new(destinations[3])),
-            ],
-            Target::new(destinations[0]),
-        ),
-    );
-    let cfg = Cfg::new(&graph);
-    assert_eq!(cfg.rpo.len(), 5);
-    for block in destinations {
-        assert!(cfg.rpo.contains(&block));
-        assert_eq!(cfg.preds[block], [entry]);
-    }
-    graph.verify().unwrap();
-}
-
-#[test]
 fn low_level_variables_resolve_long_forwarding_chain() {
     use cranelift_codegen::ir::{AbiParam, Signature, types};
     use cranelift_codegen::isa::CallConv;
