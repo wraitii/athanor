@@ -51,11 +51,6 @@ pub(crate) use regexp::regexp_flags;
 pub(crate) use shape::{DICTIONARY, NO_SHAPE};
 pub(crate) use typed::TypedKind;
 
-pub(crate) fn strict_references() -> bool {
-    static STRICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *STRICT.get_or_init(|| std::env::var("JS_STRICT_REFERENCES").as_deref() == Ok("1"))
-}
-
 #[derive(Clone, Default)]
 pub(crate) struct Heap(Rc<RefCell<HeapData>>);
 
@@ -184,18 +179,6 @@ impl Heap {
             return true;
         }
         self.0.borrow_mut().retain(value)
-    }
-
-    pub(crate) fn retain_address(&self, address: u64) -> bool {
-        let mut data = self.0.borrow_mut();
-        if !data.arena.owns(address) {
-            return false;
-        }
-        let Some(slot) = data.live_mut(address) else {
-            return false;
-        };
-        slot.references += 1;
-        true
     }
 
     pub(crate) fn release(&self, value: Value) {
@@ -538,10 +521,6 @@ impl HeapData {
         let Some(id) = heap_id(value) else { return };
         let slot = self.slot_mut(id);
         if matches!(slot.payload, Payload::Vacant | Payload::Reserved) {
-            assert!(
-                !strict_references() || matches!(slot.payload, Payload::Reserved),
-                "release of a freed value"
-            );
             return;
         }
         assert!(slot.references > 0);

@@ -257,6 +257,9 @@ impl Tiering {
     }
 
     fn request_compilation(&self, code: u64) {
+        if self.options.optimization != crate::OptimizationLevel::Full {
+            return;
+        }
         if self.recompiles.borrow_mut().request(code) && self.recompile_log.enabled() {
             let compiling = self.worker.borrow().as_ref().is_some_and(|worker| {
                 worker
@@ -569,6 +572,9 @@ impl Tiering {
         let current = variant.entry.load(Ordering::Acquire);
         if current != 0 {
             return current;
+        }
+        if self.options.optimization != crate::OptimizationLevel::Full {
+            return ordinary.code;
         }
         variant.publish(ordinary);
         self.variants.borrow_mut().publish(variant.id(), ordinary);

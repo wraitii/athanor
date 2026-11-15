@@ -225,9 +225,7 @@ pub(in crate::jit) fn emit(
                     }
                     builder.inst_results(call).to_vec()
                 }
-                Op::Cleanup { .. }
-                | Op::Reference { .. }
-                | Op::FrameStore { .. } => {
+                Op::Cleanup { .. } | Op::Reference { .. } | Op::FrameStore { .. } => {
                     return Err(Error::Compile("unlowered runtime operation".into()));
                 }
                 Op::VariableRead => {

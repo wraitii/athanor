@@ -844,12 +844,8 @@ fn exponentiation_special_values() {
                 ((-0) ** -3) === -inf && Math.pow(-0, -3) === -inf &&
                 ((-0) ** -2) === inf && Math.pow(-0, -2) === inf;
         }";
-    for (opt_level, ssa_opt) in [js_engine::OptLevel::None, js_engine::OptLevel::Speed]
-        .into_iter()
-        .flat_map(|level| [false, true].map(|ssa| (level, ssa)))
-    {
+    for ssa_opt in [false, true] {
         let mut engine = Engine::with_options(js_engine::EngineOptions {
-            opt_level,
             ssa_opt,
             ..Default::default()
         })

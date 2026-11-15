@@ -1,12 +1,8 @@
-use js_engine::{Engine, EngineOptions, OptLevel, Value};
+use js_engine::{Engine, EngineOptions, Value};
 
 fn check(source: &str) {
-    for (opt_level, ssa_opt) in [OptLevel::None, OptLevel::Speed]
-        .into_iter()
-        .flat_map(|level| [false, true].map(|semantic| (level, semantic)))
-    {
+    for ssa_opt in [false, true] {
         let mut engine = Engine::with_options(EngineOptions {
-            opt_level,
             ssa_opt,
             ..Default::default()
         })

@@ -20,12 +20,9 @@ fn numeric_guard_failures_widen_feedback_and_then_stop_speculating() {
         for (let i = 0; i < 32; ++i)
             if (runner.call(values) !== 50.2) throw 'numeric again';
     "#;
-    for continuations in [false, true] {
+    {
         let mut command = Command::new(env!("CARGO_BIN_EXE_js-runner"));
         command.env("JS_JIT_SPECIALIZATION_LOG", "accumulate");
-        if !continuations {
-            command.env("JS_JIT_NO_CONTINUATIONS", "1");
-        }
         let output = command
             .args([
                 "--compile",
@@ -110,12 +107,9 @@ fn integer_failure_replans_other_numeric_sites_as_numbers() {
         for (let i = 0; i < 32; ++i)
             if (runner.call(a,b,c) !== 60) throw 'integer again';
     "#;
-    for continuations in [false, true] {
+    {
         let mut command = Command::new(env!("CARGO_BIN_EXE_js-runner"));
         command.env("JS_JIT_SPECIALIZATION_LOG", "accumulate");
-        if !continuations {
-            command.env("JS_JIT_NO_CONTINUATIONS", "1");
-        }
         let output = command
             .args([
                 "--compile",
@@ -222,7 +216,7 @@ fn semantic_graph_versions_math_calls_and_preserves_fallbacks() {
     assert!(dump.contains("call_native Math.floor"));
     assert!(dump.contains("combined entry guards:"));
     let disabled = Command::new(env!("CARGO_BIN_EXE_js-runner"))
-        .env("JS_JIT_SSA", "0")
+        .env("JS_JIT_OPT", "none")
         .args([
             "--compile",
             "--no-ir",
@@ -241,7 +235,7 @@ fn semantic_graph_versions_math_calls_and_preserves_fallbacks() {
     );
     for enabled in [false, true] {
         let result = Command::new(env!("CARGO_BIN_EXE_js-runner"))
-            .env("JS_JIT_SSA", if enabled { "1" } else { "0" })
+            .env("JS_JIT_OPT", if enabled { "full" } else { "none" })
             .args(["--eval", source])
             .output()
             .unwrap();
@@ -255,7 +249,7 @@ fn semantic_index_reads_observe_writes_and_calls() {
     let source = "function main(){ let a=[1]; let sum=0; for(let i=0;i<3;i++){ sum+=a[0]; a[0]=i+2; } let f=()=>a[0]=9; for(let i=0;i<2;i++){ sum+=a[0]; f(); } return sum; }";
     for enabled in [false, true] {
         let result = Command::new(env!("CARGO_BIN_EXE_js-runner"))
-            .env("JS_JIT_SSA", if enabled { "1" } else { "0" })
+            .env("JS_JIT_OPT", if enabled { "full" } else { "none" })
             .args(["--eval", source])
             .output()
             .unwrap();
@@ -289,7 +283,7 @@ fn private_iteration_does_not_block_versioning() {
     );
     for enabled in [false, true] {
         let result = Command::new(env!("CARGO_BIN_EXE_js-runner"))
-            .env("JS_JIT_SSA", if enabled { "1" } else { "0" })
+            .env("JS_JIT_OPT", if enabled { "full" } else { "none" })
             .args(["--eval", source])
             .output()
             .unwrap();
@@ -302,7 +296,7 @@ fn private_iteration_does_not_block_versioning() {
 fn loops_version_independently_of_their_function() {
     let source = "function f(g,xs){ const t=g(); let s=0; let last=-1; for(let i=0;i<xs.length;++i){ last=Math.floor(xs[i]); s+=last; } return s+':'+last+':'+t; } function main(){ const xs=[0.5,2.5]; const r=f(()=>1,xs); Math.floor=x=>x*10; return r+','+f(()=>2,xs); }";
     let dump = Command::new(env!("CARGO_BIN_EXE_js-runner"))
-        .env("JS_JIT_SSA", "1")
+        .env("JS_JIT_OPT", "full")
         .args([
             "--compile",
             "--no-ir",
@@ -324,7 +318,7 @@ fn loops_version_independently_of_their_function() {
     );
     for enabled in [false, true] {
         let result = Command::new(env!("CARGO_BIN_EXE_js-runner"))
-            .env("JS_JIT_SSA", if enabled { "1" } else { "0" })
+            .env("JS_JIT_OPT", if enabled { "full" } else { "none" })
             .args(["--eval", source])
             .output()
             .unwrap();
@@ -344,7 +338,7 @@ fn array_iteration_exposes_and_inlines_known_closures() {
         );
         for enabled in [false, true] {
             let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
-                .env("JS_JIT_SSA", if enabled { "1" } else { "0" })
+                .env("JS_JIT_OPT", if enabled { "full" } else { "none" })
                 .args([
                     "--compile",
                     "--no-ir",
@@ -386,7 +380,7 @@ fn array_iteration_exposes_and_inlines_known_closures() {
 fn inlined_local_calls_remove_unused_closure_allocations() {
     let source = "function main(){ const f=x=>x*x; return f(3); }";
     let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
-        .env("JS_JIT_SSA", "1")
+        .env("JS_JIT_OPT", "full")
         .args([
             "--compile",
             "--no-ir",
@@ -415,7 +409,7 @@ fn construction_exposes_prototype_resolution() {
     let source = "function make(C,p){return new C((C.prototype=p,1));} function spread(C,args){return new C(...args);}";
     for enabled in [false, true] {
         let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
-            .env("JS_JIT_SSA", if enabled { "1" } else { "0" })
+            .env("JS_JIT_OPT", if enabled { "full" } else { "none" })
             .args([
                 "--compile",
                 "--no-ir",
@@ -495,7 +489,7 @@ function main() {
 "#;
     for enabled in [false, true] {
         let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
-            .env("JS_JIT_SSA", if enabled { "1" } else { "0" })
+            .env("JS_JIT_OPT", if enabled { "full" } else { "none" })
             .args(["--eval", source])
             .output()
             .unwrap();
@@ -515,7 +509,7 @@ function main() {
 fn inlined_captures_use_bindings_and_materialize_only_for_fallbacks() {
     let source = "function main(xs){ let limit=2; return xs.some(x=>x>limit); }";
     let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
-        .env("JS_JIT_SSA", "1")
+        .env("JS_JIT_OPT", "full")
         .args([
             "--compile",
             "--no-ir",
@@ -575,7 +569,7 @@ function main() {
 "#;
     for enabled in [false, true] {
         let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
-            .env("JS_JIT_SSA", if enabled { "1" } else { "0" })
+            .env("JS_JIT_OPT", if enabled { "full" } else { "none" })
             .args(["--eval", source])
             .output()
             .unwrap();
@@ -589,7 +583,7 @@ function main() {
             "true:14:false:12:true:10,11,12:0,0,0:3"
         );
         let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
-            .env("JS_JIT_SSA", if enabled { "1" } else { "0" })
+            .env("JS_JIT_OPT", if enabled { "full" } else { "none" })
             .args(["--eval", "function main(){ [1].some(v=>v+n); let n=2; }"])
             .output()
             .unwrap();
@@ -602,7 +596,7 @@ function main() {
 fn whole_function_guards_expose_closed_inlined_arithmetic() {
     let source = "function square(x){return x*x;} function distance(x1,y1,x2,y2){return square(x2-x1)+square(y2-y1);}";
     let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
-        .env("JS_JIT_SSA", "1")
+        .env("JS_JIT_OPT", "full")
         .args([
             "--compile",
             "--no-ir",
@@ -657,7 +651,7 @@ function main() {
 "#;
     for enabled in [false, true] {
         let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
-            .env("JS_JIT_SSA", if enabled { "1" } else { "0" })
+            .env("JS_JIT_OPT", if enabled { "full" } else { "none" })
             .args(["--eval", source])
             .output()
             .unwrap();
@@ -692,7 +686,7 @@ function main() {
 "#;
     for enabled in [false, true] {
         let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
-            .env("JS_JIT_SSA", if enabled { "1" } else { "0" })
+            .env("JS_JIT_OPT", if enabled { "full" } else { "none" })
             .args(["--eval", source])
             .output()
             .unwrap();

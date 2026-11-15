@@ -4,8 +4,7 @@ use std::process::Command;
 
 fn run(args: &[&str]) -> String {
     let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
-        .env("JS_JIT_BASELINE", "1")
-        .env("JS_JIT_SSA", "0")
+        .env("JS_JIT_OPT", "baseline")
         .env("JS_JIT_BACKGROUND", "0")
         .env("JS_JIT_OSR", "0")
         .args(args)
@@ -79,8 +78,7 @@ fn direct_baseline_handles_dynamic_numeric_operations() {
 #[test]
 fn direct_baseline_propagates_helper_errors() {
     let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
-        .env("JS_JIT_BASELINE", "1")
-        .env("JS_JIT_SSA", "0")
+        .env("JS_JIT_OPT", "baseline")
         .env("JS_JIT_BACKGROUND", "0")
         .env("JS_JIT_OSR", "0")
         .args([
@@ -153,8 +151,7 @@ fn direct_baseline_propagates_exceptions_from_calls() {
 #[test]
 fn direct_baseline_checks_recursive_stack_limit() {
     let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
-        .env("JS_JIT_BASELINE", "1")
-        .env("JS_JIT_SSA", "0")
+        .env("JS_JIT_OPT", "baseline")
         .env("JS_JIT_BACKGROUND", "0")
         .env("JS_JIT_OSR", "0")
         .args([
@@ -243,8 +240,7 @@ fn direct_baseline_checks_lexical_initialization_on_each_scope_entry() {
             "{inspection}"
         );
         let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
-            .env("JS_JIT_BASELINE", "1")
-            .env("JS_JIT_SSA", "0")
+            .env("JS_JIT_OPT", "baseline")
             .env("JS_JIT_BACKGROUND", "0")
             .env("JS_JIT_OSR", "0")
             .args(["--eval", source])
@@ -337,8 +333,7 @@ fn direct_baseline_checks_captured_initialization() {
             "{inspection}"
         );
         let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
-            .env("JS_JIT_BASELINE", "1")
-            .env("JS_JIT_SSA", "0")
+            .env("JS_JIT_OPT", "baseline")
             .env("JS_JIT_BACKGROUND", "0")
             .env("JS_JIT_OSR", "0")
             .args(["--eval", source])
@@ -390,8 +385,7 @@ fn direct_baseline_handles_large_frames_and_stack_arguments() {
         "{inspection}"
     );
     let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
-        .env("JS_JIT_BASELINE", "1")
-        .env("JS_JIT_SSA", "0")
+        .env("JS_JIT_OPT", "baseline")
         .env("JS_JIT_BACKGROUND", "0")
         .env("JS_JIT_OSR", "0")
         .args(["--eval", &source])
@@ -448,8 +442,7 @@ fn direct_baseline_propagates_script_initializer_errors() {
             "{inspection}"
         );
         let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
-            .env("JS_JIT_BASELINE", "1")
-            .env("JS_JIT_SSA", "0")
+            .env("JS_JIT_OPT", "baseline")
             .env("JS_JIT_BACKGROUND", "0")
             .env("JS_JIT_OSR", "0")
             .args(["--eval", source])
@@ -488,7 +481,7 @@ fn direct_baseline_resumes_generator_regions_with_normal_frames() {
 #[test]
 fn direct_baseline_generator_regions_preserve_tdz() {
     let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
-        .env("JS_JIT_BASELINE", "1").env("JS_JIT_SSA", "0")
+        .env("JS_JIT_OPT", "baseline")
         .env("JS_JIT_BACKGROUND", "0").env("JS_JIT_OSR", "0")
         .args(["--eval", "function* gen(){yield 1;return x;let x=2;} function main(){let g=gen();g.next();return g.next();}"])
         .output().unwrap();

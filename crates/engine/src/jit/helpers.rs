@@ -145,7 +145,6 @@ define_helpers! {
     FrameOverflow => js_frame_overflow() -> Value;
     FrameRelease => js_frame_release() -> Value;
     Release => js_release(Value) -> Value;
-    RetainAddress => js_retain_address(u64) -> Value;
     Bailout => js_bailout(u64) -> Value;
     Retain => js_retain(Value) -> Value, owned;
     IterateNew => js_iterate_new(Value) -> Value, owned;
@@ -257,7 +256,6 @@ impl Helper {
         !matches!(
             self,
             Self::Retain
-                | Self::RetainAddress
                 | Self::StringConstant
                 | Self::CompilePoll
                 | Self::CompileLeave
@@ -380,13 +378,6 @@ extern "C" fn js_bailout(_: *mut JitCtx, site: u64) -> Value {
 }
 extern "C" fn js_release(ctx: *mut JitCtx, value: Value) -> Value {
     unsafe { &*ctx }.global.heap().release(value);
-    Value::UNDEFINED
-}
-extern "C" fn js_retain_address(ctx: *mut JitCtx, address: u64) -> Value {
-    assert!(
-        unsafe { &*ctx }.global.heap().retain_address(address),
-        "retain of a freed value"
-    );
     Value::UNDEFINED
 }
 extern "C" fn js_retain(ctx: *mut JitCtx, value: Value) -> Value {

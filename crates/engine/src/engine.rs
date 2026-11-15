@@ -18,32 +18,25 @@ struct Function {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum OptLevel {
-    None,
-    #[default]
-    Speed,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Backend {
-    #[default]
     Cranelift,
     Native,
+    #[default]
     NativeOnly,
 }
 
-impl OptLevel {
-    pub(crate) fn as_flag(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Speed => "speed",
-        }
-    }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OptimizationLevel {
+    None,
+    Baseline,
+    Initial,
+    #[default]
+    Full,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EngineOptions {
-    pub opt_level: OptLevel,
+    pub optimization: OptimizationLevel,
     pub jitdump: bool,
     pub jitdump_ir: bool,
     pub ssa_opt: bool,
@@ -69,14 +62,16 @@ impl Default for EngineOptions {
         let jitdump = std::env::var("JS_JIT_JITDUMP").ok();
         let jitdump = jitdump.as_deref();
         Self {
-            opt_level: match std::env::var("JS_JIT_OPT").as_deref() {
-                Ok("none") => OptLevel::None,
-                _ => OptLevel::default(),
+            optimization: match std::env::var("JS_JIT_OPT").as_deref() {
+                Ok("none") => OptimizationLevel::None,
+                Ok("baseline") => OptimizationLevel::Baseline,
+                Ok("initial") => OptimizationLevel::Initial,
+                _ => OptimizationLevel::Full,
             },
             jitdump: matches!(jitdump, Some("1" | "2")),
             jitdump_ir: jitdump == Some("2"),
-            ssa_opt: std::env::var("JS_JIT_SSA").as_deref() != Ok("0"),
-            get_refinement: std::env::var("JS_JIT_GET_REFINEMENT").as_deref() != Ok("0"),
+            ssa_opt: true,
+            get_refinement: true,
             background_compile: std::env::var("JS_JIT_BACKGROUND").as_deref() != Ok("0"),
             compiler_threads: std::env::var("JS_JIT_WORKERS")
                 .ok()
@@ -90,17 +85,18 @@ impl Default for EngineOptions {
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(jit::DEFAULT_RECOMPILE_INLINE_MULTIPLIER),
             osr: std::env::var("JS_JIT_OSR").as_deref() != Ok("0"),
-            continuations: std::env::var_os("JS_JIT_NO_CONTINUATIONS").is_none(),
-            generic_first: std::env::var("JS_JIT_GENERIC_FIRST").as_deref() != Ok("0"),
+            continuations: true,
+            generic_first: true,
             recompile_log: std::env::var("JS_JIT_RECOMPILE_LOG").as_deref() == Ok("1"),
             specialization_log: std::env::var("JS_JIT_SPECIALIZATION_LOG")
                 .ok()
                 .filter(|filter| !filter.is_empty() && filter != "0"),
-            call_profile: std::env::var("JS_JIT_CALL_PROFILE").as_deref() == Ok("1"),
+            call_profile: false,
             backend: match std::env::var("JS_JIT_BACKEND").as_deref() {
+                Ok("cranelift") => Backend::Cranelift,
                 Ok("native") => Backend::Native,
                 Ok("native-only") => Backend::NativeOnly,
-                _ => Backend::Cranelift,
+                _ => Backend::default(),
             },
             compile: None,
         }

@@ -1,12 +1,8 @@
-use js_engine::{Engine, EngineOptions, Error, OptLevel, Value};
+use js_engine::{Engine, EngineOptions, Error, Value};
 
 fn check(source: &str) {
-    for (opt_level, ssa_opt) in [OptLevel::None, OptLevel::Speed]
-        .into_iter()
-        .flat_map(|level| [false, true].map(|semantic| (level, semantic)))
-    {
+    for ssa_opt in [false, true] {
         let mut engine = Engine::with_options(EngineOptions {
-            opt_level,
             ssa_opt,
             ..Default::default()
         })
@@ -41,12 +37,8 @@ fn class_calls_method_construction_and_early_access_fail() {
         "function main() { let a = A; class A {} return a; }",
         "var early = A; class A {} function main() {}",
     ] {
-        for (opt_level, ssa_opt) in [OptLevel::None, OptLevel::Speed]
-            .into_iter()
-            .flat_map(|level| [false, true].map(|semantic| (level, semantic)))
-        {
+        for ssa_opt in [false, true] {
             let mut engine = Engine::with_options(EngineOptions {
-                opt_level,
                 ssa_opt,
                 ..Default::default()
             })
@@ -61,10 +53,9 @@ fn class_calls_method_construction_and_early_access_fail() {
             }
         }
     }
-    for opt_level in [OptLevel::None, OptLevel::Speed] {
+    {
         for ssa_opt in [false, true] {
             let mut engine = Engine::with_options(EngineOptions {
-                opt_level,
                 ssa_opt,
                 ..Default::default()
             })
@@ -87,12 +78,8 @@ fn unsupported_class_features_fail_explicitly() {
         "class A { #method() {} }",
         "class A { static {} }",
     ] {
-        for (opt_level, ssa_opt) in [OptLevel::None, OptLevel::Speed]
-            .into_iter()
-            .flat_map(|level| [false, true].map(|semantic| (level, semantic)))
-        {
+        for ssa_opt in [false, true] {
             let mut engine = Engine::with_options(EngineOptions {
-                opt_level,
                 ssa_opt,
                 ..Default::default()
             })

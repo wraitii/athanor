@@ -1,10 +1,9 @@
-use js_engine::{Engine, EngineOptions, Error, OptLevel, Value};
+use js_engine::{Engine, EngineOptions, Error, Value};
 
 #[test]
 fn local_truthiness_and_indexing_preserve_semantics() {
-    for opt_level in [OptLevel::None, OptLevel::Speed] {
+    {
         let mut engine = Engine::with_options(EngineOptions {
-            opt_level,
             ..Default::default()
         })
         .unwrap();
@@ -23,10 +22,9 @@ fn local_truthiness_and_indexing_preserve_semantics() {
 #[test]
 fn truthiness_preserves_restricted_unions_and_generic_values() {
     for ssa_opt in [false, true] {
-        for opt_level in [OptLevel::None, OptLevel::Speed] {
+        {
             let mut engine = Engine::with_options(EngineOptions {
                 ssa_opt,
-                opt_level,
                 ..Default::default()
             })
             .unwrap();

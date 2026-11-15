@@ -51,7 +51,7 @@ aliasing, and cycles; document deliberate semantic restrictions.
   native operations for exact Int32 operands and runtime helpers for other
   conversions. Shift counts are masked to five bits; unsigned right shift
   returns a nonnegative number. These emission-time fast paths remain enabled
-  with `JS_JIT_SSA=0`. Compound assignments share
+  with `JS_JIT_OPT=none`. Compound assignments share
   binary operations and evaluate the target and its old value before the right
   operand. Numeric operators use heap-aware primitive string conversion.
 - `typeof` returns interned heap strings for supported values, identifying closures and
@@ -223,7 +223,7 @@ cannot throw. General receiver specialization remains unimplemented. Tiered
 compilation and feedback specialization are described in the semantic graph section below.
 
 `EngineOptions::ssa_opt` enables rewriting and defaults to true unless
-`JS_JIT_SSA=0`.
+`JS_JIT_OPT=none`.
 
 Compilation tiers build on this boundary. Canonical semantic graphs of ordinary
 functions are retained separately from emitted bodies; canonical CLIF bodies are
@@ -1257,7 +1257,7 @@ the function views; `--filter NAME` restricts their output by name substring.
 path constructs this view for inspection. Assembly includes
 byte offsets and semantic-location IDs. The graph verifier checks scope and
 control-flow invariants. Semantic
-optimization is disabled by `JS_JIT_SSA=0`, for graphs with exception handlers and
+optimization is disabled by `JS_JIT_OPT=none`, for graphs with exception handlers and
 for generator source graphs. Extracted ordinary resume regions are canonicalized
 and optimized normally; the shared CLIF optimization passes also apply.
 
@@ -1357,7 +1357,7 @@ Comparisons fused into branches or selects are compound target operations, so
 their flag production and consumption stay adjacent. They expose the comparison
 inputs directly rather than keeping a redundant boolean value alive. The selected
 graph retains source locations independently of instruction grouping. Inspect it
-with `JS_JIT_BACKEND=native-only` and `--after aarch64-select`.
+with the native AArch64 backend and `--after aarch64-select`.
 
 Canonicalization, planning and optimization operate on the same `FunctionState`,
 containing the working graph, its facts, specialization plan, OSR plan and
@@ -1673,7 +1673,7 @@ rejected extractions. Graphs that already store exit outputs, such as OSR
 fragments, do not extract continuations: a piece would store into its own buffer
 rather than the fragment's caller buffer. Continuations compile eagerly and have separate semantic
 IR and assembly listings under the enclosing function's name.
-`JS_JIT_NO_CONTINUATIONS=1` disables extraction and keeps every bailout in the
+`EngineOptions::continuations = false` disables extraction and keeps every bailout in the
 function's own generic copy.
 
 Only function-entry failures restart the previous native version. Fixed entries
@@ -1745,10 +1745,8 @@ usable.
 
 Scheduling has four priorities: demanded lazy compilation, OSR/feedback,
 prefetch, and unlazify. Compilation tier is carried separately on each job.
-Demanded lazy, prefetch, and unlazify jobs use the baseline tier with Cranelift
-`opt_level=none`; OSR and feedback jobs use the optimized tier with the configured
-`opt_level`. Both use the backtracking allocator; the single-pass allocator
-measured slower overall at the baseline tier.
+Demanded lazy, prefetch, and unlazify jobs use the baseline tier; OSR and feedback
+jobs use the optimized tier. Cranelift uses its default settings for both.
 
 With background compilation, initial bodies are generic by default: they keep
 semantic optimization and observations but skip region versioning, so they carry
@@ -1756,7 +1754,7 @@ no speculative guards or continuations. Specialization happens only through
 feedback recompilation (the first observation requests it, and it is submitted
 once the function has returned eight times) or through OSR fragments for loops
 still running. Nothing queues specialization merely because an initial body was
-installed. `EngineOptions::generic_first` (`JS_JIT_GENERIC_FIRST=0` disables it)
+installed. `EngineOptions::generic_first = false`
 restores speculative initial bodies. Recompilation of a generic body always
 proceeds, even when its specialization plan is unchanged. Workers retain a compiler/module per tier so emitted
 code outlives subsequent jobs. Promoting a queued lazy job to demanded priority

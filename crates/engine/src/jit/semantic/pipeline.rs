@@ -192,6 +192,7 @@ pub(in crate::jit) fn lower_global(
     arguments_references: &FxHashMap<u32, SymbolId>,
     ssa_opt: bool,
     continuations: bool,
+    initial_only: bool,
     report_regions: bool,
     after: &mut dyn FnMut(&str, &FunctionState),
 ) -> Result<FunctionState> {
@@ -206,9 +207,13 @@ pub(in crate::jit) fn lower_global(
     let mut function = FunctionState::new(graph, Vec::new(), ssa_opt);
     canonicalize(&mut function)?;
     let planned = inline_and_plan_specialization(function, ssa_opt, None, 1)?;
-    let versioning = Versioning::Speculate {
-        fallback: None,
-        continuations,
+    let versioning = if initial_only {
+        Versioning::Generic
+    } else {
+        Versioning::Speculate {
+            fallback: None,
+            continuations,
+        }
     };
     specialize_observed(planned, versioning, report_regions, None, false, after)
 }

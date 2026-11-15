@@ -33,15 +33,6 @@ pub(crate) enum CompilationTier {
     Optimized,
 }
 
-impl CompilationTier {
-    fn options(self, mut options: EngineOptions) -> EngineOptions {
-        if self == Self::Baseline {
-            options.opt_level = crate::OptLevel::None;
-        }
-        options
-    }
-}
-
 struct Callable<'a> {
     id: FuncId,
     declaration: Option<String>,
@@ -160,7 +151,7 @@ impl Drop for Compiler {
             if self.backend != crate::Backend::Cranelift {
                 eprintln!("js jit stats: {} native functions", stats.native);
             }
-            if std::env::var_os("JS_JIT_BASELINE").is_some() {
+            if self.optimization == crate::OptimizationLevel::Baseline {
                 eprintln!(
                     "js jit stats: {} direct baseline functions, {} other functions",
                     stats.baseline,
@@ -202,6 +193,7 @@ pub(crate) struct Compiler {
     dump: Option<jitdump::Writer>,
     dump_ir: bool,
     ssa_opt: bool,
+    optimization: crate::OptimizationLevel,
     inlining: bool,
     recompile_inline_multiplier: usize,
     osr: bool,
@@ -264,18 +256,12 @@ impl Compiler {
 
     pub(crate) fn new(
         options: EngineOptions,
-        tier: CompilationTier,
+        _tier: CompilationTier,
         direct_entries: *const usize,
         compilation_state: usize,
         log: super::recompile::Log,
     ) -> Result<Self, Error> {
-        let options = tier.options(options);
-        let flags = [
-            ("opt_level", options.opt_level.as_flag()),
-            ("regalloc_algorithm", "backtracking"),
-            ("enable_verifier", "false"),
-        ];
-        let builder = JITBuilder::with_flags(&flags, default_libcall_names())
+        let builder = JITBuilder::with_flags(&[], default_libcall_names())
             .map_err(|error| Error::Compile(error.to_string()))?;
         let mut module = JITModule::new(builder);
         let target = module.target_config();
@@ -302,9 +288,10 @@ impl Compiler {
         let dump_ir = dump.is_some() && options.jitdump_ir;
         Ok(Self {
             log,
-            osr: options.osr,
+            osr: options.osr && options.optimization == crate::OptimizationLevel::Full,
             speculative_continuations: options.continuations,
-            generic_first: options.generic_first && options.background_compile,
+            generic_first: options.optimization == crate::OptimizationLevel::Initial
+                || options.generic_first && options.background_compile,
             emissions: FxHashMap::default(),
             lazy: FxHashMap::default(),
             sources: Arc::default(),
@@ -329,7 +316,12 @@ impl Compiler {
             function_names: FxHashMap::default(),
             dump,
             dump_ir,
-            ssa_opt: options.ssa_opt,
+            ssa_opt: options.ssa_opt
+                && !matches!(
+                    options.optimization,
+                    crate::OptimizationLevel::None | crate::OptimizationLevel::Baseline
+                ),
+            optimization: options.optimization,
             inlining: options.inlining,
             recompile_inline_multiplier: options.recompile_inline_multiplier,
             get_refinement: options.get_refinement,
@@ -897,6 +889,7 @@ impl Compiler {
                 &analysis.arguments_references,
                 self.ssa_opt,
                 self.speculative_continuations,
+                self.optimization == crate::OptimizationLevel::Initial,
                 self.report_regions(),
                 &mut |name, state| passes.observe(name, state),
             )
@@ -911,7 +904,7 @@ impl Compiler {
             let mut baseline_data = super::function_data::FunctionData::new();
             let baseline = if !self.ssa_opt
                 && self.module.isa().name() == "aarch64"
-                && std::env::var_os("JS_JIT_BASELINE").is_some()
+                && self.optimization == crate::OptimizationLevel::Baseline
             {
                 super::aarch64::compile_baseline(
                     &graph.graph,
@@ -1629,7 +1622,7 @@ impl Compiler {
             && region.is_none()
             && !self.ssa_opt
             && self.module.isa().name() == "aarch64"
-            && std::env::var_os("JS_JIT_BASELINE").is_some()
+            && self.optimization == crate::OptimizationLevel::Baseline
         {
             super::aarch64::compile_baseline(
                 &graph.graph,
@@ -1910,7 +1903,7 @@ impl Compiler {
         let mut data = FunctionData::new();
         let baseline = if !self.ssa_opt
             && self.module.isa().name() == "aarch64"
-            && std::env::var_os("JS_JIT_BASELINE").is_some()
+            && self.optimization == crate::OptimizationLevel::Baseline
         {
             super::aarch64::compile_baseline(
                 &state.graph,
@@ -2157,9 +2150,13 @@ impl Compiler {
                 );
                 super::semantic::specialize_observed(
                     planned,
-                    super::semantic::Versioning::Speculate {
-                        fallback: None,
-                        continuations: self.speculative_continuations,
+                    if self.optimization == crate::OptimizationLevel::Initial {
+                        super::semantic::Versioning::Generic
+                    } else {
+                        super::semantic::Versioning::Speculate {
+                            fallback: None,
+                            continuations: self.speculative_continuations,
+                        }
                     },
                     self.report_regions(),
                     self.osr.then_some(self.source_name.0),
@@ -2200,7 +2197,7 @@ impl Compiler {
             );
         }
         let mut baseline_data = super::function_data::FunctionData::new();
-        let baseline = if std::env::var_os("JS_JIT_BASELINE").is_some()
+        let baseline = if self.optimization == crate::OptimizationLevel::Baseline
             && self.module.isa().name() == "aarch64"
             && !self.ssa_opt
             && matches!(kind, finalize::FunctionKind::Ordinary)

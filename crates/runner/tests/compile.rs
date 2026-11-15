@@ -2,7 +2,7 @@ use std::process::{Command, Output};
 
 fn compile(arguments: &[&str], source: &str) -> Output {
     Command::new(env!("CARGO_BIN_EXE_js-runner"))
-        .env("JS_JIT_SSA", "1")
+        .env("JS_JIT_OPT", "full")
         .env("JS_JIT_OSR", "0")
         .env_remove("JS_JIT_JITDUMP")
         .args(["--compile"])
@@ -64,7 +64,7 @@ fn after_views_span_specialization_and_lowering() {
 fn native_selection_view_preserves_clif_inspection() {
     let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
         .env("JS_JIT_BACKEND", "native-only")
-        .env("JS_JIT_SSA", "1")
+        .env("JS_JIT_OPT", "full")
         .env("JS_JIT_OSR", "0")
         .env_remove("JS_JIT_JITDUMP")
         .args([
@@ -166,7 +166,7 @@ fn filter_reports_no_matches_and_requires_compile_mode() {
 fn semantic_dump_includes_emitted_osr_instrumentation() {
     for arguments in [vec![], vec!["--after", "osr"]] {
         let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
-            .env("JS_JIT_SSA", "1")
+            .env("JS_JIT_OPT", "full")
             .env("JS_JIT_OSR", "1")
             .env_remove("JS_JIT_JITDUMP")
             .args(arguments)
@@ -477,5 +477,31 @@ fn truthiness_lowering_uses_type_facts() {
         let text = String::from_utf8(output.stdout).unwrap();
         assert_eq!(text.contains("helper: Some(Truthy)"), helper, "{text}");
         assert_eq!(text.contains("FloatCompare"), numeric, "{text}");
+    }
+}
+
+#[test]
+fn optimization_modes_control_feedback_recompilation() {
+    let source = "function f(a){return a[0]+1;} function main(){let a=[41]; let n=0; for(let i=0;i<50;i++) n=f(a); return n;}";
+    for mode in ["none", "baseline", "initial", "full"] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_js-runner"))
+            .env("JS_JIT_OPT", mode)
+            .env("JS_JIT_BACKGROUND", "0")
+            .env("JS_JIT_RECOMPILE_LOG", "1")
+            .args(["--eval", source])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{mode}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "42");
+        let log = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            log.contains("requested mode="),
+            mode == "full",
+            "{mode}: {log}"
+        );
     }
 }

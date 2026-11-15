@@ -57,10 +57,6 @@ impl Lowering<'_, '_> {
     }
 
     fn retain_address(&mut self, address: Value) {
-        if crate::heap::strict_references() {
-            self.helper(Helper::RetainAddress, address);
-            return;
-        }
         let flags = MemFlagsData::trusted();
         let references = self
             .b
@@ -93,12 +89,6 @@ impl Lowering<'_, '_> {
             let release = self.b.create_block();
             self.b.ins().brif(is_heap, release, &[], done, &[]);
             self.b.switch_to_block(release);
-        }
-        if crate::heap::strict_references() {
-            self.helper(Helper::Release, value);
-            self.b.ins().jump(done, &[]);
-            self.b.switch_to_block(done);
-            return done;
         }
         let address = layout::address(self.b, value);
         let load = self.b.create_block();
@@ -163,9 +153,6 @@ fn pure(op: &Op) -> bool {
 }
 
 fn cancel_pairs(graph: &mut Graph, blocks: &[Block]) {
-    if crate::heap::strict_references() {
-        return;
-    }
     for &block in blocks {
         let insts = std::mem::take(&mut graph.blocks[block].insts);
         let mut retained = FxHashMap::<Value, Vec<usize>>::default();
@@ -340,14 +327,7 @@ mod tests {
                     )
                 })
                 .count();
-            assert_eq!(
-                count,
-                if barrier == 0 && !crate::heap::strict_references() {
-                    0
-                } else {
-                    2
-                }
-            );
+            assert_eq!(count, if barrier == 0 { 0 } else { 2 });
             graph.verify().unwrap();
         }
     }

@@ -1,4 +1,4 @@
-use js_engine::{Engine, EngineOptions, Error, OptLevel, Value};
+use js_engine::{Engine, EngineOptions, Error, Value};
 
 #[cfg(target_arch = "aarch64")]
 #[test]
@@ -25,18 +25,13 @@ fn native_backend_resolves_unoptimized_value_aliases() {
 }
 
 fn engines() -> impl Iterator<Item = Engine> {
-    [OptLevel::None, OptLevel::Speed]
-        .into_iter()
-        .flat_map(|opt_level| {
-            [false, true].into_iter().map(move |ssa_opt| {
-                Engine::with_options(EngineOptions {
-                    opt_level,
-                    ssa_opt,
-                    ..Default::default()
-                })
-                .unwrap()
-            })
+    [false, true].into_iter().map(|ssa_opt| {
+        Engine::with_options(EngineOptions {
+            ssa_opt,
+            ..Default::default()
         })
+        .unwrap()
+    })
 }
 
 #[test]
@@ -1102,9 +1097,8 @@ fn borrowed_rows_preserve_guards_and_owner_invalidation() {
             }) === 12;
         }
     "#;
-    for opt_level in [OptLevel::None, OptLevel::Speed] {
+    {
         let mut engine = Engine::with_options(EngineOptions {
-            opt_level,
             background_compile: false,
             ..Default::default()
         })
@@ -1132,9 +1126,8 @@ fn borrowed_phi_rows_keep_their_owners_alive() {
             return true;
         }
     "#;
-    for opt_level in [OptLevel::None, OptLevel::Speed] {
+    {
         let mut engine = Engine::with_options(EngineOptions {
-            opt_level,
             background_compile: false,
             ..Default::default()
         })

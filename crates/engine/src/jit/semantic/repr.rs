@@ -206,20 +206,6 @@ pub(super) fn assign(graph: &mut Graph, facts: &Facts) {
     for value in graph.values.keys() {
         if graph.reprs[value].is_none() {
             let repr = representation(graph, facts, value);
-            if std::env::var_os("JS_JIT_REPR_ASSIGN").is_some() {
-                let kind = match graph.defining_op(value) {
-                    None => "param".to_owned(),
-                    Some(op) => {
-                        let text = format!("{op:?}");
-                        let end = text
-                            .match_indices(|c: char| !c.is_alphanumeric())
-                            .nth(if matches!(op, Op::LowLevel(_)) { 1 } else { 0 })
-                            .map_or(text.len(), |(i, _)| i);
-                        text[..end].to_owned()
-                    }
-                };
-                eprintln!("repr-assign {kind} {repr:?}");
-            }
             graph.reprs[value] = Some(repr);
         }
     }

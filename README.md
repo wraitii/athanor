@@ -46,7 +46,7 @@ once per process, on first verification.
 
 - Semantic IR is the default: the graph passed to runtime lowering, including
   OSR instrumentation when enabled. `--no-semantic-ir` (also `--no-ir`) suppresses
-  it; `--semantic-ir` enables it again. `JS_JIT_SSA=0` selects the unoptimized
+  it; `--semantic-ir` enables it again. `JS_JIT_OPT=none` selects the unoptimized
   semantic graph; Cranelift still uses its normal optimization level.
 - `--clif` adds a Cranelift IR view before and after backend preparation. For
   native code this view is constructed for inspection; the native backend consumes
@@ -97,7 +97,7 @@ compiling with the native backend. Native preparation resolves scalar conversion
 and consumes compound bit operations directly. An unknown pass reports the
 available pass names.
 
-With `JS_JIT_BACKEND=native-only`, `--after aarch64-select` shows the graph after
+With the native AArch64 backend, `--after aarch64-select` shows the graph after
 native instruction selection, before allocation. Selected operations expose their
 actual register operands, including folded addresses and comparisons. Constants
 absorbed into immediate operands and unused intermediate operations are removed.
@@ -154,7 +154,7 @@ Numeric facts and representation selection run on the semantic graph before
 CLIF emission. Numeric index operands select their specialized fallback helper
 directly. Generated code keeps the references it owns in stack slots and
 releases them after their last use, at the end of their semantic block, or on
-the way out of a failed one. `JS_JIT_SSA=0` disables semantic optimization; the embedding option is
+the way out of a failed one. `JS_JIT_OPT=none` disables semantic optimization; the embedding option is
 `EngineOptions::ssa_opt`. See
 [CLIF emission and ownership](crates/engine/DESIGN.md#clif-emission-and-ownership)
 for details.
@@ -191,8 +191,14 @@ template values, so the generated map is a workload rather than a faithful map.
 Output is a JSON summary with a deterministic hash of the generated heightmap
 and tile data, plus generator timing.
 
-Set `JS_JIT_GET_REFINEMENT=0` to disable get feedback and refinement while keeping
-other optimizations enabled (`EngineOptions::get_refinement`).
+`JS_JIT_OPT` selects the compilation pipeline: `none` disables semantic
+optimization, `baseline` additionally attempts direct AArch64 baseline emission,
+`initial` enables semantic optimization without speculative specialization or
+feedback recompilation, and `full` (the default) enables the full pipeline.
+The embedding equivalent is `EngineOptions::optimization`.
+
+`EngineOptions::get_refinement` can disable get feedback and refinement while keeping
+other optimizations enabled.
 
 An integer-speculation failure that requests recompilation puts its owning
 function into a persistent number-first policy. Later plans use general-number
@@ -214,7 +220,7 @@ observations. Numeric guard failures still report invalid assumptions; ordinary
 function compilations and their continuations continue collecting feedback.
 
 With background compilation, initial bodies are generic by default
-(`EngineOptions::generic_first`; set `JS_JIT_GENERIC_FIRST=0` to disable). They
+(`EngineOptions::generic_first` can disable this). They
 keep semantic optimization and observations but skip speculative versioning.
 Specialization comes only from feedback recompilation and OSR fragments.
 
@@ -279,18 +285,15 @@ writes a separate dump file. Set `JS_JIT_BACKGROUND=0` to recompile
 synchronously at the next dispatch instead (`EngineOptions::background_compile`).
 
 Scheduling priority and compilation tier are separate. Demanded lazy, prefetch,
-and unlazify jobs use the baseline tier: Cranelift `opt_level=none`, with semantic
-optimization still enabled and speculative versioning only when generic-first is
-disabled. Initial baseline bodies leave generic named property and indexed
+and unlazify jobs use the baseline tier, with semantic optimization still enabled
+and speculative versioning only when generic-first is disabled. Initial baseline bodies leave generic named property and indexed
 accesses as helper calls rather than expanding their cache and array fast paths.
-OSR and feedback jobs use the
-optimized tier and `EngineOptions::opt_level` (default `speed`). Both tiers use
-the backtracking register allocator. Initial bodies retain the base inlining
+OSR and feedback jobs use the optimized tier. Cranelift uses its default settings. Initial bodies retain the base inlining
 budget; OSR and feedback use the recompilation multiplier described above.
 Promoting queued prefetch or unlazify work to a demand retains its baseline
 tier. A job already running retains its tier. Optimized recompilation can
 replace a baseline body even when its specialization plan is unchanged.
-`JS_JIT_SSA=0` still disables semantic optimization globally. Source initializers,
+`JS_JIT_OPT=none` still disables semantic optimization globally. Source initializers,
 compile-only output, and synchronous compilation with `JS_JIT_BACKGROUND=0` use
 the optimized tier. The former `JS_JIT_SYNC_OPT_LEVEL` and
 `JS_JIT_SYNC_SINGLE_PASS` settings and their `EngineOptions` fields were removed.

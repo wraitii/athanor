@@ -176,7 +176,6 @@ fn functions_can_call_across_compile_calls() {
 #[test]
 fn optimization_level_is_configurable() {
     let mut engine = Engine::with_options(js_engine::EngineOptions {
-        opt_level: js_engine::OptLevel::None,
         ..Default::default()
     })
     .unwrap();
