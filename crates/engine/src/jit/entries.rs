@@ -59,8 +59,8 @@ pub(crate) const DIRECT_ENTRY_SIZE: usize = 4 * std::mem::size_of::<usize>();
 pub(crate) const DIRECT_ADAPTER_OFFSET: usize = std::mem::size_of::<usize>();
 pub(crate) const DIRECT_ARITY_OFFSET: usize = 2 * std::mem::size_of::<usize>();
 pub(crate) const DIRECT_CALLS_OFFSET: usize = 3 * std::mem::size_of::<usize>();
-pub(crate) const RECOMPILE_WARMUP: usize = 32;
-pub(crate) const RECOMPILE_PENDING: usize = 64;
+pub(crate) const RECOMPILE_WARMUP: usize = 1024;
+pub(crate) const RECOMPILE_PENDING: usize = RECOMPILE_WARMUP * 2;
 const WORDS: usize = DIRECT_ENTRY_SIZE / std::mem::size_of::<usize>();
 
 /// Each variant slot has a fixed-arity entry, an argument adapter, and its arity plus one.

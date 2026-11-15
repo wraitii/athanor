@@ -43,6 +43,18 @@ pub(in crate::jit::semantic) fn numbers(graph: &mut Graph) -> Vec<(Value, Fact)>
             }
         }
     }
+    let observed: Vec<_> = proposals
+        .iter()
+        .filter(|(_, value, _, _)| hints.contains_key(value))
+        .map(|&(_, value, fact, _)| (value, fact))
+        .collect();
+    if !observed.is_empty() {
+        // Infer from observed guards without letting derived assumptions prove themselves.
+        let inferred = Facts::assuming_values(graph, cfg, &observed);
+        proposals.retain(|&(_, value, fact, _)| {
+            hints.contains_key(&value) || !inferred.of(value).within(fact.mask().unwrap())
+        });
+    }
     for &(before, value, fact, site) in &proposals {
         let block = graph.insts[before].block;
         let at = graph.blocks[block]

@@ -209,6 +209,9 @@ loop-carried values, so nested loops move into native fragments inner loop
 first. `JS_JIT_RECOMPILE_LOG=1` reports requests, queue priorities, publication,
 the first transfer, and why ineligible loops were rejected. `JS_JIT_BACKGROUND=0`
 compiles fragments synchronously for deterministic comparisons.
+Fragments consume existing feedback without reporting call, read, or property-cache
+observations. Numeric guard failures still report invalid assumptions; ordinary
+function compilations and their continuations continue collecting feedback.
 
 With background compilation, initial bodies are generic by default
 (`EngineOptions::generic_first`; set `JS_JIT_GENERIC_FIRST=0` to disable). They
@@ -227,7 +230,7 @@ Independent jobs keep compiling without waiting for publication. Dependency
 tickets and inherited priorities support future callee preparation.
 
 Feedback requests are submitted at function return to the background compiler pool
-once the function has completed 32 calls. Earlier feedback remains pending until
+once the function has completed 1,024 calls. Earlier feedback remains pending until
 that threshold is reached; calls before feedback also count. The call count resets
 when a feedback compilation is submitted. An OSR request makes
 the enclosing function eligible immediately and queues it after the loop fragment.

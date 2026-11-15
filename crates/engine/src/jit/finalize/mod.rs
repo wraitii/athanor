@@ -31,6 +31,7 @@ pub(super) enum FunctionKind {
 #[derive(Clone, Copy)]
 pub(super) struct Feedback {
     pub(super) function_return: bool,
+    pub(super) observations: bool,
     pub(super) get_refinement: bool,
     pub(super) owner: u64,
 }

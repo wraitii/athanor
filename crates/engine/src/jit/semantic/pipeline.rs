@@ -409,6 +409,8 @@ pub(super) fn inline_and_plan_inner(
             call_variants = call_variants::apply(&mut function.graph, bodies, source)?;
         }
     }
+    function.invalidate_cfg();
+    reuse::reuse_loads(&mut function);
     let numbers = observations::plan(&mut function.graph, specialization);
     let reads = specialization.map_or_else(Vec::new, |(bodies, source)| {
         reads::plan(&function.graph, bodies, source)

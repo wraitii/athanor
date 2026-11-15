@@ -914,6 +914,80 @@ mod tests {
     }
 
     #[test]
+    fn observed_operands_prove_derived_numeric_values() {
+        use crate::jit::profile::{ReadKind, ReadType, Site};
+
+        let mut graph = graph(
+            "function f(a,b,n){const x=a.x+b.x;let sum=0;for(let i=0;i<n;++i)sum+=x+i;return sum;}",
+        );
+        let mut repository = super::super::super::calls::Repository::default();
+        for data in graph.insts.values() {
+            if matches!(data.op, Op::Get(..)) {
+                repository.read_feedback.insert(
+                    (
+                        Site {
+                            source: 7,
+                            start: data.span.start,
+                            end: data.span.end,
+                        },
+                        ReadKind::Number,
+                    ),
+                    ReadType::Integer,
+                );
+            }
+        }
+        super::super::super::observations::plan(&mut graph, Some((&repository, 7)));
+        let derived = graph
+            .insts
+            .values()
+            .find_map(|data| match data.op {
+                Op::Binary(BinaryOperator::Addition, left, right)
+                    if matches!(graph.defining_op(left), Some(Op::Get(..)))
+                        && matches!(graph.defining_op(right), Some(Op::Get(..))) =>
+                {
+                    data.result()
+                }
+                _ => None,
+            })
+            .unwrap();
+        let assumptions = super::super::propose::numbers(&mut graph);
+        assert!(!assumptions.is_empty());
+        assert!(!assumptions.iter().any(|&(value, _)| value == derived));
+        assert!(
+            Facts::assuming(&graph, &assumptions)
+                .of(derived)
+                .within(ValueType::INTEGER)
+        );
+        graph.verify().unwrap();
+    }
+
+    #[test]
+    fn feedback_planning_reuses_properties_until_reentry() {
+        for (source, expected) in [
+            (
+                "function f(holder){return holder.strength+(1-holder.strength);}",
+                1,
+            ),
+            (
+                "function f(holder,mutate){const first=holder.strength;mutate(holder);return first+(1-holder.strength);}",
+                2,
+            ),
+        ] {
+            let function = super::super::super::super::FunctionState::from_graph(graph(source));
+            let planned =
+                super::super::super::super::plan_specialization(function, true, None).unwrap();
+            let reads = Cfg::new(&planned.graph)
+                .rpo
+                .iter()
+                .flat_map(|&block| &planned.graph.blocks[block].insts)
+                .filter(|&&inst| matches!(&planned.graph.insts[inst].op, Op::Get(_, name) if name == "strength"))
+                .count();
+            assert_eq!(reads, expected);
+            planned.graph.verify().unwrap();
+        }
+    }
+
+    #[test]
     fn observed_numeric_types_select_guarded_region_facts() {
         use crate::jit::profile::{ReadKind, ReadType, Site};
         for observed in [ReadType::Integer, ReadType::Number] {

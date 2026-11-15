@@ -745,6 +745,48 @@ fn numeric_feedback_recompiles_without_read_or_call_specialization() {
 }
 
 #[test]
+fn osr_does_not_add_observation_sites() {
+    let source = "function main(){const holder={x:2};let result=0;for(let j=0;j<160;++j){if(j===100)holder.x=0.5;const x=holder.x+1;let sum=0;for(let i=0;i<3;++i)sum+=(x+i)*1;result+=holder.x*sum+(1-holder.x)*sum;}return result;}";
+    let mut generic = Engine::with_options(EngineOptions {
+        osr: false,
+        background_compile: false,
+        ..Default::default()
+    })
+    .unwrap();
+    generic.compile(source, "osr-observations.js").unwrap();
+    let expected = generic.call("main", &[]).unwrap().value();
+    let mut engine = osr_engine(false);
+    engine.compile(source, "osr-observations.js").unwrap();
+    assert_eq!(engine.call("main", &[]).unwrap().value(), expected);
+    assert!(engine.tiering.compiler.borrow().osr_transfers() > 0);
+    let profile = engine.tiering.profile.borrow();
+    let generic_profile = generic.tiering.profile.borrow();
+    let numbers: Vec<_> = profile
+        .reads()
+        .filter(|((_, kind), _)| *kind == jit::profile::ReadKind::Number)
+        .collect();
+    assert!(!numbers.is_empty());
+    for ((site, kind), _) in numbers {
+        assert!(generic_profile.reads().any(|((generic, generic_kind), _)| {
+            generic.start == site.start && generic.end == site.end && generic_kind == kind
+        }));
+    }
+    let shapes: Vec<_> = profile.shapes().collect();
+    assert!(!shapes.is_empty());
+    for ((site, property), _) in shapes {
+        assert!(
+            generic_profile
+                .shapes()
+                .any(|((generic, generic_property), _)| {
+                    generic.start == site.start
+                        && generic.end == site.end
+                        && generic_property == property
+                })
+        );
+    }
+}
+
+#[test]
 fn numeric_osr_feedback_preserves_fractional_guard_fallbacks() {
     let source = "function main(){const holder={x:2};let result=0;for(let j=0;j<160;++j){if(j===100)holder.x=0.5;const x=holder.x;let sum=0;for(let i=0;i<3;++i)sum+=(x+i)*1;result+=sum;}return result;}";
     let mut baseline = Engine::with_options(EngineOptions {

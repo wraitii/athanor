@@ -88,6 +88,9 @@ impl FunctionCompiler<'_, '_> {
             return;
         };
         use crate::jit::profile::Observation;
+        if !feedback.observations && kind != Observation::NumberFailure {
+            return;
+        }
         if !feedback.get_refinement && kind != Observation::Call {
             return;
         }
@@ -139,7 +142,9 @@ impl FunctionCompiler<'_, '_> {
         &self,
         data: &crate::jit::semantic::InstData,
     ) -> Option<(u64, crate::jit::profile::Site)> {
-        let feedback = self.feedback.filter(|feedback| feedback.get_refinement)?;
+        let feedback = self
+            .feedback
+            .filter(|feedback| feedback.observations && feedback.get_refinement)?;
         Some((
             feedback.owner,
             crate::jit::profile::Site {

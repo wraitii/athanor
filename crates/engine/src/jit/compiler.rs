@@ -366,6 +366,7 @@ impl Compiler {
     fn feedback(&self, owner: FuncId, function_return: bool) -> finalize::Feedback {
         finalize::Feedback {
             function_return,
+            observations: true,
             get_refinement: self.get_refinement,
             owner: owner.as_u32() as u64,
         }
@@ -1609,16 +1610,20 @@ impl Compiler {
             &mut |name, state| passes.observe(name, state),
         )
         .map_err(Error::Unsupported)?;
+        let mut feedback = self.feedback(code, region.is_none());
+        feedback.observations = region.is_none();
         let continuations = self.compile_continuations(
             &graph.graph,
             emission.source_name,
             emission.params,
             (&label, 1),
-            self.ssa_opt.then(|| self.feedback(code, false)),
+            self.ssa_opt.then_some(finalize::Feedback {
+                function_return: false,
+                ..feedback
+            }),
         )?;
         let signature = self.graph_signature(Some(&graph.graph));
-        let feedback = (self.ssa_opt && !self.canonical.is_region(code))
-            .then(|| self.feedback(code, region.is_none()));
+        let feedback = (self.ssa_opt && !self.canonical.is_region(code)).then_some(feedback);
         let mut baseline_data = super::function_data::FunctionData::new();
         let baseline = if initial
             && region.is_none()
