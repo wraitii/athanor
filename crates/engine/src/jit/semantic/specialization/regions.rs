@@ -211,12 +211,15 @@ pub(in crate::jit::semantic) fn version_string_leaves(
 
 fn cold_exit(graph: &Graph, block: Block) -> Option<Block> {
     let Some(Terminator {
-        kind: TerminatorKind::Branch(_, _, otherwise),
+        kind: TerminatorKind::Branch(condition, _, otherwise),
         ..
     }) = &graph.blocks[block].terminator
     else {
         return None;
     };
+    if matches!(graph.defining_op(*condition), Some(Op::GuardValid(_))) {
+        return None;
+    }
     graph
         .cold
         .contains(&otherwise.block)

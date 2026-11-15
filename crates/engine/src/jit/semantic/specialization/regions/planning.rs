@@ -1092,6 +1092,39 @@ mod tests {
             candidate.blocks[block].terminator.as_ref().unwrap().kind,
             TerminatorKind::Bailout { .. }
         )));
+        let guards: Vec<_> = cfg
+            .rpo
+            .iter()
+            .filter_map(|&block| {
+                let TerminatorKind::Branch(condition, _, no) =
+                    &candidate.blocks[block].terminator.as_ref()?.kind
+                else {
+                    return None;
+                };
+                let Op::GuardValid(guard) = candidate.defining_op(*condition)? else {
+                    return None;
+                };
+                Some((*guard, no.block))
+            })
+            .collect();
+        assert!(!guards.is_empty());
+        for (guard, start) in guards {
+            let mut pending = vec![start];
+            let mut visited = FxHashSet::default();
+            let mut committed = false;
+            while let Some(block) = pending.pop() {
+                if !visited.insert(block) {
+                    continue;
+                }
+                committed |= candidate.blocks[block].insts.iter().any(
+                    |&inst| matches!(candidate.insts[inst].op, Op::GuardCommit(id) if id == guard),
+                );
+                if let Some(term) = &candidate.blocks[block].terminator {
+                    pending.extend(term.kind.targets().into_iter().map(|target| target.block));
+                }
+            }
+            assert!(committed, "guard {guard} cannot be refreshed");
+        }
         candidate.verify().unwrap();
         graph.verify().unwrap();
     }
