@@ -15,7 +15,7 @@ use super::super::{
 pub(in crate::jit::semantic) const SPECIALIZATION_BUDGET: usize = 128;
 pub(in crate::jit::semantic) const SPECIALIZATION_BODY_INSTS: usize = 64;
 pub(in crate::jit::semantic) const SPECIALIZATION_ROUNDS: usize = 2;
-pub(crate) const DEFAULT_RECOMPILE_INLINE_MULTIPLIER: usize = 4;
+pub(crate) const DEFAULT_RECOMPILE_INLINE_MULTIPLIER: usize = 2;
 
 #[derive(Clone)]
 pub(in crate::jit) struct Repository {

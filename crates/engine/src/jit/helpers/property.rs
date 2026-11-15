@@ -274,6 +274,37 @@ impl PropertyCache {
         self.len += 1;
     }
 
+    fn lookup(&self, heap: &crate::heap::Heap, receiver: Value) -> Option<Value> {
+        if self.megamorphic != 0 {
+            return None;
+        }
+        let entries = std::iter::once(&self.entry)
+            .take(self.len.min(1) as usize)
+            .chain(
+                self.overflow
+                    .iter()
+                    .flat_map(|entries| entries.iter().take(self.len.saturating_sub(1) as usize)),
+            );
+        for entry in entries {
+            if entry.builtin_kind != 0 {
+                if heap.has_kind(receiver, entry.builtin_kind) {
+                    return Some(Value::from_bits(entry.builtin_value));
+                }
+                continue;
+            }
+            if let Some(value) = heap.cached_property_hit(
+                receiver,
+                entry.shape,
+                entry.holder,
+                entry.holder_shape,
+                entry.index,
+            ) {
+                return Some(value);
+            }
+        }
+        None
+    }
+
     fn fill(
         &mut self,
         engine: &crate::Engine,
@@ -352,6 +383,9 @@ pub(super) extern "C" fn js_property_get_cached(
 ) -> Value {
     let cache = unsafe { &mut *cache };
     let context = unsafe { &*ctx };
+    if let Some(value) = cache.lookup(context.global.heap(), object) {
+        return value;
+    }
     if let Some(value) = cache.fill(context.engine, context.global.heap(), object) {
         return value;
     }
@@ -363,32 +397,6 @@ pub(super) extern "C" fn js_property_get_baseline(
     object: Value,
     cache: *mut PropertyCache,
 ) -> Value {
-    let cache = unsafe { &mut *cache };
-    if cache.megamorphic == 0 {
-        let context = unsafe { &mut *ctx };
-        let entries = std::iter::once(&cache.entry)
-            .take(cache.len.min(1) as usize)
-            .chain(
-                cache
-                    .overflow
-                    .iter()
-                    .flat_map(|entries| entries.iter().take(cache.len.saturating_sub(1) as usize)),
-            );
-        for entry in entries {
-            if entry.builtin_kind != 0 {
-                continue;
-            }
-            if let Some(value) = context.global.heap().cached_property_hit(
-                object,
-                entry.shape,
-                entry.holder,
-                entry.holder_shape,
-                entry.index,
-            ) {
-                return context.retain(value);
-            }
-        }
-    }
     let value = js_property_get_cached(ctx, object, cache);
     unsafe { &mut *ctx }.retain(value)
 }
@@ -789,7 +797,7 @@ mod cache_tests {
         }
         for name in ["d", "c", "b", "a"] {
             let object = engine.global().get_raw(name).unwrap();
-            cache.fill(&engine, heap, object);
+            assert_eq!(cache.lookup(heap, object), heap.property(object, "x"));
             assert_eq!(cache.len, 4);
             assert_eq!(cache.megamorphic, 0);
         }
@@ -798,6 +806,7 @@ mod cache_tests {
         assert_eq!(cache.megamorphic, 1);
         let first = engine.global().get_raw("a").unwrap();
         assert_eq!(cache.fill(&engine, heap, first), None);
+        assert_eq!(cache.lookup(heap, first), None);
         assert_eq!(cache.len, 4);
     }
 
@@ -813,14 +822,46 @@ mod cache_tests {
             Some(Value::number(1.0))
         );
         let old_holder_shape = cache.entry.holder_shape;
+        assert_eq!(
+            cache.lookup(engine.global().heap(), object),
+            Some(Value::number(1.0))
+        );
         engine.call("update", &[]).unwrap();
+        assert_eq!(cache.lookup(engine.global().heap(), object), None);
         assert_eq!(
             cache.fill(&engine, engine.global().heap(), object),
             Some(Value::number(2.0))
         );
         assert_ne!(cache.entry.holder_shape, old_holder_shape);
+        assert_eq!(
+            cache.lookup(engine.global().heap(), object),
+            Some(Value::number(2.0))
+        );
         assert_eq!(cache.len, 1);
         assert!(cache.overflow.is_none());
+    }
+
+    #[test]
+    fn builtin_cache_hits_require_the_receiver_kind() {
+        let engine = engine("var a=[1]; var b=[2]; var s='text'; var o={slice:7};");
+        let heap = engine.global().heap();
+        let a = engine.global().get_raw("a").unwrap();
+        let b = engine.global().get_raw("b").unwrap();
+        let s = engine.global().get_raw("s").unwrap();
+        let o = engine.global().get_raw("o").unwrap();
+        let mut cache = PropertyCache::new("slice", None, false);
+        assert_eq!(cache.lookup(heap, a), None);
+        let array_method = cache.fill(&engine, heap, a).unwrap();
+        assert_eq!(cache.lookup(heap, b), Some(array_method));
+        assert_eq!(cache.lookup(heap, s), None);
+        assert_eq!(cache.lookup(heap, o), None);
+        assert_eq!(cache.lookup(heap, Value::NULL), None);
+        let string_method = cache.fill(&engine, heap, s).unwrap();
+        assert_ne!(array_method, string_method);
+        assert_eq!(cache.lookup(heap, s), Some(string_method));
+        assert_eq!(cache.lookup(heap, a), Some(array_method));
+        assert_eq!(cache.fill(&engine, heap, o), Some(Value::number(7.0)));
+        assert_eq!(cache.lookup(heap, o), Some(Value::number(7.0)));
     }
 
     #[test]

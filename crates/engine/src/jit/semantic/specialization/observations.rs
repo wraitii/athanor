@@ -93,9 +93,8 @@ pub(in crate::jit::semantic) fn plan(
             match data.op {
                 Op::GetIndex(object, _)
                 | Op::SetIndex(object, _, _)
-                | Op::TypedIndex(object, _, super::super::TypedRead { element: None, .. })
-                    if super::regions::element_guess(graph, object).is_none() =>
-                {
+                | Op::TypedIndex(object, _, super::super::TypedRead { element: None, .. }) => {
+                    // OSR inputs lose constructor-based guesses, so keep receiver feedback.
                     before = Some((object, Observation::Read(ReadKind::Receiver)));
                 }
                 Op::Call {

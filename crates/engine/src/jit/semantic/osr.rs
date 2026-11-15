@@ -633,6 +633,69 @@ mod tests {
     }
 
     #[test]
+    fn inferred_typed_inputs_keep_receiver_feedback_for_osr() {
+        use crate::heap::TypedKind;
+        use crate::jit::profile::{ReadKind, ReadType};
+
+        let graph = graph(
+            "function f(n){const xs=Int32Array.from([1,2]);let sum=0;for(let i=0;i<n;++i)sum+=xs[i%2];return sum;}",
+        );
+        let plan = Plan::discover(&graph, 7).unwrap();
+        let candidate = &plan.loops[0];
+        let opportunity = candidate
+            .opportunities
+            .iter()
+            .find(|opportunity| opportunity.kind == Observation::Read(ReadKind::Receiver))
+            .unwrap();
+        let Op::Observe(receiver, _, _) = graph.insts[opportunity.inst].op else {
+            panic!()
+        };
+        assert_eq!(
+            super::super::specialization::regions::element_guess(&graph, receiver),
+            Some(TypedKind::Int32)
+        );
+        assert!(
+            candidate
+                .transfer
+                .as_ref()
+                .unwrap()
+                .inputs
+                .contains(&receiver)
+        );
+        let mut extracted = plan.extract(0).unwrap();
+        let mut repository = super::super::specialization::calls::Repository::default();
+        repository.read_feedback.insert(
+            (opportunity.site, ReadKind::Receiver),
+            ReadType::Typed(TypedKind::Int32),
+        );
+        super::super::specialization::observations::plan(&mut extracted, Some((&repository, 7)));
+        let reads = super::super::specialization::reads::plan(&extracted, &repository, 7);
+        assert_eq!(reads.len(), 1);
+        assert_eq!(reads[0].element, Some(TypedKind::Int32));
+        super::super::specialization::reads::apply(&mut extracted, &reads, &mut Vec::new())
+            .unwrap();
+        assert!(
+            extracted
+                .blocks
+                .values()
+                .any(|block| block.insts.iter().any(|&inst| {
+                    matches!(
+                        extracted.insts[inst].op,
+                        Op::TypedIndex(
+                            _,
+                            _,
+                            super::super::TypedRead {
+                                element: Some(TypedKind::Int32),
+                                ..
+                            }
+                        )
+                    )
+                }))
+        );
+        extracted.verify().unwrap();
+    }
+
+    #[test]
     fn extracted_inputs_keep_known_storage_and_numeric_hints() {
         use crate::jit::profile::{ReadKind, ReadType};
         let mut graph = graph(

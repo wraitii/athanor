@@ -226,6 +226,13 @@ impl Heap {
         Some((kind, function))
     }
 
+    pub(crate) fn has_kind(&self, receiver: Value, kind: u32) -> bool {
+        let data = self.0.borrow();
+        heap_id(receiver)
+            .and_then(|id| data.live(id))
+            .is_some_and(|slot| slot.kind == kind)
+    }
+
     /// Returned values are borrowed; native functions and lazy prototypes are resolved by the caller.
     pub(crate) fn read_property(&self, receiver: Value, name: &str) -> Option<PropertyRead> {
         use NativeFunction::*;
