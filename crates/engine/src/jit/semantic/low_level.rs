@@ -15,7 +15,7 @@ pub(in crate::jit) enum CallTarget {
     Indirect(Value),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(in crate::jit) enum Unary {
     BitNot,
     FloatNeg,
@@ -35,7 +35,7 @@ pub(in crate::jit) enum Unary {
     SignedSaturatingFromFloat,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(in crate::jit) enum Binary {
     Add,
     Subtract,

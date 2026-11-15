@@ -1,6 +1,37 @@
 use js_engine::{Engine, EngineOptions, Value};
 
 #[test]
+fn floating_consumers_preserve_numbers_after_integer_feedback() {
+    let mut engine = Engine::with_options(EngineOptions {
+        background_compile: false,
+        ..Default::default()
+    })
+    .unwrap();
+    engine
+        .compile(
+            "function make(value){return {value};}
+         function scaled(object){return object.value*0.5;}
+         function change(object,value){object.value=value;}",
+            "floating_consumers.js",
+        )
+        .unwrap();
+    let object = engine.call("make", &[Value::number(7.0)]).unwrap();
+    for _ in 0..16 {
+        assert_eq!(
+            engine.call("scaled", &[object.value()]).unwrap().value(),
+            Value::number(3.5)
+        );
+    }
+    for number in [-0.0, 1.25, -3.5, f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+        engine
+            .call("change", &[object.value(), Value::number(number)])
+            .unwrap();
+        let actual = engine.call("scaled", &[object.value()]).unwrap().value();
+        assert_eq!(actual, Value::number(number * 0.5));
+    }
+}
+
+#[test]
 fn numeric_loop_continuations_preserve_accumulators_and_shared_bounds() {
     let source = r#"
         function accumulate(rows, offsets, bound) {

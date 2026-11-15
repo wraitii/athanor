@@ -16,6 +16,34 @@ pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) -> bool {
     arithmetic(function) || checks
 }
 
+pub(in crate::jit::semantic) fn relax_checks(function: &mut FunctionState) {
+    let graph = &mut function.graph;
+    let uses = graph.use_counts();
+    let mut changed = false;
+    for block in super::super::Cfg::new(graph).rpo {
+        for inst in graph.blocks[block].insts.clone() {
+            let Op::IntegerCheck(value, float, exact) = graph.insts[inst].op else {
+                continue;
+            };
+            let Some(Op::NumericFloat(integer)) = graph.defining_op(exact) else {
+                continue;
+            };
+            // The round trip now serves only the guard, with no integer consumers.
+            if uses[exact] == 1
+                && uses[*integer] == 1
+                && matches!(graph.defining_op(*integer), Some(Op::SaturatingInteger(input)) if *input == float)
+                && matches!(graph.defining_op(float), Some(Op::NumericFloat(input)) if *input == value)
+            {
+                graph.set_op(inst, Op::IsNumber(value));
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        function.invalidate_values();
+    }
+}
+
 fn lower_checks(function: &mut FunctionState) -> bool {
     if function.graph.generator || function.graph.has_handlers {
         return false;

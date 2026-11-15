@@ -25,10 +25,8 @@ mod propose;
 mod versioning;
 
 use super::super::transforms::repair;
-pub(in crate::jit::semantic) use analysis::requirements;
-use analysis::{
-    Requirement, Writes, closure_failure, closure_failure_with, conflicts, guarded_accesses,
-};
+use analysis::{Requirement, closure_failure, closure_failure_with, conflicts, guarded_accesses};
+pub(in crate::jit::semantic) use analysis::{Writes, requirements};
 #[cfg(test)]
 pub(in crate::jit::semantic) use planning::version;
 pub(in crate::jit::semantic) use planning::{materialize_properties, version_with_report};
@@ -489,75 +487,15 @@ pub(in crate::jit::semantic) fn normalise_regions(
 }
 
 pub(in crate::jit::semantic) fn hoist(function: &mut FunctionState, region: RegionId) {
-    function.ensure_cfg();
-    let region = function.graph.regions[region].blocks.clone();
-    let loops = natural_loops(&function.graph, &function.facts.cfg);
-    for (header, body) in loops {
-        if !body.is_subset(&region) {
-            continue;
-        }
-        function.ensure_facts();
-        let FunctionState {
-            graph,
-            facts,
-            notes,
-            ..
-        } = function;
-        let cfg = &facts.cfg;
-        let Some(preheader) = preheader(graph, cfg, header, &body) else {
-            continue;
-        };
-        let writes = Writes::with_facts(graph, &body, &*facts);
-        let invariant = |graph: &Graph, op: &Op| {
-            op.operands_iter()
-                .all(|value| !body.contains(&graph.def_block(value)))
-        };
-        let mut moved = Vec::new();
-        for inst in graph.blocks[header].insts.clone() {
-            let data = &graph.insts[inst];
-            if matches!(data.op, Op::ReadHint(..)) {
-                continue;
-            }
-            let pure = facts.is_pure(inst);
-            if !data.results.is_empty()
-                && invariant(graph, &data.op)
-                && (pure || writes.preserves(graph, inst))
-            {
-                moved.push(inst);
-                graph.move_inst(inst, preheader);
-            } else if !pure {
-                break;
-            }
-        }
-        for &block in cfg.rpo.iter().filter(|block| body.contains(block)) {
-            for inst in graph.blocks[block].insts.clone() {
-                let data = &graph.insts[inst];
-                if !data.results.is_empty()
-                    && (facts.is_pure(inst)
-                        || (facts.removable(inst) && writes.preserves(graph, inst)))
-                    && invariant(graph, &data.op)
-                {
-                    moved.push(inst);
-                    graph.move_inst(inst, preheader);
-                }
-            }
-        }
-        let changed = !moved.is_empty();
-        for inst in moved {
-            let data = &graph.insts[inst];
-            notes.push(format!(
-                "{} = {} hoisted from {header} to {preheader}",
-                data.results
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                graph.op_text(&data.op)
-            ));
-        }
-        if changed {
-            function.invalidate_values();
-        }
+    function.ensure_facts();
+    let scope = function.graph.regions[region].blocks.clone();
+    if super::super::transforms::licm::hoist(
+        &mut function.graph,
+        &function.facts,
+        Some(&scope),
+        &mut function.notes,
+    ) {
+        function.invalidate_values();
     }
 }
 

@@ -1952,7 +1952,7 @@ fn numeric_lowering_reuses_guard_conversions_across_calls() {
     function.ensure_values();
     assert_eq!(function.facts.of(integer), ValueType::INT64);
     let graph = &function.graph;
-    let Some(Op::IntegerCheck(_, _, exact)) = graph.defining_op(guard) else {
+    let Some(Op::IntegerCheck(_, float, _)) = graph.defining_op(guard) else {
         panic!()
     };
     let Some(Op::LowLevel(low_level::Op::Binary {
@@ -1963,13 +1963,25 @@ fn numeric_lowering_reuses_guard_conversions_across_calls() {
     else {
         panic!()
     };
-    assert_eq!(left, exact);
+    assert_eq!(left, float);
     assert_eq!(
         ops(graph)
             .iter()
             .filter(|op| matches!(op, Op::SaturatingInteger(_)))
             .count(),
         1
+    );
+    super::js::simplify(&mut function);
+    numeric::relax_checks(&mut function);
+    super::js::simplify(&mut function);
+    assert!(matches!(
+        function.graph.defining_op(guard),
+        Some(Op::IsNumber(_))
+    ));
+    assert!(
+        !ops(&function.graph)
+            .iter()
+            .any(|op| matches!(op, Op::SaturatingInteger(_)))
     );
 }
 
@@ -2464,7 +2476,7 @@ fn runtime_conversions_leave_backend_neutral_operations() {
         },
     )
     .unwrap();
-    assert_eq!(passes.last().unwrap(), "scalar-semantics");
+    assert_eq!(passes.last().unwrap(), "scalar-cleanup");
     assert!(!ops(&graph).iter().any(|op| matches!(op,
         Op::Convert(value, Repr::I32 | Repr::Boolean) if *value == number
     )));
@@ -3004,6 +3016,121 @@ fn low_level_variables_resolve_long_forwarding_chain() {
         &graph.blocks[block].terminator.as_ref().unwrap().kind,
         TerminatorKind::ReturnValues(values) if values == &[input]
     ));
+}
+
+#[test]
+fn scalar_value_numbering_keeps_words_distinct_from_numbers() {
+    use cranelift_codegen::ir::{AbiParam, Signature, types};
+    use cranelift_codegen::isa::CallConv;
+    let mut signature = Signature::new(CallConv::SystemV);
+    signature.returns.extend([AbiParam::new(types::I64); 2]);
+    let mut graph = Graph::new_low_level("words".into(), Span::new(0, 0), signature);
+    let entry = graph.entry;
+    let mut builder = low_level::Builder::new(&mut graph);
+    builder.switch_to_block(entry);
+    let word = builder.ins().iconst(types::I64, 7);
+    let number = builder.ins().iconst(types::I64, 7);
+    builder.graph.reprs[word] = Some(Repr::Word);
+    builder.graph.reprs[number] = Some(Repr::I64);
+    builder.ins().return_(&[word, number]);
+    reuse::lowered(&mut graph);
+    graph.verify().unwrap();
+    assert!(
+        matches!(&graph.blocks[entry].terminator.as_ref().unwrap().kind,
+        TerminatorKind::ReturnValues(values) if values == &[word, number])
+    );
+}
+
+#[test]
+fn lowered_value_numbering_preserves_loads_across_effects() {
+    use cranelift_codegen::ir::{AbiParam, MemFlagsData, Signature, types};
+    use cranelift_codegen::isa::CallConv;
+    for boundary in 0..3 {
+        let mut signature = Signature::new(CallConv::SystemV);
+        signature
+            .params
+            .extend([AbiParam::new(types::I64), AbiParam::new(types::I64)]);
+        signature.returns.extend([AbiParam::new(types::I64); 4]);
+        let mut graph = Graph::new_low_level("reuse".into(), Span::new(0, 0), signature.clone());
+        let entry = graph.entry;
+        let mut builder = low_level::Builder::new(&mut graph);
+        builder.append_block_params_for_function_params(entry);
+        builder.switch_to_block(entry);
+        let address = builder.block_params(entry)[0];
+        let input = builder.block_params(entry)[1];
+        let first = builder
+            .ins()
+            .load(types::I64, MemFlagsData::trusted(), address, 0);
+        let sum = builder.ins().iadd(address, input);
+        if boundary == 1 {
+            builder
+                .ins()
+                .store(MemFlagsData::trusted(), input, address, 0);
+        } else if boundary == 2 {
+            let signature = builder.import_signature(signature);
+            builder
+                .ins()
+                .call_indirect(signature, address, &[address, input]);
+        }
+        let second = builder
+            .ins()
+            .load(types::I64, MemFlagsData::trusted(), address, 0);
+        let repeated = builder.ins().iadd(address, input);
+        builder.ins().return_(&[first, second, sum, repeated]);
+        reuse::lowered(&mut graph);
+        graph.verify().unwrap();
+        let TerminatorKind::ReturnValues(values) =
+            &graph.blocks[entry].terminator.as_ref().unwrap().kind
+        else {
+            panic!()
+        };
+        assert_eq!(values[0] == values[1], boundary == 0);
+        assert_eq!(values[2], values[3]);
+    }
+}
+
+#[test]
+fn scalar_cleanup_hoists_conversions_without_speculating_loads() {
+    use cranelift_codegen::ir::{AbiParam, MemFlagsData, Signature, types};
+    use cranelift_codegen::isa::CallConv;
+    let mut signature = Signature::new(CallConv::SystemV);
+    signature
+        .params
+        .extend([AbiParam::new(types::I64), AbiParam::new(types::F64)]);
+    signature.returns.push(AbiParam::new(types::I64));
+    let mut graph = Graph::new_low_level("hoist".into(), Span::new(0, 0), signature);
+    let entry = graph.entry;
+    let mut builder = low_level::Builder::new(&mut graph);
+    builder.append_block_params_for_function_params(entry);
+    builder.switch_to_block(entry);
+    let address = builder.block_params(entry)[0];
+    let input = builder.block_params(entry)[1];
+    let header = builder.create_block();
+    let body = builder.create_block();
+    let exit = builder.create_block();
+    builder.ins().jump(header, &[]);
+    builder.switch_to_block(header);
+    let condition = builder.ins().icmp_imm_s(
+        cranelift_codegen::ir::condcodes::IntCC::NotEqual,
+        address,
+        0,
+    );
+    builder.ins().brif(condition, body, &[], exit, &[]);
+    builder.switch_to_block(body);
+    let converted = builder.ins().fcvt_to_sint_sat(types::I64, input);
+    let loaded = builder
+        .ins()
+        .load(types::I64, MemFlagsData::trusted(), address, 0);
+    builder
+        .ins()
+        .store(MemFlagsData::trusted(), converted, address, 0);
+    builder.ins().jump(header, &[]);
+    builder.switch_to_block(exit);
+    builder.ins().return_(&[address]);
+    reuse::lowered(&mut graph);
+    graph.verify().unwrap();
+    assert_eq!(graph.def_block(converted), entry);
+    assert_eq!(graph.def_block(loaded), body);
 }
 
 #[test]

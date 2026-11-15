@@ -120,6 +120,7 @@ pub(in crate::jit) const LOW_LEVEL_PASSES: &[&str] = &[
     "ownership-lower",
     "unbox",
     "scalar-semantics",
+    "scalar-cleanup",
     "aarch64-select",
     "legalize-convert",
     "bits",
@@ -143,6 +144,8 @@ pub(in crate::jit) fn lower_low_level(
     legalize::prepare(graph);
     repr::lower_conversions(&mut low_level::Builder::new(graph))?;
     after("scalar-semantics", graph);
+    reuse::lowered(graph);
+    after("scalar-cleanup", graph);
     graph.verify()
 }
 
@@ -542,6 +545,9 @@ pub(in crate::jit) fn optimize_specialized(
     }
     if numeric::lower(&mut function) {
         reuse::reuse_loads(&mut function);
+        js::simplify(&mut function);
+        numeric::relax_checks(&mut function);
+        js::simplify(&mut function);
         for region in &regions {
             regions::hoist(&mut function, *region);
             function.graph.verify()?;

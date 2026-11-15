@@ -9,6 +9,17 @@ use super::{Block, Cfg, Facts, Graph, Inst, Op, TerminatorKind, Value, resolve};
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(super) enum LoadKey {
+    Integer(cranelift_codegen::ir::Type, u64),
+    Float64(u64),
+    ScalarBinary(super::low_level::Binary, Value, Value),
+    ScalarUnary(super::low_level::Unary, cranelift_codegen::ir::Type, Value),
+    Convert(Value, super::Repr),
+    Load(
+        cranelift_codegen::ir::Type,
+        Value,
+        i32,
+        cranelift_codegen::ir::MemFlagsData,
+    ),
     ToInt32(Value),
     NumericFloat(Value),
     IntCompare(IntCC, Value, Value),
@@ -65,6 +76,8 @@ fn load_key(
 ) -> Option<LoadKey> {
     let at = |value: &Value| resolve(aliases, *value);
     Some(match op {
+        Op::LowLevel(super::low_level::Op::Integer { ty, bits }) => LoadKey::Integer(*ty, *bits),
+        Op::LowLevel(super::low_level::Op::Float64(bits)) => LoadKey::Float64(*bits),
         Op::Get(object, name) | Op::ShapedGet(object, name, _) => {
             LoadKey::Property(at(object), name.clone())
         }
@@ -89,6 +102,19 @@ fn load_key(
         }
         Op::SaturatingInteger(value) => LoadKey::SaturatingInteger(at(value)),
         Op::ToInt32(value) => LoadKey::ToInt32(at(value)),
+        Op::Convert(value, repr) if pure => LoadKey::Convert(at(value), *repr),
+        Op::LowLevel(super::low_level::Op::Binary { op, left, right }) if pure => {
+            LoadKey::ScalarBinary(*op, at(left), at(right))
+        }
+        Op::LowLevel(super::low_level::Op::Unary { op, ty, value }) if pure => {
+            LoadKey::ScalarUnary(*op, *ty, at(value))
+        }
+        Op::LowLevel(super::low_level::Op::Load {
+            ty,
+            address,
+            offset,
+            flags,
+        }) => LoadKey::Load(*ty, at(address), *offset, *flags),
         Op::LowLevel(super::low_level::Op::IntCompare {
             condition,
             left,
@@ -131,6 +157,11 @@ fn load_key(
 
 fn read_access(op: &Op, facts: &Facts) -> Option<Access> {
     match op {
+        Op::LowLevel(super::low_level::Op::Load { .. }) => Some(Access {
+            location: super::super::effects::Locations::HEAP,
+            base: None,
+            field: super::access::Field::Any,
+        }),
         Op::ProbeGlobal(name) => Access::read(&Op::GlobalRead(name.clone()), facts),
         _ => Access::read(op, facts),
     }
@@ -148,12 +179,7 @@ fn step(
     let data = &graph.insts[inst];
     let memory = facts.memory(inst);
     if memory.reenters() {
-        state.retain(|key, _| {
-            matches!(
-                key,
-                LoadKey::NumericFloat(_) | LoadKey::SaturatingInteger(_)
-            )
-        });
+        state.retain(|_, entry| entry.read.is_none());
         return None;
     }
     if memory.writes_state() {
@@ -174,7 +200,17 @@ fn step(
         return None;
     };
     let result = *result;
-    if let Some(entry) = state.get(&key) {
+    if let Some(entry) = state.get(&key)
+        && (!matches!(
+            key,
+            LoadKey::Integer(..)
+                | LoadKey::Float64(..)
+                | LoadKey::ScalarBinary(..)
+                | LoadKey::ScalarUnary(..)
+                | LoadKey::Convert(..)
+                | LoadKey::Load(..)
+        ) || graph.repr(entry.value) == graph.repr(result))
+    {
         return Some(Reuse::Value(entry.value));
     }
     let excluded = match &key {

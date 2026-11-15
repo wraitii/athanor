@@ -72,7 +72,9 @@ cargo run -p js-runner -- --compile --filter paint --planner --clif --asm SCRIPT
 
 Use `--after PASS` to inspect runtime lowering boundaries, including `boxing`,
 `finalize-runtime`, `scratch`, `cleanup`, `ownership-lower`, `unbox`,
-`scalar-semantics`, `legalize-convert`, `bits`, and `cranelift-memory`.
+`scalar-semantics`, `scalar-cleanup`, `legalize-convert`, `bits`, and `cranelift-memory`.
+`scalar-cleanup` reuses lowered scalar expressions and loads, and hoists pure
+loop invariants. Calls and writes invalidate memory reads.
 `scalar-semantics` materializes numeric truthiness, wrapping and saturating
 conversions before backend preparation. Ordinary scalar conversions and compound
 bit operations remain in the shared graph. `legalize-convert`, `bits`, and

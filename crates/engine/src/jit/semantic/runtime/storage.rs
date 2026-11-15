@@ -115,6 +115,7 @@ pub(in crate::jit::semantic) fn lower_stores(function: &mut FunctionState) {
     // Storage owns these references; preserve the function ownership plan while expanding them.
     use crate::heap::{INLINE_PROPERTY_LENGTH_OFFSET, LENGTH_OFFSET, SHAPE_OFFSET};
     use crate::jit::helpers::{CACHE_ADDITION_DESTINATION_OFFSET, CACHE_ADDITION_INDEX_OFFSET};
+    function.ensure_values();
     let graph = &mut function.graph;
     let mut checked = crate::FxHashMap::default();
     for block in Cfg::new(graph).rpo {
@@ -220,13 +221,19 @@ pub(in crate::jit::semantic) fn lower_stores(function: &mut FunctionState) {
                 super::super::dispatch::extend_regions(graph, block, first_block);
                 continue;
             }
-            at.add_effect(Op::LowLevel(low_level::Op::Reference {
-                op: low_level::Reference::Retain,
-                value,
-            }));
+            let types = function.facts.of(value);
+            if types == ValueType::default()
+                || !types.within(ValueType::PRIMITIVE.without(ValueType::STRING))
+            {
+                at.add_effect(Op::LowLevel(low_level::Op::Reference {
+                    op: low_level::Reference::Retain,
+                    value,
+                }));
+            }
             let word = at.as_word(value);
             at.ins().store(MemFlagsData::trusted(), word, address, 0);
             if let Some(old) = old {
+                let old = at.as_boxed(old);
                 at.add_effect(Op::LowLevel(low_level::Op::Reference {
                     op: low_level::Reference::Release {
                         heap: false,

@@ -10,6 +10,41 @@ fn check(source: &str, expected: f64) {
 }
 
 #[test]
+fn specialized_slot_stores_release_overwritten_values() {
+    for property in [false, true] {
+        let mut engine = Engine::with_options(EngineOptions {
+            background_compile: false,
+            ..Default::default()
+        })
+        .unwrap();
+        let source = if property {
+            "function make(){return {};}
+             function wrap(value){return {slot:value};}
+             function replace(object){object.slot=7;}"
+        } else {
+            "function make(){return {};}
+             function wrap(value){return [value];}
+             function replace(object){object[0]=7;}"
+        };
+        engine.compile(source, "slot_release.js").unwrap();
+        let warm = engine.call("wrap", &[Value::number(0.0)]).unwrap();
+        for _ in 0..16 {
+            engine.call("replace", &[warm.value()]).unwrap();
+        }
+        let old = engine.call("make", &[]).unwrap();
+        let stale = old.value();
+        let object = engine.call("wrap", &[stale]).unwrap();
+        drop(old);
+        engine.call("replace", &[object.value()]).unwrap();
+        engine.drain_disposals(1000);
+        assert!(
+            !engine.global().define("disposed", stale),
+            "property={property}"
+        );
+    }
+}
+
+#[test]
 fn allocation_results_are_released_after_forwarding_and_errors() {
     for ssa_opt in [false, true] {
         let mut engine = Engine::with_options(EngineOptions {
