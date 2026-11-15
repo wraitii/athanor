@@ -32,16 +32,17 @@ impl FunctionState {
 
     #[cfg(test)]
     pub(in crate::jit) fn lower_runtime(&mut self) -> Result<()> {
-        self.lower_runtime_observed(&mut |_, _| {})
+        self.lower_runtime_observed(false, &mut |_, _| {})
     }
 
     pub(in crate::jit) fn lower_runtime_observed(
         &mut self,
+        baseline: bool,
         after: &mut dyn FnMut(&str, &FunctionState),
     ) -> Result<()> {
         after("input", self);
         array_checks::generic_cold(self);
-        self.lower_js_observed(after)?;
+        self.lower_js_observed(baseline, after)?;
         array_checks::generic_cold(self);
         if self.optimize {
             self.lower_typed_storage()?;
@@ -54,7 +55,9 @@ impl FunctionState {
         transforms::promote(&mut self.graph, &mut self.notes);
         self.graph.verify()?;
         after("bindings", self);
-        properties::lower(self)?;
+        if !baseline {
+            properties::lower(self)?;
+        }
         after("properties", self);
         properties::lower_accesses(self)?;
         after("property-accesses", self);
@@ -208,7 +211,7 @@ pub(in crate::jit) fn lower_global(
         fallback: None,
         continuations,
     };
-    specialize_observed(planned, versioning, report_regions, None, after)
+    specialize_observed(planned, versioning, report_regions, None, false, after)
 }
 
 pub(in crate::jit) fn build_canonical(
@@ -457,6 +460,7 @@ pub(in crate::jit) fn specialize(
         versioning,
         report_regions,
         osr_source,
+        false,
         &mut |_, _| {},
     )
 }
@@ -479,6 +483,7 @@ pub(in crate::jit) fn specialize_observed(
     versioning: Versioning,
     report_regions: bool,
     osr_source: Option<usize>,
+    baseline: bool,
     after: &mut dyn FnMut(&str, &FunctionState),
 ) -> Result<FunctionState> {
     after("inline", &function);
@@ -501,9 +506,13 @@ pub(in crate::jit) fn specialize_observed(
         .iter()
         .copied()
         .collect();
-    property_accesses::assume(&mut function.graph, &function.plan.shapes);
-    reads::assume(&mut function.graph, &function.plan.reads);
-    reads::assume(&mut function.graph, &function.plan.stores);
+    if baseline {
+        property_accesses::assume_natives(&mut function.graph);
+    } else {
+        property_accesses::assume(&mut function.graph, &function.plan.shapes);
+        reads::assume(&mut function.graph, &function.plan.reads);
+        reads::assume(&mut function.graph, &function.plan.stores);
+    }
     captures::sink_closures(&mut function);
     if captures::lazy_captures(&mut function) {
         function.invalidate_cfg();
@@ -577,10 +586,14 @@ pub(in crate::jit) fn specialize_observed(
 
 impl FunctionState {
     pub(in crate::jit::semantic) fn lower_js(&mut self) -> Result<()> {
-        self.lower_js_observed(&mut |_, _| {})
+        self.lower_js_observed(false, &mut |_, _| {})
     }
 
-    fn lower_js_observed(&mut self, after: &mut dyn FnMut(&str, &FunctionState)) -> Result<()> {
+    fn lower_js_observed(
+        &mut self,
+        baseline: bool,
+        after: &mut dyn FnMut(&str, &FunctionState),
+    ) -> Result<()> {
         let Some(regions) = self.specialized_regions.take().filter(|_| self.optimize) else {
             self.ensure_facts();
             for &pass in RUNTIME_PASSES
@@ -592,10 +605,14 @@ impl FunctionState {
             }
             return Ok(());
         };
-        property_accesses::rewrite(&mut self.graph)?;
+        if !baseline {
+            property_accesses::rewrite(&mut self.graph)?;
+        }
         after("property-specialization", self);
-        reads::lower(&mut self.graph, &self.plan.reads, &mut self.notes)?;
-        writes::lower(&mut self.graph, &self.plan.stores)?;
+        if !baseline {
+            reads::lower(&mut self.graph, &self.plan.reads, &mut self.notes)?;
+            writes::lower(&mut self.graph, &self.plan.stores)?;
+        }
         after("indexed-accesses", self);
         self.invalidate_cfg();
         js::simplify(self);
@@ -620,7 +637,7 @@ impl FunctionState {
         }
         after("indexed-checks", self);
         self.invalidate_cfg();
-        let properties_changed = properties::lower(self)?;
+        let properties_changed = !baseline && properties::lower(self)?;
         let kinds_changed = array_checks::lower_array_kinds(self);
         if indexed_changed || properties_changed || kinds_changed {
             reuse::reuse_loads(self);

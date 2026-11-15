@@ -82,8 +82,9 @@ impl PassInspection {
     pub(super) fn lower_runtime(
         &mut self,
         state: &mut semantic::FunctionState,
+        baseline: bool,
     ) -> Result<(), String> {
-        state.lower_runtime_observed(&mut |name, state| self.observe(name, state))?;
+        state.lower_runtime_observed(baseline, &mut |name, state| self.observe(name, state))?;
         let Some(pass) = self.pass.as_deref() else {
             return Ok(());
         };

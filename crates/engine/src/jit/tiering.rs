@@ -506,6 +506,9 @@ impl Tiering {
         if !self.recompiles.borrow_mut().take(code) {
             return;
         }
+        self.log_prefetch_uses();
+        self.direct.reset_calls(code);
+        self.overflow_calls.borrow_mut().remove(&code);
         self.direct.set_pending(code, false);
         if !self.recompiles.borrow().has_pending() {
             self.compilation_state

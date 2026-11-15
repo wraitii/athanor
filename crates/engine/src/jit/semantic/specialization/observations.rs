@@ -2,7 +2,7 @@ use crate::{FxHashMap, FxHashSet};
 
 use crate::jit::profile::{Observation, ReadKind, ReadType, Site};
 
-use super::super::{Cfg, Facts, Graph, Op, ValueType};
+use super::super::{Cfg, Facts, Graph, Op, TerminatorKind, UnaryOp, Value, ValueType};
 use super::calls::Repository;
 
 pub(in crate::jit::semantic) fn plan(
@@ -45,6 +45,7 @@ pub(in crate::jit::semantic) fn plan(
             _ => None,
         })
         .collect();
+    let numeric_uses = numeric_uses(graph, &cfg);
     let mut numbers = Vec::new();
     for block in cfg.rpo {
         for inst in graph.blocks[block].insts.clone() {
@@ -126,7 +127,8 @@ pub(in crate::jit::semantic) fn plan(
             ) {
                 data.result()
                     .filter(|value| {
-                        facts.of(*value).intersects(ValueType::NUMBER)
+                        numeric_uses.contains(value)
+                            && facts.of(*value).intersects(ValueType::NUMBER)
                             && !facts.of(*value).within(ValueType::INTEGER)
                     })
                     .map(|value| (value, Observation::Read(ReadKind::Number)))
@@ -203,6 +205,41 @@ pub(in crate::jit::semantic) fn plan(
     numbers.sort_by_key(|(site, _)| (site.source, site.start, site.end));
     numbers.dedup();
     numbers
+}
+
+fn numeric_uses(graph: &Graph, cfg: &Cfg) -> FxHashSet<Value> {
+    let mut uses = FxHashSet::default();
+    for &block in &cfg.rpo {
+        for &inst in &graph.blocks[block].insts {
+            let op = &graph.insts[inst].op;
+            for (index, value) in op.operands_iter().enumerate() {
+                let non_numeric = match op {
+                    Op::Truthy(_)
+                    | Op::IsNullish(_)
+                    | Op::IsUndefined(_)
+                    | Op::Unary(UnaryOp::Not, _) => true,
+                    Op::Get(..)
+                    | Op::Set(..)
+                    | Op::Define(..)
+                    | Op::GetIndex(..)
+                    | Op::SetIndex(..)
+                    | Op::TypedIndex(..) => index == 0,
+                    _ => false,
+                };
+                if !non_numeric {
+                    uses.insert(value);
+                }
+            }
+        }
+        if let Some(terminator) = &graph.blocks[block].terminator {
+            for (index, value) in terminator.kind.operands_iter().enumerate() {
+                if !matches!(terminator.kind, TerminatorKind::Branch(..)) || index != 0 {
+                    uses.insert(value);
+                }
+            }
+        }
+    }
+    uses
 }
 
 pub(in crate::jit::semantic) fn numeric_hints(

@@ -931,7 +931,7 @@ impl Compiler {
             };
             if baseline.is_none() {
                 passes
-                    .lower_runtime(&mut graph)
+                    .lower_runtime(&mut graph, false)
                     .map_err(Error::Unsupported)?;
             }
             let inspection = super::inspect::Inspection::new(
@@ -1603,6 +1603,7 @@ impl Compiler {
             versioning,
             self.report_regions(),
             osr_source,
+            initial && tier == CompilationTier::Baseline,
             &mut |name, state| passes.observe(name, state),
         )
         .map_err(Error::Unsupported)?;
@@ -1644,7 +1645,7 @@ impl Compiler {
             self.data.push(baseline_data);
         } else {
             passes
-                .lower_runtime(&mut graph)
+                .lower_runtime(&mut graph, initial && tier == CompilationTier::Baseline)
                 .map_err(Error::Unsupported)?;
         }
         let listing = self.listing().then(|| graph.listing_lines());
@@ -1923,7 +1924,7 @@ impl Compiler {
             self.data.push(data);
         } else {
             passes
-                .lower_runtime(&mut state)
+                .lower_runtime(&mut state, false)
                 .map_err(Error::Unsupported)?;
         }
         let inspection =
@@ -2153,6 +2154,7 @@ impl Compiler {
                     },
                     self.report_regions(),
                     self.osr.then_some(self.source_name.0),
+                    false,
                     &mut |name, state| passes.observe(name, state),
                 )
             })
@@ -2233,7 +2235,9 @@ impl Compiler {
         if baseline.is_none()
             && let Some(graph) = &mut graph
         {
-            passes.lower_runtime(graph).map_err(Error::Unsupported)?;
+            passes
+                .lower_runtime(graph, false)
+                .map_err(Error::Unsupported)?;
         }
         let inspection = graph.as_ref().map_or_else(Default::default, |graph| {
             super::inspect::Inspection::new(

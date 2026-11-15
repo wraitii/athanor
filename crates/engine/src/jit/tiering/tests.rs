@@ -889,7 +889,7 @@ fn osr_request_queues_the_enclosing_function_before_return() {
     assert!(!engine.tiering.direct.warmed(code));
     site.entries.set(jit::osr::TICK);
     engine.tiering.osr_entry(site);
-    assert!(engine.tiering.direct.warmed(code));
+    assert!(!engine.tiering.direct.warmed(code));
     {
         let worker = engine.tiering.worker.borrow();
         let worker = worker.as_ref().unwrap();
@@ -907,10 +907,12 @@ fn osr_request_queues_the_enclosing_function_before_return() {
     finish_compilation(&engine);
     engine.tiering.request_compilation(code);
     let values = engine.global().get_raw("values").unwrap();
-    assert_eq!(
-        engine.call("hot", &[values]).unwrap().value(),
-        Value::number(6.0)
-    );
+    for _ in 0..jit::entries::RECOMPILE_WARMUP {
+        assert_eq!(
+            engine.call("hot", &[values]).unwrap().value(),
+            Value::number(6.0)
+        );
+    }
     assert!(
         engine
             .tiering
@@ -1231,7 +1233,7 @@ fn prefetched_closures_preserve_captures_and_lexical_this() {
 }
 
 #[test]
-fn background_recompilation_starts_after_eight_returns_and_guards_replacements() {
+fn background_recompilation_starts_after_warmup_and_guards_replacements() {
     let mut engine = background_engine();
     engine.compile(
         "var holder={items:[3]}; function read(a){return a.items[0];} function replace(){holder.items={0:9};}",
@@ -1241,7 +1243,7 @@ fn background_recompilation_starts_after_eight_returns_and_guards_replacements()
     let code = code(&engine, "read");
     let original = entry(&engine, code);
     let holder = engine.global().get_raw("holder").unwrap();
-    for _ in 0..7 {
+    for _ in 0..jit::entries::RECOMPILE_WARMUP - 1 {
         assert_eq!(
             engine.call("read", &[holder]).unwrap().value(),
             Value::number(3.0)
@@ -1306,7 +1308,7 @@ fn generated_dispatch_installs_background_results() {
     let read = code(&engine, "read");
     let original = entry(&engine, read);
     let holder = engine.global().get_raw("holder").unwrap();
-    for _ in 0..8 {
+    for _ in 0..jit::entries::RECOMPILE_WARMUP {
         engine.call("read", &[holder]).unwrap();
     }
     wait_ready(&engine);
@@ -1329,7 +1331,7 @@ fn background_warmup_counts_direct_calls_before_feedback() {
     ).unwrap();
     let code = code(&engine, "read");
     let callable = engine.global().get_raw("read").unwrap();
-    for _ in 0..7 {
+    for _ in 0..jit::entries::RECOMPILE_WARMUP - 1 {
         assert_eq!(
             engine
                 .call("drive", &[callable, Value::NULL])
@@ -1344,7 +1346,7 @@ fn background_warmup_counts_direct_calls_before_feedback() {
         engine.call("drive", &[callable, holder]).unwrap().value(),
         Value::number(3.0)
     );
-    assert!(engine.tiering.direct.warmed(code));
+    assert!(!engine.tiering.direct.warmed(code));
     assert!(
         engine
             .tiering
@@ -1369,7 +1371,7 @@ fn requests_during_background_compilation_are_coalesced_and_retained() {
         .unwrap();
     let code = code(&engine, "read");
     let holder = engine.global().get_raw("holder").unwrap();
-    for _ in 0..8 {
+    for _ in 0..jit::entries::RECOMPILE_WARMUP {
         engine.call("read", &[holder]).unwrap();
     }
     for _ in 0..3 {
@@ -1388,6 +1390,14 @@ fn requests_during_background_compilation_are_coalesced_and_retained() {
         1
     );
     assert!(engine.tiering.recompiles.borrow().has_pending());
+    finish_compilation(&engine);
+    assert!(engine.tiering.recompiles.borrow().has_pending());
+    for _ in 0..jit::entries::RECOMPILE_WARMUP - 1 {
+        engine.call("read", &[holder]).unwrap();
+    }
+    assert!(engine.tiering.recompiles.borrow().has_pending());
+    assert!(!engine.tiering.direct.warmed(code));
+    engine.call("read", &[holder]).unwrap();
     finish_compilation(&engine);
     assert!(!engine.tiering.recompiles.borrow().has_pending());
     assert_eq!(
@@ -1410,7 +1420,7 @@ fn background_versions_preserve_captures_heap_returns_and_foreign_errors() {
     let code = code(&engine, "invoke");
     let original = entry(&engine, code);
     let first = engine.call("invoke", &[input]).unwrap();
-    for _ in 1..8 {
+    for _ in 1..jit::entries::RECOMPILE_WARMUP {
         engine.call("invoke", &[input]).unwrap();
     }
     finish_compilation(&engine);
@@ -1485,7 +1495,7 @@ mod call_variant_tests {
         })
         .unwrap();
         engine.compile("function a(x){return x+x;} function b(x){return x*3;} function invoke(f,x){return f(x);}", "unspecialized-dispatch.js").unwrap();
-        for _ in 0..8 {
+        for _ in 0..jit::entries::RECOMPILE_WARMUP {
             for (name, expected) in [("a", 4.0), ("b", 6.0)] {
                 let callable = engine.global().get_raw(name).unwrap();
                 assert_eq!(
@@ -1522,7 +1532,7 @@ mod call_variant_tests {
             finish_compilation(&engine);
             let a = engine.global().get_raw("a").unwrap();
             let b = engine.global().get_raw("b").unwrap();
-            for _ in 0..16 {
+            for _ in 0..jit::entries::RECOMPILE_WARMUP {
                 for (object, expected) in [(a, 1.0), (b, 2.0)] {
                     assert_eq!(
                         engine.call("readX", &[object]).unwrap().value(),
@@ -1532,7 +1542,7 @@ mod call_variant_tests {
             }
             finish_compilation(&engine);
             for _ in 0..3 {
-                for _ in 0..16 {
+                for _ in 0..jit::entries::RECOMPILE_WARMUP {
                     for (name, object, expected) in [("useA", a, 11.0), ("useB", b, 22.0)] {
                         assert_eq!(
                             engine.call(name, &[object]).unwrap().value(),
@@ -1558,7 +1568,7 @@ mod call_variant_tests {
                 );
             }
             engine.call("change", &[a]).unwrap();
-            for _ in 0..16 {
+            for _ in 0..jit::entries::RECOMPILE_WARMUP {
                 assert_eq!(
                     engine.call("useA", &[a]).unwrap().value(),
                     Value::number(11.0)
@@ -1587,7 +1597,7 @@ mod call_variant_tests {
                 let a = engine.global().get_raw("a").unwrap();
                 let b = engine.global().get_raw("b").unwrap();
                 for name in ["read", "invoke"] {
-                    for _ in 0..16 {
+                    for _ in 0..jit::entries::RECOMPILE_WARMUP {
                         for object in [a, b] {
                             engine.call(name, &[object]).unwrap();
                         }
@@ -1627,7 +1637,7 @@ mod call_variant_tests {
                 }
                 engine.call("updatePrototype", &[]).unwrap();
                 let object = engine.global().get_raw("inherited").unwrap();
-                for _ in 0..16 {
+                for _ in 0..jit::entries::RECOMPILE_WARMUP {
                     let result = engine.call("invoke", &[object]).unwrap();
                     assert_eq!(
                         engine.call("value", &[result.value()]).unwrap().value(),
@@ -1653,7 +1663,7 @@ mod call_variant_tests {
             }
             engine.compile(&source, "megamorphic-read.js").unwrap();
             finish_compilation(&engine);
-            for _ in 0..8 {
+            for _ in 0..jit::entries::RECOMPILE_WARMUP {
                 for index in 0..6 {
                     let object = engine.global().get_raw(&format!("o{index}")).unwrap();
                     assert_eq!(
@@ -1703,7 +1713,7 @@ mod call_variant_tests {
                 }
                 for &(name, expected) in &targets {
                     let callable = engine.global().get_raw(name).unwrap();
-                    for _ in 0..12 {
+                    for _ in 0..jit::entries::RECOMPILE_WARMUP {
                         assert_eq!(
                             engine
                                 .call("invoke", &[callable, Value::number(10.0)])
@@ -1728,7 +1738,7 @@ mod call_variant_tests {
                 }
                 let settled = entry(&engine, invoke);
                 let fifth = engine.global().get_raw("e").unwrap();
-                for _ in 0..12 {
+                for _ in 0..jit::entries::RECOMPILE_WARMUP {
                     assert_eq!(
                         engine
                             .call("invoke", &[fifth, Value::number(10.0)])
@@ -1752,7 +1762,7 @@ mod call_variant_tests {
                 "specialized-dispatch.js",
             ).unwrap();
             finish_compilation(&engine);
-            for _ in 0..16 {
+            for _ in 0..jit::entries::RECOMPILE_WARMUP {
                 engine.call("outer", &[Value::number(10.0)]).unwrap();
             }
             finish_compilation(&engine);
@@ -1760,7 +1770,7 @@ mod call_variant_tests {
             let variants = variants(&engine, "dispatch");
             assert!(!variants.is_empty());
             engine.call("replace", &[]).unwrap();
-            for _ in 0..16 {
+            for _ in 0..jit::entries::RECOMPILE_WARMUP {
                 assert_eq!(
                     engine
                         .call("outer", &[Value::number(10.5)])
@@ -1822,7 +1832,7 @@ mod call_variant_tests {
         finish_compilation(&engine);
         let invoke = code(&engine, "invoke");
         let a = engine.global().get_raw("a").unwrap();
-        for _ in 0..12 {
+        for _ in 0..jit::entries::RECOMPILE_WARMUP {
             engine.call("invoke", &[a, Value::number(10.0)]).unwrap();
         }
         finish_compilation(&engine);
@@ -1835,6 +1845,9 @@ mod call_variant_tests {
             site,
         };
         engine.tiering.observe_call(&mut cache, code(&engine, "b"));
+        for _ in 0..jit::entries::RECOMPILE_WARMUP {
+            engine.call("invoke", &[a, Value::number(10.0)]).unwrap();
+        }
         engine.tiering.submit_compilation(invoke);
         assert!(
             engine
@@ -1847,6 +1860,9 @@ mod call_variant_tests {
                 .contains_key(&jit::recompile::Key::ordinary(invoke))
         );
         engine.tiering.observe_call(&mut cache, code(&engine, "c"));
+        for _ in 0..jit::entries::RECOMPILE_WARMUP {
+            engine.call("invoke", &[a, Value::number(10.0)]).unwrap();
+        }
         finish_compilation(&engine);
         assert!(
             selected(&engine, VariantId::ordinary(invoke))
@@ -1863,14 +1879,14 @@ mod call_variant_tests {
                 "variant-widening.js",
             ).unwrap();
             finish_compilation(&engine);
-            for _ in 0..16 {
+            for _ in 0..jit::entries::RECOMPILE_WARMUP {
                 engine.call("outer", &[Value::number(2.0)]).unwrap();
             }
             finish_compilation(&engine);
             let variants = variants(&engine, "read");
             assert!(!variants.is_empty());
             engine.call("fraction", &[]).unwrap();
-            for _ in 0..16 {
+            for _ in 0..jit::entries::RECOMPILE_WARMUP {
                 assert_eq!(
                     engine.call("outer", &[Value::number(2.0)]).unwrap().value(),
                     Value::number(2.5)

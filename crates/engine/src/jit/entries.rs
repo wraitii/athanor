@@ -59,8 +59,8 @@ pub(crate) const DIRECT_ENTRY_SIZE: usize = 4 * std::mem::size_of::<usize>();
 pub(crate) const DIRECT_ADAPTER_OFFSET: usize = std::mem::size_of::<usize>();
 pub(crate) const DIRECT_ARITY_OFFSET: usize = 2 * std::mem::size_of::<usize>();
 pub(crate) const DIRECT_CALLS_OFFSET: usize = 3 * std::mem::size_of::<usize>();
-pub(crate) const RECOMPILE_WARMUP: usize = 8;
-pub(crate) const RECOMPILE_PENDING: usize = 16;
+pub(crate) const RECOMPILE_WARMUP: usize = 32;
+pub(crate) const RECOMPILE_PENDING: usize = 64;
 const WORDS: usize = DIRECT_ENTRY_SIZE / std::mem::size_of::<usize>();
 
 /// Each variant slot has a fixed-arity entry, an argument adapter, and its arity plus one.
@@ -119,6 +119,13 @@ impl DirectEntries {
         }
         let slot = &self.0[code as usize * WORDS + 3];
         slot.set((slot.get() & RECOMPILE_PENDING) | RECOMPILE_WARMUP);
+    }
+
+    pub(crate) fn reset_calls(&self, code: u64) {
+        if code < DIRECT_ENTRIES as u64 {
+            let slot = &self.0[code as usize * WORDS + 3];
+            slot.set(slot.get() & RECOMPILE_PENDING);
+        }
     }
 
     pub(crate) fn set_pending(&self, code: u64, pending: bool) {

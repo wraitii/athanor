@@ -53,6 +53,49 @@ fn ops(graph: &Graph) -> Vec<&Op> {
 }
 
 #[test]
+fn baseline_keeps_generic_property_accesses() {
+    let graph = lower_source("function f(a, k, v) { a.x = v; return a.y + a[k]; }").unwrap();
+    let function = canonicalize_graph(graph, true).unwrap();
+    let planned = inline_and_plan_specialization(function, true, None, 1).unwrap();
+    let mut function = specialize_observed(
+        planned,
+        Versioning::Generic,
+        false,
+        None,
+        true,
+        &mut |_, _| {},
+    )
+    .unwrap();
+    let mut checked = false;
+    function
+        .lower_runtime_observed(true, &mut |stage, function| {
+            if stage != "property-accesses" {
+                return;
+            }
+            let operations = ops(&function.graph);
+            assert!(
+                operations
+                    .iter()
+                    .any(|op| matches!(op, Op::Get(_, name) if name == "y"))
+            );
+            assert!(
+                operations
+                    .iter()
+                    .any(|op| matches!(op, Op::Set(_, name, _) if name == "x"))
+            );
+            assert!(operations.iter().any(|op| matches!(op, Op::GetIndex(..))));
+            assert!(
+                !operations
+                    .iter()
+                    .any(|op| matches!(op, Op::PropertyCache(..)))
+            );
+            checked = true;
+        })
+        .unwrap();
+    assert!(checked);
+}
+
+#[test]
 fn cfg_preserves_edge_order_and_deduplicates_successors() {
     let mut graph = lower_source("function f(a){return a;}").unwrap();
     let entry = graph.entry;
@@ -1057,6 +1100,32 @@ fn integer_facts_survive_loop_backedges_without_length_bounds() {
                     && facts.of(value).intersects(ValueType::INT64))
         );
     }
+}
+
+#[test]
+fn numeric_observations_skip_conditions_and_receivers() {
+    use crate::jit::profile::{Observation, ReadKind};
+
+    let source =
+        "function f(a) { if (a.flag) {} let x = a.shared; if (x) {} return a.object.value + x; }";
+    let mut graph = canonicalize_graph(lower_source(source).unwrap(), true)
+        .unwrap()
+        .graph;
+    observations::plan(&mut graph, None);
+    let observed: Vec<_> = ops(&graph)
+        .into_iter()
+        .filter_map(|op| match op {
+            Op::Observe(_, Observation::Read(ReadKind::Number), site) => {
+                Some(&source[site.start as usize..site.end as usize])
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(!observed.contains(&"a.flag"));
+    assert!(!observed.contains(&"a.object"));
+    assert!(observed.contains(&"a.object.value"));
+    assert!(observed.contains(&"a.shared"));
+    graph.verify().unwrap();
 }
 
 #[test]

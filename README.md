@@ -222,8 +222,9 @@ Independent jobs keep compiling without waiting for publication. Dependency
 tickets and inherited priorities support future callee preparation.
 
 Feedback requests are submitted at function return to the background compiler pool
-once the function has completed eight calls. Earlier feedback remains pending until
-that threshold is reached; calls before feedback also count. An OSR request makes
+once the function has completed 32 calls. Earlier feedback remains pending until
+that threshold is reached; calls before feedback also count. The call count resets
+when a feedback compilation is submitted. An OSR request makes
 the enclosing function eligible immediately and queues it after the loop fragment.
 Inlining is enabled by default; set `JS_JIT_INLINE=0` to disable JS function
 inlining in every compilation tier (`EngineOptions::inlining`).
@@ -272,7 +273,9 @@ synchronously at the next dispatch instead (`EngineOptions::background_compile`)
 Scheduling priority and compilation tier are separate. Demanded lazy, prefetch,
 and unlazify jobs use the baseline tier: Cranelift `opt_level=none`, with semantic
 optimization still enabled and speculative versioning only when generic-first is
-disabled. OSR and feedback jobs use the
+disabled. Initial baseline bodies leave generic named property and indexed
+accesses as helper calls rather than expanding their cache and array fast paths.
+OSR and feedback jobs use the
 optimized tier and `EngineOptions::opt_level` (default `speed`). Both tiers use
 the backtracking register allocator. Initial bodies retain the base inlining
 budget; OSR and feedback use the recompilation multiplier described above.
