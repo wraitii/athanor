@@ -46,6 +46,8 @@ pub(super) struct FunctionCompiler<'a, 'f> {
     module: &'a mut JITModule,
     helper_signatures: FxHashMap<Helper, SigRef>,
     source_names: FxHashMap<usize, i64>,
+    error_sites: FxHashMap<(usize, u32, u32), i64>,
+    error_dispatch: FxHashMap<Block, Block>,
     stubs: Stubs,
     annotations: &'a mut Annotations,
     pointer: Type,
@@ -285,6 +287,8 @@ fn lower_callable(
         module,
         helper_signatures: FxHashMap::default(),
         source_names: FxHashMap::default(),
+        error_sites: FxHashMap::default(),
+        error_dispatch: FxHashMap::default(),
         stubs,
         annotations,
         pointer,
@@ -393,9 +397,21 @@ impl FunctionCompiler<'_, '_> {
 
     pub(super) fn finish_failed_exit(&mut self) {
         if let Some(block) = self.error_origin {
+            for (target, dispatch) in std::mem::take(&mut self.error_dispatch) {
+                self.switch(dispatch);
+                let site = self.b.block_params(dispatch)[0];
+                let error = self.load_ctx(crate::jit::session::ERROR_OFFSET);
+                self.brif(error, block, &[site.into()], target, &[]);
+            }
             self.switch(block);
-            let args = self.b.block_params(block).to_vec();
-            self.call_helper(Helper::ErrorOrigin, &args);
+            let site = self.b.block_params(block)[0];
+            let flags = MemFlagsData::trusted();
+            let offset = self.b.ins().load(types::I64, flags, site, 0);
+            let source = self.b.ins().iadd(self.data_base, offset);
+            let span = self.b.ins().load(types::I64, flags, site, 8);
+            let start = self.b.ins().band_imm_u(span, u32::MAX as i64);
+            let end = self.b.ins().ushr_imm_s(span, 32);
+            self.call_helper(Helper::ErrorOrigin, &[source, start, end]);
             let exit = self.failed_exit();
             self.jump(exit, &[]);
         }

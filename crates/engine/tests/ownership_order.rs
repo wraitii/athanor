@@ -327,6 +327,10 @@ fn failed_calls_release_scratch_references_from_local_writes() {
                  witness = value;
                  value = flag ? [8] : [7];
                  return raise();
+             }
+             function caught(raise, flag){
+                 try { return main(raise, flag); }
+                 catch (error) { return error; }
              }",
                 "scratch_errors.js",
             )
@@ -334,8 +338,18 @@ fn failed_calls_release_scratch_references_from_local_writes() {
         for mode in [Value::TRUE, Value::FALSE] {
             let raise = engine.call("factory", &[mode]).unwrap();
             for _ in 0..16 {
-                for flag in [Value::TRUE, Value::FALSE] {
-                    assert!(engine.call("main", &[raise.value(), flag]).is_err());
+                for (function, flag) in [
+                    ("main", Value::TRUE),
+                    ("main", Value::FALSE),
+                    ("caught", Value::TRUE),
+                    ("caught", Value::FALSE),
+                ] {
+                    let result = engine.call(function, &[raise.value(), flag]);
+                    if function == "caught" && mode == Value::FALSE {
+                        assert_eq!(result.unwrap().value(), Value::number(13.0));
+                    } else {
+                        assert!(result.is_err());
+                    }
                     let witness = engine.global().get("witness").unwrap();
                     let stale = witness.value();
                     assert!(engine.global().set("witness", Value::UNDEFINED));

@@ -14,6 +14,7 @@ use crate::jit::helpers::{
 };
 use crate::jit::profile::{CallSite, Site};
 use crate::jit::semantic::DirectTarget;
+use crate::jit::semantic::low_level::Binary;
 use crate::jit::session::CALL_SITE_OFFSET;
 use crate::value::Value;
 
@@ -1140,22 +1141,25 @@ impl FunctionCompiler<'_, '_> {
         self.check_error();
     }
 
-    fn pending(&mut self, offset: i32, none: i64) -> LoweredValue {
-        let word = self
-            .b
-            .ins()
-            .load(types::I64, MemFlagsData::trusted(), self.ctx, offset);
-        self.b.ins().icmp_imm_s(IntCC::NotEqual, word, none)
-    }
-
     pub(super) fn check_error(&mut self) {
-        // Execution reaches a helper with no pending exception; catch entry clears it.
+        // Catch entry clears the exception before execution reaches another helper.
         let can_throw = self
             .b
             .current_block()
             .and_then(|_| self.b.last_helper())
             .is_none_or(|helper| helper.can_throw());
-        let condition = self.pending(crate::jit::session::ERROR_OFFSET, 0);
+        let engine_error = self.load_ctx(crate::jit::session::ERROR_OFFSET);
+        let condition = if can_throw {
+            let exception = self.load_ctx(crate::jit::session::EXCEPTION_OFFSET);
+            let empty = self
+                .b
+                .ins()
+                .iconst(types::I64, Value::UNINITIALIZED.bits() as i64);
+            let exception = self.b.ins().binary(Binary::Xor, exception, empty);
+            self.b.ins().binary(Binary::Or, engine_error, exception)
+        } else {
+            engine_error
+        };
         let failed = self.b.create_block();
         let done = self.b.create_block();
         self.b.set_cold_block(failed);
@@ -1166,51 +1170,46 @@ impl FunctionCompiler<'_, '_> {
             None => {
                 let block = self.b.create_block();
                 self.b.set_cold_block(block);
-                for _ in 0..3 {
-                    self.b.append_block_param(block, types::I64);
-                }
+                self.b.append_block_param(block, self.pointer);
                 self.error_origin = Some(block);
                 block
             }
         };
+        let key = (
+            self.source_name.0,
+            self.source_span.start,
+            self.source_span.end,
+        );
         let source_name = self.source_name;
-        let offset = *self
+        let source = *self
             .source_names
             .entry(source_name.0)
             .or_insert_with(|| self.data.push(source_name));
-        let source = self.data_address(offset);
-        let start = self
-            .b
-            .ins()
-            .iconst(types::I64, self.source_span.start as i64);
-        let end = self.b.ins().iconst(types::I64, self.source_span.end as i64);
-        self.unwind(
-            origin,
-            &[
-                BlockArg::Value(source),
-                BlockArg::Value(start),
-                BlockArg::Value(end),
-            ],
-        );
-        self.switch(done);
-        if !can_throw {
-            self.unchecked = None;
-            return;
+        let offset = *self.error_sites.entry(key).or_insert_with(|| {
+            self.data
+                .push([source as u64, u64::from(key.1) | (u64::from(key.2) << 32)])
+        });
+        let site = self.data_address(offset);
+        if can_throw {
+            let target = match self.handlers.last().copied() {
+                Some(handler) => handler,
+                None => self.failed_exit(),
+            };
+            // Sharing the destination also lets cleanup share its release ladders.
+            let dispatch = match self.error_dispatch.get(&target) {
+                Some(&block) => block,
+                None => {
+                    let block = self.b.create_block();
+                    self.b.set_cold_block(block);
+                    self.b.append_block_param(block, self.pointer);
+                    self.error_dispatch.insert(target, block);
+                    block
+                }
+            };
+            self.unwind(dispatch, &[site.into()]);
+        } else {
+            self.unwind(origin, &[site.into()]);
         }
-        let condition = self.pending(
-            crate::jit::session::EXCEPTION_OFFSET,
-            Value::UNINITIALIZED.bits() as i64,
-        );
-        let done = self.b.create_block();
-        let target = match self.handlers.last().copied() {
-            Some(handler) => handler,
-            None => self.failed_exit(),
-        };
-        let thrown = self.b.create_block();
-        self.b.set_cold_block(thrown);
-        self.brif(condition, thrown, &[], done, &[]);
-        self.switch(thrown);
-        self.unwind(target, &[]);
         self.switch(done);
         self.unchecked = None;
     }
