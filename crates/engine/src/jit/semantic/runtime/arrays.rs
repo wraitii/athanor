@@ -6,6 +6,27 @@ use super::super::dispatch::append;
 use super::super::{Constant, FunctionState, Graph, Inst, Op, Repr, Value, ValueType, low_level};
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 
+pub(in crate::jit::semantic) fn generic_cold(function: &mut FunctionState) {
+    let graph = &mut function.graph;
+    let mut changed = false;
+    for block in graph.cold.clone() {
+        for inst in graph.blocks[block].insts.clone() {
+            let op = match graph.insts[inst].op {
+                Op::ArrayLoad(object, index, _) | Op::TypedIndex(object, index, _) => {
+                    Op::GetIndex(object, index)
+                }
+                Op::ArrayStore(object, index, value) => Op::SetIndex(object, index, value),
+                _ => continue,
+            };
+            graph.set_op(inst, op);
+            changed = true;
+        }
+    }
+    if changed {
+        function.invalidate_values();
+    }
+}
+
 pub(in crate::jit::semantic) fn lower_arrays(function: &mut FunctionState) -> bool {
     function.ensure_values();
     let graph = &mut function.graph;

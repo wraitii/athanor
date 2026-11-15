@@ -40,7 +40,9 @@ impl FunctionState {
         after: &mut dyn FnMut(&str, &FunctionState),
     ) -> Result<()> {
         after("input", self);
+        array_checks::generic_cold(self);
         self.lower_js_observed(after)?;
+        array_checks::generic_cold(self);
         if self.optimize {
             self.lower_typed_storage()?;
         }

@@ -820,3 +820,40 @@ fn integer_feedback_guards_preserve_numeric_boundaries() {
         }
     }
 }
+
+#[test]
+fn cold_array_fallback_preserves_heap_values_and_numeric_coercion() {
+    let source = r#"
+        function update(input, output) {
+            let total = 0;
+            for (let i = 0; i < 4; ++i) {
+                output[i] = input[i];
+                total += input[i];
+            }
+            return total;
+        }
+        function main() {
+            const runner = {call: update};
+            const output = [0, 0, 0, 0];
+            for (let i = 0; i < 40; ++i)
+                runner.call([1, 2, 3, 4], output);
+            const input = [1, 2, "x", 4];
+            const result = runner.call(input, output);
+            return result === "3x4" && output[2] === "x" && output[3] === 4;
+        }
+    "#;
+    for ssa_opt in [false, true] {
+        let mut engine = Engine::with_options(EngineOptions {
+            ssa_opt,
+            inlining: false,
+            background_compile: false,
+            ..Default::default()
+        })
+        .unwrap();
+        engine.compile(source, "cold_array_fallback.js").unwrap();
+        assert_eq!(
+            engine.call("main", &[]).unwrap().value(),
+            Value::boolean(true)
+        );
+    }
+}

@@ -440,6 +440,7 @@ pub(in crate::jit::semantic) fn bitwise(function: &mut FunctionState) -> bool {
         .cfg
         .rpo
         .iter()
+        .filter(|block| !graph.cold.contains(block))
         .flat_map(|&block| graph.blocks[block].insts.iter().copied())
         .filter(|&inst| {
             matches!(graph.insts[inst].op, Op::Binary(
@@ -503,6 +504,7 @@ pub(in crate::jit::semantic) fn dispatch(function: &mut FunctionState) -> bool {
         .cfg
         .rpo
         .iter()
+        .filter(|block| !graph.cold.contains(block))
         .flat_map(|&block| graph.blocks[block].insts.iter().copied())
         .filter(|&inst| {
             numeric_operands(&graph.insts[inst].op).is_some_and(|operands| {
