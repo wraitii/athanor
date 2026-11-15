@@ -17,6 +17,7 @@ pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) -> super::su
         .cfg
         .rpo
         .iter()
+        .filter(|block| !graph.cold.contains(block))
         .flat_map(|&block| graph.blocks[block].insts.iter().copied())
         .filter(|&inst| {
             matches!(graph.insts[inst].op, Op::Get(..)) && !shapes.megamorphic(graph, inst)
@@ -90,6 +91,7 @@ fn lower_stores(graph: &mut Graph) -> bool {
     use cranelift_codegen::ir::{MemFlagsData, condcodes::IntCC, types};
     let stores: Vec<_> = Cfg::reverse_postorder(graph)
         .into_iter()
+        .filter(|block| !graph.cold.contains(block))
         .flat_map(|block| graph.blocks[block].insts.iter().copied())
         .filter(|&inst| {
             matches!(
@@ -205,6 +207,7 @@ pub(in crate::jit::semantic) fn lower_accesses(
     }
     function.ensure_facts();
     let graph = &mut function.graph;
+    let mut entries = crate::FxHashMap::default();
     for inst in accesses {
         let data = graph.insts[inst].clone();
         match data.op {
@@ -212,14 +215,38 @@ pub(in crate::jit::semantic) fn lower_accesses(
             Op::CachedProperty(object, cache, builtins)
             | Op::IsPropertyCached(object, cache, builtins) => {
                 let validate = matches!(data.op, Op::IsPropertyCached(..));
+                let cached = if validate && graph.blocks[data.block].insts.last() == Some(&inst) {
+                    match graph.blocks[data.block].terminator.as_ref().map(|term| &term.kind) {
+                        Some(TerminatorKind::Branch(condition, yes, no))
+                            if Some(*condition) == data.result()
+                                && yes.block != no.block
+                                && function.facts.cfg.preds[yes.block].len() == 1 =>
+                        {
+                            graph.blocks[yes.block].insts.first().copied().filter(|&next| {
+                                matches!(graph.insts[next].op, Op::CachedProperty(receiver, site, native)
+                                    if receiver == object && site == cache && native == builtins)
+                            })
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
                 let first = graph.blocks.len();
                 let (block, continuation, finish) = super::super::dispatch::split(graph, inst);
                 graph.remove_inst(inst);
                 graph.cold.remove(&finish);
                 graph.blocks[finish].terminator = None;
                 let mut lowering = PropertyLowering { graph, inst };
-                let (entry, view) =
-                    lowering.entry(block, finish, object, cache, builtins, validate);
+                let (entry, view) = if let Some((entry, view)) = entries.remove(&inst) {
+                    lowering.jump(block, finish, Vec::new());
+                    (entry, view)
+                } else {
+                    lowering.entry(block, finish, object, cache, builtins, validate)
+                };
+                if let Some(cached) = cached {
+                    entries.insert(cached, (entry, view));
+                }
                 let (last, value) = if validate {
                     let zero = lowering
                         .at(finish)
@@ -363,6 +390,13 @@ impl PropertyLowering<'_> {
         let result = self.graph.add_param(done);
         self.graph.reprs[result] = Some(Repr::Word);
         let miss = self.block();
+        let matched = validate.then(|| {
+            let block = self.block();
+            let entry = self.graph.add_param(block);
+            self.graph.reprs[entry] = Some(Repr::Word);
+            (block, entry)
+        });
+        let view = self.view(block, object);
         if validate {
             let megamorphic =
                 self.at(block)
@@ -372,7 +406,6 @@ impl PropertyLowering<'_> {
             self.branch(block, megamorphic, Target::new(miss), Target::new(lookup));
             block = lookup;
         }
-        let view = self.view(block, object);
         let shape = self
             .at(block)
             .ins()
@@ -440,32 +473,11 @@ impl PropertyLowering<'_> {
                     .at(block)
                     .add_unassigned(Op::BooleanAnd(matches, shaped));
             }
-            if validate {
-                let holder_check = self.block();
-                self.branch(block, matches, Target::new(holder_check), Target::new(next));
-                block = holder_check;
-                let holder =
-                    self.at(block)
-                        .ins()
-                        .load(types::I64, flags, entry, CACHE_HOLDER_OFFSET);
-                let zero = self.at(block).ins().iconst(types::I64, 0);
-                let own = self.at(block).ins().icmp(IntCC::Equal, holder, zero);
-                let holder = self.at(block).ins().select(own, view, holder);
-                let actual = self
-                    .at(block)
-                    .ins()
-                    .load(types::I32, flags, holder, SHAPE_OFFSET);
-                let expected =
-                    self.at(block)
-                        .ins()
-                        .load(types::I32, flags, entry, CACHE_HOLDER_SHAPE_OFFSET);
-                matches = self.at(block).ins().icmp(IntCC::Equal, actual, expected);
-            }
             self.branch(
                 block,
                 matches,
                 Target {
-                    block: done,
+                    block: matched.map_or(done, |(block, _)| block),
                     args: vec![entry],
                 },
                 Target::new(next),
@@ -483,6 +495,33 @@ impl PropertyLowering<'_> {
             } else {
                 self.jump(block, miss, Vec::new());
             }
+        }
+        if let Some((block, entry)) = matched {
+            let holder = self
+                .at(block)
+                .ins()
+                .load(types::I64, flags, entry, CACHE_HOLDER_OFFSET);
+            let zero = self.at(block).ins().iconst(types::I64, 0);
+            let own = self.at(block).ins().icmp(IntCC::Equal, holder, zero);
+            let holder = self.at(block).ins().select(own, view, holder);
+            let actual = self
+                .at(block)
+                .ins()
+                .load(types::I32, flags, holder, SHAPE_OFFSET);
+            let expected =
+                self.at(block)
+                    .ins()
+                    .load(types::I32, flags, entry, CACHE_HOLDER_SHAPE_OFFSET);
+            let valid = self.at(block).ins().icmp(IntCC::Equal, actual, expected);
+            self.branch(
+                block,
+                valid,
+                Target {
+                    block: done,
+                    args: vec![entry],
+                },
+                Target::new(miss),
+            );
         }
         let zero = self.at(miss).ins().iconst(types::I64, 0);
         self.jump(miss, done, vec![zero]);

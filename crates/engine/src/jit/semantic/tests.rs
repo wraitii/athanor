@@ -137,6 +137,32 @@ fn baseline_keeps_generic_property_accesses() {
 }
 
 #[test]
+fn cold_property_accesses_keep_helpers() {
+    for source in [
+        "function f(a){return a.x;}",
+        "function f(a){return a.length;}",
+        "function f(a,v){a.x=v;return {x:v};}",
+    ] {
+        let graph = lower_source(source).unwrap();
+        let mut function = canonicalize_graph(graph, true).unwrap();
+        function.graph.cold.extend(function.graph.blocks.keys());
+        let blocks = function.graph.blocks.len();
+        assert!(!properties::lower(&mut function).unwrap());
+        assert_eq!(function.graph.blocks.len(), blocks);
+        assert!(!ops(&function.graph).iter().any(|op| matches!(
+            op,
+            Op::PropertyCache(..) | Op::CachedProperty(..) | Op::FillPropertyStore(..)
+        )));
+        runtime::helpers::lower(&mut function);
+        assert!(!ops(&function.graph).iter().any(|op| matches!(
+            op,
+            Op::Get(..) | Op::Set(..) | Op::Define(..)
+        )));
+        function.graph.verify().unwrap();
+    }
+}
+
+#[test]
 fn cfg_preserves_edge_order_and_deduplicates_successors() {
     let mut graph = lower_source("function f(a){return a;}").unwrap();
     let entry = graph.entry;
@@ -3855,6 +3881,31 @@ fn conflicting_property_shapes_remain_alternative_local_guards() {
 }
 
 #[test]
+fn property_reads_share_cache_search_and_holder_validation() {
+    use crate::jit::helpers::{CACHE_HOLDER_SHAPE_OFFSET, CACHE_LEN_OFFSET};
+    use cranelift_codegen::ir::types;
+
+    for name in ["x", "push"] {
+        let source = format!("function f(object){{return object.{name};}}");
+        let mut function = canonicalize_graph(lower_source(&source).unwrap(), true).unwrap();
+        properties::lower(&mut function).unwrap();
+        properties::lower_accesses(&mut function).unwrap();
+        let operations = ops(&function.graph);
+        for offset in [CACHE_LEN_OFFSET, CACHE_HOLDER_SHAPE_OFFSET] {
+            assert_eq!(
+                count(&operations, |op| matches!(op,
+                    Op::LowLevel(low_level::Op::Load { ty, offset: actual, .. })
+                        if *ty == types::I32 && *actual == offset)),
+                1,
+                "{function}"
+            );
+        }
+        assert_eq!(count(&operations, |op| matches!(op, Op::PropertyLoad(..))), 1);
+        function.graph.verify().unwrap();
+    }
+}
+
+#[test]
 fn property_access_lowering_preserves_boxed_loads_until_ownership_planning() {
     for shaped in [false, true] {
         let mut graph = canonicalize_graph(
@@ -4196,7 +4247,7 @@ fn property_additions_keep_shape_guards_inside_loops() {
     assert!(
         !body
             .iter()
-            .any(|op| matches!(op, Op::ShapedSet(..) | Op::Set(..))),
+            .any(|op| matches!(op, Op::ShapedSet(..))),
         "{function}"
     );
     function.graph.verify().unwrap();

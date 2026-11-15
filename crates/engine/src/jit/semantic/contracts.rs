@@ -1,4 +1,5 @@
 use crate::jit::helpers::Helper;
+use smallvec::{SmallVec, smallvec};
 
 use super::repr::{FloatWidth, IntegerWidth, element};
 use super::{
@@ -12,7 +13,7 @@ pub(in crate::jit) enum Use {
 }
 
 pub(in crate::jit) struct Representations {
-    pub(in crate::jit) uses: Vec<Use>,
+    pub(in crate::jit) uses: SmallVec<[Use; 4]>,
     pub(in crate::jit) produces: Option<Repr>,
 }
 
@@ -44,7 +45,7 @@ fn specific(graph: &Graph, inst: Inst) -> Option<Representations> {
         produces: Some(produces),
     };
     let any = |count: usize, produces: Option<Repr>| Representations {
-        uses: vec![Use::Any; count],
+        uses: smallvec![Use::Any; count],
         produces,
     };
     Some(match &data.op {
@@ -59,7 +60,7 @@ fn specific(graph: &Graph, inst: Inst) -> Option<Representations> {
             args,
             ..
         }) => {
-            let mut uses = Vec::with_capacity(args.len() + 1);
+            let mut uses = SmallVec::with_capacity(args.len() + 1);
             if matches!(target, super::low_level::CallTarget::Indirect(_)) {
                 uses.push(Use::Exact(Repr::Word));
             }
@@ -142,7 +143,7 @@ fn specific(graph: &Graph, inst: Inst) -> Option<Representations> {
         Op::PropertyCache(..) | Op::GlobalCache(..) => any(0, Some(Repr::Word)),
         Op::CanOverwrite(..) => exact(&[Repr::Boxed, Repr::I64], Repr::Boolean),
         Op::ArrayStore(..) | Op::PropertyStore(..) | Op::PropertyAdd(..) => Representations {
-            uses: vec![
+            uses: smallvec![
                 Use::Exact(Repr::Boxed),
                 Use::Exact(Repr::I64),
                 Use::Exact(Repr::Boxed),
@@ -157,11 +158,11 @@ fn specific(graph: &Graph, inst: Inst) -> Option<Representations> {
             super::low_level::Op::InRange { .. } | super::low_level::Op::TestMask { .. },
         ) => any(1, Some(Repr::Boolean)),
         Op::LowLevel(super::low_level::Op::Reference { .. }) => Representations {
-            uses: vec![Use::Exact(Repr::Boxed)],
+            uses: smallvec![Use::Exact(Repr::Boxed)],
             produces: None,
         },
         Op::LowLevel(super::low_level::Op::Unary { op, ty, value }) => Representations {
-            uses: vec![match op {
+            uses: smallvec![match op {
                 super::low_level::Unary::FloatDemote => Use::Exact(Repr::F64),
                 super::low_level::Unary::Reduce => Use::Exact(Repr::I64),
                 _ => Use::Any,
@@ -175,7 +176,7 @@ fn specific(graph: &Graph, inst: Inst) -> Option<Representations> {
         Op::NumericFloat(_) => exact(&[Repr::F64], Repr::F64),
         Op::SaturatingInteger(_) | Op::AsInteger(_) => exact(&[Repr::I64], Repr::I64),
         Op::IntegerCheck(..) => Representations {
-            uses: vec![Use::Exact(Repr::Boxed), Use::Any, Use::Any],
+            uses: smallvec![Use::Exact(Repr::Boxed), Use::Any, Use::Any],
             produces: Some(Repr::Boolean),
         },
         Op::IsInteger(_) => exact(&[Repr::Boxed], Repr::Boolean),
@@ -187,7 +188,7 @@ fn specific(graph: &Graph, inst: Inst) -> Option<Representations> {
             exact(&[Repr::Boxed, Repr::Word], Repr::Boxed)
         }
         Op::PrimePropertyCache(..) => Representations {
-            uses: vec![Use::Exact(Repr::Boxed), Use::Exact(Repr::Word)],
+            uses: smallvec![Use::Exact(Repr::Boxed), Use::Exact(Repr::Word)],
             produces: None,
         },
         Op::IsIndexed(_) | Op::IsString(_) | Op::Truthy(_) => exact(&[Repr::Boxed], Repr::Boolean),
@@ -196,19 +197,19 @@ fn specific(graph: &Graph, inst: Inst) -> Option<Representations> {
         }
         Op::ArrayPosition(_) => exact(&[Repr::I64], Repr::I64),
         Op::ArrayKind(_) => Representations {
-            uses: vec![view_object(graph, inst)],
+            uses: smallvec![view_object(graph, inst)],
             produces: Some(Repr::I32),
         },
         Op::IsArray(..) => Representations {
-            uses: vec![view_object(graph, inst)],
+            uses: smallvec![view_object(graph, inst)],
             produces: Some(Repr::Boolean),
         },
         Op::ArrayLoad(..) => Representations {
-            uses: vec![view_object(graph, inst), Use::Exact(Repr::I64)],
+            uses: smallvec![view_object(graph, inst), Use::Exact(Repr::I64)],
             produces: Some(Repr::Boxed),
         },
         Op::IndexedLength(_) => Representations {
-            uses: vec![view_object(graph, inst)],
+            uses: smallvec![view_object(graph, inst)],
             produces: Some(if target == Some(Repr::I64) {
                 Repr::I64
             } else {
@@ -223,7 +224,7 @@ fn specific(graph: &Graph, inst: Inst) -> Option<Representations> {
                 bounded,
             },
         ) => Representations {
-            uses: vec![view_object(graph, inst), position(graph, *index)],
+            uses: smallvec![view_object(graph, inst), position(graph, *index)],
             produces: Some(if *bounded {
                 element(*kind)
             } else {
@@ -242,13 +243,13 @@ fn generic(graph: &Graph, inst: Inst) -> Representations {
         | Op::ReadHint(..)
         | Op::Assume(..)
         | Op::ContinuationOutput(..)
-        | Op::LowLevel(_) => vec![Use::Any; count],
-        Op::MapElement(..) => vec![Use::Exact(Repr::Boxed), Use::Exact(Repr::I64)],
+        | Op::LowLevel(_) => smallvec![Use::Any; count],
+        Op::MapElement(..) => smallvec![Use::Exact(Repr::Boxed), Use::Exact(Repr::I64)],
         Op::GuardedCompare { numbers, .. } => [Use::Exact(Repr::Boxed); 2]
             .into_iter()
             .chain(numbers.iter().map(|_| Use::Exact(Repr::Boolean)))
             .collect(),
-        _ => vec![Use::Exact(Repr::Boxed); count],
+        _ => smallvec![Use::Exact(Repr::Boxed); count],
     };
     let produces = match &data.op {
         Op::LowLevel(_) => data.results.first().map(|&value| graph.repr(value)),

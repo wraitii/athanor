@@ -18,15 +18,20 @@ fn operands(graph: &mut Graph, blocks: &[Block]) {
         let mut position = 0;
         while position < graph.blocks[block].insts.len() {
             let inst = graph.blocks[block].insts[position];
-            let uses = repr_contract(graph, inst).uses;
-            let operands: Vec<_> = graph.insts[inst].op.operands_iter().collect();
-            for (index, (value, use_)) in operands.into_iter().zip(uses).enumerate() {
-                let Use::Exact(required) = use_ else {
-                    continue;
-                };
-                if graph.repr(value).accepts(required) {
-                    continue;
-                }
+            let conversions: smallvec::SmallVec<[(usize, super::Value, super::Repr); 4]> = graph
+                .insts[inst]
+                .op
+                .operands_iter()
+                .zip(repr_contract(graph, inst).uses)
+                .enumerate()
+                .filter_map(|(index, (value, use_))| match use_ {
+                    Use::Exact(required) if !graph.repr(value).accepts(required) => {
+                        Some((index, value, required))
+                    }
+                    _ => None,
+                })
+                .collect();
+            for (index, value, required) in conversions {
                 let data = &graph.insts[inst];
                 let (span, source_name, location) =
                     (data.span, data.source_name, data.emission_location);
