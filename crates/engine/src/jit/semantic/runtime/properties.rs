@@ -6,15 +6,18 @@ use super::super::{
 use super::layout;
 
 pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) -> super::super::Result<bool> {
+    function.ensure_cfg();
     let shapes = &function.plan.shapes;
     let graph = &mut function.graph;
     if graph.has_handlers || graph.generator {
         return Ok(false);
     }
-    let reads: Vec<_> = Cfg::new(graph)
+    let reads: Vec<_> = function
+        .facts
+        .cfg
         .rpo
-        .into_iter()
-        .flat_map(|block| graph.blocks[block].insts.clone())
+        .iter()
+        .flat_map(|&block| graph.blocks[block].insts.iter().copied())
         .filter(|&inst| {
             matches!(graph.insts[inst].op, Op::Get(..)) && !shapes.megamorphic(graph, inst)
         })
@@ -72,7 +75,9 @@ pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) -> super::su
             Cursor::before(graph, inst).add_unassigned(Op::PropertyCache(inst, name.clone()));
         super::super::specialization::properties::lower_cache(graph, inst, cache, object, name);
     }
-    function.invalidate_cfg();
+    if changed {
+        function.invalidate_cfg();
+    }
     Ok(changed)
 }
 
@@ -83,10 +88,9 @@ fn lower_stores(graph: &mut Graph) -> bool {
         CACHE_ADDITION_SOURCE_OFFSET, CACHE_OVERWRITE_INDEX_OFFSET, CACHE_OVERWRITE_SHAPE_OFFSET,
     };
     use cranelift_codegen::ir::{MemFlagsData, condcodes::IntCC, types};
-    let stores: Vec<_> = Cfg::new(graph)
-        .rpo
+    let stores: Vec<_> = Cfg::reverse_postorder(graph)
         .into_iter()
-        .flat_map(|block| graph.blocks[block].insts.clone())
+        .flat_map(|block| graph.blocks[block].insts.iter().copied())
         .filter(|&inst| {
             matches!(
                 graph.insts[inst].op,
@@ -176,12 +180,14 @@ pub(in crate::jit::semantic) fn lower_accesses(
 ) -> super::super::Result<()> {
     use crate::jit::helpers::Helper;
 
-    function.ensure_facts();
-    let graph = &mut function.graph;
-    let accesses: Vec<_> = Cfg::new(graph)
+    function.ensure_cfg();
+    let graph = &function.graph;
+    let accesses: Vec<_> = function
+        .facts
+        .cfg
         .rpo
-        .into_iter()
-        .flat_map(|block| graph.blocks[block].insts.clone())
+        .iter()
+        .flat_map(|&block| graph.blocks[block].insts.iter().copied())
         .filter(|&inst| {
             matches!(
                 graph.insts[inst].op,
@@ -194,6 +200,11 @@ pub(in crate::jit::semantic) fn lower_accesses(
             )
         })
         .collect();
+    if accesses.is_empty() {
+        return Ok(());
+    }
+    function.ensure_facts();
+    let graph = &mut function.graph;
     for inst in accesses {
         let data = graph.insts[inst].clone();
         match data.op {
@@ -540,8 +551,9 @@ impl PropertyLowering<'_> {
 pub(in crate::jit::semantic) fn lower_loads(function: &mut FunctionState) {
     use cranelift_codegen::ir::{MemFlagsData, types};
 
+    function.ensure_cfg();
     let graph = &mut function.graph;
-    for block in Cfg::new(graph).rpo {
+    for &block in &function.facts.cfg.rpo {
         for inst in graph.blocks[block].insts.clone() {
             let Op::PropertyLoad(_, address) = graph.insts[inst].op else {
                 continue;

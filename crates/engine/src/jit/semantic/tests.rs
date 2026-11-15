@@ -1487,8 +1487,8 @@ fn trusted_numeric_inputs_do_not_acquire_speculative_entry_guards() {
             crate::jit::variants::Fact::Number,
         )],
     );
-    let function = specialize(function, true, None).unwrap();
-    let function = optimize_specialized(
+    let function = plan_specialization(function, true, None).unwrap();
+    let function = lower_planned(
         function,
         Versioning::Speculate {
             fallback: None,
@@ -1598,8 +1598,8 @@ fn trusted_input_shapes_remove_redundant_callee_checks() {
             crate::jit::variants::Fact::Shape(10),
         )],
     );
-    let function = specialize(function, true, Some((&repository, 0))).unwrap();
-    let function = optimize_specialized(
+    let function = plan_specialization(function, true, Some((&repository, 0))).unwrap();
+    let function = lower_planned(
         function,
         Versioning::Speculate {
             fallback: None,
@@ -1688,8 +1688,9 @@ fn caller_shapes_select_useful_polymorphic_callee_contracts() {
             }
             let mut specialized = FunctionState::from_graph(function.graph.clone());
             call_variants::assume(&mut specialized.graph, &contract);
-            let specialized = specialize(specialized, true, Some((&repository, 0))).unwrap();
-            let specialized = optimize_specialized(
+            let specialized =
+                plan_specialization(specialized, true, Some((&repository, 0))).unwrap();
+            let specialized = lower_planned(
                 specialized,
                 Versioning::Speculate {
                     fallback: None,
@@ -2302,6 +2303,8 @@ fn array_storage_lowering_preserves_planned_ownership() {
             let (inst, result) = load.unwrap();
             let mut function = FunctionState::new(graph, Vec::new(), true);
             function.lower_typed_storage().unwrap();
+            function.ensure_facts();
+            borrow::borrows(&mut function.graph, &function.facts, &mut function.notes);
             assert!(matches!(function.graph.insts[inst].op, Op::ArrayLoad(..)));
             assert_eq!(function.graph.borrowed.contains(&result), !mutate);
             assert!(
@@ -4174,4 +4177,56 @@ fn shaped_accesses_on_two_receivers_hoist_both_guards() {
         "{function}"
     );
     graph.verify().unwrap();
+}
+
+#[test]
+fn block_liveness_matches_instruction_liveness() {
+    for source in [
+        "function f(a,n){let value=a;for(let i=0;i<n;++i){if(i&1)value=a[i];else value=a[i+1];for(let j=0;j<i;++j){if(j===2)break;value=value[j];}}return value;}",
+        "function f(a,n){let value=a;while(n--){if(n===4)return value;if(n&1)continue;value=value.next;}return value;}",
+        "function f(a,n){let x=a;do{let y=x.next;if(n&1)x=y;else x=a;--n;}while(n>0);return x;}",
+    ] {
+        let function = canonicalize_graph(lower_source(source).unwrap(), true).unwrap();
+        let graph = &function.graph;
+        let cfg = Cfg::new(graph);
+        assert_eq!(Cfg::reverse_postorder(graph), cfg.rpo);
+        let expected = boundary::liveness(graph, &cfg.rpo);
+        let mut uses = SecondaryMap::<Block, liveness::Set>::new();
+        let mut defs = SecondaryMap::<Block, liveness::Set>::new();
+        for &block in &cfg.rpo {
+            let data = &graph.blocks[block];
+            let mut live = liveness::Set::default();
+            live.extend(data.terminator.as_ref().unwrap().kind.operands_iter());
+            for &inst in data.insts.iter().rev() {
+                let data = &graph.insts[inst];
+                for &result in &data.results {
+                    live.remove(&result);
+                    defs[block].insert(result);
+                }
+                live.extend(data.op.operands_iter());
+            }
+            for &param in &data.params {
+                live.remove(&param);
+                defs[block].insert(param);
+            }
+            uses[block] = live;
+        }
+        let actual = liveness::solve(graph, &cfg, &uses, &defs);
+        for &block in &cfg.rpo {
+            assert_eq!(
+                actual.input[block].iter().collect::<FxHashSet<_>>(),
+                expected[block],
+                "{block}: {source}"
+            );
+            let output: FxHashSet<_> = graph
+                .successors(block)
+                .flat_map(|next| expected[next].iter().copied())
+                .collect();
+            assert_eq!(
+                actual.output[block].iter().collect::<FxHashSet<_>>(),
+                output,
+                "{block}: {source}"
+            );
+        }
+    }
 }

@@ -67,7 +67,14 @@ pub(in crate::jit::semantic) fn simplify(function: &mut FunctionState, folder: &
         }
         cfg_changed |= fold_constant_branches(graph, cfg);
         cfg_changed |= fold_dominated_branches(graph, cfg);
-        cfg_changed |= thread_branches(graph);
+        let rebuilt;
+        let cfg = if cfg_changed {
+            rebuilt = Cfg::new(graph);
+            &rebuilt
+        } else {
+            cfg
+        };
+        cfg_changed |= thread_branches(graph, cfg);
         if cfg_changed {
             function.invalidate_cfg();
         } else if changed || !dead.is_empty() {
@@ -154,8 +161,7 @@ fn fold_dominated_branches(graph: &mut Graph, cfg: &Cfg) -> bool {
     changed
 }
 
-fn thread_branches(graph: &mut Graph) -> bool {
-    let cfg = Cfg::new(graph);
+fn thread_branches(graph: &mut Graph, cfg: &Cfg) -> bool {
     let uses = graph.use_counts();
     let header = |block: Block| {
         cfg.preds[block]

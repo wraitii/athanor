@@ -5,7 +5,7 @@ use super::encode::{
 };
 use crate::jit::alloc::RegClass;
 use crate::jit::effects::{Effects, HEAP_READ};
-use crate::jit::semantic::{Contract, Ownership, Value, low_level};
+use crate::jit::semantic::{Contract, Operands, Ownership, Value, low_level};
 
 #[derive(Clone, Copy, Debug)]
 pub(in crate::jit) enum Immediate {
@@ -295,7 +295,7 @@ impl Op {
         )
     }
 
-    pub(in crate::jit) fn operands(&self) -> impl Iterator<Item = Value> + '_ {
+    pub(in crate::jit) fn operands(&self) -> Operands<'_> {
         let (fixed, rest): ([Option<Value>; 4], &[Value]) = match self {
             Self::Constant { .. } | Self::StackAddress { .. } | Self::StackPointer => {
                 ([None; 4], &[])
@@ -360,7 +360,7 @@ impl Op {
                 args,
             ),
         };
-        fixed.into_iter().flatten().chain(rest.iter().copied())
+        Operands::new(fixed, rest)
     }
 
     pub(in crate::jit) fn operands_mut(&mut self) -> impl Iterator<Item = &mut Value> + '_ {

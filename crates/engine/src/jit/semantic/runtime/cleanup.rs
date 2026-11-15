@@ -3,7 +3,7 @@ use super::super::{Block, Cfg, Graph, Op, Repr, TerminatorKind, Value};
 use crate::FxHashMap;
 
 pub(in crate::jit) fn lower(graph: &mut Graph) {
-    let blocks = Cfg::new(graph).rpo;
+    let blocks = Cfg::reverse_postorder(graph);
     let mut ladders = FxHashMap::<Block, Vec<Block>>::default();
     let mut b = Builder::new(graph);
     for block in blocks {

@@ -1466,7 +1466,8 @@ mod tests {
                     }
                 }
                 let mut planned =
-                    super::super::super::specialize(canonical, true, Some((&bodies, 0))).unwrap();
+                    super::super::super::plan_specialization(canonical, true, Some((&bodies, 0)))
+                        .unwrap();
                 assert_eq!(planned.plan.inlines.len(), 1);
                 assert_eq!(planned.plan.shapes.polymorphic_reads().len(), 1);
                 if let Some(shape) = shape {
@@ -1475,7 +1476,7 @@ mod tests {
                         &vec![(Input::Argument(0), InputFact::Shape(shape))],
                     );
                 }
-                let optimized = super::super::super::optimize_specialized(
+                let optimized = super::super::super::lower_planned(
                     planned,
                     super::super::super::Versioning::Generic,
                     false,
@@ -1534,17 +1535,18 @@ mod tests {
             ),
         ] {
             let (canonical, bodies) = fixture(source);
-            let first = super::super::super::specialize(
+            let first = super::super::super::plan_specialization(
                 FunctionState::new(canonical.graph.clone(), canonical.notes.clone(), true),
                 true,
                 Some((&bodies, 0)),
             )
             .unwrap();
             let second =
-                super::super::super::specialize(canonical, true, Some((&bodies, 0))).unwrap();
+                super::super::super::plan_specialization(canonical, true, Some((&bodies, 0)))
+                    .unwrap();
             assert_eq!(first.plan.inlines.len(), count);
             assert!(first.plan.inlines == second.plan.inlines);
-            let analysis = super::super::super::optimize_specialized(
+            let analysis = super::super::super::lower_planned(
                 first,
                 super::super::super::Versioning::Speculate {
                     fallback: None,
@@ -1620,13 +1622,13 @@ mod tests {
             }
         }
         for fallback in [None, Some(0x1234)] {
-            let planned = super::super::super::specialize(
+            let planned = super::super::super::plan_specialization(
                 FunctionState::new(canonical.graph.clone(), canonical.notes.clone(), true),
                 true,
                 Some((&bodies, 0)),
             )
             .unwrap();
-            let analysis = super::super::super::optimize_specialized(
+            let analysis = super::super::super::lower_planned(
                 planned,
                 super::super::super::Versioning::Speculate {
                     fallback,
@@ -1768,15 +1770,19 @@ mod tests {
         let (canonical, bodies) = fixture(&format!(
             "function helper(x){{{body}return x;}} function main(x){{return helper(x);}}"
         ));
-        let initial = super::super::super::specialize(
+        let initial = super::super::super::plan_specialization(
             FunctionState::new(canonical.graph.clone(), canonical.notes.clone(), true),
             true,
             Some((&bodies, 0)),
         )
         .unwrap();
-        let recompiled =
-            super::super::super::specialize_with_budget(canonical, true, Some((&bodies, 0)), 2)
-                .unwrap();
+        let recompiled = super::super::super::inline_and_plan_specialization(
+            canonical,
+            true,
+            Some((&bodies, 0)),
+            2,
+        )
+        .unwrap();
         assert!(initial.plan.inlines.is_empty());
         assert!(!recompiled.plan.inlines.is_empty());
     }

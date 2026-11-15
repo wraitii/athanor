@@ -2,7 +2,8 @@ use crate::{FxHashMap, FxHashSet};
 
 use cranelift_codegen::entity::SecondaryMap;
 
-use super::{Block, Cfg, Facts, Graph, Inst, Op, Value, ValueType};
+use super::liveness::{self, Set};
+use super::{Block, Facts, Graph, Inst, Op, Value, ValueType};
 
 const HEAP: ValueType = ValueType::STRING
     .union(ValueType::OBJECT)
@@ -45,6 +46,7 @@ struct Borrows<'g> {
     facts: &'g Facts,
     chains: FxHashMap<Value, Vec<Value>>,
     rejected: FxHashSet<Value>,
+    uses: SecondaryMap<Inst, Vec<Value>>,
 }
 
 impl Borrows<'_> {
@@ -53,8 +55,8 @@ impl Borrows<'_> {
         (memory.reenters(), memory.writes_data())
     }
 
-    fn redefined(&mut self, live: &FxHashSet<Value>, defined: Value) {
-        for &value in live {
+    fn redefined(&mut self, live: &Set, defined: Value) {
+        for value in live.iter() {
             if value == defined {
                 continue;
             }
@@ -72,15 +74,6 @@ impl Borrows<'_> {
                 }
             }
         }
-    }
-
-    fn uses(&self, inst: Inst) -> Vec<Value> {
-        self.graph.insts[inst]
-            .op
-            .operands()
-            .into_iter()
-            .filter(|value| self.chains.contains_key(value))
-            .collect()
     }
 }
 
@@ -127,7 +120,7 @@ pub(super) fn borrows(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>)
         }
         chains.insert(value, chain);
     }
-    let cfg = Cfg::new(graph);
+    let cfg = &facts.cfg;
     let mut merged = FxHashMap::default();
     loop {
         let mut changed = false;
@@ -191,38 +184,65 @@ pub(super) fn borrows(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>)
     let mut local: FxHashSet<Value> = chains.keys().copied().collect();
     for (block, data) in graph.blocks.iter() {
         for &inst in &data.insts {
-            for value in graph.insts[inst].op.operands() {
+            for value in graph.insts[inst].op.operands_iter() {
                 if local.contains(&value) && graph.def_block(value) != block {
                     local.remove(&value);
                 }
             }
         }
         if let Some(terminator) = &data.terminator {
-            for value in terminator.kind.operands() {
+            for value in terminator.kind.operands_iter() {
                 local.remove(&value);
             }
         }
     }
+    let mut uses = SecondaryMap::<Inst, Vec<Value>>::new();
+    let mut block_uses = SecondaryMap::<Block, Set>::new();
+    let mut defs = SecondaryMap::<Block, Set>::new();
+    for &block in &cfg.rpo {
+        let data = &graph.blocks[block];
+        let mut live = Set::default();
+        if let Some(terminator) = &data.terminator {
+            live.extend(
+                terminator
+                    .kind
+                    .operands_iter()
+                    .filter(|value| chains.contains_key(value)),
+            );
+        }
+        for &inst in data.insts.iter().rev() {
+            let data = &graph.insts[inst];
+            if let Some(result) = data.result() {
+                live.remove(&result);
+                if chains.contains_key(&result) {
+                    defs[block].insert(result);
+                }
+            }
+            uses[inst] = data
+                .op
+                .operands_iter()
+                .filter(|value| chains.contains_key(value))
+                .collect();
+            live.extend(uses[inst].iter().copied());
+        }
+        for &param in &data.params {
+            live.remove(&param);
+            if chains.contains_key(&param) {
+                defs[block].insert(param);
+            }
+        }
+        block_uses[block] = live;
+    }
+    let live = liveness::solve(graph, cfg, &block_uses, &defs);
     let mut borrows = Borrows {
         graph,
         facts,
         chains,
         rejected: FxHashSet::default(),
+        uses,
     };
-    let mut live_in: SecondaryMap<Block, FxHashSet<Value>> = SecondaryMap::new();
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for &block in cfg.rpo.iter().rev() {
-            let live = scan(&mut borrows, block, &live_in, false);
-            if live != live_in[block] {
-                live_in[block] = live;
-                changed = true;
-            }
-        }
-    }
     for &block in &cfg.rpo {
-        scan(&mut borrows, block, &live_in, true);
+        scan(&mut borrows, block, live.output[block].clone());
     }
     let mut accepted: FxHashSet<Value> = borrows
         .chains
@@ -273,60 +293,42 @@ pub(super) fn borrows(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>)
     graph.borrowed = accepted.into_iter().collect();
 }
 
-fn scan(
-    borrows: &mut Borrows<'_>,
-    block: Block,
-    live_in: &SecondaryMap<Block, FxHashSet<Value>>,
-    check: bool,
-) -> FxHashSet<Value> {
+fn scan(borrows: &mut Borrows<'_>, block: Block, mut live: Set) {
     let graph = borrows.graph;
     let data = &graph.blocks[block];
-    let mut live: FxHashSet<Value> = graph
-        .successors(block)
-        .into_iter()
-        .flat_map(|successor| live_in[successor].iter().copied())
-        .collect();
     if let Some(terminator) = &data.terminator {
         live.extend(
             terminator
                 .kind
-                .operands()
-                .into_iter()
+                .operands_iter()
                 .filter(|value| borrows.chains.contains_key(value)),
         );
     }
     for &inst in data.insts.iter().rev() {
         let result = graph.insts[inst].result();
-        if check {
-            if let Some(result) = result {
-                borrows.redefined(&live, result);
-            }
-            let (reenters, writes) = borrows.effects(inst);
-            if reenters || writes {
-                for &value in &live {
-                    if Some(value) != result {
-                        borrows.rejected.insert(value);
-                    }
-                }
-            }
-            if (reenters || (writes && !stores(&graph.insts[inst].op)))
-                && !matches!(graph.insts[inst].op, Op::Continuation(..))
-            {
-                for value in borrows.uses(inst) {
+        if let Some(result) = result {
+            borrows.redefined(&live, result);
+        }
+        let (reenters, writes) = borrows.effects(inst);
+        if reenters || writes {
+            for value in live.iter() {
+                if Some(value) != result {
                     borrows.rejected.insert(value);
                 }
             }
         }
+        if (reenters || (writes && !stores(&graph.insts[inst].op)))
+            && !matches!(graph.insts[inst].op, Op::Continuation(..))
+        {
+            borrows.rejected.extend(borrows.uses[inst].iter().copied());
+        }
         if let Some(result) = result {
             live.remove(&result);
         }
-        live.extend(borrows.uses(inst));
+        live.extend(borrows.uses[inst].iter().copied());
     }
     for &param in &data.params {
-        if check {
-            borrows.redefined(&live, param);
-        }
+        borrows.redefined(&live, param);
         live.remove(&param);
     }
-    live
 }

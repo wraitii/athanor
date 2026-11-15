@@ -31,16 +31,23 @@ pub(in crate::jit::semantic) fn contextual_requirements(
     offered: &Requirements,
 ) -> super::super::Result<Requirements> {
     assume(&mut function.graph, offered);
-    let planned =
-        super::super::pipeline::specialize_inner(function, true, Some((bodies, source)), 0, false)?;
-    let optimized = super::super::optimize_specialized(
+    let planned = super::super::pipeline::inline_and_plan_inner(
+        function,
+        true,
+        Some((bodies, source)),
+        0,
+        false,
+    )?;
+    let mut optimized = super::super::specialize(
         planned,
         super::super::Versioning::Speculate {
             fallback: None,
             continuations: true,
         },
         false,
+        None,
     )?;
+    optimized.lower_js()?;
     Ok(optimized
         .graph
         .entry_guards

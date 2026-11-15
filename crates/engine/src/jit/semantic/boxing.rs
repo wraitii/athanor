@@ -149,9 +149,10 @@ impl Boxing<'_> {
                 };
             }
             let uses = contract(self.graph, inst).uses;
-            let operands: Vec<_> = self.graph.insts[inst].op.operands_iter().collect();
+            let operands: smallvec::SmallVec<[Value; 4]> =
+                self.graph.insts[inst].op.operands_iter().collect();
             debug_assert_eq!(uses.len(), operands.len());
-            let mut replaced = Vec::with_capacity(operands.len());
+            let mut replaced = smallvec::SmallVec::<[Value; 4]>::with_capacity(operands.len());
             for (&value, use_) in operands.iter().zip(uses) {
                 let Use::Exact(repr) = use_ else {
                     replaced.push(value);

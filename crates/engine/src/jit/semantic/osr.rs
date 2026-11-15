@@ -198,6 +198,7 @@ impl Plan {
         graph.arity = None;
         graph.borrowed.clear();
         graph.views.clear();
+        graph.property_accesses.clear();
         let entry = graph.blocks.push(BlockData::default());
         graph.entry = entry;
         let span = graph.span;
@@ -504,6 +505,38 @@ mod tests {
     }
 
     #[test]
+    fn specialized_loops_can_be_extracted_before_property_lowering() {
+        use super::super::FunctionState;
+
+        let graph = graph(
+            "function f(n){let sum=0;for(let i=0;i<n;++i)for(let j=0;j<n;++j)sum+=this.rows[i][j];return sum;}",
+        );
+        let planned =
+            super::super::plan_specialization(FunctionState::from_graph(graph), true, None)
+                .unwrap();
+        let mut function =
+            super::super::specialize(planned, super::super::Versioning::Generic, false, None)
+                .unwrap();
+        assert!(!function.graph.property_accesses.is_empty());
+        let caches: Vec<_> = function
+            .graph
+            .insts
+            .iter()
+            .filter_map(|(inst, data)| matches!(data.op, Op::PropertyCache(..)).then_some(inst))
+            .collect();
+        assert!(!caches.is_empty());
+        for inst in caches {
+            function.graph.move_inst(inst, function.graph.entry);
+        }
+        function.graph.verify().unwrap();
+        let plan = Plan::discover(&function.graph, 0).unwrap();
+        assert_eq!(plan.loops.len(), 2);
+        for index in 0..plan.loops.len() {
+            plan.extract(index).unwrap().verify().unwrap();
+        }
+    }
+
+    #[test]
     fn osr_plan_keeps_typed_reads_before_memory_lowering() {
         use super::super::{FunctionState, MemoryOp, TypedRead};
         use crate::heap::TypedKind;
@@ -530,7 +563,7 @@ mod tests {
             ),
         );
         let mut function = FunctionState::from_graph(graph);
-        function.prepare_osr(0).unwrap();
+        function.instrument_osr(0).unwrap();
         function.lower_typed_storage().unwrap();
         let plan = function.osr.as_ref().unwrap();
         assert!(

@@ -122,7 +122,8 @@ this pass resolves their addressing,
 reads the previous contents, and writes the replacement.
 
 Known-kind bounded typed reads receive a final graph lowering after OSR
-preparation, followed by refreshed facts and borrow analysis. Reusable OSR
+preparation, followed by refreshed facts. Borrow analysis runs during runtime
+lowering before ownership planning. Reusable OSR
 graphs retain the earlier runtime operations. Runtime storage extraction
 (`TypedData`) produces a pointer, then
 `Op::Memory(MemoryOp::IndexedLoad)` reads a scalar at an integer element index.
@@ -1227,6 +1228,12 @@ those paths do not inflate the common getter's register saves and stack frame.
 
 The compiler lowers supported functions, nested callables, generator resumes,
 and script initializers through `jit/semantic/` before shared runtime lowering.
+`inline_and_plan_specialization` expands and inlines calls, then collects feedback
+plans. The compiler can skip unchanged recompilations at this checkpoint.
+`specialize` materializes guarded region versions and instruments OSR entries.
+`lower_runtime` progressively lowers JS operations, optimizing between expansions,
+then resolves runtime storage, ownership and representations. OSR descriptors retain
+the graph before runtime lowering, so extracted fragments use the same pipeline.
 `--compile` prints the graph actually passed to emission by default, with
 inferred types and semantic-location IDs. `--planner` prints specialization
 plans, available feedback, the region tree and per-region assumptions, and pass
@@ -1243,11 +1250,13 @@ and optimized normally; the shared CLIF optimization passes also apply.
 
 ```text
 Oxc AST -> build -> promote -> simplify -> canonical graph
-        -> plan specialization -> inline -> simplify -> plan regions -> version
-        -> rewrite property/read accesses -> coercions and bit tests -> reuse loads -> hoist
-        -> numeric/array/typed checks -> property writes/reads -> views -> simplify
-        -> numeric lowering -> borrow -> OSR instrumentation
-        -> property/typed/metadata/numeric lowering -> ownership planning
+        -> inline and collect specialization plans
+        -> specialize: prepare captures -> plan and version regions -> OSR instrumentation
+        -> runtime lowering:
+           rewrite property/read accesses -> simplify -> reuse loads -> hoist
+           -> coercions and bit tests -> numeric/array/typed checks
+           -> property writes/reads -> views -> simplify -> numeric lowering
+           -> property/typed/metadata/numeric lowering -> borrow -> helpers -> ownership planning
         -> array loads and slot stores -> representation assignment -> boxing insertion
         -> shared runtime emission -> scratch/cleanup/reference lowering -> unboxing
         -> scalar width/edge reconciliation -> semantic conversion expansion
@@ -1273,6 +1282,16 @@ purpose of a pass rather than a single point at which all its operations run:
   on the graph produced by shared runtime emission.
 - `cranelift.rs` expands indexed memory loads for CLIF; the native backend keeps
   these compound loads.
+
+`FunctionState` caches CFG, value and effect analyses with separate validity levels.
+Instruction-only changes preserve the CFG; passes that only need reachable block
+order can use `Cfg::reverse_postorder` without computing dominance. Numeric runtime
+operations share one traversal and one input value analysis. CSE refreshes effects
+while retaining value types; load reuse still refreshes value analysis.
+
+Borrow analysis runs once before helper lowering erases receiver identities.
+Borrow and ownership liveness use block summaries, bitsets and a predecessor
+worklist. Ownership resolves borrowed receiver anchors before solving liveness.
 
 Typed accesses and metadata lower before representation assignment and ownership
 planning. Borrowed array element loads survive ownership planning, then expand
@@ -1755,9 +1774,9 @@ in generated code but never dereference them.
 
 `EngineOptions::osr` enables loop replacement; it is on by default and
 `JS_JIT_OSR=0` disables it.
-Natural-loop discovery runs independently of the region-plan tree after guard
-placement and optimization. Merging region plans therefore does not suppress an
-inner loop that still has explicit call or indexed-read observations.
+Natural-loop discovery runs independently of the region-plan tree after region
+versioning, before runtime lowering and its subsequent optimization. Merging
+region plans therefore does not suppress an inner loop that still has explicit call or indexed-read observations.
 The descriptor retains that emission's graph and records each loop's external
 SSA inputs, header parameters, and exit shape. An observation belongs to a loop
 when it executes inside the body, or dominates its header and observes one of

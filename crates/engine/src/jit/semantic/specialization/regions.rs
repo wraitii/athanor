@@ -29,7 +29,7 @@ use analysis::{Requirement, closure_failure, closure_failure_with, conflicts, gu
 pub(in crate::jit::semantic) use analysis::{Writes, requirements};
 #[cfg(test)]
 pub(in crate::jit::semantic) use planning::version;
-pub(in crate::jit::semantic) use planning::{materialize_properties, version_with_report};
+pub(in crate::jit::semantic) use planning::{materialize_properties, version_regions};
 use versioning::Speculation;
 
 pub(in crate::jit::semantic) fn version_string_leaves(

@@ -74,7 +74,12 @@ budget; it does not execute initializers or collect warmup feedback.
 cargo run -p js-runner -- --compile --filter paint --planner --clif --asm SCRIPT
 ```
 
-Use `--after PASS` to inspect runtime lowering boundaries, including `boxing`,
+Use `--after PASS` to inspect specialization and lowering boundaries.
+Specialization exposes `inline` (inlining and plan collection), `captures`,
+`versioning`, and `osr`. Runtime lowering starts at `input`, then exposes
+`property-specialization`, `indexed-accesses`, `normalise`, `load-reuse`,
+`indexed-checks`, `property-caches`, `js-cleanup`, `numeric-specialization`,
+`js`, and `typed-storage` before the remaining runtime stages, including `boxing`,
 `finalize-runtime`, `scratch`, `cleanup`, `ownership-lower`, `unbox`,
 `scalar-semantics`, `scalar-cleanup`, `legalize-convert`, `bits`, and `cranelift-memory`.
 `scalar-cleanup` reuses lowered scalar expressions and loads, and hoists pure

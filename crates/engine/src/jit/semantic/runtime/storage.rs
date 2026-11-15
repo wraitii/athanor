@@ -2,15 +2,18 @@ use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{MemFlagsData, types};
 
 use super::super::cursor::{Cursor, Insert};
-use super::super::{ArrayLayout, Cfg, FunctionState, Graph, Op, Repr, ValueType, low_level};
+use super::super::{ArrayLayout, FunctionState, Graph, Op, Repr, ValueType, low_level};
 use super::layout;
 
 pub(in crate::jit::semantic) fn lower_metadata(function: &mut FunctionState) -> bool {
+    function.ensure_cfg();
     let graph = &mut function.graph;
     let mut changed = false;
-    for block in Cfg::new(graph).rpo {
-        for inst in graph.blocks[block].insts.clone() {
-            let data = graph.insts[inst].clone();
+    let mut insts = Vec::new();
+    for block in function.facts.cfg.rpo.clone() {
+        insts.clone_from(&graph.blocks[block].insts);
+        for &inst in &insts {
+            let data = &graph.insts[inst];
             let (object, existing_view, ty, offset) = match data.op {
                 Op::ArrayKind(object) => (
                     object,
@@ -58,11 +61,14 @@ pub(in crate::jit::semantic) fn lower_metadata(function: &mut FunctionState) -> 
 }
 
 pub(in crate::jit::semantic) fn lower_array_loads(function: &mut FunctionState) {
+    function.ensure_cfg();
     // Ownership is fixed: preserve result identities and the scheduled reference operations.
     let graph = &mut function.graph;
-    for block in Cfg::new(graph).rpo {
-        for inst in graph.blocks[block].insts.clone() {
-            let data = graph.insts[inst].clone();
+    let mut insts = Vec::new();
+    for block in function.facts.cfg.rpo.clone() {
+        insts.clone_from(&graph.blocks[block].insts);
+        for &inst in &insts {
+            let data = &graph.insts[inst];
             let Op::ArrayLoad(object, position, layout) = data.op else {
                 continue;
             };
@@ -112,15 +118,18 @@ pub(in crate::jit::semantic) fn lower_array_loads(function: &mut FunctionState) 
 }
 
 pub(in crate::jit::semantic) fn lower_stores(function: &mut FunctionState) {
+    function.ensure_cfg();
     // Storage owns these references; preserve the function ownership plan while expanding them.
     use crate::heap::{INLINE_PROPERTY_LENGTH_OFFSET, LENGTH_OFFSET, SHAPE_OFFSET};
     use crate::jit::helpers::{CACHE_ADDITION_DESTINATION_OFFSET, CACHE_ADDITION_INDEX_OFFSET};
     function.ensure_values();
     let graph = &mut function.graph;
     let mut checked = crate::FxHashMap::default();
-    for block in Cfg::new(graph).rpo {
-        for inst in graph.blocks[block].insts.clone() {
-            let data = graph.insts[inst].clone();
+    let mut insts = Vec::new();
+    for block in function.facts.cfg.rpo.clone() {
+        insts.clone_from(&graph.blocks[block].insts);
+        for &inst in &insts {
+            let data = &graph.insts[inst];
             let (object, key, value, addition) = match data.op {
                 Op::ArrayStore(object, key, value) | Op::PropertyStore(object, key, value, _) => {
                     (object, key, value, false)
@@ -129,10 +138,11 @@ pub(in crate::jit::semantic) fn lower_stores(function: &mut FunctionState) {
                 Op::CanOverwrite(object, key) => (object, key, object, false),
                 _ => continue,
             };
+            let span = data.span;
+            let checking = matches!(data.op, Op::CanOverwrite(..));
             let reuse = checked.remove(&inst);
             let store = checked_store(graph, inst, object, key);
             let existing_view = graph.views.remove(&inst);
-            let checking = matches!(data.op, Op::CanOverwrite(..));
             let mut at = Cursor::before(graph, inst);
             let (address, old, addition_data) = if let Some((address, old)) = reuse {
                 (address, Some(old), None)
@@ -179,7 +189,7 @@ pub(in crate::jit::semantic) fn lower_stores(function: &mut FunctionState) {
                 let scalar = graph.blocks.push(super::super::BlockData::default());
                 graph.terminate(
                     block,
-                    data.span,
+                    span,
                     super::super::TerminatorKind::Branch(
                         present,
                         super::super::Target::new(native),
@@ -192,7 +202,7 @@ pub(in crate::jit::semantic) fn lower_stores(function: &mut FunctionState) {
                 let yes = Cursor::at_end(graph, scalar, inst).ins().boolean(true);
                 graph.terminate(
                     scalar,
-                    data.span,
+                    span,
                     super::super::TerminatorKind::Jump(super::super::Target {
                         block: continuation,
                         args: vec![yes],
@@ -266,7 +276,7 @@ pub(in crate::jit::semantic) fn lower_stores(function: &mut FunctionState) {
             graph.detach_inst(inst);
         }
     }
-    function.facts.cfg = Cfg::new(graph);
+    function.invalidate_cfg();
 }
 
 fn checked_store(

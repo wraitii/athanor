@@ -69,7 +69,7 @@ pub(in crate::jit::semantic) fn result_facts(
         for (position, &inst) in graph.blocks[block].insts.iter().enumerate() {
             positions.insert(inst, position);
             let data = &graph.insts[inst];
-            for (index, value) in data.op.operands().into_iter().enumerate() {
+            for (index, value) in data.op.operands_iter().enumerate() {
                 let safe = match data.op {
                     Op::Get(..)
                     | Op::GetIndex(..)

@@ -79,14 +79,17 @@ pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) -> super::su
 }
 
 pub(in crate::jit::semantic) fn lower_memory(function: &mut FunctionState) -> bool {
+    function.ensure_cfg();
     use super::super::{MemoryFormat, MemoryOp};
     use crate::heap::TypedKind;
 
     let graph = &mut function.graph;
     let mut changed = false;
-    for block in super::super::Cfg::new(graph).rpo {
-        for inst in graph.blocks[block].insts.clone() {
-            let data = graph.insts[inst].clone();
+    let mut insts = Vec::new();
+    for &block in &function.facts.cfg.rpo {
+        insts.clone_from(&graph.blocks[block].insts);
+        for &inst in &insts {
+            let data = &graph.insts[inst];
             if data.block != block {
                 continue;
             }

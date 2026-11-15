@@ -724,7 +724,7 @@ pub(in crate::jit::semantic) fn version(
     notes: &mut Vec<String>,
 ) -> Result<Vec<RegionId>> {
     super::super::properties::assume_natives(graph);
-    version_with_report(
+    version_regions(
         graph,
         conditional,
         fallback,
@@ -735,7 +735,7 @@ pub(in crate::jit::semantic) fn version(
     )
 }
 
-pub(in crate::jit::semantic) fn version_with_report(
+pub(in crate::jit::semantic) fn version_regions(
     graph: &mut Graph,
     conditional: &ConditionalPlan,
     fallback: Option<usize>,

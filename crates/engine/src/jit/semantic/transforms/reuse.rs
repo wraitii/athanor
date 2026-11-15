@@ -35,14 +35,15 @@ fn refresh(graph: &Graph, facts: &mut Facts) {
 fn cleanup(graph: &mut Graph, facts: &mut Facts, mut notes: Option<&mut Vec<String>>) -> bool {
     let expressions = super::cse::eliminate(graph, facts, notes.as_deref_mut());
     if expressions {
-        refresh(graph, facts);
+        // CSE preserves value types, but aliases can change memory dependencies.
+        facts.compute_effects(graph);
     }
     if !reuse(graph, facts, notes.as_deref_mut()) {
         return expressions;
     }
     refresh(graph, facts);
     if super::cse::eliminate(graph, facts, notes) {
-        refresh(graph, facts);
+        facts.compute_effects(graph);
     }
     true
 }

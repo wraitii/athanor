@@ -58,38 +58,49 @@ fn semantic_text(lines: Vec<semantic::ListingLine>) -> String {
     text
 }
 
-pub(super) fn lower_runtime(
-    options: Option<&CompileOptions>,
-    state: &mut semantic::FunctionState,
-) -> Result<Option<(String, String)>, String> {
-    let pass = options
-        .filter(|options| options.semantic_ir)
-        .and_then(|options| options.after.as_deref());
-    let mut snapshot = None;
-    let mut passes = Vec::new();
-    state.lower_runtime_observed(&mut |name, state| {
-        if pass.is_some() {
-            passes.push(name.to_owned());
+pub(super) struct PassInspection {
+    pass: Option<String>,
+    pub(super) snapshot: Option<(String, String)>,
+}
+
+impl PassInspection {
+    pub(super) fn new(options: Option<&CompileOptions>) -> Self {
+        Self {
+            pass: options
+                .filter(|options| options.semantic_ir)
+                .and_then(|options| options.after.clone()),
+            snapshot: None,
         }
-        if pass == Some(name) {
-            snapshot = Some((name.to_owned(), semantic_text(state.listing_lines())));
-        }
-    })?;
-    if let Some(pass) = pass
-        && snapshot.is_none()
-        && !semantic::LOW_LEVEL_PASSES.contains(&pass)
-    {
-        passes.extend(
-            semantic::LOW_LEVEL_PASSES
-                .iter()
-                .map(|pass| (*pass).to_owned()),
-        );
-        return Err(format!(
-            "unknown pass {pass}; available passes: {}",
-            passes.join(", ")
-        ));
     }
-    Ok(snapshot)
+
+    pub(super) fn observe(&mut self, name: &str, state: &semantic::FunctionState) {
+        if self.pass.as_deref() == Some(name) {
+            self.snapshot = Some((name.to_owned(), semantic_text(state.listing_lines())));
+        }
+    }
+
+    pub(super) fn lower_runtime(
+        &mut self,
+        state: &mut semantic::FunctionState,
+    ) -> Result<(), String> {
+        state.lower_runtime_observed(&mut |name, state| self.observe(name, state))?;
+        let Some(pass) = self.pass.as_deref() else {
+            return Ok(());
+        };
+        let passes = semantic::SPECIALIZATION_PASSES
+            .iter()
+            .chain(semantic::RUNTIME_PASSES)
+            .chain(semantic::LOW_LEVEL_PASSES)
+            .copied()
+            .collect::<Vec<_>>();
+        if !passes.contains(&pass) {
+            return Err(format!(
+                "unknown pass {pass}; available passes: {}",
+                passes.join(", ")
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Inspection {

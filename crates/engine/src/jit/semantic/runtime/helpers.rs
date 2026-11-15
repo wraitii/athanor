@@ -1,7 +1,7 @@
 use cranelift_codegen::ir::{MemFlagsData, types};
 
 use super::super::cursor::{Cursor, Insert};
-use super::super::{Cfg, Facts, FunctionState, Op, Repr, TypedRead, Value, ValueType, low_level};
+use super::super::{Facts, FunctionState, Op, Repr, TypedRead, Value, ValueType, low_level};
 use crate::jit::helpers::Helper;
 use crate::value::Value as JsValue;
 
@@ -206,9 +206,12 @@ fn stack_vector(at: &mut Cursor, values: &[Value]) -> Value {
 }
 
 pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) {
+    function.ensure_cfg();
     let graph = &mut function.graph;
-    for block in Cfg::new(graph).rpo {
-        for inst in graph.blocks[block].insts.clone() {
+    let mut insts = Vec::new();
+    for &block in &function.facts.cfg.rpo {
+        insts.clone_from(&graph.blocks[block].insts);
+        for &inst in &insts {
             let Some(call) = select(&graph.insts[inst].op, &function.facts) else {
                 continue;
             };

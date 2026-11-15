@@ -21,13 +21,11 @@ use super::{
 };
 
 impl FunctionState {
-    pub(in crate::jit) fn lower_typed_storage(&mut self) -> Result<()> {
+    pub(super) fn lower_typed_storage(&mut self) -> Result<()> {
         let typed = typed::lower_memory(self);
         let metadata = storage::lower_metadata(self);
         if typed || metadata {
             self.graph.verify()?;
-            self.ensure_facts();
-            borrow::borrows(&mut self.graph, &self.facts, &mut self.notes);
         }
         Ok(())
     }
@@ -42,6 +40,11 @@ impl FunctionState {
         after: &mut dyn FnMut(&str, &FunctionState),
     ) -> Result<()> {
         after("input", self);
+        self.lower_js_observed(after)?;
+        if self.optimize {
+            self.lower_typed_storage()?;
+        }
+        after("typed-storage", self);
         self.graph.strip_hints();
         cells::lower(self);
         after("cells", self);
@@ -49,28 +52,23 @@ impl FunctionState {
         transforms::promote(&mut self.graph, &mut self.notes);
         self.graph.verify()?;
         after("bindings", self);
-        if properties::lower(self)? {
-            self.ensure_facts();
-            borrow::borrows(&mut self.graph, &self.facts, &mut self.notes);
-        }
+        properties::lower(self)?;
         after("properties", self);
         properties::lower_accesses(self)?;
         after("property-accesses", self);
         self.lower_typed_storage()?;
         after("memory", self);
-        let lowered = numeric::operations(self);
+        numeric::operations(self);
         let dispatched = numeric::dispatch(self);
         if dispatched {
             numeric::operations(self);
-        }
-        if lowered || dispatched {
-            self.ensure_facts();
-            borrow::borrows(&mut self.graph, &self.facts, &mut self.notes);
         }
         after("numeric", self);
         array_checks::lower_checks(self);
         after("array-checks", self);
         self.ensure_facts();
+        // Helper lowering erases the receivers needed to prove borrows.
+        borrow::borrows(&mut self.graph, &self.facts, &mut self.notes);
         helpers::lower(self);
         after("helpers", self);
         let plan = ownership::plan(&mut self.graph, &mut self.facts);
@@ -101,17 +99,49 @@ impl FunctionState {
         Ok(())
     }
 
-    pub(in crate::jit) fn prepare_osr(&mut self, source: usize) -> Result<()> {
+    pub(super) fn instrument_osr(&mut self, source: usize) -> Result<()> {
         self.osr = osr::Plan::discover(&self.graph, source).map(std::sync::Arc::new);
         if let Some(plan) = self.osr.clone() {
             self.invalidate_cfg();
             plan.instrument(&mut self.graph)?;
-            self.ensure_facts();
-            borrow::borrows(&mut self.graph, &self.facts, &mut self.notes);
         }
         Ok(())
     }
 }
+
+pub(in crate::jit) const SPECIALIZATION_PASSES: &[&str] =
+    &["inline", "captures", "versioning", "osr"];
+
+pub(in crate::jit) const RUNTIME_PASSES: &[&str] = &[
+    "input",
+    "property-specialization",
+    "indexed-accesses",
+    "normalise",
+    "load-reuse",
+    "indexed-checks",
+    "property-caches",
+    "js-cleanup",
+    "numeric-specialization",
+    "js",
+    "typed-storage",
+    "cells",
+    "bindings",
+    "properties",
+    "property-accesses",
+    "memory",
+    "numeric",
+    "array-checks",
+    "helpers",
+    "ownership",
+    "property-loads",
+    "array-loads",
+    "stores",
+    "values",
+    "conditions",
+    "repr",
+    "boxing",
+    "conversions",
+];
 
 pub(in crate::jit) const LOW_LEVEL_PASSES: &[&str] = &[
     "finalize-runtime",
@@ -159,6 +189,7 @@ pub(in crate::jit) fn lower_global(
     ssa_opt: bool,
     continuations: bool,
     report_regions: bool,
+    after: &mut dyn FnMut(&str, &FunctionState),
 ) -> Result<FunctionState> {
     let graph = build::lower_global(
         statements,
@@ -170,12 +201,12 @@ pub(in crate::jit) fn lower_global(
     )?;
     let mut function = FunctionState::new(graph, Vec::new(), ssa_opt);
     canonicalize(&mut function)?;
-    let planned = specialize(function, ssa_opt, None)?;
+    let planned = inline_and_plan_specialization(function, ssa_opt, None, 1)?;
     let versioning = Versioning::Speculate {
         fallback: None,
         continuations,
     };
-    optimize_specialized(planned, versioning, report_regions)
+    specialize_observed(planned, versioning, report_regions, None, after)
 }
 
 pub(in crate::jit) fn build_canonical(
@@ -248,8 +279,8 @@ pub(in crate::jit) fn optimize_canonical(
     ssa_opt: bool,
     specialization: Option<(&calls::Repository, usize)>,
 ) -> Result<FunctionState> {
-    optimize_specialized(
-        specialize(function, ssa_opt, specialization)?,
+    lower_planned(
+        plan_specialization(function, ssa_opt, specialization)?,
         Versioning::Speculate {
             fallback: None,
             continuations: true,
@@ -278,24 +309,25 @@ impl Expansions {
     }
 }
 
-pub(in crate::jit) fn specialize(
+#[cfg(test)]
+pub(in crate::jit) fn plan_specialization(
     function: FunctionState,
     ssa_opt: bool,
     specialization: Option<(&calls::Repository, usize)>,
 ) -> Result<FunctionState> {
-    specialize_with_budget(function, ssa_opt, specialization, 1)
+    inline_and_plan_specialization(function, ssa_opt, specialization, 1)
 }
 
-pub(in crate::jit) fn specialize_with_budget(
+pub(in crate::jit) fn inline_and_plan_specialization(
     function: FunctionState,
     ssa_opt: bool,
     specialization: Option<(&calls::Repository, usize)>,
     inline_multiplier: usize,
 ) -> Result<FunctionState> {
-    specialize_inner(function, ssa_opt, specialization, inline_multiplier, true)
+    inline_and_plan_inner(function, ssa_opt, specialization, inline_multiplier, true)
 }
 
-pub(super) fn specialize_inner(
+pub(super) fn inline_and_plan_inner(
     mut function: FunctionState,
     ssa_opt: bool,
     specialization: Option<(&calls::Repository, usize)>,
@@ -412,13 +444,50 @@ pub(in crate::jit) enum Versioning {
     },
 }
 
-pub(in crate::jit) fn optimize_specialized(
-    mut function: FunctionState,
+pub(in crate::jit) fn specialize(
+    function: FunctionState,
+    versioning: Versioning,
+    report_regions: bool,
+    osr_source: Option<usize>,
+) -> Result<FunctionState> {
+    specialize_observed(
+        function,
+        versioning,
+        report_regions,
+        osr_source,
+        &mut |_, _| {},
+    )
+}
+
+#[cfg(test)]
+pub(in crate::jit) fn lower_planned(
+    function: FunctionState,
     versioning: Versioning,
     report_regions: bool,
 ) -> Result<FunctionState> {
+    let mut function = specialize(function, versioning, report_regions, None)?;
+    function.lower_js()?;
+    function.ensure_facts();
+    borrow::borrows(&mut function.graph, &function.facts, &mut function.notes);
+    Ok(function)
+}
+
+pub(in crate::jit) fn specialize_observed(
+    mut function: FunctionState,
+    versioning: Versioning,
+    report_regions: bool,
+    osr_source: Option<usize>,
+    after: &mut dyn FnMut(&str, &FunctionState),
+) -> Result<FunctionState> {
+    after("inline", &function);
     if !function.optimize {
         function.ensure_facts();
+        after("captures", &function);
+        after("versioning", &function);
+        if let Some(source) = osr_source {
+            function.instrument_osr(source)?;
+        }
+        after("osr", &function);
         return Ok(function);
     }
     function.graph.entry_guards.clear();
@@ -443,6 +512,7 @@ pub(in crate::jit) fn optimize_specialized(
     captures::forward_captured_parameters(&mut function);
     function.graph.verify()?;
     function.invalidate_cfg();
+    after("captures", &function);
     let regions = match versioning {
         Versioning::Generic => {
             regions::materialize_properties(&mut function.graph)?;
@@ -452,7 +522,7 @@ pub(in crate::jit) fn optimize_specialized(
             fallback,
             continuations,
         } => {
-            let mut regions = regions::version_with_report(
+            let mut regions = regions::version_regions(
                 &mut function.graph,
                 &function.plan.conditional,
                 fallback,
@@ -494,68 +564,99 @@ pub(in crate::jit) fn optimize_specialized(
         }
     }
     function.graph.strip_assumes();
-    property_accesses::rewrite(&mut function.graph)?;
-    reads::lower(
-        &mut function.graph,
-        &function.plan.reads,
-        &mut function.notes,
-    )?;
-    writes::lower(&mut function.graph, &function.plan.stores)?;
-    function.invalidate_cfg();
-    regions::normalise_regions(&mut function, &regions)?;
-    js::coercions(&mut function);
-    js::bit_tests(&mut function);
-    function.graph.verify()?;
-    reuse::reuse_loads(&mut function);
-    function.graph.verify()?;
-    for region in &regions {
-        regions::hoist(&mut function, *region);
-        function.graph.verify()?;
+    function.specialized_regions = Some(regions);
+    after("versioning", &function);
+    if let Some(source) = osr_source {
+        function.instrument_osr(source)?;
     }
-    let bits_changed = numeric::bitwise(&mut function);
-    let arrays_changed = array_checks::lower_arrays(&mut function);
-    let typed_changed = typed::lower(&mut function)?;
-    if bits_changed || arrays_changed || typed_changed {
-        js::simplify(&mut function);
-        reuse::reuse_loads(&mut function);
-    }
-    function.invalidate_cfg();
-    if properties::lower(&mut function)? {
-        reuse::reuse_loads(&mut function);
-    }
-    if array_checks::lower_array_kinds(&mut function) {
-        reuse::reuse_loads(&mut function);
-    }
-    views::views(&mut function);
-    comparisons::expose(&mut function);
-    function.graph.verify()?;
-    js::simplify(&mut function);
-    function.graph.verify()?;
-    captures::sink_closures(&mut function);
-    captures::lazy_captures(&mut function);
-    function.graph.verify()?;
-    function.invalidate_cfg();
-    string_split::forward_packs(&mut function.graph);
-    transforms::trim(&mut function.graph);
-    transforms::remove_trivial_params(&mut function.graph);
-    function.graph.verify()?;
-    for region in &regions {
-        regions::hoist(&mut function, *region);
-        function.graph.verify()?;
-    }
-    if numeric::lower(&mut function) {
-        reuse::reuse_loads(&mut function);
-        js::simplify(&mut function);
-        numeric::relax_checks(&mut function);
-        js::simplify(&mut function);
-        for region in &regions {
-            regions::hoist(&mut function, *region);
-            function.graph.verify()?;
-        }
-    }
-    function.ensure_facts();
-    borrow::borrows(&mut function.graph, &function.facts, &mut function.notes);
+    after("osr", &function);
     Ok(function)
+}
+
+impl FunctionState {
+    pub(in crate::jit::semantic) fn lower_js(&mut self) -> Result<()> {
+        self.lower_js_observed(&mut |_, _| {})
+    }
+
+    fn lower_js_observed(&mut self, after: &mut dyn FnMut(&str, &FunctionState)) -> Result<()> {
+        let Some(regions) = self.specialized_regions.take().filter(|_| self.optimize) else {
+            self.ensure_facts();
+            for &pass in RUNTIME_PASSES
+                .iter()
+                .skip(1)
+                .take_while(|&&pass| pass != "typed-storage")
+            {
+                after(pass, self);
+            }
+            return Ok(());
+        };
+        property_accesses::rewrite(&mut self.graph)?;
+        after("property-specialization", self);
+        reads::lower(&mut self.graph, &self.plan.reads, &mut self.notes)?;
+        writes::lower(&mut self.graph, &self.plan.stores)?;
+        after("indexed-accesses", self);
+        self.invalidate_cfg();
+        regions::normalise_regions(self, &regions)?;
+        after("normalise", self);
+        js::coercions(self);
+        js::bit_tests(self);
+        self.graph.verify()?;
+        reuse::reuse_loads(self);
+        self.graph.verify()?;
+        for region in &regions {
+            regions::hoist(self, *region);
+            self.graph.verify()?;
+        }
+        after("load-reuse", self);
+        let bits_changed = numeric::bitwise(self);
+        let arrays_changed = array_checks::lower_arrays(self);
+        let typed_changed = typed::lower(self)?;
+        if bits_changed || arrays_changed || typed_changed {
+            js::simplify(self);
+            reuse::reuse_loads(self);
+        }
+        after("indexed-checks", self);
+        self.invalidate_cfg();
+        if properties::lower(self)? {
+            reuse::reuse_loads(self);
+        }
+        if array_checks::lower_array_kinds(self) {
+            reuse::reuse_loads(self);
+        }
+        after("property-caches", self);
+        views::views(self);
+        comparisons::expose(self);
+        self.graph.verify()?;
+        js::simplify(self);
+        self.graph.verify()?;
+        captures::sink_closures(self);
+        captures::lazy_captures(self);
+        self.graph.verify()?;
+        self.invalidate_cfg();
+        string_split::forward_packs(&mut self.graph);
+        transforms::trim(&mut self.graph);
+        transforms::remove_trivial_params(&mut self.graph);
+        self.graph.verify()?;
+        for region in &regions {
+            regions::hoist(self, *region);
+            self.graph.verify()?;
+        }
+        after("js-cleanup", self);
+        if numeric::lower(self) {
+            reuse::reuse_loads(self);
+            js::simplify(self);
+            numeric::relax_checks(self);
+            js::simplify(self);
+            for region in &regions {
+                regions::hoist(self, *region);
+                self.graph.verify()?;
+            }
+        }
+        after("numeric-specialization", self);
+        self.ensure_facts();
+        after("js", self);
+        Ok(())
+    }
 }
 
 pub(super) fn prepare_continuation(graph: Graph) -> FunctionState {
@@ -573,6 +674,5 @@ pub(super) fn prepare_continuation(graph: Graph) -> FunctionState {
     transforms::trim(&mut function.graph);
     transforms::remove_trivial_params(&mut function.graph);
     function.ensure_facts();
-    borrow::borrows(&mut function.graph, &function.facts, &mut function.notes);
     function
 }

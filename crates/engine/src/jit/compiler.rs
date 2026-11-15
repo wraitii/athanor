@@ -886,6 +886,7 @@ impl Compiler {
                 .unwrap_or("module");
             let label = format!("{module}.module");
             let id = self.declare_js(&label, line)?;
+            let mut passes = super::inspect::PassInspection::new(self.inspection.as_deref());
             let mut graph = super::semantic::lower_global(
                 &program.body,
                 program.span,
@@ -896,11 +897,9 @@ impl Compiler {
                 self.ssa_opt,
                 self.speculative_continuations,
                 self.report_regions(),
+                &mut |name, state| passes.observe(name, state),
             )
             .map_err(Error::Unsupported)?;
-            if self.ssa_opt {
-                graph.lower_typed_storage().map_err(Error::Unsupported)?;
-            }
             let continuations = self.compile_continuations(
                 &graph.graph,
                 self.source_name,
@@ -930,9 +929,9 @@ impl Compiler {
             } else {
                 None
             };
-            let mut after = None;
             if baseline.is_none() {
-                after = super::inspect::lower_runtime(self.inspection.as_deref(), &mut graph)
+                passes
+                    .lower_runtime(&mut graph)
                     .map_err(Error::Unsupported)?;
             }
             let inspection = super::inspect::Inspection::new(
@@ -942,7 +941,7 @@ impl Compiler {
                 self.source_name.0,
                 1,
             )
-            .after(after)
+            .after(passes.snapshot)
             .ast(self.inspection.as_deref(), &program);
             let listing = self.listing().then(|| graph.listing_lines());
             let (function, annotations, lowered, snapshot) = if baseline.is_some() {
@@ -1522,7 +1521,7 @@ impl Compiler {
         } else {
             self.recompile_inline_multiplier
         };
-        let planned = super::semantic::specialize_with_budget(
+        let planned = super::semantic::inline_and_plan_specialization(
             canonical,
             self.ssa_opt,
             Some((&self.canonical, source)),
@@ -1596,15 +1595,17 @@ impl Compiler {
         emission.specialization = specialization;
         emission.tier = tier;
         emission.specialized = matches!(versioning, super::semantic::Versioning::Speculate { .. });
-        let mut graph =
-            super::semantic::optimize_specialized(planned, versioning, self.report_regions())
-                .map_err(Error::Unsupported)?;
-        if self.osr && region.is_none() && !self.canonical.is_region(code) {
-            graph.prepare_osr(source).map_err(Error::Unsupported)?;
-        }
-        if self.ssa_opt {
-            graph.lower_typed_storage().map_err(Error::Unsupported)?;
-        }
+        let mut passes = super::inspect::PassInspection::new(self.inspection.as_deref());
+        let osr_source =
+            (self.osr && region.is_none() && !self.canonical.is_region(code)).then_some(source);
+        let mut graph = super::semantic::specialize_observed(
+            planned,
+            versioning,
+            self.report_regions(),
+            osr_source,
+            &mut |name, state| passes.observe(name, state),
+        )
+        .map_err(Error::Unsupported)?;
         let continuations = self.compile_continuations(
             &graph.graph,
             emission.source_name,
@@ -1639,11 +1640,11 @@ impl Compiler {
         } else {
             None
         };
-        let mut after = None;
         if baseline.is_some() {
             self.data.push(baseline_data);
         } else {
-            after = super::inspect::lower_runtime(self.inspection.as_deref(), &mut graph)
+            passes
+                .lower_runtime(&mut graph)
                 .map_err(Error::Unsupported)?;
         }
         let listing = self.listing().then(|| graph.listing_lines());
@@ -1654,7 +1655,7 @@ impl Compiler {
             source,
             inline_multiplier,
         )
-        .after(after);
+        .after(passes.snapshot);
         let (function, annotations, lowered, snapshot) = if baseline.is_some() {
             let mut function = cranelift_codegen::ir::Function::new();
             function.signature = signature;
@@ -1894,10 +1895,8 @@ impl Compiler {
         continuations: &FxHashMap<usize, FuncId>,
         feedback: Option<finalize::Feedback>,
     ) -> Result<FunctionBody, Error> {
+        let mut passes = super::inspect::PassInspection::new(self.inspection.as_deref());
         let mut state = super::semantic::FunctionState::from_graph(graph.clone());
-        if self.ssa_opt {
-            state.lower_typed_storage().map_err(Error::Unsupported)?;
-        }
         let mut data = FunctionData::new();
         let baseline = if !self.ssa_opt
             && self.module.isa().name() == "aarch64"
@@ -1920,16 +1919,16 @@ impl Compiler {
         } else {
             None
         };
-        let mut after = None;
         if baseline.is_some() {
             self.data.push(data);
         } else {
-            after = super::inspect::lower_runtime(self.inspection.as_deref(), &mut state)
+            passes
+                .lower_runtime(&mut state)
                 .map_err(Error::Unsupported)?;
         }
         let inspection =
             super::inspect::Inspection::from_graph(self.inspection.as_deref(), &state.graph)
-                .after(after);
+                .after(passes.snapshot);
         let listing = self
             .listing()
             .then(|| state.graph.listing(&state.facts).lines());
@@ -2114,6 +2113,7 @@ impl Compiler {
         semantic_function: Option<oxc_span::Span>,
     ) -> Result<FunctionBody, Error> {
         let mut specialization = None;
+        let mut passes = super::inspect::PassInspection::new(self.inspection.as_deref());
         let mut graph = semantic_function
             .map(|span| {
                 let canonical = match self.canonical.function(self.source_name.0, span.start) {
@@ -2133,7 +2133,7 @@ impl Compiler {
                         self.ssa_opt,
                     ),
                 }?;
-                let planned = super::semantic::specialize_with_budget(
+                let planned = super::semantic::inline_and_plan_specialization(
                     canonical,
                     self.ssa_opt,
                     Some((&self.canonical, self.source_name.0)),
@@ -2145,29 +2145,19 @@ impl Compiler {
                     &planned.plan,
                     self.source_name.0,
                 );
-                super::semantic::optimize_specialized(
+                super::semantic::specialize_observed(
                     planned,
                     super::semantic::Versioning::Speculate {
                         fallback: None,
                         continuations: self.speculative_continuations,
                     },
                     self.report_regions(),
+                    self.osr.then_some(self.source_name.0),
+                    &mut |name, state| passes.observe(name, state),
                 )
             })
             .transpose()
             .map_err(Error::Unsupported)?;
-        if self.osr
-            && let Some(graph) = &mut graph
-        {
-            graph
-                .prepare_osr(self.source_name.0)
-                .map_err(Error::Unsupported)?;
-        }
-        if self.ssa_opt
-            && let Some(graph) = &mut graph
-        {
-            graph.lower_typed_storage().map_err(Error::Unsupported)?;
-        }
         let feedback = if self.ssa_opt && matches!(kind, finalize::FunctionKind::Ordinary) {
             semantic_function.and_then(|span| self.canonical.code(self.source_name.0, span.start))
         } else {
@@ -2240,12 +2230,10 @@ impl Compiler {
         };
         let signature = self.graph_signature(graph.as_ref().map(|graph| &graph.graph));
         let feedback = feedback.map(|owner| self.feedback(owner, true));
-        let mut after = None;
         if baseline.is_none()
             && let Some(graph) = &mut graph
         {
-            after = super::inspect::lower_runtime(self.inspection.as_deref(), graph)
-                .map_err(Error::Unsupported)?;
+            passes.lower_runtime(graph).map_err(Error::Unsupported)?;
         }
         let inspection = graph.as_ref().map_or_else(Default::default, |graph| {
             super::inspect::Inspection::new(
@@ -2255,7 +2243,7 @@ impl Compiler {
                 self.source_name.0,
                 usize::from(self.inlining),
             )
-            .after(after)
+            .after(passes.snapshot)
         });
         let listing = self
             .listing()

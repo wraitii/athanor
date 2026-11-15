@@ -5,6 +5,7 @@ use oxc_span::Span;
 
 use super::borrow::receiver as borrowed_receiver;
 use super::contracts::{self, ResultReference};
+use super::liveness::{self, Set};
 use super::{
     Block, BlockData, Cfg, Facts, Graph, Inst, InstData, Op, Ownership, Target, Terminator,
     TerminatorKind, Value, ValueType,
@@ -312,7 +313,7 @@ fn assign(
     cfg: &Cfg,
     owned: impl Fn(Value) -> bool,
     prefers: impl Fn(Value) -> bool,
-) -> (Slots, SecondaryMap<Block, FxHashSet<Value>>) {
+) -> (Slots, SecondaryMap<Block, Set>) {
     let mut receivers = FxHashMap::default();
     for (_, data) in graph.insts.iter() {
         if let Some(result) = data.result()
@@ -342,68 +343,68 @@ fn assign(
             }
         }
     }
-    let anchored = |value: Value, live: &mut FxHashSet<Value>| {
-        if !receivers.contains_key(&value) {
-            if owned(value) {
-                live.insert(value);
+    let anchors: FxHashMap<Value, Vec<Value>> = receivers
+        .keys()
+        .map(|&value| {
+            let mut pending = vec![value];
+            let mut visited = FxHashSet::default();
+            let mut anchors = Vec::new();
+            while let Some(current) = pending.pop() {
+                if !visited.insert(current) {
+                    continue;
+                }
+                if owned(current) {
+                    anchors.push(current);
+                }
+                if let Some(owners) = receivers.get(&current) {
+                    pending.extend(owners.iter().copied());
+                }
             }
-            return;
-        }
-        let mut pending = vec![value];
-        let mut visited = FxHashSet::default();
-        while let Some(current) = pending.pop() {
-            if !visited.insert(current) {
-                continue;
-            }
-            if owned(current) {
-                live.insert(current);
-            }
-            if let Some(owners) = receivers.get(&current) {
-                pending.extend(owners.iter().copied());
-            }
+            (value, anchors)
+        })
+        .collect();
+    let anchored = |value: Value, live: &mut Set| {
+        if let Some(anchors) = anchors.get(&value) {
+            live.extend(anchors.iter().copied());
+        } else if owned(value) {
+            live.insert(value);
         }
     };
-    let terminator_uses = |block: Block| {
-        let mut uses = FxHashSet::default();
-        if let Some(terminator) = &graph.blocks[block].terminator {
+    let mut terminators = SecondaryMap::<Block, Set>::new();
+    let mut uses = SecondaryMap::<Block, Set>::new();
+    let mut defs = SecondaryMap::<Block, Set>::new();
+    for &block in &cfg.rpo {
+        let data = &graph.blocks[block];
+        if let Some(terminator) = &data.terminator {
             for value in terminator.kind.operands_iter() {
-                anchored(value, &mut uses);
+                anchored(value, &mut terminators[block]);
             }
         }
-        uses
-    };
-    let mut live_in: SecondaryMap<Block, FxHashSet<Value>> = SecondaryMap::new();
-    let mut live_out: SecondaryMap<Block, FxHashSet<Value>> = SecondaryMap::new();
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for &block in cfg.rpo.iter().rev() {
-            let data = &graph.blocks[block];
-            let mut live: FxHashSet<Value> = graph
-                .successors(block)
-                .into_iter()
-                .flat_map(|successor| live_in[successor].iter().copied())
-                .collect();
-            live_out[block] = live.clone();
-            live.extend(terminator_uses(block));
-            for &inst in data.insts.iter().rev() {
-                let data = &graph.insts[inst];
-                if let Some(result) = data.result() {
-                    live.remove(&result);
-                }
-                for value in data.op.operands_iter() {
-                    anchored(value, &mut live);
+        let mut live = terminators[block].clone();
+        for &inst in data.insts.iter().rev() {
+            let data = &graph.insts[inst];
+            if let Some(result) = data.result() {
+                live.remove(&result);
+                if owned(result) {
+                    defs[block].insert(result);
                 }
             }
-            for param in &data.params {
-                live.remove(param);
-            }
-            if live != live_in[block] {
-                live_in[block] = live;
-                changed = true;
+            for value in data.op.operands_iter() {
+                anchored(value, &mut live);
             }
         }
+        for &param in &data.params {
+            live.remove(&param);
+            if owned(param) {
+                defs[block].insert(param);
+            }
+        }
+        uses[block] = live;
     }
+    let liveness::Live {
+        input: live_in,
+        output: live_out,
+    } = liveness::solve(graph, cfg, &uses, &defs);
 
     let mut affinities = SecondaryMap::<Value, Vec<Value>>::new();
     for &block in &cfg.rpo {
@@ -424,9 +425,10 @@ fn assign(
     for &block in &cfg.rpo {
         let data = &graph.blocks[block];
         let mut live = live_out[block].clone();
-        live.extend(terminator_uses(block));
+        live.union(&terminators[block]);
         let mut dying = vec![Vec::new(); data.insts.len()];
-        let mut used = FxHashSet::default();
+        let mut used = Set::default();
+        let mut uses = Set::default();
         for (index, &inst) in data.insts.iter().enumerate().rev() {
             let data = &graph.insts[inst];
             if let Some(result) = data.result()
@@ -434,19 +436,19 @@ fn assign(
             {
                 used.insert(result);
             }
-            let mut uses = FxHashSet::default();
+            uses.clear();
             for value in data.op.operands_iter() {
                 anchored(value, &mut uses);
             }
-            for value in uses {
+            for value in uses.iter() {
                 if live.insert(value) {
                     dying[index].push(value);
                 }
             }
         }
         let mut in_use = vec![false; slots.shared.len()];
-        for value in &live_in[block] {
-            if let Some(slot) = slots.slot[*value] {
+        for value in live_in[block].iter() {
+            if let Some(slot) = slots.slot[value] {
                 in_use[slot as usize] = true;
             }
         }
@@ -461,7 +463,7 @@ fn assign(
             }
         }
         let escaping = &live_out[block];
-        let terminator = terminator_uses(block);
+        let terminator = &terminators[block];
         for (index, &inst) in data.insts.iter().enumerate() {
             for &value in &dying[index] {
                 slots.free(&mut in_use, value);
@@ -573,7 +575,7 @@ fn transfer(
     rpo: &[Block],
     holders: &SecondaryMap<Value, Holder>,
     slots: &Slots,
-    live_out: &SecondaryMap<Block, FxHashSet<Value>>,
+    live_out: &SecondaryMap<Block, Set>,
 ) -> bool {
     let mut split = false;
     for &block in rpo {

@@ -15,6 +15,7 @@ mod guards;
 mod js;
 pub(in crate::jit) mod legalize;
 mod listing;
+mod liveness;
 pub(in crate::jit) mod low_level;
 pub(super) mod osr;
 pub(in crate::jit) mod ownership;
@@ -35,11 +36,12 @@ fn verification_enabled() -> bool {
 }
 
 pub(super) use pipeline::{
-    LOW_LEVEL_PASSES, Versioning, build_canonical, canonicalize_graph, lower_global,
-    lower_low_level, optimize_specialized, specialize_with_budget,
+    LOW_LEVEL_PASSES, RUNTIME_PASSES, SPECIALIZATION_PASSES, Versioning, build_canonical,
+    canonicalize_graph, inline_and_plan_specialization, lower_global, lower_low_level, specialize,
+    specialize_observed,
 };
 #[cfg(test)]
-use pipeline::{analyze, optimize_canonical, specialize};
+use pipeline::{analyze, lower_planned, optimize_canonical, plan_specialization};
 
 use crate::{FxHashMap, FxHashSet};
 use std::fmt;
@@ -618,18 +620,53 @@ impl Target {
     }
 }
 
+pub(in crate::jit) struct Operands<'a> {
+    fixed: std::array::IntoIter<Option<Value>, 4>,
+    rest: std::slice::Iter<'a, Value>,
+}
+
+impl<'a> Operands<'a> {
+    pub(in crate::jit) fn new(fixed: [Option<Value>; 4], rest: &'a [Value]) -> Self {
+        Self {
+            fixed: fixed.into_iter(),
+            rest: rest.iter(),
+        }
+    }
+}
+
+impl Iterator for Operands<'_> {
+    type Item = Value;
+
+    fn next(&mut self) -> Option<Value> {
+        self.fixed
+            .by_ref()
+            .flatten()
+            .next()
+            .or_else(|| self.rest.next().copied())
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let size = self
+            .fixed
+            .as_slice()
+            .iter()
+            .filter(|value| value.is_some())
+            .count()
+            + self.rest.len();
+        (size, Some(size))
+    }
+}
+
+impl ExactSizeIterator for Operands<'_> {}
+
 impl Op {
     pub(super) fn operands(&self) -> Vec<Value> {
         self.operands_iter().collect()
     }
 
-    pub(super) fn operands_iter(&self) -> impl Iterator<Item = Value> + '_ {
-        let mut machine = None;
+    pub(super) fn operands_iter(&self) -> Operands<'_> {
         let (fixed, rest): ([Option<Value>; 3], &[Value]) = match self {
-            Op::Aarch64(op) => {
-                machine = Some(op.operands());
-                ([None; 3], &[])
-            }
+            Op::Aarch64(op) => return op.operands(),
             Op::LowLevel(
                 low_level::Op::Scratch { values, .. } | low_level::Op::Cleanup { values, .. },
             ) => ([None; 3], values),
@@ -868,11 +905,8 @@ impl Op {
                 ..
             } => ([Some(*callee), *receiver, None], args),
         };
-        fixed
-            .into_iter()
-            .flatten()
-            .chain(rest.iter().copied())
-            .chain(machine.into_iter().flatten())
+        let [a, b, c] = fixed;
+        Operands::new([a, b, c, None], rest)
     }
 
     pub(super) fn operands_mut(&mut self) -> impl Iterator<Item = &mut Value> + '_ {
@@ -1330,7 +1364,11 @@ impl Cfg {
         Self::from_entry(graph, graph.entry)
     }
 
-    pub(super) fn from_entry(graph: &Graph, entry: Block) -> Self {
+    pub(super) fn reverse_postorder(graph: &Graph) -> Vec<Block> {
+        Self::reverse_postorder_from(graph, graph.entry)
+    }
+
+    fn reverse_postorder_from(graph: &Graph, entry: Block) -> Vec<Block> {
         let mut visited = vec![false; graph.blocks.len()];
         visited[entry.index()] = true;
         let mut postorder = Vec::new();
@@ -1346,7 +1384,12 @@ impl Cfg {
                 stack.pop();
             }
         }
-        let rpo: Vec<Block> = postorder.into_iter().rev().collect();
+        postorder.reverse();
+        postorder
+    }
+
+    pub(super) fn from_entry(graph: &Graph, entry: Block) -> Self {
+        let rpo = Self::reverse_postorder_from(graph, entry);
         let mut edges = Vec::new();
         for &block in &rpo {
             for successor in graph.successors(block) {
@@ -2423,6 +2466,8 @@ pub(super) struct FunctionState {
     pub(in crate::jit) plan: SpecializationPlan,
     pub(super) graph: Graph,
     pub(super) osr: Option<std::sync::Arc<osr::Plan>>,
+    // Consumed by JS lowering; continuation graphs are already prepared.
+    specialized_regions: Option<Vec<RegionId>>,
     pub(in crate::jit) facts: Facts,
     notes: Vec<String>,
     optimize: bool,
@@ -2445,6 +2490,7 @@ impl FunctionState {
             facts_level: FactsLevel::None,
             plan: SpecializationPlan::default(),
             osr: None,
+            specialized_regions: None,
         }
     }
 

@@ -13,6 +13,53 @@ fn compile(arguments: &[&str], source: &str) -> Output {
 }
 
 #[test]
+fn after_views_span_specialization_and_lowering() {
+    let source = "function helper(x){return x*2;} function selected(a,n){let sum=0;for(let i=0;i<n;++i)sum+=helper(a[i]);return sum;}";
+    for pass in [
+        "inline",
+        "captures",
+        "versioning",
+        "osr",
+        "input",
+        "property-specialization",
+        "indexed-accesses",
+        "normalise",
+        "load-reuse",
+        "indexed-checks",
+        "property-caches",
+        "js-cleanup",
+        "numeric-specialization",
+        "js",
+        "typed-storage",
+        "ownership",
+        "boxing",
+        "scalar-cleanup",
+    ] {
+        let output = compile(&["--filter", "selected", "--after", pass], source);
+        assert!(
+            output.status.success(),
+            "{pass}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            text.contains(&format!("semantic IR selected after {pass}\n")),
+            "{text}"
+        );
+    }
+    let output = compile(&["--after", "unknown"], source);
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains(
+            "unknown pass unknown; available passes: inline, captures, versioning, osr, input"
+        ),
+        "{error}"
+    );
+    assert!(error.contains("scalar-cleanup"), "{error}");
+}
+
+#[test]
 #[cfg(target_arch = "aarch64")]
 fn native_selection_view_preserves_clif_inspection() {
     let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
@@ -117,29 +164,32 @@ fn filter_reports_no_matches_and_requires_compile_mode() {
 
 #[test]
 fn semantic_dump_includes_emitted_osr_instrumentation() {
-    let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
-        .env("JS_JIT_SSA", "1")
-        .env("JS_JIT_OSR", "1")
-        .env_remove("JS_JIT_JITDUMP")
-        .args([
-            "--compile",
-            "--no-ir",
-            "--filter",
-            "f",
-            "--semantic-ir",
-            "--eval",
-            "function f(rows,n){let total=0;for(let y=0;y<n;++y){let sum=0;for(let x=0;x<n;++x)sum+=rows[y][x]/1;total+=sum;}return total;}",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let text = String::from_utf8(output.stdout).unwrap();
-    assert!(text.contains("osr_start"), "{text}");
-    assert!(!text.contains("note:"));
+    for arguments in [vec![], vec!["--after", "osr"]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
+            .env("JS_JIT_SSA", "1")
+            .env("JS_JIT_OSR", "1")
+            .env_remove("JS_JIT_JITDUMP")
+            .args(arguments)
+            .args([
+                "--compile",
+                "--no-ir",
+                "--filter",
+                "f",
+                "--semantic-ir",
+                "--eval",
+                "function f(rows,n){let total=0;for(let y=0;y<n;++y){let sum=0;for(let x=0;x<n;++x)sum+=rows[y][x]/1;total+=sum;}return total;}",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.contains("osr_start"), "{text}");
+        assert!(!text.contains("note:"));
+    }
 }
 
 #[test]

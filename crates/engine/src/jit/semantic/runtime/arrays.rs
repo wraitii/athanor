@@ -11,9 +11,11 @@ pub(in crate::jit::semantic) fn lower_arrays(function: &mut FunctionState) -> bo
     let graph = &mut function.graph;
     let facts = &function.facts;
     let mut changed = false;
+    let mut insts = Vec::new();
     for &block in &facts.cfg.rpo {
-        for inst in graph.blocks[block].insts.clone() {
-            let data = graph.insts[inst].clone();
+        insts.clone_from(&graph.blocks[block].insts);
+        for &inst in &insts {
+            let data = &graph.insts[inst];
             let Op::IsArrayIndex(object, key, position, layout) = data.op else {
                 continue;
             };
@@ -40,8 +42,10 @@ pub(in crate::jit::semantic) fn lower_arrays(function: &mut FunctionState) -> bo
 pub(in crate::jit::semantic) fn lower_checks(function: &mut FunctionState) -> bool {
     let graph = &mut function.graph;
     let mut changed = false;
+    let mut insts = Vec::new();
     for block in graph.blocks.keys().collect::<Vec<_>>() {
-        for inst in graph.blocks[block].insts.clone() {
+        insts.clone_from(&graph.blocks[block].insts);
+        for &inst in &insts {
             let op = match graph.insts[inst].op {
                 Op::BooleanAnd(left, right) => low_level::Op::Binary {
                     op: low_level::Binary::BooleanAnd,
@@ -77,9 +81,11 @@ fn integer(graph: &mut Graph, inst: Inst, value: Value) -> Value {
 pub(in crate::jit::semantic) fn lower_array_kinds(function: &mut FunctionState) -> bool {
     let graph = &mut function.graph;
     let mut changed = false;
+    let mut insts = Vec::new();
     for block in graph.blocks.keys().collect::<Vec<_>>() {
-        for inst in graph.blocks[block].insts.clone() {
-            let data = graph.insts[inst].clone();
+        insts.clone_from(&graph.blocks[block].insts);
+        for &inst in &insts {
+            let data = &graph.insts[inst];
             let Op::IsArray(object, layout) = data.op else {
                 continue;
             };

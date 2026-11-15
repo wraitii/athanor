@@ -200,7 +200,7 @@ fn cancel_pairs(graph: &mut Graph, blocks: &[Block]) {
 }
 
 pub(in crate::jit) fn lower(graph: &mut Graph, ctx: Value, convention: CallConv, pointer: Type) {
-    let blocks = Cfg::new(graph).rpo;
+    let blocks = Cfg::reverse_postorder(graph);
     cancel_pairs(graph, &blocks);
     let blocks: Vec<_> = blocks
         .into_iter()

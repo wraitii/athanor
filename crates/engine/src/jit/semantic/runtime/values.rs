@@ -2,7 +2,7 @@ use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{MemFlagsData, types};
 
 use super::super::cursor::{Cursor, Insert};
-use super::super::{Cfg, Facts, FunctionState, Graph, Inst, Op, Repr, Value, ValueType, low_level};
+use super::super::{Facts, FunctionState, Graph, Inst, Op, Repr, Value, ValueType, low_level};
 use super::layout;
 use crate::FxHashMap;
 use crate::heap::{CODE_OFFSET, KIND_OFFSET, SHAPE_OFFSET, TypedKind, kind};
@@ -14,8 +14,10 @@ pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) {
     let facts = &function.facts;
     let mut aliases = FxHashMap::default();
     let mut removed = Vec::new();
-    for block in Cfg::new(graph).rpo {
-        for inst in graph.blocks[block].insts.clone() {
+    let mut insts = Vec::new();
+    for &block in &facts.cfg.rpo {
+        insts.clone_from(&graph.blocks[block].insts);
+        for &inst in &insts {
             if let Op::View(object) = graph.insts[inst].op {
                 let result = graph.insts[inst].result().unwrap();
                 let view = view(graph, inst, object);
@@ -103,9 +105,9 @@ fn scalar(types: ValueType) -> bool {
 }
 
 fn predicate(graph: &mut Graph, facts: &Facts, inst: Inst) -> Option<Value> {
-    let op = graph.insts[inst].op.clone();
+    let op = &graph.insts[inst].op;
     let boxed = |_: &Graph, value: Value| !scalar(facts.of(value));
-    Some(match op {
+    Some(match *op {
         Op::IntegerCheck(value, float, exact) => {
             integer_check(&mut Cursor::before(graph, inst), value, float, exact)
         }
