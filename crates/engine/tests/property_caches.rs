@@ -43,6 +43,19 @@ fn empty_cache_rejects_dictionary_receivers() {
 }
 
 #[test]
+fn partially_filled_overflow_rejects_uncacheable_receivers() {
+    check(
+        "function read(o) { return o.x; }
+        function main() {
+            let sum = read({x: 1}) + read({y: 0, x: 2});
+            sum += read({x: 4, 0: 0});
+            return sum + read({x: 8}) + read({y: 0, x: 16});
+        }",
+        31.0,
+    );
+}
+
+#[test]
 fn added_properties_and_dictionaries_miss() {
     check(
         "function read(o) { return o.x; }

@@ -154,10 +154,11 @@ fn cold_property_accesses_keep_helpers() {
             Op::PropertyCache(..) | Op::CachedProperty(..) | Op::FillPropertyStore(..)
         )));
         runtime::helpers::lower(&mut function);
-        assert!(!ops(&function.graph).iter().any(|op| matches!(
-            op,
-            Op::Get(..) | Op::Set(..) | Op::Define(..)
-        )));
+        assert!(
+            !ops(&function.graph)
+                .iter()
+                .any(|op| matches!(op, Op::Get(..) | Op::Set(..) | Op::Define(..)))
+        );
         function.graph.verify().unwrap();
     }
 }
@@ -3881,6 +3882,62 @@ fn conflicting_property_shapes_remain_alternative_local_guards() {
 }
 
 #[test]
+fn successful_shape_probes_eliminate_only_valid_shape_checks() {
+    for mutation in [None, Some(false), Some(true)] {
+        let mut graph = canonicalize_graph(
+            lower_source("function f(object){return object.x;}").unwrap(),
+            true,
+        )
+        .unwrap()
+        .graph;
+        let inst = graph
+            .insts
+            .iter()
+            .find_map(|(inst, data)| matches!(data.op, Op::Get(..)).then_some(inst))
+            .unwrap();
+        let Op::Get(object, _) = graph.insts[inst].op else {
+            unreachable!()
+        };
+        graph.set_op(inst, Op::ProbeShapeProperty(object, "x".into(), 34, 0));
+        let probe = graph.insts[inst].result().unwrap();
+        let block = graph.insts[inst].block;
+        let span = graph.span;
+        let success = graph.blocks.push(BlockData::default());
+        let failure = graph.blocks.push(BlockData::default());
+        if mutation == Some(false) {
+            graph.append(block, span, Op::Set(object, "y".into(), probe), false);
+        }
+        let failed = graph.append_value(block, span, Op::IsUninitialized(probe));
+        graph.terminate(
+            block,
+            span,
+            TerminatorKind::Branch(failed, Target::new(failure), Target::new(success)),
+        );
+        if mutation == Some(true) {
+            graph.append(success, span, Op::Set(object, "y".into(), probe), false);
+        }
+        let (check, result) = graph.append(success, span, Op::IsShape(object, 34), true);
+        graph.terminate(success, span, TerminatorKind::Return(result.unwrap()));
+        let (miss_check, result) = graph.append(failure, span, Op::IsShape(object, 34), true);
+        graph.terminate(failure, span, TerminatorKind::Return(result.unwrap()));
+        let mut function = FunctionState::from_graph(graph);
+        reuse::reuse_loads(&mut function);
+        assert_eq!(
+            matches!(
+                function.graph.insts[check].op,
+                Op::Constant(Constant::Boolean(true))
+            ),
+            mutation.is_none()
+        );
+        assert!(matches!(
+            function.graph.insts[miss_check].op,
+            Op::IsShape(..)
+        ));
+        function.graph.verify().unwrap();
+    }
+}
+
+#[test]
 fn property_reads_share_cache_search_and_holder_validation() {
     use crate::jit::helpers::{CACHE_HOLDER_SHAPE_OFFSET, CACHE_LEN_OFFSET};
     use cranelift_codegen::ir::types;
@@ -3900,7 +3957,21 @@ fn property_reads_share_cache_search_and_holder_validation() {
                 "{function}"
             );
         }
-        assert_eq!(count(&operations, |op| matches!(op, Op::PropertyLoad(..))), 1);
+        assert_eq!(
+            count(&operations, |op| matches!(op, Op::PropertyLoad(..))),
+            1
+        );
+        assert_eq!(
+            count(&operations, |op| matches!(
+                op,
+                Op::LowLevel(low_level::Op::IntCompare {
+                    condition: cranelift_codegen::ir::condcodes::IntCC::UnsignedGreaterThan,
+                    ..
+                })
+            )),
+            1,
+            "{function}"
+        );
         function.graph.verify().unwrap();
     }
 }
@@ -4016,6 +4087,55 @@ fn optimize_with_shapes(
         }
     }
     optimize_canonical(canonical, true, Some((&repository, 0))).unwrap()
+}
+
+#[test]
+fn nested_read_probes_use_shape_feedback() {
+    use crate::jit::profile::{PropertyAccess, ShapeAccess};
+
+    let function = optimize_with_shapes(
+        "function f(o){const r={};if(o.section){r.value=o.section.value;r.scaled=o.section.value*o.section.scale;}return r;}",
+        &[
+            (
+                "section",
+                PropertyAccess::Get,
+                ShapeAccess::Read {
+                    shape: 10,
+                    index: 0,
+                },
+            ),
+            (
+                "value",
+                PropertyAccess::Get,
+                ShapeAccess::Read {
+                    shape: 20,
+                    index: 0,
+                },
+            ),
+            (
+                "scale",
+                PropertyAccess::Get,
+                ShapeAccess::Read {
+                    shape: 20,
+                    index: 1,
+                },
+            ),
+        ],
+    );
+    for (name, shape, index) in [("section", 10, 0), ("value", 20, 0), ("scale", 20, 1)] {
+        assert!(
+            ops(&function.graph).iter().any(|op| matches!(op,
+            Op::ProbeShapeProperty(_, property, expected, slot)
+                if property == name && *expected == shape && *slot == index)),
+            "{function}"
+        );
+        assert!(
+            !ops(&function.graph).iter().any(|op| matches!(op,
+            Op::ProbeProperty(_, property) if property == name)),
+            "{function}"
+        );
+    }
+    function.graph.verify().unwrap();
 }
 
 fn loop_ops(graph: &Graph) -> Vec<&Op> {
@@ -4245,9 +4365,7 @@ fn property_additions_keep_shape_guards_inside_loops() {
         "{function}"
     );
     assert!(
-        !body
-            .iter()
-            .any(|op| matches!(op, Op::ShapedSet(..))),
+        !body.iter().any(|op| matches!(op, Op::ShapedSet(..))),
         "{function}"
     );
     function.graph.verify().unwrap();

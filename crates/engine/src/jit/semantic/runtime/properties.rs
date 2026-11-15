@@ -415,10 +415,20 @@ impl PropertyLowering<'_> {
                 .ins()
                 .load(types::I32, flags, view, KIND_OFFSET)
         });
-        let len = self
+        // Unused overflow entries carry DICTIONARY and participate in the search.
+        let dictionary = self
             .at(block)
             .ins()
-            .load(types::I32, flags, cache, CACHE_LEN_OFFSET);
+            .iconst(types::I32, crate::heap::DICTIONARY as i64);
+        let cacheable = self
+            .at(block)
+            .ins()
+            .icmp(IntCC::NotEqual, shape, dictionary);
+        if !builtins {
+            let lookup = self.block();
+            self.branch(block, cacheable, Target::new(lookup), Target::new(miss));
+            block = lookup;
+        }
         let mut overflow = None;
         for index in 0..PROPERTY_CACHE_LIMIT {
             let entry = if index == 0 {
@@ -446,7 +456,11 @@ impl PropertyLowering<'_> {
                         .load(types::I32, flags, entry, CACHE_BUILTIN_KIND_OFFSET);
                 let zero = self.at(block).ins().iconst(types::I32, 0);
                 let cached = self.at(block).ins().icmp(IntCC::NotEqual, expected, zero);
-                shaped_kind = Some(self.at(block).ins().icmp(IntCC::Equal, expected, zero));
+                let shaped = self.at(block).ins().icmp(IntCC::Equal, expected, zero);
+                shaped_kind = Some(
+                    self.at(block)
+                        .add_unassigned(Op::BooleanAnd(shaped, cacheable)),
+                );
                 let matches = self.at(block).ins().icmp(IntCC::Equal, kind, expected);
                 let hit = self
                     .at(block)
@@ -483,16 +497,20 @@ impl PropertyLowering<'_> {
                 Target::new(next),
             );
             block = next;
-            if index + 1 < PROPERTY_CACHE_LIMIT {
-                let count = self.at(block).ins().iconst(types::I32, (index + 1) as i64);
+            if index == 0 {
+                let len = self
+                    .at(block)
+                    .ins()
+                    .load(types::I32, flags, cache, CACHE_LEN_OFFSET);
+                let one = self.at(block).ins().iconst(types::I32, 1);
                 let more = self
                     .at(block)
                     .ins()
-                    .icmp(IntCC::UnsignedGreaterThan, len, count);
+                    .icmp(IntCC::UnsignedGreaterThan, len, one);
                 let lookup = self.block();
                 self.branch(block, more, Target::new(lookup), Target::new(miss));
                 block = lookup;
-            } else {
+            } else if index + 1 == PROPERTY_CACHE_LIMIT {
                 self.jump(block, miss, Vec::new());
             }
         }
@@ -503,7 +521,17 @@ impl PropertyLowering<'_> {
                 .load(types::I64, flags, entry, CACHE_HOLDER_OFFSET);
             let zero = self.at(block).ins().iconst(types::I64, 0);
             let own = self.at(block).ins().icmp(IntCC::Equal, holder, zero);
-            let holder = self.at(block).ins().select(own, view, holder);
+            let inherited = self.block();
+            self.branch(
+                block,
+                own,
+                Target {
+                    block: done,
+                    args: vec![entry],
+                },
+                Target::new(inherited),
+            );
+            let block = inherited;
             let actual = self
                 .at(block)
                 .ins()

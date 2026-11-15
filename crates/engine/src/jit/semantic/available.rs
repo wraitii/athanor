@@ -24,6 +24,7 @@ pub(super) enum LoadKey {
     Index(Value, Value),
     Global(String),
     Probe(String),
+    ShapeProbe(Value, String, u32, u32),
     PropertyCache(Inst),
     This,
     Argument(usize),
@@ -66,6 +67,9 @@ fn load_key(op: &Op, probes: bool, aliases: &FxHashMap<Value, Value>) -> Option<
         Op::ConstructorPrototype(callee) => LoadKey::Constructor(at(callee)),
         Op::GlobalRead(name) => LoadKey::Global(name.clone()),
         Op::ProbeGlobal(name) if probes => LoadKey::Probe(name.clone()),
+        Op::ProbeShapeProperty(object, name, shape, index) => {
+            LoadKey::ShapeProbe(at(object), name.clone(), *shape, *index)
+        }
         Op::LowLevel(super::low_level::Op::Load {
             ty,
             address,
@@ -128,6 +132,14 @@ fn step(
     }
     if cold {
         return None;
+    }
+    if let Op::IsShape(object, shape) = data.op
+        && state.iter().any(|(key, entry)| {
+            matches!(key, LoadKey::ShapeProbe(receiver, _, known, _)
+                if *receiver == resolve(aliases, object) && *known == shape && entry.truth == Some(true))
+        })
+    {
+        return Some(Reuse::Boolean(true));
     }
     let key = load_key(&data.op, probes, aliases)?;
     let [result] = data.results.as_slice() else {
@@ -203,13 +215,28 @@ fn entering(
             (yes.block == block) != inverted,
         ))
     };
-    let truth_on_edge = |entry: &Available, edge: Option<(Value, bool)>| match edge {
-        Some((condition, truth)) if resolve(aliases, entry.value) == condition => Some(truth),
-        _ => entry.truth,
+    let truth_on_edge = |key: &LoadKey, entry: &Available, edge: Option<(Value, bool)>| {
+        let Some((condition, truth)) = edge else {
+            return entry.truth;
+        };
+        if matches!(key, LoadKey::ShapeProbe(..)) {
+            // Probe truth records success, independently of the property's value.
+            if let Some(Op::IsUninitialized(value)) = graph.defining_op(condition)
+                && resolve(aliases, *value) == resolve(aliases, entry.value)
+            {
+                return Some(!truth);
+            }
+            return entry.truth;
+        }
+        if resolve(aliases, entry.value) == condition {
+            Some(truth)
+        } else {
+            entry.truth
+        }
     };
     let first_edge = edge_truth(first);
-    for entry in state.values_mut() {
-        entry.truth = truth_on_edge(entry, first_edge);
+    for (key, entry) in &mut state {
+        entry.truth = truth_on_edge(key, entry, first_edge);
     }
     for (pred, other) in incoming {
         let edge = edge_truth(pred);
@@ -220,7 +247,7 @@ fn entering(
             if entry.value != other.value || entry.read != other.read {
                 return false;
             }
-            if entry.truth != truth_on_edge(other, edge) {
+            if entry.truth != truth_on_edge(key, other, edge) {
                 entry.truth = None;
             }
             true
@@ -429,6 +456,11 @@ impl Solved {
         };
         let value = original(value);
         state.iter().any(|(key, entry)| {
+            if let LoadKey::ShapeProbe(known, _, shape, _) = key {
+                return original(*known) == value
+                    && fact == Fact::Shape(*shape)
+                    && entry.truth == Some(true);
+            }
             matches!(key, LoadKey::Check(known, established)
             if original(*known) == value && established.implies(fact) && entry.truth == Some(true))
         })

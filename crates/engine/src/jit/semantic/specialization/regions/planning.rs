@@ -635,12 +635,12 @@ fn plan(
             .reads
             .iter()
             .filter_map(|&inst| {
-                let Op::Get(object, _) = candidate.insts[inst].op else {
+                let Op::Get(..) = candidate.insts[inst].op else {
                     return None;
                 };
+                // The probe validates its own shape without a region-wide shape assumption.
                 shapes
                     .read(&candidate, inst)
-                    .filter(|&(shape, _)| parent.checks.contains(&(object, Fact::Shape(shape))))
                     .map(|(shape, index)| (inst, shape, index))
             })
             .collect();
