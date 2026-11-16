@@ -392,6 +392,64 @@ fn ineligible_method_feedback_keeps_the_existing_entry() {
 }
 
 #[test]
+fn property_additions_request_initializer_optimization() {
+    let mut engine = new_engine().unwrap();
+    engine
+        .compile(
+            "function initialize(o,x){o.x=x;o.y=x;}",
+            "addition_feedback.js",
+        )
+        .unwrap();
+    let code = code(&engine, "initialize");
+    let mut job = engine
+        .tiering
+        .compiler
+        .borrow()
+        .lazy_compilation(code)
+        .unwrap();
+    job.tier = jit::CompilationTier::Baseline;
+    let mut compiler = Compiler::new(
+        engine.tiering.options.clone(),
+        jit::CompilationTier::Baseline,
+        engine.tiering.direct.address(),
+        0,
+        engine.tiering.recompile_log,
+    )
+    .unwrap();
+    let replacement = compiler.recompile(job).unwrap().unwrap();
+    let unpublished = compiler.take_unpublished(replacement);
+    let jit::compiler::Installed {
+        entry: original, ..
+    } = engine
+        .tiering
+        .compiler
+        .borrow_mut()
+        .install_unpublished(unpublished)
+        .unwrap();
+    engine
+        .tiering
+        .variants
+        .borrow_mut()
+        .publish(VariantId::ordinary(code), original);
+    let heap = engine.global().heap().clone();
+    let mut entries = Vec::new();
+    for i in 0..4 {
+        let object = heap.object().unwrap();
+        let value = Value::number(i as f64);
+        assert_eq!(
+            engine.call("initialize", &[object, value]).unwrap().value(),
+            Value::UNDEFINED
+        );
+        assert_eq!(heap.property(object, "x"), Some(value));
+        assert_eq!(heap.property(object, "y"), Some(value));
+        entries.push(entry(&engine, code));
+        heap.release(object);
+    }
+    assert_ne!(entries[1], original);
+    assert!(entries[1..].windows(2).all(|pair| pair[0] == pair[1]));
+}
+
+#[test]
 fn shape_feedback_respecializes_property_reads() {
     let mut engine = new_engine().unwrap();
     engine

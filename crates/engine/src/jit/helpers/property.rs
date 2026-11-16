@@ -435,6 +435,7 @@ pub(super) extern "C" fn js_property_set_cached(
     cache.write.last = crate::heap::PropertyWrite::None;
     let result = property_set(ctx, object, &cache.name, value, Some(&mut cache.write));
     let access = match cache.write.last {
+        crate::heap::PropertyWrite::Addition => ShapeAccess::Addition,
         crate::heap::PropertyWrite::Overwrite { shape, index } => {
             ShapeAccess::Overwrite { shape, index }
         }

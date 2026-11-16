@@ -33,6 +33,7 @@ pub(crate) enum ReadType {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ShapeAccess {
+    Addition,
     Read { shape: u32, index: u32 },
     PolymorphicRead { entries: [(u32, u32); 4], len: u8 },
     Overwrite { shape: u32, index: u32 },
