@@ -51,6 +51,7 @@ fn plan_accesses(
             let site = |inst: Inst| {
                 let data = &graph.insts[inst];
                 Site {
+                    inline_context: 0,
                     source: data.source_name.map_or(source, |name| name.0),
                     start: data.span.start,
                     end: data.span.end,
@@ -309,6 +310,7 @@ pub(in crate::jit::semantic) fn apply(
             true,
         );
         graph.insts[inst].source_name = data.source_name;
+        graph.insts[inst].inline_context = data.inline_context;
         graph.blocks[fast].terminator = Some(Terminator {
             source_name: data.source_name,
             emission_location: None,
@@ -432,6 +434,7 @@ fn lower_array(graph: &mut Graph, inst: Inst, guard_number: bool, array: bool) {
             true,
         );
         graph.insts[load_inst].source_name = data.source_name;
+        graph.insts[load_inst].inline_context = data.inline_context;
         terminate(
             graph,
             load,
@@ -499,6 +502,7 @@ mod tests {
             bodies.read_feedback.insert(
                 (
                     Site {
+                        inline_context: 0,
                         source: 0,
                         start: data.span.start,
                         end: data.span.end,

@@ -46,13 +46,16 @@ pub(in crate::jit) struct Cursor<'g> {
     span: Span,
     source_name: Option<(usize, usize)>,
     location: Option<u32>,
+    inline_context: u64,
 }
 
 impl<'g> Cursor<'g> {
     pub(in crate::jit) fn at_end(graph: &'g mut Graph, block: Block, source: Inst) -> Self {
         let data = &graph.insts[source];
         let (span, source_name, location) = (data.span, data.source_name, data.emission_location);
+        let inline_context = data.inline_context;
         Self {
+            inline_context,
             graph,
             block,
             position: None,
@@ -81,7 +84,9 @@ impl<'g> Cursor<'g> {
             .iter()
             .position(|&i| i == inst)
             .unwrap();
+        let inline_context = data.inline_context;
         Self {
+            inline_context,
             graph,
             block,
             position: Some(position),
@@ -112,6 +117,7 @@ impl Insert for Cursor<'_> {
         };
         self.graph.insts[inst].emission_location = self.location;
         self.graph.insts[inst].source_name = self.source_name;
+        self.graph.insts[inst].inline_context = self.inline_context;
         (inst, value)
     }
 

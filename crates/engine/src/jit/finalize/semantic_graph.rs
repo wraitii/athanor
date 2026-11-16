@@ -148,6 +148,7 @@ impl FunctionCompiler<'_, '_> {
         Some((
             feedback.owner,
             crate::jit::profile::Site {
+                inline_context: data.inline_context,
                 source: data.source_name.map_or(self.source_name.0, |name| name.0),
                 start: data.span.start,
                 end: data.span.end,

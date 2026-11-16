@@ -664,6 +664,7 @@ mod tests {
             repository.read_feedback.insert(
                 (
                     Site {
+                        inline_context: 0,
                         source: 7,
                         start: read.start,
                         end: read.end,
@@ -704,6 +705,7 @@ mod tests {
                 repository.read_feedback.insert(
                     (
                         Site {
+                            inline_context: 0,
                             source: 7,
                             start: data.span.start,
                             end: data.span.end,
@@ -780,6 +782,7 @@ mod tests {
                 .unwrap();
             let data = &graph.insts[inst];
             let site = Site {
+                inline_context: 0,
                 source: 7,
                 start: data.span.start,
                 end: data.span.end,
@@ -826,6 +829,7 @@ mod tests {
                 repository.read_feedback.insert(
                     (
                         Site {
+                            inline_context: 0,
                             source: 7,
                             start: data.span.start,
                             end: data.span.end,
@@ -886,6 +890,7 @@ mod tests {
             .find(|data| matches!(data.op, Op::GetIndex(..)))
             .unwrap();
         let site = Site {
+            inline_context: 0,
             source: 7,
             start: data.span.start,
             end: data.span.end,
@@ -1085,6 +1090,7 @@ mod tests {
             repository.read_feedback.insert(
                 (
                     Site {
+                        inline_context: 0,
                         source: 7,
                         start: data.span.start,
                         end: data.span.end,
@@ -1129,6 +1135,7 @@ mod tests {
                 continue;
             }
             let site = Site {
+                inline_context: 0,
                 source: 7,
                 start: data.span.start,
                 end: data.span.end,
@@ -1197,6 +1204,7 @@ mod tests {
                 repository.read_feedback.insert(
                     (
                         Site {
+                            inline_context: 0,
                             source: 7,
                             start: data.span.start,
                             end: data.span.end,
@@ -1210,6 +1218,7 @@ mod tests {
                 repository.read_feedback.insert(
                     (
                         Site {
+                            inline_context: 0,
                             source: 7,
                             start: data.span.start,
                             end: data.span.end,
@@ -1398,6 +1407,7 @@ pub(in crate::jit::semantic) fn materialize_properties(graph: &mut Graph) -> Res
             let (copy, value) =
                 graph.append(block, data.span, data.op.clone(), data.result().is_some());
             graph.insts[copy].source_name = data.source_name;
+            graph.insts[copy].inline_context = data.inline_context;
             graph.property_accesses.insert(
                 copy,
                 Access {

@@ -170,6 +170,7 @@ impl<'a> Builder<'a> {
             self.graph.reprs[result] = super::repr::intrinsic(&op);
         }
         self.graph.insts.push(InstData {
+            inline_context: 0,
             source_name: None,
             emission_location: None,
             span,
@@ -195,6 +196,7 @@ impl<'a> Builder<'a> {
                 let scope = self.open[index];
                 let block = self.current.unwrap();
                 let inst = self.graph.insts.push(InstData {
+                    inline_context: 0,
                     source_name: None,
                     emission_location: None,
                     span,

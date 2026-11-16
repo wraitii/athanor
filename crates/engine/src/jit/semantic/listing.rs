@@ -27,6 +27,7 @@ impl Graph {
         let site = |inst: Inst| {
             let data = &self.insts[inst];
             Site {
+                inline_context: 0,
                 source: data.source_name.map_or(source, |name| name.0),
                 start: data.span.start,
                 end: data.span.end,
@@ -36,6 +37,10 @@ impl Graph {
         for block in Cfg::new(self).rpo {
             for &inst in &self.blocks[block].insts {
                 sites.insert(site(inst));
+                sites.insert(Site {
+                    inline_context: self.insts[inst].inline_context,
+                    ..site(inst)
+                });
                 match self.insts[inst].op {
                     Op::Observe(_, _, origin) | Op::ReadHint(_, _, _, origin) => {
                         sites.insert(origin);

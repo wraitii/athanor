@@ -74,6 +74,36 @@ struct Body {
 }
 
 impl Repository {
+    pub(in crate::jit) fn shape_feedback(
+        &self,
+        site: crate::jit::profile::Site,
+        property: crate::jit::profile::PropertyAccess,
+    ) -> Option<crate::jit::profile::ShapeAccess> {
+        use crate::jit::profile::ShapeAccess;
+
+        self.shape_feedback
+            .get(&(site, property))
+            .copied()
+            .or_else(|| {
+                if site.inline_context == 0 {
+                    return None;
+                }
+                let original = crate::jit::profile::Site {
+                    inline_context: 0,
+                    ..site
+                };
+                self.shape_feedback
+                    .get(&(original, property))
+                    .copied()
+                    .filter(|access| {
+                        matches!(
+                            access,
+                            ShapeAccess::Read { .. } | ShapeAccess::Overwrite { .. }
+                        )
+                    })
+            })
+    }
+
     pub(in crate::jit) fn with_call_options(
         call_variants: bool,
         call_specialization: bool,
@@ -799,6 +829,7 @@ impl Plan {
 
 #[derive(Clone, PartialEq, Eq)]
 pub(in crate::jit) struct Inline {
+    pub(in crate::jit::semantic) context: u64,
     pub(in crate::jit::semantic) call: Inst,
     pub(in crate::jit::semantic) target: FuncId,
     pub(in crate::jit::semantic) arrow: bool,
@@ -844,6 +875,7 @@ fn call_target(
 ) -> Option<FuncId> {
     let data = &graph.insts[call];
     let site = crate::jit::profile::Site {
+        inline_context: 0,
         source: data.source_name.map_or(source, |name| name.0),
         start: data.span.start,
         end: data.span.end,
@@ -1000,7 +1032,19 @@ pub(in crate::jit::semantic) fn plan_round(
                 .get(&body_source)
                 .map(|&length| (body_source, length))
         };
+        use std::hash::{Hash, Hasher};
+        let call = &graph.insts[request.call];
+        let mut context = std::hash::DefaultHasher::new();
+        (
+            call.inline_context,
+            call.source_name.map_or(source, |name| name.0),
+            call.span.start,
+            call.span.end,
+            request.target,
+        )
+            .hash(&mut context);
         inlines.push(Inline {
+            context: context.finish().max(1),
             call: request.call,
             target: request.target,
             source_name,
@@ -1481,7 +1525,7 @@ mod tests {
     }
 
     #[test]
-    fn inlined_polymorphic_gets_simplify_without_versioning() {
+    fn inlined_polymorphic_gets_relearn_local_shapes() {
         use crate::jit::profile::{PropertyAccess, ShapeAccess, Site};
         use crate::jit::variants::{Fact as InputFact, Input};
         for (body, invalidated) in [
@@ -1501,6 +1545,7 @@ mod tests {
                             bodies.shape_feedback.insert(
                                 (
                                     Site {
+                                        inline_context: 0,
                                         source: 0,
                                         start: data.span.start,
                                         end: data.span.end,
@@ -1515,10 +1560,38 @@ mod tests {
                         }
                     }
                 }
+                let planned = super::super::super::plan_specialization(
+                    FunctionState::new(canonical.graph.clone(), canonical.notes.clone(), true),
+                    true,
+                    Some((&bodies, 0)),
+                )
+                .unwrap();
+                assert_eq!(planned.plan.inlines.len(), 1);
+                assert!(planned.plan.shapes.polymorphic_reads().is_empty());
+                for data in planned.graph.insts.values() {
+                    if !matches!(&data.op, Op::Get(_, name) if name == "x") {
+                        continue;
+                    }
+                    assert_ne!(data.inline_context, 0);
+                    bodies.shape_feedback.insert(
+                        (
+                            Site {
+                                inline_context: data.inline_context,
+                                source: data.source_name.map_or(0, |name| name.0),
+                                start: data.span.start,
+                                end: data.span.end,
+                            },
+                            PropertyAccess::Get,
+                        ),
+                        ShapeAccess::PolymorphicRead {
+                            entries: [(10, 0), (20, 1), (0, 0), (0, 0)],
+                            len: 2,
+                        },
+                    );
+                }
                 let mut planned =
                     super::super::super::plan_specialization(canonical, true, Some((&bodies, 0)))
                         .unwrap();
-                assert_eq!(planned.plan.inlines.len(), 1);
                 assert_eq!(planned.plan.shapes.polymorphic_reads().len(), 1);
                 if let Some(shape) = shape {
                     super::super::call_variants::assume(
@@ -1573,6 +1646,84 @@ mod tests {
     }
 
     #[test]
+    fn inlined_property_feedback_is_specific_to_the_call() {
+        use crate::jit::profile::{PropertyAccess, ShapeAccess, Site};
+
+        let (canonical, mut bodies) =
+            fixture("function read(o){return o.x;} function main(a,b){return read(a)+read(b);}");
+        let (_, callee) = bodies.emission(FuncId::from_u32(0)).unwrap();
+        let read = callee
+            .graph
+            .insts
+            .values()
+            .find(|data| matches!(data.op, Op::Get(..)))
+            .unwrap();
+        let original = Site {
+            inline_context: 0,
+            source: 0,
+            start: read.span.start,
+            end: read.span.end,
+        };
+        bodies
+            .shape_feedback
+            .insert((original, PropertyAccess::Get), ShapeAccess::Megamorphic);
+        let planned = super::super::super::plan_specialization(
+            FunctionState::new(canonical.graph.clone(), canonical.notes.clone(), true),
+            true,
+            Some((&bodies, 0)),
+        )
+        .unwrap();
+        let contexts: Vec<_> = planned
+            .plan
+            .inlines
+            .iter()
+            .map(|inline| inline.context)
+            .collect();
+        assert_eq!(contexts.len(), 2);
+        assert_ne!(contexts[0], contexts[1]);
+        assert!(contexts.iter().all(|context| *context != 0));
+        assert!(planned.plan.shapes.megamorphic_sites().is_empty());
+        for (&inline_context, shape) in contexts.iter().zip([10, 20]) {
+            bodies.shape_feedback.insert(
+                (
+                    Site {
+                        inline_context,
+                        ..original
+                    },
+                    PropertyAccess::Get,
+                ),
+                ShapeAccess::Read { shape, index: 0 },
+            );
+        }
+        let planned =
+            super::super::super::plan_specialization(canonical, true, Some((&bodies, 0))).unwrap();
+        assert_eq!(
+            planned
+                .plan
+                .inlines
+                .iter()
+                .map(|inline| inline.context)
+                .collect::<Vec<_>>(),
+            contexts
+        );
+        for (&context, shape) in contexts.iter().zip([10, 20]) {
+            assert!(planned.plan.shapes.accesses().contains(&(
+                Site {
+                    inline_context: context,
+                    ..original
+                },
+                PropertyAccess::Get,
+                shape,
+                0
+            )));
+        }
+        assert_eq!(
+            bodies.shape_feedback(original, PropertyAccess::Get),
+            Some(ShapeAccess::Megamorphic)
+        );
+    }
+
+    #[test]
     fn decision_records_include_nested_and_bounded_recursive_inlines() {
         for (source, count) in [
             (
@@ -1582,6 +1733,10 @@ mod tests {
             (
                 "function recurse(n){if(n)return recurse(n-1);return 0;} function main(n){return recurse(n);}",
                 SPECIALIZATION_ROUNDS + 1,
+            ),
+            (
+                "function C(v){this.x=v;} function make(v){return new C(v);} function main(a,b){return make(a).x+make(b).x;}",
+                4,
             ),
         ] {
             let (canonical, bodies) = fixture(source);
@@ -1595,6 +1750,16 @@ mod tests {
                 super::super::super::plan_specialization(canonical, true, Some((&bodies, 0)))
                     .unwrap();
             assert_eq!(first.plan.inlines.len(), count);
+            assert_eq!(
+                first
+                    .plan
+                    .inlines
+                    .iter()
+                    .map(|inline| inline.context)
+                    .collect::<FxHashSet<_>>()
+                    .len(),
+                count,
+            );
             assert!(first.plan.inlines == second.plan.inlines);
             let analysis = super::super::super::lower_planned(
                 first,
@@ -1621,6 +1786,7 @@ mod tests {
             if matches!(data.op, Op::Call { .. }) {
                 bodies.feedback.insert(
                     crate::jit::profile::Site {
+                        inline_context: 0,
                         source: 0,
                         start: data.span.start,
                         end: data.span.end,
@@ -1663,6 +1829,7 @@ mod tests {
             {
                 bodies.feedback.insert(
                     crate::jit::profile::Site {
+                        inline_context: 0,
                         source: 0,
                         start: data.span.start,
                         end: data.span.end,

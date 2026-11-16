@@ -738,6 +738,7 @@ fn append(
     op: Op,
 ) -> Inst {
     graph.insts.push(InstData {
+        inline_context: 0,
         source_name,
         emission_location: None,
         span,

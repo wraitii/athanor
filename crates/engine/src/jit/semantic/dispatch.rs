@@ -112,6 +112,7 @@ pub(super) fn append(
 ) -> super::Value {
     let (inst, value) = graph.append(block, source.span, op, true);
     graph.insts[inst].source_name = source.source_name;
+    graph.insts[inst].inline_context = source.inline_context;
     value.unwrap()
 }
 

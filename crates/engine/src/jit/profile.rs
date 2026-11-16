@@ -4,6 +4,7 @@ use crate::heap::TypedKind;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Site {
+    pub(super) inline_context: u64,
     pub(super) source: usize,
     pub(super) start: u32,
     pub(super) end: u32,
@@ -11,7 +12,11 @@ pub(crate) struct Site {
 
 impl std::fmt::Display for Site {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}..{}", self.start, self.end)
+        write!(f, "{}..{}", self.start, self.end)?;
+        if self.inline_context != 0 {
+            write!(f, " inline={:x}", self.inline_context)?;
+        }
+        Ok(())
     }
 }
 
@@ -365,6 +370,7 @@ mod tests {
 
     fn site() -> Site {
         Site {
+            inline_context: 0,
             source: 1,
             start: 0,
             end: 10,

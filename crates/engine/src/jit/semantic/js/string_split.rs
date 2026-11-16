@@ -224,6 +224,7 @@ pub(in crate::jit::semantic) fn expand(graph: &mut Graph, expanded: &mut FxHashS
         let fast = graph.blocks.push(BlockData::default());
         let (guard, check) = graph.append(block, data.span, Op::IsStringSplit(callee), true);
         graph.insts[guard].source_name = data.source_name;
+        graph.insts[guard].inline_context = data.inline_context;
         graph.blocks[block].terminator = Some(Terminator {
             source_name: data.source_name,
             emission_location: None,
@@ -232,6 +233,7 @@ pub(in crate::jit::semantic) fn expand(graph: &mut Graph, expanded: &mut FxHashS
         });
         let (call, result) = graph.append(fast, data.span, Op::StringSplit(receiver, args), true);
         graph.insts[call].source_name = data.source_name;
+        graph.insts[call].inline_context = data.inline_context;
         graph.blocks[fast].terminator = Some(Terminator {
             source_name: data.source_name,
             emission_location: None,

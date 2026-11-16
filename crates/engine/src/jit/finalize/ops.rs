@@ -325,6 +325,7 @@ impl FunctionCompiler<'_, '_> {
             None => {
                 let data = &self.b.graph.insts[site];
                 let location = crate::jit::profile::Site {
+                    inline_context: data.inline_context,
                     source: data.source_name.map_or(self.source_name.0, |name| name.0),
                     start: data.span.start,
                     end: data.span.end,
@@ -528,6 +529,7 @@ impl FunctionCompiler<'_, '_> {
     fn mark_call_site(&mut self, span: Span, guarded: bool) {
         let site = self.data.pin(CallSite {
             site: Site {
+                inline_context: 0,
                 source: self.source_name.0,
                 start: span.start,
                 end: span.end,

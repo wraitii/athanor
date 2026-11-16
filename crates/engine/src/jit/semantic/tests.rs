@@ -360,6 +360,7 @@ fn comparisons_share_number_checks_with_refined_reads_without_splitting() {
             bodies.read_feedback.insert(
                 (
                     crate::jit::profile::Site {
+                        inline_context: 0,
                         source: 0,
                         start: data.span.start,
                         end: data.span.end,
@@ -414,6 +415,7 @@ fn late_number_facts_remove_refinement_guards_and_assertions() {
             bodies.read_feedback.insert(
                 (
                     crate::jit::profile::Site {
+                        inline_context: 0,
                         source: 0,
                         start: data.span.start,
                         end: data.span.end,
@@ -586,6 +588,7 @@ fn indexed_rows_borrow_from_owned_receivers_through_guards() {
             repository.read_feedback.insert(
                 (
                     crate::jit::profile::Site {
+                        inline_context: 0,
                         source: 0,
                         start: data.span.start,
                         end: data.span.end,
@@ -636,6 +639,7 @@ fn guard_only_region_borrows_rows_without_entry_assumptions() {
         repository.read_feedback.insert(
             (
                 Site {
+                    inline_context: 0,
                     source: 0,
                     start: data.span.start,
                     end: data.span.end,
@@ -692,6 +696,7 @@ fn typed_loop_reads_are_reused_before_inner_loop_versioning() {
     bodies.read_feedback.insert(
         (
             crate::jit::profile::Site {
+                inline_context: 0,
                 source: 0,
                 start: read.span.start,
                 end: read.span.end,
@@ -1716,6 +1721,7 @@ fn trusted_input_shapes_remove_redundant_callee_checks() {
                 repository.shape_feedback.insert(
                     (
                         crate::jit::profile::Site {
+                            inline_context: 0,
                             source: 0,
                             start: data.span.start,
                             end: data.span.end,
@@ -1781,6 +1787,7 @@ fn caller_shapes_select_useful_polymorphic_callee_contracts() {
                     repository.shape_feedback.insert(
                         (
                             Site {
+                                inline_context: 0,
                                 source: 0,
                                 start: data.span.start,
                                 end: data.span.end,
@@ -1897,6 +1904,7 @@ fn call_variant_contracts_do_not_lift_shape_guards_after_reentry() {
                     repository.shape_feedback.insert(
                         (
                             Site {
+                                inline_context: 0,
                                 source: 0,
                                 start: data.span.start,
                                 end: data.span.end,
@@ -1932,6 +1940,7 @@ fn call_variant_contracts_respect_disabled_numeric_speculation() {
                 repository.read_feedback.insert(
                     (
                         Site {
+                            inline_context: 0,
                             source: 0,
                             start: data.span.start,
                             end: data.span.end,
@@ -3746,6 +3755,7 @@ fn write_lowering_keeps_generic_keys_and_materializes_selected_stores() {
         repository.read_feedback.insert(
             (
                 crate::jit::profile::Site {
+                    inline_context: 0,
                     source: 0,
                     start: graph.insts[inst].span.start,
                     end: graph.insts[inst].span.end,
@@ -3885,6 +3895,7 @@ fn polymorphic_property_dispatch_is_planned_before_read_rewriting() {
             matches!(data.op, Op::Get(..)).then_some((
                 inst,
                 Site {
+                    inline_context: 0,
                     source: 0,
                     start: data.span.start,
                     end: data.span.end,
@@ -4039,6 +4050,7 @@ fn conflicting_property_shapes_remain_alternative_local_guards() {
     for data in graph.insts.values() {
         if let Op::Get(_, name) = &data.op {
             let site = Site {
+                inline_context: 0,
                 source: 0,
                 start: data.span.start,
                 end: data.span.end,
@@ -4272,6 +4284,7 @@ fn optimize_with_shapes(
             _ => continue,
         };
         let site = Site {
+            inline_context: 0,
             source: 0,
             start: data.span.start,
             end: data.span.end,

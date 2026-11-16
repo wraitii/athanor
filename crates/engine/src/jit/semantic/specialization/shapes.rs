@@ -70,6 +70,7 @@ fn property_access(op: &Op) -> Option<PropertyAccess> {
 fn site(graph: &Graph, inst: Inst, source: usize) -> Site {
     let data = &graph.insts[inst];
     Site {
+        inline_context: data.inline_context,
         source: data.source_name.map_or(source, |name| name.0),
         start: data.span.start,
         end: data.span.end,
@@ -100,8 +101,7 @@ pub(in crate::jit::semantic) fn plan(
             continue;
         }
         let site = site(graph, inst, source);
-        if bodies.shape_feedback.get(&(site, PropertyAccess::Get))
-            == Some(&ShapeAccess::Megamorphic)
+        if bodies.shape_feedback(site, PropertyAccess::Get) == Some(ShapeAccess::Megamorphic)
             && !megamorphic.contains(&site)
         {
             megamorphic.push(site);
@@ -122,8 +122,8 @@ pub(in crate::jit::semantic) fn plan(
                 Op::Get(object, _) | Op::ProbeProperty(object, _) | Op::Set(object, ..) => object,
                 _ => continue,
             };
-            if let Some(&ShapeAccess::PolymorphicRead { entries, len }) =
-                bodies.shape_feedback.get(&(site, property))
+            if let Some(ShapeAccess::PolymorphicRead { entries, len }) =
+                bodies.shape_feedback(site, property)
                 && matches!(data.op, Op::Get(..))
                 && (callee
                     || !assumed.get(&object).is_some_and(|shape| {
@@ -140,14 +140,14 @@ pub(in crate::jit::semantic) fn plan(
             if callee {
                 continue;
             }
-            let access = match (property, bodies.shape_feedback.get(&(site, property))) {
-                (PropertyAccess::Get, Some(&access)) => {
+            let access = match (property, bodies.shape_feedback(site, property)) {
+                (PropertyAccess::Get, Some(access)) => {
                     let Some((shape, index)) = access.read(assumed.get(&object).copied()) else {
                         continue;
                     };
                     (site, property, shape, index)
                 }
-                (PropertyAccess::Set, Some(&ShapeAccess::Overwrite { shape, index })) => {
+                (PropertyAccess::Set, Some(ShapeAccess::Overwrite { shape, index })) => {
                     (site, property, shape, index)
                 }
                 _ => continue,

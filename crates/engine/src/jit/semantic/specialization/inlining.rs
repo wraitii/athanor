@@ -209,6 +209,7 @@ pub(in crate::jit::semantic) fn apply(graph: &mut Graph, body: &Graph, plan: &In
                 let (copy, value) =
                     graph.append(blocks[&block], data.span, Op::NewArray(args.to_vec()), true);
                 graph.insts[copy].source_name = data.source_name.or(plan.source_name);
+                graph.insts[copy].inline_context = plan.context;
                 let value = value.unwrap();
                 values.insert(data.result().unwrap(), value);
                 continue;
@@ -257,6 +258,7 @@ pub(in crate::jit::semantic) fn apply(graph: &mut Graph, body: &Graph, plan: &In
             let count = data.results.len();
             let (copy, results) = graph.append_results(blocks[&block], data.span, op, count);
             graph.insts[copy].source_name = data.source_name.or(plan.source_name);
+            graph.insts[copy].inline_context = plan.context;
             graph.insts[copy].emission_location = data.emission_location;
             if matches!(data.op, Op::Closure(_, _, true, _, true, _, None)) {
                 lexical_closures.push(copy);

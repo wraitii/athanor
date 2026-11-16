@@ -1390,7 +1390,7 @@ impl Compiler {
                     .sources
                     .get(&site.source)
                     .map_or("<unknown>", |source| source.1.as_str());
-                format!("{filename}:{}..{}", site.start, site.end)
+                format!("{filename}:{site}")
             },
         )))
     }

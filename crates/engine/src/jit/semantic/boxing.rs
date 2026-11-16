@@ -67,6 +67,7 @@ impl Boxing<'_> {
         let inst = self.graph.insts.next_key();
         let result = self.graph.values.push(ValueDef::Result(inst, 0));
         self.graph.insts.push(InstData {
+            inline_context: 0,
             source_name,
             emission_location: None,
             span,

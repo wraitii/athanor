@@ -65,6 +65,7 @@ pub(in crate::jit::semantic) fn expose(function: &mut super::super::FunctionStat
                         let (check, result) =
                             graph.insert(block, position, data.span, Op::IsUndefined(value), true);
                         graph.insts[check].source_name = data.source_name;
+                        graph.insts[check].inline_context = data.inline_context;
                         graph.insts[inst].op =
                             Op::Unary(super::super::UnaryOp::Not, result.unwrap());
                     }
@@ -109,6 +110,7 @@ pub(in crate::jit::semantic) fn expose(function: &mut super::super::FunctionStat
                     .unwrap();
                 let (check, result) = graph.insert(block, position, data.span, op, true);
                 graph.insts[check].source_name = data.source_name;
+                graph.insts[check].inline_context = data.inline_context;
                 *number = result.unwrap();
                 checks.entry(value).or_default().push((block, *number));
             }

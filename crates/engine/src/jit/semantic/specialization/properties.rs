@@ -69,6 +69,7 @@ pub(in crate::jit::semantic) fn assume(graph: &mut Graph, shapes: &super::shapes
             true,
         );
         graph.insts[allocation].source_name = data.source_name;
+        graph.insts[allocation].inline_context = data.inline_context;
         let cache = cache.unwrap();
         if !data.result().is_some_and(|value| builtins.contains(&value)) {
             let (assume, _) = graph.insert(
@@ -79,6 +80,7 @@ pub(in crate::jit::semantic) fn assume(graph: &mut Graph, shapes: &super::shapes
                 false,
             );
             graph.insts[assume].source_name = data.source_name;
+            graph.insts[assume].inline_context = data.inline_context;
         }
         graph.property_accesses.insert(
             inst,
@@ -196,6 +198,7 @@ pub(in crate::jit::semantic) fn rewrite(graph: &mut Graph) -> super::super::Resu
                 true,
             );
             graph.insts[allocation].source_name = data.source_name;
+            graph.insts[allocation].inline_context = data.inline_context;
             cache.unwrap()
         });
         if cached {
@@ -275,6 +278,7 @@ pub(in crate::jit::semantic) fn assume_natives(graph: &mut Graph) {
                 false,
             );
             graph.insts[inst].source_name = data.source_name;
+            graph.insts[inst].inline_context = data.inline_context;
         }
     }
 }

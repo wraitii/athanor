@@ -79,13 +79,14 @@ fn shape_hints(graph: &Graph, bodies: &Repository, source: usize) -> FxHashMap<V
                 _ => continue,
             };
             let site = Site {
+                inline_context: data.inline_context,
                 source: data.source_name.map_or(source, |name| name.0),
                 start: data.span.start,
                 end: data.span.end,
             };
-            let shape = match bodies.shape_feedback.get(&(site, property)) {
+            let shape = match bodies.shape_feedback(site, property) {
                 Some(crate::jit::profile::ShapeAccess::Read { shape, .. })
-                | Some(crate::jit::profile::ShapeAccess::Overwrite { shape, .. }) => *shape,
+                | Some(crate::jit::profile::ShapeAccess::Overwrite { shape, .. }) => shape,
                 _ => continue,
             };
             hints.entry(object).or_insert(shape);
@@ -159,6 +160,7 @@ pub(in crate::jit::semantic) fn apply(
             continue;
         };
         let site = Site {
+            inline_context: 0,
             source: data.source_name.map_or(source, |name| name.0),
             start: data.span.start,
             end: data.span.end,
@@ -274,6 +276,7 @@ pub(in crate::jit::semantic) fn apply(
                 true,
             );
             graph.insts[call].source_name = data.source_name;
+            graph.insts[call].inline_context = data.inline_context;
             result
         });
     }

@@ -153,6 +153,8 @@ pub(super) struct BlockData {
 
 #[derive(Clone)]
 pub(super) struct InstData {
+    // Property-shape feedback is local to the inline; call and numeric feedback stay shared.
+    pub(super) inline_context: u64,
     pub(super) source_name: Option<(usize, usize)>,
     pub(super) emission_location: Option<u32>,
     pub(super) span: Span,
@@ -1657,11 +1659,16 @@ impl Graph {
             .insts
             .get(position)
             .and_then(|&next| self.insts[next].source_name);
+        let inline_context = self.blocks[block]
+            .insts
+            .get(position)
+            .map_or(0, |&next| self.insts[next].inline_context);
         self.has_assumes |= matches!(op, Op::Assume(..));
         if let Some(result) = result {
             self.reprs[result] = repr::intrinsic(&op);
         }
         self.insts.push(InstData {
+            inline_context,
             source_name,
             emission_location: None,
             span,

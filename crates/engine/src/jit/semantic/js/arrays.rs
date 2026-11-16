@@ -292,6 +292,7 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
     });
     for data in graph.insts.values_mut().skip(first_new) {
         data.source_name = call.source_name;
+        data.inline_context = call.inline_context;
     }
 }
 
@@ -314,6 +315,7 @@ pub(in crate::jit::semantic) fn push_calls(
                 continue;
             };
             let site = crate::jit::profile::Site {
+                inline_context: 0,
                 source: data.source_name.map_or(source, |name| name.0),
                 start: data.span.start,
                 end: data.span.end,
@@ -381,6 +383,7 @@ pub(in crate::jit::semantic) fn push_calls(
         });
         for data in graph.insts.values_mut().skip(first_new) {
             data.source_name = call.source_name;
+            data.inline_context = call.inline_context;
         }
         notes.push(if known_array {
             format!("known array at {site}: lower Array.push without guards")

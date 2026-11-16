@@ -897,6 +897,7 @@ mod tests {
             .find_map(|data| matches!(data.op, Op::Argument(1)).then(|| data.result().unwrap()))
             .unwrap();
         let site = Site {
+            inline_context: 0,
             source: 7,
             start: 1,
             end: 2,

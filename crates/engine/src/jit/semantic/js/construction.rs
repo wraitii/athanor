@@ -71,6 +71,7 @@ pub(in crate::jit::semantic) fn expand(graph: &mut Graph, expanded: &mut FxHashS
             graph.append(block, data.span, Op::IsUninitialized(prototype), true);
         let unresolved = unresolved.unwrap();
         graph.insts[check].source_name = data.source_name;
+        graph.insts[check].inline_context = data.inline_context;
         graph.blocks[block].terminator = Some(Terminator {
             source_name: data.source_name,
             emission_location: None,
@@ -93,6 +94,7 @@ pub(in crate::jit::semantic) fn expand(graph: &mut Graph, expanded: &mut FxHashS
         let result = graph.append_value(fast, data.span, Op::ConstructorResult(result, instance));
         for &inst in &graph.blocks[fast].insts {
             graph.insts[inst].source_name = data.source_name;
+            graph.insts[inst].inline_context = data.inline_context;
         }
         graph.blocks[fast].terminator = Some(Terminator {
             source_name: data.source_name,

@@ -54,6 +54,7 @@ pub(in crate::jit::semantic) fn plan(
                 continue;
             }
             let site = Site {
+                inline_context: 0,
                 source: data
                     .source_name
                     .map_or(specialization.map_or(0, |(_, source)| source), |name| {
@@ -280,6 +281,7 @@ pub(in crate::jit::semantic) fn numeric_site(
         return numeric_site(graph, input);
     }
     Some(Site {
+        inline_context: 0,
         source: data.source_name.map_or(0, |name| name.0),
         start: data.span.start,
         end: data.span.end,

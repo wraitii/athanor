@@ -1161,6 +1161,7 @@ fn append_generic(graph: &mut Graph, generic: &Graph) -> Copy {
             let (new_inst, results) =
                 graph.append_results(new, data.span, data.op.clone(), data.results.len());
             graph.insts[new_inst].source_name = data.source_name;
+            graph.insts[new_inst].inline_context = data.inline_context;
             graph.insts[new_inst].emission_location = data.emission_location;
             copy.insts.insert(inst, new_inst);
             for (&old, &value) in data.results.iter().zip(&results) {
