@@ -75,10 +75,10 @@ impl FunctionState {
         after("array-checks", self);
         self.ensure_facts();
         // Helper lowering erases the receivers needed to prove borrows.
-        borrow::borrows(&mut self.graph, &self.facts, &mut self.notes);
+        let borrows = borrow::borrows(&mut self.graph, &self.facts, &mut self.notes);
         helpers::lower(self);
         after("helpers", self);
-        let plan = ownership::plan(&mut self.graph, &mut self.facts);
+        let plan = ownership::plan(&mut self.graph, &mut self.facts, borrows);
         if super::verification_enabled() {
             ownership::verify(&self.graph, &self.facts, &plan)?;
         }

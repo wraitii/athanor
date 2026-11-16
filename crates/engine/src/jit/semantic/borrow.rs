@@ -31,6 +31,106 @@ pub(in crate::jit) fn receiver(op: &Op) -> Option<Value> {
     }
 }
 
+#[derive(Clone, Default)]
+pub(super) struct Plan {
+    anchors: FxHashMap<Value, Vec<Value>>,
+    aliases: FxHashMap<Value, Vec<Value>>,
+}
+
+impl Plan {
+    fn new(graph: &Graph, facts: &Facts) -> Self {
+        let mut dependencies = FxHashMap::default();
+        for &block in &facts.cfg.rpo {
+            for &inst in &graph.blocks[block].insts {
+                let data = &graph.insts[inst];
+                if let Some(result) = data.result()
+                    && facts.of(result).intersects(HEAP)
+                    && graph.contract(&data.op, facts).result == super::Ownership::Borrowed
+                {
+                    let owners = match receiver(&data.op) {
+                        Some(owner) => vec![owner],
+                        None => data.op.operands_iter().collect(),
+                    };
+                    dependencies.insert(result, owners);
+                }
+            }
+            for (index, &param) in graph.blocks[block].params.iter().enumerate() {
+                if graph.borrowed.contains(&param) {
+                    let incoming = facts.cfg.preds[block]
+                        .iter()
+                        .flat_map(|&pred| {
+                            graph.blocks[pred]
+                                .terminator
+                                .as_ref()
+                                .unwrap()
+                                .kind
+                                .targets()
+                        })
+                        .filter(|target| target.block == block)
+                        .map(|target| target.args[index])
+                        .collect();
+                    dependencies.insert(param, incoming);
+                }
+            }
+        }
+        let anchors = graph
+            .borrowed
+            .iter()
+            .map(|&value| {
+                let mut pending = vec![value];
+                let mut visited = FxHashSet::default();
+                let mut roots = Vec::new();
+                while let Some(current) = pending.pop() {
+                    if !visited.insert(current) {
+                        continue;
+                    }
+                    if graph.borrowed.contains(&current) {
+                        if let Some(owners) = dependencies.get(&current) {
+                            pending.extend(owners.iter().copied());
+                        }
+                    } else {
+                        roots.push(current);
+                    }
+                }
+                roots.sort();
+                (value, roots)
+            })
+            .collect();
+        let aliases = dependencies
+            .keys()
+            .map(|&value| (value, closure(&dependencies, value)))
+            .collect();
+        Self { anchors, aliases }
+    }
+
+    pub(super) fn anchors<'a>(&'a self, value: &'a Value) -> &'a [Value] {
+        self.anchors
+            .get(value)
+            .map_or_else(|| std::slice::from_ref(value), Vec::as_slice)
+    }
+
+    pub(super) fn aliases<'a>(&'a self, value: &'a Value) -> &'a [Value] {
+        self.aliases
+            .get(value)
+            .map_or_else(|| std::slice::from_ref(value), Vec::as_slice)
+    }
+}
+
+fn closure(dependencies: &FxHashMap<Value, Vec<Value>>, value: Value) -> Vec<Value> {
+    let mut pending = vec![value];
+    let mut visited = FxHashSet::default();
+    while let Some(current) = pending.pop() {
+        if visited.insert(current)
+            && let Some(owners) = dependencies.get(&current)
+        {
+            pending.extend(owners.iter().copied());
+        }
+    }
+    let mut values: Vec<_> = visited.into_iter().collect();
+    values.sort();
+    values
+}
+
 fn stores(op: &Op) -> bool {
     matches!(
         op,
@@ -52,6 +152,7 @@ struct Borrows<'g> {
     graph: &'g Graph,
     facts: &'g Facts,
     chains: FxHashMap<Value, Vec<Value>>,
+    dependents: FxHashMap<Value, Vec<Value>>,
     rejected: FxHashSet<Value>,
     uses: SecondaryMap<Inst, Vec<Value>>,
 }
@@ -63,23 +164,13 @@ impl Borrows<'_> {
     }
 
     fn redefined(&mut self, live: &Set, defined: Value) {
-        for value in live.iter() {
-            if value == defined {
-                continue;
-            }
-            let mut pending = self.chains[&value].clone();
-            let mut visited = FxHashSet::default();
-            while let Some(receiver) = pending.pop() {
-                if receiver == defined {
-                    self.rejected.insert(value);
-                    break;
-                }
-                if visited.insert(receiver)
-                    && let Some(chain) = self.chains.get(&receiver)
-                {
-                    pending.extend(chain.iter().copied());
-                }
-            }
+        if let Some(values) = self.dependents.get(&defined) {
+            self.rejected.extend(
+                values
+                    .iter()
+                    .copied()
+                    .filter(|&value| value != defined && live.contains(&value)),
+            );
         }
     }
 }
@@ -92,7 +183,7 @@ impl Borrows<'_> {
 // stay owned by a temporary until the block's clear, and the inline path only runs on arrays,
 // which own their elements.
 // Indexed iteration reads only run on arrays and typed arrays, so their receiver always holds them.
-pub(super) fn borrows(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>) {
+pub(super) fn borrows(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>) -> Plan {
     graph.borrowed.clear();
     let mut reads = FxHashMap::default();
     let mut held = FxHashSet::default();
@@ -187,7 +278,7 @@ pub(super) fn borrows(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>)
         }
     }
     if chains.is_empty() {
-        return;
+        return Plan::new(graph, facts);
     }
     let mut local: FxHashSet<Value> = chains.keys().copied().collect();
     for (block, data) in graph.blocks.iter() {
@@ -242,10 +333,17 @@ pub(super) fn borrows(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>)
         block_uses[block] = live;
     }
     let live = liveness::solve(graph, cfg, &block_uses, &defs);
+    let mut dependents = FxHashMap::<Value, Vec<Value>>::default();
+    for &value in chains.keys() {
+        for owner in closure(&chains, value) {
+            dependents.entry(owner).or_default().push(value);
+        }
+    }
     let mut borrows = Borrows {
         graph,
         facts,
         chains,
+        dependents,
         rejected: FxHashSet::default(),
         uses,
     };
@@ -292,13 +390,14 @@ pub(super) fn borrows(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>)
         }
     }
     if accepted.is_empty() {
-        return;
+        return Plan::new(graph, facts);
     }
     let mut accepted: Vec<Value> = accepted.into_iter().collect();
     accepted.sort();
     let list: Vec<String> = accepted.iter().map(ToString::to_string).collect();
     notes.push(format!("borrowed reads: [{}]", list.join(", ")));
     graph.borrowed = accepted.into_iter().collect();
+    Plan::new(graph, facts)
 }
 
 fn scan(borrows: &mut Borrows<'_>, block: Block, mut live: Set) {

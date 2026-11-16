@@ -3,12 +3,12 @@ use crate::{FxHashMap, FxHashSet};
 use cranelift_codegen::entity::SecondaryMap;
 use oxc_span::Span;
 
-use super::borrow::receiver as borrowed_receiver;
+use super::borrow;
 use super::contracts::{self, ResultReference};
 use super::liveness::{self, Set};
 use super::{
-    Block, BlockData, Cfg, Facts, Graph, Inst, InstData, Op, Ownership, Target, Terminator,
-    TerminatorKind, Value, ValueType,
+    Block, BlockData, Cfg, Facts, Graph, Inst, InstData, Op, Target, Terminator, TerminatorKind,
+    Value, ValueType,
 };
 use crate::jit::helpers::Helper;
 
@@ -102,6 +102,7 @@ pub(in crate::jit) struct Plan {
     pub(in crate::jit) holders: SecondaryMap<Value, Holder>,
     pub(in crate::jit) slots: Slots,
     pub(in crate::jit) results: SecondaryMap<Inst, ResultReference>,
+    borrows: borrow::Plan,
 }
 
 impl Plan {
@@ -110,11 +111,12 @@ impl Plan {
     }
 }
 
-pub(super) fn plan(graph: &mut Graph, facts: &mut Facts) -> Plan {
+pub(super) fn plan(graph: &mut Graph, facts: &mut Facts, borrows: borrow::Plan) -> Plan {
     let cfg = &facts.cfg;
     let (slots, live_out) = assign(
         graph,
         cfg,
+        &borrows,
         |value| {
             facts.of(value).intersects(HEAP)
                 && !graph.borrowed.contains(&value)
@@ -171,7 +173,7 @@ pub(super) fn plan(graph: &mut Graph, facts: &mut Facts) -> Plan {
             results[inst] = contracts::result_reference(graph, facts, inst, slot);
         }
     }
-    let mut releases = releases(graph, facts, cfg);
+    let mut releases = releases(graph, cfg, &borrows);
     for values in releases.values_mut() {
         values.retain(|&value| holders[value] == Holder::Temporary);
     }
@@ -191,6 +193,7 @@ pub(super) fn plan(graph: &mut Graph, facts: &mut Facts) -> Plan {
         holders,
         slots,
         results,
+        borrows,
     }
 }
 
@@ -200,6 +203,78 @@ pub(super) fn plan(graph: &mut Graph, facts: &mut Facts) -> Plan {
 pub(super) fn verify(graph: &Graph, facts: &Facts, plan: &Plan) -> super::Result<()> {
     let holder = |value: Value| plan.holders[value];
     let fail = |message: String| Err(format!("ownership: {message}"));
+    let anchored = |value: Value, live: &mut Set| {
+        live.extend(
+            plan.borrows
+                .anchors(&value)
+                .iter()
+                .copied()
+                .filter(|&value| holder(value) == Holder::Slot),
+        );
+    };
+    // Edge stores consume references acquired before any destination slot is overwritten.
+    let instruction_uses = |op: &Op, live: &mut Set| {
+        if !matches!(op, Op::ParamStore(..)) {
+            for value in op.operands_iter() {
+                anchored(value, live);
+            }
+        }
+    };
+    let terminator_uses = |kind: &TerminatorKind, live: &mut Set| {
+        match kind {
+            TerminatorKind::Branch(value, ..) | TerminatorKind::Yield(_, value, _) => {
+                anchored(*value, live)
+            }
+            TerminatorKind::Jump(_) | TerminatorKind::CheckException(..) => {}
+            _ => {
+                for value in kind.operands_iter() {
+                    anchored(value, live);
+                }
+            }
+        }
+        for target in kind.targets() {
+            for (&arg, &param) in target.args.iter().zip(&graph.blocks[target.block].params) {
+                if holder(param) != Holder::Slot
+                    || (plan.slots.forwarded(param) && plan.slots.of(arg) == plan.slots.of(param))
+                {
+                    anchored(arg, live);
+                }
+            }
+        }
+    };
+    let mut uses = SecondaryMap::<Block, Set>::new();
+    let mut defs = SecondaryMap::<Block, Set>::new();
+    for &block in &facts.cfg.rpo {
+        let data = &graph.blocks[block];
+        let mut live = Set::default();
+        terminator_uses(&data.terminator.as_ref().unwrap().kind, &mut live);
+        for &inst in data.insts.iter().rev() {
+            if let Some(result) = graph.insts[inst].result() {
+                live.remove(&result);
+                defs[block].insert(result);
+            }
+            instruction_uses(&graph.insts[inst].op, &mut live);
+        }
+        for &param in &data.params {
+            live.remove(&param);
+            defs[block].insert(param);
+        }
+        uses[block] = live;
+    }
+    let live = liveness::solve(graph, &facts.cfg, &uses, &defs);
+    let mut after = SecondaryMap::<Inst, Set>::new();
+    for &block in &facts.cfg.rpo {
+        let data = &graph.blocks[block];
+        let mut live = live.output[block].clone();
+        terminator_uses(&data.terminator.as_ref().unwrap().kind, &mut live);
+        for &inst in data.insts.iter().rev() {
+            after[inst] = live.clone();
+            if let Some(result) = graph.insts[inst].result() {
+                live.remove(&result);
+            }
+            instruction_uses(&graph.insts[inst].op, &mut live);
+        }
+    }
     let mut stores = FxHashMap::<Value, usize>::default();
     let mut defined = FxHashMap::<Value, Block>::default();
     for &block in &facts.cfg.rpo {
@@ -215,12 +290,17 @@ pub(super) fn verify(graph: &Graph, facts: &Facts, plan: &Plan) -> super::Result
     for &block in &facts.cfg.rpo {
         let data = &graph.blocks[block];
         let terminator = data.terminator.as_ref().unwrap();
+        let mut handed = FxHashMap::<Value, usize>::default();
+        let mut edge_stores = FxHashMap::<Value, usize>::default();
         let mut released = FxHashSet::default();
         let mut cleared = FxHashSet::default();
         for &inst in &data.insts {
             let op = &graph.insts[inst].op;
             for value in op.operands_iter() {
-                if released.contains(&value) || cleared.contains(&value) {
+                if released.contains(&value)
+                    || (cleared.contains(&value)
+                        && !matches!(op, Op::ParamStore(_, source) if *source == value))
+                {
                     return fail(format!(
                         "{value} used by {inst} after its reference is gone"
                     ));
@@ -229,6 +309,24 @@ pub(super) fn verify(graph: &Graph, facts: &Facts, plan: &Plan) -> super::Result
                     return fail(format!(
                         "temporary {value} used outside its block by {inst}"
                     ));
+                }
+            }
+            let stored = match *op {
+                Op::SlotStore(value) | Op::SlotClear(value) => Some(value),
+                Op::ParamStore(param, _) => Some(param),
+                _ => None,
+            };
+            if let Some(stored) = stored {
+                if matches!(op, Op::SlotClear(_)) && after[inst].contains(&stored) {
+                    return fail(format!("{inst} clears live {stored}"));
+                }
+                for value in after[inst].iter() {
+                    if value != stored
+                        && plan.slots.of(value).is_some()
+                        && plan.slots.of(value) == plan.slots.of(stored)
+                    {
+                        return fail(format!("{inst} overwrites the slot holding live {value}"));
+                    }
                 }
             }
             match *op {
@@ -242,18 +340,30 @@ pub(super) fn verify(graph: &Graph, facts: &Facts, plan: &Plan) -> super::Result
                         return fail(format!("{inst} stores {value}, which has no slot"));
                     }
                     *stores.entry(value).or_default() += 1;
+                    if let Some(count) = handed.get_mut(&value) {
+                        *count = count.saturating_sub(1);
+                    }
                 }
                 Op::SlotClear(value) => {
+                    *handed.entry(value).or_default() += 1;
                     if holder(value) != Holder::Slot || !cleared.insert(value) {
                         return fail(format!("{inst} clears {value}"));
                     }
                 }
-                Op::ParamStore(param, _) => {
+                Op::ParamStore(param, value) => {
+                    let stored = edge_stores.entry(value).or_default();
+                    if handed.get(&value).copied().unwrap_or(0) <= *stored {
+                        return fail(format!(
+                            "{inst} stores {value} before acquiring its reference"
+                        ));
+                    }
+                    *stored += 1;
                     if holder(param) != Holder::Slot || !plan.slots.forwarded(param) {
                         return fail(format!("{inst} stores into {param} on an edge"));
                     }
                 }
                 Op::Retain(value) => {
+                    *handed.entry(value).or_default() += 1;
                     let edge = terminator
                         .kind
                         .targets()
@@ -276,6 +386,7 @@ pub(super) fn verify(graph: &Graph, facts: &Facts, plan: &Plan) -> super::Result
             }
         }
         for target in terminator.kind.targets() {
+            let mut handed = handed.clone();
             for (&arg, &param) in target.args.iter().zip(&graph.blocks[target.block].params) {
                 if holder(param) != Holder::Slot {
                     continue;
@@ -284,14 +395,14 @@ pub(super) fn verify(graph: &Graph, facts: &Facts, plan: &Plan) -> super::Result
                 if arrives && plan.slots.forwarded(param) {
                     continue;
                 }
-                let handed = data.insts.iter().any(|&inst| {
-                    matches!(graph.insts[inst].op, Op::Retain(value) | Op::SlotClear(value) if value == arg)
-                });
+                let count = handed.entry(arg).or_default();
+                let reference = *count > 0;
+                *count = count.saturating_sub(1);
                 let stored = !plan.slots.forwarded(param)
                     || data.insts.iter().any(|&inst| {
                         matches!(graph.insts[inst].op, Op::ParamStore(to, value) if to == param && value == arg)
                     });
-                if !handed || !stored {
+                if !reference || !stored {
                     return fail(format!(
                         "edge {block} -> {} does not hand {arg} to {param}",
                         target.block
@@ -322,64 +433,18 @@ pub(super) fn verify(graph: &Graph, facts: &Facts, plan: &Plan) -> super::Result
 fn assign(
     graph: &Graph,
     cfg: &Cfg,
+    borrows: &borrow::Plan,
     owned: impl Fn(Value) -> bool,
     prefers: impl Fn(Value) -> bool,
 ) -> (Slots, SecondaryMap<Block, Set>) {
-    let mut receivers = FxHashMap::default();
-    for (_, data) in graph.insts.iter() {
-        if let Some(result) = data.result()
-            && graph.borrowed.contains(&result)
-            && let Some(receiver) = borrowed_receiver(&data.op)
-        {
-            receivers.insert(result, vec![receiver]);
-        }
-    }
-    for &block in &cfg.rpo {
-        for (index, &param) in graph.blocks[block].params.iter().enumerate() {
-            if graph.borrowed.contains(&param) {
-                let incoming = cfg.preds[block]
-                    .iter()
-                    .flat_map(|&pred| {
-                        graph.blocks[pred]
-                            .terminator
-                            .as_ref()
-                            .unwrap()
-                            .kind
-                            .targets()
-                    })
-                    .filter(|target| target.block == block)
-                    .map(|target| target.args[index])
-                    .collect();
-                receivers.insert(param, incoming);
-            }
-        }
-    }
-    let anchors: FxHashMap<Value, Vec<Value>> = receivers
-        .keys()
-        .map(|&value| {
-            let mut pending = vec![value];
-            let mut visited = FxHashSet::default();
-            let mut anchors = Vec::new();
-            while let Some(current) = pending.pop() {
-                if !visited.insert(current) {
-                    continue;
-                }
-                if owned(current) {
-                    anchors.push(current);
-                }
-                if let Some(owners) = receivers.get(&current) {
-                    pending.extend(owners.iter().copied());
-                }
-            }
-            (value, anchors)
-        })
-        .collect();
     let anchored = |value: Value, live: &mut Set| {
-        if let Some(anchors) = anchors.get(&value) {
-            live.extend(anchors.iter().copied());
-        } else if owned(value) {
-            live.insert(value);
-        }
+        live.extend(
+            borrows
+                .anchors(&value)
+                .iter()
+                .copied()
+                .filter(|&value| owned(value)),
+        );
     };
     let mut terminators = SecondaryMap::<Block, Set>::new();
     let mut uses = SecondaryMap::<Block, Set>::new();
@@ -591,35 +656,39 @@ fn transfer(
     let mut split = false;
     for &block in rpo {
         let terminator = graph.blocks[block].terminator.clone().unwrap();
-        let mut passed = FxHashMap::<Value, usize>::default();
-        for target in terminator.kind.targets() {
+        let ops = |graph: &Graph, target: &Target| -> Vec<Op> {
+            let mut passed = FxHashMap::<Value, usize>::default();
             for &arg in &target.args {
                 *passed.entry(arg).or_default() += 1;
             }
-        }
-        let ops = |graph: &Graph, target: &Target| -> Vec<Op> {
-            target
-                .args
-                .iter()
-                .zip(&graph.blocks[target.block].params)
-                .filter(|&(_, &param)| holders[param] == Holder::Slot)
-                .flat_map(|(&arg, &param)| {
-                    let arrives = slots.of(arg) == slots.of(param);
-                    if arrives && slots.forwarded(param) {
-                        return Vec::new();
-                    }
-                    let moves = holders[arg] == Holder::Slot
-                        && !arrives
-                        && !live_out[block].contains(&arg)
-                        && passed[&arg] == 1;
-                    let store = slots.forwarded(param).then_some(Op::ParamStore(param, arg));
-                    if moves {
-                        store.into_iter().chain([Op::SlotClear(arg)]).collect()
-                    } else {
-                        [Op::Retain(arg)].into_iter().chain(store).collect()
-                    }
-                })
-                .collect()
+            let mut references = Vec::new();
+            let mut clears = Vec::new();
+            let mut stores = Vec::new();
+            for (&arg, &param) in target.args.iter().zip(&graph.blocks[target.block].params) {
+                if holders[param] != Holder::Slot {
+                    continue;
+                }
+                let arrives = slots.of(arg) == slots.of(param);
+                if arrives && slots.forwarded(param) {
+                    continue;
+                }
+                let moves = holders[arg] == Holder::Slot
+                    && !arrives
+                    && !live_out[block].contains(&arg)
+                    && passed[&arg] == 1;
+                if moves {
+                    clears.push(Op::SlotClear(arg));
+                } else {
+                    references.push(Op::Retain(arg));
+                }
+                if slots.forwarded(param) {
+                    stores.push(Op::ParamStore(param, arg));
+                }
+            }
+            // A destination may hold an anchor or a source slot for another argument.
+            references.extend(clears);
+            references.extend(stores);
+            references
         };
         let (span, source_name) = (terminator.span, terminator.source_name);
         match &terminator.kind {
@@ -678,39 +747,7 @@ fn append(
     })
 }
 
-fn releases(graph: &Graph, facts: &Facts, cfg: &Cfg) -> FxHashMap<Inst, Vec<Value>> {
-    let mut aliases: FxHashMap<Value, Vec<Value>> = FxHashMap::default();
-    for &block in &cfg.rpo {
-        for &inst in &graph.blocks[block].insts {
-            let data = &graph.insts[inst];
-            let Some(result) = data.result() else {
-                continue;
-            };
-            if !facts.of(result).intersects(HEAP) {
-                continue;
-            }
-            if graph.contract(&data.op, facts).result != Ownership::Borrowed {
-                continue;
-            }
-            aliases.insert(result, data.op.operands_iter().collect());
-        }
-    }
-    let anchors: FxHashMap<Value, Vec<Value>> = aliases
-        .keys()
-        .map(|&value| {
-            let mut pending = vec![value];
-            let mut visited = FxHashSet::default();
-            while let Some(current) = pending.pop() {
-                if !visited.insert(current) {
-                    continue;
-                }
-                if let Some(owners) = aliases.get(&current) {
-                    pending.extend(owners.iter().copied());
-                }
-            }
-            (value, visited.into_iter().collect())
-        })
-        .collect();
+fn releases(graph: &Graph, cfg: &Cfg, borrows: &borrow::Plan) -> FxHashMap<Inst, Vec<Value>> {
     let mut defined: FxHashMap<Value, (Block, usize, Inst)> = FxHashMap::default();
     for &block in &cfg.rpo {
         for (index, &inst) in graph.blocks[block].insts.iter().enumerate() {
@@ -723,13 +760,13 @@ fn releases(graph: &Graph, facts: &Facts, cfg: &Cfg) -> FxHashMap<Inst, Vec<Valu
     for &block in &cfg.rpo {
         let data = &graph.blocks[block];
         let escape = |value: Value, last: &mut FxHashMap<Value, Option<usize>>| {
-            for &value in anchored(&anchors, &value) {
+            for &value in borrows.aliases(&value) {
                 last.insert(value, None);
             }
         };
         for (index, &inst) in data.insts.iter().enumerate() {
             for operand in graph.insts[inst].op.operands_iter() {
-                for &value in anchored(&anchors, &operand) {
+                for &value in borrows.aliases(&operand) {
                     match defined.get(&value) {
                         Some(&(owner, _, _)) if owner == block => {
                             let entry = last.entry(value).or_insert(Some(index));
@@ -765,12 +802,4 @@ fn releases(graph: &Graph, facts: &Facts, cfg: &Cfg) -> FxHashMap<Inst, Vec<Valu
         releases.entry(after).or_default().push(value);
     }
     releases
-}
-
-/// A value together with every value it borrows from, directly or not.
-fn anchored<'a>(anchors: &'a FxHashMap<Value, Vec<Value>>, value: &'a Value) -> &'a [Value] {
-    match anchors.get(value) {
-        Some(values) => values,
-        None => std::slice::from_ref(value),
-    }
 }

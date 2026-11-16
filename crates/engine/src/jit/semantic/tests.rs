@@ -1,3 +1,4 @@
+use super::cursor::Insert;
 use super::js::comparisons;
 use super::runtime::{arrays as array_checks, numeric, properties, storage, typed, views};
 use super::specialization::{
@@ -2543,7 +2544,8 @@ fn array_storage_lowering_preserves_planned_ownership() {
             let mut function = FunctionState::new(graph, Vec::new(), true);
             function.lower_typed_storage().unwrap();
             function.ensure_facts();
-            borrow::borrows(&mut function.graph, &function.facts, &mut function.notes);
+            let borrows =
+                borrow::borrows(&mut function.graph, &function.facts, &mut function.notes);
             assert!(matches!(function.graph.insts[inst].op, Op::ArrayLoad(..)));
             assert_eq!(function.graph.borrowed.contains(&result), !mutate);
             assert!(
@@ -2554,7 +2556,7 @@ fn array_storage_lowering_preserves_planned_ownership() {
             function.ensure_facts();
             repr::assign(&mut function.graph, &function.facts);
             boxing::insert(&mut function.graph, &mut function.facts);
-            let plan = ownership::plan(&mut function.graph, &mut function.facts);
+            let plan = ownership::plan(&mut function.graph, &mut function.facts, borrows);
             ownership::verify(&function.graph, &function.facts, &plan).unwrap();
             function.graph.ownership = Some(plan);
             let retained = |graph: &Graph| {
@@ -4776,4 +4778,122 @@ fn load_availability_retracts_aliases_after_loop_writes() {
             solved.canonical(repeated_nested)
         );
     }
+}
+
+#[test]
+fn ownership_edges_require_a_reference_for_each_parameter() {
+    let source = "function f(value, choose){let a,b;if(choose){a=value;b=value;}else{a={};b={};}return [a,b];}";
+    let mut graph = canonicalize_graph(lower_source(source).unwrap(), true)
+        .unwrap()
+        .graph;
+    let mut facts = Facts::compute(&graph);
+    let borrows = borrow::borrows(&mut graph, &facts, &mut Vec::new());
+    let plan = ownership::plan(&mut graph, &mut facts, borrows);
+    ownership::verify(&graph, &facts, &plan).unwrap();
+    for &block in &facts.cfg.rpo {
+        let mut storing = false;
+        for &inst in &graph.blocks[block].insts {
+            match graph.insts[inst].op {
+                Op::ParamStore(..) => storing = true,
+                Op::Retain(_) | Op::SlotClear(_) => assert!(!storing),
+                _ => {}
+            }
+        }
+    }
+    let (block, inst) = facts
+        .cfg
+        .rpo
+        .iter()
+        .find_map(|&block| {
+            let retained: Vec<_> = graph.blocks[block]
+                .insts
+                .iter()
+                .copied()
+                .filter_map(|inst| match graph.insts[inst].op {
+                    Op::Retain(value) => Some((inst, value)),
+                    _ => None,
+                })
+                .collect();
+            retained
+                .iter()
+                .find(|(_, value)| retained.iter().filter(|(_, other)| other == value).count() > 1)
+                .map(|&(inst, _)| (block, inst))
+        })
+        .expect("an edge must retain the duplicated argument twice");
+    graph.blocks[block].insts.retain(|&other| other != inst);
+    assert!(
+        ownership::verify(&graph, &facts, &plan)
+            .unwrap_err()
+            .contains("reference")
+    );
+}
+
+#[test]
+fn ownership_verifier_keeps_borrow_anchors_live() {
+    let source = "function f(){const owner={child:{}};return owner.child;}";
+    let mut graph = canonicalize_graph(lower_source(source).unwrap(), true)
+        .unwrap()
+        .graph;
+    let (inst, owner, value) = graph
+        .insts
+        .iter()
+        .find_map(|(inst, data)| {
+            if let Op::Get(owner, ref name) = data.op
+                && name == "child"
+            {
+                Some((inst, owner, data.result().unwrap()))
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    let mut facts = Facts::compute(&graph);
+    let borrows = borrow::borrows(&mut graph, &facts, &mut Vec::new());
+    assert!(graph.borrowed.contains(&value));
+    let plan = ownership::plan(&mut graph, &mut facts, borrows);
+    assert_eq!(plan.holder(owner), ownership::Holder::Slot);
+    ownership::verify(&graph, &facts, &plan).unwrap();
+    cursor::Cursor::after(&mut graph, inst).add_effect(Op::SlotClear(owner));
+    assert!(
+        ownership::verify(&graph, &facts, &plan)
+            .unwrap_err()
+            .contains("clears live")
+    );
+}
+
+#[test]
+fn indexed_borrow_anchors_survive_helper_lowering() {
+    let source = "function f(){const owner=[[3]];const row=owner[0];const scratch=[1];return [row,scratch];}";
+    let graph = canonicalize_graph(lower_source(source).unwrap(), true)
+        .unwrap()
+        .graph;
+    let (owner, row) = graph
+        .insts
+        .values()
+        .find_map(|data| match data.op {
+            Op::GetIndex(owner, _) => Some((owner, data.result().unwrap())),
+            _ => None,
+        })
+        .unwrap();
+    let scratch = graph
+        .insts
+        .values()
+        .find(|data| &source[data.span.start as usize..data.span.end as usize] == "[1]")
+        .unwrap()
+        .result()
+        .unwrap();
+    let mut function = FunctionState::new(graph, Vec::new(), true);
+    function.ensure_facts();
+    let borrows = borrow::borrows(&mut function.graph, &function.facts, &mut function.notes);
+    assert!(function.graph.borrowed.contains(&row));
+    super::runtime::helpers::lower(&mut function);
+    assert!(matches!(
+        function.graph.defining_op(row),
+        Some(Op::HelperCall { .. })
+    ));
+    let plan = ownership::plan(&mut function.graph, &mut function.facts, borrows);
+    assert_eq!(plan.holder(owner), ownership::Holder::Slot);
+    assert_eq!(plan.holder(scratch), ownership::Holder::Slot);
+    assert_ne!(plan.slots.of(owner), plan.slots.of(scratch));
+    ownership::verify(&function.graph, &function.facts, &plan).unwrap();
 }
