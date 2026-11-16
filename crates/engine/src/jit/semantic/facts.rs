@@ -423,9 +423,9 @@ impl Facts {
             refinements,
             probes,
             rejected: FxHashSet::default(),
-            identities: SecondaryMap::new(),
+            identities: SecondaryMap::with_capacity(graph.values.len()),
             assumed: identities.clone(),
-            types: SecondaryMap::new(),
+            types: SecondaryMap::with_capacity(graph.values.len()),
             indexed,
             known: true,
             fresh: Default::default(),
@@ -434,6 +434,10 @@ impl Facts {
         };
         for (&value, &types) in assumptions {
             facts.types[value] = types;
+        }
+        let mut ranks = SecondaryMap::<Block, usize>::with_capacity(graph.blocks.len());
+        for (rank, &block) in rpo.iter().enumerate() {
+            ranks[block] = rank;
         }
         let mut changed = true;
         while changed {
@@ -446,7 +450,7 @@ impl Facts {
                         | Op::ClosureCells(_, target, _, false, _, _, _) = data.op
                             && !marked.contains(&result)
                         {
-                            changed |= facts.join_identity(result, Identity::Code(target));
+                            facts.join_identity(result, Identity::Code(target));
                         }
                         if assumptions.contains_key(&result) {
                             continue;
@@ -459,7 +463,7 @@ impl Facts {
                                 _ => result_types(graph, &data.op, &facts),
                             }
                         };
-                        changed |= facts.widen(result, types);
+                        facts.widen(result, types);
                     }
                 }
                 let Some(terminator) = &graph.blocks[block].terminator else {
@@ -467,6 +471,7 @@ impl Facts {
                 };
                 let refinement = guards::edge_of(graph, &terminator.kind);
                 for target in terminator.kind.targets() {
+                    let retreating = ranks[target.block] <= ranks[block];
                     for (&param, &arg) in graph.blocks[target.block].params.iter().zip(&target.args)
                     {
                         let mut identity = facts.identity_at(arg, block);
@@ -477,7 +482,7 @@ impl Facts {
                         {
                             identity = identity.join(Identity::Code(code));
                         }
-                        changed |= facts.join_identity(param, identity);
+                        changed |= facts.join_identity(param, identity) && retreating;
                         if assumptions.contains_key(&param) {
                             continue;
                         }
@@ -500,7 +505,7 @@ impl Facts {
                                 types.without(mask)
                             };
                         }
-                        changed |= facts.widen(param, types);
+                        changed |= facts.widen(param, types) && retreating;
                     }
                 }
             }
