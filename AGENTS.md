@@ -3,9 +3,9 @@
 This folder is the Athanor Cargo workspace, an experimental JS JIT engine for
 fun and a possible “Beating* V8 in two weeks” blog post, with a substantial asterisk.
 The user is wraitii, a long-term 0 A.D. maintainer. Work from this folder by default.
-It lives at `anathor/` inside a 0 A.D. checkout, as a separate Git checkout
-of `https://github.com/wraitii/anathor`. Commit and push engine changes from this
-folder to Anathor, rather than to the surrounding 0 A.D. repository. This layout
+It lives at `athanor/` inside a 0 A.D. checkout, as a separate Git checkout
+of `https://github.com/wraitii/athanor`. Commit and push engine changes from this
+folder to Athanor, rather than to the surrounding 0 A.D. repository. This layout
 is required for map scripts, assets, and test fixtures; building the game is not
 required for Rust engine changes.
 

@@ -18,18 +18,18 @@ for full ECMAScript compatibility. See [the design guide](crates/engine/DESIGN.m
 
 ## Getting started
 
-Clone the repository inside a 0 A.D. checkout as `anathor/`:
+Clone the repository inside a 0 A.D. checkout as `athanor/`:
 
 ```sh
-git clone git@github.com:wraitii/anathor.git anathor
-cd anathor
+git clone git@github.com:wraitii/athanor.git athanor
+cd athanor
 ```
 
 This is a separate Git checkout: commit and push engine changes from this folder
-to Anathor. The current development layout assumes the surrounding 0 A.D. checkout
+to Athanor. The current development layout assumes the surrounding 0 A.D. checkout
 for map scripts, assets, test fixtures, and the SpiderMonkey reference runner.
 
-Run these commands from `anathor/`:
+Run these commands from `athanor/`:
 
 ```sh
 cargo run -p js-runner -- --eval 'function main(){return 6*7;}'
@@ -60,7 +60,7 @@ cargo run --release -p js-runner -- --map \
 From the 0 A.D. repository root, the equivalent command is:
 
 ```sh
-cargo run --release --manifest-path anathor/Cargo.toml -- --map \
+cargo run --release --manifest-path athanor/Cargo.toml -- --map \
   binaries/data/mods/public/maps/random/belgian_uplands.js
 ```
 

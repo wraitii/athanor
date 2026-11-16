@@ -1,6 +1,6 @@
 # Benchmarks
 
-Run commands from `anathor/` unless noted otherwise.
+Run commands from `athanor/` unless noted otherwise.
 
 ## V8 benchmark suite v7
 
@@ -119,13 +119,13 @@ scores across machines. Its node version is 27 alpha versus 23.9 locally.
 Run random map generation from the repository root:
 
 ```sh
-cargo run --release --manifest-path anathor/Cargo.toml -- --map \
+cargo run --release --manifest-path athanor/Cargo.toml -- --map \
   binaries/data/mods/public/maps/random/belgian_uplands.js
 ```
 
 The C++ runners in `cpp/` (SpiderMonkey 128, as embedded by the game) and
 `cpp-quickjs/` (QuickJS) run the same script. Build them with `make`, then from
-`anathor/`:
+`athanor/`:
 
 ```sh
 cpp/build/mapgen-runner --bootstrap bootstrap.js --data ../binaries/data/mods/public \
