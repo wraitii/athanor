@@ -596,6 +596,35 @@ fn error_properties_own_values_and_dispose_incrementally() {
 }
 
 #[test]
+fn cell_data_tracks_values_at_a_stable_address() {
+    let heap = Heap::default();
+    let cell = heap.cell(Value::UNINITIALIZED).unwrap();
+    let address = heap
+        .0
+        .borrow()
+        .slot(heap_id(cell).unwrap())
+        .data
+        .cast::<Value>();
+    assert_eq!(unsafe { *address }, Value::UNINITIALIZED);
+    assert!(heap.cell_set(cell, Value::number(17.0)));
+    for _ in 0..1000 {
+        let object = heap.object().unwrap();
+        heap.release(object);
+    }
+    assert_eq!(unsafe { *address }, Value::number(17.0));
+    assert_eq!(
+        heap.0
+            .borrow()
+            .slot(heap_id(cell).unwrap())
+            .data
+            .cast::<Value>(),
+        address
+    );
+    heap.release(cell);
+    heap.drain(1000);
+}
+
+#[test]
 fn closures_share_cells_and_retain_captured_values() {
     let heap = Heap::default();
     let first = heap.array(&[]).unwrap();

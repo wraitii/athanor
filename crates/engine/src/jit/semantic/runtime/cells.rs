@@ -2,9 +2,45 @@ use super::super::cursor::{Cursor, Insert};
 use super::super::dispatch;
 use super::super::{
     Binding, BindingData, BindingKind, Block, BlockData, Constant, FunctionState, Graph, Inst, Op,
-    Scope, ScopeKind, Target, TerminatorKind, Value,
+    PropertyWrite, Scope, ScopeKind, Target, TerminatorKind, Value,
 };
 use crate::{FxHashMap, FxHashSet};
+
+pub(in crate::jit::semantic) fn lower_accesses(function: &mut FunctionState) {
+    use cranelift_codegen::ir::{MemFlagsData, types};
+
+    function.ensure_cfg();
+    let graph = &mut function.graph;
+    for &block in &function.facts.cfg.rpo {
+        for inst in graph.blocks[block].insts.clone() {
+            match graph.insts[inst].op {
+                Op::CellGet(cell) => {
+                    let result = graph.insts[inst].result().unwrap();
+                    let mut at = Cursor::before(graph, inst);
+                    let view = at.add_unassigned(Op::View(cell));
+                    let address = at.ins().load(
+                        types::I64,
+                        MemFlagsData::trusted(),
+                        view,
+                        crate::heap::DATA_OFFSET,
+                    );
+                    graph.set_op(inst, Op::PropertyLoad(cell, address));
+                    Cursor::after(graph, inst).add_effect(Op::CheckInitialized(result));
+                }
+                Op::CellSet(cell, value) => {
+                    let index = Cursor::before(graph, inst)
+                        .add_unassigned(Op::Constant(Constant::Number(0.0)));
+                    graph.set_op(
+                        inst,
+                        Op::PropertyStore(cell, index, value, PropertyWrite::Set),
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+    function.invalidate_cfg();
+}
 
 pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) -> bool {
     let lazy = companion_cells(&mut function.graph);
@@ -94,7 +130,7 @@ fn lower_inst(
         Op::EnterCaptures(scope, closure) => {
             let mut at = Cursor::after(graph, inst);
             capture_cells(&mut at, lowered, scope, closure);
-            None
+            Some(Op::EnterScope(scope))
         }
         Op::NextIteration(scope) => {
             for (binding, cell) in lazy_scope_bindings(graph, lazy, scope) {

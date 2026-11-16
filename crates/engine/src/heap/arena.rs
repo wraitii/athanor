@@ -15,8 +15,8 @@ pub(super) struct Slot {
     // Code id + 1 of a closure that may be called without `new`, otherwise zero, so generated
     // call guards compare one word.
     pub(super) code: u32,
-    // Generated code reads elements or shaped property values through these; HeapData::sync
-    // refreshes them after any change that can move or resize that storage.
+    // Generated code reads elements, shaped property values or cell contents through these.
+    // HeapData::sync refreshes them after any change that can move or resize that storage.
     pub(super) data: *const u8,
     pub(super) length: usize,
     pub(super) payload: Payload,

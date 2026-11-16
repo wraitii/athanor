@@ -506,7 +506,7 @@ function main() {
 }
 
 #[test]
-fn inlined_captures_use_bindings_and_materialize_only_for_fallbacks() {
+fn inlined_captures_materialize_cells_only_for_fallbacks() {
     let source = "function main(xs){ let limit=2; return xs.some(x=>x>limit); }";
     let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
         .env("JS_JIT_OPT", "full")
@@ -536,7 +536,8 @@ fn inlined_captures_use_bindings_and_materialize_only_for_fallbacks() {
         .next()
         .unwrap();
     assert!(!caller.contains("enter_captures"));
-    assert!(caller.contains("read limit#"));
+    assert!(caller.contains("cell_get"));
+    assert!(!caller.contains("read limit#"));
     assert!(caller.contains("materialized only in fallback"));
     assert!(caller.contains("materialized as a cell only on closure creation"));
 }

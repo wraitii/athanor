@@ -746,7 +746,7 @@ impl FunctionCompiler<'_, '_> {
                             }
                             Op::CheckInitialized(value) => {
                                 let value = get(self, *value);
-                                let value = self.checked_temporary(value, true);
+                                let value = self.checked_temporary(value, data.result().is_some());
                                 Some(value)
                             }
                             Op::GuardedCompare {

@@ -61,6 +61,8 @@ impl FunctionState {
         after("properties", self);
         properties::lower_accesses(self)?;
         after("property-accesses", self);
+        cells::lower_accesses(self);
+        after("cell-accesses", self);
         self.lower_typed_storage()?;
         after("memory", self);
         numeric::operations(self);
@@ -133,6 +135,7 @@ pub(in crate::jit) const RUNTIME_PASSES: &[&str] = &[
     "bindings",
     "properties",
     "property-accesses",
+    "cell-accesses",
     "memory",
     "numeric",
     "array-checks",
@@ -527,6 +530,9 @@ pub(in crate::jit) fn specialize_observed(
     }
     function.graph.verify()?;
     captures::forward_captured_parameters(&mut function);
+    if cells::lower(&mut function) {
+        transforms::promote(&mut function.graph, &mut function.notes);
+    }
     function.graph.verify()?;
     function.invalidate_cfg();
     after("captures", &function);

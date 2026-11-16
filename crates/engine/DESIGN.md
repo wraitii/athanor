@@ -496,6 +496,11 @@ uncaptured locals retain their existing Cranelift variable representation.
 Sibling closures share cells, while separate activations allocate separate cells.
 Closure allocations own their capture cells, and cells own their current values.
 Reads become owned temporaries before side effects can replace their source.
+Cell reads lower to direct loads through the slot's data pointer followed by an
+initialization check. Ownership analysis retains loaded values when they must
+survive writes or reentry. Cell writes use the fixed-slot store lowering, retaining
+the new value before storing it and releasing the old value. Both accesses lower
+in the `cell-accesses` stage immediately after `property-accesses`.
 
 Captured lexical reads and writes check initialization; declarations initialize
 cells separately from assignment. Assignment to const bindings is rejected.
@@ -1803,6 +1808,9 @@ receive counters.
 
 Every eligible loop is instrumented. Eligibility requires promoted state, inputs
 dominating the header, outputs dominating their exits, and at least one exit.
+Capture lowering runs before region versioning and OSR discovery. Capture cells
+become explicit SSA values, so loop fragments can read and write shared cells
+without transferring implicit binding state. Cell contents remain mutable.
 Generators, handlers, materialized scopes, closure creation, and implicit
 function-frame reads other than `this` are excluded; the planner report names
 the rejecting operation. Exits follow the loop-continuation convention: each

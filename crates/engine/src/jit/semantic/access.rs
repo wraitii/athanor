@@ -28,7 +28,9 @@ impl Field {
 
     fn of(op: &Op, facts: &Facts) -> Self {
         match op {
-            Op::Read(_) | Op::Initialize(..) | Op::Write(..) => Self::Cells,
+            Op::Read(_) | Op::Initialize(..) | Op::Write(..) | Op::CellGet(_) | Op::CellSet(..) => {
+                Self::Cells
+            }
             Op::Get(_, name)
             | Op::FillPropertyStore(_, _, name, _, _)
             | Op::Set(_, name, _)

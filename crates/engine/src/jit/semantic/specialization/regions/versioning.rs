@@ -989,6 +989,7 @@ pub(super) fn finish(
     let mut copied = None;
     let mut previous = None;
     let mut definitions: FxHashMap<Value, Vec<Value>> = FxHashMap::default();
+    let scopes = super::super::super::boundary::scopes(graph);
     for block in Cfg::new(graph).rpo {
         let term = graph.blocks[block].terminator.clone().unwrap();
         let TerminatorKind::Bailout { target, inputs } = term.kind else {
@@ -1017,6 +1018,9 @@ pub(super) fn finish(
                 term.span,
                 Op::Continuation(piece.body.clone(), inputs),
             );
+            for &scope in scopes[block].iter().rev() {
+                graph.append(block, term.span, Op::LeaveScope(scope), false);
+            }
             graph.terminate(block, term.span, TerminatorKind::Return(result));
             notes.push(format!(
                 "bailout at {block}: resumes in {}",
@@ -1069,9 +1073,17 @@ pub(super) fn finish(
                     .iter()
                     .map(|value| copy.values[value])
                     .collect();
+                let scopes = if current == graph.entry {
+                    Vec::new()
+                } else {
+                    super::super::super::boundary::scopes(graph)[cfg.preds[current][0]].clone()
+                };
                 graph.blocks[current].insts.clear();
                 let result =
                     graph.append_value(current, generic.span, Op::Continuation(piece.body, inputs));
+                for scope in scopes.into_iter().rev() {
+                    graph.append(current, generic.span, Op::LeaveScope(scope), false);
+                }
                 graph.terminate(current, generic.span, TerminatorKind::Return(result));
             }
             repair(graph, &definitions);

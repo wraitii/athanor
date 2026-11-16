@@ -435,6 +435,7 @@ impl HeapData {
             Payload::Object(object) => object.properties.raw(),
             Payload::SmallObject(object) => (object.values.as_ptr().cast(), object.len as usize),
             Payload::Closure(closure) => closure.properties.raw(),
+            Payload::Cell(cell) => (std::ptr::from_ref(&cell.value).cast(), 1),
             _ => (std::ptr::null(), 0),
         };
     }

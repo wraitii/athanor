@@ -706,6 +706,91 @@ fn osr_engine(background_compile: bool) -> Engine {
 }
 
 #[test]
+fn captured_writes_retain_replacements_and_release_old_values() {
+    let mut engine = Engine::with_options(EngineOptions {
+        background_compile: false,
+        inlining: false,
+        ..Default::default()
+    })
+    .unwrap();
+    engine
+        .compile(
+            "var writer;
+            function setup() {
+                let value = [17];
+                writer = function(next) { value = next; return value; };
+                return value;
+            }
+            function replacement() { return [29]; }
+            function replace(next) { return writer(next); }",
+            "capture-stores.js",
+        )
+        .unwrap();
+    let original = engine.call("setup", &[]).unwrap();
+    let old = original.value();
+    for _ in 0..3 {
+        assert_eq!(engine.call("replace", &[old]).unwrap().value(), old);
+        engine.drain_disposals(1000);
+        assert!(engine.global().heap().valid(old));
+    }
+    let replacement = engine.call("replacement", &[]).unwrap();
+    let new = replacement.value();
+    assert_eq!(engine.call("replace", &[new]).unwrap().value(), new);
+    drop(original);
+    drop(replacement);
+    engine.drain_disposals(1000);
+    assert!(!engine.global().heap().valid(old));
+    assert!(engine.global().heap().valid(new));
+    engine.call("replace", &[Value::UNDEFINED]).unwrap();
+    engine.drain_disposals(1000);
+    assert!(!engine.global().heap().valid(new));
+}
+
+#[test]
+fn loop_replacement_preserves_shared_capture_cells() {
+    let source = r#"
+        function Counter() {
+            var limit = 200;
+            var total = 0;
+            var values = [1, 2, 3];
+            this.change = function() { limit = 220; values = [0.5, 1.5, 2.5]; };
+            this.read = function() { return total; };
+            this.run = function(callback) {
+                for (let i = 0; i < limit; ++i) {
+                    total += values[i % 3] / 1;
+                    if (i === 80) callback();
+                }
+                return total;
+            };
+        }
+        var first = new Counter();
+        var second = new Counter();
+        function main() {
+            var result = first.run(function() { first.change(); });
+            return result + first.read() + second.read();
+        }
+    "#;
+    let run = |osr| {
+        let mut engine = Engine::with_options(EngineOptions {
+            osr,
+            background_compile: false,
+            inlining: false,
+            ..Default::default()
+        })
+        .unwrap();
+        engine.compile(source, "capture-osr.js").unwrap();
+        let result = engine.call("main", &[]).unwrap().value();
+        let transfers = engine.tiering.compiler.borrow().osr_transfers();
+        (result, transfers)
+    };
+    let (expected, _) = run(false);
+    let (actual, transfers) = run(true);
+    assert_eq!(expected, Value::number(739.0));
+    assert_eq!(actual, expected);
+    assert!(transfers > 0);
+}
+
+#[test]
 fn numeric_feedback_recompiles_without_read_or_call_specialization() {
     let mut engine = Engine::with_options(EngineOptions {
         background_compile: false,

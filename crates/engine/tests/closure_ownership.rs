@@ -157,12 +157,53 @@ fn recursive_closures_and_captured_rest_work_at_each_optimization_level() {
 }
 
 #[test]
+fn captured_reads_keep_replaced_heap_values_alive_across_calls() {
+    let mut engine = Engine::with_options(EngineOptions {
+        inlining: false,
+        background_compile: false,
+        ..Default::default()
+    })
+    .unwrap();
+    engine
+        .compile(
+            "function make() {
+                let value = [17];
+                return {
+                    read: function(callback) { return value[callback()]; },
+                    replace: function() {
+                        value = [29];
+                        for (let i = 0; i < 100; ++i) { let churn = [i]; }
+                        return 0;
+                    }
+                };
+            }
+            function main() {
+                let pair = make();
+                return pair.read(pair.replace) + pair.read(function() { return 0; });
+            }",
+            "capture-replacement.js",
+        )
+        .unwrap();
+    for _ in 0..3 {
+        assert_eq!(
+            engine.call("main", &[]).unwrap().value(),
+            Value::number(46.0)
+        );
+        engine.drain_disposals(1000);
+    }
+}
+
+#[test]
 fn captured_lexicals_check_initialization_for_reads_and_writes() {
     for source in [
         "function main(){ let f = () => x; f(); let x = 1; }",
         "function main(){ let f = () => x = 2; f(); let x = 1; }",
     ] {
-        let mut engine = Engine::new().unwrap();
+        let mut engine = Engine::with_options(EngineOptions {
+            inlining: false,
+            ..Default::default()
+        })
+        .unwrap();
         engine.compile(source, "tdz.js").unwrap();
         let error = engine.call("main", &[]).err().unwrap().to_string();
         assert!(error.contains("before initialization"), "{error}");
