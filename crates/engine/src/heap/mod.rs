@@ -36,13 +36,12 @@ use set::*;
 use shape::*;
 use typed::*;
 
+pub(crate) use crate::builtins::{MathFunction, NativeFunction};
 pub(crate) use arena::{
     CODE_OFFSET, DATA_OFFSET, INLINE_PROPERTY_LENGTH_OFFSET, KIND_OFFSET, LENGTH_OFFSET,
     NO_ELEMENTS, REFERENCES_OFFSET, SHAPE_OFFSET,
 };
 pub(crate) use array::HOLE;
-pub(crate) use natives::{MathFunction, NativeFunction};
-pub(crate) use object::builtin_method;
 pub use owned::OwnedValue;
 pub(crate) use properties::{
     PropertyAdditionCache, PropertyOverwriteCache, PropertyWrite, PropertyWriteCache,
@@ -60,6 +59,7 @@ struct HeapData {
     atoms: Atoms,
     shapes: Shapes,
     natives: Vec<(NativeFunction, u64)>,
+    function_prototype: Option<Value>,
     interned: Vec<(&'static str, u64)>,
     regexp_cache: FxHashMap<(String, u8), Rc<regress::Regex>>,
     pending: VecDeque<u64>,

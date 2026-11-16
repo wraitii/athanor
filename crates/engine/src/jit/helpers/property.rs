@@ -618,7 +618,7 @@ pub(super) extern "C" fn js_index_set(
     let ctx = unsafe { &mut *ctx };
     if ctx.global.heap().typed_kind(array).is_some() {
         if let Some(index) = typed_numeric_index(ctx, index) {
-            let Some(number) = crate::jit::builtins::typed_array::numeric(ctx, value) else {
+            let Some(number) = crate::builtins::typed_array::numeric(ctx, value) else {
                 return Value::UNDEFINED;
             };
             if let Some(index) = index {

@@ -105,102 +105,6 @@ impl Default for EngineOptions {
     }
 }
 
-fn install_globals(global: &Environment) -> Result<(), Error> {
-    use crate::heap::{MathFunction as M, NativeFunction as N, TypedKind};
-    let heap = global.heap();
-    let exhausted = || Error::Runtime("heap exhausted".into());
-    let native = |function: N| heap.native_function(function).ok_or_else(exhausted);
-    let define = |name: &str, value: Value| {
-        global.define(name, value);
-        heap.release(value);
-    };
-    let add_methods = |object: Value, methods: &[(&str, N)]| -> Result<(), Error> {
-        for &(name, function) in methods {
-            let value = native(function)?;
-            heap.define_property(object, name, value, false);
-            heap.release(value);
-        }
-        Ok(())
-    };
-    let namespace = |methods: &[(&str, N)]| -> Result<Value, Error> {
-        let object = heap.object().ok_or_else(exhausted)?;
-        add_methods(object, methods)?;
-        Ok(object)
-    };
-
-    global.define("globalThis", Value::GLOBAL_OBJECT);
-    global.define_readonly("Infinity", Value::number(f64::INFINITY));
-    global.define_readonly("NaN", Value::number(f64::NAN));
-    for (name, function) in [
-        ("Error", N::Error),
-        ("Set", N::Set),
-        ("Array", N::Array),
-        ("print", N::Print),
-    ] {
-        define(name, native(function)?);
-    }
-    define("console", namespace(&[("log", N::ConsoleLog)])?);
-    for (name, kind) in [
-        ("Uint8Array", TypedKind::Uint8),
-        ("Uint16Array", TypedKind::Uint16),
-        ("Uint32Array", TypedKind::Uint32),
-        ("Int8Array", TypedKind::Int8),
-        ("Int16Array", TypedKind::Int16),
-        ("Int32Array", TypedKind::Int32),
-        ("Float32Array", TypedKind::Float32),
-        ("Float64Array", TypedKind::Float64),
-    ] {
-        define(name, native(N::TypedConstructor(kind))?);
-    }
-    let math = heap.object().ok_or_else(exhausted)?;
-    for (name, value) in [("PI", std::f64::consts::PI), ("E", std::f64::consts::E)] {
-        heap.define_property(math, name, Value::number(value), false);
-    }
-    let methods = [
-        ("random", M::Random),
-        ("abs", M::Abs),
-        ("ceil", M::Ceil),
-        ("floor", M::Floor),
-        ("round", M::Round),
-        ("trunc", M::Trunc),
-        ("sqrt", M::Sqrt),
-        ("sin", M::Sin),
-        ("cos", M::Cos),
-        ("tan", M::Tan),
-        ("asin", M::Asin),
-        ("acos", M::Acos),
-        ("atan", M::Atan),
-        ("atan2", M::Atan2),
-        ("exp", M::Exp),
-        ("log", M::Log),
-        ("pow", M::Pow),
-        ("min", M::Min),
-        ("max", M::Max),
-        ("imul", M::Imul),
-        ("sign", M::Sign),
-    ]
-    .map(|(name, function)| (name, N::Math(function)));
-    add_methods(math, &methods)?;
-    define("Math", math);
-    define(
-        "JSON",
-        namespace(&[("parse", N::JsonParse), ("stringify", N::JsonStringify)])?,
-    );
-    define(
-        "Object",
-        namespace(&[
-            ("keys", N::ObjectKeys),
-            ("values", N::ObjectValues),
-            ("getOwnPropertyNames", N::ObjectGetOwnPropertyNames),
-            ("freeze", N::ObjectFreeze),
-            ("isFrozen", N::ObjectIsFrozen),
-        ])?,
-    );
-    define("Date", namespace(&[("now", N::DateNow)])?);
-    define("hostSeedRandom", native(N::HostSeedRandom)?);
-    Ok(())
-}
-
 pub struct Engine {
     pub(crate) tiering: jit::Tiering,
     random_state: Cell<u64>,
@@ -246,15 +150,17 @@ impl Engine {
             return Err(Error::Compile("compiler_threads must be positive".into()));
         }
         let global = Environment::new();
-        install_globals(&global)?;
-        Ok(Self {
+        crate::builtins::install(&global)?;
+        let mut engine = Self {
             tiering: jit::Tiering::new(options)?,
             random_state: Cell::new(0x330e),
             global,
             functions: RefCell::new(FxHashMap::default()),
             locals: jit::LocalSlots::new(),
             host: None,
-        })
+        };
+        engine.compile_source(include_str!("builtins/setup.js"), "<builtins>", true)?;
+        Ok(engine)
     }
 
     pub(crate) fn seed_random(&self, seed: u32) {
@@ -307,7 +213,16 @@ impl Engine {
     }
 
     pub fn compile(&mut self, source: &str, filename: &str) -> Result<(), Error> {
-        if let Some(initializer) = self.prepare_source(source, filename)? {
+        self.compile_source(source, filename, false)
+    }
+
+    fn compile_source(
+        &mut self,
+        source: &str,
+        filename: &str,
+        intrinsics: bool,
+    ) -> Result<(), Error> {
+        if let Some(initializer) = self.prepare_source_inner(source, filename, intrinsics)? {
             let value = unsafe {
                 jit::call(
                     jit::entries::Entry::generic(initializer),
@@ -330,6 +245,15 @@ impl Engine {
         &self,
         source: &str,
         filename: &str,
+    ) -> Result<Option<usize>, Error> {
+        self.prepare_source_inner(source, filename, false)
+    }
+
+    fn prepare_source_inner(
+        &self,
+        source: &str,
+        filename: &str,
+        intrinsics: bool,
     ) -> Result<Option<usize>, Error> {
         let span = tracing::info_span!("Script compilation", filename);
         let _entered = span.enter();
@@ -408,6 +332,7 @@ impl Engine {
                 analysis.semantic.nodes(),
                 source,
                 filename,
+                intrinsics,
             )
             .map_err(|error| match error {
                 Error::Unsupported(message) => Error::Unsupported(format!("{filename}: {message}")),

@@ -546,6 +546,7 @@ impl Compiler {
         nodes: &AstNodes<'a>,
         source: &str,
         filename: &str,
+        intrinsics: bool,
     ) -> Result<
         (
             Vec<CompiledFunction>,
@@ -566,7 +567,16 @@ impl Compiler {
         Arc::make_mut(&mut self.canonical)
             .sources
             .insert(self.source_name.0, self.source_name.1);
-        let result = self.compile_program_inner(program, scoping, nodes, source, source_path);
+        let inspection = if intrinsics {
+            self.inspection.take()
+        } else {
+            None
+        };
+        let result =
+            self.compile_program_inner(program, scoping, nodes, source, source_path, intrinsics);
+        if intrinsics {
+            self.inspection = inspection;
+        }
         if result.is_err() {
             self.continuations.clear();
             self.context.clear();
@@ -582,6 +592,7 @@ impl Compiler {
         nodes: &AstNodes<'a>,
         source: &str,
         source_path: &str,
+        intrinsics: bool,
     ) -> Result<
         (
             Vec<CompiledFunction>,
@@ -810,7 +821,7 @@ impl Compiler {
             if callable.generator {
                 continue;
             }
-            let canonical = super::semantic::build_canonical(
+            let mut canonical = super::semantic::build_canonical(
                 callable.params,
                 callable.statements,
                 callable.expression,
@@ -828,6 +839,9 @@ impl Compiler {
                 self.ssa_opt,
             )
             .map_err(Error::Unsupported)?;
+            if intrinsics {
+                super::semantic::lower_intrinsics(&mut canonical)?;
+            }
             let repository = Arc::make_mut(&mut self.canonical);
             match &callable.declaration {
                 Some(name) => repository.insert(self.source_name.0, name, callable.id, canonical),
@@ -841,7 +855,7 @@ impl Compiler {
         }
 
         for callable in &callables {
-            if !callable.generator && self.inspection.is_none() {
+            if !intrinsics && !callable.generator && self.inspection.is_none() {
                 self.lazy.insert(
                     callable.id,
                     (

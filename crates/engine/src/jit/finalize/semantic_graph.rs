@@ -1092,7 +1092,7 @@ impl FunctionCompiler<'_, '_> {
             } => {
                 let builtins = if *helper == Helper::SemanticPropertyProbeCached {
                     match self.b.graph.defining_op(args[1]) {
-                        Some(Op::PropertyCache(_, name)) => crate::heap::builtin_method(name),
+                        Some(Op::PropertyCache(_, name)) => crate::builtins::builtin_method(name),
                         _ => unreachable!("property probe requires a cache"),
                     }
                 } else {

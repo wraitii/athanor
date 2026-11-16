@@ -149,9 +149,12 @@ fn indexed_stores_preserve_fallbacks_and_array_transitions() {
             store(a, '0', 40);
             const o = {};
             store(o, 0, 90);
+            const sparse = [];
+            store(sparse, 5, {value: 9});
             return a.length === 4 && a[0] === 40 && a[1] === 20 &&
                 a[2] === 30 && a[3] === 13 && o[0] === 90 &&
-                holey[0] === 10 && holey[1] === 20 && holey[2] === 30;
+                holey[0] === 10 && holey[1] === 20 && holey[2] === 30 &&
+                sparse.length === 6 && !(0 in sparse) && sparse[5].value === 9;
         }
     "#;
     for mut engine in engines() {
@@ -164,7 +167,7 @@ fn indexed_stores_preserve_fallbacks_and_array_transitions() {
             Value::number(0.5),
             Value::number(f64::NAN),
             Value::number(f64::INFINITY),
-            Value::number(5.0),
+            Value::number(33554432.0),
             Value::TRUE,
             Value::FALSE,
         ] {

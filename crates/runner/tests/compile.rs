@@ -268,8 +268,12 @@ fn planner_reports_materialized_region_candidates() {
     );
     assert!(plain.status.success());
     let plain = String::from_utf8(plain.stdout).unwrap();
+    let planner_header = text
+        .lines()
+        .find(|line| line.starts_with("[f@") && line.ends_with("] planner f"))
+        .unwrap();
     assert_eq!(
-        without_constants(text.split("[f@1#0] planner").next().unwrap()),
+        without_constants(text.split(planner_header).next().unwrap()),
         without_constants(&plain)
     );
 }

@@ -492,3 +492,11 @@ fn direct_baseline_generator_regions_preserve_tdz() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn direct_baseline_executes_javascript_apply_with_explicit_receiver() {
+    let source = "function f(a,b){return this.offset+a+b;} function main(){return f.apply({offset:4},{0:2,1:3,length:2});}";
+    let inspection = run(&["--compile", "--filter", "main", "--eval", source]);
+    assert!(inspection.contains("main"));
+    assert_eq!(run(&["--eval", source]).trim(), "9");
+}

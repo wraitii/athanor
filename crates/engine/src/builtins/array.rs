@@ -1,11 +1,11 @@
 use std::cmp::Ordering;
 
-use super::super::session::{Held, JitCtx};
 use super::{arg, fail};
 use crate::heap::NativeFunction;
+use crate::jit::session::{Held, JitCtx};
 use crate::value::Value;
 
-use super::super::helpers::{js_call, js_iterate_new, js_iterate_next, js_truthy, strict_equals};
+use crate::jit::helpers::{js_call, js_iterate_new, js_iterate_next, js_truthy, strict_equals};
 
 fn relative_index(value: Value, length: usize, default: usize) -> Option<usize> {
     if value.is_undefined() {
@@ -28,7 +28,7 @@ fn to_length(ctx: &mut JitCtx, value: Value) -> Option<usize> {
     let number = if let Some(number) = value.as_number() {
         number
     } else if let Some(text) = heap.text(value) {
-        super::super::conversion::string_number(&text)
+        crate::jit::conversion::string_number(&text)
     } else if value.is_object() {
         fail(ctx, "Array.from length must be a number");
         return None;
@@ -83,7 +83,7 @@ fn array_like_get(ctx: &mut JitCtx, value: Value, index: usize) -> Option<Value>
     Some(Value::UNDEFINED)
 }
 
-pub(in crate::jit) fn from(ctx: *mut JitCtx, args: &[Value]) -> Value {
+pub(crate) fn from(ctx: *mut JitCtx, args: &[Value]) -> Value {
     let context = unsafe { &mut *ctx };
     let heap = context.global.heap().clone();
     let source = arg(args, 0);
@@ -160,7 +160,7 @@ pub(in crate::jit) fn from(ctx: *mut JitCtx, args: &[Value]) -> Value {
     }
 }
 
-pub(in crate::jit) fn construct(ctx: *mut JitCtx, args: &[Value]) -> Value {
+pub(crate) fn construct(ctx: *mut JitCtx, args: &[Value]) -> Value {
     let context = unsafe { &mut *ctx };
     let heap = context.global.heap().clone();
     if args.len() == 1
@@ -213,7 +213,7 @@ fn sort_number(heap: &crate::heap::Heap, value: Value) -> Option<f64> {
         return Some(number);
     }
     if let Some(text) = heap.text(value) {
-        return Some(super::super::conversion::string_number(&text));
+        return Some(crate::jit::conversion::string_number(&text));
     }
     if value.is_object() {
         return None;
@@ -366,12 +366,18 @@ pub(super) fn call(
     args: &[Value],
 ) -> Value {
     use NativeFunction::*;
-    let context = unsafe { &mut *ctx };
-    let heap = context.global.heap().clone();
-    let arg = |index: usize| arg(args, index);
+    if function == Array {
+        return construct(ctx, args);
+    }
+    if function == ArrayIsArray {
+        return Value::boolean(unsafe { &*ctx }.global.heap().is_array(arg(args, 0)));
+    }
     if function == ArrayFrom {
         return from(ctx, args);
     }
+    let context = unsafe { &mut *ctx };
+    let heap = context.global.heap().clone();
+    let arg = |index: usize| arg(args, index);
     if !heap.is_array(receiver) {
         return fail(context, "array method requires an array receiver");
     }

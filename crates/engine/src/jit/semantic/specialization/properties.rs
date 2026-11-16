@@ -163,9 +163,9 @@ pub(in crate::jit::semantic) fn rewrite(graph: &mut Graph) -> super::super::Resu
                 .iter()
                 .find(|&&(shape, _)| holds(Fact::Shape(shape)))
                 .copied();
-            let cached = read
-                .cache
-                .is_some_and(|cache| holds(Fact::Cached(cache, crate::heap::builtin_method(name))));
+            let cached = read.cache.is_some_and(|cache| {
+                holds(Fact::Cached(cache, crate::builtins::builtin_method(name)))
+            });
             Some((inst, read, shaped, cached))
         })
         .collect();
@@ -200,7 +200,7 @@ pub(in crate::jit::semantic) fn rewrite(graph: &mut Graph) -> super::super::Resu
         });
         if cached {
             graph.insts[inst].op =
-                Op::CachedProperty(object, cache, crate::heap::builtin_method(&name));
+                Op::CachedProperty(object, cache, crate::builtins::builtin_method(&name));
             continue;
         }
         lower_cache(graph, inst, cache, object, &name);
@@ -225,14 +225,14 @@ pub(in crate::jit::semantic) fn lower_cache(
         graph,
         &data,
         block,
-        Op::IsPropertyCached(object, cache, crate::heap::builtin_method(name)),
+        Op::IsPropertyCached(object, cache, crate::builtins::builtin_method(name)),
     );
     let fast = dispatch::branch(graph, inst, block, check, fallback);
     let value = dispatch::append(
         graph,
         &data,
         fast,
-        Op::CachedProperty(object, cache, crate::heap::builtin_method(name)),
+        Op::CachedProperty(object, cache, crate::builtins::builtin_method(name)),
     );
     graph.terminate(
         fast,

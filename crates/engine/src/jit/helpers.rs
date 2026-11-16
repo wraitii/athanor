@@ -3,8 +3,9 @@ mod calls;
 mod generators;
 mod property;
 
-pub(in crate::jit) use arithmetic::*;
-pub(in crate::jit) use calls::*;
+pub(crate) use arithmetic::*;
+pub(crate) use calls::*;
+pub(crate) use generators::generator_next;
 use generators::*;
 pub(in crate::jit) use property::*;
 
@@ -61,7 +62,7 @@ pub(crate) struct HelperSpec {
     pub(crate) params: &'static [HelperKind],
     pub(crate) returns: HelperKind,
     pub(crate) pointer: *const u8,
-    pub(crate) ownership: super::semantic::Ownership,
+    pub(super) ownership: super::semantic::Ownership,
 }
 
 macro_rules! define_helpers {
@@ -247,7 +248,7 @@ extern "C" fn js_compile_leave(ctx: *mut JitCtx, code: u64) -> Value {
 }
 
 impl Helper {
-    pub(crate) fn result_ownership(self) -> super::semantic::Ownership {
+    pub(super) fn result_ownership(self) -> super::semantic::Ownership {
         HELPERS[self as usize].ownership
     }
 
@@ -557,7 +558,7 @@ extern "C" fn js_string_split(
     } else {
         unsafe { std::slice::from_raw_parts(argv, argc as usize) }
     };
-    super::builtins::string::split(ctx, receiver, args)
+    crate::builtins::string::split(ctx, receiver, args)
 }
 
 extern "C" fn js_closure_this(ctx: *mut JitCtx, closure: Value) -> Value {
@@ -635,7 +636,7 @@ extern "C" fn js_math_direct(
     } else {
         unsafe { std::slice::from_raw_parts(argv, argc as usize) }
     };
-    super::builtins::math::call(unsafe { &mut *ctx }, operation, args)
+    crate::builtins::math::call(unsafe { &mut *ctx }, operation, args)
 }
 
 extern "C" fn js_observe_get(ctx: *mut JitCtx, value: Value, cache: u64) -> Value {
@@ -764,7 +765,7 @@ extern "C" fn js_string_constant(
     }
 }
 
-pub(super) extern "C" fn js_truthy(ctx: *mut JitCtx, value: Value) -> Value {
+pub(crate) extern "C" fn js_truthy(ctx: *mut JitCtx, value: Value) -> Value {
     let ctx = unsafe { &*ctx };
     Value::boolean(match ctx.global.heap().string_is_empty(value) {
         Some(empty) => !empty,
@@ -906,7 +907,7 @@ extern "C" fn js_enumerate_next(ctx: *mut JitCtx, state: Value) -> Value {
     }
 }
 
-pub(super) extern "C" fn js_iterate_new(ctx: *mut JitCtx, iterable: Value) -> Value {
+pub(crate) extern "C" fn js_iterate_new(ctx: *mut JitCtx, iterable: Value) -> Value {
     let ctx = unsafe { &mut *ctx };
     if ctx.global.heap().len(iterable).is_none() {
         ctx.error = Some(Box::new(crate::Error::Runtime(
@@ -923,7 +924,7 @@ pub(super) extern "C" fn js_iterate_new(ctx: *mut JitCtx, iterable: Value) -> Va
     }
 }
 
-pub(super) extern "C" fn js_iterate_next(ctx: *mut JitCtx, state: Value) -> Value {
+pub(crate) extern "C" fn js_iterate_next(ctx: *mut JitCtx, state: Value) -> Value {
     let ctx = unsafe { &mut *ctx };
     let heap = ctx.global.heap();
     let iterable = heap.get(state, 0).unwrap();
@@ -1045,7 +1046,7 @@ extern "C" fn js_string_split_parts(
     } else {
         unsafe { std::slice::from_raw_parts(argv, argc as usize) }
     };
-    super::builtins::string::split_result(ctx, receiver, args, destination)
+    crate::builtins::string::split_result(ctx, receiver, args, destination)
 }
 
 extern "C" fn js_pack_init(_: *mut JitCtx, destination: Value) -> Value {

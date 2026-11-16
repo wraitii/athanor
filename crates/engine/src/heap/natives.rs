@@ -1,92 +1,18 @@
 use super::*;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum NativeFunction {
-    DateNow,
-    ObjectKeys,
-    ObjectValues,
-    ObjectGetOwnPropertyNames,
-    ObjectFreeze,
-    ObjectIsFrozen,
-    Array,
-    ArrayFrom,
-    ArrayIsArray,
-    TypedConstructor(TypedKind),
-    TypedFrom(TypedKind),
-    TypedFill,
-    Math(MathFunction),
-    JsonParse,
-    JsonStringify,
-    RegExpTest,
-    RegExpExec,
-    StringMatch,
-    HostSeedRandom,
-    HostReadFile,
-    Print,
-    ConsoleLog,
-    HostListFiles,
-    HostEvaluateSource,
-    Error,
-    Set,
-    SetAdd,
-    SetHas,
-    SetDelete,
-    SetClear,
-    GeneratorNext,
-    ArrayFilter,
-    ArrayMap,
-    ArrayEvery,
-    ArraySome,
-    ArrayFind,
-    ArrayForEach,
-    ArrayAt,
-    ArraySort,
-    ArrayJoin,
-    ArrayPop,
-    ArrayIndexOf,
-    ArrayConcat,
-    ArrayPush,
-    ArrayIncludes,
-    ArrayReverse,
-    ArraySlice,
-    ArrayFlat,
-    ArrayFlatMap,
-    ArrayFill,
-    NumberToFixed,
-    NumberToString,
-    StringSlice,
-    StringSplit,
-    StringStartsWith,
-    StringReplace,
-    StringPadStart,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum MathFunction {
-    Random,
-    Abs,
-    Ceil,
-    Floor,
-    Round,
-    Trunc,
-    Sqrt,
-    Sin,
-    Cos,
-    Tan,
-    Asin,
-    Acos,
-    Atan,
-    Atan2,
-    Exp,
-    Log,
-    Pow,
-    Min,
-    Max,
-    Imul,
-    Sign,
-}
-
 impl Heap {
+    pub(crate) fn install_function_prototype(&self, prototype: Value) -> bool {
+        let mut data = self.0.borrow_mut();
+        if data.function_prototype.is_some()
+            || heap_id(prototype).and_then(|id| data.object(id)).is_none()
+        {
+            return false;
+        }
+        data.retain(prototype);
+        data.function_prototype = Some(prototype);
+        true
+    }
+
     pub(crate) fn native_function(&self, function: NativeFunction) -> Option<Value> {
         let mut data = self.0.borrow_mut();
         let id = if let Some((_, id)) = data.natives.iter().find(|(kind, _)| *kind == function) {

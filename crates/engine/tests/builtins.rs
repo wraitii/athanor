@@ -854,3 +854,109 @@ fn exponentiation_special_values() {
         assert_eq!(engine.call("main", &[]).unwrap().value(), Value::TRUE);
     }
 }
+
+#[test]
+fn string_conversion_character_codes_and_ranges() {
+    assert_eq!(
+        run(r#"function main() {
+        const from = String.fromCharCode;
+        const s = 'a😀bc';
+        return String() === '' && String(undefined) === 'undefined' &&
+            String(null) === 'null' && String(false) === 'false' &&
+            String(-0) === '0' && String(1e21) === '1e+21' && String('é') === 'é' &&
+            from(65, 66, 0xd83d, 0xde00) === 'AB😀' && from(65537, -1) === '\u0001\uffff' &&
+            from(NaN, Infinity) === '\0\0' && s.charAt('1') === '😀' &&
+            s.charAt(-1) === '' && s.charAt(Infinity) === '' && s.charCodeAt(1) === 128512 &&
+            s.charCodeAt() === 97 && s.charCodeAt(99) !== s.charCodeAt(99) &&
+            s.substring(3, 1) === '😀b' && s.substring(-1, Infinity) === s &&
+            s.substr(-3, 2) === '😀b' && s.substr(2, -1) === '' && s.substr(2) === 'bc';
+    }"#)
+        .unwrap(),
+        Value::TRUE
+    );
+    assert!(run("function main(){ return String({}); }").is_err());
+    assert!(run("function main(){ return String.fromCharCode(0xd800); }").is_err());
+}
+
+#[test]
+fn parse_int_handles_radices_prefixes_and_primitive_inputs() {
+    assert_eq!(
+        run(r#"function main() {
+        return parseInt(' \ufeff-0XfFtail') === -255 && parseInt('1012', 2) === 5 &&
+            parseInt('0x20', 10) === 0 && parseInt('010') === 10 &&
+            parseInt('z!', 36) === 35 && parseInt(12.9) === 12 &&
+            parseInt('11', '2') === 3 && parseInt('0xff', 4294967296) === 255 &&
+            1 / parseInt('-0') === -Infinity && parseInt(true, 36) === 1389110 &&
+            parseInt('\u00851') !== parseInt('\u00851') && parseInt('1', 1) !== parseInt('1', 1) && parseInt('0x') !== parseInt('0x') &&
+            parseInt() !== parseInt() && Math.LN2 > 0.69 && Math.LN2 < 0.70;
+    }"#)
+        .unwrap(),
+        Value::TRUE
+    );
+}
+
+#[test]
+fn javascript_apply_preserves_receivers_and_array_like_arguments() {
+    assert_eq!(
+        run(r#"function sum(a, b) { return this.offset + a + b; }
+    function main() {
+        const receiver = {offset: 4};
+        function missing(a) { return this === undefined && a === undefined; }
+        const methods = {offset: 7, make: function() { return x => this.offset + x; }};
+        const arrow = methods.make();
+        return sum.apply === Function.prototype.apply && 'apply' in sum && 'apply' in Math.max &&
+            Object.keys(Function.prototype).length === 0 &&
+            sum.apply(receiver, {0: 2, 1: 3, length: '2.9'}) === 9 &&
+            missing.apply(undefined, null) && missing.apply(undefined, {length: -2}) &&
+            arrow.apply({offset: 100}, [3]) === 10 && Math.max.apply(null, [1, 9, 3]) === 9 &&
+            String.apply(null, [42]) === '42';
+    }"#)
+        .unwrap(),
+        Value::TRUE
+    );
+}
+
+#[test]
+fn javascript_apply_propagates_exceptions_and_keeps_arguments_alive() {
+    assert_eq!(
+        run(r#"function main() {
+        let list = [{value: 8}];
+        function f(a, b) { list[0] = null; return a.value + b; }
+        const result = f.apply(null, {0: list[0], 1: 2, length: 2});
+        function throws(value) { throw value; }
+        let caught = false;
+        try { throws.apply(null, [17]); } catch (e) { caught = e === 17; }
+        let invalid = false;
+        try { f.apply(null, 'ab'); } catch (e) { invalid = true; }
+        const old = Function.prototype.apply;
+        Function.prototype.apply = function() { return 23; };
+        const replaced = f.apply(null, []);
+        Function.prototype.apply = old;
+        function $call(a, b) { return a + b; }
+        return result === 10 && caught && invalid && replaced === 23 && $call(3, 4) === 7 &&
+            typeof $callSpread === 'undefined';
+    }"#)
+        .unwrap(),
+        Value::TRUE
+    );
+}
+
+#[test]
+fn hot_apply_keeps_target_guards_and_packed_argument_ownership() {
+    assert_eq!(
+        run(r#"function sum(a, b) { return this.offset + a.value + b; }
+    function product(a, b) { return this.offset + a.value * b; }
+    function main() {
+        let total = 0;
+        const args = [{value: 3}, 2];
+        const receiver = {offset: 1};
+        for (let i = 0; i < 5000; ++i) {
+            const target = i < 2500 ? sum : product;
+            total += target.apply(receiver, args);
+        }
+        return total === 32500 && args[0].value === 3 && args.length === 2;
+    }"#)
+        .unwrap(),
+        Value::TRUE
+    );
+}

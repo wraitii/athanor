@@ -54,7 +54,7 @@ pub(super) extern "C" fn js_construct_pack(
     js_construct(ctx, callable, argv, argc as u64)
 }
 
-pub(in crate::jit) extern "C" fn js_call(
+pub(crate) extern "C" fn js_call(
     ctx: *mut JitCtx,
     closure: Value,
     receiver: Value,
@@ -211,96 +211,26 @@ pub(super) extern "C" fn js_construct(
     argv: *const Value,
     argc: u64,
 ) -> Value {
-    let ctx = unsafe { &mut *ctx };
-    if ctx.global.heap().native(constructor) == Some(crate::heap::NativeFunction::Array) {
+    let context = unsafe { &mut *ctx };
+    if let Some(function) = context.global.heap().native(constructor) {
         let args = if argc == 0 {
             &[]
         } else {
             unsafe { std::slice::from_raw_parts(argv, argc as usize) }
         };
-        return crate::jit::builtins::array::construct(ctx, args);
+        return crate::builtins::construct(ctx, function, args);
     }
-    if let Some(crate::heap::NativeFunction::TypedConstructor(kind)) =
-        ctx.global.heap().native(constructor)
-    {
-        let args = if argc == 0 {
-            &[]
-        } else {
-            unsafe { std::slice::from_raw_parts(argv, argc as usize) }
-        };
-        return crate::jit::builtins::typed_array::construct(ctx, kind, args);
-    }
-    if ctx.global.heap().constructable(constructor) {
-        let Some(instance) = ctx.global.heap().constructed_object(constructor) else {
-            ctx.error = Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
+    if context.global.heap().constructable(constructor) {
+        let Some(instance) = context.global.heap().constructed_object(constructor) else {
+            context.error = Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
             return Value::UNDEFINED;
         };
         return invoke_constructor(ctx, constructor, instance, argv, argc);
     }
-    if ctx.global.heap().native(constructor) == Some(crate::heap::NativeFunction::Set) {
-        let argument = if argc == 0 {
-            Value::UNDEFINED
-        } else {
-            unsafe { *argv }
-        };
-        if !argument.is_nullish() {
-            ctx.error = Some(Box::new(crate::Error::Runtime(
-                "Set iterable construction is unsupported".into(),
-            )));
-            return Value::UNDEFINED;
-        }
-        return match ctx.global.heap().set_new() {
-            Some(value) => value,
-            None => {
-                ctx.error = Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
-                Value::UNDEFINED
-            }
-        };
-    }
-    if ctx.global.heap().native(constructor) != Some(crate::heap::NativeFunction::Error) {
-        ctx.error = Some(Box::new(crate::Error::Runtime(
-            "unsupported constructor".into(),
-        )));
-        return Value::UNDEFINED;
-    }
-    let argument = if argc == 0 {
-        Value::UNDEFINED
-    } else {
-        unsafe { *argv }
-    };
-    let heap = ctx.global.heap();
-    let text = if argument.is_undefined() {
-        String::new()
-    } else if argument.is_object() {
-        let Some(text) = heap.error_text(argument) else {
-            ctx.error = Some(Box::new(crate::Error::Runtime(
-                "object-to-primitive conversion is unsupported".into(),
-            )));
-            return Value::UNDEFINED;
-        };
-        text
-    } else {
-        heap.text(argument).unwrap_or_else(|| argument.to_string())
-    };
-    let Some(message) = heap.string(&text) else {
-        ctx.error = Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
-        return Value::UNDEFINED;
-    };
-    let Some(name) = heap.string("Error") else {
-        heap.release(message);
-        ctx.error = Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
-        return Value::UNDEFINED;
-    };
-    let result = heap.error(message, name);
-    heap.release(message);
-    heap.release(name);
-    match result {
-        Some(value) => value,
-        None => {
-            ctx.error = Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
-            Value::UNDEFINED
-        }
-    }
+    context.error = Some(Box::new(crate::Error::Runtime(
+        "unsupported constructor".into(),
+    )));
+    Value::UNDEFINED
 }
 
 pub(super) fn native_call(
@@ -310,138 +240,10 @@ pub(super) fn native_call(
     argv: *const Value,
     argc: u64,
 ) -> Value {
-    use crate::heap::NativeFunction;
-    if matches!(
-        function,
-        NativeFunction::JsonParse | NativeFunction::JsonStringify
-    ) {
-        let args = if argc == 0 {
-            &[]
-        } else {
-            unsafe { std::slice::from_raw_parts(argv, argc as usize) }
-        };
-        return crate::jit::builtins::json::call(unsafe { &mut *ctx }, function, args);
-    }
-    if matches!(
-        function,
-        NativeFunction::ObjectKeys
-            | NativeFunction::ObjectValues
-            | NativeFunction::ObjectGetOwnPropertyNames
-            | NativeFunction::ObjectFreeze
-            | NativeFunction::ObjectIsFrozen
-    ) {
-        let args = if argc == 0 {
-            &[]
-        } else {
-            unsafe { std::slice::from_raw_parts(argv, argc as usize) }
-        };
-        return crate::jit::builtins::object::call(unsafe { &mut *ctx }, function, args);
-    }
-    if let NativeFunction::Math(operation) = function {
-        let args = if argc == 0 {
-            &[]
-        } else {
-            unsafe { std::slice::from_raw_parts(argv, argc as usize) }
-        };
-        return crate::jit::builtins::math::call(unsafe { &mut *ctx }, operation, args);
-    }
-    if matches!(function, NativeFunction::TypedConstructor(_)) {
-        unsafe { &mut *ctx }.error = Some(Box::new(crate::Error::Runtime(
-            "typed array constructor requires new".into(),
-        )));
-        return Value::UNDEFINED;
-    }
-    if function == NativeFunction::Array {
-        let args = if argc == 0 {
-            &[]
-        } else {
-            unsafe { std::slice::from_raw_parts(argv, argc as usize) }
-        };
-        return crate::jit::builtins::array::construct(unsafe { &mut *ctx }, args);
-    }
-    if function == NativeFunction::HostSeedRandom {
-        let argument = if argc == 0 {
-            Value::UNDEFINED
-        } else {
-            unsafe { *argv }
-        };
-        if !numeric_operands(ctx, &[argument]) {
-            return Value::UNDEFINED;
-        }
-        let seed = to_int32(primitive_number(ctx, argument)) as u32;
-        unsafe { &*ctx }.engine.seed_random(seed);
-        return Value::UNDEFINED;
-    }
-    if function == NativeFunction::Error {
-        let constructor = unsafe { &*ctx }
-            .global
-            .heap()
-            .native_function(function)
-            .unwrap();
-        let value = js_construct(ctx, constructor, argv, argc);
-        unsafe { &*ctx }.global.heap().release(constructor);
-        return value;
-    }
-    if function == NativeFunction::GeneratorNext {
-        if argc != 0 && unsafe { *argv } != Value::UNDEFINED {
-            unsafe { &mut *ctx }.error = Some(Box::new(crate::Error::Runtime(
-                "generator resume arguments are unsupported".into(),
-            )));
-            return Value::UNDEFINED;
-        }
-        return generator_next(ctx, receiver);
-    }
-    if !matches!(
-        function,
-        NativeFunction::Set
-            | NativeFunction::SetHas
-            | NativeFunction::SetDelete
-            | NativeFunction::SetAdd
-            | NativeFunction::SetClear
-    ) {
-        let args = if argc == 0 {
-            &[]
-        } else {
-            unsafe { std::slice::from_raw_parts(argv, argc as usize) }
-        };
-        return crate::jit::builtins::call(ctx, function, receiver, args);
-    }
-    let ctx = unsafe { &mut *ctx };
-    if function == NativeFunction::Set {
-        ctx.error = Some(Box::new(crate::Error::Runtime("Set requires new".into())));
-        return Value::UNDEFINED;
-    }
-    if ctx.global.heap().set_size(receiver).is_none() {
-        ctx.error = Some(Box::new(crate::Error::Runtime(
-            "Set method requires a Set receiver".into(),
-        )));
-        return Value::UNDEFINED;
-    }
-    let argument = if argc == 0 {
-        Value::UNDEFINED
+    let args = if argc == 0 {
+        &[]
     } else {
-        unsafe { *argv }
+        unsafe { std::slice::from_raw_parts(argv, argc as usize) }
     };
-    match function {
-        NativeFunction::SetHas => {
-            Value::boolean(ctx.global.heap().set_has(receiver, argument).unwrap())
-        }
-        NativeFunction::SetDelete => {
-            Value::boolean(ctx.global.heap().set_delete(receiver, argument).unwrap())
-        }
-        NativeFunction::SetAdd => {
-            if !ctx.global.heap().set_add(receiver, argument) {
-                ctx.error = Some(Box::new(crate::Error::Runtime("invalid Set entry".into())));
-                return Value::UNDEFINED;
-            }
-            ctx.retain(receiver)
-        }
-        NativeFunction::SetClear => {
-            if !ctx.global.heap().set_clear(receiver) {
-                ctx.error = Some(Box::new(crate::Error::Runtime("heap exhausted".into())));
-            }
-            Value::UNDEFINED
-        }
-        _ => unreachable!(),
-    }
+    crate::builtins::call(ctx, function, receiver, args)
 }

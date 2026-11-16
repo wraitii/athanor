@@ -1,6 +1,6 @@
 use super::*;
 
-pub(in crate::jit) fn primitive_number(ctx: *mut JitCtx, value: Value) -> f64 {
+pub(crate) fn primitive_number(ctx: *mut JitCtx, value: Value) -> f64 {
     if value.is_string() {
         let heap = unsafe { &*ctx }.global.heap();
         return heap
@@ -60,7 +60,7 @@ pub(super) fn number_compare(
     ))
 }
 
-pub(in crate::jit) fn to_int32(number: f64) -> i32 {
+pub(crate) fn to_int32(number: f64) -> i32 {
     if !number.is_finite() || number == 0.0 {
         return 0;
     }
@@ -100,7 +100,7 @@ pub(super) fn loose_equals(ctx: *mut JitCtx, left: Value, right: Value) -> bool 
     primitive_number(ctx, left) == primitive_number(ctx, right)
 }
 
-pub(in crate::jit) fn strict_equals(heap: &crate::heap::Heap, left: Value, right: Value) -> bool {
+pub(crate) fn strict_equals(heap: &crate::heap::Heap, left: Value, right: Value) -> bool {
     if left.is_string() && right.is_string() {
         return heap.strings_equal(left, right);
     }
@@ -166,7 +166,7 @@ pub(crate) extern "C" fn js_pow(ctx: *mut JitCtx, left: Value, right: Value) -> 
     number_binary(ctx, left, right, number_pow)
 }
 
-pub(in crate::jit) fn number_pow(base: f64, exponent: f64) -> f64 {
+pub(crate) fn number_pow(base: f64, exponent: f64) -> f64 {
     if exponent.is_nan() || (base.abs() == 1.0 && exponent.is_infinite()) {
         f64::NAN
     } else {

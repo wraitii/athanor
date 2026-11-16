@@ -493,7 +493,7 @@ fn arrays_reject_stale_host_values_before_slot_reuse() {
 }
 
 #[test]
-fn dense_arrays_reject_holes_and_allow_length_shrink() {
+fn arrays_reject_literal_holes_and_allow_sparse_writes() {
     let mut engine = Engine::new().unwrap();
     assert!(
         engine
@@ -505,7 +505,15 @@ fn dense_arrays_reject_holes_and_allow_length_shrink() {
             r#"
         function truncate() { let a = [1, 2, 3]; a.length = 1; return a.length + a[1]; }
         function grow() { let a = [1]; a.length = 3; }
-        function sparse() { let a = [1]; a[3] = 4; }
+        function sparse() {
+            let a = [1];
+            a[3] = {value: 4};
+            let holes = a.length === 4 && !(1 in a) && !(2 in a) && a[1] === undefined;
+            a[1] = {value: 2};
+            a.length = 2;
+            return holes && a.length === 2 && a[1].value === 2 && a[3] === undefined;
+        }
+        function enormous() { let a = []; a[4294967294] = 1; }
     "#,
             "dense.js",
         )
@@ -520,7 +528,8 @@ fn dense_arrays_reject_holes_and_allow_length_shrink() {
             .is_nan()
     );
     assert!(engine.call("grow", &[]).is_err());
-    assert!(engine.call("sparse", &[]).is_err());
+    assert_eq!(engine.call("sparse", &[]).unwrap().value(), Value::TRUE);
+    assert!(engine.call("enormous", &[]).is_err());
 }
 
 #[test]

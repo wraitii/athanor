@@ -1,5 +1,7 @@
 use super::*;
 
+const MAX_ARRAY_LENGTH: usize = (256 << 20) / std::mem::size_of::<Value>();
+
 pub(crate) const HOLE: Value = Value::UNINITIALIZED;
 
 pub(super) struct Array {
@@ -145,6 +147,9 @@ impl Heap {
     }
 
     pub(crate) fn array_of_length(&self, length: usize) -> Option<Value> {
+        if length > MAX_ARRAY_LENGTH {
+            return None;
+        }
         self.drain(64);
         let mut data = self.0.borrow_mut();
         let mut elements = Vec::new();
@@ -245,6 +250,9 @@ impl Heap {
     }
 
     pub(crate) fn set(&self, array: Value, index: usize, value: Value) -> bool {
+        if index >= MAX_ARRAY_LENGTH {
+            return false;
+        }
         let mut data = self.0.borrow_mut();
         let Some(id) = heap_id(array) else {
             return false;
@@ -252,11 +260,27 @@ impl Heap {
         let Some(len) = data.array(id).map(|array| array.elements.len()) else {
             return false;
         };
-        if index > len || !data.retain(value) {
+        if index >= len {
+            let Some(length) = index.checked_add(1) else {
+                return false;
+            };
+            if data
+                .array_mut(id)
+                .unwrap()
+                .elements
+                .try_reserve(length - len)
+                .is_err()
+            {
+                return false;
+            }
+        }
+        if !data.retain(value) {
             return false;
         }
         let array = data.array_mut(id).unwrap();
-        if index == len {
+        if index >= len {
+            array.elements.resize(index, HOLE);
+            array.holes += index - len;
             array.elements.push(value);
         } else {
             let old = std::mem::replace(&mut array.elements[index], value);

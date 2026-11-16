@@ -10,9 +10,9 @@ pub(super) struct StackPack {
 
 // The owning JIT context must stay alive and at the same address until this guard drops.
 // No pool borrow is held across calls: nested invocations check out distinct buffers.
-pub(super) struct OwnedValues<'a> {
+pub(crate) struct OwnedValues<'a> {
     context: *mut JitCtx<'a>,
-    pub(super) values: Vec<Value>,
+    pub(crate) values: Vec<Value>,
 }
 
 impl Drop for OwnedValues<'_> {
@@ -32,7 +32,7 @@ pub(super) unsafe fn initialize(address: Value) {
     }
 }
 
-pub(super) unsafe fn store(ctx: *mut JitCtx, address: Value, values: Vec<Value>) -> Option<Value> {
+pub(crate) unsafe fn store(ctx: *mut JitCtx, address: Value, values: Vec<Value>) -> Option<Value> {
     let heap = unsafe { &*ctx }.global.heap();
     if address == Value::UNDEFINED {
         return heap.array_from_owned(values);
@@ -53,7 +53,7 @@ pub(super) unsafe fn take<'a>(ctx: *mut JitCtx<'a>, pack: Value) -> OwnedValues<
     unsafe { owned(ctx, values) }
 }
 
-pub(super) unsafe fn buffer<'a>(ctx: *mut JitCtx<'a>) -> OwnedValues<'a> {
+pub(crate) unsafe fn buffer<'a>(ctx: *mut JitCtx<'a>) -> OwnedValues<'a> {
     let values = unsafe { &mut *ctx }.pack_buffers.pop().unwrap_or_default();
     unsafe { owned(ctx, values) }
 }

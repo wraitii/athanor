@@ -1,14 +1,14 @@
-use super::super::session::JitCtx;
 use super::{arg, fail};
 use crate::heap::NativeFunction;
+use crate::jit::session::JitCtx;
 use crate::value::Value;
 
 /// Returns an owned reference without registering a temporary.
-pub(in crate::jit) fn split(ctx: *mut JitCtx, receiver: Value, args: &[Value]) -> Value {
+pub(crate) fn split(ctx: *mut JitCtx, receiver: Value, args: &[Value]) -> Value {
     split_result(ctx, receiver, args, Value::UNINITIALIZED)
 }
 
-pub(in crate::jit) fn split_result(
+pub(crate) fn split_result(
     ctx: *mut JitCtx,
     receiver: Value,
     args: &[Value],
@@ -32,7 +32,7 @@ pub(in crate::jit) fn split_result(
     } else {
         return fail(unsafe { &mut *ctx }, "split separator must be a string");
     };
-    let mut values = unsafe { super::super::pack::buffer(ctx) };
+    let mut values = unsafe { crate::jit::pack::buffer(ctx) };
     if heap
         .split_string_into(receiver, separator, &mut values.values)
         .is_none()
@@ -43,14 +43,14 @@ pub(in crate::jit) fn split_result(
     match if destination == Value::UNINITIALIZED {
         heap.array_from_owned(values)
     } else {
-        unsafe { super::super::pack::store(ctx, destination, values) }
+        unsafe { crate::jit::pack::store(ctx, destination, values) }
     } {
         Some(value) => value,
         None => fail(unsafe { &mut *ctx }, "heap exhausted"),
     }
 }
 
-pub(in crate::jit) fn call(
+pub(crate) fn call(
     ctx: *mut JitCtx,
     function: NativeFunction,
     receiver: Value,
@@ -68,6 +68,54 @@ pub(in crate::jit) fn call(
     };
     let string_arg = |value: Value| heap.text(value);
     let result = match function {
+        StringCharAt | StringCharCodeAt => {
+            let value = arg(0);
+            if value.is_object() {
+                return fail(context, "character index object coercion is unsupported");
+            }
+            let index = crate::jit::helpers::primitive_number(ctx, value);
+            let index = if index.is_nan() { 0.0 } else { index.trunc() };
+            let character = if index < 0.0 || !index.is_finite() {
+                None
+            } else {
+                text.chars().nth(index as usize)
+            };
+            if function == StringCharCodeAt {
+                return Value::number(character.map_or(f64::NAN, |c| c as u32 as f64));
+            }
+            character.map(|c| c.to_string()).unwrap_or_default()
+        }
+        StringSubstring | StringSubstr => {
+            let length = text.chars().count();
+            let integer = |value: Value, default: f64| -> Option<f64> {
+                if value.is_undefined() {
+                    return Some(default);
+                }
+                if value.is_object() {
+                    return None;
+                }
+                let n = crate::jit::helpers::primitive_number(ctx, value);
+                Some(if n.is_nan() { 0.0 } else { n.trunc() })
+            };
+            let (Some(start), Some(end)) = (integer(arg(0), 0.0), integer(arg(1), length as f64))
+            else {
+                return fail(context, "string range object coercion is unsupported");
+            };
+            let (start, end) = if function == StringSubstring {
+                let a = start.max(0.0).min(length as f64) as usize;
+                let b = end.max(0.0).min(length as f64) as usize;
+                (a.min(b), a.max(b))
+            } else {
+                let start = if start < 0.0 {
+                    (length as f64 + start).max(0.0)
+                } else {
+                    start.min(length as f64)
+                } as usize;
+                let count = end.max(0.0).min((length - start) as f64) as usize;
+                (start, start + count)
+            };
+            text.chars().skip(start).take(end - start).collect()
+        }
         StringSlice => {
             let chars: Vec<char> = text.chars().collect();
             let convert = |value: Value, default: usize| -> Option<usize> {
@@ -164,5 +212,69 @@ pub(in crate::jit) fn call(
     match heap.string(&result) {
         Some(value) => value,
         None => fail(context, "heap exhausted"),
+    }
+}
+
+pub(super) fn primitive_text(ctx: &mut JitCtx, value: Value) -> Option<String> {
+    let heap = ctx.global.heap();
+    if let Some(text) = heap.text(value).or_else(|| heap.error_text(value)) {
+        return Some(text);
+    }
+    if value.is_object() {
+        fail(ctx, "object-to-primitive conversion is unsupported");
+        return None;
+    }
+    Some(value.to_string())
+}
+
+pub(super) fn convert(
+    ctx: *mut JitCtx,
+    _function: NativeFunction,
+    _receiver: Value,
+    args: &[Value],
+) -> Value {
+    let ctx = unsafe { &mut *ctx };
+    let value = arg(args, 0);
+    if value.is_string() {
+        return ctx.retain(value);
+    }
+    let text = if args.is_empty() {
+        String::new()
+    } else {
+        let Some(text) = primitive_text(ctx, value) else {
+            return Value::UNDEFINED;
+        };
+        text
+    };
+    match ctx.global.heap().string(&text) {
+        Some(value) => value,
+        None => fail(ctx, "heap exhausted"),
+    }
+}
+
+pub(super) fn from_char_code(
+    ctx: *mut JitCtx,
+    _function: NativeFunction,
+    _receiver: Value,
+    args: &[Value],
+) -> Value {
+    let mut units = Vec::with_capacity(args.len());
+    for &value in args {
+        if value.is_object() {
+            return fail(
+                unsafe { &mut *ctx },
+                "character code object coercion is unsupported",
+            );
+        }
+        let n = crate::jit::helpers::primitive_number(ctx, value);
+        units.push(crate::jit::helpers::to_int32(n) as u16);
+    }
+    let ctx = unsafe { &mut *ctx };
+    let Ok(text) = String::from_utf16(&units) else {
+        return fail(ctx, "unpaired surrogate character codes are unsupported");
+    };
+    match ctx.global.heap().string(&text) {
+        Some(value) => value,
+        None => fail(ctx, "heap exhausted"),
     }
 }

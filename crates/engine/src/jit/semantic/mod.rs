@@ -2596,3 +2596,9 @@ impl FunctionState {
 
 #[cfg(test)]
 mod tests;
+
+pub(in crate::jit) fn lower_intrinsics(function: &mut FunctionState) -> crate::Result<()> {
+    js::intrinsics::lower(&mut function.graph).map_err(crate::Error::Unsupported)?;
+    function.invalidate_cfg();
+    Ok(())
+}

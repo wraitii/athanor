@@ -3,7 +3,13 @@ use crate::heap::NativeFunction;
 use crate::jit::session::JitCtx;
 use crate::value::Value;
 
-pub(in crate::jit) fn call(ctx: &mut JitCtx, function: NativeFunction, args: &[Value]) -> Value {
+pub(super) fn call(
+    ctx: *mut JitCtx,
+    function: NativeFunction,
+    _receiver: Value,
+    args: &[Value],
+) -> Value {
+    let ctx = unsafe { &mut *ctx };
     let value = arg(args, 0);
     if function == NativeFunction::ObjectFreeze {
         return ctx.retain(value);

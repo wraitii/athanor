@@ -35,7 +35,7 @@ fn min_max(ctx: &mut JitCtx, function: MathFunction, args: &[Value]) -> Value {
     Value::number(result)
 }
 
-pub(in crate::jit) fn call(ctx: &mut JitCtx, function: MathFunction, args: &[Value]) -> Value {
+pub(crate) fn call(ctx: &mut JitCtx, function: MathFunction, args: &[Value]) -> Value {
     use MathFunction::*;
     if function == Random {
         return Value::number(ctx.engine.random());

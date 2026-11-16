@@ -572,7 +572,7 @@ pub(super) fn property_assumptions(graph: &mut Graph, notes: &mut Vec<String>) {
             let (access, shapes) = accesses.get(&cache)?;
             let fact = match (&graph.insts[*access].op, shapes.as_slice()) {
                 (Op::Get(_, name), []) => {
-                    Some(Fact::Cached(cache, crate::heap::builtin_method(&name)))
+                    Some(Fact::Cached(cache, crate::builtins::builtin_method(&name)))
                 }
                 (Op::Get(..) | Op::Set(..), &[(shape, _)]) => {
                     (!solved.as_ref().is_some_and(|solved| {
