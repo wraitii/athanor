@@ -1489,21 +1489,10 @@ impl Compiler {
     }
 
     pub(crate) fn osr_compilation(&self, site: &super::osr::Site) -> Option<RecompileJob> {
-        let mut job = self.recompilation(site.owner, Entry::generic(0))?;
-        let has_feedback =
-            site.plan.loops[site.candidate]
-                .opportunities
-                .iter()
-                .any(|opportunity| {
-                    let mut location = opportunity.site;
-                    if location.source == 0 {
-                        location.source = job.emission.source_name.0;
-                    }
-                    self.canonical.observed(location, opportunity.kind)
-                });
-        if !has_feedback {
+        if !site.plan.has_new_feedback(site.candidate, &self.canonical) {
             return None;
         }
+        let mut job = self.recompilation(site.owner, Entry::generic(0))?;
         job.label += &format!(".loop{}", site.plan.loops[site.candidate].header);
         job.region = Some(OsrRequest {
             site: site as *const _ as usize,
@@ -1712,6 +1701,7 @@ impl Compiler {
             versioning,
             self.report_regions(),
             osr_source,
+            Some(&self.canonical),
             initial && tier == CompilationTier::Baseline,
             &mut |name, state| passes.observe(name, state),
         )
@@ -2290,6 +2280,7 @@ impl Compiler {
                     },
                     self.report_regions(),
                     (self.osr && self.ssa_opt).then_some(self.source_name.0),
+                    Some(&self.canonical),
                     false,
                     &mut |name, state| passes.observe(name, state),
                 )

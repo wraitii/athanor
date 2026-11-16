@@ -6,9 +6,12 @@ use crate::{FxHashMap, FxHashSet};
 use std::sync::Arc;
 
 use cranelift_codegen::entity::SecondaryMap;
+use cranelift_module::FuncId;
 use oxc_syntax::operator::BinaryOperator;
+use smallvec::SmallVec;
 
-use crate::jit::profile::{Observation, Site};
+use super::specialization::calls::Repository;
+use crate::jit::profile::{Observation, ReadKind, ReadType, Site};
 
 use super::continuation::{Shape, liveness, unbox};
 use super::{
@@ -25,6 +28,8 @@ impl std::fmt::Debug for Plan {
 }
 
 pub(in crate::jit) struct Plan {
+    source: usize,
+    number_first: bool,
     pub(in crate::jit) graph: Graph,
     pub(in crate::jit) loops: Vec<Loop>,
 }
@@ -56,10 +61,73 @@ pub(in crate::jit) struct Opportunity {
     pub(in crate::jit) inst: Inst,
     pub(in crate::jit) site: Site,
     pub(in crate::jit) kind: Observation,
+    feedback: Feedback,
+}
+
+#[derive(Clone)]
+enum Feedback {
+    Call {
+        targets: SmallVec<[FuncId; crate::jit::profile::CALL_TARGET_LIMIT]>,
+        native: Option<crate::heap::NativeFunction>,
+    },
+    Read(ReadKind, Option<ReadType>),
+}
+
+impl Feedback {
+    fn capture(repository: Option<&Repository>, site: Site, kind: Observation) -> Self {
+        match kind {
+            Observation::Call => Self::Call {
+                targets: repository
+                    .and_then(|repository| repository.feedback.get(&site))
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .collect(),
+                native: repository
+                    .and_then(|repository| repository.native_feedback.get(&site))
+                    .copied(),
+            },
+            Observation::Read(kind) => Self::Read(kind, Self::read(repository, site, kind)),
+            Observation::NumberFailure => Self::Read(
+                ReadKind::Number,
+                Self::read(repository, site, ReadKind::Number),
+            ),
+        }
+    }
+
+    fn read(repository: Option<&Repository>, site: Site, kind: ReadKind) -> Option<ReadType> {
+        repository
+            .and_then(|repository| repository.read_feedback.get(&(site, kind)))
+            .copied()
+            .filter(|observed| *observed != ReadType::Unknown)
+    }
+
+    fn changed(&self, repository: &Repository, site: Site) -> bool {
+        match self {
+            Self::Call { targets, native } => {
+                targets.as_slice()
+                    != repository
+                        .feedback
+                        .get(&site)
+                        .map_or(&[][..], Vec::as_slice)
+                    || *native != repository.native_feedback.get(&site).copied()
+            }
+            Self::Read(kind, before) => *before != Self::read(Some(repository), site, *kind),
+        }
+    }
 }
 
 impl Plan {
+    #[cfg(test)]
     pub(super) fn discover(graph: &Graph, source: usize) -> Option<Self> {
+        Self::discover_observed(graph, source, None)
+    }
+
+    pub(super) fn discover_observed(
+        graph: &Graph,
+        source: usize,
+        feedback: Option<&Repository>,
+    ) -> Option<Self> {
         if graph.generator || graph.has_handlers {
             return None;
         }
@@ -76,7 +144,12 @@ impl Plan {
                 if site.source == 0 {
                     site.source = source;
                 }
-                Some(Opportunity { inst, site, kind })
+                Some(Opportunity {
+                    inst,
+                    site,
+                    kind,
+                    feedback: Feedback::capture(feedback, site, kind),
+                })
             })
             .collect();
         if opportunities.is_empty() {
@@ -108,6 +181,7 @@ impl Plan {
                         inst: opportunity.inst,
                         site: opportunity.site,
                         kind: opportunity.kind,
+                        feedback: opportunity.feedback.clone(),
                     })
                     .collect();
                 if opportunities.is_empty() {
@@ -122,9 +196,24 @@ impl Plan {
             })
             .collect();
         (!loops.is_empty()).then(|| Self {
+            source,
+            number_first: feedback
+                .is_some_and(|repository| repository.number_first(source, graph.span.start)),
             graph: graph.clone(),
             loops,
         })
+    }
+
+    pub(in crate::jit) fn has_new_feedback(
+        &self,
+        candidate: usize,
+        repository: &Repository,
+    ) -> bool {
+        self.number_first != repository.number_first(self.source, self.graph.span.start)
+            || self.loops[candidate]
+                .opportunities
+                .iter()
+                .any(|opportunity| opportunity.feedback.changed(repository, opportunity.site))
     }
 
     pub(in crate::jit) fn instrument(self: &Arc<Self>, graph: &mut Graph) -> super::Result<()> {
@@ -478,6 +567,92 @@ mod tests {
     }
 
     #[test]
+    fn feedback_is_relative_to_the_loop_generation() {
+        let graph = graph(
+            "function f(callback,n){let sum=0;for(let i=0;i<n;++i)sum+=callback(i);return sum;}",
+        );
+        let original = Plan::discover(&graph, 7).unwrap();
+        let site = original.loops[0]
+            .opportunities
+            .iter()
+            .find(|opportunity| opportunity.kind == Observation::Call)
+            .unwrap()
+            .site;
+        let mut repository = Repository::default();
+        assert!(!original.has_new_feedback(0, &repository));
+        repository.feedback.insert(site, vec![FuncId::from_u32(1)]);
+        let replacement = Plan::discover_observed(&graph, 7, Some(&repository)).unwrap();
+        assert!(original.has_new_feedback(0, &repository));
+        assert!(!replacement.has_new_feedback(0, &repository));
+        repository
+            .feedback
+            .insert(Site { source: 8, ..site }, vec![FuncId::from_u32(2)]);
+        assert!(!replacement.has_new_feedback(0, &repository));
+        repository
+            .feedback
+            .get_mut(&site)
+            .unwrap()
+            .push(FuncId::from_u32(2));
+        assert!(replacement.has_new_feedback(0, &repository));
+        let replacement = Plan::discover_observed(&graph, 7, Some(&repository)).unwrap();
+        repository
+            .native_feedback
+            .insert(site, crate::heap::NativeFunction::ArrayPush);
+        assert!(replacement.has_new_feedback(0, &repository));
+    }
+
+    #[test]
+    fn numeric_feedback_ignores_first_unknowns_but_keeps_widening() {
+        let graph = graph("function f(xs,n){let sum=0;for(let i=0;i<n;++i)sum+=xs[i];return sum;}");
+        let original = Plan::discover(&graph, 7).unwrap();
+        let site = original.loops[0]
+            .opportunities
+            .iter()
+            .find(|opportunity| opportunity.kind == Observation::Read(ReadKind::Number))
+            .unwrap()
+            .site;
+        let mut repository = Repository::default();
+        repository
+            .read_feedback
+            .insert((site, ReadKind::Number), ReadType::Unknown);
+        assert!(!original.has_new_feedback(0, &repository));
+        repository
+            .read_feedback
+            .insert((site, ReadKind::Number), ReadType::Integer);
+        assert!(original.has_new_feedback(0, &repository));
+        let integer = Plan::discover_observed(&graph, 7, Some(&repository)).unwrap();
+        assert!(!integer.has_new_feedback(0, &repository));
+        repository
+            .read_feedback
+            .insert((site, ReadKind::Number), ReadType::Number);
+        assert!(integer.has_new_feedback(0, &repository));
+        let number = Plan::discover_observed(&graph, 7, Some(&repository)).unwrap();
+        repository
+            .read_feedback
+            .insert((site, ReadKind::Number), ReadType::Unknown);
+        assert!(number.has_new_feedback(0, &repository));
+    }
+
+    #[test]
+    fn numeric_policy_changes_remain_osr_opportunities() {
+        let graph = graph("function f(xs,n){let sum=0;for(let i=0;i<n;++i)sum+=xs[i];return sum;}");
+        let code = FuncId::from_u32(1);
+        let mut repository = Repository::default();
+        repository.insert(
+            7,
+            "f",
+            code,
+            super::super::FunctionState::from_graph(graph.clone()),
+        );
+        let original = Plan::discover_observed(&graph, 7, Some(&repository)).unwrap();
+        assert!(!original.has_new_feedback(0, &repository));
+        repository.number_first.insert(code);
+        assert!(original.has_new_feedback(0, &repository));
+        let replacement = Plan::discover_observed(&graph, 7, Some(&repository)).unwrap();
+        assert!(!replacement.has_new_feedback(0, &repository));
+    }
+
+    #[test]
     fn nested_loops_keep_their_own_transfer_state() {
         let graph = graph(
             "function f(rows,n){let total=0;for(let y=0;y<n;++y){let sum=0;for(let x=0;x<n;++x)sum+=rows[y][x];total+=sum;}return total;}",
@@ -566,7 +741,7 @@ mod tests {
             ),
         );
         let mut function = FunctionState::from_graph(graph);
-        function.instrument_osr(0).unwrap();
+        function.instrument_osr(0, None).unwrap();
         function.lower_typed_storage().unwrap();
         let plan = function.osr.as_ref().unwrap();
         assert!(

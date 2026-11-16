@@ -170,6 +170,7 @@ impl CallProfile {
 
 #[derive(Default)]
 pub(crate) struct Profile {
+    revision: u64,
     calls: FxHashMap<*const CallSite, (Site, CallProfile)>,
     targets: FxHashMap<Site, Vec<u64>>,
     call_versions: FxHashMap<(u64, Site), usize>,
@@ -189,10 +190,15 @@ pub(crate) struct Recompiles {
 }
 
 impl Profile {
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
+    }
+
     pub(crate) fn observe(&mut self, owner: u64, site: Site, target: u64) -> Update {
         let targets = self.targets.entry(site).or_default();
         if targets.len() < CALL_TARGET_LIMIT && !targets.contains(&target) {
             targets.push(target);
+            self.revision += 1;
         }
         let changed =
             self.call_versions.insert((owner, site), targets.len()) != Some(targets.len());
@@ -211,7 +217,10 @@ impl Profile {
         if !self.observed.insert((owner, site)) {
             return false;
         }
-        self.natives.entry(site).or_insert(target);
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.natives.entry(site) {
+            entry.insert(target);
+            self.revision += 1;
+        }
         true
     }
 
@@ -229,7 +238,10 @@ impl Profile {
         if !self.observed_reads.insert((owner, site, kind)) {
             return false;
         }
-        self.reads.entry((site, kind)).or_insert(observed);
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.reads.entry((site, kind)) {
+            entry.insert(observed);
+            self.revision += 1;
+        }
         true
     }
 
@@ -246,6 +258,9 @@ impl Profile {
         let changed = known != Some(ReadType::Unknown) && known != Some(observed);
         if changed {
             self.reads.insert(key, observed);
+        }
+        if changed || policy_changed {
+            self.revision += 1;
         }
         Update {
             changed: changed || policy_changed,
@@ -269,6 +284,7 @@ impl Profile {
         let changed = self.shape_versions.insert((owner, site, property), merged) != Some(merged);
         if known != Some(merged) {
             self.shapes.insert((site, property), merged);
+            self.revision += 1;
         }
         (changed && (known.is_some() || merged != ShapeAccess::Varying)).then_some(merged)
     }

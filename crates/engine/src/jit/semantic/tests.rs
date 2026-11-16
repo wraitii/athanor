@@ -64,6 +64,7 @@ fn baseline_keeps_generic_property_accesses() {
         Versioning::Generic,
         false,
         None,
+        None,
         true,
         &mut |_, _| {},
     )

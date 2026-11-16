@@ -1003,6 +1003,16 @@ fn osr_request_queues_the_enclosing_function_before_return() {
         .osr_read_site(code)
         .unwrap();
     let site = unsafe { &*site };
+    site.entries.set(jit::osr::TICK);
+    assert_eq!(engine.tiering.osr_entry(site), 0);
+    assert!(!site.requested.get());
+    assert_eq!(
+        site.feedback_revision.get(),
+        Some(engine.tiering.profile.borrow().revision())
+    );
+    site.entries.set(jit::osr::TICK * 2);
+    assert_eq!(engine.tiering.osr_entry(site), 0);
+    assert!(!site.requested.get());
     let mut cache = jit::profile::ObservationCache {
         complete: 0,
         last_callee: 0,

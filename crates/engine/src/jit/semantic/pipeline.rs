@@ -106,8 +106,13 @@ impl FunctionState {
         Ok(())
     }
 
-    pub(super) fn instrument_osr(&mut self, source: usize) -> Result<()> {
-        self.osr = osr::Plan::discover(&self.graph, source).map(std::sync::Arc::new);
+    pub(super) fn instrument_osr(
+        &mut self,
+        source: usize,
+        feedback: Option<&calls::Repository>,
+    ) -> Result<()> {
+        self.osr =
+            osr::Plan::discover_observed(&self.graph, source, feedback).map(std::sync::Arc::new);
         if let Some(plan) = self.osr.clone() {
             self.invalidate_cfg();
             plan.instrument(&mut self.graph)?;
@@ -218,7 +223,15 @@ pub(in crate::jit) fn lower_global(
             continuations,
         }
     };
-    specialize_observed(planned, versioning, report_regions, None, false, after)
+    specialize_observed(
+        planned,
+        versioning,
+        report_regions,
+        None,
+        None,
+        false,
+        after,
+    )
 }
 
 pub(in crate::jit) fn build_canonical(
@@ -470,6 +483,7 @@ pub(in crate::jit) fn specialize(
         versioning,
         report_regions,
         osr_source,
+        None,
         false,
         &mut |_, _| {},
     )
@@ -493,16 +507,21 @@ pub(in crate::jit) fn specialize_observed(
     versioning: Versioning,
     report_regions: bool,
     osr_source: Option<usize>,
+    osr_feedback: Option<&calls::Repository>,
     baseline: bool,
     after: &mut dyn FnMut(&str, &FunctionState),
 ) -> Result<FunctionState> {
+    let osr_feedback = match versioning {
+        Versioning::Generic => None,
+        Versioning::Speculate { .. } => osr_feedback,
+    };
     after("inline", &function);
     if !function.optimize {
         function.ensure_facts();
         after("captures", &function);
         after("versioning", &function);
         if let Some(source) = osr_source {
-            function.instrument_osr(source)?;
+            function.instrument_osr(source, osr_feedback)?;
         }
         after("osr", &function);
         return Ok(function);
@@ -591,7 +610,7 @@ pub(in crate::jit) fn specialize_observed(
     function.specialized_regions = Some(regions);
     after("versioning", &function);
     if let Some(source) = osr_source {
-        function.instrument_osr(source)?;
+        function.instrument_osr(source, osr_feedback)?;
     }
     after("osr", &function);
     Ok(function)

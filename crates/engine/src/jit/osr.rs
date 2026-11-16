@@ -10,6 +10,7 @@ pub(crate) struct Site {
     pub(crate) entries: Cell<u64>,
     pub(crate) entry: Cell<usize>,
     pub(crate) requested: Cell<bool>,
+    pub(crate) feedback_revision: Cell<Option<u64>>,
     pub(crate) transfers: Cell<u64>,
 }
 
@@ -34,6 +35,7 @@ impl Site {
             entries: Cell::new(0),
             entry: Cell::new(0),
             requested: Cell::new(false),
+            feedback_revision: Cell::new(None),
             transfers: Cell::new(0),
         }
     }

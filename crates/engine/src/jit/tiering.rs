@@ -643,6 +643,10 @@ impl Tiering {
         if site.requested.get() {
             return 0;
         }
+        let revision = self.profile.borrow().revision();
+        if site.feedback_revision.replace(Some(revision)) == Some(revision) {
+            return 0;
+        }
         let job = {
             let mut compiler = self.compiler.borrow_mut();
             compiler.update_feedback(&self.profile.borrow());
