@@ -828,6 +828,7 @@ fn result_types(graph: &Graph, op: &Op, facts: &Facts) -> ValueType {
             Constant::String(_) => ValueType::STRING,
             Constant::Uninitialized => ValueType::UNINITIALIZED,
         },
+        Op::ArgumentCount => ValueType::INTEGER,
         Op::NewObject
         | Op::NewInstance(_)
         | Op::ConstructorResult(..)

@@ -364,6 +364,7 @@ pub(super) enum Op {
     Argument(usize),
     Restored(usize),
     Arguments,
+    ArgumentCount,
     Rest(usize),
     This,
     Callee,
@@ -416,6 +417,8 @@ pub(super) enum Op {
     PackRelease(Value),
     PackAppend(Value, Value, bool),
     CallPack(Value, Value, Value),
+    // Borrows the current frame's original arguments, which inlining substitutes.
+    CallForward(Value, Value),
     ConstructPack(Value, Value),
     // UNINITIALIZED leaves native constructors and lazy prototypes to generic construction.
     ConstructorPrototype(Value),
@@ -759,6 +762,7 @@ impl Op {
             | Op::Argument(_)
             | Op::Restored(_)
             | Op::Arguments
+            | Op::ArgumentCount
             | Op::Rest(_)
             | Op::This
             | Op::Callee
@@ -889,6 +893,7 @@ impl Op {
             | Op::ArrayAppend(object, key, _)
             | Op::ConstructorResult(object, key)
             | Op::ConstructPack(object, key) => ([Some(*object), Some(*key), None], &[]),
+            Op::CallForward(callee, receiver) => ([Some(*callee), Some(*receiver), None], &[]),
             Op::IntegerCheck(object, key, position)
             | Op::IsArrayIndex(object, key, position, _) => {
                 ([Some(*object), Some(*key), Some(*position)], &[])
@@ -1004,6 +1009,7 @@ impl Op {
             | Op::Argument(_)
             | Op::Restored(_)
             | Op::Arguments
+            | Op::ArgumentCount
             | Op::Rest(_)
             | Op::This
             | Op::Callee
@@ -1134,6 +1140,7 @@ impl Op {
             | Op::ArrayAppend(object, key, _)
             | Op::ConstructorResult(object, key)
             | Op::ConstructPack(object, key) => ([Some(object), Some(key), None], &mut []),
+            Op::CallForward(callee, receiver) => ([Some(callee), Some(receiver), None], &mut []),
             Op::IntegerCheck(object, key, position)
             | Op::IsArrayIndex(object, key, position, _) => {
                 ([Some(object), Some(key), Some(position)], &mut [])
@@ -1590,7 +1597,9 @@ impl Graph {
         self.insts
             .values()
             .filter_map(|data| match data.op {
-                Op::Call { callee, .. } | Op::CallPack(callee, ..) => Some(callee),
+                Op::Call { callee, .. } | Op::CallPack(callee, ..) | Op::CallForward(callee, _) => {
+                    Some(callee)
+                }
                 _ => None,
             })
             .collect()
@@ -1976,6 +1985,7 @@ impl Graph {
             Op::Rest(_) | Op::Arguments => closed(ALLOCATION | INTERNAL | ERROR, Owned),
             Op::Throw(_) => closed(INTERNAL | ERROR, None),
             Op::Catch => closed(INTERNAL, Owned),
+            Op::ArgumentCount => closed(0, Unowned),
             Op::Argument(_) | Op::Restored(_) | Op::This | Op::Callee => closed(0, Borrowed),
             Op::ClosureThis(_) => closed(HEAP_READ, Borrowed),
             Op::NewHoleyArray(_) => closed(ALLOCATION | INTERNAL | ERROR, Owned),
@@ -2126,6 +2136,7 @@ impl Graph {
             Op::Call { .. }
             | Op::Construct { .. }
             | Op::CallPack(..)
+            | Op::CallForward(..)
             | Op::ConstructPack(..)
             | Op::ConstructorCall { .. }
             | Op::ConstructorCallPack(..)

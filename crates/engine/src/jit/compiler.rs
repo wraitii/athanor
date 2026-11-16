@@ -1659,6 +1659,8 @@ impl Compiler {
             .listing()
             .then(|| jitdump::Listing::new(graph.listing_lines()));
         let mut feedback = self.feedback(code, region.is_none());
+        // Observer placement belongs before OSR extraction; replanning can introduce
+        // sites incompatible with the enclosing function's feedback.
         feedback.observations = region.is_none();
         let continuations = self.compile_continuations(
             &graph.graph,

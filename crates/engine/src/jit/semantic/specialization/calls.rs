@@ -806,7 +806,7 @@ pub(in crate::jit) struct Inline {
     pub(in crate::jit::semantic) source_name: Option<(usize, usize)>,
 }
 
-fn eligible(graph: &Graph, body_limit: usize) -> bool {
+fn eligible(graph: &Graph, body_limit: usize, spread: bool) -> bool {
     if graph.generator || graph.has_handlers {
         return false;
     }
@@ -821,10 +821,12 @@ fn eligible(graph: &Graph, body_limit: usize) -> bool {
         for &inst in &graph.blocks[block].insts {
             count += 1;
             if count > body_limit
-                || matches!(
-                    graph.insts[inst].op,
-                    Op::Arguments | Op::Rest(_) | Op::Catch
-                )
+                || spread
+                    && matches!(
+                        graph.insts[inst].op,
+                        Op::Arguments | Op::ArgumentCount | Op::CallForward(..)
+                    )
+                || matches!(graph.insts[inst].op, Op::Rest(_) | Op::Catch)
             {
                 return false;
             }
@@ -924,10 +926,16 @@ pub(in crate::jit::semantic) fn requests(
             let Some(target) = call_target(graph, bodies, source, call, *callee) else {
                 continue;
             };
-            if bodies
-                .body(target)
-                .is_some_and(|body| eligible(body, budget.body_limit))
-            {
+            if bodies.body(target).is_some_and(|body| {
+                eligible(
+                    body,
+                    budget.body_limit,
+                    matches!(
+                        graph.insts[call].op,
+                        Op::CallPack(..) | Op::ConstructorCallPack(..)
+                    ),
+                )
+            }) {
                 requests.push(Request { call, target });
             }
         }
@@ -954,10 +962,16 @@ pub(in crate::jit::semantic) fn plan_round(
 ) -> Plan {
     let mut inlines = Vec::new();
     for request in requests {
-        let Some(body) = bodies
-            .body(request.target)
-            .filter(|body| eligible(body, budget.body_limit))
-        else {
+        let Some(body) = bodies.body(request.target).filter(|body| {
+            eligible(
+                body,
+                budget.body_limit,
+                matches!(
+                    graph.insts[request.call].op,
+                    Op::CallPack(..) | Op::ConstructorCallPack(..)
+                ),
+            )
+        }) else {
             continue;
         };
         let callee = match &graph.insts[request.call].op {

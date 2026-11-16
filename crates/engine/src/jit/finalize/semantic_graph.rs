@@ -617,6 +617,19 @@ impl FunctionCompiler<'_, '_> {
                                 self.check_error();
                                 Some(value)
                             }
+                            Op::CallForward(callee, receiver) => {
+                                let callee = get(self, *callee);
+                                let receiver = get(self, *receiver);
+                                let (argv, argc) = self.argument_vector()?;
+                                let value =
+                                    self.call_helper(Helper::Call, &[callee, receiver, argv, argc]);
+                                self.check_error();
+                                Some(value)
+                            }
+                            Op::ArgumentCount => {
+                                let (_, argc) = self.argument_vector()?;
+                                Some(self.b.ins().fcvt_from_uint(types::F64, argc))
+                            }
                             Op::Rest(index) => {
                                 let index = self.b.ins().iconst(types::I64, *index as i64);
                                 let (argv, argc) = self.argument_vector()?;

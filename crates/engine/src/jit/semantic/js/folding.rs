@@ -28,6 +28,14 @@ impl Folder for Rules {
         let data = &graph.insts[inst];
         let boolean = |value| Some(Fold::Op(Op::Constant(Constant::Boolean(value))));
         match data.op {
+            Op::IsOrdinaryArray(value)
+                if matches!(
+                    graph.defining_op(value),
+                    Some(Op::Arguments | Op::NewArray(_) | Op::NewHoleyArray(_))
+                ) =>
+            {
+                boolean(true)
+            }
             Op::GuardedCompare {
                 operator,
                 left,

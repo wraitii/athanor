@@ -206,6 +206,8 @@ impl Graph {
             Op::Argument(index) => format!("argument {index}"),
             Op::Restored(index) => format!("restored {index}"),
             Op::Arguments => "arguments".into(),
+            Op::ArgumentCount => "argument_count".into(),
+            Op::CallForward(callee, receiver) => format!("call_forward {callee}, this={receiver}"),
             Op::Constant(Constant::Undefined) => "undefined".into(),
             Op::Constant(Constant::Null) => "null".into(),
             Op::Rest(index) => format!("rest {index}"),

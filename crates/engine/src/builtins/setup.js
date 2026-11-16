@@ -28,6 +28,13 @@
      * @returns {*}
      */
     $defineHidden(Function.prototype, "apply", function(thisArg, arrayLike) {
+        if ($isOrdinaryArray(arrayLike)) {
+            if (typeof this !== "function")
+                throw new Error("apply requires a callable receiver");
+            if (arrayLike.length > 1048576)
+                throw new Error("apply argument list exceeds the engine limit");
+            return $callSpread(this, thisArg, arrayLike);
+        }
         return $callSpread(this, thisArg, argumentList(this, arrayLike));
     });
 })();

@@ -103,6 +103,7 @@ pub(in crate::jit::semantic) fn plan(
                     ..
                 }
                 | Op::CallPack(callee, ..)
+                | Op::CallForward(callee, _)
                 | Op::Construct { callee, .. }
                 | Op::ConstructorCall { callee, .. } => {
                     before = Some((callee, Observation::Call));

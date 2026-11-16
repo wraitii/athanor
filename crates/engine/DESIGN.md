@@ -109,12 +109,17 @@ Adding dedicated IR operations is not a prerequisite for extending the library.
 `builtins/setup.js` installs JS library functions using the normal closure and
 compilation machinery. Only this trusted setup enables private intrinsics:
 `$call` and `$callSpread` lower to ordinary call operations with explicit
-receivers, and `$defineHidden` installs a non-enumerable property. Their lowering
+receivers, `$defineHidden` installs a non-enumerable property, and
+`$isOrdinaryArray` checks for an ordinary array. Their lowering
 is required even without optimizations, and the names are not runtime globals.
 Packed calls expose their targets to profiling and guarded inlining. A facility
 for registering handwritten IR bodies is not implemented.
 
-`Function.prototype.apply` is a JS wrapper and argument-list helper. Closures and
+`Function.prototype.apply` is a JS wrapper and argument-list helper. Its ordinary
+array path avoids an intermediate JS array. Argument lowering forwards fresh,
+unmodified argument arrays directly and sinks materialization to an exclusive
+fallback when needed. Fixed-argument calls can inline functions using `arguments`,
+substituting a snapshot of the actual caller arguments. Closures and
 native callables resolve inherited methods through the shared function prototype;
 own closure properties take precedence. `apply` accepts array-like objects and
 limits argument lists to 1,048,576 entries. Dynamic `Function` construction and

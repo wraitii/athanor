@@ -46,7 +46,8 @@ pub(in crate::jit::semantic) fn lower(graph: &mut Graph) -> Result<()> {
                     );
                     Op::CallPack(callee, receiver, pack.unwrap())
                 }
-                "$call" | "$callSpread" | "$defineHidden" => {
+                "$isOrdinaryArray" if args.len() == 1 => Op::IsOrdinaryArray(args[0]),
+                "$call" | "$callSpread" | "$defineHidden" | "$isOrdinaryArray" => {
                     return Err("invalid library intrinsic arguments".into());
                 }
                 _ => continue,
@@ -55,7 +56,7 @@ pub(in crate::jit::semantic) fn lower(graph: &mut Graph) -> Result<()> {
         }
     }
     for (_, data) in graph.insts.iter_mut() {
-        if matches!(&data.op, Op::GlobalRead(name) if name == "$call" || name == "$callSpread" || name == "$defineHidden")
+        if matches!(&data.op, Op::GlobalRead(name) if name == "$call" || name == "$callSpread" || name == "$defineHidden" || name == "$isOrdinaryArray")
         {
             data.op = Op::Constant(Constant::Undefined);
         }

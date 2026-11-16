@@ -352,7 +352,7 @@ fn ineligible_feedback_keeps_the_existing_entry() {
     let mut engine = new_engine().unwrap();
     engine
         .compile(
-            "function run(x){return arguments[0];}function invoke(x){return run(x);}",
+            "function run(...values){return values[0];}function invoke(x){return run(x);}",
             "ineligible.js",
         )
         .unwrap();
@@ -374,7 +374,7 @@ fn ineligible_feedback_keeps_the_existing_entry() {
 fn ineligible_method_feedback_keeps_the_existing_entry() {
     let mut engine = new_engine().unwrap();
     engine.compile(
-        "var object={run:function(x){return arguments[0];}};function invoke(x){return object.run(x);}",
+        "var object={run:function(...values){return values[0];}};function invoke(x){return object.run(x);}",
         "ineligible_method.js",
     ).unwrap();
     let code = code(&engine, "invoke");

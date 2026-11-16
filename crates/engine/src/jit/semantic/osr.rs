@@ -381,6 +381,8 @@ fn transfer(
                 | Op::EnterCaptures(..)
                 | Op::Callee
                 | Op::Arguments
+                | Op::CallForward(..)
+                | Op::ArgumentCount
                 | Op::Rest(_) => {
                     return Err(format!(
                         "requires non-SSA frame state: {}",

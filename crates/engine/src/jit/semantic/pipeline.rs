@@ -310,6 +310,7 @@ struct Expansions {
 
 impl Expansions {
     fn calls(&mut self, graph: &mut Graph, source: usize, notes: &mut Vec<String>) -> Result<()> {
+        js::arguments::lower(graph);
         arrays::expand(graph, source, notes, &mut self.arrays)?;
         string_split::expand(graph, &mut self.splits);
         Ok(())

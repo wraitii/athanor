@@ -1,3 +1,4 @@
+pub(in crate::jit::semantic) mod arguments;
 pub(in crate::jit::semantic) mod arrays;
 mod bit_tests;
 pub(in crate::jit::semantic) mod captures;

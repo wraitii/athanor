@@ -93,6 +93,8 @@ fn extract(graph: &Graph, target: Target, facts: &Facts) -> super::Result<(Graph
                 | Op::Callee
                 | Op::EnterCaptures(..)
                 | Op::Arguments
+                | Op::CallForward(..)
+                | Op::ArgumentCount
                 | Op::Rest(_)
                 | Op::OsrStart(..)
                 | Op::BindingLoad(..)

@@ -205,6 +205,23 @@ pub(in crate::jit::semantic) fn apply(graph: &mut Graph, body: &Graph, plan: &In
                 values.insert(data.result().unwrap(), receiver);
                 continue;
             }
+            if matches!(data.op, Op::Arguments) {
+                let (copy, value) =
+                    graph.append(blocks[&block], data.span, Op::NewArray(args.to_vec()), true);
+                graph.insts[copy].source_name = data.source_name.or(plan.source_name);
+                let value = value.unwrap();
+                values.insert(data.result().unwrap(), value);
+                continue;
+            }
+            if matches!(data.op, Op::ArgumentCount) {
+                let value = graph.append_value(
+                    current,
+                    call.span,
+                    Op::Constant(Constant::Number(args.len() as f64)),
+                );
+                values.insert(data.result().unwrap(), value);
+                continue;
+            }
             let mut op = data.op.clone();
             match &mut op {
                 Op::LowLevel(super::super::low_level::Op::StackAddress { slot, .. }) => {
@@ -260,6 +277,17 @@ pub(in crate::jit::semantic) fn apply(graph: &mut Graph, body: &Graph, plan: &In
         }
         for value in graph.insts[inst].op.operands_mut() {
             *value = values[value];
+        }
+        if let Op::CallForward(callee, receiver) = graph.insts[inst].op {
+            graph.set_op(
+                inst,
+                Op::Call {
+                    callee,
+                    receiver: Some(receiver),
+                    args: args.to_vec(),
+                    target: None,
+                },
+            );
         }
     }
     for inst in lexical_closures {
