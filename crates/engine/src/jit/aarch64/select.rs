@@ -412,9 +412,8 @@ fn float_conds(cond: FloatCC) -> (Cond, Option<Cond>) {
 
 pub(in crate::jit) fn run(graph: &mut Graph) -> Result<(), Unsupported> {
     graph.verify_machine().map_err(Unsupported)?;
-    let cfg = crate::jit::semantic::Cfg::new(graph);
-    check_function(graph, &cfg.rpo)?;
-    let order = cfg.rpo;
+    let order = crate::jit::semantic::Cfg::reverse_postorder(graph);
+    check_function(graph, &order)?;
     let patterns = Patterns::new(graph);
     let mut replacements = Vec::new();
     let mut branches = Vec::new();
