@@ -842,6 +842,57 @@ mod cache_tests {
     }
 
     #[test]
+    fn function_prototype_reads_cache_and_follow_mutations() {
+        let engine = engine(
+            "function f(){} function g(){} var plain={};
+            function replace(){Function.prototype.apply=8;}
+            function grow(){Function.prototype.extra=1;}
+            function shadow(){f.apply=9;}",
+        );
+        let f = engine.global().get_raw("f").unwrap();
+        let g = engine.global().get_raw("g").unwrap();
+        let plain = engine.global().get_raw("plain").unwrap();
+        let heap = engine.global().heap();
+        let mut cache = PropertyCache::new("apply", None, false);
+        let method = heap.property(f, "apply").unwrap();
+        assert_eq!(cache.fill(&engine, heap, f), Some(method));
+        assert_eq!(cache.lookup(heap, g), Some(method));
+        assert_eq!(cache.lookup(heap, plain), None);
+        engine.call("replace", &[]).unwrap();
+        assert_eq!(cache.lookup(heap, f), Some(Value::number(8.0)));
+        engine.call("grow", &[]).unwrap();
+        assert_eq!(cache.lookup(heap, f), None);
+        assert_eq!(cache.fill(&engine, heap, f), Some(Value::number(8.0)));
+        engine.call("shadow", &[]).unwrap();
+        assert_eq!(cache.lookup(heap, f), None);
+        assert_eq!(cache.lookup(heap, g), Some(Value::number(8.0)));
+        assert_eq!(cache.fill(&engine, heap, f), Some(Value::number(9.0)));
+        assert_eq!(cache.megamorphic, 0);
+    }
+
+    #[test]
+    fn function_prototype_cache_preserves_lazy_constructor_prototypes() {
+        let engine = engine(
+            "Function.prototype.prototype=123; function f(){}
+            function C(){} C.prototype=Function.prototype; var inherited=new C();",
+        );
+        let heap = engine.global().heap();
+        let f = engine.global().get_raw("f").unwrap();
+        let inherited = engine.global().get_raw("inherited").unwrap();
+        let mut cache = PropertyCache::new("prototype", None, false);
+        assert_eq!(
+            cache.fill(&engine, heap, inherited),
+            Some(Value::number(123.0))
+        );
+        assert_eq!(cache.lookup(heap, f), None);
+        assert_eq!(cache.fill(&engine, heap, f), None);
+        let prototype = heap.property(f, "prototype").unwrap();
+        assert!(prototype.is_object());
+        assert_eq!(cache.fill(&engine, heap, f), Some(prototype));
+        assert_eq!(cache.lookup(heap, f), Some(prototype));
+    }
+
+    #[test]
     fn builtin_cache_hits_require_the_receiver_kind() {
         let engine = engine("var a=[1]; var b=[2]; var s='text'; var o={slice:7};");
         let heap = engine.global().heap();

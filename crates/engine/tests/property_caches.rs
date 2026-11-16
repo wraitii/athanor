@@ -113,6 +113,56 @@ fn closures_and_primitives_share_sites() {
 }
 
 #[test]
+fn inherited_function_properties_follow_mutations() {
+    check(
+        "Function.prototype.token=1;
+        function f(){} function g(){}
+        function C(){} C.prototype=Function.prototype;
+        const inherited=new C();
+        function read(o){return o.token;}
+        function main(){
+            let sum=0;
+            for(let i=0;i<64;i++) sum+=read(f)+read(g)+read(inherited);
+            Function.prototype.token=10;
+            sum+=read(f)+read(g)+read(inherited);
+            f.token=100;
+            sum+=read(f)+read(g)+read(inherited);
+            Function.prototype.extra=0;
+            return sum+read(f)+read(g)+read(inherited)+read({token:1000});
+        }",
+        1462.0,
+    );
+}
+
+#[test]
+fn inherited_function_prototypes_preserve_lazy_constructor_prototypes() {
+    check(
+        "Function.prototype.prototype=123;
+        const arrow=()=>0;
+        class C{method(){}}
+        const method=(new C()).method;
+        function f(){} function g(){}
+        function read(o){return o.prototype;}
+        function main(){
+            const functions=[arrow,f,method,g];
+            let sum=0;
+            for(let i=0;i<functions.length;i++){
+                const prototype=read(functions[i]);
+                if(i%2===0){
+                    if(prototype!==123) return -1;
+                } else {
+                    if(typeof prototype!=='object') return -2;
+                    if(prototype!==read(functions[i])) return -3;
+                }
+                sum++;
+            }
+            return sum;
+        }",
+        4.0,
+    );
+}
+
+#[test]
 fn reused_slots_and_retained_values_stay_valid() {
     check(
         "function read(o) { return o.x; }

@@ -48,6 +48,10 @@ pub(super) struct Shape {
 }
 
 impl Shape {
+    pub(super) fn has_prototype(&self, prototype: Value) -> bool {
+        self.prototype == prototype.bits()
+    }
+
     pub(super) fn keys(&self) -> &[Key] {
         &self.keys
     }
@@ -78,7 +82,7 @@ impl Shape {
 
 pub(super) struct Shapes {
     shapes: Vec<Shape>,
-    roots: FxHashMap<u64, ShapeId>,
+    roots: FxHashMap<(u64, bool), ShapeId>,
     transitions: FxHashMap<(ShapeId, Key), ShapeId>,
 }
 
@@ -99,12 +103,22 @@ impl Shapes {
 
     // Roots are keyed by prototype address; a reused address describes its new occupant.
     pub(super) fn root(&mut self, prototype: Option<Value>) -> ShapeId {
+        self.root_for(prototype, false)
+    }
+
+    pub(super) fn closure_root(&mut self, prototype: Option<Value>) -> ShapeId {
+        // Closure roots stay distinct because their constructor prototype is lazy.
+        self.root_for(prototype, true)
+    }
+
+    fn root_for(&mut self, prototype: Option<Value>, closure: bool) -> ShapeId {
         let prototype = prototype.map_or(0, Value::bits);
-        if let Some(&shape) = self.roots.get(&prototype) {
+        let key = (prototype, closure);
+        if let Some(&shape) = self.roots.get(&key) {
             return shape;
         }
         let shape = self.push(Shape::with(prototype, Vec::new()));
-        self.roots.insert(prototype, shape);
+        self.roots.insert(key, shape);
         shape
     }
 

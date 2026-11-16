@@ -441,8 +441,11 @@ impl HeapData {
     }
 
     fn store_shaped(&mut self, id: u64, payload: Payload) {
+        let root = match &payload {
+            Payload::Closure(_) => self.shapes.closure_root(self.function_prototype),
+            _ => self.shapes.root(None),
+        };
         self.store(id, payload);
-        let root = self.shapes.root(None);
         self.slot_mut(id).shape = root;
     }
 

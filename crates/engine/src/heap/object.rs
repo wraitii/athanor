@@ -82,7 +82,20 @@ impl Heap {
         let (holder, holder_shape, index) = if let Some(index) = data.shapes.get(shape).slot(atom) {
             (0, shape, index)
         } else {
-            let holder = heap_id(data.object(id)?.prototype?)?;
+            let prototype = if data.closure(id).is_some() {
+                // Closures share shapes even when only some have a lazy own prototype.
+                if name == "prototype" {
+                    return None;
+                }
+                let prototype = data.function_prototype?;
+                if !data.shapes.get(shape).has_prototype(prototype) {
+                    return None;
+                }
+                prototype
+            } else {
+                data.object(id)?.prototype?
+            };
+            let holder = heap_id(prototype)?;
             let holder_shape = data.cacheable_shape(holder)?;
             let index = data.shapes.get(holder_shape).slot(atom)?;
             (holder, holder_shape, index)
