@@ -105,6 +105,7 @@ impl Access {
             Op::EntryAssume(object, super::guards::Fact::Shape(_))
             | Op::IsShape(object, _)
             | Op::IsPropertyCached(object, ..) => (Locations::CODE, Some(*object)),
+            Op::CellGet(cell) => (Locations::HEAP, Some(*cell)),
             Op::GlobalRead(_) => (Locations::GLOBAL, None),
             _ => return None,
         };

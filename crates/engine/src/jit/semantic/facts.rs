@@ -911,6 +911,7 @@ fn result_types(graph: &Graph, op: &Op, facts: &Facts) -> ValueType {
         Op::TypedIndex(..) => ValueType::NUMBER.union(ValueType::UNDEFINED),
         Op::IsTyped(..)
         | Op::IsIndexed(_)
+        | Op::IsOrdinaryArray(_)
         | Op::IsArrayIndex(..)
         | Op::IsArray(..)
         | Op::IsExactPosition(..)

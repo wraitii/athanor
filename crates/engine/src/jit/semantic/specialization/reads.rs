@@ -1,8 +1,8 @@
 use crate::jit::profile::{ReadKind, ReadType, Site};
 
 use super::super::{
-    BlockData, Cfg, Facts, Graph, Inst, Op, Target, Terminator, TerminatorKind, TypedRead,
-    ValueDef, ValueType,
+    BlockData, Cfg, Constant, Facts, Graph, Inst, Op, Target, Terminator, TerminatorKind,
+    TypedRead, ValueDef, ValueType,
 };
 
 #[derive(Clone, PartialEq, Eq)]
@@ -111,7 +111,7 @@ pub(in crate::jit::semantic) fn assume(graph: &mut Graph, reads: &[Read]) {
         let receiver = if read.typed {
             Fact::Typed(read.element)
         } else {
-            Fact::Indexed
+            Fact::Array
         };
         graph.insert(
             data.block,
@@ -186,17 +186,30 @@ pub(in crate::jit::semantic) fn lower(
         .iter()
         .filter(|block| !graph.cold.contains(block))
         .flat_map(|&block| graph.blocks[block].insts.iter().copied())
-        .filter(|&inst| {
-            matches!(graph.insts[inst].op, Op::ArrayGet(_, key)
-            if facts.of(key).within(ValueType::NUMBER))
+        .filter_map(|inst| {
+            let Op::ArrayGet(object, key) = graph.insts[inst].op else {
+                return None;
+            };
+            facts.of(key).within(ValueType::NUMBER).then(|| {
+                let array = super::super::guards::holds(
+                    graph,
+                    &facts.cfg,
+                    graph.insts[inst].block,
+                    object,
+                    super::super::guards::Fact::Array,
+                );
+                (inst, array)
+            })
         })
         .collect();
-    for inst in arrays {
-        lower_array(graph, inst, false);
-        notes.push(format!(
-            "read at {}: packed/holey array checks",
-            graph.note_inst(inst)
-        ));
+    for (inst, array) in arrays {
+        lower_array(graph, inst, false, array);
+        let checks = if array {
+            "known array bounds check"
+        } else {
+            "packed/holey array checks"
+        };
+        notes.push(format!("read at {}: {checks}", graph.note_inst(inst)));
     }
     graph.verify()
 }
@@ -217,18 +230,18 @@ pub(in crate::jit::semantic) fn apply(
         let cfg = Cfg::new(graph);
         let facts = Facts::compute(graph);
         let block = data.block;
-        // A guarded indexed receiver owns the result even when the index needs a slow path.
         if !read.typed
             && super::super::guards::holds(
                 graph,
                 &cfg,
                 block,
                 object,
-                super::super::guards::Fact::Indexed,
+                super::super::guards::Fact::Array,
             )
             && facts.of(key).within(ValueType::NUMBER)
         {
             graph.set_op(read.inst, Op::ArrayGet(object, key));
+            continue;
         }
         if read.typed
             && super::super::guards::holds(
@@ -254,7 +267,7 @@ pub(in crate::jit::semantic) fn apply(
             continue;
         }
         if !read.typed {
-            lower_array(graph, read.inst, read.guard_number);
+            lower_array(graph, read.inst, read.guard_number, false);
             notes.push(format!("read at {site}: packed/holey array checks"));
             continue;
         }
@@ -311,7 +324,7 @@ pub(in crate::jit::semantic) fn apply(
     graph.verify()
 }
 
-fn lower_array(graph: &mut Graph, inst: Inst, guard_number: bool) {
+fn lower_array(graph: &mut Graph, inst: Inst, guard_number: bool, array: bool) {
     let data = graph.insts[inst].clone();
     let (object, key) = match data.op {
         Op::GetIndex(object, key) | Op::ArrayGet(object, key) => (object, key),
@@ -341,6 +354,56 @@ fn lower_array(graph: &mut Graph, inst: Inst, guard_number: bool) {
         (block, key)
     };
     let position = graph.append_value(fast, data.span, Op::ArrayPosition(key));
+    if array {
+        let load = graph.blocks.push(BlockData::default());
+        let outside = graph.blocks.push(BlockData::default());
+        let absent = graph.blocks.push(BlockData::default());
+        let exact = graph.append_value(fast, data.span, Op::IsExactPosition(key, position));
+        let length = graph.append_value(fast, data.span, Op::IndexedLength(object));
+        let inside = graph.append_value(fast, data.span, Op::IsInBounds(position, length));
+        let valid = graph.append_value(fast, data.span, Op::BooleanAnd(exact, inside));
+        terminate(
+            graph,
+            fast,
+            TerminatorKind::Branch(valid, Target::new(load), Target::new(outside)),
+        );
+        let value = graph.append_value(
+            load,
+            data.span,
+            Op::ArrayLoad(object, position, super::super::ArrayLayout::Holey),
+        );
+        terminate(
+            graph,
+            load,
+            TerminatorKind::Jump(Target {
+                block: continuation,
+                args: vec![value],
+            }),
+        );
+        let limit = graph.append_value(
+            outside,
+            data.span,
+            Op::Constant(Constant::Number(u32::MAX as f64)),
+        );
+        let canonical = graph.append_value(outside, data.span, Op::IsInBounds(position, limit));
+        let canonical = graph.append_value(outside, data.span, Op::BooleanAnd(exact, canonical));
+        terminate(
+            graph,
+            outside,
+            TerminatorKind::Branch(canonical, Target::new(absent), Target::new(fallback)),
+        );
+        let undefined = graph.append_value(absent, data.span, Op::Constant(Constant::Undefined));
+        terminate(
+            graph,
+            absent,
+            TerminatorKind::Jump(Target {
+                block: continuation,
+                args: vec![undefined],
+            }),
+        );
+        extend_regions(graph, data.block, first_block);
+        return;
+    }
     let mut guard = fast;
     for layout in [
         super::super::ArrayLayout::Packed,

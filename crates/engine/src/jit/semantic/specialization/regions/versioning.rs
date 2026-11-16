@@ -382,7 +382,7 @@ fn entry_checks(
     for &(value, fact) in assumes {
         let checked = values.get(&value).copied().unwrap_or(value);
         let test = match fact {
-            Fact::Indexed => Op::IsIndexed(checked),
+            Fact::Array => Op::IsOrdinaryArray(checked),
             Fact::Shape(shape) => Op::IsShape(checked, shape),
             Fact::Cached(cache, builtins) => Op::IsPropertyCached(
                 checked,

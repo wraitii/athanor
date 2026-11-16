@@ -289,6 +289,7 @@ impl Graph {
             Op::IteratorNext(value) => format!("iterator_next {value}"),
             Op::BooleanAnd(left, right) => format!("boolean_and {left}, {right}"),
             Op::IsIndexed(value) => format!("is_indexed {value}"),
+            Op::IsOrdinaryArray(value) => format!("is_array {value}"),
             Op::IsExactPosition(key, position) => format!("is_exact_position {key}, {position}"),
             Op::IsInBounds(position, length) => format!("is_in_bounds {position}, {length}"),
             Op::ArrayPosition(key) => format!("array_position {key}"),

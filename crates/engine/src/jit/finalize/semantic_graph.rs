@@ -497,6 +497,7 @@ impl FunctionCompiler<'_, '_> {
                             | Op::IsTyped(..)
                             | Op::IsString(..)
                             | Op::IsIndexed(..)
+                            | Op::IsOrdinaryArray(..)
                             | Op::CellNew(..)
                             | Op::CellGet(..)
                             | Op::CellSet(..)

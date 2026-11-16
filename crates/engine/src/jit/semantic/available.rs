@@ -20,6 +20,7 @@ pub(super) enum LoadKey {
     ArrayKind(Value),
     Array(Value, super::ArrayLayout),
     Constructor(Value),
+    Cell(Value),
     Property(Value, String),
     Index(Value, Value),
     Global(String),
@@ -65,6 +66,7 @@ fn load_key(op: &Op, probes: bool, aliases: &FxHashMap<Value, Value>) -> Option<
         | Op::ArrayGet(object, key)
         | Op::ArrayLoad(object, key, _) => LoadKey::Index(at(object), at(key)),
         Op::ConstructorPrototype(callee) => LoadKey::Constructor(at(callee)),
+        Op::CellGet(cell) => LoadKey::Cell(at(cell)),
         Op::GlobalRead(name) => LoadKey::Global(name.clone()),
         Op::ProbeGlobal(name) if probes => LoadKey::Probe(name.clone()),
         Op::ProbeShapeProperty(object, name, shape, index) => {
@@ -85,6 +87,7 @@ fn load_key(op: &Op, probes: bool, aliases: &FxHashMap<Value, Value>) -> Option<
                 fact @ (Fact::Type(_)
                 | Fact::Code(_)
                 | Fact::Typed(_)
+                | Fact::Array
                 | Fact::Shape(_)
                 | Fact::Cached(..)),
             ) => LoadKey::Check(at(&value), fact),

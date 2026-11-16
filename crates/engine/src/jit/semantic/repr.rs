@@ -259,6 +259,7 @@ pub(in crate::jit) fn intrinsic(op: &Op) -> Option<Repr> {
         | Op::IsTyped(..)
         | Op::IsPropertyCached(..)
         | Op::IsIndexed(_)
+        | Op::IsOrdinaryArray(_)
         | Op::IsString(_)
         | Op::Truthy(_)
         | Op::IsNumber(_)

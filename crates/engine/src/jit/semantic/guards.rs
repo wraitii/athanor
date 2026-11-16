@@ -13,7 +13,7 @@ pub(in crate::jit) enum Fact {
     Code(FuncId),
     Shape(u32),
     Typed(Option<TypedKind>),
-    Indexed,
+    Array,
     // Planning resolves this IC proposal into a shape or cache-hit requirement.
     Property(Value),
     Cached(Value, bool),
@@ -61,7 +61,7 @@ impl Fact {
             Self::Cached(cache, builtins) => Op::IsPropertyCached(value, cache, builtins),
             Self::Shape(shape) => Op::IsShape(value, shape),
             Self::Typed(element) => Op::IsTyped(value, element),
-            Self::Indexed => Op::IsIndexed(value),
+            Self::Array => Op::IsOrdinaryArray(value),
             Self::Native(native) => Op::IsNative(value, native),
             _ => return None,
         })
@@ -113,7 +113,7 @@ pub(super) fn implies(op: &Op) -> Option<(Value, Fact)> {
         Op::EntryAssume(value, fact) => (value, fact),
         Op::IsShape(value, shape) => (value, Fact::Shape(shape)),
         Op::IsTyped(value, element) => (value, Fact::Typed(element)),
-        Op::IsIndexed(value) => (value, Fact::Indexed),
+        Op::IsOrdinaryArray(value) => (value, Fact::Array),
         Op::IsPropertyCached(value, cache, builtins) => (value, Fact::Cached(cache, builtins)),
         _ => return None,
     })

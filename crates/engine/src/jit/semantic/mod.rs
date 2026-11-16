@@ -437,6 +437,7 @@ pub(super) enum Op {
     IteratorNew(Value),
     IteratorNext(Value),
     IsIndexed(Value),
+    IsOrdinaryArray(Value),
     // Saturating numeric conversion; validity is checked separately by IsArrayIndex or IsExactPosition.
     ArrayPosition(Value),
     // Compare a numeric key with its integer position converted back to a number.
@@ -800,6 +801,7 @@ impl Op {
             | Op::IteratorNew(value)
             | Op::IteratorNext(value)
             | Op::IsIndexed(value)
+            | Op::IsOrdinaryArray(value)
             | Op::ArrayKind(value)
             | Op::IndexedLength(value)
             | Op::EnumerateNew(value)
@@ -1044,6 +1046,7 @@ impl Op {
             | Op::IteratorNew(value)
             | Op::IteratorNext(value)
             | Op::IsIndexed(value)
+            | Op::IsOrdinaryArray(value)
             | Op::ArrayKind(value)
             | Op::IndexedLength(value)
             | Op::EnumerateNew(value)
@@ -1181,7 +1184,8 @@ impl Op {
 
     pub(super) fn write_target(&self) -> Option<Value> {
         match self {
-            Op::Define(object, ..)
+            Op::CellSet(object, _)
+            | Op::Define(object, ..)
             | Op::Set(object, ..)
             | Op::ShapedSet(object, ..)
             | Op::ArrayStore(object, ..)
@@ -2144,7 +2148,7 @@ impl Graph {
             }
             Op::Memory(MemoryOp::Address { .. }) | Op::MemoryNumber(..) => closed(0, Unowned),
             Op::KeepAlive(_) => closed(INTERNAL, None),
-            Op::IsTyped(..) | Op::IsIndexed(_) => closed(0, Unowned),
+            Op::IsTyped(..) | Op::IsIndexed(_) | Op::IsOrdinaryArray(_) => closed(0, Unowned),
             Op::IsArrayIndex(..) | Op::IsArray(..) => closed(HEAP_READ, Unowned),
             Op::ArrayPosition(_) => closed(INTERNAL, Unowned),
             Op::IsExactPosition(..) | Op::IsInBounds(..) | Op::BooleanAnd(..) => closed(0, Unowned),

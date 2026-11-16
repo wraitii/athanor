@@ -183,6 +183,9 @@ fn predicate(graph: &mut Graph, facts: &Facts, inst: Inst) -> Option<Value> {
         Op::IsTyped(object, None) => {
             has_kind(&mut Cursor::before(graph, inst), object, kind::TYPED)
         }
+        Op::IsOrdinaryArray(object) => {
+            has_kind(&mut Cursor::before(graph, inst), object, kind::ARRAY)
+        }
         Op::IsIndexed(object) => has_kind(
             &mut Cursor::before(graph, inst),
             object,

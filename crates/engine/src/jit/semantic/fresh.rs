@@ -22,6 +22,7 @@ fn contained_use(op: &Op, index: usize) -> bool {
         | Op::IsNullish(_)
         | Op::CheckInitialized(_)
         | Op::IsIndexed(_)
+        | Op::IsOrdinaryArray(_)
         | Op::IndexedLength(_) => true,
         Op::Binary(BinaryOperator::StrictEquality | BinaryOperator::StrictInequality, ..) => true,
         Op::IteratorNew(_) | Op::IteratorNext(_) | Op::EnumerateNew(_) | Op::EnumerateNext(_) => {

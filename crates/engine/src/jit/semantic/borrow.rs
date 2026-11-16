@@ -148,6 +148,7 @@ pub(super) fn borrows(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>)
                     })
                     .filter(|target| target.block == block)
                     .map(|target| target.args[index])
+                    .filter(|&value| facts.of(value).intersects(HEAP))
                     .collect();
                 if incoming.is_empty() || incoming.iter().any(|value| !objects.contains(value)) {
                     continue;

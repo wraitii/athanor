@@ -2,8 +2,44 @@ use super::super::super::guards::{Fact, Kind, Origin};
 use super::super::calls::ConditionalPlan;
 use super::placement::{Reach, place_assumes};
 use super::*;
-use crate::jit::profile::ReadType;
+use crate::jit::profile::{ReadKind, ReadType};
 use crate::{FxHashMap, FxHashSet};
+
+fn numeric_demand(graph: &Graph, cfg: &Cfg, native_calls: &FxHashSet<Inst>) -> FxHashSet<Value> {
+    let mut pending = Vec::new();
+    for &block in &cfg.rpo {
+        for &inst in &graph.blocks[block].insts {
+            let op = &graph.insts[inst].op;
+            for (index, value) in op.operands_iter().enumerate() {
+                if matches!(graph.values[value], ValueDef::Param(..))
+                    && (numeric_use(op, index)
+                        || native_calls.contains(&inst)
+                            && matches!(op, Op::Call { args, .. } if args.contains(&value)))
+                {
+                    pending.push(value);
+                }
+            }
+        }
+    }
+    let mut demanded = FxHashSet::default();
+    while let Some(value) = pending.pop() {
+        if !demanded.insert(value) {
+            continue;
+        }
+        let ValueDef::Param(block, index) = graph.values[value] else {
+            continue;
+        };
+        for &pred in &cfg.preds[block] {
+            let terminator = graph.blocks[pred].terminator.as_ref().unwrap();
+            for target in terminator.kind.targets() {
+                if target.block == block {
+                    pending.push(target.args[index]);
+                }
+            }
+        }
+    }
+    demanded
+}
 
 pub(in crate::jit::semantic) fn numbers(graph: &mut Graph) -> Vec<(Value, Fact)> {
     let cfg = Cfg::new(graph);
@@ -13,6 +49,7 @@ pub(in crate::jit::semantic) fn numbers(graph: &mut Graph) -> Vec<(Value, Fact)>
         .into_iter()
         .map(|requirement| requirement.call)
         .collect();
+    let demanded = numeric_demand(graph, &cfg, &native_calls);
     let mut proposals: Vec<(Inst, Value, Fact, Option<crate::jit::profile::Site>)> = Vec::new();
     let mut seen = FxHashSet::default();
     for &block in &cfg.rpo {
@@ -21,10 +58,16 @@ pub(in crate::jit::semantic) fn numbers(graph: &mut Graph) -> Vec<(Value, Fact)>
             for (index, value) in op.operands_iter().enumerate() {
                 let integer = hints.get(&value) == Some(&ReadType::Integer);
                 let desired = if integer { ValueType::INTEGER } else { NUMERIC };
+                let observed = matches!(
+                    op,
+                    Op::ReadHint(_, ReadKind::Number, ReadType::Integer | ReadType::Number, _)
+                ) && demanded.contains(&value);
                 if hints.get(&value) == Some(&ReadType::Unknown)
                     || !(numeric_use(op, index)
                         || native_calls.contains(&inst)
-                            && matches!(op, Op::Call { args, .. } if args.contains(&value)))
+                            && matches!(op, Op::Call { args, .. } if args.contains(&value))
+                        || observed)
+                    || !facts.of(value).intersects(desired)
                     || facts.of(value).within(desired)
                     || matches!(graph.defining_op(value), Some(Op::Constant(_)))
                 {
@@ -197,7 +240,7 @@ pub(in crate::jit::semantic) fn assume(
                     hints.get(&value),
                     Some(ReadType::Integer | ReadType::Number)
                 ),
-                Op::Assume(_, Fact::Typed(_) | Fact::Indexed, _) => true,
+                Op::Assume(_, Fact::Typed(_) | Fact::Array, _) => true,
                 _ => false,
             }) && !reached.iter().any(|reach| reach.inst == inst)
                 && loops

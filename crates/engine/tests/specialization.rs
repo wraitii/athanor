@@ -1,6 +1,164 @@
 use js_engine::{Engine, EngineOptions, Value};
 
 #[test]
+fn array_feedback_preserves_holes_bounds_and_receiver_changes() {
+    let source = r#"
+        function read(array, index) { return array[index]; }
+        function main() {
+            const runner = {read};
+            const object = {};
+            const array = new Array(5);
+            array[0] = object;
+            array[1] = 2;
+            for (let i = 0; i < 1100; ++i)
+                runner.read(array, 0);
+            if (runner.read(array, 0) !== object)
+                return false;
+            array[4] = 9;
+            if (runner.read(array, 2) !== undefined || runner.read(array, 4) !== 9)
+                return false;
+            array[1] = 4;
+            array[2] = 5;
+            array[3] = 6;
+            if (runner.read(array, 2) !== 5 || runner.read(array, 10) !== undefined)
+                return false;
+            array.length = 1;
+            array[1] = 7;
+            if (runner.read(array, 1) !== 7 || runner.read(array, 4) !== undefined)
+                return false;
+            const typed = new Float64Array(2);
+            typed[0] = 17;
+            return runner.read(array, -0) === object
+                && runner.read(typed, 0) === 17
+                && runner.read({0: 19}, 0) === 19;
+        }
+    "#;
+    for osr in [false, true] {
+        let mut engine = Engine::with_options(EngineOptions {
+            osr,
+            background_compile: false,
+            ..Default::default()
+        })
+        .unwrap();
+        engine.compile(source, "array-feedback.js").unwrap();
+        assert_eq!(
+            engine.call("main", &[]).unwrap().value(),
+            Value::boolean(true)
+        );
+    }
+}
+
+#[test]
+fn array_feedback_preserves_non_index_numeric_errors() {
+    let mut engine = Engine::with_options(EngineOptions {
+        background_compile: false,
+        ..Default::default()
+    })
+    .unwrap();
+    engine
+        .compile(
+            "function make(){return [7];} function read(array,index){return array[index];}",
+            "array-numeric-properties.js",
+        )
+        .unwrap();
+    let array = engine.call("make", &[]).unwrap();
+    for _ in 0..1100 {
+        assert_eq!(
+            engine
+                .call("read", &[array.value(), Value::number(0.0)])
+                .unwrap()
+                .value(),
+            Value::number(7.0)
+        );
+    }
+    for index in [-1.0, 0.5, f64::NAN, f64::INFINITY, 4294967295.0] {
+        assert!(
+            engine
+                .call("read", &[array.value(), Value::number(index)])
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn capture_reads_preserve_changes_across_calls_and_cell_writes() {
+    let source = r#"
+        function main() {
+            let width = 4;
+            function change() { width = 2; }
+            function run(array, callback) {
+                let sum = 0;
+                for (let i = 0; i < width; ++i) {
+                    array[i] = i;
+                    sum += width;
+                    callback();
+                }
+                return sum;
+            }
+            function keep() {}
+            const runner = {run};
+            const array = [0, 0, 0, 0];
+            for (let i = 0; i < 1100; ++i)
+                runner.run(array, keep);
+            const changed = runner.run(array, change);
+            width = 3;
+            return changed === 6 && runner.run(array, keep) === 9;
+        }
+    "#;
+    let mut engine = Engine::with_options(EngineOptions {
+        background_compile: false,
+        ..Default::default()
+    })
+    .unwrap();
+    engine.compile(source, "cell-aliasing.js").unwrap();
+    assert_eq!(
+        engine.call("main", &[]).unwrap().value(),
+        Value::boolean(true)
+    );
+}
+
+#[test]
+fn loop_carried_numeric_feedback_preserves_initial_values() {
+    let source = r#"
+        function iterate(holder, n) {
+            let value = holder.value;
+            for (let i = 0; i < n; ++i)
+                value = (value + 1) * 0.5;
+            return value;
+        }
+        function main() {
+            const runner = {call: iterate};
+            const holder = {value: 2};
+            for (let i = 0; i < 1100; ++i)
+                runner.call(holder, 4);
+            const numeric = runner.call(holder, 4);
+            holder.value = "2";
+            const empty = runner.call(holder, 0);
+            const string = runner.call(holder, 1);
+            holder.value = false;
+            const boolean = runner.call(holder, 1);
+            const object = {};
+            holder.value = object;
+            return numeric === 1.0625 && empty === "2" && string === 10.5
+                && boolean === 0.5 && runner.call(holder, 0) === object;
+        }
+    "#;
+    for osr in [false, true] {
+        let mut engine = Engine::with_options(EngineOptions {
+            osr,
+            background_compile: false,
+            ..Default::default()
+        })
+        .unwrap();
+        engine.compile(source, "loop-carried-feedback.js").unwrap();
+        assert_eq!(
+            engine.call("main", &[]).unwrap().value(),
+            Value::boolean(true)
+        );
+    }
+}
+
+#[test]
 fn floating_consumers_preserve_numbers_after_integer_feedback() {
     let mut engine = Engine::with_options(EngineOptions {
         background_compile: false,

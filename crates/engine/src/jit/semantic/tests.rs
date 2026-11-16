@@ -2169,6 +2169,108 @@ fn hoisting_moves_constant_arithmetic_and_lowered_conversions() {
 }
 
 #[test]
+fn cell_reads_hoist_across_elements_but_not_cell_writes_or_calls() {
+    for mutation in 0..3 {
+        let mut graph = lower_source("function f(cell,array,condition){return cell;}").unwrap();
+        let entry = graph.entry;
+        let span = graph.span;
+        let cell = graph.append_value(entry, span, Op::Argument(0));
+        let array = graph.append_value(entry, span, Op::Argument(1));
+        let condition = graph.append_value(entry, span, Op::Argument(2));
+        let index = graph.append_value(entry, span, Op::Constant(Constant::Number(0.0)));
+        let header = graph.blocks.push(BlockData::default());
+        let body = graph.blocks.push(BlockData::default());
+        let exit = graph.blocks.push(BlockData::default());
+        graph.terminate(entry, span, TerminatorKind::Jump(Target::new(header)));
+        let read = graph.append_value(header, span, Op::CellGet(cell));
+        graph.terminate(
+            header,
+            span,
+            TerminatorKind::Branch(condition, Target::new(body), Target::new(exit)),
+        );
+        match mutation {
+            0 => {
+                graph.append(body, span, Op::ArrayStore(array, index, index), false);
+            }
+            1 => {
+                graph.append(body, span, Op::CellSet(cell, index), false);
+            }
+            _ => {
+                graph.append_value(
+                    body,
+                    span,
+                    Op::Call {
+                        callee: condition,
+                        receiver: None,
+                        args: vec![],
+                        target: None,
+                    },
+                );
+            }
+        }
+        graph.terminate(body, span, TerminatorKind::Jump(Target::new(header)));
+        graph.terminate(exit, span, TerminatorKind::Return(read));
+        let mut function = FunctionState::new(graph, Vec::new(), true);
+        let region = function.graph.regions.push(Region {
+            blocks: function.graph.blocks.keys().collect(),
+            fallback: None,
+        });
+        regions::hoist(&mut function, region);
+        function.graph.verify().unwrap();
+        assert_eq!(
+            function.graph.def_block(read),
+            if mutation == 0 { entry } else { header }
+        );
+    }
+}
+
+#[test]
+fn cell_read_reuse_stops_at_cell_writes_and_reentry() {
+    for mutation in 0..3 {
+        let mut graph = lower_source("function f(cell,array){return cell;}").unwrap();
+        let entry = graph.entry;
+        let span = graph.span;
+        let cell = graph.append_value(entry, span, Op::Argument(0));
+        let array = graph.append_value(entry, span, Op::Argument(1));
+        let index = graph.append_value(entry, span, Op::Constant(Constant::Number(0.0)));
+        let first = graph.append_value(entry, span, Op::CellGet(cell));
+        match mutation {
+            0 => {
+                graph.append(entry, span, Op::ArrayStore(array, index, index), false);
+            }
+            1 => {
+                graph.append(entry, span, Op::CellSet(cell, index), false);
+            }
+            _ => {
+                graph.append_value(
+                    entry,
+                    span,
+                    Op::Call {
+                        callee: array,
+                        receiver: None,
+                        args: vec![],
+                        target: None,
+                    },
+                );
+            }
+        }
+        let second = graph.append_value(entry, span, Op::CellGet(cell));
+        let result = graph.append_value(entry, span, Op::NewArray(vec![first, second]));
+        graph.terminate(entry, span, TerminatorKind::Return(result));
+        let mut function = FunctionState::new(graph, Vec::new(), true);
+        reuse::reuse_loads(&mut function);
+        function.graph.verify().unwrap();
+        assert_eq!(
+            ops(&function.graph)
+                .iter()
+                .filter(|op| matches!(op, Op::CellGet(_)))
+                .count(),
+            if mutation == 0 { 1 } else { 2 }
+        );
+    }
+}
+
+#[test]
 fn array_kind_reuse_stops_at_calls_and_writes() {
     for call in [false, true] {
         let mut graph = lower_source("function f(a){return a;}").unwrap();

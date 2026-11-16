@@ -246,7 +246,7 @@ fn invariant_guards(
                     &graph.blocks[block].terminator,
                     Some(Terminator { kind: TerminatorKind::Branch(condition, ..), .. })
                         if invariant(*condition)
-                            || graph.defining_op(*condition).unwrap().operands_iter().all(invariant)
+                            || graph.defining_op(*condition).is_some_and(|op| op.operands_iter().all(invariant))
                 )
         })
         .collect()

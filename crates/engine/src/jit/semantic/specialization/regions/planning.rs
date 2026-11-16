@@ -19,7 +19,7 @@ fn pure_guard(graph: &Graph, block: Block) -> bool {
         None => true,
         Some(op) => matches!(
             super::super::super::guards::implies(op),
-            Some((_, Fact::Type(_) | Fact::Typed(_) | Fact::Indexed))
+            Some((_, Fact::Type(_) | Fact::Typed(_) | Fact::Array))
         ),
     }
 }
@@ -215,7 +215,7 @@ fn plan_region(
                 && graph.blocks[block].insts.contains(&inst)
                 && match graph.insts[inst].op {
                     Op::Assume(value, Fact::Type(types), _) => !known.of(value).within(types),
-                    Op::Assume(_, Fact::Typed(_) | Fact::Indexed, _) => true,
+                    Op::Assume(_, Fact::Typed(_) | Fact::Array, _) => true,
                     _ => false,
                 }
         })
@@ -425,7 +425,7 @@ fn plan_region(
                     return false;
                 }
                 match fact {
-                    Fact::Indexed => true,
+                    Fact::Array => true,
                     Fact::Shape(shape) if reentry.is_none() => {
                         Access::read(&Op::IsShape(value, shape), &shared)
                             .is_some_and(|read| !writes.clobbers(&read))
@@ -814,6 +814,48 @@ mod tests {
     }
 
     #[test]
+    fn invariant_guards_handle_block_parameters() {
+        let mut graph = graph("function f(value){return value;}");
+        let entry = graph.entry;
+        let span = graph.span;
+        let value = graph.append_value(entry, span, Op::Argument(0));
+        let guard = graph.blocks.push(BlockData::default());
+        let fast = graph.blocks.push(BlockData::default());
+        let cold = graph.blocks.push(BlockData::default());
+        let condition = graph.add_param(guard);
+        graph.terminate(
+            entry,
+            span,
+            TerminatorKind::Jump(Target {
+                block: guard,
+                args: vec![value],
+            }),
+        );
+        graph.terminate(
+            guard,
+            span,
+            TerminatorKind::Branch(condition, Target::new(fast), Target::new(cold)),
+        );
+        graph.terminate(fast, span, TerminatorKind::Return(value));
+        graph.terminate(cold, span, TerminatorKind::Return(value));
+        graph.cold.insert(cold);
+        graph.verify().unwrap();
+        assert!(
+            invariant_guards(
+                &graph,
+                &FxHashSet::from_iter([guard, fast, cold]),
+                &[guard],
+                &[]
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            invariant_guards(&graph, &FxHashSet::from_iter([fast, cold]), &[guard], &[]),
+            vec![guard]
+        );
+    }
+
+    #[test]
     fn property_dispatch_uses_updated_receivers() {
         for source in [
             "function f(object){return object.child.value;}",
@@ -911,6 +953,64 @@ mod tests {
             }));
         }
         graph.verify().unwrap();
+    }
+
+    #[test]
+    fn observed_numeric_inputs_flow_through_parameters() {
+        use crate::jit::profile::{ReadKind, ReadType, Site};
+
+        for (source, expected) in [
+            (
+                "function f(a,n){let x=a.x;for(let i=0;i<n;++i)x=(x+1)*0.5;return x;}",
+                true,
+            ),
+            (
+                "function f(a,n,choose){let x=a.x;if(choose)x=1;for(let i=0;i<n;++i)x=(x+1)*0.5;return x;}",
+                true,
+            ),
+            (
+                "function f(a,n){let x=a.x;for(let i=0;i<n;++i)x=i;return x;}",
+                false,
+            ),
+        ] {
+            let mut graph = graph(source);
+            let (read, value) = graph
+                .insts
+                .values()
+                .find_map(|data| {
+                    matches!(data.op, Op::Get(_, ref name) if name == "x")
+                        .then(|| (data.span, data.result().unwrap()))
+                })
+                .unwrap();
+            let mut repository = super::super::super::calls::Repository::default();
+            repository.read_feedback.insert(
+                (
+                    Site {
+                        source: 7,
+                        start: read.start,
+                        end: read.end,
+                    },
+                    ReadKind::Number,
+                ),
+                ReadType::Number,
+            );
+            super::super::super::observations::plan(&mut graph, Some((&repository, 7)));
+            let assumptions = super::super::propose::numbers(&mut graph);
+            assert_eq!(
+                assumptions.contains(&(value, Fact::Type(ValueType::NUMBER))),
+                expected,
+                "{source}",
+            );
+            if expected {
+                let facts = Facts::assuming(&graph, &assumptions);
+                for data in graph.insts.values() {
+                    if let Op::Binary(BinaryOperator::Addition, left, _) = data.op {
+                        assert!(facts.of(left).within(ValueType::NUMBER), "{source}");
+                    }
+                }
+            }
+            graph.verify().unwrap();
+        }
     }
 
     #[test]
