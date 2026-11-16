@@ -25,6 +25,7 @@ pub(in crate::jit::semantic) fn lowered(graph: &mut Graph) {
         facts.refresh(graph);
         cleanup(graph, &mut facts, None);
     }
+    super::dce::eliminate(graph, &facts);
 }
 
 fn cleanup(graph: &mut Graph, facts: &mut Facts, mut notes: Option<&mut Vec<String>>) -> bool {

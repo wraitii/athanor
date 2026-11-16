@@ -12,9 +12,16 @@ pub(in crate::jit::semantic) enum Fold {
     Alias(Value),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(in crate::jit::semantic) enum Change {
+    None,
+    Values,
+    Cfg,
+}
+
 pub(in crate::jit::semantic) trait Folder {
-    fn refine(&mut self, _graph: &mut Graph, _cfg: &Cfg) -> bool {
-        false
+    fn refine(&mut self, _graph: &mut Graph, _cfg: &Cfg) -> Change {
+        Change::None
     }
 
     fn fold(&mut self, graph: &Graph, facts: &Facts, inst: Inst) -> Option<Fold>;
@@ -28,8 +35,9 @@ pub(in crate::jit::semantic) fn simplify(function: &mut FunctionState, folder: &
         let uses = graph.use_counts();
         let mut aliases = FxHashMap::default();
         let mut dead = Vec::new();
-        let mut cfg_changed = folder.refine(graph, cfg);
-        let mut changed = cfg_changed;
+        let refined = folder.refine(graph, cfg);
+        let mut cfg_changed = refined == Change::Cfg;
+        let mut changed = refined != Change::None;
         for &block in &cfg.rpo {
             for inst in graph.blocks[block].insts.clone() {
                 match folder.fold(graph, facts, inst) {

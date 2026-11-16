@@ -5,10 +5,14 @@ use cranelift_codegen::ir::Type;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use oxc_syntax::operator::BinaryOperator;
 
-use super::super::{Block, Facts, Graph, Op, Repr, Value, low_level, resolve};
+use super::super::{Block, Constant, Facts, Graph, Op, Repr, Value, low_level, resolve};
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum Expression {
+    Undefined,
+    Null,
+    Boolean(bool),
+    Number(u64),
     Integer(Type, u64),
     Float64(u64),
     ScalarBinary(low_level::Binary, Value, Value),
@@ -36,6 +40,10 @@ fn expression(
 ) -> Option<Expression> {
     let at = |value: &Value| resolve(aliases, *value);
     Some(match op {
+        Op::Constant(Constant::Undefined) => Expression::Undefined,
+        Op::Constant(Constant::Null) => Expression::Null,
+        Op::Constant(Constant::Boolean(value)) => Expression::Boolean(*value),
+        Op::Constant(Constant::Number(value)) => Expression::Number(value.to_bits()),
         Op::LowLevel(low_level::Op::Integer { ty, bits }) => Expression::Integer(*ty, *bits),
         Op::LowLevel(low_level::Op::Float64(bits)) => Expression::Float64(*bits),
         Op::NumericFloat(value) => {

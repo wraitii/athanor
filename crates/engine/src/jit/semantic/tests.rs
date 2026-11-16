@@ -3216,6 +3216,97 @@ fn low_level_variables_resolve_long_forwarding_chain() {
 }
 
 #[test]
+fn semantic_constant_cse_preserves_bits_and_representations() {
+    use cranelift_codegen::ir::{AbiParam, Signature, types};
+    use cranelift_codegen::isa::CallConv;
+    let constants = [
+        Constant::Undefined,
+        Constant::Null,
+        Constant::Boolean(false),
+        Constant::Boolean(true),
+        Constant::Number(0.0),
+        Constant::Number(-0.0),
+        Constant::Number(7.0),
+        Constant::Number(f64::NAN),
+        Constant::Number(f64::from_bits(f64::NAN.to_bits() + 1)),
+    ];
+    let mut signature = Signature::new(CallConv::SystemV);
+    signature.returns.extend([AbiParam::new(types::I64); 20]);
+    let mut graph = Graph::new_low_level("constants".into(), Span::new(0, 0), signature);
+    let entry = graph.entry;
+    let mut builder = low_level::Builder::new(&mut graph);
+    builder.switch_to_block(entry);
+    let mut originals = Vec::new();
+    let mut repeated = Vec::new();
+    for constant in constants {
+        originals.push(builder.semantic(Op::Constant(constant.clone()), Repr::Boxed));
+        repeated.push(builder.semantic(Op::Constant(constant), Repr::Boxed));
+    }
+    let integer = builder.semantic(Op::Constant(Constant::Number(7.0)), Repr::I64);
+    let string = builder.semantic(Op::Constant(Constant::String("7".into())), Repr::Boxed);
+    let mut results = originals.clone();
+    results.extend(repeated);
+    results.extend([integer, string]);
+    builder.ins().return_(&results);
+    let facts = Facts::compute(&graph);
+    assert!(cse::eliminate(&mut graph, &facts, None));
+    graph.verify().unwrap();
+    let TerminatorKind::ReturnValues(values) =
+        &graph.blocks[entry].terminator.as_ref().unwrap().kind
+    else {
+        panic!()
+    };
+    let mut expected = originals.clone();
+    expected.extend(originals);
+    expected.extend([integer, string]);
+    assert_eq!(*values, expected);
+}
+
+#[test]
+fn scalar_dce_removes_unused_chains_and_keeps_effects() {
+    use cranelift_codegen::ir::{AbiParam, MemFlagsData, Signature, types};
+    use cranelift_codegen::isa::CallConv;
+    let mut signature = Signature::new(CallConv::SystemV);
+    signature.params.push(AbiParam::new(types::I64));
+    signature.returns.push(AbiParam::new(types::I64));
+    let mut graph = Graph::new_low_level("dead".into(), Span::new(0, 0), signature);
+    let entry = graph.entry;
+    let mut builder = low_level::Builder::new(&mut graph);
+    builder.append_block_params_for_function_params(entry);
+    builder.switch_to_block(entry);
+    let address = builder.block_params(entry)[0];
+    let one = builder.ins().iconst(types::I64, 1);
+    let loaded = builder
+        .ins()
+        .load(types::I64, MemFlagsData::trusted(), address, 0);
+    let mut unused = loaded;
+    for _ in 0..100 {
+        unused = builder.ins().iadd(unused, one);
+    }
+    builder
+        .ins()
+        .store(MemFlagsData::trusted(), one, address, 0);
+    let mut called = Signature::new(CallConv::SystemV);
+    called.returns.extend([AbiParam::new(types::I64); 2]);
+    let called = builder.import_signature(called);
+    builder.ins().call_indirect(called, address, &[]);
+    builder.ins().return_(&[address]);
+    reuse::lowered(&mut graph);
+    graph.verify().unwrap();
+    assert_eq!(ops(&graph).len(), 3);
+    assert!(
+        ops(&graph)
+            .iter()
+            .any(|op| matches!(op, Op::LowLevel(low_level::Op::Store { .. })))
+    );
+    assert!(
+        ops(&graph)
+            .iter()
+            .any(|op| matches!(op, Op::LowLevel(low_level::Op::Call { .. })))
+    );
+}
+
+#[test]
 fn scalar_cse_respects_dominance_and_canonicalizes_operands() {
     use cranelift_codegen::ir::condcodes::IntCC;
     use cranelift_codegen::ir::{AbiParam, Signature, types};
@@ -3378,9 +3469,10 @@ fn scalar_cleanup_hoists_conversions_without_speculating_loads() {
     let loaded = builder
         .ins()
         .load(types::I64, MemFlagsData::trusted(), address, 0);
+    let stored = builder.ins().iadd(converted, loaded);
     builder
         .ins()
-        .store(MemFlagsData::trusted(), converted, address, 0);
+        .store(MemFlagsData::trusted(), stored, address, 0);
     builder.ins().jump(header, &[]);
     builder.switch_to_block(exit);
     builder.ins().return_(&[address]);

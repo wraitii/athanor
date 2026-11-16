@@ -2,7 +2,7 @@ use crate::FxHashMap;
 
 use oxc_syntax::operator::BinaryOperator;
 
-use super::super::transforms::{self, Fold, Folder};
+use super::super::transforms::{self, Change, Fold, Folder};
 use super::super::{
     Block, Cfg, Constant, Facts, FunctionState, Graph, Inst, Op, Terminator, TerminatorKind,
     UnaryOp, Value, ValueType,
@@ -16,8 +16,12 @@ pub(in crate::jit::semantic) fn simplify(function: &mut FunctionState) {
 struct Rules;
 
 impl Folder for Rules {
-    fn refine(&mut self, graph: &mut Graph, cfg: &Cfg) -> bool {
-        refine_string_guards(graph, cfg)
+    fn refine(&mut self, graph: &mut Graph, cfg: &Cfg) -> Change {
+        if refine_string_guards(graph, cfg) {
+            Change::Values
+        } else {
+            Change::None
+        }
     }
 
     fn fold(&mut self, graph: &Graph, facts: &Facts, inst: Inst) -> Option<Fold> {
