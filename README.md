@@ -26,11 +26,14 @@ supported on macOS and Linux, and samply must be attached when the thread starts
 Set `JS_JIT_JITDUMP=1` to write a `jit-<pid>-<timestamp>-js.dump` file to the
 temporary directory. `samply` and `perf` can consume the dump, and debug
 information points at the original JavaScript source so they show JavaScript
-lines alongside the assembly. Set `JS_JIT_JITDUMP=2` to instead write one `.jsir` listing per compiled
-function; debug information then points at these listings, which contain the
-semantic IR in block order with the originating JavaScript source line
-interspersed whenever it changes. Profile samples are attributed to semantic
-instructions and terminators where machine-code source locations are available;
+lines alongside the assembly. Set `JS_JIT_JITDUMP=2` to instead write one `.jsir`
+listing per compiled function; debug information then points at these listings, which contain the
+semantic IR after specialization and before runtime lowering, in block order
+with the originating JavaScript source line interspersed whenever it changes.
+Profile samples are attributed to semantic instructions and terminators where
+machine-code source locations are available.
+Lowered operations map back by instruction ID and source span, falling back to an
+instruction on the same JavaScript line in the same source file;
 generated code without a semantic location points to the listing header.
 
 Use `--compile --eval SOURCE` or `--compile SCRIPT` to compile all functions

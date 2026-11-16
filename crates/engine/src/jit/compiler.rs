@@ -349,6 +349,22 @@ impl Compiler {
         self.dump_ir || (self.dump.is_some() && self.inspection.is_some())
     }
 
+    fn remap_listing(
+        &self,
+        listing: &mut jitdump::Listing,
+        state: &super::semantic::FunctionState,
+        source: usize,
+    ) {
+        let mut starts = FxHashMap::default();
+        listing.remap(state.listing_lines(), source, |source, offset| {
+            let source_text = &self.sources.get(&source)?.as_ref().0;
+            let starts = starts
+                .entry(source)
+                .or_insert_with(|| line_starts(source_text));
+            Some(line_at(starts, offset))
+        });
+    }
+
     fn report_regions(&self) -> bool {
         self.inspection
             .as_ref()
@@ -894,6 +910,9 @@ impl Compiler {
                 &mut |name, state| passes.observe(name, state),
             )
             .map_err(Error::Unsupported)?;
+            let mut listing = self
+                .listing()
+                .then(|| jitdump::Listing::new(graph.listing_lines()));
             let continuations = self.compile_continuations(
                 &graph.graph,
                 self.source_name,
@@ -937,7 +956,9 @@ impl Compiler {
             )
             .after(passes.snapshot)
             .ast(self.inspection.as_deref(), &program);
-            let listing = self.listing().then(|| graph.listing_lines());
+            if let Some(listing) = &mut listing {
+                self.remap_listing(listing, &graph, self.source_name.0);
+            }
             let (function, annotations, lowered, snapshot) = if baseline.is_some() {
                 self.data.push(baseline_data);
                 let mut function = cranelift_codegen::ir::Function::new();
@@ -1038,10 +1059,19 @@ impl Compiler {
             if self.dump_ir
                 && let Some(semantic) = &code.listing
             {
-                let ir = ir_lines(semantic, source, source_path, lines, &self.sources);
+                let ir = ir_lines(&semantic.lines, source, source_path, lines, &self.sources);
                 if let Some(dump) = self.dump.as_mut() {
                     match dump.listing(&name, &ir) {
-                        Ok(written) => listing = Some(written),
+                        Ok((path, lines)) => {
+                            let locations = semantic
+                                .locations
+                                .iter()
+                                .filter_map(|(id, origin)| {
+                                    lines.get(origin).map(|line| (*id, *line))
+                                })
+                                .collect::<BTreeMap<_, _>>();
+                            listing = Some((path, locations));
+                        }
                         Err(error) => eprintln!("js jit: listing write failed: {error}"),
                     }
                 }
@@ -1117,13 +1147,21 @@ impl Compiler {
                     let source_locations: FxHashMap<_, _> = code
                         .listing
                         .iter()
-                        .flatten()
+                        .flat_map(|listing| &listing.lines)
                         .filter_map(|(id, location, _)| {
                             let location = location.as_ref()?;
                             location
                                 .source
                                 .is_none_or(|source| source == self.source_name.0)
                                 .then_some((*id, location.span.start))
+                        })
+                        .collect();
+                    let source_locations: FxHashMap<_, _> = code
+                        .listing
+                        .iter()
+                        .flat_map(|listing| &listing.locations)
+                        .filter_map(|(id, origin)| {
+                            source_locations.get(origin).map(|offset| (*id, *offset))
                         })
                         .collect();
                     let mut default_line = None;
@@ -1603,6 +1641,9 @@ impl Compiler {
             &mut |name, state| passes.observe(name, state),
         )
         .map_err(Error::Unsupported)?;
+        let mut listing = self
+            .listing()
+            .then(|| jitdump::Listing::new(graph.listing_lines()));
         let mut feedback = self.feedback(code, region.is_none());
         feedback.observations = region.is_none();
         let continuations = self.compile_continuations(
@@ -1648,7 +1689,9 @@ impl Compiler {
                 .lower_runtime(&mut graph, initial && tier == CompilationTier::Baseline)
                 .map_err(Error::Unsupported)?;
         }
-        let listing = self.listing().then(|| graph.listing_lines());
+        if let Some(listing) = &mut listing {
+            self.remap_listing(listing, &graph, emission.source_name.0);
+        }
         let inspection = super::inspect::Inspection::new(
             self.inspection.as_deref(),
             &graph,
@@ -1900,6 +1943,9 @@ impl Compiler {
     ) -> Result<FunctionBody, Error> {
         let mut passes = super::inspect::PassInspection::new(self.inspection.as_deref());
         let mut state = super::semantic::FunctionState::from_graph(graph.clone());
+        let mut listing = self
+            .listing()
+            .then(|| jitdump::Listing::new(state.listing_lines()));
         let mut data = FunctionData::new();
         let baseline = if !self.ssa_opt
             && self.module.isa().name() == "aarch64"
@@ -1932,9 +1978,9 @@ impl Compiler {
         let inspection =
             super::inspect::Inspection::from_graph(self.inspection.as_deref(), &state.graph)
                 .after(passes.snapshot);
-        let listing = self
-            .listing()
-            .then(|| state.graph.listing(&state.facts).lines());
+        if let Some(listing) = &mut listing {
+            self.remap_listing(listing, &state, source_name.0);
+        }
         let (function, annotations, lowered, snapshot) = if baseline.is_some() {
             let mut function = cranelift_codegen::ir::Function::new();
             function.signature = self.signature.clone();
@@ -2238,6 +2284,14 @@ impl Compiler {
         };
         let signature = self.graph_signature(graph.as_ref().map(|graph| &graph.graph));
         let feedback = feedback.map(|owner| self.feedback(owner, true));
+        let mut listing = self
+            .listing()
+            .then(|| {
+                graph
+                    .as_ref()
+                    .map(|graph| jitdump::Listing::new(graph.listing_lines()))
+            })
+            .flatten();
         if baseline.is_none()
             && let Some(graph) = &mut graph
         {
@@ -2255,10 +2309,9 @@ impl Compiler {
             )
             .after(passes.snapshot)
         });
-        let listing = self
-            .listing()
-            .then(|| graph.as_ref().map(|graph| graph.listing_lines()))
-            .flatten();
+        if let Some(listing) = &mut listing {
+            self.remap_listing(listing, graph.as_ref().unwrap(), self.source_name.0);
+        }
         let (function, annotations, lowered, snapshot) = if baseline.is_some() {
             let mut function = cranelift_codegen::ir::Function::new();
             function.signature = signature;

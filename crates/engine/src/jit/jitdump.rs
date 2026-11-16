@@ -3,6 +3,66 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::PathBuf;
 
+use crate::FxHashMap;
+
+use super::semantic::ListingLine;
+
+#[derive(Clone)]
+pub(super) struct Listing {
+    pub lines: Vec<ListingLine>,
+    pub locations: FxHashMap<u32, u32>,
+}
+
+impl Listing {
+    pub fn new(lines: Vec<ListingLine>) -> Self {
+        Self {
+            lines,
+            locations: FxHashMap::default(),
+        }
+    }
+
+    pub fn remap(
+        &mut self,
+        lowered: Vec<ListingLine>,
+        source: usize,
+        mut line_at: impl FnMut(usize, u32) -> Option<u32>,
+    ) {
+        let mut spans = FxHashMap::default();
+        let mut ids = FxHashMap::default();
+        let mut lines = FxHashMap::default();
+        for (id, location, _) in &self.lines {
+            let Some(location) = location else {
+                continue;
+            };
+            let source = location.source.unwrap_or(source);
+            let key = (source, location.span.start, location.span.end);
+            spans.entry(key).or_insert(*id);
+            ids.insert(*id, key);
+            if let Some(line) = line_at(source, location.span.start) {
+                lines.entry((source, line)).or_insert(*id);
+            }
+        }
+        for (id, location, _) in lowered {
+            let Some(location) = location else {
+                continue;
+            };
+            let source = location.source.unwrap_or(source);
+            let key = (source, location.span.start, location.span.end);
+            let target = if ids.get(&id) == Some(&key) {
+                Some(id)
+            } else {
+                spans.get(&key).copied().or_else(|| {
+                    let line = line_at(source, location.span.start)?;
+                    lines.get(&(source, line)).copied()
+                })
+            };
+            if let Some(target) = target {
+                self.locations.insert(id, target);
+            }
+        }
+    }
+}
+
 const JITDUMP_MAGIC: u32 = 0x4a69_5444;
 const JITDUMP_VERSION: u32 = 1;
 const HEADER_SIZE: u32 = 40;
@@ -267,5 +327,49 @@ mod tests {
         let mut listing = Vec::new();
         let mapping = write_listing(&instructions, &mut listing).unwrap();
         assert_eq!(mapping.get(&1), Some(&3));
+    }
+
+    #[test]
+    fn listing_remaps_lowered_locations_to_specialized_ir() {
+        use super::super::semantic::SourceLocation;
+        use oxc_span::Span;
+
+        let line = |id, source, start, end| {
+            (
+                id,
+                Some(SourceLocation {
+                    source,
+                    span: Span::new(start, end),
+                }),
+                String::new(),
+            )
+        };
+        let mut listing = Listing::new(vec![
+            line(1, None, 10, 30),
+            line(2, None, 15, 20),
+            line(3, None, 15, 20),
+            line(4, Some(1), 15, 20),
+            line(5, None, 40, 50),
+        ]);
+        listing.remap(
+            vec![
+                line(3, None, 15, 20),
+                line(5, None, 15, 20),
+                line(6, None, 16, 19),
+                line(7, Some(1), 15, 20),
+                line(8, Some(2), 15, 20),
+                line(9, Some(0), 40, 50),
+                line(10, None, 30, 35),
+            ],
+            0,
+            |_, start| Some(start / 10),
+        );
+        assert_eq!(listing.locations.get(&3), Some(&3));
+        assert_eq!(listing.locations.get(&5), Some(&2));
+        assert_eq!(listing.locations.get(&6), Some(&1));
+        assert_eq!(listing.locations.get(&7), Some(&4));
+        assert_eq!(listing.locations.get(&8), None);
+        assert_eq!(listing.locations.get(&9), Some(&5));
+        assert_eq!(listing.locations.get(&10), None);
     }
 }

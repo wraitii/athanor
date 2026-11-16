@@ -765,7 +765,7 @@ fn emit(
                     };
                     let offset = data.result()?.index().checked_mul(8)? as u32;
                     e::mov_imm(Width::X, 9, value.bits(), |word| asm.emit(word));
-                    store(&mut asm, context_offset as u32, offset, 9, false, failed)?;
+                    store_primitive(&mut asm, context_offset as u32, offset, 9, failed)?;
                 }
                 Op::Initialize(binding, value) | Op::Write(binding, value) => {
                     let source = value.index().checked_mul(8)? as u32;
@@ -979,19 +979,18 @@ fn emit(
                             e::mov_imm(Width::X, 9, Value::UNINITIALIZED.bits(), |word| {
                                 asm.emit(word)
                             });
-                            store(&mut asm, context_offset as u32, dest, 9, true, failed)?;
+                            store_primitive(&mut asm, context_offset as u32, dest, 9, failed)?;
                         }
                     }
                 }
                 Op::LeaveScope(scope) => {
                     for binding in &graph.scopes[*scope].bindings {
                         e::mov_imm(Width::X, 9, Value::UNDEFINED.bits(), |word| asm.emit(word));
-                        store(
+                        store_primitive(
                             &mut asm,
                             context_offset as u32,
                             (values_size + binding.index() * 8) as u32,
                             9,
-                            true,
                             failed,
                         )?;
                     }
@@ -1349,6 +1348,28 @@ fn store(
     owned: bool,
     failed: super::asm::Label,
 ) -> Option<()> {
+    store_impl(asm, context, offset, value_reg, owned, true, failed)
+}
+
+fn store_primitive(
+    asm: &mut Assembler,
+    context: u32,
+    offset: u32,
+    value_reg: u8,
+    failed: super::asm::Label,
+) -> Option<()> {
+    store_impl(asm, context, offset, value_reg, true, false, failed)
+}
+
+fn store_impl(
+    asm: &mut Assembler,
+    context: u32,
+    offset: u32,
+    value_reg: u8,
+    owned: bool,
+    check: bool,
+    failed: super::asm::Label,
+) -> Option<()> {
     let slow = asm.label();
     let done = asm.label();
     asm.emit(e::mov(Width::X, 11, value_reg));
@@ -1393,7 +1414,10 @@ fn store(
     });
     asm.emit(e::blr(16));
     asm.bind(done);
-    check_error(asm, context, failed)
+    if check {
+        check_error(asm, context, failed)?;
+    }
+    Some(())
 }
 
 fn numeric(graph: &Graph, value: SemanticValue, depth: usize) -> bool {

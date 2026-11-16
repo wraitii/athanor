@@ -15,6 +15,6 @@ pub(super) struct FunctionBody {
     pub lowered: Option<super::semantic::Graph>,
     pub baseline: Option<std::sync::Arc<super::machine::MachineCode>>,
     pub annotations: Annotations,
-    pub listing: Option<Vec<super::semantic::ListingLine>>,
+    pub listing: Option<super::jitdump::Listing>,
     pub inspection: super::inspect::Inspection,
 }
