@@ -1412,61 +1412,68 @@ impl Cfg {
 
     pub(super) fn from_entry(graph: &Graph, entry: Block) -> Self {
         let rpo = Self::reverse_postorder_from(graph, entry);
+        let mut ranks = SecondaryMap::<Block, u32>::with_capacity(graph.blocks.len());
+        for (index, &block) in rpo.iter().enumerate() {
+            ranks[block] = index as u32;
+        }
         let mut edges = Vec::new();
+        let mut offsets = vec![0u32; rpo.len() + 1];
         for &block in &rpo {
             for successor in graph.successors(block) {
-                edges.push((successor, block));
+                edges.push((ranks[successor], block));
+                offsets[ranks[successor] as usize + 1] += 1;
             }
         }
-        edges.sort_by_key(|&(successor, _)| successor);
-        let mut ranges = SecondaryMap::<Block, (u32, u32)>::new();
-        for (index, &(successor, _)) in edges.iter().enumerate() {
-            let range = &mut ranges[successor];
-            if range.0 == range.1 {
-                range.0 = index as u32;
-            }
-            range.1 = index as u32 + 1;
+        for index in 1..offsets.len() {
+            offsets[index] += offsets[index - 1];
         }
-        let preds = Preds {
-            ranges,
-            list: edges.into_iter().map(|(_, pred)| pred).collect(),
-        };
-        let mut ranks = SecondaryMap::<Block, usize>::new();
+        let mut ranges = SecondaryMap::<Block, (u32, u32)>::with_capacity(graph.blocks.len());
         for (index, &block) in rpo.iter().enumerate() {
-            ranks[block] = index;
+            ranges[block] = (offsets[index], offsets[index + 1]);
         }
-        let mut dominators = SecondaryMap::<Block, Option<Block>>::new();
-        dominators[entry] = Some(entry);
+        let mut list = vec![entry; edges.len()];
+        let mut incoming = vec![0u32; edges.len()];
+        let mut fill = offsets.clone();
+        for &(successor, pred) in &edges {
+            let at = &mut fill[successor as usize];
+            list[*at as usize] = pred;
+            incoming[*at as usize] = ranks[pred];
+            *at += 1;
+        }
+        let mut dominators = vec![u32::MAX; rpo.len()];
+        if !rpo.is_empty() {
+            dominators[0] = 0;
+        }
         let mut changed = true;
         while changed {
             changed = false;
-            for &block in rpo.iter().skip(1) {
-                let mut incoming = preds[block]
+            for index in 1..rpo.len() {
+                let preds = &incoming[offsets[index] as usize..offsets[index + 1] as usize];
+                let mut processed = preds
                     .iter()
                     .copied()
-                    .filter(|&pred| dominators[pred].is_some());
-                let Some(mut next) = incoming.next() else {
+                    .filter(|&pred| dominators[pred as usize] != u32::MAX);
+                let Some(mut next) = processed.next() else {
                     continue;
                 };
-                for mut pred in incoming {
+                for mut pred in processed {
                     while next != pred {
-                        if ranks[next] > ranks[pred] {
-                            next = dominators[next].unwrap();
+                        if next > pred {
+                            next = dominators[next as usize];
                         } else {
-                            pred = dominators[pred].unwrap();
+                            pred = dominators[pred as usize];
                         }
                     }
                 }
-                if dominators[block] != Some(next) {
-                    dominators[block] = Some(next);
+                if dominators[index] != next {
+                    dominators[index] = next;
                     changed = true;
                 }
             }
         }
         let mut size = vec![1u32; rpo.len()];
         for index in (1..rpo.len()).rev() {
-            let parent = ranks[dominators[rpo[index]].unwrap()];
-            size[parent] += size[index];
+            size[dominators[index] as usize] += size[index];
         }
         let mut dominance = SecondaryMap::with_default((u32::MAX, 0));
         let mut next = vec![0u32; rpo.len()];
@@ -1475,7 +1482,7 @@ impl Cfg {
             next[0] = 1;
         }
         for index in 1..rpo.len() {
-            let parent = ranks[dominators[rpo[index]].unwrap()];
+            let parent = dominators[index] as usize;
             let start = next[parent];
             next[parent] += size[index];
             next[index] = start + 1;
@@ -1483,7 +1490,7 @@ impl Cfg {
         }
         Self {
             rpo,
-            preds,
+            preds: Preds { ranges, list },
             dominance,
         }
     }
