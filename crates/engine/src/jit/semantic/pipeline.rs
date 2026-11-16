@@ -597,8 +597,16 @@ pub(in crate::jit) fn specialize_observed(
 }
 
 impl FunctionState {
+    #[cfg(test)]
     pub(in crate::jit::semantic) fn lower_js(&mut self) -> Result<()> {
         self.lower_js_observed(false, &mut |_, _| {})
+    }
+
+    pub(in crate::jit::semantic) fn rewrite_properties(&mut self) -> Result<()> {
+        if !self.optimize || self.specialized_regions.is_none() {
+            return Ok(());
+        }
+        property_accesses::rewrite(&mut self.graph)
     }
 
     fn lower_js_observed(

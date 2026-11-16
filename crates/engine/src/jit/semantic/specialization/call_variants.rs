@@ -47,7 +47,7 @@ pub(in crate::jit::semantic) fn contextual_requirements(
         false,
         None,
     )?;
-    optimized.lower_js()?;
+    optimized.rewrite_properties()?;
     Ok(optimized
         .graph
         .entry_guards
