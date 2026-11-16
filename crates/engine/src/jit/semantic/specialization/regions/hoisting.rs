@@ -37,6 +37,7 @@ pub(super) fn hoist(
     notes: &mut Vec<String>,
 ) -> bool {
     let mut changed = false;
+    let mut facts: Option<Facts> = None;
     loop {
         let mut moved = false;
         for index in 0..groups.len() {
@@ -49,29 +50,14 @@ pub(super) fn hoist(
                 {
                     continue;
                 }
-                let facts = Facts::compute(graph);
-                let source = match group.before {
-                    Some(before) => {
-                        if !matches!(&graph.blocks[before].terminator.as_ref().unwrap().kind,
-                            TerminatorKind::Jump(target) if target.block == group.start)
-                        {
-                            continue;
-                        }
-                        before
-                    }
-                    None => continue,
+                let Some(source) = group.before else {
+                    continue;
                 };
-                if !facts.cfg.rpo.contains(&source) {
+                if !matches!(&graph.blocks[source].terminator.as_ref().unwrap().kind,
+                    TerminatorKind::Jump(target) if target.block == group.start)
+                {
                     continue;
                 }
-                let Some(dependencies) = policy.dependencies(graph, &facts, group, point) else {
-                    continue;
-                };
-                let Some(recovery) =
-                    bailouts.available(graph, &point.target, values, &facts.cfg, point.before)
-                else {
-                    continue;
-                };
                 let destination = match point.before {
                     Some(before) => {
                         let TerminatorKind::Jump(target) =
@@ -92,6 +78,18 @@ pub(super) fn hoist(
                     .unwrap()
                     .kind
                     .clone()
+                else {
+                    continue;
+                };
+                let known = facts.get_or_insert_with(|| Facts::compute(graph));
+                if !known.cfg.rpo.contains(&source) {
+                    continue;
+                }
+                let Some(dependencies) = policy.dependencies(graph, known, group, point) else {
+                    continue;
+                };
+                let Some(recovery) =
+                    bailouts.available(graph, &point.target, values, &known.cfg, point.before)
                 else {
                     continue;
                 };
@@ -142,6 +140,7 @@ pub(super) fn hoist(
                         other.before = Some(source);
                     }
                 }
+                facts = None;
                 moved = true;
                 changed = true;
                 break;
