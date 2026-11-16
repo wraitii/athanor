@@ -1,6 +1,11 @@
-# cranelift-exp
+# Athanor
 
-Experimental JavaScript engine runners.
+Athanor is a toy JavaScript engine written in Rust, built around a single graph
+representation that is progressively optimized and lowered to native code. It
+takes a pure-JIT approach, with no interpreter or bytecode tier, using Oxc for
+parsing and Cranelift or an experimental AArch64 backend for code generation.
+It supports a growing subset of JavaScript, with 0 A.D. random-map generation
+as its main real-world workload.
 
 ## Rust runner
 
