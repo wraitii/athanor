@@ -1,6 +1,18 @@
 use super::*;
 
 impl Heap {
+    pub(crate) fn install_function_prototype(&self, prototype: Value) -> bool {
+        let mut data = self.0.borrow_mut();
+        if data.function_prototype.is_some()
+            || heap_id(prototype).and_then(|id| data.object(id)).is_none()
+        {
+            return false;
+        }
+        data.retain(prototype);
+        data.function_prototype = Some(prototype);
+        true
+    }
+
     pub(crate) fn native_function(&self, function: NativeFunction) -> Option<Value> {
         let mut data = self.0.borrow_mut();
         let id = if let Some((_, id)) = data.natives.iter().find(|(kind, _)| *kind == function) {

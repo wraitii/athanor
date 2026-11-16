@@ -99,7 +99,7 @@ pub(in crate::jit::semantic) fn apply(graph: &mut Graph, body: &Graph, plan: &In
             receiver,
             args,
         } => (callee, Some(*receiver), args.as_slice(), None),
-        Op::ConstructorCallPack(callee, receiver, args) => {
+        Op::CallPack(callee, receiver, args) | Op::ConstructorCallPack(callee, receiver, args) => {
             (callee, Some(*receiver), &[][..], Some(*args))
         }
         _ => unreachable!(),

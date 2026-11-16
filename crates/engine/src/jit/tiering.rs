@@ -112,11 +112,12 @@ impl Tiering {
         nodes: &AstNodes<'a>,
         source: &str,
         filename: &str,
+        intrinsics: bool,
     ) -> Result<(Vec<jit::CompiledFunction>, Vec<String>, Option<usize>), Error> {
         let (functions, globals, initializer, code) = self
             .compiler
             .borrow_mut()
-            .compile_program(program, scoping, nodes, source, filename)?;
+            .compile_program(program, scoping, nodes, source, filename, intrinsics)?;
         let mut entries = self.variants.borrow_mut();
         for (code, entry) in code {
             entries.publish(VariantId::ordinary(code), entry);

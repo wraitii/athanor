@@ -106,8 +106,21 @@ use `JitCtx` for runtime services, allocation, callbacks and error propagation.
 Compiler recognition of selected builtin identities remains an optional fast
 path. Every builtin has a runtime implementation that works without recognition.
 Adding dedicated IR operations is not a prerequisite for extending the library.
-Library functions written in JS can use the existing closure and compilation
-machinery; a facility for registering handwritten IR bodies is not implemented.
+`builtins/setup.js` installs JS library functions using the normal closure and
+compilation machinery. Only this trusted setup enables private intrinsics:
+`$call` and `$callSpread` lower to ordinary call operations with explicit
+receivers, and `$defineHidden` installs a non-enumerable property. Their lowering
+is required even without optimizations, and the names are not runtime globals.
+Packed calls expose their targets to profiling and guarded inlining. A facility
+for registering handwritten IR bodies is not implemented.
+
+`Function.prototype.apply` is a JS wrapper and argument-list helper. Closures and
+native callables resolve inherited methods through the shared function prototype;
+own closure properties take precedence. `apply` accepts array-like objects and
+limits argument lists to 1,048,576 entries. Dynamic `Function` construction and
+boxed `String` construction remain unsupported. Array index writes may grow the
+backing storage with holes, with a 256 MiB limit; assigning a larger `.length`
+remains unsupported.
 
 ### Observable differences
 
@@ -117,7 +130,10 @@ include current implementation gaps; these do not all define a permanent subset:
 - Strings are UTF-8 and indexing and length count Unicode scalar values, not
   UTF-16 code units. For example, `'😀'.length` is 1 and `'😀'[1]` is
   `undefined`. Lone surrogate string literals are rejected. String methods and
-  iteration also operate on scalars where implemented.
+  iteration also operate on scalars where implemented, including `charAt`,
+  `charCodeAt`, `substring` and `substr`. `String.fromCharCode` decodes UTF-16
+  arguments into valid Unicode, accepting surrogate pairs and rejecting unpaired
+  surrogates.
 - General object-to-primitive coercion is currently unsupported. Operations such as
   `[] + 1`, `+[]`, or `[] == true` stop with a runtime error instead of calling
   user conversion methods. Object identity comparisons still work; string

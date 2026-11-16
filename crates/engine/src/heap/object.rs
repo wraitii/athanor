@@ -175,10 +175,18 @@ impl Heap {
                 return Some(if closure.constructable && name == "prototype" {
                     PropertyRead::Prototype
                 } else {
-                    PropertyRead::Value(Value::UNDEFINED)
+                    PropertyRead::Value(data.function_property(name))
                 });
             }
-            Payload::Native(function) => function.static_method(name)?,
+            Payload::Native(function) => {
+                if *function == NativeFunction::Function && name == "prototype" {
+                    return Some(PropertyRead::Value(data.function_prototype?));
+                }
+                match function.static_method(name) {
+                    Some(function) => function,
+                    None => return Some(PropertyRead::Value(data.function_property(name))),
+                }
+            }
             Payload::TypedArray(array) => match name {
                 "length" => {
                     return Some(PropertyRead::Value(Value::number(
@@ -242,7 +250,11 @@ impl Heap {
         }
         let data = self.0.borrow();
         if data.closure(id).is_some() {
-            return Some(data.properties(id)?.get(name).unwrap_or(Value::UNDEFINED));
+            return Some(
+                data.properties(id)?
+                    .get(name)
+                    .unwrap_or_else(|| data.function_property(name)),
+            );
         }
         data.object(id)?;
         data.object_property(id, name)
@@ -470,7 +482,15 @@ impl Heap {
             return Some({
                 data.properties(id)?.contains_key(name)
                     || (closure.constructable && name == "prototype")
+                    || data.function_has_property(name)
             });
+        }
+        if let Payload::Native(function) = &data.live(id)?.payload {
+            return Some(
+                function.static_method(name).is_some()
+                    || (*function == NativeFunction::Function && name == "prototype")
+                    || data.function_has_property(name),
+            );
         }
         if let Some(array) = data.array(id) {
             if matches!(
@@ -619,6 +639,20 @@ pub(crate) struct CachedProperty {
 }
 
 impl HeapData {
+    fn function_has_property(&self, name: &str) -> bool {
+        self.function_prototype
+            .and_then(heap_id)
+            .and_then(|id| self.properties(id))
+            .is_some_and(|properties| properties.contains_key(name))
+    }
+
+    fn function_property(&self, name: &str) -> Value {
+        self.function_prototype
+            .and_then(heap_id)
+            .and_then(|id| self.object_property(id, name))
+            .unwrap_or(Value::UNDEFINED)
+    }
+
     fn reuse_object(&mut self, prototype: Option<Value>) -> Option<u64> {
         let id = *self.pending.front()?;
         if !matches!(self.slot(id).payload, Payload::SmallObject(_)) {

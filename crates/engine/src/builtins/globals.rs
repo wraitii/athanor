@@ -25,6 +25,12 @@ pub(crate) fn install(global: &Environment) -> Result<(), Error> {
         Ok(object)
     };
 
+    let prototype = heap.object().ok_or_else(exhausted)?;
+    let installed = heap.install_function_prototype(prototype);
+    heap.release(prototype);
+    if !installed {
+        return Err(Error::Runtime("cannot install function prototype".into()));
+    }
     global.define("globalThis", Value::GLOBAL_OBJECT);
     global.define_readonly("Infinity", Value::number(f64::INFINITY));
     global.define_readonly("NaN", Value::number(f64::NAN));
@@ -47,7 +53,11 @@ pub(crate) fn install(global: &Environment) -> Result<(), Error> {
         define(name, native(NativeFunction::TypedConstructor(kind))?);
     }
     let math = heap.object().ok_or_else(exhausted)?;
-    for (name, value) in [("PI", std::f64::consts::PI), ("E", std::f64::consts::E)] {
+    for (name, value) in [
+        ("PI", std::f64::consts::PI),
+        ("E", std::f64::consts::E),
+        ("LN2", std::f64::consts::LN_2),
+    ] {
         heap.define_property(math, name, Value::number(value), false);
     }
     add_methods(math, super::MATH_METHODS)?;

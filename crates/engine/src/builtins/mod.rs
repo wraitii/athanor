@@ -2,6 +2,7 @@ mod array;
 mod console;
 mod date;
 mod error;
+mod function;
 mod generator;
 mod globals;
 mod host;
@@ -113,6 +114,9 @@ define_builtins! {
         Set: "Set" => set::call, new => set::construct;
         Array: "Array" => array::call, new => array::construct;
         Print: "print" => console::call;
+        Function: "Function" => function::call;
+        StringConvert: "String" => string::convert;
+        ParseInt: "parseInt" => number::parse_int;
         HostSeedRandom: "hostSeedRandom" => host::seed_random;
     }
     namespaces {
@@ -164,6 +168,10 @@ define_builtins! {
             RegExpExec: "exec" => regexp::call;
         }
         String {
+            StringCharAt: "charAt" => string::call;
+            StringCharCodeAt: "charCodeAt" => string::call;
+            StringSubstring: "substring" => string::call;
+            StringSubstr: "substr" => string::call;
             StringMatch: "match" => regexp::call;
             StringSlice: "slice" => string::call;
             StringSplit: "split" => string::call;
@@ -186,6 +194,9 @@ define_builtins! {
         }
     }
     statics {
+        StringConvert {
+            StringFromCharCode: "fromCharCode" => string::from_char_code;
+        }
         Array {
             ArrayFrom: "from" => array::call;
             ArrayIsArray: "isArray" => array::call;

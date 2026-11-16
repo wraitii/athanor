@@ -916,6 +916,7 @@ pub(in crate::jit::semantic) fn requests(
         for &call in &graph.blocks[block].insts {
             let callee = match &graph.insts[call].op {
                 Op::Call { callee, .. }
+                | Op::CallPack(callee, ..)
                 | Op::ConstructorCall { callee, .. }
                 | Op::ConstructorCallPack(callee, ..) => callee,
                 _ => continue,
@@ -961,6 +962,7 @@ pub(in crate::jit::semantic) fn plan_round(
         };
         let callee = match &graph.insts[request.call].op {
             Op::Call { callee, .. }
+            | Op::CallPack(callee, ..)
             | Op::ConstructorCall { callee, .. }
             | Op::ConstructorCallPack(callee, ..) => callee,
             _ => continue,
@@ -1066,6 +1068,40 @@ mod tests {
             .flat_map(|block| &graph.blocks[block].insts)
             .map(|&inst| &graph.insts[inst].op)
             .collect()
+    }
+
+    #[test]
+    fn library_invocation_exposes_packed_target_for_inlining() {
+        let (mut canonical, bodies) = fixture(
+            "function target(a,b){return this.offset+a+b;} function main(receiver,args){return $callSpread(target,receiver,args);}",
+        );
+        super::super::super::lower_intrinsics(&mut canonical).unwrap();
+        let mut graph = canonical.graph;
+        assert!(
+            operations(&graph)
+                .iter()
+                .any(|op| matches!(op, Op::CallPack(..)))
+        );
+        assert!(
+            !operations(&graph)
+                .iter()
+                .any(|op| matches!(op, Op::GlobalRead(name) if name == "$callSpread"))
+        );
+        let requests = requests(&graph, &bodies, 0, &Budget::default());
+        assert_eq!(requests.len(), 1);
+        let plan = plan(&graph, &bodies, 0, &requests);
+        apply(&mut graph, &bodies, 0, plan, &mut Vec::new()).unwrap();
+        assert!(
+            operations(&graph)
+                .iter()
+                .any(|op| matches!(op, Op::PackTake(..)))
+        );
+        assert!(
+            operations(&graph)
+                .iter()
+                .any(|op| matches!(op, Op::Get(_, name) if name == "offset"))
+        );
+        graph.verify().unwrap();
     }
 
     #[test]

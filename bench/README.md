@@ -90,10 +90,25 @@ Unsupported benchmarks:
 | benchmark | first error |
 |-----------|-------------|
 | deltablue | `cannot assign property "inheritsFrom" of undefined` |
-| crypto | `cannot read property "charCodeAt" of string` |
-| raytrace | `value is not callable in this engine` |
 | earley-boyer | `unsupported unary operator in unary expression` |
-| regexp, splay | ``unknown variable `String` `` |
+| regexp | `split separator must be a string` |
+
+Additional scores on the same machine, medians of three sequential runs per
+engine and benchmark, with the current builtin library and release JIT build.
+Node and Bun use their default configurations; QuickJS uses the C++ runner and
+the same benchmark harness:
+
+| benchmark | jit | node | bun | QuickJS |
+|-----------|----:|-----:|----:|--------:|
+| splay | 3952 | 20870 | 74605 | 5827 |
+| raytrace | 2125 | 107372 | 205791 | 2905 |
+| crypto | 7031 | 64927 | 79353 | 979 |
+
+All three benchmarks completed successfully in every engine.
+
+`Function.prototype.apply` is implemented in JS with a compiler-visible target
+call; string conversion, character/range methods and `parseInt` use Rust
+implementations. RegExp now reaches its first regex separator passed to `split`.
 
 ### Published results
 

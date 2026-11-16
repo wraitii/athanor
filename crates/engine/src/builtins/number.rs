@@ -120,3 +120,52 @@ pub(super) fn call(
         None => fail(ctx, "heap exhausted"),
     }
 }
+
+pub(super) fn parse_int(
+    ctx: *mut JitCtx,
+    _function: NativeFunction,
+    _receiver: Value,
+    args: &[Value],
+) -> Value {
+    let Some(text) = super::string::primitive_text(unsafe { &mut *ctx }, arg(args, 0)) else {
+        return Value::UNDEFINED;
+    };
+    let value = arg(args, 1);
+    if value.is_object() {
+        return fail(
+            unsafe { &mut *ctx },
+            "parseInt radix object coercion is unsupported",
+        );
+    }
+    let radix = crate::jit::helpers::to_int32(crate::jit::helpers::primitive_number(ctx, value));
+    if radix != 0 && !(2..=36).contains(&radix) {
+        return Value::number(f64::NAN);
+    }
+    let mut text = text.trim_start_matches(crate::jit::conversion::whitespace);
+    let negative = text.starts_with('-');
+    if text.starts_with(['-', '+']) {
+        text = &text[1..];
+    }
+    let hex = text.starts_with("0x") || text.starts_with("0X");
+    let radix = if radix == 0 {
+        if hex { 16 } else { 10 }
+    } else {
+        radix as u32
+    };
+    if radix == 16 && hex {
+        text = &text[2..];
+    }
+    let mut result = 0.0;
+    let mut digits = 0;
+    for c in text.chars() {
+        let Some(digit) = c.to_digit(radix).filter(|_| c.is_ascii()) else {
+            break;
+        };
+        result = result * radix as f64 + digit as f64;
+        digits += 1;
+    }
+    if digits == 0 {
+        return Value::number(f64::NAN);
+    }
+    Value::number(if negative { -result } else { result })
+}

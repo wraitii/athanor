@@ -149,14 +149,16 @@ impl Engine {
         }
         let global = Environment::new();
         crate::builtins::install(&global)?;
-        Ok(Self {
+        let mut engine = Self {
             tiering: jit::Tiering::new(options)?,
             random_state: Cell::new(0x330e),
             global,
             functions: RefCell::new(FxHashMap::default()),
             locals: jit::LocalSlots::new(),
             host: None,
-        })
+        };
+        engine.compile_source(include_str!("builtins/setup.js"), "<builtins>", true)?;
+        Ok(engine)
     }
 
     pub(crate) fn seed_random(&self, seed: u32) {
@@ -209,7 +211,16 @@ impl Engine {
     }
 
     pub fn compile(&mut self, source: &str, filename: &str) -> Result<(), Error> {
-        if let Some(initializer) = self.prepare_source(source, filename)? {
+        self.compile_source(source, filename, false)
+    }
+
+    fn compile_source(
+        &mut self,
+        source: &str,
+        filename: &str,
+        intrinsics: bool,
+    ) -> Result<(), Error> {
+        if let Some(initializer) = self.prepare_source_inner(source, filename, intrinsics)? {
             let value = unsafe {
                 jit::call(
                     jit::entries::Entry::generic(initializer),
@@ -232,6 +243,15 @@ impl Engine {
         &self,
         source: &str,
         filename: &str,
+    ) -> Result<Option<usize>, Error> {
+        self.prepare_source_inner(source, filename, false)
+    }
+
+    fn prepare_source_inner(
+        &self,
+        source: &str,
+        filename: &str,
+        intrinsics: bool,
     ) -> Result<Option<usize>, Error> {
         let span = tracing::info_span!("Script compilation", filename);
         let _entered = span.enter();
@@ -310,6 +330,7 @@ impl Engine {
                 analysis.semantic.nodes(),
                 source,
                 filename,
+                intrinsics,
             )
             .map_err(|error| match error {
                 Error::Unsupported(message) => Error::Unsupported(format!("{filename}: {message}")),
