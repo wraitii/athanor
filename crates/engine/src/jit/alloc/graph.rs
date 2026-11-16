@@ -512,21 +512,10 @@ pub(crate) fn allocate(
         }
     }
 
-    let mut crossing = SecondaryMap::<Block, bool>::new();
-    for &block in order {
-        crossing[block] = cfg.preds[block]
-            .iter()
-            .any(|&pred| cold[pred] != cold[block]);
-    }
     let mut boundary = SecondaryMap::<Block, Vec<Value>>::new();
-    for value in graph.values.keys() {
-        if !split[value] {
-            continue;
-        }
-        for segment in liveness.of(value) {
-            if segment.live_in && crossing[segment.block] {
-                boundary[segment.block].push(value);
-            }
+    for &(value, block) in &liveness.boundary {
+        if split[value] {
+            boundary[block].push(value);
         }
     }
 

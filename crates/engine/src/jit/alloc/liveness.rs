@@ -5,15 +5,14 @@ use cranelift_codegen::entity::{EntityRef, SecondaryMap};
 pub(super) struct Segment {
     pub start: u32,
     pub end: u32,
-    pub block: Block,
     pub cold: bool,
-    pub live_in: bool,
 }
 
 pub(super) struct Liveness {
     segments: Vec<Segment>,
     ranges: SecondaryMap<Value, (u32, u32)>,
     pub calls: Vec<u32>,
+    pub boundary: Vec<(Value, Block)>,
 }
 
 impl Liveness {
@@ -62,8 +61,14 @@ pub(super) fn compute(
     let mut uses = Vec::new();
     let mut recent = SecondaryMap::<Value, Option<(Block, usize)>>::new();
     let mut calls = Vec::new();
+    let mut position = SecondaryMap::<Block, u32>::new();
+    let mut crossing = SecondaryMap::<Block, bool>::new();
     let mut next = 0;
-    for &block in order {
+    for (index, &block) in order.iter().enumerate() {
+        position[block] = index as u32;
+        crossing[block] = cfg.preds[block]
+            .iter()
+            .any(|&pred| cold[pred] != cold[block]);
         header[block] = next;
         for &param in &graph.blocks[block].params {
             definition[param] = Some((block, def_position(next)));
@@ -127,9 +132,10 @@ pub(super) fn compute(
     let mut live_in = SecondaryMap::<Block, u32>::new();
     let mut live_out = SecondaryMap::<Block, u32>::new();
     let mut used_at = SecondaryMap::<Block, (u32, u32)>::new();
-    let mut touched = Vec::new();
+    let mut touched = vec![0u64; order.len().div_ceil(64)];
     let mut worklist = Vec::new();
-    let mut segments = Vec::new();
+    let mut segments = Vec::<Segment>::new();
+    let mut boundary = Vec::new();
     let mut ranges = SecondaryMap::<Value, (u32, u32)>::new();
     let mut cursor = 0;
     for index in 0..graph.values.len() {
@@ -150,13 +156,20 @@ pub(super) fn compute(
             continue;
         }
 
-        touched.clear();
-        touched.push(def_block);
+        let mut low = position[def_block];
+        let mut high = low;
+        let mut touch = |block: Block| {
+            let at = position[block];
+            touched[at as usize / 64] |= 1 << (at % 64);
+            low = low.min(at);
+            high = high.max(at);
+        };
+        touch(def_block);
         for u in value_uses {
             used_at[u.block] = (stamp, u.at);
             if u.block != def_block && live_in[u.block] != stamp {
                 live_in[u.block] = stamp;
-                touched.push(u.block);
+                touch(u.block);
                 worklist.push(u.block);
             }
         }
@@ -165,7 +178,7 @@ pub(super) fn compute(
                 live_out[pred] = stamp;
                 if pred != def_block && live_in[pred] != stamp {
                     live_in[pred] = stamp;
-                    touched.push(pred);
+                    touch(pred);
                     worklist.push(pred);
                 }
             }
@@ -175,36 +188,50 @@ pub(super) fn compute(
         }
 
         let first_segment = segments.len();
-        for &block in &touched {
-            let entering = live_in[block] == stamp;
-            let start = if entering {
-                use_position(header[block])
-            } else {
-                def_at
-            };
-            let end = if live_out[block] == stamp {
-                def_position(last[block])
-            } else {
-                match used_at[block] {
-                    (seen, at) if seen == stamp => at.max(start),
-                    _ => start,
+        for word in low as usize / 64..=high as usize / 64 {
+            let mut bits = std::mem::take(&mut touched[word]);
+            while bits != 0 {
+                let block = order[word * 64 + bits.trailing_zeros() as usize];
+                bits &= bits - 1;
+                let entering = live_in[block] == stamp;
+                if entering && crossing[block] {
+                    boundary.push((value, block));
                 }
-            };
-            segments.push(Segment {
-                start,
-                end,
-                block,
-                cold: cold[block],
-                live_in: entering,
-            });
+                let start = if entering {
+                    use_position(header[block])
+                } else {
+                    def_at
+                };
+                let end = if live_out[block] == stamp {
+                    def_position(last[block])
+                } else {
+                    match used_at[block] {
+                        (seen, at) if seen == stamp => at.max(start),
+                        _ => start,
+                    }
+                };
+                let segment = Segment {
+                    start,
+                    end,
+                    cold: cold[block],
+                };
+                match segments[first_segment..].last_mut() {
+                    Some(previous)
+                        if previous.end + 1 == start && previous.cold == segment.cold =>
+                    {
+                        previous.end = end;
+                    }
+                    _ => segments.push(segment),
+                }
+            }
         }
-        segments[first_segment..].sort_unstable_by_key(|segment| segment.start);
         ranges[value] = (first_segment as u32, segments.len() as u32);
     }
     Ok(Liveness {
         segments,
         ranges,
         calls,
+        boundary,
     })
 }
 
@@ -283,18 +310,24 @@ mod tests {
             );
         }
         let live = compute(&graph, &cfg.rpo, &cfg, &cold, &input).unwrap();
+        let mut headers = SecondaryMap::<Block, u32>::new();
+        let mut next = 0;
+        for &block in &cfg.rpo {
+            headers[block] = next;
+            next += graph.blocks[block].insts.len() as u32 + 2;
+        }
+        let live_into = |value: Value, block: Block| {
+            let at = use_position(headers[block]);
+            live.of(value).iter().any(|s| s.start <= at && at <= s.end)
+        };
         assert_eq!(live.calls.len(), 1);
-        assert!(live.of(results[0]).iter().any(|s| s.block == entry));
-        assert!(
-            live.of(results[1])
-                .iter()
-                .any(|s| s.block == loop_block && s.live_in)
+        assert_eq!(
+            live.of(results[0]).first().map(|s| s.start),
+            Some(def_position(headers[entry] + 1))
         );
-        assert!(
-            live.of(carried)
-                .iter()
-                .any(|s| s.block == exit && s.live_in)
-        );
+        assert!(live_into(results[1], loop_block));
+        assert!(live_into(carried, exit));
+        assert!(!live_into(results[0], exit));
         let target = crate::jit::alloc::Target {
             int: crate::jit::alloc::Registers {
                 caller_saved: &[0, 1],
