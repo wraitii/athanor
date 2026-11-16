@@ -3,6 +3,7 @@ use cranelift_codegen::entity::SecondaryMap;
 use smallvec::SmallVec;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+use std::rc::Rc;
 
 use super::access::Access;
 use super::guards::{Fact, implies};
@@ -42,7 +43,7 @@ pub(super) struct Available {
 pub(super) type AvailableLoads = FxHashMap<LoadKey, Available>;
 
 pub(super) struct Solved {
-    exits: SecondaryMap<Block, Option<AvailableLoads>>,
+    exits: SecondaryMap<Block, Option<Rc<AvailableLoads>>>,
     aliases: FxHashMap<Value, Value>,
     pub(super) reused: Vec<(Inst, Value)>,
     pub(super) folded: Vec<(Inst, bool)>,
@@ -115,17 +116,22 @@ fn step(
     cold: bool,
     probes: bool,
     aliases: &FxHashMap<Value, Value>,
-    state: &mut AvailableLoads,
+    state: &mut Rc<AvailableLoads>,
 ) -> Option<Reuse> {
     let data = &graph.insts[inst];
     let memory = facts.memory(inst);
     if memory.reenters() {
-        state.retain(|_, entry| entry.read.is_none());
+        if state.values().any(|entry| entry.read.is_some()) {
+            Rc::make_mut(state).retain(|_, entry| entry.read.is_none());
+        }
         return None;
     }
     if memory.writes_state() {
+        if state.is_empty() {
+            return None;
+        }
         let write = Access::written(&data.op, facts, memory.writes);
-        state.retain(|_, entry| {
+        Rc::make_mut(state).retain(|_, entry| {
             entry
                 .read
                 .as_ref()
@@ -167,7 +173,7 @@ fn step(
         read.base = read.base.map(|base| resolve(aliases, base));
         read
     });
-    state.insert(
+    Rc::make_mut(state).insert(
         key,
         Available {
             value: result,
@@ -187,19 +193,21 @@ fn step(
 fn entering(
     graph: &Graph,
     cfg: &Cfg,
-    exits: &SecondaryMap<Block, Option<AvailableLoads>>,
+    exits: &SecondaryMap<Block, Option<Rc<AvailableLoads>>>,
     block: Block,
     aliases: &FxHashMap<Value, Value>,
-) -> AvailableLoads {
+) -> Rc<AvailableLoads> {
     if block == graph.entry {
-        return AvailableLoads::default();
+        return Rc::default();
     }
     let mut incoming = cfg.preds[block]
         .iter()
         .filter_map(|pred| exits[*pred].as_ref().map(|state| (*pred, state)));
-    let Some((first, mut state)) = incoming.next().map(|(pred, state)| (pred, state.clone()))
+    let Some((first, mut state)) = incoming
+        .next()
+        .map(|(pred, state)| (pred, Rc::clone(state)))
     else {
-        return AvailableLoads::default();
+        return Rc::default();
     };
     let edge_truth = |pred: Block| {
         let terminator = graph.blocks[pred].terminator.as_ref()?;
@@ -238,21 +246,38 @@ fn entering(
         }
     };
     let first_edge = edge_truth(first);
-    for (key, entry) in &mut state {
-        entry.truth = truth_on_edge(key, entry, first_edge);
+    if state
+        .iter()
+        .any(|(key, entry)| entry.truth != truth_on_edge(key, entry, first_edge))
+    {
+        for (key, entry) in Rc::make_mut(&mut state) {
+            entry.truth = truth_on_edge(key, entry, first_edge);
+        }
     }
     for (pred, other) in incoming {
         let edge = edge_truth(pred);
-        state.retain(|key, entry| {
-            let Some(other) = other.get(key) else {
+        let merged = |key: &LoadKey, entry: &Available| {
+            let other = other.get(key)?;
+            if entry.value != other.value || entry.read != other.read {
+                return None;
+            }
+            Some(if entry.truth == truth_on_edge(key, other, edge) {
+                entry.truth
+            } else {
+                None
+            })
+        };
+        if state
+            .iter()
+            .all(|(key, entry)| merged(key, entry) == Some(entry.truth))
+        {
+            continue;
+        }
+        Rc::make_mut(&mut state).retain(|key, entry| {
+            let Some(truth) = merged(key, entry) else {
                 return false;
             };
-            if entry.value != other.value || entry.read != other.read {
-                return false;
-            }
-            if entry.truth != truth_on_edge(key, other, edge) {
-                entry.truth = None;
-            }
+            entry.truth = truth;
             true
         });
     }
@@ -304,7 +329,7 @@ pub(super) fn solve(
             }
         }
     }
-    let mut exits = SecondaryMap::<Block, Option<AvailableLoads>>::new();
+    let mut exits = SecondaryMap::<Block, Option<Rc<AvailableLoads>>>::new();
     let mut folded = SecondaryMap::<Inst, Option<bool>>::new();
     let mut dependents = SecondaryMap::<Value, SmallVec<[Value; 2]>>::new();
     let mut pending: BinaryHeap<_> = (0..cfg.rpo.len()).map(Reverse).collect();
@@ -322,10 +347,13 @@ pub(super) fn solve(
         let block = cfg.rpo[rank];
         let mut state = entering(graph, cfg, &exits, block, &aliases);
         // Backedge states start optimistically; keep aliases dominating while they are revised.
-        state.retain(|_, entry| {
+        let dominating = |entry: &Available| {
             let owner = graph.def_block(entry.value);
             owner != block && cfg.dominates(owner, block)
-        });
+        };
+        if !state.values().all(dominating) {
+            Rc::make_mut(&mut state).retain(|_, entry| dominating(entry));
+        }
         let is_cold = cold.contains(&block);
         for &inst in &scan[block] {
             let reuse = step(graph, facts, inst, is_cold, probes, &aliases, &mut state);
@@ -364,7 +392,10 @@ pub(super) fn solve(
                 pending.push(Reverse(rank));
             }
         };
-        if exits[block].as_ref() != Some(&state) {
+        if exits[block]
+            .as_ref()
+            .is_none_or(|exit| !Rc::ptr_eq(exit, &state) && **exit != *state)
+        {
             exits[block] = Some(state);
             for successor in graph.successors(block) {
                 enqueue(successor);
@@ -436,7 +467,7 @@ impl Solved {
                 &mut state,
             );
         }
-        state
+        Rc::unwrap_or_clone(state)
     }
 
     pub(super) fn canonical(&self, value: Value) -> Value {
