@@ -1,14 +1,14 @@
-use super::super::session::JitCtx;
 use super::{arg, fail};
 use crate::heap::NativeFunction;
+use crate::jit::session::JitCtx;
 use crate::value::Value;
 
 /// Returns an owned reference without registering a temporary.
-pub(in crate::jit) fn split(ctx: *mut JitCtx, receiver: Value, args: &[Value]) -> Value {
+pub(crate) fn split(ctx: *mut JitCtx, receiver: Value, args: &[Value]) -> Value {
     split_result(ctx, receiver, args, Value::UNINITIALIZED)
 }
 
-pub(in crate::jit) fn split_result(
+pub(crate) fn split_result(
     ctx: *mut JitCtx,
     receiver: Value,
     args: &[Value],
@@ -32,7 +32,7 @@ pub(in crate::jit) fn split_result(
     } else {
         return fail(unsafe { &mut *ctx }, "split separator must be a string");
     };
-    let mut values = unsafe { super::super::pack::buffer(ctx) };
+    let mut values = unsafe { crate::jit::pack::buffer(ctx) };
     if heap
         .split_string_into(receiver, separator, &mut values.values)
         .is_none()
@@ -43,14 +43,14 @@ pub(in crate::jit) fn split_result(
     match if destination == Value::UNINITIALIZED {
         heap.array_from_owned(values)
     } else {
-        unsafe { super::super::pack::store(ctx, destination, values) }
+        unsafe { crate::jit::pack::store(ctx, destination, values) }
     } {
         Some(value) => value,
         None => fail(unsafe { &mut *ctx }, "heap exhausted"),
     }
 }
 
-pub(in crate::jit) fn call(
+pub(crate) fn call(
     ctx: *mut JitCtx,
     function: NativeFunction,
     receiver: Value,

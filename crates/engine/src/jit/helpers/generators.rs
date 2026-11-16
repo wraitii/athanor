@@ -36,7 +36,7 @@ pub(super) fn generator_result(ctx: &mut JitCtx, value: Value, done: bool) -> Va
     result
 }
 
-pub(super) fn generator_next(ctx: *mut JitCtx, generator: Value) -> Value {
+pub(crate) fn generator_next(ctx: *mut JitCtx, generator: Value) -> Value {
     use crate::heap::{GENERATOR_DONE, GENERATOR_RUNNING};
     let context = unsafe { &mut *ctx };
     let Some(state) = context.global.heap().generator_state(generator) else {

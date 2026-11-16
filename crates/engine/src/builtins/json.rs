@@ -5,7 +5,13 @@ use crate::heap::NativeFunction;
 use crate::jit::session::{Held, JitCtx};
 use crate::value::Value;
 
-pub(in crate::jit) fn call(ctx: &mut JitCtx, function: NativeFunction, args: &[Value]) -> Value {
+pub(super) fn call(
+    ctx: *mut JitCtx,
+    function: NativeFunction,
+    _receiver: Value,
+    args: &[Value],
+) -> Value {
+    let ctx = unsafe { &mut *ctx };
     match function {
         NativeFunction::JsonParse => {
             if !arg(args, 1).is_undefined() {

@@ -1,6 +1,6 @@
-use super::super::session::JitCtx;
 use super::{arg, fail};
 use crate::heap::NativeFunction;
+use crate::jit::session::JitCtx;
 use crate::value::Value;
 
 fn byte_offset(text: &str, index: f64) -> Option<usize> {

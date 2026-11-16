@@ -70,7 +70,7 @@ are relative to `crates/engine/src/` unless stated otherwise.
 4. Lowering: `jit/finalize/`, `jit/semantic/runtime/`, and
    `jit/semantic/ownership_lowering.rs`. The shared graph feeds
    `jit/cranelift/` or `jit/aarch64/`; the latter owns selection and allocation.
-5. Runtime: `jit/session.rs`, `jit/helpers/`, and `jit/builtins/`.
+5. Runtime: `jit/session.rs`, `jit/helpers/`, and `builtins/`.
 6. Inspection: `jit/jitdump.rs`, `jit/semantic/listing.rs`, and
    `crates/runner/src/main.rs`.
 7. Behavioral specs: `crates/engine/tests/`, `heap/tests.rs`, and

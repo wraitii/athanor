@@ -1,5 +1,5 @@
-use super::super::session::JitCtx;
 use crate::heap::{Heap, NativeFunction};
+use crate::jit::session::JitCtx;
 use crate::value::Value;
 
 fn printable(heap: &Heap, value: Value) -> String {
@@ -29,7 +29,12 @@ fn printable(heap: &Heap, value: Value) -> String {
     value.to_string()
 }
 
-pub(super) fn call(ctx: *mut JitCtx, function: NativeFunction, args: &[Value]) -> Value {
+pub(super) fn call(
+    ctx: *mut JitCtx,
+    function: NativeFunction,
+    _receiver: Value,
+    args: &[Value],
+) -> Value {
     let context = unsafe { &mut *ctx };
     let mut output = String::new();
     for (index, value) in args.iter().copied().enumerate() {

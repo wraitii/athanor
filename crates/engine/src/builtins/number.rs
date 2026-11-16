@@ -1,8 +1,8 @@
 use num_bigint::BigUint;
 
-use super::super::session::JitCtx;
 use super::{arg, fail};
 use crate::heap::NativeFunction;
+use crate::jit::session::JitCtx;
 use crate::value::{Value, number_text};
 
 fn parts(value: f64) -> (u64, i32) {

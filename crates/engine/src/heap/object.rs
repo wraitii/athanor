@@ -1,5 +1,6 @@
 use super::*;
 use crate::FxHashSet;
+use crate::builtins::ReceiverKind;
 
 pub(super) struct Enumerator {
     pub(super) current: Option<Value>,
@@ -20,85 +21,6 @@ pub(super) struct ObjectInfo {
 }
 
 pub(super) const INLINE_PROPERTIES: usize = 8;
-
-pub(crate) fn builtin_method(name: &str) -> bool {
-    [
-        array_method,
-        typed_method,
-        regexp_method,
-        string_method,
-        set_method,
-        generator_method,
-    ]
-    .iter()
-    .any(|method| method(name).is_some())
-}
-
-fn array_method(name: &str) -> Option<NativeFunction> {
-    use NativeFunction::*;
-    Some(match name {
-        "filter" => ArrayFilter,
-        "map" => ArrayMap,
-        "every" => ArrayEvery,
-        "some" => ArraySome,
-        "find" => ArrayFind,
-        "forEach" => ArrayForEach,
-        "at" => ArrayAt,
-        "sort" => ArraySort,
-        "join" => ArrayJoin,
-        "pop" => ArrayPop,
-        "indexOf" => ArrayIndexOf,
-        "concat" => ArrayConcat,
-        "push" => ArrayPush,
-        "includes" => ArrayIncludes,
-        "reverse" => ArrayReverse,
-        "slice" => ArraySlice,
-        "flat" => ArrayFlat,
-        "flatMap" => ArrayFlatMap,
-        "fill" => ArrayFill,
-        _ => return None,
-    })
-}
-
-fn typed_method(name: &str) -> Option<NativeFunction> {
-    (name == "fill").then_some(NativeFunction::TypedFill)
-}
-
-fn regexp_method(name: &str) -> Option<NativeFunction> {
-    Some(match name {
-        "test" => NativeFunction::RegExpTest,
-        "exec" => NativeFunction::RegExpExec,
-        _ => return None,
-    })
-}
-
-fn string_method(name: &str) -> Option<NativeFunction> {
-    use NativeFunction::*;
-    Some(match name {
-        "match" => StringMatch,
-        "slice" => StringSlice,
-        "split" => StringSplit,
-        "startsWith" => StringStartsWith,
-        "replace" => StringReplace,
-        "padStart" => StringPadStart,
-        _ => return None,
-    })
-}
-
-fn set_method(name: &str) -> Option<NativeFunction> {
-    use NativeFunction::*;
-    Some(match name {
-        "add" => SetAdd,
-        "has" => SetHas,
-        "delete" => SetDelete,
-        "clear" => SetClear,
-        _ => return None,
-    })
-}
-
-fn generator_method(name: &str) -> Option<NativeFunction> {
-    (name == "next").then_some(NativeFunction::GeneratorNext)
-}
 
 #[repr(C)]
 pub(super) struct SmallObject {
@@ -235,14 +157,8 @@ impl Heap {
 
     /// Returned values are borrowed; native functions and lazy prototypes are resolved by the caller.
     pub(crate) fn read_property(&self, receiver: Value, name: &str) -> Option<PropertyRead> {
-        use NativeFunction::*;
-
         if receiver.is_number() {
-            return Some(PropertyRead::Native(match name {
-                "toFixed" => NumberToFixed,
-                "toString" => NumberToString,
-                _ => return None,
-            }));
+            return Some(PropertyRead::Native(ReceiverKind::Number.method(name)?));
         }
         let data = self.0.borrow();
         let payload = &data.live(heap_id(receiver)?)?.payload;
@@ -262,26 +178,18 @@ impl Heap {
                     PropertyRead::Value(Value::UNDEFINED)
                 });
             }
-            Payload::Native(Array) => match name {
-                "from" => ArrayFrom,
-                "isArray" => ArrayIsArray,
-                _ => return None,
-            },
-            Payload::Native(TypedConstructor(kind)) => match name {
-                "from" => TypedFrom(*kind),
-                _ => return None,
-            },
+            Payload::Native(function) => function.static_method(name)?,
             Payload::TypedArray(array) => match name {
                 "length" => {
                     return Some(PropertyRead::Value(Value::number(
                         array.storage.len() as f64
                     )));
                 }
-                _ => typed_method(name)?,
+                _ => ReceiverKind::TypedArray.method(name)?,
             },
             Payload::RegExp(regexp) => match name {
                 "lastIndex" => return Some(PropertyRead::Value(Value::number(regexp.last_index))),
-                _ => regexp_method(name)?,
+                _ => ReceiverKind::RegExp.method(name)?,
             },
             Payload::Array(array) => match name {
                 "length" => {
@@ -289,7 +197,7 @@ impl Heap {
                         array.elements.len() as f64
                     )));
                 }
-                _ => array_method(name)?,
+                _ => ReceiverKind::Array.method(name)?,
             },
             Payload::String(text) => match name {
                 "length" => {
@@ -297,18 +205,18 @@ impl Heap {
                         text.chars().count() as f64
                     )));
                 }
-                _ => string_method(name)?,
+                _ => ReceiverKind::String.method(name)?,
             },
             Payload::Set(set) => match name {
                 "size" => {
                     return Some(PropertyRead::Value(Value::number(set.entries.len() as f64)));
                 }
-                _ => match set_method(name) {
+                _ => match ReceiverKind::Set.method(name) {
                     Some(function) => function,
                     None => return Some(PropertyRead::Value(Value::UNDEFINED)),
                 },
             },
-            Payload::Generator(_) => match generator_method(name) {
+            Payload::Generator(_) => match ReceiverKind::Generator.method(name) {
                 Some(function) => function,
                 None => return Some(PropertyRead::Value(Value::UNDEFINED)),
             },

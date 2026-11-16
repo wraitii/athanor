@@ -3,7 +3,7 @@ use crate::heap::TypedKind;
 use crate::jit::session::{Held, JitCtx};
 use crate::value::Value;
 
-pub(in crate::jit) fn numeric(ctx: &mut JitCtx, value: Value) -> Option<f64> {
+pub(crate) fn numeric(ctx: &mut JitCtx, value: Value) -> Option<f64> {
     if value.is_object() {
         fail(
             ctx,
@@ -17,7 +17,7 @@ pub(in crate::jit) fn numeric(ctx: &mut JitCtx, value: Value) -> Option<f64> {
     Some(value.to_number())
 }
 
-pub(in crate::jit) fn from(ctx: *mut JitCtx, kind: TypedKind, args: &[Value]) -> Value {
+pub(crate) fn from(ctx: *mut JitCtx, kind: TypedKind, args: &[Value]) -> Value {
     let array = super::array::from(ctx, args);
     let context = unsafe { &mut *ctx };
     if context.error.is_some() || context.exception_pending() {
@@ -46,7 +46,7 @@ pub(in crate::jit) fn from(ctx: *mut JitCtx, kind: TypedKind, args: &[Value]) ->
     result
 }
 
-pub(in crate::jit) fn construct(ctx: &mut JitCtx, kind: TypedKind, args: &[Value]) -> Value {
+pub(crate) fn construct(ctx: &mut JitCtx, kind: TypedKind, args: &[Value]) -> Value {
     let argument = arg(args, 0);
     let length = if argument.is_undefined() {
         0.0
@@ -80,7 +80,7 @@ fn bound(ctx: &mut JitCtx, value: Value, length: usize, default: usize) -> Optio
     })
 }
 
-pub(in crate::jit) fn fill(ctx: &mut JitCtx, receiver: Value, args: &[Value]) -> Value {
+pub(crate) fn fill(ctx: &mut JitCtx, receiver: Value, args: &[Value]) -> Value {
     let heap = ctx.global.heap().clone();
     if heap.typed_kind(receiver).is_none() {
         return fail(ctx, "typed array fill requires a typed array receiver");
@@ -97,4 +97,21 @@ pub(in crate::jit) fn fill(ctx: &mut JitCtx, receiver: Value, args: &[Value]) ->
     };
     heap.typed_fill(receiver, start, end, number);
     ctx.retain(receiver)
+}
+
+pub(super) fn call(
+    ctx: *mut JitCtx,
+    function: crate::heap::NativeFunction,
+    receiver: Value,
+    args: &[Value],
+) -> Value {
+    use crate::heap::NativeFunction;
+    match function {
+        NativeFunction::TypedConstructor(_) => {
+            fail(unsafe { &mut *ctx }, "typed array constructor requires new")
+        }
+        NativeFunction::TypedFrom(kind) => from(ctx, kind, args),
+        NativeFunction::TypedFill => fill(unsafe { &mut *ctx }, receiver, args),
+        _ => unreachable!(),
+    }
 }

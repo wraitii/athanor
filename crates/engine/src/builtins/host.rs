@@ -1,6 +1,6 @@
-use super::super::session::JitCtx;
 use super::{arg, fail};
 use crate::heap::NativeFunction;
+use crate::jit::session::JitCtx;
 use crate::value::Value;
 
 fn text(context: &mut JitCtx, value: Value) -> Option<String> {
@@ -38,7 +38,12 @@ fn host_error(context: &mut JitCtx, message: &str) -> Value {
     Value::UNDEFINED
 }
 
-pub(super) fn call(ctx: *mut JitCtx, function: NativeFunction, args: &[Value]) -> Value {
+pub(super) fn call(
+    ctx: *mut JitCtx,
+    function: NativeFunction,
+    _receiver: Value,
+    args: &[Value],
+) -> Value {
     let context = unsafe { &mut *ctx };
     let required = if function == NativeFunction::HostEvaluateSource {
         2
@@ -68,7 +73,7 @@ pub(super) fn call(ctx: *mut JitCtx, function: NativeFunction, args: &[Value]) -
                 };
                 filter
             };
-            let recursive = super::super::helpers::js_truthy(ctx, arg(args, 2)) == Value::TRUE;
+            let recursive = crate::jit::helpers::js_truthy(ctx, arg(args, 2)) == Value::TRUE;
             let context = unsafe { &mut *ctx };
             context
                 .engine
@@ -87,4 +92,23 @@ pub(super) fn call(ctx: *mut JitCtx, function: NativeFunction, args: &[Value]) -
         },
         Err(error) => host_error(context, &error),
     }
+}
+
+pub(super) fn seed_random(
+    ctx: *mut JitCtx,
+    _function: NativeFunction,
+    _receiver: Value,
+    args: &[Value],
+) -> Value {
+    let argument = arg(args, 0);
+    if argument.is_object() {
+        return fail(
+            unsafe { &mut *ctx },
+            "object-to-primitive conversion is unsupported",
+        );
+    }
+    let seed =
+        crate::jit::helpers::to_int32(crate::jit::helpers::primitive_number(ctx, argument)) as u32;
+    unsafe { &*ctx }.engine.seed_random(seed);
+    Value::UNDEFINED
 }

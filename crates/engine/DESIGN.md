@@ -81,11 +81,33 @@ implementation boundaries, not necessarily permanent design decisions.
 Supported constructs include closures, classes, generators, exceptions with
 `catch`, arrays, typed arrays and a selection of native builtins. Support for a
 construct does not imply all standard corner cases or builtins. The globals
-installed by `install_globals` and the implementations under `jit/builtins/`
+installed by `builtins/globals.rs` and the implementations under `builtins/`
 define the actual library surface. The runner's seeded random implementation
 and synthetic map host are workload-specific. When investigating a discrepancy,
 first distinguish rejected syntax, missing library behavior and a bug in a
 supported path.
+
+### Builtins
+
+`builtins/mod.rs` declares native builtin identities, their exposure as globals,
+namespace members, receiver methods or constructor statics, and their call and
+optional construction handlers. The catalog generates static lookup matches and
+exhaustive dispatch; it does not introduce a dynamic registry. A normal Rust
+builtin needs a catalog entry and its implementation, without changes to the
+engine, heap method-name lists, compiler passes or backends. Parameterized Math
+and typed-array families share their dispatch routes.
+
+`builtins/globals.rs` installs the catalog into each engine. The heap still owns
+value storage and property mechanics, while the library owns method names and
+behavior. JIT call helpers forward native calls and construction to the library;
+handlers borrow their inputs and return owned results. Implementations still
+use `JitCtx` for runtime services, allocation, callbacks and error propagation.
+
+Compiler recognition of selected builtin identities remains an optional fast
+path. Every builtin has a runtime implementation that works without recognition.
+Adding dedicated IR operations is not a prerequisite for extending the library.
+Library functions written in JS can use the existing closure and compilation
+machinery; a facility for registering handwritten IR bodies is not implemented.
 
 ### Observable differences
 

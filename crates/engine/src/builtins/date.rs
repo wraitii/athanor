@@ -1,5 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use super::NativeFunction;
+use crate::jit::session::JitCtx;
 use crate::value::Value;
 
 fn unix_milliseconds(time: SystemTime) -> f64 {
@@ -14,7 +16,12 @@ fn unix_milliseconds(time: SystemTime) -> f64 {
     }
 }
 
-pub(super) fn now() -> Value {
+pub(super) fn call(
+    _ctx: *mut JitCtx,
+    _function: NativeFunction,
+    _receiver: Value,
+    _args: &[Value],
+) -> Value {
     Value::number(unix_milliseconds(SystemTime::now()))
 }
 
