@@ -1,4 +1,4 @@
-use super::super::transforms::loops::{natural_loops, preheader};
+use super::super::transforms::loops::{natural_loop, natural_loops, preheader};
 use crate::{FxHashMap, FxHashSet};
 
 use oxc_syntax::operator::BinaryOperator;

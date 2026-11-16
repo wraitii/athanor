@@ -25,6 +25,23 @@ pub(in crate::jit::semantic) fn preheader(
     .then_some(preheader)
 }
 
+pub(in crate::jit::semantic) fn natural_loop(cfg: &Cfg, header: Block) -> Option<FxHashSet<Block>> {
+    let mut body: Option<FxHashSet<Block>> = None;
+    for &latch in cfg.preds[header].iter() {
+        if !cfg.dominates(header, latch) {
+            continue;
+        }
+        let body = body.get_or_insert_with(|| FxHashSet::from_iter([header]));
+        let mut stack = vec![latch];
+        while let Some(node) = stack.pop() {
+            if body.insert(node) {
+                stack.extend(cfg.preds[node].iter().copied());
+            }
+        }
+    }
+    body
+}
+
 pub(in crate::jit::semantic) fn natural_loops(
     graph: &Graph,
     cfg: &Cfg,

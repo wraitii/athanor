@@ -63,10 +63,7 @@ fn plan(
         let known = Facts::values(&working);
         let (body, entry) = match entry {
             Some((_, header)) => {
-                let Some((_, current)) = natural_loops(&working, &known.cfg)
-                    .into_iter()
-                    .find(|(block, _)| *block == header)
-                else {
+                let Some(current) = natural_loop(&known.cfg, header) else {
                     continue;
                 };
                 let Some(before) = preheader(&working, &known.cfg, header, &current) else {

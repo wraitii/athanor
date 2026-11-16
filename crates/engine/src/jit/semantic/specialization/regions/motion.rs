@@ -17,12 +17,7 @@ impl Motion for JsMotion {
             return None;
         }
         let body: FxHashSet<_> = match point.before {
-            Some(_) => {
-                natural_loops(graph, &facts.cfg)
-                    .into_iter()
-                    .find(|(header, _)| *header == point.target.block)?
-                    .1
-            }
+            Some(_) => natural_loop(&facts.cfg, point.target.block)?,
             None => facts.cfg.rpo.iter().copied().collect(),
         };
         let written: FxHashSet<_> = body
