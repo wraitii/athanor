@@ -42,6 +42,7 @@ pub struct EngineOptions {
     pub ssa_opt: bool,
     pub get_refinement: bool,
     pub background_compile: bool,
+    pub prefetch_compile: bool,
     pub compiler_threads: usize,
     pub inlining: bool,
     pub call_variants: bool,
@@ -73,6 +74,7 @@ impl Default for EngineOptions {
             ssa_opt: true,
             get_refinement: true,
             background_compile: std::env::var("JS_JIT_BACKGROUND").as_deref() != Ok("0"),
+            prefetch_compile: std::env::var("JS_JIT_PREFETCH").as_deref() != Ok("0"),
             compiler_threads: std::env::var("JS_JIT_WORKERS")
                 .ok()
                 .and_then(|value| value.parse().ok())

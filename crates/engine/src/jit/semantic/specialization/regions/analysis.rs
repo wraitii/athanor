@@ -74,13 +74,6 @@ impl<F: std::borrow::Borrow<Facts>> Writes<F> {
             && write.field.conflicts(&read.field)
     }
 
-    pub(in crate::jit::semantic) fn killer(&self, read: &Access) -> Option<Inst> {
-        self.writes
-            .iter()
-            .find(|(inst, write)| self.kills(*inst, write, read))
-            .map(|(inst, _)| *inst)
-    }
-
     pub(in crate::jit::semantic) fn clobbers(&self, read: &Access) -> bool {
         self.writes
             .iter()

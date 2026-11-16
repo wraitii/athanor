@@ -17,10 +17,13 @@ use crate::heap::TypedKind;
 const SPECIALIZATION_REGION_LIMIT: usize = 512;
 
 mod analysis;
+mod assumptions;
 mod cost;
-mod placement;
+mod hoisting;
+mod motion;
 mod planning;
 mod propose;
+mod rewrites;
 mod versioning;
 
 use super::super::transforms::repair;
@@ -165,6 +168,10 @@ pub(in crate::jit::semantic) fn version_string_leaves(
             &mut candidate,
             &blocks,
             Some((preheader, header)),
+            match &original.blocks[preheader].terminator.as_ref().unwrap().kind {
+                TerminatorKind::Jump(target) => target.clone(),
+                _ => unreachable!(),
+            },
             &speculation,
             &[],
             &mut values,
@@ -353,10 +360,25 @@ fn bounded_reads(
         if !region.contains(&header) {
             continue;
         }
+        let mut condition_block = header;
+        let mut visited = FxHashSet::default();
+        while visited.insert(condition_block) {
+            let Some(Terminator {
+                kind: TerminatorKind::Jump(target),
+                ..
+            }) = &graph.blocks[condition_block].terminator
+            else {
+                break;
+            };
+            if !body.contains(&target.block) || !graph.blocks[target.block].params.is_empty() {
+                break;
+            }
+            condition_block = target.block;
+        }
         let Some(Terminator {
             kind: TerminatorKind::Branch(condition, inside, outside),
             ..
-        }) = &graph.blocks[header].terminator
+        }) = &graph.blocks[condition_block].terminator
         else {
             continue;
         };

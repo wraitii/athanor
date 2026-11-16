@@ -179,6 +179,24 @@ its associated facts. When it fails, generated code must continue with correct
 generic semantics, preserving already performed effects rather than restarting
 an effectful computation indiscriminately.
 
+Region versioning prepares speculative proposals and explicit recovery boundaries
+before preserving a generic graph snapshot. It visits loops from inner to outer,
+then the function, rewriting candidates and materializing guards as CFG groups
+with success edges, abstract bailout edges and a scope. Accepted child groups
+remain opaque to parent rewriting. After each accepted candidate, a hoisting
+driver moves eligible groups outward to a fixed point using the rewritten
+graph's effects. The JS motion policy checks dependencies, invalidating effects
+and shape-preserving overwrites; placement no longer relies on a separate graph
+of optimistically rewritten calls. Proposal preparation, candidate rewrites,
+CFG motion and JS motion policy live in `specialization/regions/assumptions.rs`,
+`rewrites.rs`, `hoisting.rs` and `motion.rs` respectively.
+
+Current insertion points and generic recovery targets are distinct. Moving a
+guard retargets its bailout and live inputs to the enclosing generic boundary;
+the old local failure edge becomes unreachable. Independent checks can move
+separately, while compound validation CFGs stay atomic. Continuations and inline
+generic copies are materialized only after planning and guard motion finish.
+
 The compiler can create a generic region copy or extract a continuation from a
 suitable graph boundary. Continuations receive the live values needed to resume
 and may return values for dispatch back to the enclosing graph. Extraction has
@@ -270,9 +288,14 @@ Compile mode does not execute source unless `--execute` is supplied. Use
 `semantic/pipeline.rs`. `JS_JIT_OPT=none`, `baseline`, or `initial` selects an
 optimization level; the default is `full`. Useful switches include
 `JS_JIT_BACKEND=cranelift|native|native-only`, `JS_JIT_BACKGROUND=0`,
-`JS_JIT_INLINE=0`, `JS_JIT_OSR=0`, `JS_JIT_VERIFY=1`,
+`JS_JIT_PREFETCH=0`, `JS_JIT_INLINE=0`, `JS_JIT_OSR=0`, `JS_JIT_VERIFY=1`,
 `JS_JIT_RECOMPILE_LOG=1`, and `JS_JIT_JITDUMP=1` (or `2` with IR). Defaults
 and further controls live in `EngineOptions`.
+
+`JS_JIT_PREFETCH=0` (`EngineOptions::prefetch_compile = false`) disables
+both eager background unlazification and callee precompilation. Functions are
+compiled when first needed; background optimization remains enabled. Prefetch
+compilation is enabled by default and requires background compilation.
 
 Run `cargo test --workspace` for compiler or runtime changes. Tests under
 `crates/engine/tests/` exercise semantics, ownership, specialization, caches,

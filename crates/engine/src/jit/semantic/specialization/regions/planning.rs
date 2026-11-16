@@ -1,529 +1,18 @@
-use super::super::super::guards::{Fact, Origin};
-use super::super::calls::{ConditionalCall, ConditionalPlan};
+use super::super::super::guards::Fact;
+use super::super::calls::ConditionalPlan;
+use super::assumptions::Proposal;
 use super::cost::{Candidate, Verdict, worth};
-use super::placement::Reach;
+use super::hoisting::RecoveryPoint;
+use super::motion::JsMotion;
+use super::rewrites::{Candidates, RegionPlan, plan_region, property_assumptions};
 use super::versioning::{Bailouts, materialize};
 use super::*;
 use crate::{FxHashMap, FxHashSet};
 
-fn pure_guard(graph: &Graph, block: Block) -> bool {
-    let Some(Terminator {
-        kind: TerminatorKind::Branch(condition, ..),
-        ..
-    }) = &graph.blocks[block].terminator
-    else {
-        return false;
-    };
-    let condition = super::super::super::guards::negated(graph, *condition).unwrap_or(*condition);
-    match graph.defining_op(condition) {
-        None => true,
-        Some(op) => matches!(
-            super::super::super::guards::implies(op),
-            Some((_, Fact::Type(_) | Fact::Typed(_) | Fact::Array))
-        ),
-    }
-}
-
-#[derive(Default)]
-pub(in crate::jit::semantic) struct Candidates {
-    locals: Vec<Inst>,
-    facts: Vec<(Value, Fact)>,
-    codes: Vec<(String, cranelift_module::FuncId)>,
-    origins: Vec<(Value, Fact, Origin)>,
-    code_origins: Vec<(String, cranelift_module::FuncId, Origin)>,
-}
-
-struct RegionPlan {
-    locals: Vec<Inst>,
-    body: FxHashSet<Block>,
-    entry: Option<(Block, Block)>,
-    requirements: Vec<Requirement>,
-    calls: Vec<ConditionalCall>,
-    identities: Vec<(String, cranelift_module::FuncId)>,
-    reads: Vec<Inst>,
-    checks: Vec<(Value, Fact)>,
-    guards: Vec<Block>,
-    exits: Vec<Block>,
-    typed_reads: Vec<(Inst, TypedRead)>,
-    survivors: Vec<(Fact, Origin)>,
-    reentry: Option<String>,
-    children: Vec<RegionPlan>,
-}
-
-impl RegionPlan {
-    fn typed(&self) -> Vec<(Value, Option<TypedKind>)> {
-        self.checks
-            .iter()
-            .filter_map(|&(value, fact)| match fact {
-                Fact::Typed(element) => Some((value, element)),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn bounds(&self) -> Vec<(Value, Value)> {
-        self.checks
-            .iter()
-            .filter_map(|&(value, fact)| match fact {
-                Fact::Bound(bound) => Some((value, bound)),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn numbers(&self) -> usize {
-        self.checks
-            .iter()
-            .filter(|(_, fact)| matches!(fact, Fact::Type(_)))
-            .count()
-    }
-
-    fn report(&self, graph: &Graph, depth: usize, children: bool) -> String {
-        use std::fmt::Write;
-
-        let indent = "  ".repeat(depth);
-        let mut out = String::new();
-        match self.entry {
-            Some((preheader, header)) => {
-                writeln!(out, "{indent}region loop at {header} preheader={preheader}").unwrap()
-            }
-            None => writeln!(out, "{indent}region function").unwrap(),
-        }
-        let mut blocks: Vec<_> = self.body.iter().copied().collect();
-        blocks.sort();
-        writeln!(
-            out,
-            "{indent}  blocks: {}",
-            blocks
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-        .unwrap();
-        writeln!(out, "{indent}  speculative: {}", self.speculative()).unwrap();
-        for requirement in &self.requirements {
-            writeln!(
-                out,
-                "{indent}  native {}: {}",
-                requirement.call, requirement.native
-            )
-            .unwrap();
-        }
-        for call in &self.calls {
-            writeln!(
-                out,
-                "{indent}  closed call {}: {} {} {}",
-                call.inst, call.name, call.memory, call.control
-            )
-            .unwrap();
-        }
-        for (name, code) in &self.identities {
-            writeln!(out, "{indent}  identity {name}={code}").unwrap();
-        }
-        for &(value, fact) in &self.checks {
-            let types = match fact {
-                Fact::Shape(shape) => {
-                    writeln!(out, "{indent}  shape assumption {value}: {shape}").unwrap();
-                    continue;
-                }
-                Fact::Cached(cache, _) => {
-                    writeln!(out, "{indent}  cache-hit assumption {value}: {cache}").unwrap();
-                    continue;
-                }
-                Fact::Type(types) => types,
-                _ => continue,
-            };
-            let origin = graph
-                .defining_op(value)
-                .map(|op| graph.op_text(op))
-                .unwrap_or_else(|| "block parameter".into());
-            writeln!(
-                out,
-                "{indent}  number assumption {value} as {types}: {origin}"
-            )
-            .unwrap();
-        }
-        for &inst in &self.locals {
-            writeln!(
-                out,
-                "{indent}  local assumption {inst}: {}",
-                graph.op_text(&graph.insts[inst].op)
-            )
-            .unwrap();
-        }
-        for &inst in &self.reads {
-            writeln!(
-                out,
-                "{indent}  probe {inst}: {}",
-                graph.op_text(&graph.insts[inst].op)
-            )
-            .unwrap();
-        }
-        for &block in &self.guards {
-            writeln!(out, "{indent}  hoisted guard {block}").unwrap();
-        }
-        for &block in &self.exits {
-            writeln!(out, "{indent}  fallback exit {block}").unwrap();
-        }
-        for (value, element) in &self.typed() {
-            writeln!(out, "{indent}  typed receiver {value}: {element:?}").unwrap();
-        }
-        for (object, bound) in &self.bounds() {
-            writeln!(out, "{indent}  length check {bound} <= length({object})").unwrap();
-        }
-        for (inst, read) in &self.typed_reads {
-            writeln!(
-                out,
-                "{indent}  typed read {inst}: element={:?} bounded={}",
-                read.element, read.bounded
-            )
-            .unwrap();
-        }
-        if children {
-            for child in &self.children {
-                out.push_str(&child.report(graph, depth + 1, true));
-            }
-        }
-        out
-    }
-
-    fn speculative(&self) -> bool {
-        !self.locals.is_empty()
-            || !self.identities.is_empty()
-            || !self.requirements.is_empty()
-            || !self.checks.is_empty()
-            || !self.guards.is_empty()
-    }
-}
-
-fn plan_region(
-    graph: &Graph,
-    known: &Facts,
-    body: FxHashSet<Block>,
-    entry: Option<(Block, Block)>,
-    conditional: &[ConditionalCall],
-    candidates: &Candidates,
-) -> Result<(RegionPlan, Graph)> {
-    let locals: Vec<_> = candidates
-        .locals
-        .iter()
-        .copied()
-        .filter(|&inst| {
-            let block = graph.insts[inst].block;
-            body.contains(&block)
-                && graph.blocks[block].insts.contains(&inst)
-                && match graph.insts[inst].op {
-                    Op::Assume(value, Fact::Type(types), _) => !known.of(value).within(types),
-                    Op::Assume(_, Fact::Typed(_) | Fact::Array, _) => true,
-                    _ => false,
-                }
-        })
-        .collect();
-    let blocks: Vec<_> = known
-        .cfg
-        .rpo
-        .iter()
-        .copied()
-        .filter(|block| body.contains(block))
-        .collect();
-    let exits: Vec<_> = blocks
-        .iter()
-        .copied()
-        .filter(|&block| cold_exit(graph, block).is_some())
-        .collect();
-    let fallbacks: FxHashSet<_> = exits
-        .iter()
-        .filter_map(|&block| cold_exit(graph, block))
-        .collect();
-    let written: FxHashSet<_> = body.difference(&fallbacks).copied().collect();
-    let mut requirements = requirements(graph, &blocks);
-    let native_of = |requirement: &Requirement| match graph.insts[requirement.call].op {
-        Op::Call { callee, .. } => (callee, Fact::Native(requirement.native)),
-        _ => unreachable!(),
-    };
-    let mut calls: Vec<_> = conditional
-        .iter()
-        .filter(|call| {
-            written.contains(&graph.insts[call.inst].block)
-                && body.contains(&graph.def_block(call.callee))
-                && matches!(graph.insts[call.inst].op, Op::Call { callee, .. } if callee == call.callee)
-                && matches!(graph.defining_op(call.callee), Some(Op::GlobalRead(name)) if name == &call.name)
-        })
-        .cloned()
-        .collect();
-    let assumed_codes = |call: &ConditionalCall| {
-        call.identities
-            .iter()
-            .all(|identity| candidates.codes.contains(identity))
-    };
-    let assumed_native =
-        |requirement: &Requirement| candidates.facts.contains(&native_of(requirement));
-    requirements.retain(|requirement| assumed_native(requirement));
-    calls.retain(|call| assumed_codes(call));
-    let build = |requirements: &[Requirement], calls: &[ConditionalCall]| {
-        let mut planning = graph.clone();
-        for requirement in requirements {
-            let Op::Call { args, .. } = &planning.insts[requirement.call].op else {
-                unreachable!()
-            };
-            planning.set_op(
-                requirement.call,
-                Op::CallNative(requirement.native, args.clone()),
-            );
-        }
-        let assumed: FxHashMap<Value, cranelift_module::FuncId> = calls
-            .iter()
-            .map(|call| (call.callee, call.target))
-            .collect();
-        (planning, assumed)
-    };
-    let identities_of = |calls: &[ConditionalCall]| {
-        let mut identities = FxHashMap::default();
-        for call in calls {
-            for (name, code) in &call.identities {
-                if identities
-                    .insert(name.clone(), *code)
-                    .is_some_and(|other| other != *code)
-                {
-                    return Err(format!("conflicting code identities for {name}"));
-                }
-            }
-        }
-        let mut identities: Vec<_> = identities.into_iter().collect();
-        identities.sort_by(|a, b| a.0.cmp(&b.0));
-        Ok(identities)
-    };
-    let (mut planning, assumed, identities, guarded, reentry) = loop {
-        let identities = identities_of(&calls)?;
-        let (planning, assumed) = build(&requirements, &calls);
-        let found = conflicts(&planning, &written, &assumed);
-        let dead_identities: FxHashSet<&String> = identities
-            .iter()
-            .filter(|identity| {
-                found.invalidates(&guarded_accesses(&[], std::slice::from_ref(identity)))
-            })
-            .map(|(name, _)| name)
-            .collect();
-        let live_requirements: Vec<bool> = requirements
-            .iter()
-            .map(|requirement| {
-                requirement.captured.is_some()
-                    || !found.invalidates(&guarded_accesses(std::slice::from_ref(requirement), &[]))
-            })
-            .collect();
-        let live_calls: Vec<bool> = calls
-            .iter()
-            .map(|call| {
-                !call
-                    .identities
-                    .iter()
-                    .any(|(name, _)| dead_identities.contains(name))
-            })
-            .collect();
-        if live_requirements.iter().all(|&live| live) && live_calls.iter().all(|&live| live) {
-            let guarded = guarded_accesses(&requirements, &identities);
-            break (planning, assumed, identities, guarded, found.reentry);
-        }
-        let mut index = 0;
-        requirements.retain(|_| {
-            index += 1;
-            live_requirements[index - 1]
-        });
-        let mut index = 0;
-        calls.retain(|_| {
-            index += 1;
-            live_calls[index - 1]
-        });
-    };
-    let mut uses = planning.use_counts();
-    let mut unused: Vec<_> = requirements
-        .iter()
-        .filter_map(|requirement| match graph.insts[requirement.call].op {
-            Op::Call { callee, .. } => Some(callee),
-            _ => None,
-        })
-        .collect();
-    while let Some(value) = unused.pop() {
-        if uses[value] != 0 || !body.contains(&planning.def_block(value)) {
-            continue;
-        }
-        let ValueDef::Result(inst, _) = planning.values[value] else {
-            continue;
-        };
-        match planning.insts[inst].op {
-            Op::Get(object, _) => {
-                uses[object] -= 1;
-                unused.push(object);
-            }
-            Op::GlobalRead(_) => {}
-            _ => continue,
-        }
-        planning.remove_inst(inst);
-    }
-    let shared = Facts::assuming(&planning, &guards::assumed(&FxHashMap::default(), &assumed));
-    let reads = probe_reads(
-        &planning,
-        &body,
-        &written,
-        &blocks,
-        entry.is_none(),
-        &shared,
-    );
-    let available: FxHashSet<_> = reads
-        .iter()
-        .filter_map(|&inst| planning.insts[inst].result())
-        .collect();
-    let assumes = candidates.facts.clone();
-    let numbers = entry_assumes(&planning, &body, &reads, &shared, &assumes);
-    let mut guards = invariant_guards(&planning, &body, &blocks, &reads);
-    if reentry.is_some() {
-        guards.retain(|&block| pure_guard(&planning, block));
-    }
-    // Candidate facts must not narrow the original graph before its guards execute.
-    let assumptions = numbers
-        .iter()
-        .filter_map(|&(value, fact)| Some((value, fact.mask()?)))
-        .collect();
-    // Call rewrites and dead callee removal leave control flow unchanged.
-    let facts = Facts::assuming_values(
-        &planning,
-        known.cfg.clone(),
-        &guards::assumed(&assumptions, &assumed),
-    );
-    let typed = typed_entry(&planning, &body, &available, &facts, &assumes);
-    let objects: Vec<Value> = typed.iter().map(|&(object, _)| object).collect();
-    let mut bounded = bounded_reads(&planning, &facts.cfg, &body, &objects, &available, &facts);
-    bounded.retain(|_, &mut (object, bound)| {
-        assumes.contains(&(object, Fact::Bound(bound)))
-            && (reentry.is_none() || typed.iter().any(|&(typed, _)| typed == object))
-    });
-    let mut bounds: Vec<_> = bounded.values().copied().collect();
-    bounds.sort();
-    bounds.dedup();
-    let mut checks = numbers;
-    checks.extend(
-        typed
-            .iter()
-            .map(|&(object, element)| (object, Fact::Typed(element))),
-    );
-    checks.extend(
-        bounds
-            .iter()
-            .map(|&(object, bound)| (object, Fact::Bound(bound))),
-    );
-    checks.extend(requirements.iter().map(native_of));
-    let mut overwrites = shaped_overwrites(&planning, &written, &assumes);
-    let preserved = loop {
-        let writes = Writes::with_facts(&planning, &written, &shared)
-            .preserving_shapes(&overwrites.iter().map(|&(inst, _)| inst).collect());
-        let preserved: Vec<_> = assumes
-            .iter()
-            .copied()
-            .filter(|&(value, fact)| {
-                if body.contains(&planning.def_block(value)) && !available.contains(&value) {
-                    return false;
-                }
-                match fact {
-                    Fact::Array => true,
-                    Fact::Shape(shape) if reentry.is_none() => {
-                        Access::read(&Op::IsShape(value, shape), &shared)
-                            .is_some_and(|read| !writes.clobbers(&read))
-                    }
-                    Fact::Cached(cache, builtins) if reentry.is_none() => {
-                        (!body.contains(&planning.def_block(cache)) || available.contains(&cache))
-                            && Access::read(&Op::IsPropertyCached(value, cache, builtins), &shared)
-                                .is_some_and(|read| !writes.clobbers(&read))
-                    }
-                    _ => false,
-                }
-            })
-            .collect();
-        let count = overwrites.len();
-        overwrites.retain(|(_, requirement)| preserved.contains(requirement));
-        if overwrites.len() == count {
-            break preserved;
-        }
-    };
-    checks.extend(preserved);
-    let mut typed_reads = Vec::new();
-    for &block in &blocks {
-        for &inst in &planning.blocks[block].insts {
-            if let Op::GetIndex(object, key) | Op::TypedIndex(object, key, _) =
-                planning.insts[inst].op
-                && let Some(&(_, element)) =
-                    typed.iter().find(|(candidate, _)| *candidate == object)
-                && facts.of(key).within(NUMERIC)
-                && !reads.contains(&inst)
-            {
-                let previous = match planning.insts[inst].op {
-                    Op::TypedIndex(_, _, read) => Some(read),
-                    _ => None,
-                };
-                typed_reads.push((
-                    inst,
-                    TypedRead {
-                        element: previous.and_then(|read| read.element).or(element),
-                        bounded: previous.is_some_and(|read| read.bounded)
-                            || bounded.contains_key(&inst),
-                    },
-                ));
-            }
-        }
-    }
-    if locals.is_empty()
-        && identities.is_empty()
-        && requirements.is_empty()
-        && checks.is_empty()
-        && guards.is_empty()
-        && closure_failure_with(&planning, &body, &guarded, &shared).is_some()
-    {
-        return Err(
-            reentry.unwrap_or_else(|| "no invariant entry guards for reentrant fallbacks".into())
-        );
-    }
-    let mut survivors: Vec<(Fact, Origin)> = candidates
-        .origins
-        .iter()
-        .filter(|&&(value, fact, _)| {
-            checks
-                .iter()
-                .any(|&(checked, known)| checked == value && known.implies(fact))
-        })
-        .map(|&(_, fact, origin)| (fact, origin))
-        .collect();
-    survivors.extend(
-        candidates
-            .code_origins
-            .iter()
-            .filter(|(name, code, _)| identities.contains(&(name.clone(), *code)))
-            .map(|&(_, code, origin)| (Fact::Code(code), origin)),
-    );
-    Ok((
-        RegionPlan {
-            locals,
-            body,
-            entry,
-            requirements,
-            calls,
-            identities,
-            reads,
-            checks,
-            guards,
-            exits,
-            typed_reads,
-            survivors,
-            reentry,
-            children: Vec::new(),
-        },
-        planning,
-    ))
-}
-
 fn plan(
     graph: &Graph,
     conditional: &ConditionalPlan,
-    reached: &[Reach],
+    assumptions: &[Proposal],
     notes: &mut Vec<String>,
     shapes: &super::super::shapes::Plan,
 ) -> Result<(Graph, Vec<RegionPlan>)> {
@@ -544,47 +33,94 @@ fn plan(
         .iter()
         .map(|(body, entry)| (entry.map(|(_, header)| header), body.clone()))
         .collect();
+    let points: Vec<_> = candidates
+        .iter()
+        .map(|(body, entry)| {
+            let target = match entry {
+                Some((before, _)) => {
+                    let TerminatorKind::Jump(target) =
+                        &graph.blocks[*before].terminator.as_ref().unwrap().kind
+                    else {
+                        unreachable!()
+                    };
+                    target.clone()
+                }
+                None => Target::new(graph.entry),
+            };
+            RecoveryPoint {
+                before: entry.map(|(before, _)| before),
+                target,
+                body: body.clone(),
+            }
+        })
+        .collect();
+    let mut groups = Vec::new();
     let mut working = graph.clone();
     let mut values: FxHashMap<_, _> = graph.values.keys().map(|value| (value, value)).collect();
     let mut bailouts = Bailouts::new(graph);
     let mut plans: Vec<RegionPlan> = Vec::new();
-    for (mut body, entry) in candidates {
-        for child in &plans {
-            if bodies[&entry.map(|(_, header)| header)]
-                .is_superset(&bodies[&child.entry.map(|(_, header)| header)])
-            {
-                body.extend(&child.body);
-            }
-        }
+    for (_, entry) in candidates {
         let known = Facts::values(&working);
-        let live: FxHashSet<_> = known.cfg.rpo.iter().copied().collect();
-        body.retain(|block| live.contains(block));
+        let (body, entry) = match entry {
+            Some((_, header)) => {
+                let Some((_, current)) = natural_loops(&working, &known.cfg)
+                    .into_iter()
+                    .find(|(block, _)| *block == header)
+                else {
+                    continue;
+                };
+                let Some(before) = preheader(&working, &known.cfg, header, &current) else {
+                    continue;
+                };
+                (current, Some((before, header)))
+            }
+            None => (known.cfg.rpo.iter().copied().collect(), None),
+        };
+        let protected: FxHashSet<_> = groups
+            .iter()
+            .flat_map(|group: &super::hoisting::AssumeCfg| group.blocks.iter().copied())
+            .collect();
         let mut proposals = Candidates::default();
-        for reach in reached.iter().filter(|reach| {
-            body.contains(&reach.use_block)
-                && bodies.get(&reach.header).is_some_and(|outer| {
-                    outer.is_superset(&bodies[&entry.map(|(_, header)| header)])
-                })
-        }) {
-            if reach.local {
-                proposals.locals.push(reach.inst);
+        for proposal in assumptions
+            .iter()
+            .filter(|proposal| body.contains(&proposal.point))
+        {
+            if !matches!(proposal.fact, Fact::Code(_))
+                && !working.blocks[working.insts[proposal.inst].block]
+                    .insts
+                    .contains(&proposal.inst)
+            {
                 continue;
             }
-            match (reach.fact, &reach.global) {
+            if entry.is_none()
+                && matches!(proposal.fact, Fact::Shape(_))
+                && known.cfg.rpo.iter().any(|&block| {
+                    matches!(
+                        working.blocks[block].terminator.as_ref().unwrap().kind,
+                        TerminatorKind::Return(_)
+                    ) && !known.cfg.dominates(proposal.point, block)
+                })
+            {
+                continue;
+            }
+            if proposal.local {
+                proposals.locals.push(proposal.inst);
+            }
+            match (proposal.fact, &proposal.global) {
                 (Fact::Code(code), Some(name)) => {
                     proposals.codes.push((name.clone(), code));
                     proposals
                         .code_origins
-                        .push((name.clone(), code, reach.origin));
+                        .push((name.clone(), code, proposal.origin));
                 }
                 (Fact::Code(_), None) => {}
                 (mut fact, _) => {
-                    let value = values[&reach.value];
+                    let value = values[&proposal.value];
                     if let Fact::Bound(bound) | Fact::Cached(bound, _) = &mut fact {
                         *bound = values[bound];
                     }
                     proposals.facts.push((value, fact));
-                    proposals.origins.push((value, fact, reach.origin));
+                    proposals.origins.push((value, fact, proposal.origin));
                 }
             }
         }
@@ -599,6 +135,7 @@ fn plan(
             entry,
             &conditional.calls,
             &proposals,
+            &protected,
         ) {
             Ok(plan) => plan,
             Err(reason) => {
@@ -658,19 +195,29 @@ fn plan(
         let mut candidate_values = values.clone();
         let mut candidate_notes = Vec::new();
         let added = candidate.blocks.len();
-        if parent.speculative() {
+        let added_groups = if parent.speculative() {
             materialize(
                 &mut candidate,
                 &blocks,
                 parent.entry,
+                points
+                    .iter()
+                    .find(|point| {
+                        point.target.block == entry.map_or(graph.entry, |(_, header)| header)
+                    })
+                    .unwrap()
+                    .target
+                    .clone(),
                 &speculation,
                 &parent.requirements,
                 &mut candidate_values,
                 &mut bailouts,
                 &mut candidate_notes,
             )
-            .map_err(|reason| format!("{label}: {reason}"))?;
-        }
+            .map_err(|reason| format!("{label}: {reason}"))?
+        } else {
+            Vec::new()
+        };
         parent.body.extend(candidate.blocks.keys().skip(added));
         let live: FxHashSet<_> = Cfg::new(&candidate).rpo.into_iter().collect();
         parent.body.retain(|block| live.contains(block));
@@ -712,6 +259,17 @@ fn plan(
         plans = remaining;
         working = candidate;
         values = candidate_values;
+        groups.extend(added_groups);
+        super::hoisting::hoist(
+            &mut working,
+            &mut groups,
+            &points,
+            &bailouts,
+            &values,
+            &JsMotion,
+            notes,
+        );
+        working.verify()?;
     }
     Ok((working, plans))
 }
@@ -745,7 +303,7 @@ pub(in crate::jit::semantic) fn version_regions(
     shapes: &super::super::shapes::Plan,
 ) -> Result<Vec<RegionId>> {
     property_assumptions(graph, notes);
-    let reached = super::propose::assume(graph, conditional);
+    let reached = super::assumptions::prepare(graph, conditional);
     let original = graph.clone();
     let (mut candidate, plans) = plan(&original, conditional, &reached, notes, shapes)?;
     if report_regions {
@@ -811,6 +369,129 @@ mod tests {
         super::super::super::super::js::comparisons::expose(&mut function);
         let graph = function.graph;
         graph
+    }
+
+    #[test]
+    fn assumption_cfg_hoisting_moves_the_recovery_boundary() {
+        let mut graph = graph("function f(a,n){let s=0;for(let i=0;i<n;++i)s+=a*1;return s;}");
+        let proposals = super::super::assumptions::prepare(&mut graph, &ConditionalPlan::default());
+        let generic_entry = graph.entry;
+        let mut notes = Vec::new();
+        let (candidate, _) = plan(
+            &graph,
+            &ConditionalPlan::default(),
+            &proposals,
+            &mut notes,
+            &Default::default(),
+        )
+        .unwrap();
+        assert!(
+            notes.iter().any(|note| note.starts_with("assumption CFG")),
+            "{notes:?}"
+        );
+        let targets: Vec<_> = Cfg::new(&candidate)
+            .rpo
+            .iter()
+            .filter_map(
+                |&block| match &candidate.blocks[block].terminator.as_ref().unwrap().kind {
+                    TerminatorKind::Bailout { target, .. } => Some(target.block),
+                    _ => None,
+                },
+            )
+            .collect();
+        assert!(!targets.is_empty());
+        assert!(
+            targets.iter().all(|&target| target == generic_entry),
+            "{targets:?}"
+        );
+        candidate.verify().unwrap();
+    }
+
+    #[test]
+    fn guard_motion_keeps_a_stable_recovery_identity() {
+        struct Motion;
+        impl super::super::hoisting::Motion for Motion {
+            fn dependencies(
+                &self,
+                _: &Graph,
+                _: &Facts,
+                _: &super::super::hoisting::AssumeCfg,
+                _: &RecoveryPoint,
+            ) -> Option<Vec<Inst>> {
+                Some(Vec::new())
+            }
+        }
+        let original = graph("function f(){return 1;}");
+        let mut candidate = original.clone();
+        let before = candidate.entry;
+        let good = candidate.blocks.push(BlockData::default());
+        candidate.blocks[good].terminator = candidate.blocks[before].terminator.take();
+        let start = candidate.blocks.push(BlockData::default());
+        let exit = candidate.blocks.push(BlockData::default());
+        let bailouts = Bailouts::new(&original);
+        let values = original.values.keys().map(|value| (value, value)).collect();
+        let failure = bailouts.target(&mut candidate, Target::new(original.entry), &values);
+        let condition =
+            candidate.append_value(start, candidate.span, Op::Constant(Constant::Boolean(true)));
+        candidate.terminate(
+            before,
+            candidate.span,
+            TerminatorKind::Jump(Target::new(start)),
+        );
+        candidate.terminate(
+            start,
+            candidate.span,
+            TerminatorKind::Branch(condition, Target::new(exit), failure.clone()),
+        );
+        candidate.terminate(
+            exit,
+            candidate.span,
+            TerminatorKind::Jump(Target::new(good)),
+        );
+        let mut groups = [super::super::hoisting::AssumeCfg {
+            start,
+            exit,
+            fallback: failure.block,
+            recovery: original.entry,
+            before: Some(before),
+            blocks: [start, exit].into_iter().collect(),
+            scope: FxHashSet::default(),
+            dependencies: Vec::new(),
+        }];
+        let points = [RecoveryPoint {
+            before: Some(before),
+            target: Target::new(original.entry),
+            body: [original.entry].into_iter().collect(),
+        }];
+        assert!(!super::super::hoisting::hoist(
+            &mut candidate,
+            &mut groups,
+            &points,
+            &bailouts,
+            &values,
+            &Motion,
+            &mut Vec::new()
+        ));
+        assert!(
+            matches!(&candidate.blocks[exit].terminator.as_ref().unwrap().kind, TerminatorKind::Jump(target) if target.block == good)
+        );
+        candidate.verify().unwrap();
+    }
+
+    #[test]
+    fn proposal_recovery_points_exist_before_cloning() {
+        let mut graph = graph("function f(a,n){let s=0;for(let i=0;i<n;++i)s+=a[i];return s;}");
+        let proposals = super::super::assumptions::prepare(&mut graph, &ConditionalPlan::default());
+        let original = graph.clone();
+        for proposal in proposals {
+            assert_eq!(original.insts[proposal.inst].block, proposal.point);
+            assert!(
+                original.blocks[proposal.point]
+                    .insts
+                    .contains(&proposal.inst)
+            );
+        }
+        original.verify().unwrap();
     }
 
     #[test]
@@ -1241,7 +922,7 @@ mod tests {
             "function f(grid,width){let sum=0;for(let y=0;y<2;++y){const offset=y*width;for(let x=0;x<2;++x)sum+=Math.sqrt(grid[offset+x]);}return sum;}",
         );
         super::super::super::properties::assume_natives(&mut graph);
-        let reached = super::propose::assume(&mut graph, &ConditionalPlan::default());
+        let reached = super::assumptions::prepare(&mut graph, &ConditionalPlan::default());
         let (candidate, plans) = plan(
             &graph,
             &ConditionalPlan::default(),
@@ -1375,7 +1056,7 @@ mod tests {
             "function f(rows){let sum=0;for(let y=0;y<2;++y){const row=rows[y];for(let x=0;x<2;++x)sum+=row[x];}return sum;}",
         );
         super::super::super::properties::assume_natives(&mut graph);
-        let reached = super::propose::assume(&mut graph, &ConditionalPlan::default());
+        let reached = super::assumptions::prepare(&mut graph, &ConditionalPlan::default());
         let (_, plans) = plan(
             &graph,
             &ConditionalPlan::default(),
@@ -1572,8 +1253,8 @@ mod tests {
             })
             .unwrap();
         super::super::super::properties::assume_natives(&mut graph);
-        let reached = super::propose::assume(&mut graph, &ConditionalPlan::default());
-        let (_, plans) = plan(
+        let reached = super::assumptions::prepare(&mut graph, &ConditionalPlan::default());
+        let (candidate, plans) = plan(
             &graph,
             &ConditionalPlan::default(),
             &reached,
@@ -1581,7 +1262,13 @@ mod tests {
             &Default::default(),
         )
         .unwrap();
-        assert!(plans[0].typed().iter().any(|&(object, _)| object == xs));
+        let cfg = Cfg::new(&candidate);
+        let (_, outer_header) = plans[0].entry.unwrap();
+        assert!(cfg.rpo.iter().any(|&block| {
+            let Some(Terminator { kind: TerminatorKind::Branch(condition, good, _), .. }) = &candidate.blocks[block].terminator else { return false };
+            matches!(candidate.defining_op(*condition), Some(Op::IsTyped(object, _)) if *object == xs)
+                && cfg.dominates(good.block, outer_header)
+        }));
         assert!(
             plans[0]
                 .children
@@ -1612,7 +1299,7 @@ mod tests {
             "function f(state){let sum=0;for(let y=0;y<2;++y){state.width=y+1;for(let x=0;x<2;++x)sum+=state.grid[x*state.width];}return sum;}",
         );
         super::super::super::properties::assume_natives(&mut graph);
-        let reached = super::propose::assume(&mut graph, &ConditionalPlan::default());
+        let reached = super::assumptions::prepare(&mut graph, &ConditionalPlan::default());
         let (candidate, plans) = plan(
             &graph,
             &ConditionalPlan::default(),
@@ -1664,29 +1351,6 @@ mod tests {
 
 // Overwrites guarded by their own shape requirement cannot change any shape, so they do not
 // clobber the region's shape or cache checks.
-fn shaped_overwrites(
-    graph: &Graph,
-    written: &FxHashSet<Block>,
-    assumes: &[(Value, Fact)],
-) -> Vec<(Inst, (Value, Fact))> {
-    written
-        .iter()
-        .flat_map(|&block| &graph.blocks[block].insts)
-        .filter_map(|&inst| {
-            let Op::Set(object, ..) = graph.insts[inst].op else {
-                return None;
-            };
-            let &[(shape, _)] = graph.property_accesses.get(&inst)?.shapes.as_slice() else {
-                return None;
-            };
-            let requirement = (object, Fact::Shape(shape));
-            assumes
-                .contains(&requirement)
-                .then_some((inst, requirement))
-        })
-        .collect()
-}
-
 pub(in crate::jit::semantic) fn materialize_properties(graph: &mut Graph) -> Result<()> {
     use super::super::super::{available, dispatch};
     use super::super::properties::{Access, shape_writes};
@@ -1755,77 +1419,4 @@ pub(in crate::jit::semantic) fn materialize_properties(graph: &mut Graph) -> Res
         dispatch::extend_regions(graph, data.block, first);
     }
     graph.verify()
-}
-
-fn property_assumptions(graph: &mut Graph, notes: &mut Vec<String>) {
-    use super::super::super::available;
-
-    let facts = Facts::compute(graph);
-    let solved = available::solve(graph, &facts, &facts.cfg, Default::default(), false);
-    let accesses: FxHashMap<_, _> = graph
-        .property_accesses
-        .iter()
-        .filter_map(|(&inst, access)| Some((access.cache?, (inst, access.shapes.clone()))))
-        .collect();
-    let proposals: Vec<_> = facts
-        .cfg
-        .rpo
-        .iter()
-        .copied()
-        .flat_map(|block| graph.blocks[block].insts.iter().copied())
-        .filter_map(|inst| {
-            let Op::Assume(object, Fact::Property(cache), origin) = graph.insts[inst].op else {
-                return None;
-            };
-            let (access, shapes) = accesses.get(&cache)?;
-            let fact = match (&graph.insts[*access].op, shapes.as_slice()) {
-                (Op::Get(_, name), []) => {
-                    Some(Fact::Cached(cache, crate::heap::builtin_method(&name)))
-                }
-                (Op::Get(..) | Op::Set(..), &[(shape, _)]) => {
-                    (!solved.as_ref().is_some_and(|solved| {
-                        let state = solved.before(graph, &facts, &facts.cfg, inst);
-                        solved.holds(graph, &state, object, Fact::Shape(shape))
-                    }))
-                    .then_some(Fact::Shape(shape))
-                }
-                _ => None,
-            };
-            Some((inst, object, fact, origin))
-        })
-        .collect();
-    let canonical = |value| {
-        solved
-            .as_ref()
-            .map_or(value, |solved| solved.canonical(value))
-    };
-    let mut shapes = FxHashMap::default();
-    let mut conflicting = FxHashSet::default();
-    for &(_, object, fact, _) in &proposals {
-        if let Some(Fact::Shape(shape)) = fact {
-            let object = canonical(object);
-            if shapes
-                .insert(object, shape)
-                .is_some_and(|other| other != shape)
-            {
-                conflicting.insert(object);
-            }
-        }
-    }
-    if !conflicting.is_empty() {
-        notes.push(format!(
-            "property ICs: conflicting shape requirements for {} receiver(s) stay inline",
-            conflicting.len()
-        ));
-    }
-    for (inst, object, fact, origin) in proposals {
-        let fact = fact.filter(|fact| {
-            !matches!(fact, Fact::Shape(_)) || !conflicting.contains(&canonical(object))
-        });
-        if let Some(fact) = fact {
-            graph.set_op(inst, Op::Assume(object, fact, origin));
-        } else {
-            graph.detach_inst(inst);
-        }
-    }
 }

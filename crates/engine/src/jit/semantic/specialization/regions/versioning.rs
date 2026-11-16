@@ -1,3 +1,4 @@
+use super::hoisting::AssumeCfg;
 use crate::jit::profile::{Observation, ReadKind};
 use crate::{FxHashMap, FxHashSet};
 
@@ -107,7 +108,7 @@ fn entry_checks(
     values: &mut FxHashMap<Value, Value>,
     copies: &FxHashSet<Block>,
     original: Target,
-) {
+) -> AssumeCfg {
     let Speculation {
         reads,
         guards,
@@ -126,6 +127,7 @@ fn entry_checks(
         },
         None => Vec::new(),
     };
+    let first = graph.blocks.len();
     let start = graph.blocks.push(BlockData::default());
     let mut current = start;
     let mut guarded_probes = FxHashMap::default();
@@ -534,16 +536,176 @@ fn entry_checks(
     bounds.sort();
     bounds.dedup();
     current = typed_guards(graph, current, &original, &mapped_typed, &bounds);
-    graph.terminate(
-        current,
-        span,
-        TerminatorKind::Jump(Target { block: head, args }),
-    );
+    let good = Target { block: head, args };
+    graph.terminate(current, span, TerminatorKind::Jump(good.clone()));
     match entry {
         Some((preheader, _)) => {
             graph.terminate(preheader, span, TerminatorKind::Jump(Target::new(start)));
         }
         None => graph.entry = start,
+    }
+    AssumeCfg {
+        start,
+        exit: current,
+        fallback: original.block,
+        recovery: head,
+        before: entry.map(|(before, _)| before),
+        blocks: graph.blocks.keys().skip(first).collect(),
+        scope: region.iter().copied().collect(),
+        dependencies: Vec::new(),
+    }
+}
+
+impl AssumeCfg {
+    pub(super) fn atoms(self, graph: &mut Graph) -> Vec<Self> {
+        let mut segments = Vec::new();
+        let mut blocks = FxHashSet::default();
+        let mut current = self.start;
+        let mut start = current;
+        let mut visited = FxHashSet::default();
+        while current != self.exit {
+            if !visited.insert(current) {
+                return vec![self];
+            }
+            blocks.insert(current);
+            match &graph.blocks[current].terminator.as_ref().unwrap().kind {
+                TerminatorKind::Jump(target) if self.blocks.contains(&target.block) => {
+                    current = target.block
+                }
+                TerminatorKind::Branch(_, yes, no) => {
+                    let yes_failure = self.failure_path(graph, yes.block);
+                    let no_failure = self.failure_path(graph, no.block);
+                    let (success, failure, yes) = match (yes_failure, no_failure) {
+                        (Some(failure), None) => (no.clone(), failure, false),
+                        (None, Some(failure)) => (yes.clone(), failure, true),
+                        _ => return vec![self],
+                    };
+                    blocks.extend(failure);
+                    segments.push((
+                        start,
+                        current,
+                        yes,
+                        success.clone(),
+                        std::mem::take(&mut blocks),
+                    ));
+                    current = success.block;
+                    start = current;
+                }
+                _ => return vec![self],
+            }
+        }
+        blocks.insert(current);
+        let mut groups = Vec::new();
+        let mut before = self.before;
+        for (start, branch, yes, good, mut blocks) in segments {
+            let exit = graph.blocks.push(BlockData::default());
+            graph.terminate(exit, graph.span, TerminatorKind::Jump(good.clone()));
+            let TerminatorKind::Branch(_, taken, otherwise) =
+                &mut graph.blocks[branch].terminator.as_mut().unwrap().kind
+            else {
+                unreachable!()
+            };
+            *if yes { taken } else { otherwise } = Target::new(exit);
+            let aliases: Vec<_> = graph.blocks[good.block]
+                .insts
+                .iter()
+                .copied()
+                .take_while(|&inst| matches!(graph.insts[inst].op, Op::AsObject(_)))
+                .collect();
+            for inst in aliases {
+                graph.move_inst(inst, exit);
+            }
+            blocks.insert(exit);
+            groups.push(Self {
+                start,
+                exit,
+                fallback: self.fallback,
+                recovery: self.recovery,
+                before,
+                blocks,
+                scope: self.scope.clone(),
+                dependencies: self.dependencies.clone(),
+            });
+            before = Some(exit);
+        }
+        groups.push(Self {
+            start,
+            before,
+            blocks,
+            ..self
+        });
+        Self::bind_outputs(graph, &groups);
+        groups
+    }
+
+    fn bind_outputs(graph: &mut Graph, groups: &[Self]) {
+        // Narrowing must move with its proof, rather than the next independent check.
+        let cfg = Cfg::new(graph);
+        let proofs: Vec<_> = groups
+            .iter()
+            .flat_map(|group| {
+                group.blocks.iter().filter_map(|&block| {
+                    let TerminatorKind::Branch(condition, good, _) =
+                        &graph.blocks[block].terminator.as_ref()?.kind
+                    else {
+                        return None;
+                    };
+                    if good.block != group.exit {
+                        return None;
+                    }
+                    let (value, fact) = implies(graph.defining_op(*condition)?)?;
+                    Some((group.exit, value, fact))
+                })
+            })
+            .collect();
+        let insts: Vec<_> = groups
+            .iter()
+            .flat_map(|group| &group.blocks)
+            .flat_map(|&block| graph.blocks[block].insts.iter().copied())
+            .collect();
+        for inst in insts {
+            let data = &graph.insts[inst];
+            let (value, required) = match data.op {
+                Op::AsNumber(value) => (value, Fact::Type(ValueType::NUMBER)),
+                Op::AsInteger(value) => (value, Fact::Type(ValueType::INTEGER)),
+                _ => continue,
+            };
+            let block = data.block;
+            let Some(&(exit, _, _)) = proofs.iter().find(|&&(exit, checked, fact)| {
+                exit != block
+                    && checked == value
+                    && fact.implies(required)
+                    && cfg.dominates(exit, block)
+            }) else {
+                continue;
+            };
+            let result = data.result().unwrap();
+            let observations: Vec<_> = graph.blocks[block].insts.iter().copied()
+                .filter(|&inst| matches!(graph.insts[inst].op, Op::Observe(value, Observation::Read(ReadKind::Number), _) if value == result)).collect();
+            graph.move_inst(inst, exit);
+            for observation in observations {
+                graph.move_inst(observation, exit);
+            }
+        }
+    }
+
+    fn failure_path(&self, graph: &Graph, mut block: Block) -> Option<Vec<Block>> {
+        let mut blocks = Vec::new();
+        while block != self.fallback {
+            if !self.blocks.contains(&block)
+                || !graph.cold.contains(&block)
+                || blocks.contains(&block)
+            {
+                return None;
+            }
+            blocks.push(block);
+            let TerminatorKind::Jump(target) = &graph.blocks[block].terminator.as_ref()?.kind
+            else {
+                return None;
+            };
+            block = target.block;
+        }
+        Some(blocks)
     }
 }
 
@@ -713,7 +875,39 @@ impl<'a> Bailouts<'a> {
         }
     }
 
-    fn target(
+    pub(super) fn available(
+        &self,
+        graph: &Graph,
+        target: &Target,
+        values: &FxHashMap<Value, Value>,
+        cfg: &Cfg,
+        before: Option<Block>,
+    ) -> Option<FxHashMap<Value, Value>> {
+        let insertion = before.unwrap_or(graph.entry);
+        super::super::super::boundary::inputs(target, &self.live)
+            .into_iter()
+            .map(|original| {
+                let current = values.get(&original).copied().unwrap_or(original);
+                let available = |value| {
+                    let block = graph.def_block(value);
+                    let defined = match graph.values[value] {
+                        ValueDef::Result(inst, _) => graph.blocks[block].insts.contains(&inst),
+                        ValueDef::Param(_, _) => graph.blocks[block].params.contains(&value),
+                    };
+                    defined && cfg.rpo.contains(&block) && cfg.dominates(block, insertion)
+                };
+                if available(current) {
+                    Some((original, current))
+                } else if available(original) {
+                    Some((original, original))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    pub(super) fn target(
         &self,
         graph: &mut Graph,
         target: Target,
@@ -738,27 +932,17 @@ pub(super) fn materialize(
     graph: &mut Graph,
     region: &[Block],
     entry: Option<(Block, Block)>,
+    recovery: Target,
     speculation: &Speculation<'_>,
     requirements: &[Requirement],
     canonical_values: &mut FxHashMap<Value, Value>,
     bailouts: &mut Bailouts<'_>,
     notes: &mut Vec<String>,
-) -> Result<()> {
+) -> Result<Vec<AssumeCfg>> {
     let generic = bailouts.generic;
     let head = entry.map_or(graph.entry, |(_, header)| header);
-    let generic_head = entry.map_or(generic.entry, |(_, header)| header);
-    let target = Target {
-        block: generic_head,
-        args: entry.map_or_else(Vec::new, |(before, _)| {
-            let TerminatorKind::Jump(target) =
-                &generic.blocks[before].terminator.as_ref().unwrap().kind
-            else {
-                unreachable!()
-            };
-            target.args.clone()
-        }),
-    };
-    let failure = bailouts.target(graph, target, canonical_values);
+    let recovery_block = recovery.block;
+    let failure = bailouts.target(graph, recovery, canonical_values);
     let mut values = region
         .iter()
         .flat_map(|&block| {
@@ -789,7 +973,7 @@ pub(super) fn materialize(
         .collect();
     let hints = super::super::observations::numeric_hints(graph);
     let tested = EntryGuard::at_entry(graph, entry.map_or(graph.entry, |(before, _)| before));
-    entry_checks(
+    let mut group = entry_checks(
         graph,
         region,
         entry,
@@ -802,6 +986,12 @@ pub(super) fn materialize(
         &scope,
         failure,
     );
+    group.recovery = recovery_block;
+    group.dependencies = guarded_accesses(requirements, speculation.code_guards);
+    group
+        .scope
+        .retain(|block| (block.as_u32() as usize) < generic.blocks.len());
+    let mut groups = vec![group];
     for current in canonical_values.values_mut() {
         *current = values.get(current).copied().unwrap_or(*current);
     }
@@ -828,18 +1018,34 @@ pub(super) fn materialize(
             block: data.block,
             args: generic.blocks[data.block].params.clone(),
         };
-        let failure = bailouts.target(graph, target, canonical_values);
-        let failure = number_failure(graph, value, origin.site, failure, data.span);
+        let fallback = bailouts.target(graph, target, canonical_values);
+        let first = graph.blocks.len();
+        let start = graph.blocks.push(BlockData::default());
+        let exit = graph.blocks.push(BlockData::default());
+        let failure = number_failure(graph, value, origin.site, fallback.clone(), data.span);
         let check = graph.append_value(
-            before,
+            start,
             data.span,
             fact.test(value).ok_or("unsupported local assumption")?,
         );
         graph.terminate(
-            before,
+            start,
             data.span,
-            TerminatorKind::Branch(check, Target::new(data.block), failure),
+            TerminatorKind::Branch(check, Target::new(exit), failure.clone()),
         );
+        let good = Target::new(data.block);
+        graph.terminate(exit, data.span, TerminatorKind::Jump(good.clone()));
+        graph.terminate(before, data.span, TerminatorKind::Jump(Target::new(start)));
+        groups.push(AssumeCfg {
+            start,
+            exit,
+            fallback: fallback.block,
+            recovery: data.block,
+            before: Some(before),
+            blocks: graph.blocks.keys().skip(first).collect(),
+            scope: [data.block].into_iter().collect(),
+            dependencies: Vec::new(),
+        });
         if let Some(types) = fact.mask() {
             let (_, number) = graph.insert(
                 data.block,
@@ -861,6 +1067,7 @@ pub(super) fn materialize(
                 .collect();
             retarget(graph, &dominated, value, number.unwrap());
         }
+        graph.detach_inst(inst);
         notes.push(format!("local assumption {inst}: bailout to generic code"));
     }
     for (block, taken) in speculation
@@ -923,7 +1130,12 @@ pub(super) fn materialize(
         *if taken { yes } else { no } = failure;
     }
     consume_assumes(graph, region, entry, speculation.assumes);
-    graph.verify()
+    let groups = groups
+        .into_iter()
+        .flat_map(|group| group.atoms(graph))
+        .collect();
+    graph.verify()?;
+    Ok(groups)
 }
 
 fn append_generic(graph: &mut Graph, generic: &Graph) -> Copy {

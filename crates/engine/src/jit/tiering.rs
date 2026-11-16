@@ -354,7 +354,7 @@ impl Tiering {
     }
 
     fn queue_callees(&self, code: u64) {
-        if !self.options.background_compile {
+        if !self.options.background_compile || !self.options.prefetch_compile {
             return;
         }
         let jobs = self.compiler.borrow().lazy_callees(code);
@@ -423,7 +423,7 @@ impl Tiering {
     }
 
     pub(crate) fn queue_unlazification(&self) {
-        if !self.options.background_compile {
+        if !self.options.background_compile || !self.options.prefetch_compile {
             return;
         }
         let codes = self.compiler.borrow().lazy_codes();

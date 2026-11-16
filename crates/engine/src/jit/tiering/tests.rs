@@ -1257,6 +1257,36 @@ fn background_unlazification_drains_uncalled_bodies_across_sources() {
 }
 
 #[test]
+fn disabling_prefetch_compiles_only_demanded_functions() {
+    let mut engine = Engine::with_options(EngineOptions {
+        background_compile: true,
+        prefetch_compile: false,
+        inlining: false,
+        ..Default::default()
+    })
+    .unwrap();
+    engine.compile("function caller(a){return callee(a);} function callee(a){return a.items[0];} function unused(a){return a.items[1];} var holder={items:[3,7]};", "demand.js").unwrap();
+    let caller = code(&engine, "caller");
+    let callee = code(&engine, "callee");
+    let unused = code(&engine, "unused");
+    assert!(engine.tiering.worker.borrow().is_none());
+    assert_eq!(engine.tiering.compiler.borrow().lazy_codes().len(), 3);
+    engine.tiering.entry(caller).unwrap().unwrap();
+    finish_compilation(&engine);
+    assert!(!engine.tiering.compiler.borrow().has_lazy(caller));
+    assert!(engine.tiering.compiler.borrow().has_lazy(callee));
+    assert!(engine.tiering.compiler.borrow().has_lazy(unused));
+    let holder = engine.global().get_raw("holder").unwrap();
+    assert_eq!(
+        engine.call("caller", &[holder]).unwrap().value(),
+        Value::number(3.0)
+    );
+    finish_compilation(&engine);
+    assert!(!engine.tiering.compiler.borrow().has_lazy(callee));
+    assert!(engine.tiering.compiler.borrow().has_lazy(unused));
+}
+
+#[test]
 fn synchronous_compilation_prefetches_callees_exposed_by_inlining() {
     let mut engine = Engine::with_options(EngineOptions {
         background_compile: true,

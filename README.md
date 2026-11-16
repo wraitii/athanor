@@ -98,6 +98,24 @@ Compile mode does not execute the source unless given `--execute 'JS'`.
 `--after PASS` inspects a lowering boundary; `--ast` shows the parsed source.
 Use `JS_JIT_OPT=none` to compare against unoptimized semantic graphs.
 
+For a compile-time benchmark without inspection output or execution, use:
+
+```sh
+cargo build --release -p js-runner
+time target/release/js-runner --compile --no-ir script.js
+```
+
+Compile mode eagerly compiles all functions in the file, including uncalled and
+nested functions. It does not execute library loads. To benchmark a map script,
+remove its `generateMap` export as the map bootstrap does:
+
+```sh
+sed 's/export function\* generateMap/function* generateMap/' \
+  ../binaries/data/mods/public/maps/random/belgian_uplands.js \
+  > /tmp/belgian_uplands.js
+time target/release/js-runner --compile --no-ir /tmp/belgian_uplands.js
+```
+
 See [DESIGN.md](crates/engine/DESIGN.md) for architecture, supported semantics,
 ownership, compiler controls, and detailed inspection and profiling instructions.
 See [bench/README.md](bench/README.md) for benchmarks and [AGENTS.md](AGENTS.md)
