@@ -40,6 +40,21 @@ cpp-quickjs/build/mapgen-runner --bootstrap bench/v8-v7/quickjs.js bench/v8-v7/r
 cpp-quickjs/build/mapgen-runner --bootstrap bench/v8-v7/quickjs.js bench/v8-v7/navier-stokes.js
 ```
 
+### Ant
+
+Use the official macOS ARM64 release binary; its JIT is enabled by default.
+The results below use [Ant 16.5.c41757b4.0](https://github.com/theMackabu/ant/releases/tag/v16.5.c41757b4.0).
+Combine the existing harness, benchmark, and driver into one entry script:
+
+```sh
+{ printf 'function print(text) { console.log(text); }\n';
+  cat bench/v8-v7/base.js bench/v8-v7/navier-stokes.js bench/v8-v7/driver.js;
+} > /tmp/ant-navier-stokes.js
+/path/to/ant /tmp/ant-navier-stokes.js
+```
+
+Substitute the benchmark path for Richards or Gaussian blur.
+
 ### Gaussian blur
 
 `gaussian-blur.js` benchmarks a 3×3 Gaussian convolution over the interior of
@@ -57,17 +72,18 @@ cpp-quickjs/build/mapgen-runner --bootstrap bench/v8-v7/quickjs.js bench/gaussia
 
 ### Results
 
-Apple Silicon; node 23.9.0, bun 1.3.1, QuickJS 2026-06-04. Higher is better.
+Apple Silicon, 2026-11-16; node 23.9.0, bun 1.3.1, SpiderMonkey 128,
+QuickJS 2026-06-04, Ant 16.5.c41757b4.0. Higher is better.
 
-| benchmark | jit | node jitless | node ≤Sparkplug | node ≤Maglev | node | bun | QuickJS |
-|-----------|----:|-------------:|----------------:|-------------:|-----:|----:|--------:|
-| richards | 3272 | 1753 | 1952 | 33717 | 46221 | 53147 | 1177 |
-| navier-stokes | 6293 | 2503 | 3620 | 28048 | 40662 | 34429 | 1779 |
-| gaussian-blur | 207 | 13.2 | 20.3 | 235 | 659 | 1313 | 7.99 |
+| benchmark | jit | node jitless | node ≤Sparkplug | node ≤Maglev | node | bun | Ant | SpiderMonkey 128 | QuickJS |
+|-----------|----:|-------------:|----------------:|-------------:|-----:|----:|----:|----------------:|--------:|
+| richards | 4162 | 1753 | 2835 | 33057 | 44911 | 51315 | 5454 | 15621 | 1139 |
+| navier-stokes | 24462 | 2370 | 3379 | 27788 | 40392 | 34280 | 20755 | 21390 | 1783 |
+| gaussian-blur | 289 | 12.9 | 19.9 | 229 | 648 | 1286 | 153 | 260 | 7.93 |
 
-JIT, QuickJS, and Gaussian blur scores are medians of three runs; other scores
-are from single runs. All Gaussian blur runs produced an output buffer sum of
-`2019780`.
+All scores are medians of three runs, with benchmark processes run sequentially.
+The standard harness warms up each benchmark for one second before measurement.
+All engines produced a Gaussian blur output buffer sum of `2019780`.
 
 Unsupported benchmarks:
 
@@ -122,8 +138,10 @@ All engines must report the same `heightHash` (`dd1de906` for belgian_uplands).
 | engine          | belgian_uplands |
 |-----------------|-----------------|
 | SpiderMonkey 128 | 330 ms         |
-| jit             | 979 ms         |
+| jit             | 829 ms         |
+| Ant             | 2195 ms        |
 | QuickJS         | 7537 ms         |
 
-JIT time is the median of three runs; C++ runners were run once each.
-All runs produced the expected `heightHash`.
+JIT and Ant times are medians of three sequential runs; C++ runners were run once each.
+Ant uses the same bootstrap and settings through JavaScript file-loading and
+seeded-random host adapters. All runs produced the expected `heightHash`.
