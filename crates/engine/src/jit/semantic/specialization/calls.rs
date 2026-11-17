@@ -888,12 +888,11 @@ fn call_target(
         start: data.span.start,
         end: data.span.end,
     };
-    if let Some(target) = bodies
-        .feedback
-        .get(&site)
-        .and_then(|targets| targets.first())
-    {
-        return Some(*target);
+    if let Some(targets) = bodies.feedback.get(&site) {
+        return match targets.as_slice() {
+            [target] => Some(*target),
+            _ => None,
+        };
     }
     match graph.defining_op(callee) {
         Some(Op::GlobalRead(name)) => bodies.globals.get(name).copied(),
@@ -1833,6 +1832,43 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn polymorphic_feedback_keeps_calls_out_of_inlining() {
+        for call in ["square(x)", "object.square(x)"] {
+            let (canonical, mut bodies) = fixture(&format!(
+                "function square(x){{return x*x;}} function other(x){{return x+1;}} function main(x){{return {call};}}"
+            ));
+            let mut graph = canonical.graph;
+            for data in graph.insts.values() {
+                if matches!(data.op, Op::Call { .. }) {
+                    bodies.feedback.insert(
+                        crate::jit::profile::Site {
+                            inline_context: 0,
+                            source: 0,
+                            start: data.span.start,
+                            end: data.span.end,
+                        },
+                        vec![FuncId::from_u32(0), FuncId::from_u32(1)],
+                    );
+                }
+            }
+            assert!(requests(&graph, &bodies, 0, &Budget::default()).is_empty());
+            direct_calls(&mut graph, &bodies, 0);
+            assert!(
+                operations(&graph)
+                    .iter()
+                    .any(|op| matches!(op, Op::Call { target: None, .. }))
+            );
+            let variants = super::super::call_variants::apply(&mut graph, &bodies, 0).unwrap();
+            for code in [0, 1] {
+                assert!(variants.iter().any(|(_, variant)| {
+                    *variant == crate::jit::entries::VariantId::ordinary(code)
+                }));
+            }
+            graph.verify().unwrap();
+        }
     }
 
     #[test]

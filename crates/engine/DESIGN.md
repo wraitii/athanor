@@ -304,6 +304,8 @@ region versions. A guard is a runtime condition; only the success path may use
 its associated facts. When it fails, generated code must continue with correct
 generic semantics, preserving already performed effects rather than restarting
 an effectful computation indiscriminately.
+Inlining selects a target only for monomorphic call feedback; polymorphic sites
+retain guarded call dispatch.
 
 Region versioning prepares speculative proposals and explicit recovery boundaries
 before preserving a generic graph snapshot. It visits loops from inner to outer,
