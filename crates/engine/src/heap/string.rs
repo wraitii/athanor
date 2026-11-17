@@ -93,6 +93,25 @@ impl Heap {
         Some(text.is_empty())
     }
 
+    // The closure must not access the heap.
+    pub(crate) fn with_text<R>(&self, value: Value, f: impl FnOnce(&str) -> R) -> Option<R> {
+        if !value.is_string() {
+            return None;
+        }
+        let data = self.0.borrow();
+        let text = data.string(heap_id(value)?)?;
+        Some(f(text))
+    }
+
+    pub(crate) fn substring(&self, value: Value, range: std::ops::Range<usize>) -> Option<Value> {
+        self.drain(64);
+        let mut data = self.0.borrow_mut();
+        let piece = data.string(heap_id(value)?)?.get(range)?.to_owned();
+        let id = data.reserve()?;
+        data.store(id, Payload::String(piece));
+        Some(Value::from_bits(TAG_STRING | id))
+    }
+
     pub(crate) fn text(&self, value: Value) -> Option<String> {
         if !value.is_string() {
             return None;

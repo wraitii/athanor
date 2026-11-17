@@ -22,34 +22,49 @@ fn next_offset(text: &str, end: usize) -> Option<usize> {
         .map(|character| end + character.len_utf8())
 }
 
-fn capture_array(ctx: &mut JitCtx, text: &str, found: regress::Match) -> Value {
-    let heap = ctx.global.heap().clone();
-    let mut values = Vec::with_capacity(found.captures.len() + 1);
-    for range in std::iter::once(Some(found.range)).chain(found.captures) {
-        let value = if let Some(range) = range {
-            let Some(piece) = text.get(range) else {
-                for value in values {
-                    heap.release(value);
-                }
-                return fail(ctx, "regular expression returned an invalid UTF-8 range");
+fn match_ranges(regex: &regress::Regex, text: &str, global: bool) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut offset = 0;
+    while let Some(found) = regex.find_from(text, offset).next() {
+        let empty = found.range.is_empty();
+        let end = found.range.end;
+        ranges.push(found.range);
+        if !global {
+            break;
+        }
+        offset = if empty {
+            let Some(next) = next_offset(text, end) else {
+                break;
             };
-            let Some(value) = heap.string(piece) else {
-                for value in values {
-                    heap.release(value);
-                }
-                return fail(ctx, "heap exhausted");
-            };
-            value
+            next
         } else {
-            Value::UNDEFINED
+            end
+        };
+    }
+    ranges
+}
+
+fn pieces(
+    ctx: &mut JitCtx,
+    input: Value,
+    ranges: impl IntoIterator<Item = Option<std::ops::Range<usize>>>,
+) -> Value {
+    let heap = ctx.global.heap().clone();
+    let mut values = Vec::new();
+    for range in ranges {
+        let value = match range {
+            Some(range) => match heap.substring(input, range) {
+                Some(value) => value,
+                None => {
+                    heap.release_all(&values);
+                    return fail(ctx, "heap exhausted");
+                }
+            },
+            None => Value::UNDEFINED,
         };
         values.push(value);
     }
-    let array = heap.array(&values);
-    for value in values {
-        heap.release(value);
-    }
-    match array {
+    match heap.array_from_owned(values) {
         Some(value) => value,
         None => fail(ctx, "heap exhausted"),
     }
@@ -74,75 +89,49 @@ pub(super) fn call(
             "regular expression method requires a RegExp receiver or argument",
         );
     };
-    let Some(text) = heap.text(input) else {
-        return fail(ctx, "regular expression matching requires a string");
-    };
     let (global, last_index) = heap.regexp_state(regexp).unwrap();
     if function == NativeFunction::StringMatch && global {
         heap.regexp_set_last_index(regexp, 0.0);
-        let mut offset = 0;
-        let mut values = Vec::new();
-        while let Some(found) = regex.find_from(&text, offset).next() {
-            let Some(piece) = text.get(found.range.clone()) else {
-                for value in values {
-                    heap.release(value);
-                }
-                return fail(ctx, "regular expression returned an invalid UTF-8 range");
-            };
-            let Some(value) = heap.string(piece) else {
-                for value in values {
-                    heap.release(value);
-                }
-                return fail(ctx, "heap exhausted");
-            };
-            values.push(value);
-            if found.range.is_empty() {
-                let Some(next) = next_offset(&text, found.range.end) else {
-                    break;
-                };
-                offset = next;
-            } else {
-                offset = found.range.end;
-            }
-        }
-        if values.is_empty() {
+        let Some(ranges) = heap.with_text(input, |text| match_ranges(&regex, text, true)) else {
+            return fail(ctx, "regular expression matching requires a string");
+        };
+        if ranges.is_empty() {
             return Value::NULL;
         }
-        let array = heap.array(&values);
-        for value in values {
-            heap.release(value);
-        }
-        return match array {
-            Some(value) => value,
-            None => fail(ctx, "heap exhausted"),
-        };
+        return pieces(ctx, input, ranges.into_iter().map(Some));
     }
-    let offset = if global {
-        byte_offset(&text, last_index)
-    } else {
-        Some(0)
-    };
-    let found = offset.and_then(|offset| regex.find_from(&text, offset).next());
-    if global {
-        let end = match &found {
-            Some(found) => match text.get(..found.range.end) {
-                Some(prefix) => prefix.chars().count() as f64,
-                None => return fail(ctx, "regular expression returned an invalid UTF-8 range"),
-            },
-            None => 0.0,
+    let Some((found, end)) = heap.with_text(input, |text| {
+        let offset = if global {
+            byte_offset(text, last_index)
+        } else {
+            Some(0)
         };
+        let found = offset.and_then(|offset| regex.find_from(text, offset).next());
+        let end = match &found {
+            Some(found) if global => text[..found.range.end].chars().count() as f64,
+            _ => 0.0,
+        };
+        (found, end)
+    }) else {
+        return fail(ctx, "regular expression matching requires a string");
+    };
+    if global {
         heap.regexp_set_last_index(regexp, end);
     }
     if function == NativeFunction::RegExpTest {
         return Value::boolean(found.is_some());
     }
     match found {
-        Some(found) => capture_array(ctx, &text, found),
+        Some(found) => pieces(
+            ctx,
+            input,
+            std::iter::once(Some(found.range)).chain(found.captures),
+        ),
         None => Value::NULL,
     }
 }
 
-pub(super) fn replace(ctx: &mut JitCtx, text: &str, regexp: Value, replacement: Value) -> Value {
+pub(super) fn replace(ctx: &mut JitCtx, input: Value, regexp: Value, replacement: Value) -> Value {
     let heap = ctx.global.heap().clone();
     let Some(replacement) = heap.text(replacement) else {
         return fail(ctx, "replace requires a literal string replacement");
@@ -157,35 +146,27 @@ pub(super) fn replace(ctx: &mut JitCtx, text: &str, regexp: Value, replacement: 
     if global {
         heap.regexp_set_last_index(regexp, 0.0);
     }
-    let mut output = String::new();
-    let mut previous = 0;
-    let mut offset = 0;
-    while let Some(found) = regex.find_from(text, offset).next() {
-        let Some(prefix) = text.get(previous..found.range.start) else {
-            return fail(ctx, "regular expression returned an invalid UTF-8 range");
-        };
-        if text.get(found.range.clone()).is_none() {
-            return fail(ctx, "regular expression returned an invalid UTF-8 range");
+    let Some(output) = heap.with_text(input, |text| {
+        let ranges = match_ranges(&regex, text, global);
+        if ranges.is_empty() {
+            return None;
         }
-        output.push_str(prefix);
-        output.push_str(&replacement);
-        previous = found.range.end;
-        if !global {
-            break;
+        let mut output = String::with_capacity(text.len());
+        let mut previous = 0;
+        for range in ranges {
+            output.push_str(&text[previous..range.start]);
+            output.push_str(&replacement);
+            previous = range.end;
         }
-        if found.range.is_empty() {
-            let Some(next) = next_offset(text, found.range.end) else {
-                break;
-            };
-            offset = next;
-        } else {
-            offset = found.range.end;
-        }
-    }
-    let Some(suffix) = text.get(previous..) else {
-        return fail(ctx, "regular expression returned an invalid UTF-8 range");
+        output.push_str(&text[previous..]);
+        Some(output)
+    }) else {
+        return fail(ctx, "string method requires a string receiver");
     };
-    output.push_str(suffix);
+    let Some(output) = output else {
+        heap.retain(input);
+        return input;
+    };
     match heap.string(&output) {
         Some(value) => value,
         None => fail(ctx, "heap exhausted"),

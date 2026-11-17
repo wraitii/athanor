@@ -25,18 +25,24 @@ pub(crate) fn split_result(
     if args.len() > 1 && arg(1) != Value::UNDEFINED {
         return fail(unsafe { &mut *ctx }, "split limit is unsupported");
     }
-    let separator = if arg(0) == Value::UNDEFINED {
+    let regexp = heap.regexp_state(arg(0)).is_some();
+    let separator = if regexp || arg(0) == Value::UNDEFINED {
         None
     } else if heap.string_is_empty(arg(0)).is_some() {
         Some(arg(0))
     } else {
-        return fail(unsafe { &mut *ctx }, "split separator must be a string");
+        return fail(
+            unsafe { &mut *ctx },
+            "split separator must be a string or RegExp",
+        );
     };
     let mut values = unsafe { crate::jit::pack::buffer(ctx) };
-    if heap
-        .split_string_into(receiver, separator, &mut values.values)
-        .is_none()
-    {
+    let split = if regexp {
+        heap.regexp_split_into(receiver, arg(0), &mut values.values)
+    } else {
+        heap.split_string_into(receiver, separator, &mut values.values)
+    };
+    if split.is_none() {
         return fail(unsafe { &mut *ctx }, "heap exhausted");
     }
     let values = std::mem::take(&mut values.values);
@@ -63,6 +69,9 @@ pub(crate) fn call(
     let context = unsafe { &mut *ctx };
     let heap = context.global.heap().clone();
     let arg = |index: usize| arg(args, index);
+    if function == StringReplace && heap.regexp_state(arg(0)).is_some() {
+        return super::regexp::replace(context, receiver, arg(0), arg(1));
+    }
     let Some(text) = heap.text(receiver) else {
         return fail(context, "string method requires a string receiver");
     };
@@ -155,9 +164,6 @@ pub(crate) fn call(
             );
         }
         StringReplace => {
-            if heap.regexp_state(arg(0)).is_some() {
-                return super::regexp::replace(context, &text, arg(0), arg(1));
-            }
             let (Some(search), Some(replacement)) = (string_arg(arg(0)), string_arg(arg(1))) else {
                 return fail(context, "replace requires literal string arguments");
             };

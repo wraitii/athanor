@@ -91,7 +91,6 @@ Unsupported benchmarks:
 |-----------|-------------|
 | deltablue | `cannot assign property "inheritsFrom" of undefined` |
 | earley-boyer | `unsupported unary operator in unary expression` |
-| regexp | `split separator must be a string` |
 
 Additional scores on the same machine, medians of three sequential runs per
 engine and benchmark, with the current builtin library and release JIT build.
@@ -108,7 +107,7 @@ All three benchmarks completed successfully in every engine.
 
 `Function.prototype.apply` is implemented in JS with a compiler-visible target
 call; string conversion, character/range methods and `parseInt` use Rust
-implementations. RegExp now reaches its first regex separator passed to `split`.
+implementations.
 
 ### Published results
 

@@ -205,6 +205,7 @@ fn regular_expression_literals_and_matching() {
     }"#;
     assert_eq!(run(source).unwrap(), Value::TRUE);
     assert_eq!(run(r#"function main(){ return /./.exec('😀')[0] === '😀' && /é/u.test('é') && /^b/m.test('a\nb') && /a.b/s.test('a\nb') && /(?<=a)b/.test('ab') && /(.)\1/.test('éé'); }"#).unwrap(), Value::TRUE);
+    assert_eq!(run(r#"function main(){ return JSON.stringify(['a b  c'.split(/\s+/), ''.split(/x*/), 'abc'.split(/x*/), 'a1b'.split(/(\d)|(z)/), 'XaX'.split(/X/g), 'aaa'.replace(/a*/g, '-')]) === '[["a","b","c"],[],["a","b","c"],["a","1",null,"b"],["","a",""],"--"]'; }"#).unwrap(), Value::TRUE);
 }
 
 #[test]

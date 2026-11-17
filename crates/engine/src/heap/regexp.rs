@@ -16,6 +16,36 @@ pub(crate) fn regexp_flags(bits: u8) -> regress::Flags {
     }
 }
 
+fn split_ranges(regex: &regress::Regex, text: &str) -> Vec<Option<std::ops::Range<usize>>> {
+    if text.is_empty() {
+        return match regex.find(text) {
+            Some(_) => Vec::new(),
+            None => vec![Some(0..0)],
+        };
+    }
+    let mut pieces = Vec::new();
+    let mut start = 0;
+    let mut offset = 0;
+    while let Some(found) = regex.find_from(text, offset).next() {
+        if found.range.start >= text.len() {
+            break;
+        }
+        if found.range.end == start {
+            let Some(character) = text[found.range.start..].chars().next() else {
+                break;
+            };
+            offset = found.range.start + character.len_utf8();
+            continue;
+        }
+        pieces.push(Some(start..found.range.start));
+        pieces.extend(found.captures);
+        start = found.range.end;
+        offset = start;
+    }
+    pieces.push(Some(start..text.len()));
+    pieces
+}
+
 impl Heap {
     pub(crate) fn regexp(&self, pattern: &str, flags: u8) -> Result<Value, String> {
         self.drain(64);
@@ -41,6 +71,34 @@ impl Heap {
             })),
         );
         Ok(Value::from_bits(TAG_OBJECT | id))
+    }
+
+    // Appended values are owned by the caller, including partial results on failure.
+    pub(crate) fn regexp_split_into(
+        &self,
+        value: Value,
+        regexp: Value,
+        values: &mut Vec<Value>,
+    ) -> Option<()> {
+        assert!(values.is_empty());
+        let regex = self.regexp_compiled(regexp)?;
+        let pieces = self.with_text(value, |text| split_ranges(&regex, text))?;
+        // The caller keeps the source alive while draining and allocating pieces.
+        self.drain(64usize.saturating_mul(pieces.len()));
+        let mut data = self.0.borrow_mut();
+        let id = heap_id(value)?;
+        values.reserve(pieces.len());
+        for piece in pieces {
+            let Some(range) = piece else {
+                values.push(Value::UNDEFINED);
+                continue;
+            };
+            let piece = data.string(id)?.get(range)?.to_owned();
+            let piece_id = data.reserve()?;
+            data.store(piece_id, Payload::String(piece));
+            values.push(Value::from_bits(TAG_STRING | piece_id));
+        }
+        Some(())
     }
 
     pub(crate) fn regexp_compiled(&self, value: Value) -> Option<Rc<regress::Regex>> {
