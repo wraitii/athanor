@@ -72,15 +72,19 @@ pub(crate) struct RecompileJob {
     pub(crate) tier: CompilationTier,
     pub(crate) code: FuncId,
     variant: VariantId,
-    initial: bool,
-    previous: Entry,
+    request: RecompileRequest,
     emission: Emission,
     canonical: Arc<super::semantic::specialization::calls::Repository>,
     sources: Arc<FxHashMap<usize, Arc<(String, String)>>>,
     pub(super) label: String,
     pub(super) queued_at: Option<Instant>,
-    region: Option<OsrRequest>,
-    observing: Option<super::baseline_tiering::Request>,
+}
+
+enum RecompileRequest {
+    Initial,
+    Replacement { previous: Entry },
+    Loop(OsrRequest),
+    Observing(super::baseline_tiering::Request),
 }
 
 struct OsrRequest {
@@ -91,16 +95,16 @@ struct OsrRequest {
 
 impl RecompileJob {
     pub(crate) fn key(&self) -> super::recompile::Key {
-        if let Some(request) = &self.observing {
-            return super::recompile::Key::Baseline(request.site);
+        match &self.request {
+            RecompileRequest::Loop(region) => super::recompile::Key::Loop(region.site),
+            RecompileRequest::Observing(request) => super::recompile::Key::Baseline(request.site),
+            RecompileRequest::Initial | RecompileRequest::Replacement { .. } => {
+                super::recompile::Key::Variant {
+                    function: self.code.as_u32() as u64,
+                    variant: self.variant,
+                }
+            }
         }
-        self.region.as_ref().map_or(
-            super::recompile::Key::Variant {
-                function: self.code.as_u32() as u64,
-                variant: self.variant,
-            },
-            |region| super::recompile::Key::Loop(region.site),
-        )
     }
 }
 
@@ -1501,16 +1505,17 @@ impl Compiler {
     }
 
     pub(crate) fn recompilation(&self, code: u64, previous: Entry) -> Option<RecompileJob> {
+        self.recompile_job(code, RecompileRequest::Replacement { previous })
+    }
+
+    fn recompile_job(&self, code: u64, request: RecompileRequest) -> Option<RecompileJob> {
         let variant = VariantId::ordinary(code);
         let code = FuncId::from_u32(u32::try_from(code).ok()?);
         Some(RecompileJob {
             tier: CompilationTier::Optimized,
-            region: None,
-            observing: None,
             code,
             variant,
-            initial: false,
-            previous,
+            request,
             emission: self.emissions.get(&variant)?.clone(),
             canonical: self.canonical.clone(),
             sources: self.sources.clone(),
@@ -1551,13 +1556,15 @@ impl Compiler {
         if !site.plan.has_new_feedback(site.candidate, &self.canonical) {
             return None;
         }
-        let mut job = self.recompilation(site.owner, Entry::generic(0))?;
+        let mut job = self.recompile_job(
+            site.owner,
+            RecompileRequest::Loop(OsrRequest {
+                site: site as *const _ as usize,
+                plan: site.plan.clone(),
+                candidate: site.candidate,
+            }),
+        )?;
         job.label += &format!(".loop{}", site.plan.loops[site.candidate].header);
-        job.region = Some(OsrRequest {
-            site: site as *const _ as usize,
-            plan: site.plan.clone(),
-            candidate: site.candidate,
-        });
         Some(job)
     }
 
@@ -1575,10 +1582,14 @@ impl Compiler {
             ));
         }
         let ssa_opt = self.ssa_opt;
-        if job.observing.is_some()
-            || job.region.is_some()
-            || !job.initial && self.optimization == crate::OptimizationLevel::Baseline
-        {
+        let ssa_required = match &job.request {
+            RecompileRequest::Initial => false,
+            RecompileRequest::Replacement { .. } => {
+                self.optimization == crate::OptimizationLevel::Baseline
+            }
+            RecompileRequest::Loop(_) | RecompileRequest::Observing(_) => true,
+        };
+        if ssa_required {
             self.ssa_opt = true;
         }
         let result = self.recompile_inner(job, false);
@@ -1611,26 +1622,27 @@ impl Compiler {
             tier,
             code,
             variant,
-            initial,
-            previous,
+            request,
             mut emission,
             canonical,
             sources,
             label,
             queued_at: _,
-            region,
-            observing,
         } = job;
+        let initial = matches!(request, RecompileRequest::Initial);
+        let whole_function = matches!(
+            request,
+            RecompileRequest::Initial | RecompileRequest::Replacement { .. }
+        );
         self.canonical = canonical;
         self.sources = sources;
-        let (source, mut canonical) = if let Some(request) = &observing {
-            (
+        let (source, mut canonical) = match &request {
+            RecompileRequest::Observing(request) => (
                 emission.source_name.0,
                 super::semantic::canonicalize_graph((*request.graph).clone(), true)
                     .map_err(Error::Unsupported)?,
-            )
-        } else if let Some(region) = &region {
-            (
+            ),
+            RecompileRequest::Loop(region) => (
                 emission.source_name.0,
                 super::semantic::FunctionState::from_graph(
                     region
@@ -1638,25 +1650,23 @@ impl Compiler {
                         .extract(region.candidate)
                         .map_err(Error::Unsupported)?,
                 ),
-            )
-        } else {
-            let Some(canonical) = self.canonical.emission(code) else {
-                return Ok(None);
-            };
-            if self.optimization == crate::OptimizationLevel::Baseline && self.ssa_opt {
-                (
-                    canonical.0,
-                    super::semantic::canonicalize_graph(canonical.1.graph, true)
-                        .map_err(Error::Unsupported)?,
-                )
-            } else {
-                canonical
+            ),
+            RecompileRequest::Initial | RecompileRequest::Replacement { .. } => {
+                let Some(canonical) = self.canonical.emission(code) else {
+                    return Ok(None);
+                };
+                if self.optimization == crate::OptimizationLevel::Baseline && self.ssa_opt {
+                    (
+                        canonical.0,
+                        super::semantic::canonicalize_graph(canonical.1.graph, true)
+                            .map_err(Error::Unsupported)?,
+                    )
+                } else {
+                    canonical
+                }
             }
         };
-        if region.is_none()
-            && observing.is_none()
-            && let Some(variant) = self.variant(variant)
-        {
+        if whole_function && let Some(variant) = self.variant(variant) {
             super::semantic::specialization::call_variants::assume(
                 &mut canonical.graph,
                 &variant.requirements,
@@ -1679,12 +1689,12 @@ impl Compiler {
         emission.callees = self.canonical.graph_callees(&planned.graph, source);
         let specialization =
             self.specialization_entries(&label, &planned.graph, &planned.plan, source);
-        let previous_specialization = if region.is_some() {
+        let previous_specialization = if matches!(request, RecompileRequest::Loop(_)) {
             None
         } else {
             emission.specialization.as_deref()
         };
-        if region.is_some() && planned.plan == Default::default() {
+        if matches!(request, RecompileRequest::Loop(_)) && planned.plan == Default::default() {
             self.log_specialization(
                 code,
                 &label,
@@ -1706,11 +1716,9 @@ impl Compiler {
                 emission.plan.conditional != planned.plan.conditional,
             ));
         }
-        if !initial
-            && observing.is_none()
+        if matches!(request, RecompileRequest::Replacement { .. })
             && emission.specialized
             && emission.tier == tier
-            && region.is_none()
             && planned.plan == emission.plan
         {
             self.log_specialization(
@@ -1722,22 +1730,25 @@ impl Compiler {
             );
             return Ok(None);
         }
-        let versioning = if observing.is_some() || initial && region.is_none() && self.generic_first
-        {
-            super::semantic::Versioning::Generic
-        } else {
-            super::semantic::Versioning::Speculate {
-                fallback: (!initial && region.is_none()).then_some(previous.code),
-                continuations: self.speculative_continuations,
-            }
-        };
+        let versioning =
+            if matches!(request, RecompileRequest::Observing(_)) || initial && self.generic_first {
+                super::semantic::Versioning::Generic
+            } else {
+                super::semantic::Versioning::Speculate {
+                    fallback: match &request {
+                        RecompileRequest::Replacement { previous } => Some(previous.code),
+                        _ => None,
+                    },
+                    continuations: self.speculative_continuations,
+                }
+            };
         self.log_specialization(
             code,
             &label,
             match versioning {
-                _ if observing.is_some() => "compile-observing",
+                _ if matches!(request, RecompileRequest::Observing(_)) => "compile-observing",
                 super::semantic::Versioning::Generic => "compile-generic",
-                _ if region.is_some() => "compile-osr",
+                _ if matches!(request, RecompileRequest::Loop(_)) => "compile-osr",
                 _ => "compile-specialized",
             },
             previous_specialization,
@@ -1752,9 +1763,11 @@ impl Compiler {
         emission.specialized =
             self.ssa_opt && matches!(versioning, super::semantic::Versioning::Speculate { .. });
         let mut passes = super::inspect::PassInspection::new(self.inspection.as_deref());
-        let osr_source =
-            (self.osr && self.ssa_opt && region.is_none() && !self.canonical.is_region(code))
-                .then_some(source);
+        let osr_source = (self.osr
+            && self.ssa_opt
+            && !matches!(request, RecompileRequest::Loop(_))
+            && !self.canonical.is_region(code))
+        .then_some(source);
         let mut graph = super::semantic::specialize_observed(
             planned,
             versioning,
@@ -1768,10 +1781,10 @@ impl Compiler {
         let mut listing = self
             .listing()
             .then(|| jitdump::Listing::new(graph.listing_lines()));
-        let mut feedback = self.feedback(code, region.is_none() && observing.is_none());
+        let mut feedback = self.feedback(code, whole_function);
         // Observer placement belongs before OSR extraction; replanning can introduce
         // sites incompatible with the enclosing function's feedback.
-        feedback.observations = self.ssa_opt && region.is_none();
+        feedback.observations = self.ssa_opt && !matches!(request, RecompileRequest::Loop(_));
         let continuations = self.compile_continuations(
             &graph.graph,
             emission.source_name,
@@ -1788,7 +1801,6 @@ impl Compiler {
         .then_some(feedback);
         let mut baseline_data = super::function_data::FunctionData::new();
         let baseline = if initial
-            && region.is_none()
             && !self.ssa_opt
             && self.module.isa().name() == "aarch64"
             && self.optimization == crate::OptimizationLevel::Baseline
@@ -1880,20 +1892,19 @@ impl Compiler {
             self.log.event(format_args!("{}", plan.report(&label)));
         }
         let mut entry = self.entry(id)?;
-        if region.is_none() {
-            entry.lexical_this = if initial {
-                self.canonical.lexical_this(code)
-            } else {
-                previous.lexical_this
-            };
-        }
+        entry.lexical_this = match &request {
+            RecompileRequest::Initial => self.canonical.lexical_this(code),
+            RecompileRequest::Replacement { previous } => previous.lexical_this,
+            RecompileRequest::Loop(_) => entry.lexical_this,
+            RecompileRequest::Observing(_) => false,
+        };
         Ok(Some(Replacement {
             code,
             variant,
             initial,
             entry,
             emission,
-            region: region.is_some() || observing.is_some(),
+            region: !whole_function,
         }))
     }
 
@@ -1914,12 +1925,9 @@ impl Compiler {
         let (emission, canonical) = self.lazy.get(&id)?.clone();
         Some(RecompileJob {
             tier: CompilationTier::Optimized,
-            region: None,
-            observing: None,
             code: id,
             variant: VariantId::ordinary(code),
-            initial: true,
-            previous: Entry::generic(0),
+            request: RecompileRequest::Initial,
             emission,
             canonical,
             sources: self.sources.clone(),
