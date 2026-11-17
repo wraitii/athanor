@@ -207,7 +207,10 @@ impl PropertyView<'_> {
 
 impl HeapData {
     pub(super) fn properties(&self, id: u64) -> Option<PropertyView<'_>> {
-        let slot = self.live(id)?;
+        self.slot_properties(self.live(id)?)
+    }
+
+    pub(super) fn slot_properties<'a>(&'a self, slot: &'a Slot) -> Option<PropertyView<'a>> {
         let properties = match &slot.payload {
             Payload::SmallObject(object) => {
                 return Some(PropertyView::Shaped {
@@ -216,6 +219,16 @@ impl HeapData {
                     values: &object.values[..object.len as usize],
                 });
             }
+            Payload::Array(array) => match array.properties.as_deref() {
+                Some(properties) => properties,
+                None => {
+                    return Some(PropertyView::Shaped {
+                        atoms: &self.atoms,
+                        shape: self.shapes.get(slot.shape),
+                        values: &[],
+                    });
+                }
+            },
             Payload::Object(object) => &object.properties,
             Payload::Closure(closure) => &closure.properties,
             Payload::Native(native) => &native.properties,
@@ -314,11 +327,12 @@ impl HeapData {
             slot.payload = Payload::Object(Object {
                 properties: Properties::Shaped(values),
                 error: object.error,
-                prototype: object.prototype,
+                prototype: object.prototype(),
             });
         }
         let is_closure = matches!(slot.payload, Payload::Closure(_) | Payload::Native(_));
         let properties = match &mut slot.payload {
+            Payload::Array(array) => array.properties.get_or_insert_with(Default::default),
             Payload::Object(object) => &mut object.properties,
             Payload::Closure(closure) => &mut closure.properties,
             Payload::Native(native) => &mut native.properties,
@@ -379,7 +393,7 @@ impl HeapData {
         let slot = unsafe { &mut *self.arena.get(id).as_ptr() };
         match &mut slot.payload {
             Payload::Object(object) => object.prototype = Some(prototype),
-            Payload::SmallObject(object) => object.prototype = Some(prototype),
+            Payload::SmallObject(object) => object.prototype = prototype,
             _ => unreachable!(),
         }
         if slot.shape != DICTIONARY {

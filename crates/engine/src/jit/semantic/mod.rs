@@ -503,7 +503,7 @@ pub(super) enum Op {
     PropertyStore(Value, Value, Value, js::memory::Field, PropertyWrite),
     PropertyAdd(Value, Value, Value, PropertyWrite),
     // Native slot replacement must go through the runtime setter.
-    CanOverwrite(Value, Value),
+    CanOverwrite(Value, Value, js::memory::Field),
     FillPropertyStore(Value, Value, String, Value, PropertyWrite),
     ToNumeric(Value),
     // Pure integer coercion of a value proven to be a number or undefined.
@@ -849,7 +849,7 @@ impl Op {
             })
             | Op::MapElement(object, key)
             | Op::IsArrayIteration(object, key, _)
-            | Op::CanOverwrite(object, key)
+            | Op::CanOverwrite(object, key, _)
             | Op::Delete(object, key)
             | Op::GetIndex(object, key)
             | Op::TypedIndex(object, key, _)
@@ -1058,7 +1058,7 @@ impl Op {
             })
             | Op::MapElement(object, key)
             | Op::IsArrayIteration(object, key, _)
-            | Op::CanOverwrite(object, key)
+            | Op::CanOverwrite(object, key, _)
             | Op::Delete(object, key)
             | Op::GetIndex(object, key)
             | Op::TypedIndex(object, key, _)

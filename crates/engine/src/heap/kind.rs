@@ -14,3 +14,5 @@ pub(crate) const REGEXP: u32 = 1 << 17;
 pub(crate) const ENUMERATOR: u32 = 1 << 18;
 pub(crate) const SET: u32 = 1 << 19;
 pub(crate) const INLINE: u32 = 1 << 20;
+
+pub(crate) const PROTOTYPE_INDEXED: u32 = 1 << 21;

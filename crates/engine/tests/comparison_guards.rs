@@ -34,7 +34,7 @@ fn exposed_number_checks_preserve_comparison_fallbacks() {
 }
 
 #[test]
-fn comparisons_preserve_original_index_keys_and_errors() {
+fn comparisons_preserve_original_index_keys() {
     for key in ["1", "01"] {
         let source = format!(
             r#"
@@ -48,7 +48,7 @@ fn comparisons_preserve_original_index_keys_and_errors() {
         if key == "1" {
             assert_eq!(optimized.unwrap(), Value::number(8.0));
         } else {
-            assert!(optimized.is_err());
+            assert_eq!(optimized.unwrap(), Value::UNDEFINED);
         }
     }
 }

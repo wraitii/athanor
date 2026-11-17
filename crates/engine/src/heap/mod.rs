@@ -42,7 +42,7 @@ use typed::*;
 pub(crate) use crate::builtins::{MathFunction, NativeFunction};
 pub(crate) use arena::{
     CODE_OFFSET, DATA_OFFSET, INLINE_PROPERTY_LENGTH_OFFSET, KIND_OFFSET, LENGTH_OFFSET,
-    NO_ELEMENTS, REFERENCES_OFFSET, SHAPE_OFFSET,
+    NO_ELEMENTS, PROPERTY_DATA_OFFSET, REFERENCES_OFFSET, SHAPE_OFFSET,
 };
 pub(crate) use array::HOLE;
 pub use owned::OwnedValue;
@@ -66,6 +66,9 @@ struct HeapData {
     object_shape: ShapeId,
     empty_object_shape: ShapeId,
     function_prototype: Option<Value>,
+    array_prototype: Option<Value>,
+    indexed_prototypes: bool,
+    array_shape: ShapeId,
     interned: Vec<(&'static str, u64)>,
     regexp_cache: FxHashMap<(String, u8), Rc<crate::regex::Pattern>>,
     pending: VecDeque<u64>,
@@ -86,6 +89,9 @@ impl Default for HeapData {
             object_shape: ShapeId::default(),
             empty_object_shape: ShapeId::default(),
             function_prototype: None,
+            array_prototype: None,
+            indexed_prototypes: false,
+            array_shape: NO_SHAPE,
             interned: Vec::new(),
             regexp_cache: FxHashMap::default(),
             pending: VecDeque::new(),
@@ -268,7 +274,12 @@ impl Heap {
                         .map(|(_, value)| value),
                     Payload::Object(object) => object.properties.pop(),
                     Payload::SmallObject(object) => object.pop(),
-                    Payload::Array(array) => array.elements.pop(),
+                    Payload::Array(array) => array.elements.pop().or_else(|| {
+                        array
+                            .properties
+                            .as_mut()
+                            .and_then(|properties| properties.pop())
+                    }),
                     Payload::Closure(closure) => {
                         closure.properties.pop().or_else(|| closure.captures.pop())
                     }
@@ -291,7 +302,12 @@ impl Heap {
                 }
                 let payload = data.vacate(id);
                 match payload {
-                    Payload::Array(array) => data.array_buffers.put(array.elements),
+                    Payload::Array(array) => {
+                        if let Some(prototype) = array.prototype {
+                            data.release(prototype);
+                        }
+                        data.array_buffers.put(array.elements);
+                    }
                     Payload::String(mut text) => {
                         text.clear();
                         data.string_buffers.put(text.into_bytes());
@@ -312,7 +328,7 @@ impl Heap {
                         }
                     }
                     Payload::SmallObject(object) => {
-                        if let Some(value) = object.prototype {
+                        if let Some(value) = object.prototype() {
                             data.release(value);
                         }
                     }
@@ -398,7 +414,7 @@ impl HeapData {
                 error: value.error,
             }),
             Payload::SmallObject(value) => Some(ObjectInfo {
-                prototype: value.prototype,
+                prototype: value.prototype(),
                 error: value.error,
             }),
             _ => None,
@@ -415,9 +431,6 @@ impl HeapData {
             Payload::Array(value) => Some(value),
             _ => None,
         }
-    }
-    fn is_array(&self, id: u64) -> bool {
-        self.array(id).is_some()
     }
     fn typed_array(&self, id: u64) -> Option<&TypedArray> {
         match &self.live(id)?.payload {
@@ -478,11 +491,27 @@ impl HeapData {
     }
 
     fn sync(&mut self, id: u64) {
+        let inherited =
+            self.indexed_prototypes || self.array_prototype.and_then(heap_id) == Some(id);
         let slot = self.slot_mut(id);
         slot.kind = slot.payload.kind();
+        if inherited && matches!(slot.payload, Payload::Array(_)) {
+            slot.kind |= kind::PROTOTYPE_INDEXED;
+        }
         slot.code = match &slot.payload {
             Payload::Closure(closure) => callable_code(closure),
             _ => 0,
+        };
+        slot.property_data = match &slot.payload {
+            Payload::SmallObject(object) => object.values.as_ptr().cast(),
+            Payload::Object(object) => object.properties.raw().0,
+            Payload::Closure(closure) => closure.properties.raw().0,
+            Payload::Native(native) => native.properties.raw().0,
+            Payload::Array(array) => array
+                .properties
+                .as_ref()
+                .map_or(std::ptr::null(), |properties| properties.raw().0),
+            _ => std::ptr::null(),
         };
         (slot.data, slot.length) = match &slot.payload {
             Payload::Array(array) => (array.elements.as_ptr().cast(), array.elements.len()),
@@ -518,6 +547,7 @@ impl HeapData {
         slot.shape = NO_SHAPE;
         slot.code = 0;
         slot.data = std::ptr::null();
+        slot.property_data = std::ptr::null();
         slot.length = 0;
         let payload = std::mem::replace(&mut slot.payload, Payload::Vacant);
         let slot = NonNull::from(slot);

@@ -608,7 +608,11 @@ extern "C" fn js_array_iteration_guard(
         _ => unreachable!(),
     };
     let heap = unsafe { &*ctx }.global.heap();
-    Value::boolean(heap.native(callee) == Some(native) && heap.is_array(receiver))
+    Value::boolean(
+        heap.native(callee) == Some(native)
+            && heap.is_array(receiver)
+            && !heap.has_indexed_prototypes(),
+    )
 }
 
 extern "C" fn js_array_map_new(ctx: *mut JitCtx, length: Value) -> Value {
@@ -888,11 +892,11 @@ extern "C" fn js_instanceof(ctx: *mut JitCtx, value: Value, constructor: Value) 
     if let Some(crate::heap::NativeFunction::TypedConstructor(kind)) = heap.native(constructor) {
         return Value::boolean(heap.typed_kind(value) == Some(kind));
     }
-    if heap.native(constructor) == Some(crate::heap::NativeFunction::Array) {
-        return Value::boolean(heap.is_array(value));
-    }
     if heap.closure_code(constructor).is_none()
-        && heap.native(constructor) != Some(crate::heap::NativeFunction::Object)
+        && !matches!(
+            heap.native(constructor),
+            Some(crate::heap::NativeFunction::Object | crate::heap::NativeFunction::Array)
+        )
     {
         ctx.error = Some(Box::new(crate::Error::Runtime(
             "instanceof requires a supported callable right operand".into(),

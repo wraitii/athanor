@@ -134,25 +134,33 @@ pub(in crate::jit::semantic) fn lower_stores(function: &mut FunctionState) {
                 Op::ArrayStore(object, key, value)
                 | Op::PropertyStore(object, key, value, _, _) => (object, key, value, false),
                 Op::PropertyAdd(object, key, value, _) => (object, key, value, true),
-                Op::CanOverwrite(object, key) => (object, key, object, false),
+                Op::CanOverwrite(object, key, _) => (object, key, object, false),
                 _ => continue,
             };
             let span = data.span;
             let checking = matches!(data.op, Op::CanOverwrite(..));
             let reuse = checked.remove(&inst);
             let store = checked_store(graph, inst, object, key);
+            let indexed = matches!(data.op, Op::ArrayStore(..))
+                || matches!(
+                    data.op,
+                    Op::PropertyStore(_, _, _, super::super::js::memory::Field::Cells, _)
+                        | Op::CanOverwrite(_, _, super::super::js::memory::Field::Elements)
+                );
+            let data_offset = if indexed {
+                crate::heap::DATA_OFFSET
+            } else {
+                crate::heap::PROPERTY_DATA_OFFSET
+            };
             let existing_view = graph.views.remove(&inst);
             let mut at = Cursor::before(graph, inst);
             let (address, old, addition_data) = if let Some((address, old)) = reuse {
                 (address, Some(old), None)
             } else {
                 let view = existing_view.unwrap_or_else(|| at.add(Op::View(object), Repr::Boxed));
-                let base = at.ins().load(
-                    types::I64,
-                    MemFlagsData::trusted(),
-                    view,
-                    crate::heap::DATA_OFFSET,
-                );
+                let base = at
+                    .ins()
+                    .load(types::I64, MemFlagsData::trusted(), view, data_offset);
                 let index = if addition {
                     let raw = at.ins().load(
                         types::I32,

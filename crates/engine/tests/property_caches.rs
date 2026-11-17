@@ -323,10 +323,16 @@ fn computed_index_probes_follow_index_semantics() {
                 "function main() {{ let a = [1], t = new Uint8Array(1); let n = 0; for (let i = 0; i < 4; ++i) n += {expression}; return n; }}"
             );
             engine.compile(&source, "property_caches.js").unwrap();
-            assert!(
-                engine.call("main", &[]).is_err(),
-                "{expression}, ssa_opt: {ssa_opt}"
-            );
+            let result = engine.call("main", &[]);
+            if expression.starts_with('t') {
+                assert!(result.is_err(), "{expression}, ssa_opt: {ssa_opt}");
+            } else {
+                assert_eq!(
+                    result.unwrap().value(),
+                    Value::number(f64::NAN),
+                    "{expression}, ssa_opt: {ssa_opt}"
+                );
+            }
         }
     }
 }

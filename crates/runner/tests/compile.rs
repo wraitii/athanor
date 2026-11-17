@@ -388,7 +388,7 @@ fn native_push_feedback_specializes_unknown_receivers_and_keeps_fallback() {
 }
 
 #[test]
-fn fresh_array_push_is_lowered_without_execution_or_identity_guards() {
+fn fresh_array_push_is_lowered_with_identity_guards() {
     let source = "function selected(x){const a=[]; const first=a.push(x,2); const second=a.push(); return first===2 && second===2 && a[0]===x && a[1]===2;}";
     let output = compile(&["--filter", "selected", "--planner"], source);
     assert!(
@@ -398,9 +398,12 @@ fn fresh_array_push_is_lowered_without_execution_or_identity_guards() {
     );
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(text.contains("feedback: 0"), "{text}");
-    assert!(text.contains("lower Array.push without guards"), "{text}");
+    assert!(
+        text.contains("lower Array.push behind native and array checks"),
+        "{text}"
+    );
     assert!(text.contains("helper_call ArrayAppend"), "{text}");
-    assert!(!text.contains("helper_call ArrayIterationGuard"), "{text}");
+    assert!(text.contains("helper_call ArrayIterationGuard"), "{text}");
     assert!(!text.contains(".feedback@"), "{text}");
     let output = compile(
         &["--filter", "selected", "--execute", "print(selected(7));"],

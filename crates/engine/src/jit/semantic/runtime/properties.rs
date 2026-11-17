@@ -143,9 +143,11 @@ fn lower_stores(graph: &mut Graph) -> bool {
             let inline = at.ins().icmp(IntCC::Equal, actual_kind, inline_kind);
             let matching = at.ins().icmp(IntCC::Equal, shape, addition_shape);
             let addition = at.add_unassigned(Op::BooleanAnd(inline, matching));
-            let object_bits = at.ins().iconst(types::I32, kind::OBJECT as i64);
+            let object_bits = at
+                .ins()
+                .iconst(types::I32, (kind::OBJECT | kind::ARRAY) as i64);
             let bits = at.ins().band(actual_kind, object_bits);
-            let is_object = at.ins().icmp(IntCC::Equal, bits, object_bits);
+            let is_object = at.ins().icmp_imm_s(IntCC::NotEqual, bits, 0);
             let matching = at.ins().icmp(IntCC::Equal, shape, overwrite_shape);
             let overwrite = at.add_unassigned(Op::BooleanAnd(is_object, matching));
             let add = graph.blocks.push(BlockData::default());
@@ -166,7 +168,8 @@ fn lower_stores(graph: &mut Graph) -> bool {
             (fast, index)
         };
         let mut at = Cursor::at_end(graph, overwrite, inst);
-        let (check, writable) = at.place(Op::CanOverwrite(object, index), true);
+        let (check, writable) =
+            at.place(Op::CanOverwrite(object, index, Field::named(&name)), true);
         graph.views.insert(check, view);
         let writable = writable.unwrap();
         let fast = super::super::dispatch::branch(graph, inst, overwrite, writable, fallback);
@@ -369,7 +372,7 @@ fn lower_shaped(graph: &mut Graph, inst: Inst, object: Value, name: &str, index:
         types::I64,
         MemFlagsData::trusted(),
         view,
-        crate::heap::DATA_OFFSET,
+        crate::heap::PROPERTY_DATA_OFFSET,
     );
     let offset = at.ins().iconst(types::I64, i64::from(index) * 8);
     let address = at.ins().iadd(values, offset);
@@ -388,7 +391,7 @@ fn lower_layout(graph: &mut Graph, inst: Inst, object: Value, name: &str, layout
         types::I64,
         MemFlagsData::trusted(),
         holder,
-        crate::heap::DATA_OFFSET,
+        crate::heap::PROPERTY_DATA_OFFSET,
     );
     let offset = at.ins().iconst(types::I64, i64::from(layout.index) * 8);
     let address = at.ins().iadd(values, offset);
@@ -630,7 +633,7 @@ impl PropertyLowering<'_> {
         entry: Value,
         builtins: bool,
     ) -> (Block, Value) {
-        use crate::heap::DATA_OFFSET;
+        use crate::heap::PROPERTY_DATA_OFFSET;
         use crate::jit::helpers::{
             CACHE_BUILTIN_KIND_OFFSET, CACHE_BUILTIN_VALUE_OFFSET, CACHE_HOLDER_OFFSET,
             CACHE_INDEX_OFFSET,
@@ -677,7 +680,7 @@ impl PropertyLowering<'_> {
         let data = self
             .at(block)
             .ins()
-            .load(types::I64, flags, holder, DATA_OFFSET);
+            .load(types::I64, flags, holder, PROPERTY_DATA_OFFSET);
         let slot = self.at(block).ins().iadd(data, offset);
         if let Some(ready) = ready {
             self.jump(block, ready, vec![slot]);

@@ -587,7 +587,13 @@ fn get_feedback_specializes_arrays_and_preserves_heap_results() {
         f64::MAX,
         f64::MIN,
     ] {
-        assert!(engine.call("read", &[Value::number(index)]).is_err());
+        assert_eq!(
+            engine
+                .call("read", &[Value::number(index)])
+                .unwrap()
+                .value(),
+            Value::UNDEFINED
+        );
     }
     let key = engine.string("2").unwrap();
     assert_eq!(

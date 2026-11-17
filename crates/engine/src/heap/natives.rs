@@ -32,6 +32,20 @@ impl Heap {
         true
     }
 
+    pub(crate) fn install_array_prototype(&self, prototype: Value) -> bool {
+        let mut data = self.0.borrow_mut();
+        if data.array_prototype.is_some()
+            || heap_id(prototype).and_then(|id| data.array(id)).is_none()
+        {
+            return false;
+        }
+        data.retain(prototype);
+        data.array_prototype = Some(prototype);
+        data.array_shape = data.shapes.array_root(Some(prototype));
+        data.sync(heap_id(prototype).unwrap());
+        true
+    }
+
     pub(crate) fn native_function(&self, function: NativeFunction) -> Option<Value> {
         let mut data = self.0.borrow_mut();
         let id = if let Some((_, id)) = data.natives.iter().find(|(kind, _)| *kind == function) {

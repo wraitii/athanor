@@ -366,7 +366,9 @@ impl Graph {
             Op::PropertyAdd(object, cache, value, _) => {
                 format!("add_property {object}, {cache}, {value}")
             }
-            Op::CanOverwrite(object, key) => format!("can_overwrite {object}[{key}]"),
+            Op::CanOverwrite(object, key, field) => {
+                format!("can_overwrite {object}[{key}] {field:?}")
+            }
             Op::HelperCall { helper, args, .. } => format!(
                 "helper_call {helper:?}({})",
                 args.iter()

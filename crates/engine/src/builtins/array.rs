@@ -394,7 +394,30 @@ pub(super) fn call(
         return Value::number((length + args.len()) as f64);
     }
     if function == ArrayReverse {
-        heap.reverse_array(receiver);
+        if !heap.has_indexed_prototypes() {
+            heap.reverse_array(receiver);
+            return context.retain(receiver);
+        }
+        for left in 0..length / 2 {
+            let right = length - left - 1;
+            let left_present = heap.present(receiver, left);
+            let right_present = heap.present(receiver, right);
+            let left_value = context.retain(heap.get(receiver, left).unwrap());
+            let right_value = context.retain(heap.get(receiver, right).unwrap());
+            let stored = (!right_present || heap.set(receiver, left, right_value))
+                && (!left_present || heap.set(receiver, right, left_value));
+            if !right_present {
+                heap.delete_property(receiver, &left.to_string());
+            }
+            if !left_present {
+                heap.delete_property(receiver, &right.to_string());
+            }
+            heap.release(left_value);
+            heap.release(right_value);
+            if !stored {
+                return fail(context, "cannot reverse array elements");
+            }
+        }
         return context.retain(receiver);
     }
     if function == ArrayFlat {

@@ -320,7 +320,6 @@ pub(in crate::jit::semantic) fn push_calls(
                 start: data.span.start,
                 end: data.span.end,
             };
-            // Array named methods are fixed by Heap::property, including after escape.
             let known_array = matches!(
                 graph.defining_op(receiver),
                 Some(Op::NewArray(_) | Op::NewHoleyArray(_))
@@ -347,16 +346,12 @@ pub(in crate::jit::semantic) fn push_calls(
         };
         let (block, continuation, fallback) = super::super::dispatch::split(graph, inst);
         let fast = graph.blocks.push(BlockData::default());
-        let kind = if known_array {
-            TerminatorKind::Jump(Target::new(fast))
-        } else {
-            let check = graph.append_value(
-                block,
-                call.span,
-                Op::IsArrayIteration(callee, receiver, ArrayMethod::Push),
-            );
-            TerminatorKind::Branch(check, Target::new(fast), Target::new(fallback))
-        };
+        let check = graph.append_value(
+            block,
+            call.span,
+            Op::IsArrayIteration(callee, receiver, ArrayMethod::Push),
+        );
+        let kind = TerminatorKind::Branch(check, Target::new(fast), Target::new(fallback));
         graph.blocks[block].terminator = Some(Terminator {
             source_name: call.source_name,
             emission_location: None,
@@ -386,7 +381,7 @@ pub(in crate::jit::semantic) fn push_calls(
             data.inline_context = call.inline_context;
         }
         notes.push(if known_array {
-            format!("known array at {site}: lower Array.push without guards")
+            format!("known array at {site}: lower Array.push behind native and array checks")
         } else {
             format!(
                 "native feedback at {site}: specialize Array.push behind native and array checks"

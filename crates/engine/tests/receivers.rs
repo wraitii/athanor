@@ -311,3 +311,123 @@ fn property_updates_preserve_results_and_evaluate_the_base_once() {
         Value::TRUE,
     );
 }
+
+#[test]
+fn arrays_share_a_mutable_array_prototype() {
+    check(
+        r#"
+        function size(o) { return o.length; }
+        function main() {
+            let p = Array.prototype;
+            Object.prototype.length = 99;
+            if (size({}) !== 99 || size(p) !== 0) return false;
+            Object.prototype.root = 7;
+            p.shared = function() { return this.length + this.root; };
+            let a = [1, 2];
+            return Array.isArray(p) && p.length === 0 && p.constructor === Array &&
+                a instanceof Array && a instanceof Object && p instanceof Object &&
+                !(p instanceof Array) && a.shared() === 9 &&
+                Object.keys(p).join(',') === 'shared' && Object.keys(a).join(',') === '0,1' &&
+                Object.getOwnPropertyNames(a).join(',') === '0,1,length';
+        }
+        "#,
+        Value::TRUE,
+    );
+}
+
+#[test]
+fn array_property_caches_follow_shadowing_and_prototype_changes() {
+    check(
+        r#"
+        function read(a) { return a.label; }
+        function map(a) { return a.map(x => x + 1)[0]; }
+        function push() { let a = []; return a.push(1); }
+        function shadow() { let a = []; a.push = function() { return 43; }; return a.push(1); }
+        function main() {
+            let a = [1];
+            Array.prototype.label = { value: 3 };
+            for (let i = 0; i < 300; ++i) { read(a); map(a); }
+            Array.prototype.label = { value: 7 };
+            if (read(a).value !== 7) return false;
+            a.label = { value: 9 };
+            if (read(a).value !== 9) return false;
+            delete a.label;
+            if (read(a).value !== 7) return false;
+            let saved = Array.prototype.map;
+            Array.prototype.map = function(f) { return [41]; };
+            if (map(a) !== 41) return false;
+            a.map = function(f) { return [42]; };
+            if (map(a) !== 42) return false;
+            delete a.map;
+            if (map(a) !== 41) return false;
+            delete Array.prototype.map;
+            if (a.map !== undefined || 'map' in a) return false;
+            Array.prototype.map = saved;
+            if (map(a) !== 2 || push() !== 1 || shadow() !== 43) return false;
+            Array.prototype.push = function() { return 44; };
+            return push() === 44;
+        }
+        "#,
+        Value::TRUE,
+    );
+}
+
+#[test]
+fn array_named_properties_enumerate_and_release_like_objects() {
+    check(
+        r#"
+        function write(a, value) { a.extra = value; }
+        function main() {
+            let a = [1, 2];
+            let b = [];
+            b['01'] = 12;
+            b[-1] = 13;
+            if (b['01'] !== 12 || b[-1] !== 13 || Object.values(b).join(',') !== '12,13') return false;
+            for (let i = 0; i < 300; ++i) write(a, { n: i });
+            a.other = 4;
+            if (Object.values(a)[2].n !== 299) return false;
+            delete a.extra;
+            a.extra = 5;
+            Array.prototype.inherited = 6;
+            let keys = '';
+            for (let key in a) keys += key + ',';
+            a.length = 1;
+            return keys === '0,1,other,extra,inherited,' &&
+                Object.keys(a).join(',') === '0,other,extra' && a.other === 4;
+        }
+        "#,
+        Value::TRUE,
+    );
+}
+
+#[test]
+fn array_holes_observe_indexed_prototype_mutations() {
+    check(
+        r#"
+        function read(a) { return a[1]; }
+        function mapped(a) { return a.map(x => x + 1)[1]; }
+        function fresh() { let a = []; return a[1]; }
+        function holey() { let a = new Array(3); return a[1]; }
+        function args(a) { return function(x, y) { return y; }.apply(null, a); }
+        function main() {
+            let a = [1, 2, 3];
+            delete a[1];
+            for (let i = 0; i < 300; ++i) { read(a); mapped(a); }
+            let local = [];
+            if (local[1] !== undefined) return false;
+            Array.prototype[1] = 41;
+            if (local[1] !== 41) return false;
+            if (read(a) !== 41 || mapped(a) !== 42 || args(a) !== 41 || fresh() !== 41 || holey() !== 41 || !(1 in a)) return false;
+            delete Array.prototype[1];
+            Object.prototype[1] = 9;
+            if (read(a) !== 9 || mapped(a) !== 10) return false;
+            a[1] = 7;
+            if (read(a) !== 7) return false;
+            delete a[1];
+            delete Object.prototype[1];
+            return read(a) === undefined && !(1 in a);
+        }
+        "#,
+        Value::TRUE,
+    );
+}

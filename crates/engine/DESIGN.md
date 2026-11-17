@@ -136,13 +136,16 @@ Ordinary objects share a heap-owned `Object.prototype`, whose own prototype is
 null. Object literals, lazy function prototypes, error objects and constructors
 with a non-object `.prototype` use this root. `Function.prototype` inherits from
 it, so closures and native functions see properties added to the object root.
-Arrays and other specialized payloads retain their existing lookup rules;
-this does not install a full hierarchy of builtin prototypes.
+Arrays share an empty-array `Array.prototype`, which inherits from
+`Object.prototype`. Its native methods and constructor property are writable,
+non-enumerable properties. Arrays reuse shapes and property transitions for
+named own properties, allocating their named storage only when needed. Other
+specialized payloads retain their existing lookup rules.
 
 `Object()` and `new Object()` allocate an ordinary object for absent or nullish
 arguments and preserve the identity of object arguments. Primitive boxing is
 unsupported. Native functions have shaped own properties, including writable,
-non-enumerable constructor statics. The Object and Function constructors reject
+non-enumerable constructor statics. The Object, Function and Array constructors reject
 assignment to their `prototype` property. The existing Function prototype object
 is still not callable. Ordinary object layout is unchanged, and allocation caches
 the default root shape; cached own-property reads require no prototype traversal.
@@ -390,8 +393,19 @@ See `jit/recompile.rs`, `jit/compiler.rs`, and the tiering and entry machinery.
 Shapes describe property layouts and enable cached property access. Fast paths
 must check the relevant receiver shape and other conditions before using a cached
 slot; writes and layout changes must preserve cache validity. Arrays have
-separate indexed storage and distinguish dense from holey arrays. Typed arrays
-carry an element kind and require appropriate kind and bounds checks. Heap views
+separate indexed storage and distinguish dense from holey arrays. Heap headers
+expose separate pointers for indexed data and shaped property values, preserving
+128-byte slots and direct loads for both. Array shape roots are distinct from
+ordinary object roots, so special array properties cannot collide with ordinary
+property caches. Array method reads use receiver and holder shape guards rather
+than immutable kind-based method caches. Installing an indexed property on
+`Array.prototype` or `Object.prototype` permanently switches the heap's arrays
+to generic indexed access and iteration; this conservative fallback preserves
+inherited elements without traversing prototypes on normal dense accesses.
+`Array.prototype` itself always uses generic indexed access so writes cannot
+bypass this invalidation.
+
+Typed arrays carry an element kind and require appropriate kind and bounds checks. Heap views
 and lowered offsets expose storage to optimized code only while their validity
 conditions hold. The slow helpers implement generic behavior when those
 conditions are not established. `heap/shape.rs`, `heap/properties.rs`,

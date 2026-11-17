@@ -25,7 +25,7 @@ pub(super) const INLINE_PROPERTIES: usize = 8;
 #[repr(C)]
 pub(super) struct SmallObject {
     pub(super) values: [Value; INLINE_PROPERTIES],
-    pub(super) prototype: Option<Value>,
+    pub(super) prototype: Value,
     pub(super) error: bool,
     pub(super) len: u8,
 }
@@ -34,10 +34,14 @@ impl SmallObject {
     fn new(error: bool) -> Self {
         Self {
             values: [Value::UNDEFINED; INLINE_PROPERTIES],
-            prototype: None,
+            prototype: Value::NULL,
             error,
             len: 0,
         }
+    }
+
+    pub(super) fn prototype(&self) -> Option<Value> {
+        (self.prototype != Value::NULL).then_some(self.prototype)
     }
 
     pub(super) fn pop(&mut self) -> Option<Value> {
@@ -59,7 +63,10 @@ impl Heap {
     }
 
     pub(crate) fn has_properties(&self, value: Value) -> bool {
-        heap_id(value).is_some_and(|id| self.0.borrow().object(id).is_some())
+        heap_id(value).is_some_and(|id| {
+            let data = self.0.borrow();
+            data.object(id).is_some() || data.array(id).is_some()
+        })
     }
 
     pub(crate) fn error(&self, message: Value, name: Value) -> Option<Value> {
@@ -79,7 +86,7 @@ impl Heap {
         data.store(
             id,
             Payload::SmallObject(SmallObject {
-                prototype,
+                prototype: prototype.unwrap_or(Value::NULL),
                 ..SmallObject::new(true)
             }),
         );
@@ -94,6 +101,9 @@ impl Heap {
         let data = self.0.borrow();
         let id = heap_id(receiver)?;
         let shape = data.cacheable_shape(id)?;
+        if data.array(id).is_some() && (name == "length" || array_index_name(name).is_some()) {
+            return None;
+        }
         let atom = data.atoms.find(name)?;
         let (holder, holder_shape, index) = if let Some(index) = data.shapes.get(shape).slot(atom) {
             (0, shape, index)
@@ -112,7 +122,7 @@ impl Heap {
                 }
                 prototype
             } else {
-                data.object(id)?.prototype?
+                data.property_prototype(id)?
             };
             let holder = heap_id(prototype)?;
             let holder_shape = data.cacheable_shape(holder)?;
@@ -165,8 +175,7 @@ impl Heap {
             let data = self.0.borrow();
             let slot = data.live(heap_id(receiver)?)?;
             match &slot.payload {
-                Payload::Array(_)
-                | Payload::TypedArray(_)
+                Payload::TypedArray(_)
                 | Payload::String(_)
                 | Payload::Set(_)
                 | Payload::RegExp(_)
@@ -214,7 +223,11 @@ impl Heap {
         let payload = &data.live(heap_id(receiver)?)?.payload;
         let atom = if matches!(
             payload,
-            Payload::Object(_) | Payload::SmallObject(_) | Payload::Closure(_) | Payload::Native(_)
+            Payload::Object(_)
+                | Payload::SmallObject(_)
+                | Payload::Closure(_)
+                | Payload::Native(_)
+                | Payload::Array(_)
         ) {
             match cache {
                 Some(cache) => cache.atom(self, &data, name),
@@ -265,14 +278,11 @@ impl Heap {
                 "lastIndex" => return Some(PropertyRead::Value(Value::number(regexp.last_index))),
                 _ => ReceiverKind::RegExp.method(name)?,
             },
-            Payload::Array(array) => match name {
-                "length" => {
-                    return Some(PropertyRead::Value(Value::number(
-                        array.elements.len() as f64
-                    )));
-                }
-                _ => ReceiverKind::Array.method(name)?,
-            },
+            Payload::Array(_) => {
+                return data
+                    .object_property_atom(heap_id(receiver)?, name, atom)
+                    .map(PropertyRead::Value);
+            }
             Payload::String(text) => match name {
                 "length" => {
                     return Some(PropertyRead::Value(Value::number(
@@ -327,7 +337,7 @@ impl Heap {
                     .unwrap_or_else(|| data.function_property_atom(name, data.atoms.find(name))),
             );
         }
-        data.object(id)?;
+        data.properties(id)?;
         data.object_property(id, name)
     }
 
@@ -351,11 +361,7 @@ impl Heap {
             return Some(keys);
         }
         let mut keys = data.enumeration_keys(value)?;
-        if data.is_array(id) {
-            keys.retain(|name| {
-                array_index_name(name).is_some() || (!enumerable_only && name == "length")
-            });
-        } else if enumerable_only {
+        if enumerable_only {
             keys.retain(|name| data.enumeration_presence(value, name) == Some(true));
         } else if data
             .closure(id)
@@ -396,7 +402,7 @@ impl Heap {
         };
         let slot = data.live(id)?;
         match &slot.payload {
-            Payload::Array(_) => {
+            Payload::Array(_) if name == "length" || array_index_name(name).is_some() => {
                 if name == "length" {
                     return Some(false);
                 }
@@ -438,7 +444,7 @@ impl Heap {
                 Payload::Native(native)
                     if matches!(
                         native.function,
-                        NativeFunction::Object | NativeFunction::Function
+                        NativeFunction::Object | NativeFunction::Function | NativeFunction::Array
                     ) =>
                 {
                     return Some(false);
@@ -478,6 +484,10 @@ impl Heap {
             Some(old)
         } else {
             let properties = match &mut slot.payload {
+                Payload::Array(array) => match array.properties.as_deref_mut() {
+                    Some(properties) => properties,
+                    None => return Some(true),
+                },
                 Payload::Object(object) => &mut object.properties,
                 Payload::Closure(closure) => &mut closure.properties,
                 Payload::Native(native) => &mut native.properties,
@@ -538,12 +548,27 @@ impl Heap {
             return false;
         };
         let mut data = self.0.borrow_mut();
+        if data.array(id).is_some() {
+            if name == "length" {
+                drop(data);
+                return value.as_number().is_some_and(|number| {
+                    number >= 0.0
+                        && number.fract() == 0.0
+                        && number < u32::MAX as f64
+                        && self.truncate(object, number as usize)
+                });
+            }
+            if let Some(index) = array_index_name(name) {
+                drop(data);
+                return self.set(object, index as usize, value);
+            }
+        }
         let enumerable = if enumerable.is_none() && name == "prototype" {
             match data.live(id).map(|slot| &slot.payload) {
                 Some(Payload::Native(native))
                     if matches!(
                         native.function,
-                        NativeFunction::Object | NativeFunction::Function
+                        NativeFunction::Object | NativeFunction::Function | NativeFunction::Array
                     ) =>
                 {
                     return false;
@@ -561,6 +586,9 @@ impl Heap {
         };
         if data.properties(id).is_none() || !data.retain(value) {
             return false;
+        }
+        if array_index_name(name).is_some() {
+            data.indexed_prototype_write(id);
         }
         let old = match cache {
             Some(cache) => {
@@ -686,46 +714,13 @@ impl Heap {
                     || data.function_has_property(name),
             );
         }
-        if let Some(array) = data.array(id) {
-            if matches!(
-                name,
-                "length"
-                    | "filter"
-                    | "map"
-                    | "every"
-                    | "some"
-                    | "find"
-                    | "forEach"
-                    | "at"
-                    | "sort"
-                    | "join"
-                    | "pop"
-                    | "indexOf"
-                    | "concat"
-                    | "push"
-                    | "includes"
-                    | "reverse"
-                    | "slice"
-                    | "flat"
-                    | "flatMap"
-                    | "fill"
-            ) {
-                return Some(true);
-            }
-            let index = name
-                .parse::<u32>()
-                .ok()
-                .filter(|index| *index != u32::MAX && index.to_string() == name);
-            return Some(index.is_some_and(|index| array.present(index as usize)));
-        }
+        data.properties(id)?;
         let mut current = value;
         loop {
-            let id = heap_id(current)?;
-            let object = data.object(id)?;
-            if data.properties(id)?.contains_key(name) {
+            if data.enumeration_presence(current, name).is_some() {
                 return Some(true);
             }
-            let Some(prototype) = object.prototype else {
+            let Some(prototype) = data.enumeration_prototype(current) else {
                 return Some(false);
             };
             current = prototype;
@@ -752,7 +747,10 @@ impl Heap {
         }
         // Reading an absent prototype must not trigger its lazy allocation.
         let prototype = data.properties(id)?.get("prototype")?;
-        if prototype.is_object() && heap_id(prototype).and_then(|id| data.object(id)).is_none() {
+        if prototype.is_object()
+            && heap_id(prototype)
+                .is_none_or(|id| data.object(id).is_none() && data.array(id).is_none())
+        {
             return None;
         }
         Some(prototype)
@@ -787,7 +785,7 @@ impl Heap {
         data.store(
             id,
             Payload::SmallObject(SmallObject {
-                prototype,
+                prototype: prototype.unwrap_or(Value::NULL),
                 ..SmallObject::new(false)
             }),
         );
@@ -843,7 +841,22 @@ pub(crate) struct CachedProperty {
     pub(crate) index: u32,
 }
 
+impl Slot {
+    fn property_prototype(&self) -> Option<Value> {
+        match &self.payload {
+            Payload::Array(array) => array.prototype,
+            Payload::Object(object) => object.prototype,
+            Payload::SmallObject(object) => object.prototype(),
+            _ => None,
+        }
+    }
+}
+
 impl HeapData {
+    pub(super) fn property_prototype(&self, id: u64) -> Option<Value> {
+        self.live(id)?.property_prototype()
+    }
+
     fn function_has_property(&self, name: &str) -> bool {
         let Some(mut id) = self.function_prototype.and_then(heap_id) else {
             return false;
@@ -898,12 +911,13 @@ impl HeapData {
         let Payload::SmallObject(object) = &mut slot.payload else {
             unreachable!();
         };
-        let previous = std::mem::replace(&mut object.prototype, prototype);
+        let previous = std::mem::replace(&mut object.prototype, prototype.unwrap_or(Value::NULL));
         object.error = false;
         slot.references = 1;
         slot.shape = root;
         slot.code = 0;
         slot.length = 0;
+        let previous = (previous != Value::NULL).then_some(previous);
         if previous != prototype {
             if let Some(prototype) = prototype {
                 self.retain(prototype);
@@ -936,12 +950,23 @@ impl HeapData {
 
     fn object_property_atom(&self, mut id: u64, name: &str, atom: Option<Atom>) -> Option<Value> {
         loop {
-            if (atom.is_some() || self.live(id)?.shape == DICTIONARY)
-                && let Some(value) = self.properties(id)?.get_atom(name, atom)
+            let slot = self.live(id)?;
+            if let Payload::Array(array) = &slot.payload {
+                if name == "length" {
+                    return Some(Value::number(array.elements.len() as f64));
+                }
+                if let Some(index) = array_index_name(name)
+                    && array.present(index as usize)
+                {
+                    return Some(array.get(index as usize));
+                }
+            }
+            if (atom.is_some() || slot.shape == DICTIONARY)
+                && let Some(value) = self.slot_properties(slot)?.get_atom(name, atom)
             {
                 return Some(value);
             }
-            let Some(prototype) = self.object(id)?.prototype else {
+            let Some(prototype) = slot.property_prototype() else {
                 return Some(Value::UNDEFINED);
             };
             id = heap_id(prototype)?;
@@ -982,14 +1007,8 @@ impl HeapData {
                 .filter(|index| array.present(*index))
                 .map(|index| index.to_string())
                 .collect();
-            keys.extend(
-                [
-                    "length", "filter", "map", "join", "pop", "indexOf", "concat", "push",
-                    "includes", "reverse", "slice",
-                ]
-                .into_iter()
-                .map(str::to_owned),
-            );
+            keys.push("length".into());
+            keys.extend(self.properties(id)?.keys());
             return Some(keys);
         }
         None
@@ -1014,24 +1033,13 @@ impl HeapData {
                 .and_then(|index| ((index as usize) < array.storage.len()).then_some(true));
         }
         if let Some(array) = self.array(id) {
-            if matches!(
-                name,
-                "length"
-                    | "filter"
-                    | "map"
-                    | "join"
-                    | "pop"
-                    | "indexOf"
-                    | "concat"
-                    | "push"
-                    | "includes"
-                    | "reverse"
-                    | "slice"
-            ) {
+            if name == "length" {
                 return Some(false);
             }
-            return array_index_name(name)
-                .and_then(|index| array.present(index as usize).then_some(true));
+            if let Some(index) = array_index_name(name) {
+                return array.present(index as usize).then_some(true);
+            }
+            return self.properties(id)?.enumerable(name);
         }
         None
     }
@@ -1040,7 +1048,7 @@ impl HeapData {
         let id = heap_id(value)?;
         match self.live(id)?.payload {
             Payload::Closure(_) | Payload::Native(_) => self.function_prototype,
-            _ => self.object(id).and_then(|object| object.prototype),
+            _ => self.property_prototype(id),
         }
     }
 }

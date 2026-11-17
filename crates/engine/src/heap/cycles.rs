@@ -27,7 +27,7 @@ impl Payload {
             Self::Enumerator(value) => value.current.into_iter().for_each(visit),
             Self::Set(value) => value.entries.values().copied().for_each(visit),
             Self::SmallObject(value) => {
-                value.prototype.into_iter().for_each(&mut visit);
+                value.prototype().into_iter().for_each(&mut visit);
                 value.values[..value.len as usize]
                     .iter()
                     .copied()
@@ -37,7 +37,13 @@ impl Payload {
                 value.prototype.into_iter().for_each(&mut visit);
                 value.properties.visit_values(&mut visit);
             }
-            Self::Array(value) => value.elements.iter().copied().for_each(visit),
+            Self::Array(value) => {
+                value.prototype.into_iter().for_each(&mut visit);
+                if let Some(properties) = &value.properties {
+                    properties.visit_values(&mut visit);
+                }
+                value.elements.iter().copied().for_each(visit);
+            }
             Self::Cell(value) => visit(value.value),
             Self::Closure(value) => {
                 value.lexical_this.into_iter().for_each(&mut visit);

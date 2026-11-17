@@ -94,7 +94,7 @@ Unsupported benchmarks:
 
 | benchmark | first error |
 |-----------|-------------|
-| earley-boyer | `Array.prototype` is undefined when initializing `sc_Vector.prototype` |
+| earley-boyer | `String.prototype` is undefined when assigning `sc_toDisplayString` |
 
 Additional scores on the same machine, medians of three sequential runs per
 engine and benchmark, using the same dates and release JIT build as above.
@@ -144,11 +144,19 @@ runtime compatibility beyond these compile failures remains unchecked.
 A subsequent implementation adds shape-reusing property deletion and `finally`.
 The original Earley–Boyer source now passes those syntax boundaries, but fails
 during initialization at line 1345: `sc_Vector` aliases `Array`, whose
-`prototype` property is currently undefined. The write to
+`prototype` property was undefined at that stage. The write to
 `sc_Vector.prototype.sc_toWriteOrDisplayString` therefore throws a TypeError.
 With these changes, Belgian Uplands retains the three hashes and 1137 entities
 listed below; one release run takes 860 ms, compared with the earlier 773 ms
 recording. These single runs do not establish a performance regression.
+
+Array prototype support subsequently lets the original source initialize through
+its vector extensions. The next blocker is `String.prototype`, which remains
+undefined: assigning `sc_toDisplayString` at line 3418 throws a TypeError.
+Five alternating Belgian Uplands runs against `3fd519f` retain all three hashes
+and 1137 entities. Median generator time is 843 ms before and 853 ms after;
+the individual runs range from 797–925 ms before and 847–867 ms after, so this
+small sample does not establish a performance change.
 
 Map probes use size 128, seed 0 and two players (`athen`, `brit`), with the same
 shared bootstrap in Athanor and SpiderMonkey. Belgian Uplands completes with
@@ -241,6 +249,63 @@ All six map runs produce `heightHash: dd1de906`,
 `Function.prototype.call` lets the unmodified DeltaBlue benchmark complete its
 correctness checks. Median scores from three sequential runs per engine are in
 the results table above.
+
+### Array prototype comparison, 2026-11-17
+
+Release baseline `3fd519f` versus the initial array prototype implementation,
+with default compiler settings and benchmark processes run sequentially in
+alternating order. Scores are medians of three runs; compilation times are
+medians of five process wall times using `--compile --no-ir`.
+Background Rust compilation was observed during this initial pass, so its
+smaller differences remain provisional.
+
+| benchmark | score before | score after | score change | compile before (ms) | compile after (ms) |
+|-----------|-------------:|------------:|-------------:|--------------------:|-------------------:|
+| richards | 4134 | 4099 | -0.8% | 89.0 | 88.8 |
+| navier-stokes | 24017 | 4248 | -82.3% | 100.0 | 99.6 |
+| gaussian-blur | 290 | 272 | -6.2% | 27.8 | 27.7 |
+| deltablue | 3167 | 2784 | -12.1% | 222.5 | 226.5 |
+| splay | 7636 | 7090 | -7.2% | 89.9 | 89.3 |
+| raytrace | 5164 | 4987 | -3.4% | 255.8 | 256.8 |
+| crypto | 8692 | 8536 | -1.8% | 677.3 | 676.8 |
+| regexp | 5116 | 5000 | -2.3% | 1067.1 | 1076.2 |
+
+After the competing build finished, three further alternating Navier–Stokes
+pairs gave baseline scores 24041, 24069, 24041 and updated scores
+4240, 4244, 4242. The medians are 24041 → 4242, an 82.4% regression.
+Both benchmark binaries were unchanged for that rerun.
+All supported benchmarks completed their correctness checks. Earley–Boyer
+advances from the missing array prototype to the missing string prototype.
+
+The full suite rerun below includes the guard-triggered recompilation fix.
+Scores are medians of three sequential release runs with default compiler
+settings, alternating between that build and the initial array prototype
+build. Compile times are medians of five `--compile --no-ir` runs.
+
+| benchmark | initial prototype score | score with tiering fix | compile with tiering fix (ms) |
+|-----------|------------------------:|-----------------------:|------------------------------:|
+| richards | 4233 | 4212 | 86.3 |
+| navier-stokes | 4240 | 22705 | 96.7 |
+| gaussian-blur | 272 | 273 | 26.8 |
+| deltablue | 2778 | 2748 | 216.9 |
+| splay | 7335 | 7400 | 86.4 |
+| raytrace | 4977 | 5002 | 247.7 |
+| crypto | 8524 | 8543 | 652.5 |
+| regexp | 5000 | 5036 | 1054.4 |
+
+The initial Navier–Stokes build scored 22705, 4238, and 4240. All three
+runs with the tiering fix scored 22660–22785. A fractional array element
+invalidates integer feedback in `FluidField.project`. Recompilation now
+starts as soon as the changed feedback can be used.
+
+A follow-up removes repeated heap-slot checks during prototype lookup.
+DeltaBlue scored 3164 at `3fd519f`, 2768 with the tiering fix, and 3052
+with the lookup change (medians of five interleaved release runs).
+Navier–Stokes measured 23993, 22592, and 22557 on those same builds
+(three runs each). Belgian Uplands measured 856 ms before the lookup change
+and 852 ms after (three runs each), with identical hashes and entity counts.
+Gaussian blur reproduced the output sum of `2019780`. Earley–Boyer still
+stops at `String.prototype.sc_toDisplayString`.
 
 ### Published results
 

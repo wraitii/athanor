@@ -55,6 +55,12 @@ macro_rules! define_builtins {
         pub(crate) enum ReceiverKind { $($kind,)* }
 
         impl ReceiverKind {
+            pub(crate) fn methods(self) -> &'static [(&'static str, NativeFunction)] {
+                match self {
+                    $(Self::$kind => &[$(($method_name, NativeFunction::$method),)*],)*
+                }
+            }
+
             pub(crate) fn method(self, name: &str) -> Option<NativeFunction> {
                 Some(match (self, name) {
                     $($( (Self::$kind, $method_name) => NativeFunction::$method,)*)*

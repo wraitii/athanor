@@ -5,7 +5,10 @@ use oxc_span::Span;
 use oxc_syntax::operator::BinaryOperator;
 
 use crate::error::{Error, compile_at};
-use crate::heap::{CODE_OFFSET, DATA_OFFSET, KIND_OFFSET, LENGTH_OFFSET, SHAPE_OFFSET, TypedKind};
+use crate::heap::{
+    CODE_OFFSET, DATA_OFFSET, KIND_OFFSET, LENGTH_OFFSET, PROPERTY_DATA_OFFSET, SHAPE_OFFSET,
+    TypedKind,
+};
 use crate::jit::helpers::{
     self, CACHE_BUILTIN_KIND_OFFSET, CACHE_BUILTIN_VALUE_OFFSET, CACHE_ENTRY_OFFSET,
     CACHE_ENTRY_SIZE, CACHE_HOLDER_OFFSET, CACHE_HOLDER_SHAPE_OFFSET, CACHE_INDEX_OFFSET,
@@ -1039,7 +1042,10 @@ impl FunctionCompiler<'_, '_> {
             index
         };
         let offset = self.b.ins().ishl_imm_s(index, 3);
-        let data = self.b.ins().load(self.pointer, flags, holder, DATA_OFFSET);
+        let data = self
+            .b
+            .ins()
+            .load(self.pointer, flags, holder, PROPERTY_DATA_OFFSET);
         let slot = self.b.ins().iadd(data, offset);
         let value = self.b.ins().load(types::I64, flags, slot, 0);
         self.jump(ready, &[BlockArg::Value(value)]);

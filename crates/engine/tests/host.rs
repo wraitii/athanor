@@ -111,21 +111,21 @@ fn nested_source_evaluation_keeps_script_this_separate_from_method_this() {
 #[test]
 fn runtime_errors_preserve_innermost_source_location() {
     let mut first = engine();
-    let inner = "function inner(){ return [1].missing; }";
+    let inner = "function inner(){ return /x/.missing; }";
     first.compile(inner, "inner.js").unwrap();
     first
         .compile("function main(){ return inner(); }", "outer.js")
         .unwrap();
     let error = first.call("main", &[]).err().unwrap().to_string();
-    let start = inner.find("[1].missing").unwrap();
+    let start = inner.find("/x/.missing").unwrap();
     assert!(
         error.contains(&format!(
             "inner.js:{start}..{}",
-            start + "[1].missing".len()
+            start + "/x/.missing".len()
         )),
         "{error}"
     );
-    assert!(error.contains("property \"missing\" of array"), "{error}");
+    assert!(error.contains("property \"missing\" of regexp"), "{error}");
 
     let mut engine = engine();
     engine

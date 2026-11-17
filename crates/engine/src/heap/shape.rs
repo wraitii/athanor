@@ -82,9 +82,16 @@ impl Shape {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum RootKind {
+    Object,
+    Function,
+    Array,
+}
+
 pub(super) struct Shapes {
     shapes: Vec<Shape>,
-    roots: FxHashMap<(u64, bool), ShapeId>,
+    roots: FxHashMap<(u64, RootKind), ShapeId>,
     transitions: FxHashMap<(ShapeId, Key), ShapeId>,
     deletions: FxHashMap<(ShapeId, Atom), ShapeId>,
 }
@@ -107,17 +114,21 @@ impl Shapes {
 
     // Roots are keyed by prototype address; a reused address describes its new occupant.
     pub(super) fn root(&mut self, prototype: Option<Value>) -> ShapeId {
-        self.root_for(prototype, false)
+        self.root_for(prototype, RootKind::Object)
     }
 
     pub(super) fn closure_root(&mut self, prototype: Option<Value>) -> ShapeId {
         // Closure roots stay distinct because their constructor prototype is lazy.
-        self.root_for(prototype, true)
+        self.root_for(prototype, RootKind::Function)
     }
 
-    fn root_for(&mut self, prototype: Option<Value>, closure: bool) -> ShapeId {
+    pub(super) fn array_root(&mut self, prototype: Option<Value>) -> ShapeId {
+        self.root_for(prototype, RootKind::Array)
+    }
+
+    fn root_for(&mut self, prototype: Option<Value>, kind: RootKind) -> ShapeId {
         let prototype = prototype.map_or(0, Value::bits);
-        let key = (prototype, closure);
+        let key = (prototype, kind);
         if let Some(&shape) = self.roots.get(&key) {
             return shape;
         }

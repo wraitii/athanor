@@ -25,7 +25,7 @@ pub(in crate::jit::semantic) fn views(function: &mut FunctionState) {
                     },
                 )
                 | Op::ArrayLoad(object, key, _)
-                | Op::CanOverwrite(object, key)
+                | Op::CanOverwrite(object, key, _)
                 | Op::ArrayStore(object, key, _)
                 | Op::PropertyStore(object, key, ..)
                     if facts.of(key).intersects(ValueType::NUMBER) =>

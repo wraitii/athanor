@@ -133,8 +133,8 @@ fn indexed_stores_preserve_values_and_ownership() {
 fn indexed_stores_preserve_fallbacks_and_array_transitions() {
     let source = r#"
         function store(a, k, v) { a[k] = v; }
-        function rejected(k) { const a = [1, 2]; store(a, k, 9); }
-        function booleanKey() { const a = [1, 2]; a[true] = 9; }
+        function named(k) { const a = [1, 2]; store(a, k, 9); return a[k]; }
+        function booleanKey() { const a = [1, 2]; a[true] = 9; return a[true]; }
         function main() {
             const a = [1, 2];
             for (let i = 0; i < 4; ++i)
@@ -167,17 +167,20 @@ fn indexed_stores_preserve_fallbacks_and_array_transitions() {
             Value::number(0.5),
             Value::number(f64::NAN),
             Value::number(f64::INFINITY),
-            Value::number(33554432.0),
             Value::TRUE,
             Value::FALSE,
         ] {
-            assert!(matches!(
-                engine.call("rejected", &[key]),
-                Err(Error::Runtime(_))
-            ));
+            assert_eq!(
+                engine.call("named", &[key]).unwrap().value(),
+                Value::number(9.0)
+            );
         }
+        assert_eq!(
+            engine.call("booleanKey", &[]).unwrap().value(),
+            Value::number(9.0)
+        );
         assert!(matches!(
-            engine.call("booleanKey", &[]),
+            engine.call("named", &[Value::number(33554432.0)]),
             Err(Error::Runtime(_))
         ));
     }

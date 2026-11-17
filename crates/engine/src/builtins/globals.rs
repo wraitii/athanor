@@ -37,6 +37,17 @@ pub(crate) fn install(global: &Environment) -> Result<(), Error> {
     if !installed {
         return Err(Error::Runtime("cannot install function prototype".into()));
     }
+    let array_prototype = heap.array(&[]).ok_or_else(exhausted)?;
+    let installed = heap.install_array_prototype(array_prototype);
+    heap.release(array_prototype);
+    if !installed {
+        return Err(Error::Runtime("cannot install array prototype".into()));
+    }
+    add_methods(array_prototype, super::ReceiverKind::Array.methods())?;
+    let constructor = native(NativeFunction::Array)?;
+    heap.define_property(constructor, "prototype", array_prototype, false);
+    heap.define_property(array_prototype, "constructor", constructor, false);
+    heap.release(constructor);
     global.define("globalThis", Value::GLOBAL_OBJECT);
     global.define_readonly("Infinity", Value::number(f64::INFINITY));
     global.define_readonly("NaN", Value::number(f64::NAN));

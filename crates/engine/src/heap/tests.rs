@@ -1163,7 +1163,7 @@ fn jit_cached_additions_guard_representation_and_errors() {
             slot.payload = Payload::Object(Object {
                 properties: Properties::Shaped(Vec::new()),
                 error: object.error,
-                prototype: object.prototype,
+                prototype: object.prototype(),
             });
             data.sync(id);
         }
@@ -1171,10 +1171,12 @@ fn jit_cached_additions_guard_representation_and_errors() {
         engine.call("write", &[boxed, child]).unwrap();
         assert_eq!(heap.property(boxed, "child"), Some(child));
         assert_eq!(heap.0.borrow().slot(heap_id(child).unwrap()).references, 2);
-        for receiver in [Value::NULL, Value::number(1.0), child] {
+        for receiver in [Value::NULL, Value::number(1.0)] {
             assert!(engine.call("write", &[receiver, child]).is_err());
             assert_eq!(heap.0.borrow().slot(heap_id(child).unwrap()).references, 2);
         }
+        engine.call("write", &[child, warm]).unwrap();
+        assert_eq!(heap.property(child, "child"), Some(warm));
         heap.release(child);
         heap.release(warm);
         heap.release(boxed);
@@ -1275,4 +1277,29 @@ fn deleting_native_properties_invalidates_guards() {
     assert_eq!(heap.delete_property(object, "method"), Some(true));
     assert_eq!(heap.0.borrow().epoch, epoch + 1);
     heap.release(object);
+}
+
+#[test]
+fn array_named_properties_share_shapes_and_own_values() {
+    let heap = Heap::default();
+    let first = heap.array(&[Value::number(1.0)]).unwrap();
+    let second = heap.array(&[]).unwrap();
+    let child = heap.object().unwrap();
+    assert!(heap.set_property(first, "child", child));
+    assert!(heap.set_property(second, "child", Value::TRUE));
+    let shape = heap.0.borrow().slot(heap_id(first).unwrap()).shape;
+    assert_eq!(heap.0.borrow().slot(heap_id(second).unwrap()).shape, shape);
+    heap.release(child);
+    assert!(heap.valid(child));
+    assert_eq!(heap.delete_property(first, "child"), Some(true));
+    heap.drain(1000);
+    assert!(!heap.valid(child));
+    assert!(heap.set_property(first, "child", second));
+    assert_eq!(heap.0.borrow().slot(heap_id(first).unwrap()).shape, shape);
+    assert_eq!(heap.get(first, 0), Some(Value::number(1.0)));
+    assert_eq!(heap.property(first, "child"), Some(second));
+    heap.release(second);
+    heap.release(first);
+    heap.drain(1000);
+    assert!(!heap.valid(second));
 }

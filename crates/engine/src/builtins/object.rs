@@ -46,7 +46,7 @@ pub(super) fn call(
             let index: usize = name.parse().unwrap();
             heap.string(characters[index].encode_utf8(&mut [0; 4]))
         } else {
-            let element = if heap.is_array(value) || heap.typed_kind(value).is_some() {
+            let element = if heap.typed_kind(value).is_some() {
                 heap.get(value, name.parse().unwrap())
             } else {
                 heap.property(value, &name)

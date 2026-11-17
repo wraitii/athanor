@@ -66,7 +66,11 @@ fn lower_array(graph: &mut Graph, inst: Inst) {
         ),
     );
     let fast = branch(graph, inst, fast, valid, fallback);
-    let writable = graph.append_value(fast, data.span, Op::CanOverwrite(object, position));
+    let writable = graph.append_value(
+        fast,
+        data.span,
+        Op::CanOverwrite(object, position, super::super::js::memory::Field::Elements),
+    );
     let fast = branch(graph, inst, fast, writable, fallback);
     graph.append(
         fast,

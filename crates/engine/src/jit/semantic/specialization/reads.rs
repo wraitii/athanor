@@ -346,7 +346,7 @@ fn lower_array(graph: &mut Graph, inst: Inst, guard_number: bool, array: bool) {
     };
     let first_block = graph.blocks.len();
     let (block, continuation, fallback) = super::super::dispatch::split(graph, inst);
-    let (fast, key) = if guard_number {
+    let (mut fast, key) = if guard_number {
         let fast = graph.blocks.push(BlockData::default());
         let check = graph.append_value(block, data.span, Op::IsNumber(key));
         terminate(
@@ -361,6 +361,36 @@ fn lower_array(graph: &mut Graph, inst: Inst, guard_number: bool, array: bool) {
     };
     let position = graph.append_value(fast, data.span, Op::ArrayPosition(key));
     if array {
+        let kind = graph.append_value(fast, data.span, Op::ArrayKind(object));
+        let mask = graph.append_value(
+            fast,
+            data.span,
+            Op::Constant(Constant::Number(
+                crate::heap::kind::PROTOTYPE_INDEXED as f64,
+            )),
+        );
+        let indexed = graph.append_value(
+            fast,
+            data.span,
+            Op::Binary(oxc_syntax::operator::BinaryOperator::BitwiseAnd, kind, mask),
+        );
+        let zero = graph.append_value(fast, data.span, Op::Constant(Constant::Number(0.0)));
+        let regular = graph.append_value(
+            fast,
+            data.span,
+            Op::Binary(
+                oxc_syntax::operator::BinaryOperator::StrictEquality,
+                indexed,
+                zero,
+            ),
+        );
+        let checked = graph.blocks.push(BlockData::default());
+        terminate(
+            graph,
+            fast,
+            TerminatorKind::Branch(regular, Target::new(checked), Target::new(fallback)),
+        );
+        fast = checked;
         let load = graph.blocks.push(BlockData::default());
         let outside = graph.blocks.push(BlockData::default());
         let absent = graph.blocks.push(BlockData::default());

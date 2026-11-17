@@ -51,7 +51,7 @@ fn array_feedback_preserves_holes_bounds_and_receiver_changes() {
 }
 
 #[test]
-fn array_feedback_preserves_non_index_numeric_errors() {
+fn array_feedback_preserves_non_index_numeric_properties() {
     let mut engine = Engine::with_options(EngineOptions {
         background_compile: false,
         ..Default::default()
@@ -74,10 +74,12 @@ fn array_feedback_preserves_non_index_numeric_errors() {
         );
     }
     for index in [-1.0, 0.5, f64::NAN, f64::INFINITY, 4294967295.0] {
-        assert!(
+        assert_eq!(
             engine
                 .call("read", &[array.value(), Value::number(index)])
-                .is_err()
+                .unwrap()
+                .value(),
+            Value::UNDEFINED
         );
     }
 }
@@ -904,19 +906,14 @@ fn array_read_feedback_preserves_layouts_bounds_and_fallbacks() {
             .unwrap();
         engine.call("warm", &[]).unwrap();
         assert_eq!(engine.call("main", &[]).unwrap().value(), Value::TRUE);
-        for name in [
-            "fractional",
-            "negative",
-            "nan",
-            "infinite",
-            "huge",
-            "nullReceiver",
-        ] {
-            assert!(
-                engine.call(name, &[]).is_err(),
+        for name in ["fractional", "negative", "nan", "infinite", "huge"] {
+            assert_eq!(
+                engine.call(name, &[]).unwrap().value(),
+                Value::UNDEFINED,
                 "{name}, optimized={enabled}"
             );
         }
+        assert!(engine.call("nullReceiver", &[]).is_err());
     }
 }
 

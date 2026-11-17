@@ -15,9 +15,9 @@ pub(super) struct Slot {
     // Code id + 1 of a closure that may be called without `new`, otherwise zero, so generated
     // call guards compare one word.
     pub(super) code: u32,
-    // Generated code reads elements, shaped property values or cell contents through these.
-    // HeapData::sync refreshes them after any change that can move or resize that storage.
+    // HeapData::sync refreshes these pointers after storage moves or resizes.
     pub(super) data: *const u8,
+    pub(super) property_data: *const u8,
     pub(super) length: usize,
     pub(super) payload: Payload,
 }
@@ -29,8 +29,9 @@ pub(crate) const KIND_OFFSET: i32 = std::mem::offset_of!(Slot, kind) as i32;
 pub(crate) const SHAPE_OFFSET: i32 = std::mem::offset_of!(Slot, shape) as i32;
 pub(crate) const CODE_OFFSET: i32 = std::mem::offset_of!(Slot, code) as i32;
 pub(crate) const DATA_OFFSET: i32 = std::mem::offset_of!(Slot, data) as i32;
+pub(crate) const PROPERTY_DATA_OFFSET: i32 = std::mem::offset_of!(Slot, property_data) as i32;
 pub(crate) const LENGTH_OFFSET: i32 = std::mem::offset_of!(Slot, length) as i32;
-// Relative to the inline object values addressed by Slot::data.
+// Relative to the inline object values addressed by Slot::property_data.
 pub(crate) const INLINE_PROPERTY_LENGTH_OFFSET: i32 = std::mem::offset_of!(SmallObject, len) as i32;
 
 pub(crate) static NO_ELEMENTS: [u64; SLOT_SIZE / 8] = [0; SLOT_SIZE / 8];
@@ -43,6 +44,7 @@ impl Slot {
             shape: 0,
             code: 0,
             data: std::ptr::null(),
+            property_data: std::ptr::null(),
             length: 0,
             payload: Payload::Vacant,
         }
