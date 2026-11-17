@@ -22,17 +22,17 @@ fn next_offset(text: &str, end: usize) -> Option<usize> {
         .map(|character| end + character.len_utf8())
 }
 
-fn match_ranges(
+fn visit_matches(
     pattern: &crate::regex::Pattern,
     text: &str,
     global: bool,
-) -> Vec<std::ops::Range<usize>> {
-    let mut ranges = Vec::new();
+    mut visit: impl FnMut(std::ops::Range<usize>),
+) {
     let mut offset = 0;
     while let Some(found) = pattern.find(text, offset) {
         let empty = found.is_empty();
         let end = found.end;
-        ranges.push(found);
+        visit(found);
         if !global {
             break;
         }
@@ -45,7 +45,6 @@ fn match_ranges(
             end
         };
     }
-    ranges
 }
 
 fn pieces(
@@ -96,7 +95,11 @@ pub(super) fn call(
     let (global, last_index) = heap.regexp_state(regexp).unwrap();
     if function == NativeFunction::StringMatch && global {
         heap.regexp_set_last_index(regexp, 0.0);
-        let Some(ranges) = heap.with_text(input, |text| match_ranges(&regex, text, true)) else {
+        let Some(ranges) = heap.with_text(input, |text| {
+            let mut ranges = Vec::new();
+            visit_matches(&regex, text, true, |range| ranges.push(range));
+            ranges
+        }) else {
             return fail(ctx, "regular expression matching requires a string");
         };
         if ranges.is_empty() {
@@ -184,17 +187,15 @@ pub(super) fn replace(ctx: &mut JitCtx, input: Value, regexp: Value, replacement
         heap.regexp_set_last_index(regexp, 0.0);
     }
     let Some(output) = heap.with_text(input, |text| {
-        let ranges = match_ranges(&regex, text, global);
-        if ranges.is_empty() {
-            return None;
-        }
-        let mut output = String::with_capacity(text.len());
+        let mut output = None;
         let mut previous = 0;
-        for range in ranges {
+        visit_matches(&regex, text, global, |range| {
+            let output = output.get_or_insert_with(|| String::with_capacity(text.len()));
             output.push_str(&text[previous..range.start]);
             output.push_str(&replacement);
             previous = range.end;
-        }
+        });
+        let mut output = output?;
         output.push_str(&text[previous..]);
         Some(output)
     }) else {

@@ -69,6 +69,41 @@ pub(super) fn to_string(
     fail(context, "string method requires a string receiver")
 }
 
+pub(super) fn character(
+    ctx: *mut JitCtx,
+    function: NativeFunction,
+    receiver: Value,
+    args: &[Value],
+) -> Value {
+    let index = arg(args, 0);
+    let index = (!index.is_object()).then(|| crate::jit::helpers::primitive_number(ctx, index));
+    let context = unsafe { &mut *ctx };
+    let heap = context.global.heap();
+    let Some(character) = heap.with_text(receiver, |text| {
+        let index = index?;
+        let index = if index.is_nan() { 0.0 } else { index.trunc() };
+        Some(if index < 0.0 || !index.is_finite() {
+            None
+        } else {
+            text.chars().nth(index as usize)
+        })
+    }) else {
+        return fail(context, "string method requires a string receiver");
+    };
+    let Some(character) = character else {
+        return fail(context, "character index object coercion is unsupported");
+    };
+    if function == NativeFunction::StringCharCodeAt {
+        return Value::number(character.map_or(f64::NAN, |c| c as u32 as f64));
+    }
+    let mut buffer = [0; 4];
+    let text = character.map_or("", |c| c.encode_utf8(&mut buffer) as &str);
+    match heap.string(text) {
+        Some(value) => value,
+        None => fail(context, "heap exhausted"),
+    }
+}
+
 pub(crate) fn call(
     ctx: *mut JitCtx,
     function: NativeFunction,
@@ -90,23 +125,6 @@ pub(crate) fn call(
     };
     let string_arg = |value: Value| heap.text(value);
     let result = match function {
-        StringCharAt | StringCharCodeAt => {
-            let value = arg(0);
-            if value.is_object() {
-                return fail(context, "character index object coercion is unsupported");
-            }
-            let index = crate::jit::helpers::primitive_number(ctx, value);
-            let index = if index.is_nan() { 0.0 } else { index.trunc() };
-            let character = if index < 0.0 || !index.is_finite() {
-                None
-            } else {
-                text.chars().nth(index as usize)
-            };
-            if function == StringCharCodeAt {
-                return Value::number(character.map_or(f64::NAN, |c| c as u32 as f64));
-            }
-            character.map(|c| c.to_string()).unwrap_or_default()
-        }
         StringSubstring | StringSubstr => {
             let length = text.chars().count();
             let integer = |value: Value, default: f64| -> Option<f64> {

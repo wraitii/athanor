@@ -328,6 +328,15 @@ The synthetic loop calls `charCodeAt` 262,144 times per iteration on a
 
 All map runs produced the same three hashes and 1137 entities.
 
+The allocation follow-up reads character indices from borrowed string data
+and builds RegExp replacement output as matches are found. Medians of six
+release rounds with rotating build order are shown below.
+
+| Workload | `8d753c5` | Prototype (`3b75ca5`) | Allocation follow-up |
+|----------|-----------:|----------------------:|---------------------:|
+| charCodeAt score | 836.5 | 784.5 | 1340 |
+| RegExp score | 4960.5 | 4681 | 4971 |
+
 ### Published results
 
 Selected macos-arm64 results from

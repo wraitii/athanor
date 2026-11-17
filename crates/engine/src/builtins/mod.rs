@@ -173,8 +173,8 @@ define_builtins! {
         }
         String {
             StringToString: "toString" => string::to_string;
-            StringCharAt: "charAt" => string::call;
-            StringCharCodeAt: "charCodeAt" => string::call;
+            StringCharAt: "charAt" => string::character;
+            StringCharCodeAt: "charCodeAt" => string::character;
             StringSubstring: "substring" => string::call;
             StringSubstr: "substr" => string::call;
             StringMatch: "match" => regexp::call;
