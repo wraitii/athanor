@@ -62,7 +62,7 @@ struct HeapData {
     natives: Vec<(NativeFunction, u64)>,
     function_prototype: Option<Value>,
     interned: Vec<(&'static str, u64)>,
-    regexp_cache: FxHashMap<(String, u8), Rc<regress::Regex>>,
+    regexp_cache: FxHashMap<(String, u8), Rc<crate::regex::Pattern>>,
     pending: VecDeque<u64>,
     epoch: u64,
 }

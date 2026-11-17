@@ -1,7 +1,7 @@
 use super::*;
 
 pub(super) struct RegExp {
-    pub(super) regex: Rc<regress::Regex>,
+    pub(super) pattern: Rc<crate::regex::Pattern>,
     pub(super) global: bool,
     pub(super) last_index: f64,
 }
@@ -16,9 +16,9 @@ pub(crate) fn regexp_flags(bits: u8) -> regress::Flags {
     }
 }
 
-fn split_ranges(regex: &regress::Regex, text: &str) -> Vec<Option<std::ops::Range<usize>>> {
+fn split_ranges(pattern: &crate::regex::Pattern, text: &str) -> Vec<Option<std::ops::Range<usize>>> {
     if text.is_empty() {
-        return match regex.find(text) {
+        return match pattern.find(text, 0) {
             Some(_) => Vec::new(),
             None => vec![Some(0..0)],
         };
@@ -26,7 +26,7 @@ fn split_ranges(regex: &regress::Regex, text: &str) -> Vec<Option<std::ops::Rang
     let mut pieces = Vec::new();
     let mut start = 0;
     let mut offset = 0;
-    while let Some(found) = regex.find_from(text, offset).next() {
+    while let Some(found) = pattern.captures(text, offset) {
         if found.range.start >= text.len() {
             break;
         }
@@ -38,7 +38,7 @@ fn split_ranges(regex: &regress::Regex, text: &str) -> Vec<Option<std::ops::Rang
             continue;
         }
         pieces.push(Some(start..found.range.start));
-        pieces.extend(found.captures);
+        pieces.extend(found.groups);
         start = found.range.end;
         offset = start;
     }
@@ -51,21 +51,18 @@ impl Heap {
         self.drain(64);
         let mut data = self.0.borrow_mut();
         let key = (pattern.to_owned(), flags);
-        let regex = if let Some(regex) = data.regexp_cache.get(&key) {
-            regex.clone()
+        let compiled = if let Some(compiled) = data.regexp_cache.get(&key) {
+            compiled.clone()
         } else {
-            let regex = Rc::new(
-                regress::Regex::with_flags(pattern, regexp_flags(flags))
-                    .map_err(|error| error.to_string())?,
-            );
-            data.regexp_cache.insert(key, regex.clone());
-            regex
+            let compiled = Rc::new(crate::regex::Pattern::new(pattern, flags)?);
+            data.regexp_cache.insert(key, compiled.clone());
+            compiled
         };
         let id = data.reserve().ok_or("heap exhausted")?;
         data.store(
             id,
             Payload::RegExp(Box::new(RegExp {
-                regex,
+                pattern: compiled,
                 global: flags & 16 != 0,
                 last_index: 0.0,
             })),
@@ -81,8 +78,8 @@ impl Heap {
         values: &mut Vec<Value>,
     ) -> Option<()> {
         assert!(values.is_empty());
-        let regex = self.regexp_compiled(regexp)?;
-        let pieces = self.with_text(value, |text| split_ranges(&regex, text))?;
+        let pattern = self.regexp_compiled(regexp)?;
+        let pieces = self.with_text(value, |text| split_ranges(&pattern, text))?;
         // The caller keeps the source alive while draining and allocating pieces.
         self.drain(64usize.saturating_mul(pieces.len()));
         let mut data = self.0.borrow_mut();
@@ -101,10 +98,10 @@ impl Heap {
         Some(())
     }
 
-    pub(crate) fn regexp_compiled(&self, value: Value) -> Option<Rc<regress::Regex>> {
+    pub(crate) fn regexp_compiled(&self, value: Value) -> Option<Rc<crate::regex::Pattern>> {
         let data = self.0.borrow();
         let regexp = data.regexp(heap_id(value)?)?;
-        Some(regexp.regex.clone())
+        Some(regexp.pattern.clone())
     }
 
     pub(crate) fn regexp_state(&self, value: Value) -> Option<(bool, f64)> {

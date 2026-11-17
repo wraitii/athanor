@@ -81,6 +81,29 @@ impl Tiering {
         })
     }
 
+    pub(crate) fn prepare_regex(&self, pattern: &crate::regex::Pattern) {
+        if !pattern.needs_native() {
+            return;
+        }
+        if !self.options.regex {
+            pattern.install(None);
+            return;
+        }
+        let Ok(mut compiler) = self.compiler.try_borrow_mut() else {
+            return;
+        };
+        let native = pattern.program().ok().and_then(|program| {
+            match compiler.compile_regex(&program.dfa) {
+                Ok(search) => Some((search, program.groups)),
+                Err(error) => {
+                    eprintln!("js jit: regular expression compilation failed: {error}");
+                    None
+                }
+            }
+        });
+        pattern.install(native);
+    }
+
     pub(crate) fn report(&self) {
         if self.recompile_log.enabled() {
             let stats = self.prefetch_stats.borrow();

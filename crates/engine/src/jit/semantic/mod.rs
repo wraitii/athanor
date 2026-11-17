@@ -20,6 +20,7 @@ mod memory;
 pub(super) mod osr;
 pub(in crate::jit) mod ownership;
 mod pipeline;
+pub(in crate::jit) mod regex;
 pub(in crate::jit) mod repr;
 pub(in crate::jit) mod runtime;
 pub(in crate::jit) mod specialization;
@@ -348,6 +349,7 @@ pub(super) enum PropertyWrite {
 #[derive(Clone, Debug)]
 pub(super) enum Op {
     LowLevel(low_level::Op),
+    Regex(regex::Op),
     Aarch64(crate::jit::aarch64::inst::Op),
     Observe(Value, super::profile::Observation, super::profile::Site),
     ReadHint(
@@ -703,6 +705,7 @@ impl Op {
     pub(super) fn operands_iter(&self) -> Operands<'_> {
         let (fixed, rest): ([Option<Value>; 3], &[Value]) = match self {
             Op::Aarch64(op) => return op.operands(),
+            Op::Regex(op) => return op.operands(),
             Op::LowLevel(low_level::Op::Cleanup { values, .. }) => ([None; 3], values),
             Op::LowLevel(low_level::Op::Call { target, args, .. }) => (
                 [
@@ -953,6 +956,7 @@ impl Op {
     pub(super) fn operands_mut(&mut self) -> OperandsMut<'_> {
         let (fixed, rest): ([Option<&mut Value>; 3], &mut [Value]) = match self {
             Op::Aarch64(op) => return op.operands_mut(),
+            Op::Regex(op) => return op.operands_mut(),
             Op::LowLevel(low_level::Op::Cleanup { values, .. }) => ([None, None, None], values),
             Op::LowLevel(low_level::Op::Call { target, args, .. }) => (
                 [
@@ -1943,6 +1947,7 @@ impl Graph {
         };
         match op {
             Op::Aarch64(op) => op.contract(),
+            Op::Regex(op) => op.contract(),
             Op::LowLevel(low_level::Op::Reference { .. } | low_level::Op::Cleanup { .. }) => {
                 closed(INTERNAL | HEAP_WRITE, None)
             }

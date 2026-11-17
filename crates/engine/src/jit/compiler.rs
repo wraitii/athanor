@@ -514,6 +514,43 @@ impl Compiler {
         Ok(machine)
     }
 
+    pub(crate) fn compile_regex(&mut self, dfa: &crate::regex::Dfa) -> Result<crate::regex::Search, Error> {
+        let mut signature = self.module.make_signature();
+        for _ in 0..3 {
+            signature.params.push(AbiParam::new(types::I64));
+        }
+        signature.returns.push(AbiParam::new(types::I64));
+        let name = format!("regex_{}", self.next_id);
+        self.next_id += 1;
+        let id = self
+            .module
+            .declare_function(&name, Linkage::Local, &signature)
+            .map_err(|error| Error::Compile(error.to_string()))?;
+        let mut graph = super::semantic::regex::matcher(dfa, signature.clone());
+        super::semantic::regex::lower(&mut graph);
+        self.context.clear();
+        self.context.func.signature = signature;
+        if self.backend == crate::Backend::Cranelift || self.module.isa().name() != "aarch64" {
+            let mut prepared = graph.clone();
+            cranelift::prepare(&mut prepared, &mut |_, _| {}).map_err(Error::Compile)?;
+            let mut builder = cranelift_frontend::FunctionBuilder::new(
+                &mut self.context.func,
+                &mut self.builder_context,
+            );
+            cranelift::emit(&mut builder, &mut self.module, &prepared, None)?;
+            builder.seal_all_blocks();
+            builder.finalize(self.module.target_config());
+        }
+        let machine = self.machine_code(id, &name, Some(&mut graph))?;
+        machine
+            .define(&mut self.module, id)
+            .map_err(|error| Error::Compile(error.to_string()))?;
+        self.module
+            .finalize_definitions()
+            .map_err(|error| Error::Compile(error.to_string()))?;
+        Ok(unsafe { std::mem::transmute(self.module.get_finalized_function(id)) })
+    }
+
     fn entry(&mut self, id: FuncId) -> Result<Entry, Error> {
         let code = self.module.get_finalized_function(id) as usize;
         let arity = self.fixed.get(&id).copied();
@@ -2871,5 +2908,35 @@ mod native_tests {
                 .machine_code(id, "unsupported_test", Some(&mut graph),)
                 .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod regex_tests {
+    use super::*;
+    use crate::regex::NO_MATCH;
+
+    #[test]
+    fn compiled_regex_matches_regress() {
+        for backend in [crate::Backend::Cranelift, crate::Backend::NativeOnly] {
+            let mut compiler = Compiler::new(
+                EngineOptions {
+                    backend,
+                    ..Default::default()
+                },
+                CompilationTier::Optimized,
+                std::ptr::null(),
+                0,
+                super::super::recompile::Log::new(false),
+            )
+            .unwrap();
+            crate::regex::tests::differential(&mut |dfa| {
+                let search = compiler.compile_regex(dfa).unwrap();
+                Box::new(move |text: &str, from: usize| {
+                    let found = search(text.as_ptr(), text.len() as u64, from as u64);
+                    (found != NO_MATCH).then(|| ((found >> 32) as usize, found as u32 as usize))
+                })
+            });
+        }
     }
 }

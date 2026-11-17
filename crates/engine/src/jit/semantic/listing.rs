@@ -196,6 +196,7 @@ impl Graph {
         };
         match op {
             Op::Aarch64(op) => format!("aarch64 {op:?}"),
+            Op::Regex(op) => op.listing(),
             Op::LowLevel(op) => format!("low_level {op:?}"),
             Op::Observe(value, kind, site) => {
                 format!("observe {kind:?} {value} site={site}")

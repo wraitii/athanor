@@ -22,13 +22,13 @@ fn next_offset(text: &str, end: usize) -> Option<usize> {
         .map(|character| end + character.len_utf8())
 }
 
-fn match_ranges(regex: &regress::Regex, text: &str, global: bool) -> Vec<std::ops::Range<usize>> {
+fn match_ranges(pattern: &crate::regex::Pattern, text: &str, global: bool) -> Vec<std::ops::Range<usize>> {
     let mut ranges = Vec::new();
     let mut offset = 0;
-    while let Some(found) = regex.find_from(text, offset).next() {
-        let empty = found.range.is_empty();
-        let end = found.range.end;
-        ranges.push(found.range);
+    while let Some(found) = pattern.find(text, offset) {
+        let empty = found.is_empty();
+        let end = found.end;
+        ranges.push(found);
         if !global {
             break;
         }
@@ -106,7 +106,15 @@ pub(super) fn call(
         } else {
             Some(0)
         };
-        let found = offset.and_then(|offset| regex.find_from(text, offset).next());
+        let found = offset.and_then(|offset| {
+            if function == NativeFunction::RegExpTest {
+                return regex.find(text, offset).map(|range| crate::regex::Captures {
+                    range,
+                    groups: Vec::new(),
+                });
+            }
+            regex.captures(text, offset)
+        });
         let end = match &found {
             Some(found) if global => text[..found.range.end].chars().count() as f64,
             _ => 0.0,
@@ -125,7 +133,7 @@ pub(super) fn call(
         Some(found) => pieces(
             ctx,
             input,
-            std::iter::once(Some(found.range)).chain(found.captures),
+            std::iter::once(Some(found.range)).chain(found.groups),
         ),
         None => Value::NULL,
     }

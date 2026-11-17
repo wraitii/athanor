@@ -320,6 +320,7 @@ impl FunctionCompiler<'_, '_> {
                     'lowered: {
                         let result = match &data.op {
                             Op::Aarch64(_) => unreachable!("target operation before selection"),
+                            Op::Regex(_) => unreachable!("regex operation before regex lowering"),
                             Op::LowLevel(_) => {
                                 return Err(Error::Compile(
                                     "low-level operation reached runtime lowering finalization"

@@ -739,7 +739,12 @@ extern "C" fn js_regexp_new(ctx: *mut JitCtx, flags: u64, ptr: *const u8, len: u
     let pattern =
         unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len as usize)) };
     match ctx.global.heap().regexp(pattern, flags as u8) {
-        Ok(value) => value,
+        Ok(value) => {
+            if let Some(pattern) = ctx.global.heap().regexp_compiled(value) {
+                ctx.engine.tiering.prepare_regex(&pattern);
+            }
+            value
+        }
         Err(message) => {
             ctx.error = Some(Box::new(crate::Error::Runtime(format!(
                 "invalid regular expression: {message}"
