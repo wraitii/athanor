@@ -160,6 +160,7 @@ define_helpers! {
     IsTypeof => js_is_typeof(Value, Value) -> Value;
     Truthy => js_truthy(Value) -> Value;
     ObjectNew => js_object_new(Value) -> Value, owned;
+    Delete => js_delete(Value, Value) -> Value;
     PropertyKey => js_property_key(Value) -> Value, owned;
     StringConstant => js_string_constant(*mut u64, *const u8, u64) -> Value;
     RegExpNew => js_regexp_new(u64, *const u8, u64) -> Value, owned;
@@ -269,8 +270,7 @@ impl Helper {
         // These helpers may report engine errors, but never execute JavaScript or throw.
         !matches!(
             self,
-            Self::Retain
-                | Self::StringConstant
+            Self::StringConstant
                 | Self::CompilePoll
                 | Self::CompileLeave
                 | Self::BaselineWarm
@@ -278,12 +278,6 @@ impl Helper {
                 | Self::Release
                 | Self::FrameOverflow
                 | Self::FrameRelease
-                | Self::IndexGet
-                | Self::IndexGetNumeric
-                | Self::PropertyGetCached
-                | Self::PropertyGetMegamorphic
-                | Self::GlobalGetBorrowed
-                | Self::GlobalGetOptionalBorrowed
                 | Self::BitwiseAnd
                 | Self::BitwiseOr
                 | Self::BitwiseXor
@@ -364,7 +358,9 @@ extern "C" fn js_error_origin(
     end: u64,
 ) -> Value {
     let ctx = unsafe { &mut *ctx };
-    if ctx.error_origin.is_none() && matches!(ctx.error.as_deref(), Some(crate::Error::Runtime(_)))
+    if ctx.error_origin.is_none()
+        && (ctx.exception_pending()
+            || matches!(ctx.error.as_deref(), Some(crate::Error::Runtime(_))))
     {
         let (ptr, len) = unsafe { *source };
         let filename = unsafe {
@@ -399,9 +395,7 @@ extern "C" fn js_release(ctx: *mut JitCtx, value: Value) -> Value {
 extern "C" fn js_retain(ctx: *mut JitCtx, value: Value) -> Value {
     let ctx = unsafe { &mut *ctx };
     if value == Value::UNINITIALIZED {
-        ctx.error = Some(Box::new(crate::Error::Runtime(
-            "binding accessed before initialization".into(),
-        )));
+        ctx.language_error("ReferenceError", "binding accessed before initialization");
         return Value::UNDEFINED;
     }
     ctx.retain(value)
@@ -454,9 +448,7 @@ extern "C" fn js_cell_get(ctx: *mut JitCtx, cell: Value) -> Value {
     let ctx = unsafe { &mut *ctx };
     match ctx.global.heap().cell_get(cell) {
         Some(Value::UNINITIALIZED) => {
-            ctx.error = Some(Box::new(crate::Error::Runtime(
-                "binding accessed before initialization".into(),
-            )));
+            ctx.language_error("ReferenceError", "binding accessed before initialization");
             Value::UNDEFINED
         }
         Some(value) => ctx.retain(value),
@@ -944,9 +936,7 @@ extern "C" fn js_is_typeof(ctx: *mut JitCtx, value: Value, kind: Value) -> Value
 extern "C" fn js_typeof(ctx: *mut JitCtx, value: Value) -> Value {
     let ctx = unsafe { &mut *ctx };
     if value == Value::UNINITIALIZED {
-        ctx.error = Some(Box::new(crate::Error::Runtime(
-            "binding accessed before initialization".into(),
-        )));
+        ctx.language_error("ReferenceError", "binding accessed before initialization");
         return Value::UNDEFINED;
     }
     let name = if ctx.global.heap().closure_code(value).is_some()

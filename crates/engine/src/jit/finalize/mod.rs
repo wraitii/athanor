@@ -402,23 +402,28 @@ impl FunctionCompiler<'_, '_> {
         block
     }
 
+    fn record_error_origin(&mut self, site: LoweredValue) {
+        let flags = MemFlagsData::trusted();
+        let offset = self.b.ins().load(types::I64, flags, site, 0);
+        let source = self.b.ins().iadd(self.data_base, offset);
+        let span = self.b.ins().load(types::I64, flags, site, 8);
+        let start = self.b.ins().band_imm_u(span, u32::MAX as i64);
+        let end = self.b.ins().ushr_imm_s(span, 32);
+        self.call_helper(Helper::ErrorOrigin, &[source, start, end]);
+    }
+
     pub(super) fn finish_failed_exit(&mut self) {
         if let Some(block) = self.error_origin {
             for (target, dispatch) in std::mem::take(&mut self.error_dispatch) {
                 self.switch(dispatch);
                 let site = self.b.block_params(dispatch)[0];
+                self.record_error_origin(site);
                 let error = self.load_ctx(crate::jit::session::ERROR_OFFSET);
                 self.brif(error, block, &[site.into()], target, &[]);
             }
             self.switch(block);
             let site = self.b.block_params(block)[0];
-            let flags = MemFlagsData::trusted();
-            let offset = self.b.ins().load(types::I64, flags, site, 0);
-            let source = self.b.ins().iadd(self.data_base, offset);
-            let span = self.b.ins().load(types::I64, flags, site, 8);
-            let start = self.b.ins().band_imm_u(span, u32::MAX as i64);
-            let end = self.b.ins().ushr_imm_s(span, 32);
-            self.call_helper(Helper::ErrorOrigin, &[source, start, end]);
+            self.record_error_origin(site);
             let exit = self.failed_exit();
             self.jump(exit, &[]);
         }

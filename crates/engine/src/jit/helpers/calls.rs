@@ -62,9 +62,7 @@ pub(crate) extern "C" fn js_call(
     argc: u64,
 ) -> Value {
     if unsafe { &*ctx }.global.heap().is_class(closure) {
-        unsafe { &mut *ctx }.error = Some(Box::new(crate::Error::Runtime(
-            "class constructor requires new".into(),
-        )));
+        unsafe { &mut *ctx }.language_error("TypeError", "class constructor requires new");
         return Value::UNDEFINED;
     }
     invoke(ctx, closure, receiver, argv, argc)
@@ -96,9 +94,7 @@ pub(super) fn invoke(
             }
         };
         let Some(entry) = entry else {
-            context.error = Some(Box::new(crate::Error::Runtime(
-                "value is not callable in this engine".into(),
-            )));
+            context.language_error("TypeError", "value is not callable in this engine");
             return Value::UNDEFINED;
         };
         entry

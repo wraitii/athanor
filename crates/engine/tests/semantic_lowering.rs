@@ -728,19 +728,21 @@ fn exceptions_preserve_values_bindings_and_error_boundaries() {
         }
     }
     for semantic in [false, true] {
-        assert!(
+        assert_eq!(
             run(
                 "function main(){ try { undefined(); } catch { return 42; } }",
                 semantic
             )
-            .is_err()
+            .unwrap(),
+            Value::number(42.0)
         );
-        assert!(
+        assert_eq!(
             run(
                 "function main(){ try { return 1; } finally { return 2; } }",
                 semantic
             )
-            .is_err()
+            .unwrap(),
+            Value::number(2.0)
         );
     }
 }

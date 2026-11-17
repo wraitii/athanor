@@ -41,6 +41,21 @@ struct Loop {
     is_loop: bool,
 }
 
+#[derive(Clone, Copy)]
+enum Completion {
+    Normal(Block),
+    Return,
+    Throw,
+    Jump(Block, usize, usize),
+}
+
+struct Finalizer {
+    entry: Block,
+    depth: usize,
+    routes: Vec<Completion>,
+    loop_depth: usize,
+}
+
 struct Builder<'a> {
     scoping: &'a Scoping,
     captured: &'a FxHashSet<SymbolId>,
@@ -52,6 +67,7 @@ struct Builder<'a> {
     open: Vec<Scope>,
     loops: Vec<Loop>,
     handlers: Vec<(Block, usize)>,
+    finalizers: Vec<Finalizer>,
 }
 
 fn literal_elements<'s, 'a>(init: &'s Expression<'a>) -> Option<Vec<&'s Expression<'a>>> {
@@ -535,7 +551,33 @@ impl<'a> Builder<'a> {
                         return Ok(self.constant(span, Constant::Undefined));
                     }
                     UnaryOperator::Delete => {
-                        return unsupported("unary operator in unary expression", span);
+                        let argument = x.argument.without_parentheses();
+                        let (object, key) = match argument {
+                            Expression::StaticMemberExpression(member) => {
+                                let object = self.expression(&member.object)?;
+                                let key = self.constant(
+                                    span,
+                                    Constant::String(member.property.name.to_string()),
+                                );
+                                (object, key)
+                            }
+                            Expression::ComputedMemberExpression(member) => {
+                                let object = self.expression(&member.object)?;
+                                let key = self.expression(&member.expression)?;
+                                (object, key)
+                            }
+                            Expression::Identifier(_) => {
+                                return unsupported("delete binding", span);
+                            }
+                            Expression::ChainExpression(_) => {
+                                return unsupported("optional delete", span);
+                            }
+                            _ => {
+                                self.expression(argument)?;
+                                return Ok(self.constant(span, Constant::Boolean(true)));
+                            }
+                        };
+                        return Ok(self.emit(span, Op::Delete(object, key)));
                     }
                 };
                 let value = self.expression(&x.argument)?;
@@ -1043,8 +1085,7 @@ impl<'a> Builder<'a> {
                     Some(expression) => self.expression(expression)?,
                     None => self.constant(statement.span, Constant::Undefined),
                 };
-                self.unwind(statement.span, 0);
-                self.terminate(statement.span, TerminatorKind::Return(value));
+                self.complete(statement.span, Completion::Return, value);
             }
             Statement::IfStatement(statement) => self.if_statement(statement)?,
             Statement::ForStatement(statement) => self.for_statement(statement)?,
@@ -1061,8 +1102,12 @@ impl<'a> Builder<'a> {
                     return unsupported("break outside loop", statement.span);
                 };
                 let (block, depth) = (target.break_target, target.depth);
-                self.unwind(statement.span, depth);
-                self.jump(statement.span, block, Vec::new());
+                let value = self.constant(statement.span, Constant::Undefined);
+                self.complete(
+                    statement.span,
+                    Completion::Jump(block, depth, self.loops.len() - 1),
+                    value,
+                );
             }
             Statement::ContinueStatement(statement) => {
                 if statement.label.is_some() {
@@ -1073,8 +1118,8 @@ impl<'a> Builder<'a> {
                 };
                 let depth = self.loops[index].depth;
                 let block = self.continue_target(index);
-                self.unwind(statement.span, depth);
-                self.jump(statement.span, block, Vec::new());
+                let value = self.constant(statement.span, Constant::Undefined);
+                self.complete(statement.span, Completion::Jump(block, depth, index), value);
             }
             _ => return unsupported("statement", statement.span()),
         }
@@ -1371,11 +1416,121 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
-    fn try_statement(&mut self, statement: &oxc_ast::ast::TryStatement<'_>) -> Result<()> {
-        let span = statement.span;
-        if statement.finalizer.is_some() {
-            return unsupported("finally", span);
+    fn complete(&mut self, span: Span, completion: Completion, value: Value) {
+        let depth = match completion {
+            Completion::Jump(_, depth, _) => depth,
+            _ => 0,
+        };
+        if let Some(finalizer) = self.finalizers.last_mut()
+            && !matches!(completion, Completion::Normal(_) | Completion::Throw)
+            && depth <= finalizer.depth
+            && !matches!(completion, Completion::Jump(_, _, index) if index >= finalizer.loop_depth)
+        {
+            let index = finalizer.routes.len();
+            finalizer.routes.push(completion);
+            let entry = finalizer.entry;
+            let depth = finalizer.depth;
+            let kind = self.constant(span, Constant::Number(index as f64));
+            self.unwind(span, depth);
+            self.jump(span, entry, vec![kind, value]);
+            return;
         }
+        match completion {
+            Completion::Normal(block) => self.jump(span, block, Vec::new()),
+            Completion::Return => {
+                self.unwind(span, 0);
+                self.terminate(span, TerminatorKind::Return(value));
+            }
+            Completion::Throw => {
+                self.effect(span, Op::Throw(value));
+                let undefined = self.constant(span, Constant::Undefined);
+                self.unwind(span, 0);
+                self.terminate(span, TerminatorKind::Return(undefined));
+            }
+            Completion::Jump(block, depth, _) => {
+                self.unwind(span, depth);
+                self.jump(span, block, Vec::new());
+            }
+        }
+    }
+
+    fn try_finally(
+        &mut self,
+        statement: &oxc_ast::ast::TryStatement<'_>,
+        finalizer: &oxc_ast::ast::BlockStatement<'_>,
+    ) -> Result<()> {
+        let span = statement.span;
+        self.graph.has_handlers = true;
+        let entry = self.block();
+        let kind = self.param(entry);
+        let value = self.param(entry);
+        let exceptional = self.block();
+        let done = self.block();
+        let depth = self.open.len();
+        self.finalizers.push(Finalizer {
+            entry,
+            depth,
+            routes: vec![Completion::Normal(done), Completion::Throw],
+            loop_depth: self.loops.len(),
+        });
+        self.handlers.push((exceptional, depth));
+        if statement.handler.is_some() {
+            self.try_catch(statement)?;
+        } else {
+            let scope = self.open_scope(
+                statement.block.span,
+                ScopeKind::Block,
+                lexical_bindings(&statement.block.body)?,
+            )?;
+            self.statements(&statement.block.body)?;
+            self.close_scope(statement.block.span, scope);
+        }
+        self.handlers.pop();
+        if self.current.is_some() {
+            let normal = self.constant(span, Constant::Number(0.0));
+            let undefined = self.constant(span, Constant::Undefined);
+            self.jump(span, entry, vec![normal, undefined]);
+        }
+        self.switch(exceptional);
+        let exception = self.emit(span, Op::Catch);
+        let thrown = self.constant(span, Constant::Number(1.0));
+        self.jump(span, entry, vec![thrown, exception]);
+        let frame = self.finalizers.pop().unwrap();
+        self.switch(entry);
+        let scope = self.open_scope(
+            finalizer.span,
+            ScopeKind::Block,
+            lexical_bindings(&finalizer.body)?,
+        )?;
+        self.statements(&finalizer.body)?;
+        self.close_scope(finalizer.span, scope);
+        if self.current.is_some() {
+            for (index, completion) in frame.routes.iter().enumerate() {
+                let route = self.block();
+                let next = self.block();
+                let tag = self.constant(span, Constant::Number(index as f64));
+                let matches =
+                    self.emit(span, Op::Binary(BinaryOperator::StrictEquality, kind, tag));
+                self.branch(span, matches, Target::new(route), Target::new(next));
+                self.switch(route);
+                self.complete(span, *completion, value);
+                self.switch(next);
+            }
+            self.jump(span, done, Vec::new());
+        }
+        self.switch(done);
+        Ok(())
+    }
+
+    fn try_statement(&mut self, statement: &oxc_ast::ast::TryStatement<'_>) -> Result<()> {
+        if let Some(finalizer) = &statement.finalizer {
+            return self.try_finally(statement, finalizer);
+        }
+        self.try_catch(statement)
+    }
+
+    fn try_catch(&mut self, statement: &oxc_ast::ast::TryStatement<'_>) -> Result<()> {
+        let span = statement.span;
         let Some(handler) = &statement.handler else {
             return unsupported("try without catch", span);
         };
@@ -1674,6 +1829,7 @@ pub(super) fn lower_global(
         open: Vec::new(),
         loops: Vec::new(),
         handlers: Vec::new(),
+        finalizers: Vec::new(),
     };
     let entry = builder.block();
     builder.switch(entry);
@@ -1773,6 +1929,7 @@ pub(super) fn lower_parts(
         open: Vec::new(),
         loops: Vec::new(),
         handlers: Vec::new(),
+        finalizers: Vec::new(),
     };
     let entry = builder.block();
     builder.switch(entry);

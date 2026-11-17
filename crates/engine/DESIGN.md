@@ -78,7 +78,7 @@ The parser accepts more syntax than the compiler implements. Unsupported forms
 are rejected during lowering, often with a source span, rather than interpreted.
 `jit/semantic/build.rs` and `jit/syntax.rs` are the authoritative checks; tests
 show the currently implemented subset. Examples of explicit rejections include
-array literal holes, object spread, optional calls, `finally`, labelled
+array literal holes, object spread, optional calls, labelled
 break/continue, and several destructuring and class forms. These are current
 implementation boundaries, not necessarily permanent design decisions.
 
@@ -170,10 +170,15 @@ include current implementation gaps; these do not all define a permanent subset:
 - `Object.freeze` currently returns its argument without freezing objects or
   arrays. `Object.isFrozen` reports false for those values and true for
   primitives. Mutations after `freeze` therefore still succeed.
-- JavaScript `throw` values propagate to `catch`, including through calls and
-  callbacks. Engine runtime errors, such as calling `undefined`, bypass JS
-  `catch` and return an error to the embedder. Parse and unsupported-syntax
-  failures likewise occur outside JS exception handling.
+- JavaScript `throw` values and implemented language errors, including invalid
+  calls, nullish property access and uninitialized binding reads, propagate to
+  `catch`. `finally` runs on normal exits and JS abrupt completions, with a new
+  abrupt completion replacing the pending one. Engine failures and unsupported
+  runtime operations bypass JS handlers and return an error to the embedder.
+  Parse and unsupported-syntax failures likewise occur outside JS handling.
+- Property deletion reuses shape transitions and preserves remaining key order;
+  array element deletion creates a hole without changing length. Deleting
+  bindings, optional chains or global object properties remains unsupported.
 
 Numbers use binary64, but exact agreement with JS integer arithmetic at precision
 limits is not a design requirement. Integer optimizations may depart from JS

@@ -714,6 +714,7 @@ impl FunctionCompiler<'_, '_> {
                             | Op::IsStringSplit(..)
                             | Op::IsNative(..)
                             | Op::GetIndex(..)
+                            | Op::Delete(..)
                             | Op::ArrayGet(..)
                             | Op::SetIndex(..)
                             | Op::Truthy(..)

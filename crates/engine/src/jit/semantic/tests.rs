@@ -885,7 +885,7 @@ fn keeps_shadowed_bindings_and_call_order() {
 
 #[test]
 fn rejects_unsupported_syntax() {
-    let Err(error) = lower_source("function f(a) { return delete a.x; }") else {
+    let Err(error) = lower_source("function f(a) { return delete a; }") else {
         panic!()
     };
     assert!(error.contains("unsupported"));

@@ -94,7 +94,7 @@ Unsupported benchmarks:
 
 | benchmark | first error |
 |-----------|-------------|
-| earley-boyer | `unsupported unary operator in unary expression` |
+| earley-boyer | `Array.prototype` is undefined when initializing `sc_Vector.prototype` |
 
 Additional scores on the same machine, medians of three sequential runs per
 engine and benchmark, using the same dates and release JIT build as above.
@@ -140,6 +140,15 @@ Earley–Boyer first rejects `delete ht[key]` in `sc_rempropBang` at line 131.
 Replacing `delete` with `void` in a temporary copy, solely to probe compilation,
 exposes unsupported `finally` at line 1719. Both language features need work;
 runtime compatibility beyond these compile failures remains unchecked.
+
+A subsequent implementation adds shape-reusing property deletion and `finally`.
+The original Earley–Boyer source now passes those syntax boundaries, but fails
+during initialization at line 1345: `sc_Vector` aliases `Array`, whose
+`prototype` property is currently undefined. The write to
+`sc_Vector.prototype.sc_toWriteOrDisplayString` therefore throws a TypeError.
+With these changes, Belgian Uplands retains the three hashes and 1137 entities
+listed below; one release run takes 860 ms, compared with the earlier 773 ms
+recording. These single runs do not establish a performance regression.
 
 Map probes use size 128, seed 0 and two players (`athen`, `brit`), with the same
 shared bootstrap in Athanor and SpiderMonkey. Belgian Uplands completes with

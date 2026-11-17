@@ -1227,3 +1227,52 @@ fn property_read_cache_handles_mutation_and_heap_identity() {
         heap.drain(1000);
     }
 }
+
+#[test]
+fn deletion_reuses_shapes_and_releases_values() {
+    let heap = Heap::default();
+    let object = heap.object().unwrap();
+    let child = heap.object().unwrap();
+    let id = heap_id(object).unwrap();
+    let root = heap.0.borrow().slot(id).shape;
+    heap.set_property(object, "a", Value::number(1.0));
+    let first = heap.0.borrow().slot(id).shape;
+    for _ in 0..10 {
+        heap.set_property(object, "b", child);
+        assert_eq!(heap.delete_property(object, "b"), Some(true));
+        assert_eq!(heap.0.borrow().slot(id).shape, first);
+    }
+    heap.set_property(object, "b", child);
+    heap.set_property(object, "c", Value::number(3.0));
+    heap.release(child);
+    heap.delete_property(object, "b");
+    heap.drain(100);
+    assert!(!heap.valid(child));
+    let peer = heap.object().unwrap();
+    heap.set_property(peer, "a", Value::number(1.0));
+    heap.set_property(peer, "c", Value::number(3.0));
+    assert_eq!(
+        heap.0.borrow().slot(id).shape,
+        heap.0.borrow().slot(heap_id(peer).unwrap()).shape
+    );
+    heap.delete_property(object, "a");
+    heap.delete_property(object, "c");
+    assert_eq!(heap.0.borrow().slot(id).shape, root);
+    heap.release(object);
+    heap.release(peer);
+}
+
+#[test]
+fn deleting_native_properties_invalidates_guards() {
+    let heap = Heap::default();
+    let object = heap.object().unwrap();
+    let native = heap.native_function(NativeFunction::Object).unwrap();
+    heap.set_property(object, "method", native);
+    heap.release(native);
+    let epoch = heap.0.borrow().epoch;
+    assert_eq!(heap.delete_property(object, "method"), Some(true));
+    assert_eq!(heap.0.borrow().epoch, epoch + 1);
+    assert_eq!(heap.delete_property(object, "method"), Some(true));
+    assert_eq!(heap.0.borrow().epoch, epoch + 1);
+    heap.release(object);
+}

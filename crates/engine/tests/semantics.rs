@@ -702,10 +702,13 @@ fn exceptions_propagate_and_catch_values() {
 }
 
 #[test]
-fn engine_errors_bypass_catch_and_uncaught_exceptions_do_not_persist() {
+fn caught_and_uncaught_exceptions_do_not_persist() {
     let mut engine = Engine::new().unwrap();
     engine.compile("function bad() { try { undefined(); } catch { return 42; } } function fail() { throw 'oops'; } function main() { return 42; }", "exceptions.js").unwrap();
-    assert!(matches!(engine.call("bad", &[]), Err(Error::Runtime(_))));
+    assert_eq!(
+        engine.call("bad", &[]).unwrap().value(),
+        Value::number(42.0)
+    );
     assert!(
         engine
             .call("fail", &[])
@@ -730,18 +733,6 @@ fn exceptions_keep_thrown_closures_alive() {
         "function main() { let n = 0; for (let i = 0; i < 10; ++i) { try { throw [i]; } catch (e) { n += e[0]; } } return n; }",
         Value::number(45.0),
     );
-}
-
-#[test]
-fn finally_is_explicitly_unsupported() {
-    let mut engine = Engine::new().unwrap();
-    assert!(matches!(
-        engine.compile(
-            "function main() { try { return 1; } finally { return 2; } }",
-            "finally.js"
-        ),
-        Err(Error::Unsupported(_))
-    ));
 }
 
 #[test]
@@ -1750,4 +1741,64 @@ fn pooled_spread_buffers_survive_nested_calls_and_errors() {
         engine.compile(source, "pack-pool.js").unwrap();
         assert_eq!(engine.call("main", &[]).unwrap().value(), Value::TRUE);
     }
+}
+
+#[test]
+fn delete_properties_preserves_lookup_and_order() {
+    check(
+        "function main(){var o={a:1,b:2,c:3}; var ok=delete o.b; o.b=4; return ok && Object.keys(o).join(',')==='a,c,b' && o.b===4 && delete o.missing;}",
+        Value::boolean(true),
+    );
+    check(
+        "function main(){var a=[1,2,3]; return delete a[1] && a.length===3 && !(1 in a) && a[2]===3;}",
+        Value::boolean(true),
+    );
+    check(
+        "function C(){} C.prototype.x=7; function main(){var o=new C();o.x=3;delete o.x;return o.x;}",
+        Value::number(7.0),
+    );
+}
+
+#[test]
+fn finally_routes_completions() {
+    check(
+        "var x=''; function f(){try {try {return {n:7};} finally {x+='a';}} finally {x+='b';}} function main(){var r=f();return r.n===7 && x==='ab';}",
+        Value::boolean(true),
+    );
+    check(
+        "function main(){try {return 1;} finally {return 2;}}",
+        Value::number(2.0),
+    );
+    check(
+        "var x=0;function f(){try {throw {n:7};} finally {x=3;}}function main(){try {f();}catch(e){return e.n+x;}}",
+        Value::number(10.0),
+    );
+    check(
+        "function main(){var x=0;for(var i=0;i<4;i++){try {if(i===1)continue;if(i===3)break;x+=10;}finally{x++;}}return x;}",
+        Value::number(24.0),
+    );
+    check(
+        "function main(){var x=0;try {throw 1;}catch(e){x=e;throw 2;}finally{return x+3;}}",
+        Value::number(4.0),
+    );
+    check(
+        "function main(){var x=0;try {for(var i=0;i<3;i++){if(i===1)break;x++;}x+=10;}finally{x+=100;}return x;}",
+        Value::number(111.0),
+    );
+    check(
+        "function main(){try{try{return 1;}finally{throw {n:7};}}catch(e){return e.n;}}",
+        Value::number(7.0),
+    );
+    check(
+        "function main(){try{}finally{var x=7;}return x;}",
+        Value::number(7.0),
+    );
+}
+
+#[test]
+fn language_errors_are_catchable() {
+    check(
+        "var x=0;function f(){try {undefined();}finally{x=3;}}function main(){try{f();}catch(e){return e.name==='TypeError' && x===3;}}",
+        Value::boolean(true),
+    );
 }

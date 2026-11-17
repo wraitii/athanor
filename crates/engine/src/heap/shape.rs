@@ -43,6 +43,7 @@ pub(super) struct Key {
 
 pub(super) struct Shape {
     prototype: u64,
+    root: ShapeId,
     keys: Vec<Key>,
     index: FxHashMap<Atom, usize>,
 }
@@ -74,6 +75,7 @@ impl Shape {
         };
         Self {
             prototype,
+            root: NO_SHAPE,
             keys,
             index,
         }
@@ -84,6 +86,7 @@ pub(super) struct Shapes {
     shapes: Vec<Shape>,
     roots: FxHashMap<(u64, bool), ShapeId>,
     transitions: FxHashMap<(ShapeId, Key), ShapeId>,
+    deletions: FxHashMap<(ShapeId, Atom), ShapeId>,
 }
 
 impl Default for Shapes {
@@ -92,6 +95,7 @@ impl Default for Shapes {
             shapes: vec![Shape::with(0, Vec::new())],
             roots: FxHashMap::default(),
             transitions: FxHashMap::default(),
+            deletions: FxHashMap::default(),
         }
     }
 }
@@ -118,6 +122,7 @@ impl Shapes {
             return shape;
         }
         let shape = self.push(Shape::with(prototype, Vec::new()));
+        self.shapes[shape as usize].root = shape;
         self.roots.insert(key, shape);
         shape
     }
@@ -127,13 +132,43 @@ impl Shapes {
             return next;
         }
         let parent = self.get(shape);
+        let root = parent.root;
         let mut keys = parent.keys.clone();
-        match parent.slot(key.atom) {
-            Some(slot) => keys[slot] = key,
-            None => keys.push(key),
+        if let Some(slot) = parent.slot(key.atom) {
+            if keys[slot] == key {
+                return shape;
+            }
+            keys[slot] = key;
+            let next = keys
+                .into_iter()
+                .fold(root, |id, key| self.transition(id, key));
+            self.transitions.insert((shape, key), next);
+            return next;
         }
-        let next = self.push(Shape::with(parent.prototype, keys));
+        keys.push(key);
+        let mut layout = Shape::with(parent.prototype, keys);
+        layout.root = root;
+        let next = self.push(layout);
         self.transitions.insert((shape, key), next);
+        self.deletions.insert((next, key.atom), shape);
+        next
+    }
+
+    pub(super) fn delete(&mut self, shape: ShapeId, atom: Atom) -> ShapeId {
+        if let Some(&next) = self.deletions.get(&(shape, atom)) {
+            return next;
+        }
+        let layout = self.get(shape);
+        if layout.slot(atom).is_none() {
+            return shape;
+        }
+        let root = layout.root;
+        let keys = layout.keys.clone();
+        let next = keys
+            .into_iter()
+            .filter(|key| key.atom != atom)
+            .fold(root, |id, key| self.transition(id, key));
+        self.deletions.insert((shape, atom), next);
         next
     }
 

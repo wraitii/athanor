@@ -51,19 +51,19 @@ pub(super) fn global_get(ctx: *mut JitCtx, cache: *mut GlobalCache, optional: bo
     let cache = unsafe { &mut *cache };
     match cache.resolve(&ctx.global) {
         Some(Value::UNINITIALIZED) => {
-            ctx.error = Some(Box::new(crate::Error::Runtime(format!(
-                "binding `{}` accessed before initialization",
-                cache.name
-            ))));
+            ctx.language_error(
+                "ReferenceError",
+                &format!("binding `{}` accessed before initialization", cache.name),
+            );
             Value::UNDEFINED
         }
         Some(value) => value,
         None if optional => Value::UNDEFINED,
         None => {
-            ctx.error = Some(Box::new(crate::Error::Runtime(format!(
-                "unknown variable `{}`",
-                cache.name
-            ))));
+            ctx.language_error(
+                "ReferenceError",
+                &format!("unknown variable `{}`", cache.name),
+            );
             Value::UNDEFINED
         }
     }
@@ -79,9 +79,20 @@ pub(super) extern "C" fn js_global_set(
     let name =
         unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len as usize)) };
     if let Err(reason) = ctx.global.set_binding(name, value) {
-        ctx.error = Some(Box::new(crate::Error::Runtime(format!(
-            "binding `{name}` {reason}"
-        ))));
+        if reason == "has invalid value" {
+            ctx.error = Some(Box::new(crate::Error::Runtime(format!(
+                "binding `{name}` {reason}"
+            ))));
+        } else {
+            ctx.language_error(
+                if reason == "is constant" {
+                    "TypeError"
+                } else {
+                    "ReferenceError"
+                },
+                &format!("binding `{name}` {reason}"),
+            );
+        }
     }
     value
 }
@@ -129,6 +140,13 @@ fn property_get_with_cache(
     if object == Value::GLOBAL_OBJECT {
         let value = ctx.global.get_object_raw(name).unwrap_or(Value::UNDEFINED);
         return if owned { ctx.retain(value) } else { value };
+    }
+    if object == Value::NULL || object == Value::UNDEFINED {
+        ctx.language_error(
+            "TypeError",
+            &format!("cannot read property {name:?} of null or undefined"),
+        );
+        return Value::UNDEFINED;
     }
     let read = match cache {
         Some(cache) => ctx.global.heap().read_property_cached(object, name, cache),
@@ -496,6 +514,13 @@ pub(super) fn property_set(
     value: Value,
     cache: Option<&mut crate::heap::PropertyWriteCache>,
 ) -> Value {
+    if object == Value::NULL || object == Value::UNDEFINED {
+        ctx.language_error(
+            "TypeError",
+            &format!("cannot assign property {name:?} of null or undefined"),
+        );
+        return Value::UNDEFINED;
+    }
     if object != Value::GLOBAL_OBJECT {
         if name == "lastIndex" && ctx.global.heap().regexp_state(object).is_some() {
             if let Some(index) = value.as_number() {
@@ -805,6 +830,29 @@ pub(super) extern "C" fn js_property_key(ctx: *mut JitCtx, value: Value) -> Valu
             Value::UNDEFINED
         }
     }
+}
+
+pub(super) extern "C" fn js_delete(ctx: *mut JitCtx, object: Value, key: Value) -> Value {
+    let ctx = unsafe { &mut *ctx };
+    let Some(name) = property_key(ctx, key) else {
+        return Value::UNDEFINED;
+    };
+    if object == Value::GLOBAL_OBJECT {
+        ctx.error = Some(Box::new(crate::Error::Runtime(
+            "deleting global object properties is unsupported".into(),
+        )));
+        return Value::UNDEFINED;
+    }
+    if object == Value::NULL || object == Value::UNDEFINED {
+        ctx.language_error("TypeError", "cannot delete property of null or undefined");
+        return Value::UNDEFINED;
+    }
+    Value::boolean(
+        ctx.global
+            .heap()
+            .delete_property(object, &name)
+            .unwrap_or(true),
+    )
 }
 
 #[cfg(test)]

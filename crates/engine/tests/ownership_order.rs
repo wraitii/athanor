@@ -345,8 +345,13 @@ fn failed_calls_release_scratch_references_from_local_writes() {
                     ("caught", Value::FALSE),
                 ] {
                     let result = engine.call(function, &[raise.value(), flag]);
-                    if function == "caught" && mode == Value::FALSE {
-                        assert_eq!(result.unwrap().value(), Value::number(13.0));
+                    if function == "caught" {
+                        let result = result.unwrap();
+                        if mode == Value::FALSE {
+                            assert_eq!(result.value(), Value::number(13.0));
+                        } else {
+                            assert!(result.value().is_object());
+                        }
                     } else {
                         assert!(result.is_err());
                     }

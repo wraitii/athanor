@@ -233,13 +233,13 @@ fn unsupported_expressions_report_filename_and_span() {
     let mut engine = Engine::new().unwrap();
     let error = engine
         .compile(
-            "function main() { return delete ({}).x; }",
+            "function main() { var x; return delete x; }",
             "operator-test.js",
         )
         .unwrap_err()
         .to_string();
     assert!(error.contains("operator-test.js"));
-    assert!(error.contains("unary operator"));
+    assert!(error.contains("delete binding"));
     assert!(error.contains(" at "));
 }
 

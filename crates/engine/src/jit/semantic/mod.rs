@@ -495,6 +495,7 @@ pub(super) enum Op {
     FillPropertyCache(Value, Value, String),
     PrimePropertyCache(Value, Value),
     GetIndex(Value, Value),
+    Delete(Value, Value),
     Set(Value, String, Value),
     SetIndex(Value, Value, Value),
     // Bounded packed-array replacement; storage retains the incoming value before releasing the old one.
@@ -894,6 +895,7 @@ impl Op {
             | Op::MapElement(object, key)
             | Op::IsArrayIteration(object, key, _)
             | Op::CanOverwrite(object, key)
+            | Op::Delete(object, key)
             | Op::GetIndex(object, key)
             | Op::TypedIndex(object, key, _)
             | Op::ArrayGet(object, key)
@@ -1147,6 +1149,7 @@ impl Op {
             | Op::MapElement(object, key)
             | Op::IsArrayIteration(object, key, _)
             | Op::CanOverwrite(object, key)
+            | Op::Delete(object, key)
             | Op::GetIndex(object, key)
             | Op::TypedIndex(object, key, _)
             | Op::ArrayGet(object, key)
@@ -2104,6 +2107,10 @@ impl Graph {
             | Op::PropertyAdd(.., PropertyWrite::Define) => {
                 closed(HEAP_READ | CODE_WRITE | INTERNAL, None)
             }
+            Op::Delete(..) => closed(
+                HEAP_READ | HEAP_WRITE | CODE_WRITE | ALLOCATION | INTERNAL | ERROR,
+                Unowned,
+            ),
             Op::Set(..) | Op::SetIndex(..) | Op::FillPropertyStore(..) => closed(
                 HEAP_READ | HEAP_WRITE | CODE_WRITE | ALLOCATION | INTERNAL | ERROR,
                 None,

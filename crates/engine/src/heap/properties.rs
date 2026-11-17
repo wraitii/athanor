@@ -461,6 +461,15 @@ impl PropertyTable {
             .map(|index| self.slots[*index].enumerable)
     }
 
+    pub(super) fn remove(&mut self, name: &str) -> Option<Value> {
+        let index = self.index.remove(name)?;
+        let old = self.slots.remove(index);
+        for (index, slot) in self.slots.iter().enumerate().skip(index) {
+            self.index.insert(slot.name.clone(), index);
+        }
+        Some(old.value)
+    }
+
     pub(super) fn pop(&mut self) -> Option<Value> {
         let slot = self.slots.pop()?;
         self.index.remove(&slot.name);

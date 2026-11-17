@@ -356,6 +356,7 @@ impl Graph {
             Op::PrimePropertyCache(object, cache) => {
                 format!("prime_property_cache {object} {cache}")
             }
+            Op::Delete(object, key) => format!("delete {object}[{key}]"),
             Op::GetIndex(object, key) => format!("get {object}[{key}]"),
             Op::Set(object, name, value) => format!("set {object}.{name}, {value}"),
             Op::ArrayStore(object, key, value) => format!("store_array {object}[{key}], {value}"),

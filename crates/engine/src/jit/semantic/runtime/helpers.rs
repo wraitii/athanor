@@ -94,6 +94,7 @@ fn select(inst: super::super::Inst, op: &Op, facts: &Facts) -> Option<Call> {
             let (helper, index) = key(facts, *index);
             call(helper, vec![Arg::Value(*object, Repr::Boxed), index], true)
         }
+        Op::Delete(object, index) => call(Helper::Delete, boxed(&[*object, *index]), true),
         Op::SetIndex(object, index, value) => {
             call(Helper::IndexSet, boxed(&[*object, *index, *value]), false)
         }

@@ -389,6 +389,119 @@ impl Heap {
         )
     }
 
+    pub(crate) fn delete_property(&self, object: Value, name: &str) -> Option<bool> {
+        let mut data = self.0.borrow_mut();
+        let Some(id) = heap_id(object) else {
+            return Some(true);
+        };
+        let slot = data.live(id)?;
+        match &slot.payload {
+            Payload::Array(_) => {
+                if name == "length" {
+                    return Some(false);
+                }
+                let Some(index) = array_index_name(name) else {
+                    return Some(true);
+                };
+                let Payload::Array(array) = &mut data.slot_mut(id).payload else {
+                    unreachable!()
+                };
+                let old = if let Some(value) = array.elements.get_mut(index as usize) {
+                    std::mem::replace(value, super::array::HOLE)
+                } else {
+                    return Some(true);
+                };
+                if old != super::array::HOLE {
+                    array.holes += 1;
+                }
+                data.release(old);
+                data.sync(id);
+                return Some(true);
+            }
+            Payload::TypedArray(array) => {
+                return Some(
+                    !array_index_name(name).is_some_and(|i| (i as usize) < array.storage.len()),
+                );
+            }
+            Payload::String(text) => {
+                return Some(
+                    name != "length"
+                        && !array_index_name(name)
+                            .is_some_and(|i| (i as usize) < text.chars().count()),
+                );
+            }
+            _ => {}
+        }
+        if name == "prototype" {
+            match &slot.payload {
+                Payload::Closure(closure) if closure.constructable => return Some(false),
+                Payload::Native(native)
+                    if matches!(
+                        native.function,
+                        NativeFunction::Object | NativeFunction::Function
+                    ) =>
+                {
+                    return Some(false);
+                }
+                _ => {}
+            }
+        }
+        if name == "lastIndex" && matches!(slot.payload, Payload::RegExp(_)) {
+            return Some(false);
+        }
+        let Some(view) = data.properties(id) else {
+            return Some(true);
+        };
+        let old_shape = data.slot(id).shape;
+        let index = match view {
+            PropertyView::Shaped { shape, .. } => {
+                data.atoms.find(name).and_then(|atom| shape.slot(atom))
+            }
+            PropertyView::Dictionary(_) => None,
+        };
+        let next = if let Some(atom) = data.atoms.find(name).filter(|_| index.is_some()) {
+            data.shapes.delete(old_shape, atom)
+        } else {
+            old_shape
+        };
+        let slot = data.slot_mut(id);
+        let old = if let Payload::SmallObject(object) = &mut slot.payload {
+            let Some(index) = index else {
+                return Some(true);
+            };
+            let old = object.values[index];
+            object
+                .values
+                .copy_within(index + 1..object.len as usize, index);
+            object.len -= 1;
+            object.values[object.len as usize] = Value::UNDEFINED;
+            Some(old)
+        } else {
+            let properties = match &mut slot.payload {
+                Payload::Object(object) => &mut object.properties,
+                Payload::Closure(closure) => &mut closure.properties,
+                Payload::Native(native) => &mut native.properties,
+                _ => return Some(true),
+            };
+            match properties {
+                Properties::Shaped(values) => index.map(|index| values.remove(index)),
+                Properties::Dictionary(table) => table.remove(name),
+            }
+        };
+        slot.shape = next;
+        if let Some(old) = old {
+            if heap_id(old)
+                .and_then(|id| data.live(id))
+                .is_some_and(|slot| matches!(slot.payload, Payload::Native(_)))
+            {
+                data.epoch += 1;
+            }
+            data.release(old);
+        }
+        data.sync(id);
+        Some(true)
+    }
+
     pub(crate) fn set_property(&self, object: Value, name: &str, value: Value) -> bool {
         self.write_property(object, name, value, None, None)
     }

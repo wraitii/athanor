@@ -166,6 +166,9 @@ pub(in crate::jit) fn collect_var_symbols(
             }
             Statement::TryStatement(statement) => {
                 collect_var_symbols(&statement.block.body, symbols);
+                if let Some(finalizer) = &statement.finalizer {
+                    collect_var_symbols(&finalizer.body, symbols);
+                }
                 if let Some(handler) = &statement.handler {
                     collect_var_symbols(&handler.body.body, symbols);
                 }

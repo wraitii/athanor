@@ -230,6 +230,25 @@ impl<'a> JitCtx<'a> {
         )
     }
 
+    pub(crate) fn language_error(&mut self, kind: &str, message: &str) {
+        let heap = self.global.heap();
+        let result = heap.string(message).and_then(|message| {
+            let result = heap.string(kind).and_then(|name| {
+                let result = heap.error(message, name);
+                heap.release(name);
+                result
+            });
+            heap.release(message);
+            result
+        });
+        if let Some(value) = result {
+            self.throw(value);
+            self.global.heap().release(value);
+        } else {
+            self.error = Some(Box::new(Error::Runtime("heap exhausted".into())));
+        }
+    }
+
     pub(crate) fn throw(&mut self, value: Value) {
         if !self.global.heap().retain(value) {
             self.error = Some(Box::new(Error::Runtime("invalid thrown value".into())));
@@ -244,6 +263,7 @@ impl<'a> JitCtx<'a> {
     }
 
     pub(crate) fn catch(&mut self) -> Value {
+        self.error_origin = None;
         std::mem::replace(&mut self.exception, Value::UNINITIALIZED)
     }
 
