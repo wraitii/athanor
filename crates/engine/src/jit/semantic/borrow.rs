@@ -33,6 +33,33 @@ pub(in crate::jit) fn receiver(op: &Op) -> Option<Value> {
     }
 }
 
+struct BorrowedRead {
+    receiver: Value,
+}
+
+fn anchored_read(op: &Op, facts: &Facts) -> Option<BorrowedRead> {
+    let receiver = receiver(op)?;
+    if matches!(
+        op,
+        Op::ArrayGet(..)
+            | Op::ArrayLoad(..)
+            | Op::ProbeProperty(..)
+            | Op::ProbeShapeProperty(..)
+            | Op::PropertyLoad(..)
+            | Op::CachedProperty(..)
+            | Op::ShapedGet(..)
+            | Op::HelperCall {
+                helper: crate::jit::helpers::Helper::PropertyGetCached
+                    | crate::jit::helpers::Helper::SemanticPropertyProbeCached,
+                ..
+            }
+    ) || facts.of(receiver).within(ValueType::OBJECT)
+    {
+        return Some(BorrowedRead { receiver });
+    }
+    None
+}
+
 #[derive(Clone, Default)]
 pub(super) struct Plan {
     anchors: FxHashMap<Value, Vec<Value>>,
@@ -190,24 +217,18 @@ impl Borrows<'_> {
 pub(super) fn borrows(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>) -> Plan {
     graph.borrowed.clear();
     let mut reads = FxHashMap::default();
-    let mut held = FxHashSet::default();
+    let mut anchored = FxHashSet::default();
     for (_, data) in graph.insts.iter() {
         if let (Some(object), Some(result)) = (receiver(&data.op), data.result())
             && facts.of(result).intersects(HEAP)
         {
+            let object = if let Some(read) = anchored_read(&data.op, facts) {
+                anchored.insert(result);
+                read.receiver
+            } else {
+                object
+            };
             reads.insert(result, object);
-            if matches!(
-                data.op,
-                Op::ArrayGet(..)
-                    | Op::ArrayLoad(..)
-                    | Op::ProbeProperty(..)
-                    | Op::ProbeShapeProperty(..)
-                    | Op::PropertyLoad(..)
-                    | Op::CachedProperty(..)
-                    | Op::ShapedGet(..)
-            ) {
-                held.insert(result);
-            }
         }
     }
     let mut chains = FxHashMap::default();
@@ -217,7 +238,7 @@ pub(super) fn borrows(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>)
         while let Some(&next) = reads.get(chain.last().unwrap()) {
             chain.push(next);
         }
-        if held.contains(&value) || facts.of(object).within(ValueType::OBJECT) {
+        if anchored.contains(&value) {
             objects.insert(value);
         }
         chains.insert(value, chain);
@@ -262,7 +283,7 @@ pub(super) fn borrows(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>)
                 }
                 chains.insert(param, chain);
                 objects.insert(param);
-                held.insert(param);
+                anchored.insert(param);
                 merged.insert(param, incoming);
                 changed = true;
             }
@@ -406,7 +427,7 @@ pub(super) fn borrows(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>)
                 let chain = &borrows.chains[value];
                 let results = std::iter::once(**value).chain(chain.iter().copied());
                 for (result, &object) in results.zip(chain) {
-                    if !held.contains(&result) && !facts.of(object).within(ValueType::OBJECT) {
+                    if !anchored.contains(&result) {
                         return true;
                     }
                     if !accepted.contains(&object) {

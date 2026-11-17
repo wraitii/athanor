@@ -4943,26 +4943,26 @@ fn property_borrows_follow_owning_slots_across_writes() {
 
 #[test]
 fn lowered_property_accesses_preserve_borrowed_slots() {
-    for (write, expected) in [("o.y=null;", true), ("o.x=null;", false)] {
-        let source = format!(
-            "function f(){{let o={{x:{{n:7}},y:null}};let value=o.x;{write}return value.n;}}"
-        );
-        let graph = canonicalize_graph(lower_source(&source).unwrap(), true)
-            .unwrap()
-            .graph;
-        let mut function = FunctionState::new(graph, Vec::new(), true);
-        let mut borrowed = false;
-        function
-            .lower_runtime_observed(false, &mut |pass, state| {
-                if pass != "ownership" {
-                    return;
-                }
-                borrowed = state.graph.insts.values().any(|data| {
-                    matches!(&data.op, Op::PropertyLoad(receiver, _, js::memory::Field::Named(name))
-                    if name == "n" && state.graph.borrowed.contains(receiver))
-                });
-            })
-            .unwrap();
-        assert_eq!(borrowed, expected, "{source}");
+    for setup in ["function f(){let o={x:{n:7},y:null};", "function f(o){"] {
+        for (write, expected) in [("o.y=null;", true), ("o.x=null;", false)] {
+            let source = format!("{setup}let value=o.x;{write}return value.n;}}");
+            let graph = canonicalize_graph(lower_source(&source).unwrap(), true)
+                .unwrap()
+                .graph;
+            let mut function = FunctionState::new(graph, Vec::new(), true);
+            let mut borrowed = false;
+            function
+                .lower_runtime_observed(false, &mut |pass, state| {
+                    if pass != "ownership" {
+                        return;
+                    }
+                    borrowed = state.graph.insts.values().any(|data| {
+                        matches!(&data.op, Op::PropertyLoad(receiver, _, js::memory::Field::Named(name))
+                        if name == "n" && state.graph.borrowed.contains(receiver))
+                    });
+                })
+                .unwrap();
+            assert_eq!(borrowed, expected, "{source}");
+        }
     }
 }

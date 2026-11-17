@@ -449,3 +449,40 @@ fn distinct_property_slots_preserve_aliased_values() {
         }
     }
 }
+
+#[test]
+fn generic_property_helpers_preserve_result_anchors() {
+    for ssa_opt in [false, true] {
+        let mut engine = Engine::with_options(EngineOptions {
+            ssa_opt,
+            inlining: false,
+            background_compile: false,
+            ..Default::default()
+        })
+        .unwrap();
+        engine.compile(
+            "var anchoredGlobal={n:11};
+             function separate(o){let value=o.x;o.y=null;return value.n;}
+             function replace(o){let value=o.x;o.x=null;return value.n;}
+             function globalRead(){let value=globalThis.anchoredGlobal;globalThis.other=null;return value.n;}
+             function method(o,choose){let value=o.map;if(choose)return value;return null;}
+             function prototype(C,choose){let value=C.prototype;if(choose)return value;return null;}
+             function main(){
+                 function Base(){}
+                 Base.prototype.x={n:9};
+                 let inherited=separate(new Base());
+                 let own=separate({x:{n:7},y:null});
+                 let replaced=replace({x:{n:8},y:null});
+                 function C(){}
+                 let p=prototype(C,true);p.n=13;
+                 return inherited===9 && own===7 && replaced===8 && globalRead()===11
+                     && method([],true)===[].map && p===C.prototype && p.n===13;
+             }",
+            "property-helper-anchors.js",
+        ).unwrap();
+        for _ in 0..16 {
+            assert_eq!(engine.call("main", &[]).unwrap().value(), Value::TRUE);
+            engine.drain_disposals(1000);
+        }
+    }
+}
