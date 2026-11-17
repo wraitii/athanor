@@ -1,6 +1,5 @@
 use crate::{FxHashMap, FxHashSet};
 
-use cranelift_codegen::entity::PrimaryMap;
 use oxc_ast::ast::{
     Argument, ArrayExpressionElement, AssignmentExpression, BindingIdentifier, BindingPattern,
     CallExpression, ChainElement, ChainExpression, DoWhileStatement, Expression, ForInStatement,
@@ -1796,34 +1795,7 @@ pub(super) fn lower_global(
         captured,
         closures,
         arguments_references,
-        graph: Graph {
-            name: "<module>".into(),
-            span,
-            entry: Block::from_u32(0),
-            has_handlers: false,
-            guards: 0,
-            views: FxHashMap::default(),
-            property_accesses: FxHashMap::default(),
-            borrowed: FxHashSet::default(),
-            summaries: Default::default(),
-            lazy_captures: FxHashSet::default(),
-            cold: FxHashSet::default(),
-            generator: false,
-            has_assumes: false,
-            entry_guards: Vec::new(),
-            megamorphic_gets: Default::default(),
-            arity: None,
-            regions: PrimaryMap::new(),
-            blocks: PrimaryMap::new(),
-            insts: PrimaryMap::new(),
-            values: PrimaryMap::new(),
-            reprs: Default::default(),
-            ownership: None,
-            low_level_slots: Vec::new(),
-            low_level_signature: None,
-            bindings: PrimaryMap::new(),
-            scopes: PrimaryMap::new(),
-        },
+        graph: Graph::new("<module>".into(), span, false),
         current: None,
         symbols: FxHashMap::default(),
         open: Vec::new(),
@@ -1831,8 +1803,7 @@ pub(super) fn lower_global(
         handlers: Vec::new(),
         finalizers: Vec::new(),
     };
-    let entry = builder.block();
-    builder.switch(entry);
+    builder.switch(builder.graph.entry);
     for statement in statements {
         if let Statement::ClassDeclaration(class) = statement {
             let value = builder.constant(class.span, Constant::Uninitialized);
@@ -1896,34 +1867,7 @@ pub(super) fn lower_parts(
         captured,
         closures,
         arguments_references,
-        graph: Graph {
-            name: "<function>".into(),
-            span,
-            entry: Block::from_u32(0),
-            has_handlers: false,
-            guards: 0,
-            views: FxHashMap::default(),
-            property_accesses: FxHashMap::default(),
-            borrowed: FxHashSet::default(),
-            summaries: Default::default(),
-            lazy_captures: FxHashSet::default(),
-            cold: FxHashSet::default(),
-            generator,
-            has_assumes: false,
-            entry_guards: Vec::new(),
-            megamorphic_gets: Default::default(),
-            arity: None,
-            regions: PrimaryMap::new(),
-            blocks: PrimaryMap::new(),
-            insts: PrimaryMap::new(),
-            values: PrimaryMap::new(),
-            reprs: Default::default(),
-            ownership: None,
-            low_level_slots: Vec::new(),
-            low_level_signature: None,
-            bindings: PrimaryMap::new(),
-            scopes: PrimaryMap::new(),
-        },
+        graph: Graph::new("<function>".into(), span, generator),
         current: None,
         symbols: FxHashMap::default(),
         open: Vec::new(),
@@ -1931,8 +1875,7 @@ pub(super) fn lower_parts(
         handlers: Vec::new(),
         finalizers: Vec::new(),
     };
-    let entry = builder.block();
-    builder.switch(entry);
+    builder.switch(builder.graph.entry);
     let capture_scope = if captures.is_empty() {
         None
     } else {

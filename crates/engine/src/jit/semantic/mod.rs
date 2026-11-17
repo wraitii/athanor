@@ -1525,11 +1525,7 @@ impl Cfg {
 }
 
 impl Graph {
-    pub(super) fn new_low_level(
-        name: String,
-        span: Span,
-        signature: cranelift_codegen::ir::Signature,
-    ) -> Self {
+    pub(super) fn new(name: String, span: Span, generator: bool) -> Self {
         let mut blocks = PrimaryMap::new();
         let entry = blocks.push(BlockData::default());
         Self {
@@ -1545,7 +1541,7 @@ impl Graph {
             cold: FxHashSet::default(),
             megamorphic_gets: FxHashSet::default(),
             lazy_captures: FxHashSet::default(),
-            generator: false,
+            generator,
             has_assumes: false,
             entry_guards: Vec::new(),
             arity: None,
@@ -1556,9 +1552,20 @@ impl Graph {
             reprs: SecondaryMap::new(),
             ownership: None,
             low_level_slots: Vec::new(),
-            low_level_signature: Some(signature),
+            low_level_signature: None,
             bindings: PrimaryMap::new(),
             scopes: PrimaryMap::new(),
+        }
+    }
+
+    pub(super) fn new_low_level(
+        name: String,
+        span: Span,
+        signature: cranelift_codegen::ir::Signature,
+    ) -> Self {
+        Self {
+            low_level_signature: Some(signature),
+            ..Self::new(name, span, false)
         }
     }
 
@@ -1569,17 +1576,9 @@ impl Graph {
             .flat_map(|terminator| terminator.kind.targets());
         let first = targets.next().map(|target| target.block);
         let second = targets.next().map(|target| target.block);
-        let mut rest = Vec::new();
-        for target in targets {
-            let block = target.block;
-            if Some(block) != first && Some(block) != second && !rest.contains(&block) {
-                rest.push(block);
-            }
-        }
         first
             .into_iter()
             .chain(second.filter(|block| Some(*block) != first))
-            .chain(rest)
     }
 
     pub(super) fn def_block(&self, value: Value) -> Block {
