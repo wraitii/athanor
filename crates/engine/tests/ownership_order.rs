@@ -406,3 +406,46 @@ fn property_results_survive_receiver_replacement_without_leaking() {
         }
     }
 }
+
+#[test]
+fn distinct_property_slots_preserve_aliased_values() {
+    for ssa_opt in [false, true] {
+        let mut engine = Engine::with_options(EngineOptions {
+            ssa_opt,
+            background_compile: false,
+            ..Default::default()
+        })
+        .unwrap();
+        engine
+            .compile(
+                "function make(){return {x:{n:7},y:null};}
+             function take(o){o.y=o.x;let value=o.x;o.y=null;return value;}
+             function replace(o){let value=o.x;o.x=null;return value;}
+             function chain(o){let value=o.x.child;o.x=null;return value;}
+             function nested(){return {x:{child:{n:9}}};}
+             function read(value){return value.n;}",
+                "owning-slots.js",
+            )
+            .unwrap();
+        for (make, take, expected) in [
+            ("make", "take", 7.0),
+            ("make", "replace", 7.0),
+            ("nested", "chain", 9.0),
+        ] {
+            for _ in 0..16 {
+                let owner = engine.call(make, &[]).unwrap();
+                let value = engine.call(take, &[owner.value()]).unwrap();
+                let stale = value.value();
+                drop(owner);
+                engine.drain_disposals(1000);
+                assert_eq!(
+                    engine.call("read", &[stale]).unwrap().value(),
+                    Value::number(expected)
+                );
+                drop(value);
+                engine.drain_disposals(1000);
+                assert!(!engine.global().define("disposed", stale));
+            }
+        }
+    }
+}

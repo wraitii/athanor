@@ -355,8 +355,8 @@ impl Graph {
             Op::GetIndex(object, key) => format!("get {object}[{key}]"),
             Op::Set(object, name, value) => format!("set {object}.{name}, {value}"),
             Op::ArrayStore(object, key, value) => format!("store_array {object}[{key}], {value}"),
-            Op::PropertyStore(object, key, value, _) => {
-                format!("store_property {object}[{key}], {value}")
+            Op::PropertyStore(object, key, value, field, _) => {
+                format!("store_property {object}[{key}], {value} field={field:?}")
             }
             Op::PropertyAdd(object, cache, value, _) => {
                 format!("add_property {object}, {cache}, {value}")
@@ -369,7 +369,9 @@ impl Graph {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
-            Op::PropertyLoad(object, address) => format!("property_load {object} {address}"),
+            Op::PropertyLoad(object, address, field) => {
+                format!("property_load {object} {address} field={field:?}")
+            }
             Op::GlobalCache(name) => format!("global_cache {name}"),
             Op::PropertyCache(site, name) => format!("property_cache {site} {name}"),
             Op::FillPropertyStore(object, cache, name, value, _) => {

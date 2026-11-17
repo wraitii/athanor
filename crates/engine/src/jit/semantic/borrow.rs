@@ -1,8 +1,10 @@
+use super::super::effects::Locations;
 use crate::{FxHashMap, FxHashSet};
 
 use cranelift_codegen::entity::SecondaryMap;
 
 use super::liveness::{self, Set};
+use super::memory::Access;
 use super::{Block, Facts, Graph, Inst, Op, Value, ValueType};
 
 const HEAP: ValueType = ValueType::STRING
@@ -19,7 +21,7 @@ pub(in crate::jit) fn receiver(op: &Op) -> Option<Value> {
             ..
         } => args.first().copied(),
         Op::Get(object, _)
-        | Op::PropertyLoad(object, _)
+        | Op::PropertyLoad(object, ..)
         | Op::CachedProperty(object, _, _)
         | Op::ShapedGet(object, ..)
         | Op::ProbeProperty(object, _)
@@ -153,14 +155,16 @@ struct Borrows<'g> {
     facts: &'g Facts,
     chains: FxHashMap<Value, Vec<Value>>,
     dependents: FxHashMap<Value, Vec<Value>>,
+    accesses: FxHashMap<Value, Vec<Access>>,
     rejected: FxHashSet<Value>,
     uses: SecondaryMap<Inst, Vec<Value>>,
 }
 
 impl Borrows<'_> {
-    fn effects(&self, inst: Inst) -> (bool, bool) {
-        let memory = self.facts.memory(inst);
-        (memory.reenters(), memory.writes_data())
+    fn invalidates(&self, inst: Inst, write: &Access, value: Value) -> bool {
+        self.accesses[&value]
+            .iter()
+            .any(|read| self.facts.kills(self.graph, inst, write, read))
     }
 
     fn redefined(&mut self, live: &Set, defined: Value) {
@@ -176,8 +180,8 @@ impl Borrows<'_> {
 }
 
 // A borrowed read skips frame rooting and the inline temporary retain. While it is live, no
-// write, reentry, or redefinition of a receiver in its chain may run, so a receiver that holds
-// the value keeps holding it. Ownership proofs stop at receivers that remain rooted; borrowed
+// conflicting write, reentry, or redefinition of a receiver in its chain may run, so its
+// owning property slots keep holding it. Ownership proofs stop at receivers that remain rooted; borrowed
 // receivers must themselves be held along the rest of the chain. When a receiver might not
 // hold it (string indexing allocates), the value must die within its block: slow-path results
 // stay owned by a temporary until the block's clear, and the inline path only runs on arrays,
@@ -339,11 +343,42 @@ pub(super) fn borrows(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>)
             dependents.entry(owner).or_default().push(value);
         }
     }
+    let mut dependencies: FxHashMap<Value, Vec<Value>> = reads
+        .into_iter()
+        .map(|(value, owner)| (value, vec![owner]))
+        .collect();
+    dependencies.extend(
+        merged
+            .iter()
+            .map(|(&value, incoming)| (value, incoming.clone())),
+    );
+    let accesses = chains
+        .keys()
+        .map(|&value| {
+            let accesses = closure(&dependencies, value)
+                .into_iter()
+                .filter_map(|source| {
+                    graph
+                        .defining_op(source)
+                        .and_then(|op| Access::read(graph, op, facts))
+                })
+                .collect::<Vec<_>>();
+            (
+                value,
+                if accesses.is_empty() {
+                    vec![Access::broad(Locations::HEAP.union(Locations::GLOBAL))]
+                } else {
+                    accesses
+                },
+            )
+        })
+        .collect();
     let mut borrows = Borrows {
         graph,
         facts,
         chains,
         dependents,
+        accesses,
         rejected: FxHashSet::default(),
         uses,
     };
@@ -416,10 +451,12 @@ fn scan(borrows: &mut Borrows<'_>, block: Block, mut live: Set) {
         if let Some(result) = result {
             borrows.redefined(&live, result);
         }
-        let (reenters, writes) = borrows.effects(inst);
+        let memory = borrows.facts.memory(inst);
+        let (reenters, writes) = (memory.reenters(), memory.writes_data());
         if reenters || writes {
+            let write = Access::written(graph, &graph.insts[inst].op, borrows.facts, memory.writes);
             for value in live.iter() {
-                if Some(value) != result {
+                if Some(value) != result && (reenters || borrows.invalidates(inst, &write, value)) {
                     borrows.rejected.insert(value);
                 }
             }

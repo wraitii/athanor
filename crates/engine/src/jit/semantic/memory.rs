@@ -28,18 +28,18 @@ impl Access {
             || (self.location.intersects(code) && read.location.intersects(code))
     }
 
-    pub(super) fn read(op: &Op, facts: &Facts) -> Option<Self> {
-        let (location, access) = js::Access::read(op, facts)?;
+    pub(super) fn read(graph: &Graph, op: &Op, facts: &Facts) -> Option<Self> {
+        let (location, access) = js::Access::read(graph, op, facts)?;
         Some(Self {
             location,
             js: Some(access),
         })
     }
 
-    pub(super) fn written(op: &Op, facts: &Facts, location: Locations) -> Self {
+    pub(super) fn written(graph: &Graph, op: &Op, facts: &Facts, location: Locations) -> Self {
         Self {
             location,
-            js: js::Access::written(op, facts),
+            js: js::Access::written(graph, op, facts),
         }
     }
 

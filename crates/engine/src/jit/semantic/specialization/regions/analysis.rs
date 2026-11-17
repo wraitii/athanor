@@ -40,7 +40,7 @@ impl<F: std::borrow::Borrow<Facts>> Writes<F> {
                 if memory.writes_state() {
                     writes.push((
                         inst,
-                        Access::written(&graph.insts[inst].op, known, memory.writes),
+                        Access::written(graph, &graph.insts[inst].op, known, memory.writes),
                     ));
                 }
             }
@@ -81,7 +81,7 @@ impl<F: std::borrow::Borrow<Facts>> Writes<F> {
 
     pub(in crate::jit::semantic) fn preserves(&self, graph: &Graph, inst: Inst) -> bool {
         let facts = self.facts.borrow();
-        if let Some(read) = Access::read(&graph.insts[inst].op, facts) {
+        if let Some(read) = Access::read(graph, &graph.insts[inst].op, facts) {
             return !self.clobbers(&read);
         }
         if !facts.removable(inst) || facts.memory(inst).reenters() {
@@ -146,7 +146,7 @@ pub(in crate::jit::semantic) fn closure_failure_with(
             if !memory.writes_state() || guards.is_empty() {
                 continue;
             }
-            let write = Access::written(op, facts, memory.writes);
+            let write = Access::written(graph, op, facts, memory.writes);
             if guards.iter().any(|guard| {
                 (write.is_unknown() || write.location.intersects(guard.location))
                     && writes.kills(inst, &write, guard)

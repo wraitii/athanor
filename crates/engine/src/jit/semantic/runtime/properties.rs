@@ -1,4 +1,5 @@
 use super::super::cursor::{Cursor, Insert};
+use super::super::js::memory::Field;
 use super::super::{
     Block, BlockData, Cfg, FunctionState, Graph, Inst, Op, Repr, Target, Terminator,
     TerminatorKind, Value, ValueType,
@@ -120,7 +121,7 @@ fn lower_stores(graph: &mut Graph) -> bool {
         let (block, done, fallback) = super::super::dispatch::split(graph, inst);
         graph.set_op(
             inst,
-            Op::FillPropertyStore(object, cache, name, value, write),
+            Op::FillPropertyStore(object, cache, name.clone(), value, write),
         );
         let view = Cursor::at_end(graph, block, inst).add_unassigned(Op::View(object));
         let mut at = Cursor::at_end(graph, block, inst);
@@ -168,8 +169,13 @@ fn lower_stores(graph: &mut Graph) -> bool {
         graph.views.insert(check, view);
         let writable = writable.unwrap();
         let fast = super::super::dispatch::branch(graph, inst, overwrite, writable, fallback);
-        let store = Cursor::at_end(graph, fast, inst)
-            .add_effect(Op::PropertyStore(object, index, value, write));
+        let store = Cursor::at_end(graph, fast, inst).add_effect(Op::PropertyStore(
+            object,
+            index,
+            value,
+            Field::named(&name),
+            write,
+        ));
         graph.views.insert(store, view);
         graph.terminate(fast, data.span, TerminatorKind::Jump(Target::new(done)));
         super::super::dispatch::extend_regions(graph, block, first);
@@ -211,7 +217,7 @@ pub(in crate::jit::semantic) fn lower_accesses(
     for inst in accesses {
         let data = graph.insts[inst].clone();
         match data.op {
-            Op::ShapedGet(object, _, index) => lower_shaped(graph, inst, object, index),
+            Op::ShapedGet(object, name, index) => lower_shaped(graph, inst, object, &name, index),
             Op::CachedProperty(object, cache, builtins)
             | Op::IsPropertyCached(object, cache, builtins) => {
                 let validate = matches!(data.op, Op::IsPropertyCached(..));
@@ -262,10 +268,11 @@ pub(in crate::jit::semantic) fn lower_accesses(
                     lowering.graph.reprs[result] = Some(Repr::Boolean);
                     (finish, hit)
                 } else {
+                    let field = Field::cached(lowering.graph, cache);
                     let (last, address) = lowering.slot(finish, view, entry, builtins);
                     let value = lowering
                         .at(last)
-                        .add_unassigned(Op::PropertyLoad(object, address));
+                        .add_unassigned(Op::PropertyLoad(object, address, field));
                     (last, value)
                 };
                 lowering.jump(last, continuation, vec![value]);
@@ -315,7 +322,7 @@ pub(in crate::jit::semantic) fn lower_accesses(
     function.graph.verify()
 }
 
-fn lower_shaped(graph: &mut Graph, inst: Inst, object: Value, index: u32) {
+fn lower_shaped(graph: &mut Graph, inst: Inst, object: Value, name: &str, index: u32) {
     use cranelift_codegen::ir::{MemFlagsData, types};
 
     let mut at = Cursor::before(graph, inst);
@@ -328,7 +335,7 @@ fn lower_shaped(graph: &mut Graph, inst: Inst, object: Value, index: u32) {
     );
     let offset = at.ins().iconst(types::I64, i64::from(index) * 8);
     let address = at.ins().iadd(values, offset);
-    graph.set_op(inst, Op::PropertyLoad(object, address));
+    graph.set_op(inst, Op::PropertyLoad(object, address, Field::named(name)));
 }
 
 struct PropertyLowering<'a> {
@@ -628,7 +635,7 @@ pub(in crate::jit::semantic) fn lower_loads(function: &mut FunctionState) {
     let graph = &mut function.graph;
     for &block in &function.facts.cfg.rpo {
         for inst in graph.blocks[block].insts.clone() {
-            let Op::PropertyLoad(_, address) = graph.insts[inst].op else {
+            let Op::PropertyLoad(_, address, _) = graph.insts[inst].op else {
                 continue;
             };
             let word = Cursor::before(graph, inst).ins().load(

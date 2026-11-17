@@ -1,12 +1,13 @@
-use super::super::{Facts, Op, Value, ValueType};
+use super::super::{Facts, Graph, Op, Value, ValueType};
 use crate::jit::effects::Locations;
+use crate::jit::helpers::Helper;
 
 mod fresh;
 
 pub(in crate::jit::semantic) use fresh::Fresh;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(in crate::jit::semantic) enum Field {
+pub(in crate::jit) enum Field {
     Named(String),
     // Cells can alias other captures, but cannot alias JavaScript properties.
     Cells,
@@ -18,7 +19,7 @@ pub(in crate::jit::semantic) enum Field {
 }
 
 impl Field {
-    fn named(name: &str) -> Self {
+    pub(in crate::jit::semantic) fn named(name: &str) -> Self {
         match name {
             "length" => Self::Length,
             _ if name.starts_with(|c: char| c.is_ascii_digit() || c == '-')
@@ -30,8 +31,27 @@ impl Field {
         }
     }
 
-    fn of(op: &Op, facts: &Facts) -> Self {
+    pub(in crate::jit::semantic) fn cached(graph: &Graph, cache: Value) -> Self {
+        match graph.defining_op(cache) {
+            Some(Op::PropertyCache(_, name)) => Self::named(name),
+            _ => Self::Any,
+        }
+    }
+
+    fn of(graph: &Graph, op: &Op, facts: &Facts) -> Self {
         match op {
+            Op::PropertyLoad(_, _, field) | Op::PropertyStore(_, _, _, field, _) => field.clone(),
+            Op::CachedProperty(_, cache, _) | Op::PropertyAdd(_, cache, ..) => {
+                Self::cached(graph, *cache)
+            }
+            Op::HelperCall {
+                helper:
+                    Helper::PropertyGetCached
+                    | Helper::SemanticPropertyProbeCached
+                    | Helper::PropertySetCached,
+                args,
+                ..
+            } => Self::cached(graph, args[1]),
             Op::Read(_) | Op::Initialize(..) | Op::Write(..) | Op::CellGet(_) | Op::CellSet(..) => {
                 Self::Cells
             }
@@ -43,6 +63,7 @@ impl Field {
             | Op::ProbeProperty(_, name)
             | Op::ShapedSet(_, name, _, _)
             | Op::GlobalRead(name)
+            | Op::ProbeGlobal(name)
             | Op::GlobalWrite(name, _)
             | Op::GlobalInitialize(name, _) => Self::named(name),
             Op::GetIndex(_, key)
@@ -91,9 +112,15 @@ impl Access {
         self.field == Field::Any
     }
 
-    pub(in crate::jit::semantic) fn read(op: &Op, facts: &Facts) -> Option<(Locations, Self)> {
+    pub(in crate::jit::semantic) fn read(
+        graph: &Graph,
+        op: &Op,
+        facts: &Facts,
+    ) -> Option<(Locations, Self)> {
         let (location, base) = match op {
-            Op::Get(object, _)
+            Op::PropertyLoad(object, ..)
+            | Op::CachedProperty(object, ..)
+            | Op::Get(object, _)
             | Op::ProbeProperty(object, _)
             | Op::ShapedGet(object, ..)
             | Op::GetIndex(object, _)
@@ -111,24 +138,36 @@ impl Access {
             | Op::IsShape(object, _)
             | Op::IsPropertyCached(object, ..) => (Locations::CODE, Some(*object)),
             Op::CellGet(cell) => (Locations::HEAP, Some(*cell)),
-            Op::GlobalRead(_) => (Locations::GLOBAL, None),
+            Op::GlobalRead(_) | Op::ProbeGlobal(_) => (Locations::GLOBAL, None),
+            Op::HelperCall {
+                helper: Helper::PropertyGetCached | Helper::SemanticPropertyProbeCached,
+                args,
+                ..
+            } => (Locations::HEAP, Some(args[0])),
             _ => return None,
         };
         Some((
             location,
             Self {
                 base,
-                field: Field::of(op, facts),
+                field: Field::of(graph, op, facts),
             },
         ))
     }
 
-    pub(in crate::jit::semantic) fn written(op: &Op, facts: &Facts) -> Option<Self> {
-        let field = match Field::of(op, facts) {
+    pub(in crate::jit::semantic) fn written(graph: &Graph, op: &Op, facts: &Facts) -> Option<Self> {
+        let field = match Field::of(graph, op, facts) {
             Field::Length => Field::Any,
             field => field,
         };
-        let base = write_target(op);
+        let base = match op {
+            Op::HelperCall {
+                helper: Helper::PropertySetCached,
+                args,
+                ..
+            } => Some(args[0]),
+            _ => write_target(op),
+        };
         (base.is_some() || field != Field::Any).then_some(Self { base, field })
     }
 }

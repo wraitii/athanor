@@ -131,9 +131,8 @@ pub(in crate::jit::semantic) fn lower_stores(function: &mut FunctionState) {
         for &inst in &insts {
             let data = &graph.insts[inst];
             let (object, key, value, addition) = match data.op {
-                Op::ArrayStore(object, key, value) | Op::PropertyStore(object, key, value, _) => {
-                    (object, key, value, false)
-                }
+                Op::ArrayStore(object, key, value)
+                | Op::PropertyStore(object, key, value, _, _) => (object, key, value, false),
                 Op::PropertyAdd(object, key, value, _) => (object, key, value, true),
                 Op::CanOverwrite(object, key) => (object, key, object, false),
                 _ => continue,
@@ -299,7 +298,7 @@ fn checked_store(
     }
     for &inst in &graph.blocks[yes.block].insts {
         match graph.insts[inst].op {
-            Op::ArrayStore(receiver, position, _) | Op::PropertyStore(receiver, position, _, _)
+            Op::ArrayStore(receiver, position, _) | Op::PropertyStore(receiver, position, ..)
                 if receiver == object && position == key =>
             {
                 return Some(inst);

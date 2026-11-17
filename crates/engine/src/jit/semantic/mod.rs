@@ -471,7 +471,7 @@ pub(super) enum Op {
     Get(Value, String),
     PropertyCache(Inst, String),
     GlobalCache(String),
-    PropertyLoad(Value, Value),
+    PropertyLoad(Value, Value, js::memory::Field),
     HelperCall {
         helper: super::helpers::Helper,
         args: Vec<Value>,
@@ -492,7 +492,7 @@ pub(super) enum Op {
     SetIndex(Value, Value, Value),
     // Bounded packed-array replacement; storage retains the incoming value before releasing the old one.
     ArrayStore(Value, Value, Value),
-    PropertyStore(Value, Value, Value, PropertyWrite),
+    PropertyStore(Value, Value, Value, js::memory::Field, PropertyWrite),
     PropertyAdd(Value, Value, Value, PropertyWrite),
     // Native slot replacement must go through the runtime setter.
     CanOverwrite(Value, Value),
@@ -858,7 +858,7 @@ impl Op {
             | Op::SlotStore(value)
             | Op::SlotClear(value)
             | Op::ParamStore(_, value) => ([Some(*value), None, None], &[]),
-            Op::PropertyLoad(object, cache)
+            Op::PropertyLoad(object, cache, _)
             | Op::IsPropertyCached(object, cache, _)
             | Op::CachedProperty(object, cache, _)
             | Op::FillPropertyCache(object, cache, _)
@@ -921,7 +921,7 @@ impl Op {
                 ..
             } => ([Some(*left), Some(*right), None], numbers),
             Op::ArrayStore(object, key, value)
-            | Op::PropertyStore(object, key, value, _)
+            | Op::PropertyStore(object, key, value, _, _)
             | Op::PropertyAdd(object, key, value, _)
             | Op::FillPropertyStore(object, key, _, value, _)
             | Op::SetIndex(object, key, value) => ([Some(*object), Some(*key), Some(*value)], &[]),
@@ -1105,7 +1105,7 @@ impl Op {
             | Op::SlotStore(value)
             | Op::SlotClear(value)
             | Op::ParamStore(_, value) => ([Some(value), None, None], &mut []),
-            Op::PropertyLoad(object, cache)
+            Op::PropertyLoad(object, cache, _)
             | Op::IsPropertyCached(object, cache, _)
             | Op::CachedProperty(object, cache, _)
             | Op::FillPropertyCache(object, cache, _)
@@ -1168,7 +1168,7 @@ impl Op {
                 ..
             } => ([Some(left), Some(right), None], numbers),
             Op::ArrayStore(object, key, value)
-            | Op::PropertyStore(object, key, value, _)
+            | Op::PropertyStore(object, key, value, _, _)
             | Op::PropertyAdd(object, key, value, _)
             | Op::FillPropertyStore(object, key, _, value, _)
             | Op::SetIndex(object, key, value) => ([Some(object), Some(key), Some(value)], &mut []),

@@ -322,7 +322,12 @@ provides the shared conflict query used by load reuse and region analysis.
 `semantic/js/memory/` owns receiver and field rules and flow-sensitive freshness;
 `Facts` caches the analysis and invalidates it when effects are recomputed.
 An access without JS information remains broad. This separation does not add
-address-range analysis or change call summaries and ownership proofs.
+address-range analysis or change call summaries. Property loads and stores retain
+their JS field identity until storage lowering. Borrow analysis uses those access
+facts to preserve owning property edges across unrelated writes, checking all
+edges in a borrowed receiver chain. Stored values may alias even when the owning
+slots are distinct; writes to a potentially aliasing slot still invalidate the
+borrow. Unknown calls and unclassified writes remain conservative.
 
 Representation selection is separate from semantic type facts and ownership.
 Values may be boxed or held in scalar integer, floating-point, boolean or word

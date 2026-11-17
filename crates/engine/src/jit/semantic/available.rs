@@ -97,13 +97,13 @@ fn load_key(op: &Op, probes: bool, aliases: &FxHashMap<Value, Value>) -> Option<
     })
 }
 
-fn read_access(op: &Op, facts: &Facts) -> Option<Access> {
+fn read_access(graph: &Graph, op: &Op, facts: &Facts) -> Option<Access> {
     match op {
         Op::LowLevel(super::low_level::Op::Load { .. }) => {
             Some(Access::broad(super::super::effects::Locations::HEAP))
         }
-        Op::ProbeGlobal(name) => Access::read(&Op::GlobalRead(name.clone()), facts),
-        _ => Access::read(op, facts),
+        Op::ProbeGlobal(name) => Access::read(graph, &Op::GlobalRead(name.clone()), facts),
+        _ => Access::read(graph, op, facts),
     }
 }
 
@@ -128,7 +128,7 @@ fn step(
         if state.is_empty() {
             return None;
         }
-        let write = Access::written(&data.op, facts, memory.writes);
+        let write = Access::written(graph, &data.op, facts, memory.writes);
         Rc::make_mut(state).retain(|_, entry| {
             entry
                 .read
@@ -167,7 +167,7 @@ fn step(
         }),
         _ => false,
     };
-    let read = read_access(&data.op, facts).map(|mut read| {
+    let read = read_access(graph, &data.op, facts).map(|mut read| {
         if let Some(js) = &mut read.js {
             js.base = js.base.map(|base| resolve(aliases, base));
         }

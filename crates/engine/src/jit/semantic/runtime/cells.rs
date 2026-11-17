@@ -1,5 +1,6 @@
 use super::super::cursor::{Cursor, Insert};
 use super::super::dispatch;
+use super::super::js::memory::Field;
 use super::super::{
     Binding, BindingData, BindingKind, Block, BlockData, Constant, FunctionState, Graph, Inst, Op,
     PropertyWrite, Scope, ScopeKind, Target, TerminatorKind, Value,
@@ -24,7 +25,7 @@ pub(in crate::jit::semantic) fn lower_accesses(function: &mut FunctionState) {
                         view,
                         crate::heap::DATA_OFFSET,
                     );
-                    graph.set_op(inst, Op::PropertyLoad(cell, address));
+                    graph.set_op(inst, Op::PropertyLoad(cell, address, Field::Cells));
                     Cursor::after(graph, inst).add_effect(Op::CheckInitialized(result));
                 }
                 Op::CellSet(cell, value) => {
@@ -32,7 +33,7 @@ pub(in crate::jit::semantic) fn lower_accesses(function: &mut FunctionState) {
                         .add_unassigned(Op::Constant(Constant::Number(0.0)));
                     graph.set_op(
                         inst,
-                        Op::PropertyStore(cell, index, value, PropertyWrite::Set),
+                        Op::PropertyStore(cell, index, value, Field::Cells, PropertyWrite::Set),
                     );
                 }
                 _ => {}

@@ -424,13 +424,17 @@ pub(super) fn plan_region(
                 match fact {
                     Fact::Array => true,
                     Fact::Shape(shape) if reentry.is_none() => {
-                        Access::read(&Op::IsShape(value, shape), &shared)
+                        Access::read(graph, &Op::IsShape(value, shape), &shared)
                             .is_some_and(|read| !writes.clobbers(&read))
                     }
                     Fact::Cached(cache, builtins) if reentry.is_none() => {
                         (!body.contains(&planning.def_block(cache)) || available.contains(&cache))
-                            && Access::read(&Op::IsPropertyCached(value, cache, builtins), &shared)
-                                .is_some_and(|read| !writes.clobbers(&read))
+                            && Access::read(
+                                graph,
+                                &Op::IsPropertyCached(value, cache, builtins),
+                                &shared,
+                            )
+                            .is_some_and(|read| !writes.clobbers(&read))
                     }
                     _ => false,
                 }

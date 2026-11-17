@@ -4911,3 +4911,58 @@ fn indexed_borrow_anchors_survive_helper_lowering() {
     assert_ne!(plan.slots.of(owner), plan.slots.of(scratch));
     ownership::verify(&function.graph, &function.facts, &plan).unwrap();
 }
+
+#[test]
+fn property_borrows_follow_owning_slots_across_writes() {
+    for (read, write, expected) in [
+        ("o.x", "o.y=null;", true),
+        ("o.x", "o.x=null;", false),
+        ("o.x", "p.x=null;", false),
+        ("o.x.child", "o.y=null;", true),
+        ("o.x.child", "o.x=null;", false),
+        ("o.x.child", "o.x.child=null;", false),
+        ("o.x", "change(o);", false),
+    ] {
+        let source = format!("function f(o,p,choose){{let value={read};{write}return value.n;}}");
+        let mut graph = canonicalize_graph(lower_source(&source).unwrap(), true)
+            .unwrap()
+            .graph;
+        let value = graph
+            .insts
+            .values()
+            .find_map(|data| {
+                matches!(&data.op, Op::Get(_, name) if name == "n")
+                    .then(|| data.op.operands_iter().next().unwrap())
+            })
+            .unwrap();
+        let facts = Facts::compute(&graph);
+        borrow::borrows(&mut graph, &facts, &mut Vec::new());
+        assert_eq!(graph.borrowed.contains(&value), expected, "{source}");
+    }
+}
+
+#[test]
+fn lowered_property_accesses_preserve_borrowed_slots() {
+    for (write, expected) in [("o.y=null;", true), ("o.x=null;", false)] {
+        let source = format!(
+            "function f(){{let o={{x:{{n:7}},y:null}};let value=o.x;{write}return value.n;}}"
+        );
+        let graph = canonicalize_graph(lower_source(&source).unwrap(), true)
+            .unwrap()
+            .graph;
+        let mut function = FunctionState::new(graph, Vec::new(), true);
+        let mut borrowed = false;
+        function
+            .lower_runtime_observed(false, &mut |pass, state| {
+                if pass != "ownership" {
+                    return;
+                }
+                borrowed = state.graph.insts.values().any(|data| {
+                    matches!(&data.op, Op::PropertyLoad(receiver, _, js::memory::Field::Named(name))
+                    if name == "n" && state.graph.borrowed.contains(receiver))
+                });
+            })
+            .unwrap();
+        assert_eq!(borrowed, expected, "{source}");
+    }
+}
