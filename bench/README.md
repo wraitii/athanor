@@ -72,14 +72,16 @@ cpp-quickjs/build/mapgen-runner --bootstrap bench/v8-v7/quickjs.js bench/gaussia
 
 ### Results
 
-Apple Silicon, 2026-11-16; node 23.9.0, bun 1.3.1, SpiderMonkey 128,
+Apple Silicon; node 23.9.0, bun 1.3.1, SpiderMonkey 128,
 QuickJS 2026-06-04, Ant 16.5.c41757b4.0. Higher is better.
+JIT, default Node and Bun results were measured on 2026-11-17, with Athanor
+at `56d6718`. Other results are retained from 2026-11-16.
 
 | benchmark | jit | node jitless | node ≤Sparkplug | node ≤Maglev | node | bun | Ant | SpiderMonkey 128 | QuickJS |
 |-----------|----:|-------------:|----------------:|-------------:|-----:|----:|----:|----------------:|--------:|
-| richards | 4162 | 1753 | 2835 | 33057 | 44911 | 51315 | 5454 | 15621 | 1139 |
-| navier-stokes | 24462 | 2370 | 3379 | 27788 | 40392 | 34280 | 20755 | 21390 | 1783 |
-| gaussian-blur | 289 | 12.9 | 19.9 | 229 | 648 | 1286 | 153 | 260 | 7.93 |
+| richards | 4204 | 1753 | 2835 | 33057 | 44947 | 51484 | 5454 | 15621 | 1139 |
+| navier-stokes | 23869 | 2370 | 3379 | 27788 | 40096 | 33700 | 20755 | 21390 | 1783 |
+| gaussian-blur | 289 | 12.9 | 19.9 | 229 | 645 | 1282 | 153 | 260 | 7.93 |
 
 All scores are medians of three runs, with benchmark processes run sequentially.
 The standard harness warms up each benchmark for one second before measurement.
@@ -93,15 +95,15 @@ Unsupported benchmarks:
 | earley-boyer | `unsupported unary operator in unary expression` |
 
 Additional scores on the same machine, medians of three sequential runs per
-engine and benchmark, with the current builtin library and release JIT build.
+engine and benchmark, using the same dates and release JIT build as above.
 Node and Bun use their default configurations; QuickJS uses the C++ runner and
 the same benchmark harness:
 
 | benchmark | jit | node | bun | QuickJS |
 |-----------|----:|-----:|----:|--------:|
-| splay | 3952 | 20870 | 74605 | 5827 |
-| raytrace | 2125 | 107372 | 205791 | 2905 |
-| crypto | 7031 | 64927 | 79353 | 979 |
+| splay | 7774 | 20715 | 72421 | 5827 |
+| raytrace | 5119 | 105226 | 201055 | 2905 |
+| crypto | 8679 | 63546 | 76789 | 979 |
 
 All three benchmarks completed successfully in every engine.
 
@@ -266,10 +268,12 @@ All engines must report the same `heightHash` (`dd1de906` for belgian_uplands).
 | engine          | belgian_uplands |
 |-----------------|-----------------|
 | SpiderMonkey 128 | 330 ms         |
-| jit             | 829 ms         |
+| jit             | 824 ms         |
 | Ant             | 2195 ms        |
 | QuickJS         | 7537 ms         |
 
 JIT and Ant times are medians of three sequential runs; C++ runners were run once each.
+The JIT result was measured on 2026-11-17 at `56d6718` (823, 824 and 828 ms);
+other engine results are retained from 2026-11-16.
 Ant uses the same bootstrap and settings through JavaScript file-loading and
 seeded-random host adapters. All runs produced the expected `heightHash`.
