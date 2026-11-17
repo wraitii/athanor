@@ -13,10 +13,6 @@ use crate::jit;
 use crate::parse;
 use crate::value::Value;
 
-struct Function {
-    arity: usize,
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Backend {
     Cranelift,
@@ -121,7 +117,7 @@ pub struct Engine {
     pub(crate) tiering: jit::Tiering,
     random_state: Cell<u64>,
     global: Environment,
-    functions: RefCell<FxHashMap<String, Function>>,
+    functions: RefCell<FxHashMap<String, usize>>,
     pub(crate) locals: jit::LocalSlots,
     pub(crate) host: Option<Box<dyn Host>>,
 }
@@ -368,12 +364,9 @@ impl Engine {
                 self.global.define(function.name.clone(), value);
             }
             self.global.heap().release(value);
-            self.functions.borrow_mut().insert(
-                function.name,
-                Function {
-                    arity: function.arity,
-                },
-            );
+            self.functions
+                .borrow_mut()
+                .insert(function.name, function.arity);
         }
         for name in globals {
             self.global.define(name, Value::UNDEFINED);
@@ -427,10 +420,7 @@ impl Engine {
     }
 
     pub fn arity(&self, name: &str) -> Option<usize> {
-        self.functions
-            .borrow()
-            .get(name)
-            .map(|function| function.arity)
+        self.functions.borrow().get(name).copied()
     }
 
     pub fn has_function(&self, name: &str) -> bool {

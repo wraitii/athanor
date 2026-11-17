@@ -21,6 +21,15 @@ struct EnvironmentData {
     heap: Heap,
 }
 
+impl EnvironmentData {
+    fn binding(&self, name: &str) -> Option<&Cell<Value>> {
+        self.lexical
+            .get(name)
+            .map(|binding| binding.0.as_ref())
+            .or_else(|| self.bindings.get(name).map(Box::as_ref))
+    }
+}
+
 impl Default for Environment {
     fn default() -> Self {
         let heap = Heap::default();
@@ -114,12 +123,7 @@ impl Environment {
 
     pub(crate) fn get_raw(&self, name: &str) -> Option<Value> {
         let data = self.data.borrow();
-        match data
-            .lexical
-            .get(name)
-            .map(|binding| &binding.0)
-            .or_else(|| data.bindings.get(name))
-        {
+        match data.binding(name) {
             Some(value) => Some(value.get()),
             None => data.parent.as_ref().and_then(|parent| parent.get_raw(name)),
         }
@@ -144,14 +148,8 @@ impl Environment {
 
     pub(crate) fn binding_slot(&self, name: &str) -> Option<*const Value> {
         let data = self.data.borrow();
-        data.lexical
-            .get(name)
-            .map(|binding| binding.0.as_ptr().cast_const())
-            .or_else(|| {
-                data.bindings
-                    .get(name)
-                    .map(|value| value.as_ptr().cast_const())
-            })
+        data.binding(name)
+            .map(|value| value.as_ptr().cast_const())
             .or_else(|| {
                 data.parent
                     .as_ref()
