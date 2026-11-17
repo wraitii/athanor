@@ -87,6 +87,7 @@ enum RootKind {
     Object,
     Function,
     Array,
+    String,
 }
 
 pub(super) struct Shapes {
@@ -124,6 +125,10 @@ impl Shapes {
 
     pub(super) fn array_root(&mut self, prototype: Option<Value>) -> ShapeId {
         self.root_for(prototype, RootKind::Array)
+    }
+
+    pub(super) fn string_root(&mut self, prototype: Value) -> ShapeId {
+        self.root_for(Some(prototype), RootKind::String)
     }
 
     fn root_for(&mut self, prototype: Option<Value>, kind: RootKind) -> ShapeId {

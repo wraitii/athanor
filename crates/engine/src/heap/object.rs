@@ -101,7 +101,9 @@ impl Heap {
         let data = self.0.borrow();
         let id = heap_id(receiver)?;
         let shape = data.cacheable_shape(id)?;
-        if data.array(id).is_some() && (name == "length" || array_index_name(name).is_some()) {
+        if (receiver.is_string() || data.array(id).is_some())
+            && (name == "length" || array_index_name(name).is_some())
+        {
             return None;
         }
         let atom = data.atoms.find(name)?;
@@ -151,15 +153,19 @@ impl Heap {
         index: u32,
     ) -> Option<Value> {
         let data = self.0.borrow();
-        let id = heap_id(receiver)?;
-        if data.cacheable_shape(id)? != shape {
+        let slot = data.live(heap_id(receiver)?)?;
+        if slot.cacheable_shape()? != shape {
             return None;
         }
-        let owner = if holder == 0 { id } else { holder };
-        if data.cacheable_shape(owner)? != holder_shape {
+        let owner = if holder == 0 {
+            slot
+        } else {
+            data.live(holder)?
+        };
+        if owner.cacheable_shape()? != holder_shape {
             return None;
         }
-        let PropertyView::Shaped { values, .. } = data.properties(owner)? else {
+        let PropertyView::Shaped { values, .. } = data.slot_properties(owner)? else {
             return None;
         };
         values.get(index as usize).copied()
@@ -176,7 +182,6 @@ impl Heap {
             let slot = data.live(heap_id(receiver)?)?;
             match &slot.payload {
                 Payload::TypedArray(_)
-                | Payload::String(_)
                 | Payload::Set(_)
                 | Payload::RegExp(_)
                 | Payload::Generator(_) => slot.kind,
@@ -217,10 +222,21 @@ impl Heap {
         cache: Option<&mut PropertyReadCache>,
     ) -> Option<PropertyRead> {
         if receiver.is_number() {
-            return Some(PropertyRead::Native(ReceiverKind::Number.method(name)?));
+            return Some(
+                ReceiverKind::Number
+                    .method(name)
+                    .map_or(PropertyRead::Value(Value::UNDEFINED), PropertyRead::Native),
+            );
         }
         let data = self.0.borrow();
         let payload = &data.live(heap_id(receiver)?)?.payload;
+        if let Payload::String(text) = payload
+            && name == "length"
+        {
+            return Some(PropertyRead::Value(Value::number(
+                text.chars().count() as f64
+            )));
+        }
         let atom = if matches!(
             payload,
             Payload::Object(_)
@@ -228,6 +244,7 @@ impl Heap {
                 | Payload::Closure(_)
                 | Payload::Native(_)
                 | Payload::Array(_)
+                | Payload::String(_)
         ) {
             match cache {
                 Some(cache) => cache.atom(self, &data, name),
@@ -283,14 +300,14 @@ impl Heap {
                     .object_property_atom(heap_id(receiver)?, name, atom)
                     .map(PropertyRead::Value);
             }
-            Payload::String(text) => match name {
-                "length" => {
-                    return Some(PropertyRead::Value(Value::number(
-                        text.chars().count() as f64
-                    )));
-                }
-                _ => ReceiverKind::String.method(name)?,
-            },
+            Payload::String(_) => {
+                let value = data
+                    .string_prototype
+                    .and_then(heap_id)
+                    .and_then(|id| data.object_property_atom(id, name, atom))
+                    .unwrap_or(Value::UNDEFINED);
+                return Some(PropertyRead::Value(value));
+            }
             Payload::Set(set) => match name {
                 "size" => {
                     return Some(PropertyRead::Value(Value::number(set.entries.len() as f64)));
@@ -444,7 +461,10 @@ impl Heap {
                 Payload::Native(native)
                     if matches!(
                         native.function,
-                        NativeFunction::Object | NativeFunction::Function | NativeFunction::Array
+                        NativeFunction::Object
+                            | NativeFunction::Function
+                            | NativeFunction::Array
+                            | NativeFunction::StringConvert
                     ) =>
                 {
                     return Some(false);
@@ -568,7 +588,10 @@ impl Heap {
                 Some(Payload::Native(native))
                     if matches!(
                         native.function,
-                        NativeFunction::Object | NativeFunction::Function | NativeFunction::Array
+                        NativeFunction::Object
+                            | NativeFunction::Function
+                            | NativeFunction::Array
+                            | NativeFunction::StringConvert
                     ) =>
                 {
                     return false;
@@ -842,6 +865,10 @@ pub(crate) struct CachedProperty {
 }
 
 impl Slot {
+    fn cacheable_shape(&self) -> Option<ShapeId> {
+        (self.shape != NO_SHAPE && self.shape != DICTIONARY).then_some(self.shape)
+    }
+
     fn property_prototype(&self) -> Option<Value> {
         match &self.payload {
             Payload::Array(array) => array.prototype,
@@ -854,7 +881,11 @@ impl Slot {
 
 impl HeapData {
     pub(super) fn property_prototype(&self, id: u64) -> Option<Value> {
-        self.live(id)?.property_prototype()
+        let slot = self.live(id)?;
+        if matches!(slot.payload, Payload::String(_)) {
+            return self.string_prototype;
+        }
+        slot.property_prototype()
     }
 
     fn function_has_property(&self, name: &str) -> bool {
@@ -934,7 +965,7 @@ impl HeapData {
     }
 
     fn cacheable_shape(&self, id: u64) -> Option<ShapeId> {
-        Some(self.live(id)?.shape).filter(|&shape| shape != NO_SHAPE && shape != DICTIONARY)
+        self.live(id)?.cacheable_shape()
     }
 
     fn object_root(&mut self, prototype: Option<Value>) -> ShapeId {

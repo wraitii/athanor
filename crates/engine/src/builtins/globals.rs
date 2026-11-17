@@ -48,6 +48,17 @@ pub(crate) fn install(global: &Environment) -> Result<(), Error> {
     heap.define_property(constructor, "prototype", array_prototype, false);
     heap.define_property(array_prototype, "constructor", constructor, false);
     heap.release(constructor);
+    let string_prototype = heap.object().ok_or_else(exhausted)?;
+    let installed = heap.install_string_prototype(string_prototype);
+    heap.release(string_prototype);
+    if !installed {
+        return Err(Error::Runtime("cannot install string prototype".into()));
+    }
+    add_methods(string_prototype, super::ReceiverKind::String.methods())?;
+    let constructor = native(NativeFunction::StringConvert)?;
+    heap.define_property(constructor, "prototype", string_prototype, false);
+    heap.define_property(string_prototype, "constructor", constructor, false);
+    heap.release(constructor);
     global.define("globalThis", Value::GLOBAL_OBJECT);
     global.define_readonly("Infinity", Value::number(f64::INFINITY));
     global.define_readonly("NaN", Value::number(f64::NAN));

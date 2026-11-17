@@ -217,7 +217,11 @@ fn borrowed_guard_inputs_may_be_immediate_values() {
             "#
         );
         let generic = run(&source, false);
-        assert!(generic.is_err(), "replacement: {replacement}");
+        if replacement == "3.25" {
+            assert_eq!(generic, Ok(Value::number(133.0)));
+        } else {
+            assert!(generic.is_err(), "replacement: {replacement}");
+        }
         assert_eq!(run(&source, true), generic, "replacement: {replacement}");
     }
 }

@@ -90,12 +90,6 @@ All engines produced a Gaussian blur output buffer sum of `2019780`.
 DeltaBlue was measured separately on 2026-11-17 with the `Function.prototype.call`
 change; Ant was unavailable for that run.
 
-Unsupported benchmarks:
-
-| benchmark | first error |
-|-----------|-------------|
-| earley-boyer | `String.prototype` is undefined when assigning `sc_toDisplayString` |
-
 Additional scores on the same machine, medians of three sequential runs per
 engine and benchmark, using the same dates and release JIT build as above.
 Node and Bun use their default configurations; QuickJS uses the C++ runner and
@@ -306,6 +300,33 @@ Navier–Stokes measured 23993, 22592, and 22557 on those same builds
 and 852 ms after (three runs each), with identical hashes and entity counts.
 Gaussian blur reproduced the output sum of `2019780`. Earley–Boyer still
 stops at `String.prototype.sc_toDisplayString`.
+
+### String prototype comparison
+
+The shared `String.prototype`, `String.prototype.toString` and missing-property
+reads on numbers let unmodified Earley–Boyer complete. All eight V8 v7
+benchmarks and Gaussian Blur pass the release smoke check.
+
+The table shows medians of five alternating release pairs against `8d753c5`.
+Earley–Boyer's score comes from five release runs with string prototype support.
+The synthetic loop calls `charCodeAt` 262,144 times per iteration on a
+16-character ASCII string and checks the accumulated code units.
+
+| Workload | Before | After | Change |
+|----------|-------:|------:|-------:|
+| charCodeAt score | 833 | 773 | −7.2% |
+| RegExp score | 5091 | 4771 | −6.3% |
+| Richards score | 4240 | 4236 | −0.09% |
+| DeltaBlue score | 2790 | 2791 | +0.04% |
+| Crypto score | 8446 | 8447 | +0.01% |
+| RayTrace score | 4982 | 4928 | −1.08% |
+| Splay score | 7327 | 7236 | −1.24% |
+| Navier–Stokes score | 22592 | 22467 | −0.55% |
+| Gaussian Blur score | 273 | 273 | 0.00% |
+| Earley–Boyer score | — | 4280 | — |
+| Belgian Uplands generator time | 855 ms | 851 ms | −0.5% |
+
+All map runs produced the same three hashes and 1137 entities.
 
 ### Published results
 

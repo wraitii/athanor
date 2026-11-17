@@ -437,12 +437,14 @@ fn shaped_probes_preserve_nested_reads_and_receiver_fallbacks() {
         engine.call("main", &[]).unwrap().value(),
         Value::number(12.0)
     );
-    let error = engine
-        .call("read", &[Value::number(42.0)])
-        .err()
-        .unwrap()
-        .to_string();
-    assert!(error.contains("cannot read property \"x\" of number"));
+    assert!(
+        engine
+            .call("read", &[Value::number(42.0)])
+            .unwrap()
+            .value()
+            .as_number()
+            .is_some_and(f64::is_nan)
+    );
 }
 
 #[test]

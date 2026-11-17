@@ -7,7 +7,7 @@ impl Heap {
             *id
         } else {
             let id = data.reserve()?;
-            data.store(id, Payload::String(text.into()));
+            data.store_string(id, text.into());
             data.interned.push((text, id));
             id
         };
@@ -21,7 +21,7 @@ impl Heap {
         let mut buffer = String::from_utf8(data.string_buffers.take(text.len())?).unwrap();
         buffer.push_str(text);
         let id = data.reserve()?;
-        data.store(id, Payload::String(buffer));
+        data.store_string(id, buffer);
         Some(Value::from_bits(TAG_STRING | id))
     }
 
@@ -38,7 +38,7 @@ impl Heap {
         text.push_str(data.string(left)?);
         text.push_str(data.string(right)?);
         let id = data.reserve()?;
-        data.store(id, Payload::String(text));
+        data.store_string(id, text);
         Some(Value::from_bits(TAG_STRING | id))
     }
 
@@ -53,7 +53,7 @@ impl Heap {
             text.push_str(data.string(heap_id(value)?)?);
         }
         let id = data.reserve()?;
-        data.store(id, Payload::String(text));
+        data.store_string(id, text);
         Some(Value::from_bits(TAG_STRING | id))
     }
 
@@ -103,7 +103,7 @@ impl Heap {
             let mut piece = String::from_utf8(data.string_buffers.take(range.len())?).unwrap();
             piece.push_str(&data.string(id).unwrap()[range]);
             let piece_id = data.reserve()?;
-            data.store(piece_id, Payload::String(piece));
+            data.store_string(piece_id, piece);
             values.push(Value::from_bits(TAG_STRING | piece_id));
         }
         Some(())
@@ -143,7 +143,7 @@ impl Heap {
         let mut data = self.0.borrow_mut();
         let piece = data.string(heap_id(value)?)?.get(range)?.to_owned();
         let id = data.reserve()?;
-        data.store(id, Payload::String(piece));
+        data.store_string(id, piece);
         Some(Value::from_bits(TAG_STRING | id))
     }
 

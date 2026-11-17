@@ -186,12 +186,9 @@ impl Heap {
                     IndexRead::Primitive(value)
                 })
             }
-            Payload::String(text) => Some(
-                element_index(number, u32::MAX as f64)
-                    .and_then(|index| text.chars().nth(index))
-                    .map(IndexRead::Character)
-                    .unwrap_or(IndexRead::Primitive(Value::UNDEFINED)),
-            ),
+            Payload::String(text) => element_index(number, u32::MAX as f64)
+                .and_then(|index| text.chars().nth(index))
+                .map(IndexRead::Character),
             _ => None,
         }
     }

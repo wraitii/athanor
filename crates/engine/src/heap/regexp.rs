@@ -92,7 +92,7 @@ impl Heap {
             };
             let piece = data.string(id)?.get(range)?.to_owned();
             let piece_id = data.reserve()?;
-            data.store(piece_id, Payload::String(piece));
+            data.store_string(piece_id, piece);
             values.push(Value::from_bits(TAG_STRING | piece_id));
         }
         Some(())

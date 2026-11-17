@@ -139,16 +139,23 @@ it, so closures and native functions see properties added to the object root.
 Arrays share an empty-array `Array.prototype`, which inherits from
 `Object.prototype`. Its native methods and constructor property are writable,
 non-enumerable properties. Arrays reuse shapes and property transitions for
-named own properties, allocating their named storage only when needed. Other
-specialized payloads retain their existing lookup rules.
+named own properties, allocating their named storage only when needed.
+
+Primitive strings have a shared shape whose prototype is the heap-owned
+`String.prototype`, an ordinary object inheriting from `Object.prototype`.
+Each string keeps its existing payload and uses the shape in its slot header
+for cached method reads. The cache guards the prototype's shape and loads the
+current slot value. Length and in-range indices are read from the string.
+A missing property read on a number returns `undefined`.
 
 `Object()` and `new Object()` allocate an ordinary object for absent or nullish
 arguments and preserve the identity of object arguments. Primitive boxing is
 unsupported. Native functions have shaped own properties, including writable,
-non-enumerable constructor statics. The Object, Function and Array constructors reject
-assignment to their `prototype` property. The existing Function prototype object
-is still not callable. Ordinary object layout is unchanged, and allocation caches
-the default root shape; cached own-property reads require no prototype traversal.
+non-enumerable constructor statics. The Object, Function, Array and String
+constructors reject assignment to their `prototype` property. The existing
+Function prototype object is still not callable. Ordinary object layout is
+unchanged, and allocation caches the default root shape; cached own-property
+reads require no prototype traversal.
 
 ### Observable differences
 

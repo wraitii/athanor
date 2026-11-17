@@ -70,8 +70,7 @@ macro_rules! define_builtins {
         }
 
         pub(crate) fn builtin_method(name: &str) -> bool {
-            // Numeric receivers have no heap payload for the method cache.
-            false $(|| (!matches!(ReceiverKind::$kind, ReceiverKind::Number)
+            false $(|| (!matches!(ReceiverKind::$kind, ReceiverKind::Number | ReceiverKind::String)
                 && matches!(name, $($method_name)|*)))*
         }
 
@@ -173,6 +172,7 @@ define_builtins! {
             RegExpExec: "exec" => regexp::call;
         }
         String {
+            StringToString: "toString" => string::to_string;
             StringCharAt: "charAt" => string::call;
             StringCharCodeAt: "charCodeAt" => string::call;
             StringSubstring: "substring" => string::call;

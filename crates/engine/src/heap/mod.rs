@@ -66,6 +66,8 @@ struct HeapData {
     object_shape: ShapeId,
     empty_object_shape: ShapeId,
     function_prototype: Option<Value>,
+    string_prototype: Option<Value>,
+    string_shape: ShapeId,
     array_prototype: Option<Value>,
     indexed_prototypes: bool,
     array_shape: ShapeId,
@@ -89,6 +91,8 @@ impl Default for HeapData {
             object_shape: ShapeId::default(),
             empty_object_shape: ShapeId::default(),
             function_prototype: None,
+            string_prototype: None,
+            string_shape: NO_SHAPE,
             array_prototype: None,
             indexed_prototypes: false,
             array_shape: NO_SHAPE,
@@ -488,6 +492,11 @@ impl HeapData {
         }
         self.slot_mut(id).payload = payload;
         self.sync(id);
+    }
+
+    fn store_string(&mut self, id: u64, text: String) {
+        self.store(id, Payload::String(text));
+        self.slot_mut(id).shape = self.string_shape;
     }
 
     fn sync(&mut self, id: u64) {

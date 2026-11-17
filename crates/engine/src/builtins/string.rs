@@ -56,6 +56,19 @@ pub(crate) fn split_result(
     }
 }
 
+pub(super) fn to_string(
+    ctx: *mut JitCtx,
+    _: NativeFunction,
+    receiver: Value,
+    _: &[Value],
+) -> Value {
+    let context = unsafe { &mut *ctx };
+    if receiver.is_string() && context.global.heap().retain(receiver) {
+        return receiver;
+    }
+    fail(context, "string method requires a string receiver")
+}
+
 pub(crate) fn call(
     ctx: *mut JitCtx,
     function: NativeFunction,

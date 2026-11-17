@@ -431,3 +431,38 @@ fn array_holes_observe_indexed_prototype_mutations() {
         Value::TRUE,
     );
 }
+
+#[test]
+fn string_property_caches_follow_prototype_changes() {
+    check(
+        r#"
+        function split(s) { return s.split(',')[0]; }
+        function label(s) { return s.label; }
+        function main() {
+            let p = String.prototype;
+            let saved = p.split;
+            let s = 'α,b';
+            if (p.constructor !== String || !(p instanceof Object) ||
+                Object.keys(p).length !== 0 || s.toString() !== s) return false;
+            for (let i = 0; i < 300; ++i)
+                if (split(s) !== 'α' || label(s) !== undefined) return false;
+            p.label = function() { return this; };
+            if (label(s) !== p.label || s.label() !== s) return false;
+            p.split = function() { return ['changed']; };
+            if (split(s) !== 'changed') return false;
+            delete p.split;
+            if (s.split !== undefined) return false;
+            p.split = saved;
+            if (split(s) !== 'α') return false;
+            p[0] = 'shadowed';
+            p[4] = 'inherited';
+            Object.prototype.root = 7;
+            if (split(s) !== 'α' || s[0] !== 'α' || s[4] !== 'inherited' ||
+                s['4'] !== 'inherited' || s.root !== 7 || s.length !== 3) return false;
+            delete p[4];
+            return s[4] === undefined && (42).missing === undefined;
+        }
+        "#,
+        Value::TRUE,
+    );
+}
