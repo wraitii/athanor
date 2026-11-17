@@ -907,6 +907,13 @@ impl Graph {
         }
     }
 
+    fn defining_js_op(&self, value: Value) -> Option<&JsOp> {
+        match self.defining_op(value)? {
+            Op::Javascript(op) => Some(op),
+            _ => None,
+        }
+    }
+
     pub(in crate::jit) fn callees(&self) -> FxHashSet<Value> {
         self.insts
             .values()

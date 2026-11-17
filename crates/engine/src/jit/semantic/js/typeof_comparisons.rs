@@ -19,13 +19,10 @@ pub(in crate::jit::semantic) fn typeof_comparisons(graph: &mut Graph) {
             let pair = [(left, right), (right, left)]
                 .into_iter()
                 .find_map(|(value, literal)| {
-                    let Op::Javascript(JsOp::Unary(UnaryOp::Typeof, operand)) =
-                        graph.defining_op(value)?
-                    else {
+                    let JsOp::Unary(UnaryOp::Typeof, operand) = graph.defining_js_op(value)? else {
                         return None;
                     };
-                    let Op::Javascript(JsOp::Constant(Constant::String(text))) =
-                        graph.defining_op(literal)?
+                    let JsOp::Constant(Constant::String(text)) = graph.defining_js_op(literal)?
                     else {
                         return None;
                     };
@@ -57,12 +54,13 @@ pub(in crate::jit::semantic) fn typeof_comparisons(graph: &mut Graph) {
                 graph.remove_inst(literal_inst);
             }
             let test = if kind == 0 {
-                Op::Javascript(JsOp::IsString(operand))
+                JsOp::IsString(operand)
             } else if kind == 1 {
-                Op::Javascript(JsOp::IsNumber(operand))
+                JsOp::IsNumber(operand)
             } else {
-                Op::Javascript(JsOp::IsTypeof(operand, kind))
+                JsOp::IsTypeof(operand, kind)
             };
+            let test = Op::Javascript(test);
             let op = if operator == BinaryOperator::StrictEquality {
                 test
             } else {

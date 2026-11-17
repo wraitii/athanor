@@ -18,22 +18,22 @@ pub(in crate::jit::semantic) fn bit_tests(function: &mut super::super::FunctionS
         if uses[condition] != 1 {
             continue;
         }
-        let Some(&Op::Javascript(JsOp::Binary(BinaryOperator::BitwiseAnd, left, right))) =
-            graph.defining_op(condition)
+        let Some(&JsOp::Binary(BinaryOperator::BitwiseAnd, left, right)) =
+            graph.defining_js_op(condition)
         else {
             continue;
         };
         let test = [(left, right), (right, left)]
             .into_iter()
             .find_map(|(word, mask)| {
-                let &Op::Javascript(JsOp::Binary(BinaryOperator::ShiftLeft, one, index)) =
-                    graph.defining_op(mask)?
+                let &JsOp::Binary(BinaryOperator::ShiftLeft, one, index) =
+                    graph.defining_js_op(mask)?
                 else {
                     return None;
                 };
                 (matches!(
-                    graph.defining_op(one),
-                    Some(Op::Javascript(JsOp::Constant(Constant::Number(1.0))))
+                    graph.defining_js_op(one),
+                    Some(JsOp::Constant(Constant::Number(1.0)))
                 ) && facts.of(word).within(ValueType::INT32)
                     && facts.of(index).within(ValueType::INT32))
                 .then_some((word, index, one))
