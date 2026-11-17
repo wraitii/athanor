@@ -83,6 +83,25 @@ fn array_like_get(ctx: &mut JitCtx, value: Value, index: usize) -> Option<Value>
     Some(Value::UNDEFINED)
 }
 
+fn map_element(
+    ctx: &mut JitCtx,
+    mapper: Value,
+    receiver: Value,
+    value: Value,
+    index: usize,
+) -> Option<Value> {
+    if mapper.is_undefined() {
+        return Some(value);
+    }
+    let args = [value, Value::number(index as f64)];
+    let mapped = js_call(ctx, mapper, receiver, args.as_ptr(), 2);
+    ctx.global.heap().release(value);
+    if ctx.error.is_some() || ctx.exception_pending() {
+        return None;
+    }
+    Some(mapped)
+}
+
 pub(crate) fn from(ctx: *mut JitCtx, args: &[Value]) -> Value {
     let context = unsafe { &mut *ctx };
     let heap = context.global.heap().clone();
@@ -114,16 +133,8 @@ pub(crate) fn from(ctx: *mut JitCtx, args: &[Value]) -> Value {
             if value == Value::UNINITIALIZED {
                 break;
             }
-            let mapped = if mapper.is_undefined() {
-                value
-            } else {
-                let callback_args = [value, Value::number(index as f64)];
-                let mapped = js_call(ctx, mapper, this_arg, callback_args.as_ptr(), 2);
-                heap.release(value);
-                if context.error.is_some() || context.exception_pending() {
-                    return Value::UNDEFINED;
-                }
-                mapped
+            let Some(mapped) = map_element(context, mapper, this_arg, value, index) else {
+                return Value::UNDEFINED;
             };
             values.push(mapped);
             index += 1;
@@ -140,16 +151,8 @@ pub(crate) fn from(ctx: *mut JitCtx, args: &[Value]) -> Value {
                 return Value::UNDEFINED;
             };
             let value = context.retain(value);
-            let mapped = if mapper.is_undefined() {
-                value
-            } else {
-                let callback_args = [value, Value::number(index as f64)];
-                let mapped = js_call(ctx, mapper, this_arg, callback_args.as_ptr(), 2);
-                heap.release(value);
-                if context.error.is_some() || context.exception_pending() {
-                    return Value::UNDEFINED;
-                }
-                mapped
+            let Some(mapped) = map_element(context, mapper, this_arg, value, index) else {
+                return Value::UNDEFINED;
             };
             values.push(mapped);
         }

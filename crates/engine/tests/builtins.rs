@@ -485,6 +485,12 @@ fn array_from_uses_iterables_array_likes_and_mapping() {
         let fromHoles = Array.from(holes);
         let context = { offset: 10 };
         let thisArg = Array.from([1, 2], function(value) { return value + this.offset; }, context);
+        let likeSource = { length: 2, 0: { value: 3 }, 1: { value: 4 } };
+        let mappedLike = Array.from(likeSource, function(value, index) {
+            likeSource[index] = null;
+            value.value += this.offset + index;
+            return value;
+        }, context);
         let growing = [1];
         let observed = Array.from(growing, (value, index) => {
             if (index === 0) growing.push(2);
@@ -494,6 +500,7 @@ fn array_from_uses_iterables_array_likes_and_mapping() {
             text.join() === "a,😀,é" && like.join() === "x,y" &&
             fromHoles.length === 2 && fromHoles[0] === 1 && fromHoles[1] === undefined &&
             thisArg.join() === "11,12" && observed.join() === "2,2" &&
+            mappedLike[0].value === 13 && mappedLike[1].value === 15 &&
             Array.from === Array.from;
     }"#;
     assert_eq!(run(source).unwrap(), Value::TRUE);
@@ -521,6 +528,7 @@ fn array_from_and_constructor_reject_invalid_inputs() {
         "function main(){ return Array.from([1], 3); }",
         "function main(){ return Array.from(new Set()); }",
         "function main(){ return Array.from([1], () => { throw 5; }); }",
+        "function main(){ return Array.from({length: 1, 0: 1}, () => { throw 5; }); }",
         "function main(){ return Array(2.5); }",
         "function main(){ return Array(-1); }",
         "function main(){ return new Array(1 / 0); }",
