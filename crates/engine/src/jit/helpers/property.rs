@@ -388,6 +388,12 @@ impl PropertyCache {
         {
             return;
         }
+        let access = self
+            .reported
+            .map_or(access, |reported| reported.merge(access));
+        if self.reported == Some(access) {
+            return;
+        }
         self.reported = Some(access);
         engine.tiering.observe_shape(owner, site, property, access);
     }
@@ -815,6 +821,45 @@ mod cache_tests {
         .unwrap();
         engine.compile(source, "read-cache.js").unwrap();
         engine
+    }
+
+    #[test]
+    fn cache_feedback_merges_alternating_shapes() {
+        let engine = engine("");
+        let site = crate::jit::profile::Site {
+            inline_context: 0,
+            source: 0,
+            start: 0,
+            end: 0,
+        };
+        let mut cache = PropertyCache::new("x", Some((0, site)), false);
+        for shape in [10, 20, 10, 20] {
+            cache.observe(
+                &engine,
+                PropertyAccess::Set,
+                ShapeAccess::Overwrite { shape, index: 0 },
+            );
+        }
+        assert_eq!(cache.reported, Some(ShapeAccess::Varying));
+
+        let mut cache = PropertyCache::new("x", Some((0, site)), false);
+        for shape in [10, 20, 10, 20] {
+            cache.observe(
+                &engine,
+                PropertyAccess::Get,
+                ShapeAccess::Read(ReadLayout::own(shape, 0)),
+            );
+        }
+        let reported = cache.reported.unwrap();
+        assert_eq!(reported.read(Some(10)), Some(ReadLayout::own(10, 0)));
+        assert_eq!(reported.read(Some(20)), Some(ReadLayout::own(20, 0)));
+        cache.megamorphic = 1;
+        cache.observe(
+            &engine,
+            PropertyAccess::Get,
+            ShapeAccess::Read(ReadLayout::own(10, 0)),
+        );
+        assert_eq!(cache.reported, Some(ShapeAccess::Megamorphic));
     }
 
     #[test]
