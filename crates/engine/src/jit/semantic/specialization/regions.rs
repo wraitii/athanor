@@ -618,6 +618,36 @@ mod tests {
     }
 
     #[test]
+    fn unknown_storage_reads_can_alias_fresh_allocations() {
+        let mut graph = empty_graph();
+        let block = graph.entry;
+        let span = graph.span;
+        let object = graph.append_value(block, span, Op::NewObject);
+        let value = graph.append_value(
+            block,
+            span,
+            Op::Constant(super::super::super::Constant::Number(1.0)),
+        );
+        let (store, _) = graph.append(block, span, Op::Set(object, "x".into(), value), false);
+        let scope = Cfg::new(&graph).rpo.into_iter().collect();
+        let writes = Writes::collect(&graph, &scope);
+        let facts = Facts::compute(&graph);
+        let read = Access::read(
+            &graph,
+            &Op::RelatedPropertyLoad(object, object, Field::Named("x".into())),
+            &facts,
+        )
+        .unwrap();
+        let write = heap(object, Field::Named("x".into()));
+        assert!(writes.kills(store, &write, &read));
+        assert!(!writes.kills(
+            store,
+            &write,
+            &Access::js(Locations::HEAP, None, Field::Named("x".into()))
+        ));
+    }
+
+    #[test]
     fn shape_exclusion_requires_a_live_positive_fact() {
         for writes_shape in [false, true] {
             let mut graph = empty_graph();

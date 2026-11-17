@@ -1,4 +1,5 @@
 use super::*;
+use crate::jit::layout::ReadLayout;
 use crate::jit::profile::{PropertyAccess, ShapeAccess};
 
 #[repr(C)]
@@ -337,14 +338,14 @@ impl PropertyCache {
             self.observe(
                 engine,
                 PropertyAccess::Get,
-                if found.holder == 0 {
-                    ShapeAccess::Read {
-                        shape: found.shape,
-                        index: found.index,
-                    }
-                } else {
-                    ShapeAccess::Varying
-                },
+                ShapeAccess::Read(ReadLayout {
+                    shape: found.shape,
+                    index: found.index,
+                    storage: (found.holder != 0).then_some(crate::jit::layout::RelatedStorage {
+                        identity: found.holder,
+                        shape: found.holder_shape,
+                    }),
+                }),
             );
             return Some(found.value);
         }

@@ -16,7 +16,10 @@ impl Access {
     pub(super) fn js(location: Locations, base: Option<Value>, field: js::Field) -> Self {
         Self {
             location,
-            js: Some(js::Access { base, field }),
+            js: Some(js::Access {
+                base: base.map_or(js::Base::External, js::Base::Known),
+                field,
+            }),
         }
     }
 

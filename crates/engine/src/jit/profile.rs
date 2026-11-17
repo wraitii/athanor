@@ -1,3 +1,4 @@
+use crate::jit::layout::ReadLayout;
 use crate::{FxHashMap, FxHashSet};
 
 use crate::heap::TypedKind;
@@ -39,8 +40,8 @@ pub(crate) enum ReadType {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ShapeAccess {
     Addition,
-    Read { shape: u32, index: u32 },
-    PolymorphicRead { entries: [(u32, u32); 4], len: u8 },
+    Read(ReadLayout),
+    PolymorphicRead { entries: [ReadLayout; 4], len: u8 },
     Overwrite { shape: u32, index: u32 },
     Varying,
     Megamorphic,
@@ -53,20 +54,20 @@ pub(crate) enum PropertyAccess {
 }
 
 impl ShapeAccess {
-    pub(crate) fn read(self, preferred: Option<u32>) -> Option<(u32, u32)> {
+    pub(crate) fn read(self, preferred: Option<u32>) -> Option<ReadLayout> {
         match self {
-            Self::Read { shape, index } => Some((shape, index)),
+            Self::Read(layout) => Some(layout),
             Self::PolymorphicRead { entries, len } => entries[..usize::from(len)]
                 .iter()
                 .copied()
-                .find(|&(shape, _)| Some(shape) == preferred),
+                .find(|layout| Some(layout.shape) == preferred),
             _ => None,
         }
     }
 
     fn merge(self, other: Self) -> Self {
         let reads = |access| match access {
-            Self::Read { shape, index } => Some(([(shape, index); 4], 1)),
+            Self::Read(layout) => Some(([layout; 4], 1)),
             Self::PolymorphicRead { entries, len } => Some((entries, len)),
             _ => None,
         };
@@ -79,7 +80,7 @@ impl ShapeAccess {
                 if usize::from(len) == entries.len()
                     || entries[..usize::from(len)]
                         .iter()
-                        .any(|known| known.0 == entry.0)
+                        .any(|known| known.shape == entry.shape)
                 {
                     return Self::Varying;
                 }
@@ -87,7 +88,7 @@ impl ShapeAccess {
                 len += 1;
             }
             if len > 1 {
-                entries[usize::from(len)..].fill((0, 0));
+                entries[usize::from(len)..].fill(ReadLayout::default());
                 entries[..usize::from(len)].sort_unstable();
                 return Self::PolymorphicRead { entries, len };
             }
@@ -418,6 +419,45 @@ mod tests {
     }
 
     #[test]
+    fn related_read_feedback_preserves_storage_and_rejects_conflicts() {
+        use crate::jit::layout::RelatedStorage;
+        let inherited = ReadLayout {
+            shape: 10,
+            index: 2,
+            storage: Some(RelatedStorage {
+                identity: 128,
+                shape: 20,
+            }),
+        };
+        let mut profile = Profile::default();
+        assert_eq!(
+            profile.observe_shape(1, site(), PropertyAccess::Get, ShapeAccess::Read(inherited)),
+            Some(ShapeAccess::Read(inherited))
+        );
+        assert_eq!(
+            profile.observe_shape(1, site(), PropertyAccess::Get, ShapeAccess::Read(inherited)),
+            None
+        );
+        let own = ReadLayout::own(30, 1);
+        profile.observe_shape(1, site(), PropertyAccess::Get, ShapeAccess::Read(own));
+        let access = profile.shapes().next().unwrap().1;
+        assert_eq!(access.read(Some(10)), Some(inherited));
+        assert_eq!(access.read(Some(30)), Some(own));
+        assert_eq!(access.read(None), None);
+        let changed = ReadLayout {
+            storage: Some(RelatedStorage {
+                identity: 128,
+                shape: 21,
+            }),
+            ..inherited
+        };
+        assert_eq!(
+            profile.observe_shape(1, site(), PropertyAccess::Get, ShapeAccess::Read(changed)),
+            Some(ShapeAccess::Varying)
+        );
+    }
+
+    #[test]
     fn own_read_feedback_retains_bounded_shape_alternatives() {
         let mut profile = Profile::default();
         for shape in [30, 10, 20, 40] {
@@ -427,10 +467,7 @@ mod tests {
                         1,
                         site(),
                         PropertyAccess::Get,
-                        ShapeAccess::Read {
-                            shape,
-                            index: shape / 10
-                        }
+                        ShapeAccess::Read(ReadLayout::own(shape, shape / 10))
                     )
                     .is_some()
             );
@@ -442,21 +479,18 @@ mod tests {
                         1,
                         site(),
                         PropertyAccess::Get,
-                        ShapeAccess::Read {
-                            shape,
-                            index: shape / 10
-                        }
+                        ShapeAccess::Read(ReadLayout::own(shape, shape / 10))
                     )
                     .is_none()
             );
             let access = profile.shapes().next().unwrap().1;
-            assert_eq!(access.read(Some(shape)), Some((shape, shape / 10)));
+            assert_eq!(
+                access.read(Some(shape)),
+                Some(ReadLayout::own(shape, shape / 10))
+            );
             assert_eq!(access.read(None), None);
         }
-        let fifth = ShapeAccess::Read {
-            shape: 50,
-            index: 5,
-        };
+        let fifth = ShapeAccess::Read(ReadLayout::own(50, 5));
         assert_eq!(
             profile.observe_shape(1, site(), PropertyAccess::Get, fifth),
             Some(ShapeAccess::Varying)

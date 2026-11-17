@@ -1030,49 +1030,6 @@ impl FunctionCompiler<'_, '_> {
         self.b.as_boxed(word)
     }
 
-    pub(super) fn shape_hit(&mut self, object: LoweredValue, shape: u32) -> LoweredValue {
-        let view = self.view(object);
-        let actual = self
-            .b
-            .ins()
-            .load(types::I32, MemFlagsData::trusted(), view, SHAPE_OFFSET);
-        self.b.ins().icmp_imm_s(IntCC::Equal, actual, shape as i64)
-    }
-
-    pub(super) fn shaped_property_probe(
-        &mut self,
-        object: LoweredValue,
-        shape: u32,
-        index: u32,
-    ) -> LoweredValue {
-        let hit = self.shape_hit(object, shape);
-        let fast = self.b.create_block();
-        let miss = self.b.create_block();
-        let done = self.b.create_block();
-        self.b.append_block_param_repr(done, Repr::Boxed);
-        self.brif(hit, fast, &[], miss, &[]);
-        self.switch(fast);
-        let value = self.shaped_property_get(object, index);
-        self.jump(done, &[BlockArg::Value(value)]);
-        self.switch(miss);
-        let missing = self.constant(Value::UNINITIALIZED);
-        self.jump(done, &[BlockArg::Value(missing)]);
-        self.switch(done);
-        self.b.block_params(done)[0]
-    }
-
-    pub(super) fn shaped_property_get(&mut self, object: LoweredValue, index: u32) -> LoweredValue {
-        let flags = MemFlagsData::trusted();
-        let object = self.b.as_word(object);
-        let view = layout::address(self.b, object);
-        let data = self.b.ins().load(self.pointer, flags, view, DATA_OFFSET);
-        let word = self
-            .b
-            .ins()
-            .load(types::I64, flags, data, (index as i32) * 8);
-        self.b.as_boxed(word)
-    }
-
     pub(super) fn define_hidden_property(
         &mut self,
         object: LoweredValue,

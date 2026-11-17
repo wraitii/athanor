@@ -77,7 +77,9 @@ fn specific(graph: &Graph, inst: Inst) -> Option<Representations> {
                 produces: data.results.first().map(|&value| graph.repr(value)),
             }
         }
-        Op::PropertyLoad(..) => exact(&[Repr::Boxed, Repr::Word], Repr::Boxed),
+        Op::PropertyLoad(..) | Op::RelatedPropertyLoad(..) => {
+            exact(&[Repr::Boxed, Repr::Word], Repr::Boxed)
+        }
         Op::LowLevel(super::low_level::Op::Load { ty, .. }) => {
             any(1, Some(Repr::from_machine(*ty)))
         }
@@ -182,7 +184,9 @@ fn specific(graph: &Graph, inst: Inst) -> Option<Representations> {
         Op::IsInteger(_) => exact(&[Repr::Boxed], Repr::Boolean),
         Op::ToInt32(_) => exact(&[Repr::I32], Repr::I32),
         Op::AsNumber(_) => any(1, target),
-        Op::IsCode(..) | Op::IsShape(..) | Op::IsTyped(..) => exact(&[Repr::Boxed], Repr::Boolean),
+        Op::IsCode(..) | Op::IsShape(..) | Op::IsReadLayout(..) | Op::IsTyped(..) => {
+            exact(&[Repr::Boxed], Repr::Boolean)
+        }
         Op::IsPropertyCached(..) => exact(&[Repr::Boxed, Repr::Word], Repr::Boolean),
         Op::CachedProperty(..) | Op::FillPropertyCache(..) => {
             exact(&[Repr::Boxed, Repr::Word], Repr::Boxed)

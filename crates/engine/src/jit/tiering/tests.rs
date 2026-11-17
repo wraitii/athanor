@@ -473,6 +473,36 @@ fn shape_feedback_respecializes_property_reads() {
 }
 
 #[test]
+fn inherited_read_feedback_replaces_the_entry_and_checks_holder_layouts() {
+    for backend in [crate::Backend::NativeOnly, crate::Backend::Cranelift] {
+        let mut engine = Engine::with_options(EngineOptions {
+            backend,
+            background_compile: false,
+            generic_first: false,
+            ..Default::default()
+        })
+        .unwrap();
+        engine.compile(
+            "function C(){} C.prototype={a:3,b:4};var object=new C();function read(){return object.a*object.b;}function change(){C.prototype.extra=1;C.prototype.a=5;}",
+            "inherited_feedback.js").unwrap();
+        let code = code(&engine, "read");
+        let original = entry(&engine, code);
+        for _ in 0..4 {
+            assert_eq!(
+                engine.call("read", &[]).unwrap().value(),
+                Value::number(12.0)
+            );
+        }
+        assert_ne!(entry(&engine, code), original);
+        engine.call("change", &[]).unwrap();
+        assert_eq!(
+            engine.call("read", &[]).unwrap().value(),
+            Value::number(20.0)
+        );
+    }
+}
+
+#[test]
 fn entry_guards_specialize_nested_reads_and_guard_replacements() {
     let mut engine = new_engine().unwrap();
     engine.compile(

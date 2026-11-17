@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::jit::layout::ReadLayout;
 use crate::{FxHashMap, FxHashSet};
 use std::sync::Arc;
 
@@ -1553,7 +1555,12 @@ mod tests {
                                     PropertyAccess::Get,
                                 ),
                                 ShapeAccess::PolymorphicRead {
-                                    entries: [(10, 0), (20, 1), (0, 0), (0, 0)],
+                                    entries: [
+                                        ReadLayout::own(10, 0),
+                                        ReadLayout::own(20, 1),
+                                        ReadLayout::default(),
+                                        ReadLayout::default(),
+                                    ],
                                     len: 2,
                                 },
                             );
@@ -1584,7 +1591,12 @@ mod tests {
                             PropertyAccess::Get,
                         ),
                         ShapeAccess::PolymorphicRead {
-                            entries: [(10, 0), (20, 1), (0, 0), (0, 0)],
+                            entries: [
+                                ReadLayout::own(10, 0),
+                                ReadLayout::own(20, 1),
+                                ReadLayout::default(),
+                                ReadLayout::default(),
+                            ],
                             len: 2,
                         },
                     );
@@ -1692,7 +1704,7 @@ mod tests {
                     },
                     PropertyAccess::Get,
                 ),
-                ShapeAccess::Read { shape, index: 0 },
+                ShapeAccess::Read(ReadLayout::own(shape, 0)),
             );
         }
         let planned =
@@ -1713,8 +1725,7 @@ mod tests {
                     ..original
                 },
                 PropertyAccess::Get,
-                shape,
-                0
+                ReadLayout::own(shape, 0)
             )));
         }
         assert_eq!(

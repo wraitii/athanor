@@ -48,7 +48,7 @@ impl Motion for JsMotion {
                 let Some(access) = graph.property_accesses.get(&inst) else {
                     return false;
                 };
-                let &[(shape, _)] = access.shapes.as_slice() else {
+                let &[layout] = access.shapes.as_slice() else {
                     return false;
                 };
                 guards::holds(
@@ -56,7 +56,7 @@ impl Motion for JsMotion {
                     &facts.cfg,
                     graph.insts[inst].block,
                     object,
-                    guards::Fact::Shape(shape),
+                    guards::Fact::Shape(layout.shape),
                 )
             })
             .copied()

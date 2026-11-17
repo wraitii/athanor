@@ -9,6 +9,7 @@ use super::transforms::{conversions, cse, loops, reuse};
 use super::variables::Variables;
 use super::*;
 use crate::FxHashSet;
+use crate::jit::layout::ReadLayout;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::Statement;
 use oxc_parser::Parser;
@@ -1728,10 +1729,7 @@ fn trusted_input_shapes_remove_redundant_callee_checks() {
                         },
                         crate::jit::profile::PropertyAccess::Get,
                     ),
-                    crate::jit::profile::ShapeAccess::Read {
-                        shape: 10,
-                        index: 0,
-                    },
+                    crate::jit::profile::ShapeAccess::Read(ReadLayout::own(10, 0)),
                 );
             }
         }
@@ -1795,7 +1793,12 @@ fn caller_shapes_select_useful_polymorphic_callee_contracts() {
                             PropertyAccess::Get,
                         ),
                         ShapeAccess::PolymorphicRead {
-                            entries: [(10, 0), (20, 1), (0, 0), (0, 0)],
+                            entries: [
+                                ReadLayout::own(10, 0),
+                                ReadLayout::own(20, 1),
+                                ReadLayout::default(),
+                                ReadLayout::default(),
+                            ],
                             len: 2,
                         },
                     );
@@ -1911,10 +1914,7 @@ fn call_variant_contracts_do_not_lift_shape_guards_after_reentry() {
                             },
                             PropertyAccess::Get,
                         ),
-                        ShapeAccess::Read {
-                            shape: 10,
-                            index: 0,
-                        },
+                        ShapeAccess::Read(ReadLayout::own(10, 0)),
                     );
                 }
             }
@@ -3907,7 +3907,12 @@ fn polymorphic_property_dispatch_is_planned_before_read_rewriting() {
     repository.shape_feedback.insert(
         (site, PropertyAccess::Get),
         ShapeAccess::PolymorphicRead {
-            entries: [(10, 0), (20, 1), (0, 0), (0, 0)],
+            entries: [
+                ReadLayout::own(10, 0),
+                ReadLayout::own(20, 1),
+                ReadLayout::default(),
+                ReadLayout::default(),
+            ],
             len: 2,
         },
     );
@@ -4058,7 +4063,7 @@ fn conflicting_property_shapes_remain_alternative_local_guards() {
             let shape = if name == "x" { 10 } else { 20 };
             repository.shape_feedback.insert(
                 (site, PropertyAccess::Get),
-                ShapeAccess::Read { shape, index: 0 },
+                ShapeAccess::Read(ReadLayout::own(shape, 0)),
             );
         }
     }
@@ -4107,7 +4112,10 @@ fn successful_shape_probes_eliminate_only_valid_shape_checks() {
         let Op::Get(object, _) = graph.insts[inst].op else {
             unreachable!()
         };
-        graph.set_op(inst, Op::ProbeShapeProperty(object, "x".into(), 34, 0));
+        graph.set_op(
+            inst,
+            Op::ProbeShapeProperty(object, "x".into(), ReadLayout::own(34, 0)),
+        );
         let probe = graph.insts[inst].result().unwrap();
         let block = graph.insts[inst].block;
         let span = graph.span;
@@ -4300,6 +4308,35 @@ fn optimize_with_shapes(
 }
 
 #[test]
+fn related_storage_reads_use_explicit_layout_guards_and_probes() {
+    use crate::jit::layout::{ReadLayout, RelatedStorage};
+    use crate::jit::profile::{PropertyAccess, ShapeAccess};
+    let layout = ReadLayout {
+        shape: 10,
+        index: 1,
+        storage: Some(RelatedStorage {
+            identity: 128,
+            shape: 20,
+        }),
+    };
+    for source in [
+        "function f(o){return o.x;}",
+        "function f(o){return o.x+o.x;}",
+    ] {
+        let function = optimize_with_shapes(
+            source,
+            &[("x", PropertyAccess::Get, ShapeAccess::Read(layout))],
+        );
+        assert!(
+            ops(&function.graph).iter().any(|op| matches!(op,
+            Op::LayoutGet(_, _, known) | Op::ProbeShapeProperty(_, _, known) if *known == layout)),
+            "{function}"
+        );
+        function.graph.verify().unwrap();
+    }
+}
+
+#[test]
 fn nested_read_probes_use_shape_feedback() {
     use crate::jit::profile::{PropertyAccess, ShapeAccess};
 
@@ -4309,34 +4346,25 @@ fn nested_read_probes_use_shape_feedback() {
             (
                 "section",
                 PropertyAccess::Get,
-                ShapeAccess::Read {
-                    shape: 10,
-                    index: 0,
-                },
+                ShapeAccess::Read(ReadLayout::own(10, 0)),
             ),
             (
                 "value",
                 PropertyAccess::Get,
-                ShapeAccess::Read {
-                    shape: 20,
-                    index: 0,
-                },
+                ShapeAccess::Read(ReadLayout::own(20, 0)),
             ),
             (
                 "scale",
                 PropertyAccess::Get,
-                ShapeAccess::Read {
-                    shape: 20,
-                    index: 1,
-                },
+                ShapeAccess::Read(ReadLayout::own(20, 1)),
             ),
         ],
     );
     for (name, shape, index) in [("section", 10, 0), ("value", 20, 0), ("scale", 20, 1)] {
         assert!(
             ops(&function.graph).iter().any(|op| matches!(op,
-            Op::ProbeShapeProperty(_, property, expected, slot)
-                if property == name && *expected == shape && *slot == index)),
+            Op::ProbeShapeProperty(_, property, layout)
+                if property == name && layout.shape == shape && layout.index == index)),
             "{function}"
         );
         assert!(
@@ -4386,22 +4414,8 @@ fn shaped_overwrites_share_hoisted_guards_with_reads() {
     let function = optimize_with_shapes(
         "function f(o,n){for(let i=0;i<n;++i)o.x=o.x+o.y;return o.x;}",
         &[
-            (
-                "x",
-                Get,
-                Read {
-                    shape: 10,
-                    index: 0,
-                },
-            ),
-            (
-                "y",
-                Get,
-                Read {
-                    shape: 10,
-                    index: 1,
-                },
-            ),
+            ("x", Get, Read(ReadLayout::own(10, 0))),
+            ("y", Get, Read(ReadLayout::own(10, 1))),
             (
                 "x",
                 Set,
@@ -4448,22 +4462,8 @@ fn shaped_overwrites_keep_one_entry_guard_across_reads() {
     let function = optimize_with_shapes(
         "function f(o){o.x=1;o.y=o.x+1;return o.y;}",
         &[
-            (
-                "x",
-                Get,
-                Read {
-                    shape: 10,
-                    index: 0,
-                },
-            ),
-            (
-                "y",
-                Get,
-                Read {
-                    shape: 10,
-                    index: 1,
-                },
-            ),
+            ("x", Get, Read(ReadLayout::own(10, 0))),
+            ("y", Get, Read(ReadLayout::own(10, 1))),
             (
                 "x",
                 Set,
@@ -4540,14 +4540,7 @@ fn property_additions_keep_shape_guards_inside_loops() {
     let function = optimize_with_shapes(
         "function f(o,n){for(let i=0;i<n;++i){o.x=o.x+1;o.z=i;}return o.x;}",
         &[
-            (
-                "x",
-                Get,
-                Read {
-                    shape: 10,
-                    index: 0,
-                },
-            ),
+            ("x", Get, Read(ReadLayout::own(10, 0))),
             (
                 "x",
                 Set,
@@ -4588,22 +4581,8 @@ fn shaped_accesses_on_two_receivers_hoist_both_guards() {
     let function = optimize_with_shapes(
         "function f(a,b,n){for(let i=0;i<n;++i){a.p=b.r;b.s=a.q+a.p;}return b.s;}",
         &[
-            (
-                "p",
-                Get,
-                Read {
-                    shape: 10,
-                    index: 0,
-                },
-            ),
-            (
-                "q",
-                Get,
-                Read {
-                    shape: 10,
-                    index: 1,
-                },
-            ),
+            ("p", Get, Read(ReadLayout::own(10, 0))),
+            ("q", Get, Read(ReadLayout::own(10, 1))),
             (
                 "p",
                 Set,
@@ -4612,22 +4591,8 @@ fn shaped_accesses_on_two_receivers_hoist_both_guards() {
                     index: 0,
                 },
             ),
-            (
-                "r",
-                Get,
-                Read {
-                    shape: 20,
-                    index: 0,
-                },
-            ),
-            (
-                "s",
-                Get,
-                Read {
-                    shape: 20,
-                    index: 1,
-                },
-            ),
+            ("r", Get, Read(ReadLayout::own(20, 0))),
+            ("s", Get, Read(ReadLayout::own(20, 1))),
             (
                 "s",
                 Set,

@@ -40,7 +40,9 @@ impl Field {
 
     fn of(graph: &Graph, op: &Op, facts: &Facts) -> Self {
         match op {
-            Op::PropertyLoad(_, _, field) | Op::PropertyStore(_, _, _, field, _) => field.clone(),
+            Op::PropertyLoad(_, _, field)
+            | Op::RelatedPropertyLoad(_, _, field)
+            | Op::PropertyStore(_, _, _, field, _) => field.clone(),
             Op::CachedProperty(_, cache, _) | Op::PropertyAdd(_, cache, ..) => {
                 Self::cached(graph, *cache)
             }
@@ -60,6 +62,7 @@ impl Field {
             | Op::Set(_, name, _)
             | Op::Define(_, name, _)
             | Op::ShapedGet(_, name, _)
+            | Op::LayoutGet(_, name, _)
             | Op::ProbeProperty(_, name)
             | Op::ShapedSet(_, name, _, _)
             | Op::GlobalRead(name)
@@ -96,15 +99,40 @@ impl Field {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(in crate::jit::semantic) enum Base {
+    Known(Value),
+    // External state cannot alias an allocation that has not escaped.
+    External,
+    // Indirect storage can alias even an otherwise fresh allocation.
+    Unknown,
+}
+
+impl Base {
+    pub(in crate::jit::semantic) fn map(self, f: impl FnOnce(Value) -> Value) -> Self {
+        match self {
+            Self::Known(value) => Self::Known(f(value)),
+            _ => self,
+        }
+    }
+
+    pub(in crate::jit::semantic) fn value(self) -> Option<Value> {
+        match self {
+            Self::Known(value) => Some(value),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(in crate::jit::semantic) struct Access {
-    pub(in crate::jit::semantic) base: Option<Value>,
+    pub(in crate::jit::semantic) base: Base,
     pub(in crate::jit::semantic) field: Field,
 }
 
 impl Access {
     pub(in crate::jit::semantic) const UNKNOWN: Self = Self {
-        base: None,
+        base: Base::Unknown,
         field: Field::Any,
     };
 
@@ -118,6 +146,11 @@ impl Access {
         facts: &Facts,
     ) -> Option<(Locations, Self)> {
         let (location, base) = match op {
+            Op::LayoutGet(..) | Op::RelatedPropertyLoad(..) => (Locations::HEAP, Base::Unknown),
+            Op::IsReadLayout(..) => (Locations::CODE, Base::Unknown),
+            Op::ProbeShapeProperty(_, _, layout) if layout.storage.is_some() => {
+                (Locations::HEAP.union(Locations::CODE), Base::Unknown)
+            }
             Op::PropertyLoad(object, ..)
             | Op::CachedProperty(object, ..)
             | Op::Get(object, _)
@@ -130,20 +163,20 @@ impl Access {
             | Op::IndexedLength(object)
             | Op::ArrayKind(object)
             | Op::IsArray(object, _)
-            | Op::ConstructorPrototype(object) => (Locations::HEAP, Some(*object)),
+            | Op::ConstructorPrototype(object) => (Locations::HEAP, Base::Known(*object)),
             Op::ProbeShapeProperty(object, ..) => {
-                (Locations::HEAP.union(Locations::CODE), Some(*object))
+                (Locations::HEAP.union(Locations::CODE), Base::Known(*object))
             }
             Op::EntryAssume(object, super::super::guards::Fact::Shape(_))
             | Op::IsShape(object, _)
-            | Op::IsPropertyCached(object, ..) => (Locations::CODE, Some(*object)),
-            Op::CellGet(cell) => (Locations::HEAP, Some(*cell)),
-            Op::GlobalRead(_) | Op::ProbeGlobal(_) => (Locations::GLOBAL, None),
+            | Op::IsPropertyCached(object, ..) => (Locations::CODE, Base::Known(*object)),
+            Op::CellGet(cell) => (Locations::HEAP, Base::Known(*cell)),
+            Op::GlobalRead(_) | Op::ProbeGlobal(_) => (Locations::GLOBAL, Base::External),
             Op::HelperCall {
                 helper: Helper::PropertyGetCached | Helper::SemanticPropertyProbeCached,
                 args,
                 ..
-            } => (Locations::HEAP, Some(args[0])),
+            } => (Locations::HEAP, Base::Known(args[0])),
             _ => return None,
         };
         Some((
@@ -168,7 +201,10 @@ impl Access {
             } => Some(args[0]),
             _ => write_target(op),
         };
-        (base.is_some() || field != Field::Any).then_some(Self { base, field })
+        (base.is_some() || field != Field::Any).then_some(Self {
+            base: base.map_or(Base::External, Base::Known),
+            field,
+        })
     }
 }
 

@@ -1,4 +1,5 @@
 use super::hoisting::AssumeCfg;
+use crate::jit::layout::ReadLayout;
 use crate::jit::profile::{Observation, ReadKind};
 use crate::{FxHashMap, FxHashSet};
 
@@ -36,7 +37,7 @@ fn retarget(graph: &mut Graph, blocks: &FxHashSet<Block>, from: Value, to: Value
 pub(in crate::jit::semantic) struct Speculation<'a> {
     pub(in crate::jit::semantic) locals: &'a [Inst],
     pub(in crate::jit::semantic) reads: &'a [Inst],
-    pub(in crate::jit::semantic) shaped_reads: &'a [(Inst, u32, u32)],
+    pub(in crate::jit::semantic) shaped_reads: &'a [(Inst, ReadLayout)],
     pub(in crate::jit::semantic) guards: &'a [Block],
     pub(in crate::jit::semantic) exits: &'a [Block],
     pub(in crate::jit::semantic) exits_true: &'a [Block],
@@ -227,9 +228,9 @@ fn entry_checks(
                 match speculation
                     .shaped_reads
                     .iter()
-                    .find(|&&(read, _, _)| read == inst)
+                    .find(|&&(read, _)| read == inst)
                 {
-                    Some(&(_, shape, index)) => Op::ProbeShapeProperty(object, name, shape, index),
+                    Some(&(_, layout)) => Op::ProbeShapeProperty(object, name, layout),
                     None => Op::ProbeProperty(object, name),
                 }
             }
@@ -386,6 +387,7 @@ fn entry_checks(
         let test = match fact {
             Fact::Array => Op::IsOrdinaryArray(checked),
             Fact::Shape(shape) => Op::IsShape(checked, shape),
+            Fact::ReadLayout(layout) => Op::IsReadLayout(checked, layout),
             Fact::Cached(cache, builtins) => Op::IsPropertyCached(
                 checked,
                 values.get(&cache).copied().unwrap_or(cache),

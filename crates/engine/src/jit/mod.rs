@@ -16,6 +16,7 @@ mod generator;
 pub(crate) mod helpers;
 mod inspect;
 mod jitdump;
+pub(crate) mod layout;
 mod machine;
 mod math;
 pub(crate) mod osr;

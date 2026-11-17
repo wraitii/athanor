@@ -22,8 +22,10 @@ pub(in crate::jit) fn receiver(op: &Op) -> Option<Value> {
         } => args.first().copied(),
         Op::Get(object, _)
         | Op::PropertyLoad(object, ..)
+        | Op::RelatedPropertyLoad(object, ..)
         | Op::CachedProperty(object, _, _)
         | Op::ShapedGet(object, ..)
+        | Op::LayoutGet(object, ..)
         | Op::ProbeProperty(object, _)
         | Op::ProbeShapeProperty(object, ..)
         | Op::GetIndex(object, _)
@@ -46,6 +48,8 @@ fn anchored_read(op: &Op, facts: &Facts) -> Option<BorrowedRead> {
             | Op::ProbeProperty(..)
             | Op::ProbeShapeProperty(..)
             | Op::PropertyLoad(..)
+            | Op::RelatedPropertyLoad(..)
+            | Op::LayoutGet(..)
             | Op::CachedProperty(..)
             | Op::ShapedGet(..)
             | Op::HelperCall {

@@ -303,6 +303,16 @@ conditions hold. The slow helpers implement generic behavior when those
 conditions are not established. `heap/shape.rs`, `heap/properties.rs`,
 `semantic/runtime/` and `jit/helpers/` are the important boundaries.
 
+Observed slot reads use `jit/layout.rs` descriptors that distinguish receiver
+storage from related storage. The language-specific lookup supplies the layout
+and storage relationship; the shared guard, dispatch and recovery machinery
+checks it before loading a slot. A related-storage identity is valid only after
+the receiver layout matches, and that layout must guarantee the storage's
+lifetime. Layout guards exclude slot indices so different slots can share the
+same validation. JS currently supplies own and immediate-prototype reads;
+longer chains retain generic lookup. Related reads use conservative alias bases
+so writes through another reference invalidate their loads and layout facts.
+
 Generated code cannot rely on Rust's lexical ownership. Operations have
 contracts describing borrowed or owned results and operand requirements. The
 ownership planner combines those contracts with liveness and proven borrows:

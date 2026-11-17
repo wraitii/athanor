@@ -1,4 +1,5 @@
 use crate::FxHashMap;
+use crate::jit::layout::ReadLayout;
 use crate::jit::profile::{PropertyAccess, ShapeAccess, Site};
 
 use super::super::{Cfg, Graph, Inst, Op};
@@ -6,13 +7,13 @@ use super::super::{Cfg, Graph, Inst, Op};
 #[derive(Clone, Default, PartialEq, Eq)]
 pub(in crate::jit) struct Plan {
     source: usize,
-    accesses: Vec<(Site, PropertyAccess, u32, u32)>,
-    polymorphic: Vec<(Site, Vec<(u32, u32)>)>,
+    accesses: Vec<(Site, PropertyAccess, ReadLayout)>,
+    polymorphic: Vec<(Site, Vec<ReadLayout>)>,
     megamorphic: Vec<Site>,
 }
 
 impl Plan {
-    pub(in crate::jit) fn polymorphic_reads(&self) -> &[(Site, Vec<(u32, u32)>)] {
+    pub(in crate::jit) fn polymorphic_reads(&self) -> &[(Site, Vec<ReadLayout>)] {
         &self.polymorphic
     }
 
@@ -20,7 +21,7 @@ impl Plan {
         &self,
         graph: &Graph,
         inst: Inst,
-    ) -> Option<&[(u32, u32)]> {
+    ) -> Option<&[ReadLayout]> {
         let site = site(graph, inst, self.source);
         self.polymorphic
             .iter()
@@ -35,25 +36,23 @@ impl Plan {
         self.megamorphic.contains(&site(graph, inst, self.source))
     }
 
-    pub(in crate::jit::semantic) fn accesses(&self) -> &[(Site, PropertyAccess, u32, u32)] {
+    pub(in crate::jit::semantic) fn accesses(&self) -> &[(Site, PropertyAccess, ReadLayout)] {
         &self.accesses
     }
 
-    pub(in crate::jit::semantic) fn read(&self, graph: &Graph, inst: Inst) -> Option<(u32, u32)> {
+    pub(in crate::jit::semantic) fn read(&self, graph: &Graph, inst: Inst) -> Option<ReadLayout> {
         self.access(graph, inst, PropertyAccess::Get)
     }
 
-    pub(in crate::jit::semantic) fn write(&self, graph: &Graph, inst: Inst) -> Option<(u32, u32)> {
+    pub(in crate::jit::semantic) fn write(&self, graph: &Graph, inst: Inst) -> Option<ReadLayout> {
         self.access(graph, inst, PropertyAccess::Set)
     }
 
-    fn access(&self, graph: &Graph, inst: Inst, kind: PropertyAccess) -> Option<(u32, u32)> {
+    fn access(&self, graph: &Graph, inst: Inst, kind: PropertyAccess) -> Option<ReadLayout> {
         let site = site(graph, inst, self.source);
-        self.accesses
-            .iter()
-            .find_map(|&(origin, access, shape, index)| {
-                (origin == site && access == kind).then_some((shape, index))
-            })
+        self.accesses.iter().find_map(|&(origin, access, layout)| {
+            (origin == site && access == kind).then_some(layout)
+        })
     }
 }
 
@@ -117,19 +116,19 @@ pub(in crate::jit::semantic) fn plan(
                 continue;
             };
             let site = site(graph, inst, source);
+            let observed = bodies.shape_feedback(site, property);
             let callee = data.result().is_some_and(|value| callees.contains(&value));
             let object = match data.op {
                 Op::Get(object, _) | Op::ProbeProperty(object, _) | Op::Set(object, ..) => object,
                 _ => continue,
             };
-            if let Some(ShapeAccess::PolymorphicRead { entries, len }) =
-                bodies.shape_feedback(site, property)
+            if let Some(ShapeAccess::PolymorphicRead { entries, len }) = observed
                 && matches!(data.op, Op::Get(..))
                 && (callee
                     || !assumed.get(&object).is_some_and(|shape| {
                         entries[..usize::from(len)]
                             .iter()
-                            .any(|entry| entry.0 == *shape)
+                            .any(|entry| entry.shape == *shape)
                     }))
             {
                 if !polymorphic.iter().any(|(origin, _)| *origin == site) {
@@ -137,18 +136,22 @@ pub(in crate::jit::semantic) fn plan(
                 }
                 continue;
             }
-            if callee {
+            if callee
+                && !observed
+                    .and_then(|access| access.read(None))
+                    .is_some_and(|layout| layout.storage.is_some())
+            {
                 continue;
             }
-            let access = match (property, bodies.shape_feedback(site, property)) {
+            let access = match (property, observed) {
                 (PropertyAccess::Get, Some(access)) => {
-                    let Some((shape, index)) = access.read(assumed.get(&object).copied()) else {
+                    let Some(layout) = access.read(assumed.get(&object).copied()) else {
                         continue;
                     };
-                    (site, property, shape, index)
+                    (site, property, layout)
                 }
                 (PropertyAccess::Set, Some(ShapeAccess::Overwrite { shape, index })) => {
-                    (site, property, shape, index)
+                    (site, property, ReadLayout::own(shape, index))
                 }
                 _ => continue,
             };

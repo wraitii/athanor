@@ -329,8 +329,11 @@ impl Fresh {
         write: &Access,
         read: &Access,
     ) -> bool {
-        match write.base.and_then(|target| self.at(target, inst)) {
-            Some(class) => Some(class) == read.base.and_then(|base| self.class(base)),
+        if read.base == super::Base::Unknown {
+            return true;
+        }
+        match write.base.value().and_then(|target| self.at(target, inst)) {
+            Some(class) => Some(class) == read.base.value().and_then(|base| self.class(base)),
             None => true,
         }
     }

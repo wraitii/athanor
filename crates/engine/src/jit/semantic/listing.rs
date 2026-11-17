@@ -111,10 +111,10 @@ impl Graph {
                 ),
             );
         }
-        for &(location, access, shape, index) in plan.shapes.accesses() {
+        for &(location, access, layout) in plan.shapes.accesses() {
             entries.insert(
                 format!("shape {access:?} {}", site_name(location)),
-                format!("shape={shape} slot={index}"),
+                format!("{layout:?}"),
             );
         }
         for (location, alternatives) in plan.shapes.polymorphic_reads() {
@@ -340,6 +340,8 @@ impl Graph {
             }
             Op::CachedProperty(object, cache, _) => format!("cached_property {object} {cache}"),
             Op::IsShape(object, shape) => format!("is_shape {object}, {shape}"),
+            Op::IsReadLayout(object, layout) => format!("is_read_layout {object} {layout:?}"),
+            Op::LayoutGet(object, name, layout) => format!("layout_get {object}.{name} {layout:?}"),
             Op::ShapedGet(object, name, index) => {
                 format!("shaped_get {object}.{name} @{index}")
             }
@@ -369,6 +371,9 @@ impl Graph {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
+            Op::RelatedPropertyLoad(object, address, field) => {
+                format!("related_property_load {object} {address} {field:?}")
+            }
             Op::PropertyLoad(object, address, field) => {
                 format!("property_load {object} {address} field={field:?}")
             }
@@ -423,8 +428,8 @@ impl Graph {
             Op::IsNullish(value) => format!("is_nullish {value}"),
             Op::ProbeGlobal(name) => format!("probe_global {name}"),
             Op::ProbeProperty(object, name) => format!("probe {object}.{name}"),
-            Op::ProbeShapeProperty(object, name, shape, index) => {
-                format!("probe_shape_property {object}.{name} shape={shape} @{index}")
+            Op::ProbeShapeProperty(object, name, layout) => {
+                format!("probe_shape_property {object}.{name} {layout:?}")
             }
             Op::ProbeIndex(object, key) => format!("probe {object}[{key}]"),
             Op::IsNative(value, native) => format!("is_native {value}, {native}"),

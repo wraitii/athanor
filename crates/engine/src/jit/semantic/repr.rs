@@ -256,6 +256,7 @@ pub(in crate::jit) fn intrinsic(op: &Op) -> Option<Repr> {
         | Op::IsInteger(_)
         | Op::IsCode(..)
         | Op::IsShape(..)
+        | Op::IsReadLayout(..)
         | Op::IsTyped(..)
         | Op::IsPropertyCached(..)
         | Op::IsIndexed(_)

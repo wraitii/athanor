@@ -1,4 +1,5 @@
 use crate::FxHashMap;
+use crate::jit::layout::ReadLayout;
 use cranelift_module::FuncId;
 
 use super::facts::ValueType;
@@ -12,6 +13,7 @@ pub(in crate::jit) enum Fact {
     Type(ValueType),
     Code(FuncId),
     Shape(u32),
+    ReadLayout(crate::jit::layout::LayoutGuard),
     Typed(Option<TypedKind>),
     Array,
     // Planning resolves this IC proposal into a shape or cache-hit requirement.
@@ -60,6 +62,7 @@ impl Fact {
             Self::Code(code) => Op::IsCode(value, code),
             Self::Cached(cache, builtins) => Op::IsPropertyCached(value, cache, builtins),
             Self::Shape(shape) => Op::IsShape(value, shape),
+            Self::ReadLayout(layout) => Op::IsReadLayout(value, layout),
             Self::Typed(element) => Op::IsTyped(value, element),
             Self::Array => Op::IsOrdinaryArray(value),
             Self::Native(native) => Op::IsNative(value, native),
@@ -78,6 +81,7 @@ impl Fact {
         match (self, other) {
             (Self::Type(known), Self::Type(wanted)) => known.within(wanted),
             (Self::Typed(Some(_)), Self::Typed(None)) => true,
+            (Self::ReadLayout(layout), Self::Shape(shape)) => layout.shape == shape,
             _ => self == other,
         }
     }
@@ -112,6 +116,7 @@ pub(super) fn implies(op: &Op) -> Option<(Value, Fact)> {
         Op::IsCode(value, code) => (value, Fact::Code(code)),
         Op::EntryAssume(value, fact) => (value, fact),
         Op::IsShape(value, shape) => (value, Fact::Shape(shape)),
+        Op::IsReadLayout(value, layout) => (value, Fact::ReadLayout(layout)),
         Op::IsTyped(value, element) => (value, Fact::Typed(element)),
         Op::IsOrdinaryArray(value) => (value, Fact::Array),
         Op::IsPropertyCached(value, cache, builtins) => (value, Fact::Cached(cache, builtins)),
@@ -205,4 +210,16 @@ pub(super) fn holds(
                     && cfg.dominates(edge.yes, block)
             })
     })
+}
+
+impl ReadLayout {
+    pub(in crate::jit) fn requirement(self) -> Fact {
+        match self.storage {
+            None => Fact::Shape(self.shape),
+            Some(_) => Fact::ReadLayout(crate::jit::layout::LayoutGuard {
+                shape: self.shape,
+                storage: self.storage,
+            }),
+        }
+    }
 }

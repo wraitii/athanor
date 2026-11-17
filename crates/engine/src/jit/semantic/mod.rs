@@ -1,3 +1,4 @@
+use crate::jit::layout::ReadLayout;
 mod available;
 pub(in crate::jit) mod bits;
 mod borrow;
@@ -472,6 +473,7 @@ pub(super) enum Op {
     PropertyCache(Inst, String),
     GlobalCache(String),
     PropertyLoad(Value, Value, js::memory::Field),
+    RelatedPropertyLoad(Value, Value, js::memory::Field),
     HelperCall {
         helper: super::helpers::Helper,
         args: Vec<Value>,
@@ -483,6 +485,8 @@ pub(super) enum Op {
     IsPropertyCached(Value, Value, bool),
     CachedProperty(Value, Value, bool),
     IsShape(Value, u32),
+    IsReadLayout(Value, crate::jit::layout::LayoutGuard),
+    LayoutGet(Value, String, ReadLayout),
     ShapedGet(Value, String, u32),
     ShapedSet(Value, String, u32, Value),
     FillPropertyCache(Value, Value, String),
@@ -523,7 +527,7 @@ pub(super) enum Op {
     IsNullish(Value),
     ProbeGlobal(String),
     ProbeProperty(Value, String),
-    ProbeShapeProperty(Value, String, u32, u32),
+    ProbeShapeProperty(Value, String, ReadLayout),
     ProbeIndex(Value, Value),
     IsNative(Value, Native),
     IsCode(Value, cranelift_module::FuncId),
@@ -814,6 +818,8 @@ impl Op {
             | Op::IsUninitialized(value)
             | Op::Get(value, _)
             | Op::IsShape(value, _)
+            | Op::IsReadLayout(value, _)
+            | Op::LayoutGet(value, _, _)
             | Op::ShapedGet(value, _, _)
             | Op::MarkClass(value)
             | Op::DisableConstructor(value)
@@ -825,7 +831,7 @@ impl Op {
             | Op::IsUndefined(value)
             | Op::IsNullish(value)
             | Op::ProbeProperty(value, _)
-            | Op::ProbeShapeProperty(value, _, _, _)
+            | Op::ProbeShapeProperty(value, _, _)
             | Op::IsNative(value, _)
             | Op::NewInstance(value)
             | Op::ConstructorPrototype(value)
@@ -859,6 +865,7 @@ impl Op {
             | Op::SlotClear(value)
             | Op::ParamStore(_, value) => ([Some(*value), None, None], &[]),
             Op::PropertyLoad(object, cache, _)
+            | Op::RelatedPropertyLoad(object, cache, _)
             | Op::IsPropertyCached(object, cache, _)
             | Op::CachedProperty(object, cache, _)
             | Op::FillPropertyCache(object, cache, _)
@@ -1061,6 +1068,8 @@ impl Op {
             | Op::IsUninitialized(value)
             | Op::Get(value, _)
             | Op::IsShape(value, _)
+            | Op::IsReadLayout(value, _)
+            | Op::LayoutGet(value, _, _)
             | Op::ShapedGet(value, _, _)
             | Op::MarkClass(value)
             | Op::DisableConstructor(value)
@@ -1072,7 +1081,7 @@ impl Op {
             | Op::IsUndefined(value)
             | Op::IsNullish(value)
             | Op::ProbeProperty(value, _)
-            | Op::ProbeShapeProperty(value, _, _, _)
+            | Op::ProbeShapeProperty(value, _, _)
             | Op::IsNative(value, _)
             | Op::NewInstance(value)
             | Op::ConstructorPrototype(value)
@@ -1106,6 +1115,7 @@ impl Op {
             | Op::SlotClear(value)
             | Op::ParamStore(_, value) => ([Some(value), None, None], &mut []),
             Op::PropertyLoad(object, cache, _)
+            | Op::RelatedPropertyLoad(object, cache, _)
             | Op::IsPropertyCached(object, cache, _)
             | Op::CachedProperty(object, cache, _)
             | Op::FillPropertyCache(object, cache, _)
@@ -2063,10 +2073,12 @@ impl Graph {
                     None
                 },
             },
-            Op::PropertyLoad(..) => closed(HEAP_READ, Borrowed),
+            Op::PropertyLoad(..) | Op::RelatedPropertyLoad(..) => closed(HEAP_READ, Borrowed),
             Op::PropertyCache(..) | Op::GlobalCache(..) => closed(0, Unowned),
-            Op::IsPropertyCached(..) | Op::IsShape(..) => closed(CODE_READ, Unowned),
-            Op::ShapedGet(..) => closed(HEAP_READ | INTERNAL | ERROR, Borrowed),
+            Op::IsPropertyCached(..) | Op::IsShape(..) | Op::IsReadLayout(..) => {
+                closed(CODE_READ, Unowned)
+            }
+            Op::ShapedGet(..) | Op::LayoutGet(..) => closed(HEAP_READ | INTERNAL | ERROR, Borrowed),
             Op::ShapedSet(..) => {
                 closed(HEAP_READ | HEAP_WRITE | ALLOCATION | INTERNAL | ERROR, None)
             }

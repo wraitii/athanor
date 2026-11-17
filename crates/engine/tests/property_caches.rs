@@ -517,3 +517,134 @@ fn polymorphic_prototype_gets_preserve_retained_values_after_overflow() {
         417.0,
     );
 }
+
+fn hot_engine(source: &str, backend: js_engine::Backend) -> Engine {
+    let mut engine = Engine::with_options(EngineOptions {
+        backend,
+        generic_first: false,
+        background_compile: false,
+        ..Default::default()
+    })
+    .unwrap();
+    engine.compile(source, "inherited_feedback.js").unwrap();
+    for _ in 0..8 {
+        engine.call("read", &[]).unwrap();
+    }
+    engine
+}
+
+#[test]
+fn specialized_inherited_reads_follow_mutations_and_shadowing() {
+    for backend in [
+        js_engine::Backend::NativeOnly,
+        js_engine::Backend::Cranelift,
+    ] {
+        let engine = hot_engine(
+            "function C(){} C.prototype={x:3}; const object=new C();
+            function read(){return object.x+object.x;}
+            function overwrite(){C.prototype.x=5;}
+            function reshape(){C.prototype.extra=1;}
+            function dictionary(){for(let i=0;i<70;++i)C.prototype['p'+i]=i;}
+            function shadow(){object.x=7;}
+            function clear(){object.x=undefined;}",
+            backend,
+        );
+        for (change, expected) in [
+            ("overwrite", 10.0),
+            ("reshape", 10.0),
+            ("dictionary", 10.0),
+            ("shadow", 14.0),
+        ] {
+            engine.call(change, &[]).unwrap();
+            assert_eq!(
+                engine.call("read", &[]).unwrap().value(),
+                Value::number(expected),
+                "{backend:?} {change}"
+            );
+        }
+        engine.call("clear", &[]).unwrap();
+        assert!(
+            engine
+                .call("read", &[])
+                .unwrap()
+                .value()
+                .as_number()
+                .unwrap()
+                .is_nan()
+        );
+    }
+}
+
+#[test]
+fn specialized_inherited_reads_preserve_aliasing_and_owned_results() {
+    for backend in [
+        js_engine::Backend::NativeOnly,
+        js_engine::Backend::Cranelift,
+    ] {
+        let mut engine = hot_engine(
+            "function C(){} C.prototype={x:{value:3}}; const object=new C();
+            function read(){return object.x;}
+            function replace(){C.prototype.x={value:7};}
+            function acrossCall(change){const before=object.x;if(change)replace();return before.value+object.x.value;}
+            function aliasWrite(change){const alias=C.prototype;const before=object.x;if(change)alias.x={value:11};return before.value+object.x.value;}
+            function forget(){C.prototype.x=undefined;}", backend);
+        let retained = engine.call("read", &[]).unwrap();
+        for _ in 0..8 {
+            engine.call("acrossCall", &[Value::FALSE]).unwrap();
+        }
+        assert_eq!(
+            engine.call("acrossCall", &[Value::TRUE]).unwrap().value(),
+            Value::number(10.0)
+        );
+        for _ in 0..8 {
+            engine.call("aliasWrite", &[Value::FALSE]).unwrap();
+        }
+        assert_eq!(
+            engine.call("aliasWrite", &[Value::TRUE]).unwrap().value(),
+            Value::number(18.0)
+        );
+        engine.call("forget", &[]).unwrap();
+        assert_eq!(engine.call("read", &[]).unwrap().value(), Value::UNDEFINED);
+        engine
+            .compile(
+                "function retainedValue(object){return object.value;}",
+                "retained.js",
+            )
+            .unwrap();
+        assert_eq!(
+            engine
+                .call("retainedValue", &[retained.value()])
+                .unwrap()
+                .value(),
+            Value::number(3.0)
+        );
+    }
+}
+
+#[test]
+fn specialized_inherited_methods_follow_target_and_receiver_changes() {
+    for backend in [
+        js_engine::Backend::NativeOnly,
+        js_engine::Backend::Cranelift,
+    ] {
+        let engine = hot_engine(
+            "function C(){} C.prototype={method:function(){return this.value;}};
+            const a=new C();a.value=3;const b={value:5,method:function(){return this.value+10;}};
+            let object=a;
+            function read(){return object.method();}
+            function replace(){C.prototype.method=function(){return this.value*2;};}
+            function switchReceiver(){object=b;}",
+            backend,
+        );
+        engine.call("replace", &[]).unwrap();
+        assert_eq!(
+            engine.call("read", &[]).unwrap().value(),
+            Value::number(6.0)
+        );
+        engine.call("switchReceiver", &[]).unwrap();
+        assert_eq!(
+            engine.call("read", &[]).unwrap().value(),
+            Value::number(15.0)
+        );
+    }
+}

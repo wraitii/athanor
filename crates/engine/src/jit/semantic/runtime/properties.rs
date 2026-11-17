@@ -5,6 +5,7 @@ use super::super::{
     TerminatorKind, Value, ValueType,
 };
 use super::layout;
+use crate::jit::layout::ReadLayout;
 
 pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) -> super::super::Result<bool> {
     function.ensure_cfg();
@@ -200,6 +201,8 @@ pub(in crate::jit::semantic) fn lower_accesses(
             matches!(
                 graph.insts[inst].op,
                 Op::ShapedGet(..)
+                    | Op::LayoutGet(..)
+                    | Op::ProbeShapeProperty(..)
                     | Op::CachedProperty(..)
                     | Op::IsPropertyCached(..)
                     | Op::FillPropertyCache(..)
@@ -217,7 +220,42 @@ pub(in crate::jit::semantic) fn lower_accesses(
     for inst in accesses {
         let data = graph.insts[inst].clone();
         match data.op {
-            Op::ShapedGet(object, name, index) => lower_shaped(graph, inst, object, &name, index),
+            Op::ShapedGet(object, ref name, index) => {
+                lower_shaped(graph, inst, object, name, index)
+            }
+            Op::LayoutGet(object, ref name, layout) => {
+                lower_layout(graph, inst, object, name, layout)
+            }
+            Op::ProbeShapeProperty(object, ref name, layout) => {
+                let first = graph.blocks.len();
+                let (block, done, fallback) = super::super::dispatch::split(graph, inst);
+                graph.set_op(inst, Op::Constant(super::super::Constant::Uninitialized));
+                let check = super::super::dispatch::append(
+                    graph,
+                    &data,
+                    block,
+                    layout.requirement().test(object).unwrap(),
+                );
+                let fast = super::super::dispatch::branch(graph, inst, block, check, fallback);
+                let (load, value) = graph.append(
+                    fast,
+                    data.span,
+                    Op::LayoutGet(object, name.clone(), layout),
+                    true,
+                );
+                graph.insts[load].source_name = data.source_name;
+                graph.insts[load].inline_context = data.inline_context;
+                lower_layout(graph, load, object, name, layout);
+                graph.terminate(
+                    fast,
+                    data.span,
+                    TerminatorKind::Jump(Target {
+                        block: done,
+                        args: vec![value.unwrap()],
+                    }),
+                );
+                super::super::dispatch::extend_regions(graph, block, first);
+            }
             Op::CachedProperty(object, cache, builtins)
             | Op::IsPropertyCached(object, cache, builtins) => {
                 let validate = matches!(data.op, Op::IsPropertyCached(..));
@@ -336,6 +374,28 @@ fn lower_shaped(graph: &mut Graph, inst: Inst, object: Value, name: &str, index:
     let offset = at.ins().iconst(types::I64, i64::from(index) * 8);
     let address = at.ins().iadd(values, offset);
     graph.set_op(inst, Op::PropertyLoad(object, address, Field::named(name)));
+}
+
+fn lower_layout(graph: &mut Graph, inst: Inst, object: Value, name: &str, layout: ReadLayout) {
+    let Some(storage) = layout.storage else {
+        lower_shaped(graph, inst, object, name, layout.index);
+        return;
+    };
+    use cranelift_codegen::ir::{MemFlagsData, types};
+    let mut at = Cursor::before(graph, inst);
+    let holder = at.ins().iconst(types::I64, storage.identity as i64);
+    let values = at.ins().load(
+        types::I64,
+        MemFlagsData::trusted(),
+        holder,
+        crate::heap::DATA_OFFSET,
+    );
+    let offset = at.ins().iconst(types::I64, i64::from(layout.index) * 8);
+    let address = at.ins().iadd(values, offset);
+    graph.set_op(
+        inst,
+        Op::RelatedPropertyLoad(object, address, Field::named(name)),
+    );
 }
 
 struct PropertyLowering<'a> {
@@ -635,7 +695,9 @@ pub(in crate::jit::semantic) fn lower_loads(function: &mut FunctionState) {
     let graph = &mut function.graph;
     for &block in &function.facts.cfg.rpo {
         for inst in graph.blocks[block].insts.clone() {
-            let Op::PropertyLoad(_, address, _) = graph.insts[inst].op else {
+            let (Op::PropertyLoad(_, address, _) | Op::RelatedPropertyLoad(_, address, _)) =
+                graph.insts[inst].op
+            else {
                 continue;
             };
             let word = Cursor::before(graph, inst).ins().load(

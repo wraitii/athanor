@@ -1,3 +1,4 @@
+use crate::jit::layout::ReadLayout;
 use crate::{FxHashMap, FxHashSet};
 use cranelift_codegen::entity::SecondaryMap;
 use smallvec::SmallVec;
@@ -26,7 +27,7 @@ pub(super) enum LoadKey {
     Index(Value, Value),
     Global(String),
     Probe(String),
-    ShapeProbe(Value, String, u32, u32),
+    ShapeProbe(Value, String, ReadLayout),
     PropertyCache(Inst),
     This,
     Argument(usize),
@@ -59,7 +60,7 @@ enum Reuse {
 fn load_key(op: &Op, probes: bool, aliases: &FxHashMap<Value, Value>) -> Option<LoadKey> {
     let at = |value: &Value| resolve(aliases, *value);
     Some(match op {
-        Op::Get(object, name) | Op::ShapedGet(object, name, _) => {
+        Op::Get(object, name) | Op::ShapedGet(object, name, _) | Op::LayoutGet(object, name, _) => {
             LoadKey::Property(at(object), name.clone())
         }
         Op::GetIndex(object, key)
@@ -70,8 +71,8 @@ fn load_key(op: &Op, probes: bool, aliases: &FxHashMap<Value, Value>) -> Option<
         Op::CellGet(cell) => LoadKey::Cell(at(cell)),
         Op::GlobalRead(name) => LoadKey::Global(name.clone()),
         Op::ProbeGlobal(name) if probes => LoadKey::Probe(name.clone()),
-        Op::ProbeShapeProperty(object, name, shape, index) => {
-            LoadKey::ShapeProbe(at(object), name.clone(), *shape, *index)
+        Op::ProbeShapeProperty(object, name, layout) => {
+            LoadKey::ShapeProbe(at(object), name.clone(), *layout)
         }
         Op::LowLevel(super::low_level::Op::Load {
             ty,
@@ -90,6 +91,7 @@ fn load_key(op: &Op, probes: bool, aliases: &FxHashMap<Value, Value>) -> Option<
                 | Fact::Typed(_)
                 | Fact::Array
                 | Fact::Shape(_)
+                | Fact::ReadLayout(_)
                 | Fact::Cached(..)),
             ) => LoadKey::Check(at(&value), fact),
             _ => return None,
@@ -140,12 +142,16 @@ fn step(
     if cold {
         return None;
     }
-    if let Op::IsShape(object, shape) = data.op
-        && state.iter().any(|(key, entry)| {
-            matches!(key, LoadKey::ShapeProbe(receiver, _, known, _)
-                if *receiver == resolve(aliases, object) && *known == shape && entry.truth == Some(true))
-        })
-    {
+    if let Some((object, wanted)) = match data.op {
+        Op::IsShape(object, shape) => Some((object, Fact::Shape(shape))),
+        Op::IsReadLayout(object, layout) => Some((object, Fact::ReadLayout(layout))),
+        _ => None,
+    } && state.iter().any(|(key, entry)| {
+        matches!(key, LoadKey::ShapeProbe(receiver, _, layout)
+            if *receiver == resolve(aliases, object)
+                && (layout.requirement() == wanted || Fact::Shape(layout.shape) == wanted)
+                && entry.truth == Some(true))
+    }) {
         return Some(Reuse::Boolean(true));
     }
     let key = load_key(&data.op, probes, aliases)?;
@@ -490,9 +496,9 @@ impl Solved {
         };
         let value = original(value);
         state.iter().any(|(key, entry)| {
-            if let LoadKey::ShapeProbe(known, _, shape, _) = key {
+            if let LoadKey::ShapeProbe(known, _, layout) = key {
                 return original(*known) == value
-                    && fact == Fact::Shape(*shape)
+                    && (fact == layout.requirement() || fact == Fact::Shape(layout.shape))
                     && entry.truth == Some(true);
             }
             matches!(key, LoadKey::Check(known, established)

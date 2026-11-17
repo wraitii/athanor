@@ -658,6 +658,7 @@ impl FunctionCompiler<'_, '_> {
                             | Op::FillPropertyCache(..)
                             | Op::PrimePropertyCache(..)
                             | Op::PropertyLoad(..)
+                            | Op::RelatedPropertyLoad(..)
                             | Op::HelperCall { .. }
                             | Op::ArrayStore(..)
                             | Op::PropertyStore(..)
@@ -884,9 +885,10 @@ impl FunctionCompiler<'_, '_> {
                             Op::ProbeGlobal(..) | Op::ProbeProperty(..) => {
                                 unreachable!("cache probes must be lowered before ownership")
                             }
-                            Op::ProbeShapeProperty(object, _, shape, index) => {
-                                let object = get(self, *object);
-                                Some(self.shaped_property_probe(object, *shape, *index))
+                            Op::ProbeShapeProperty(..)
+                            | Op::LayoutGet(..)
+                            | Op::IsReadLayout(..) => {
+                                unreachable!("layout reads must be lowered before ownership")
                             }
                             Op::StringSplitParts(receiver, args) => {
                                 let receiver = get(self, *receiver);

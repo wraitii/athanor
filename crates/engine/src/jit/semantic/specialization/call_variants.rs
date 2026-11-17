@@ -85,8 +85,8 @@ fn shape_hints(graph: &Graph, bodies: &Repository, source: usize) -> FxHashMap<V
                 end: data.span.end,
             };
             let shape = match bodies.shape_feedback(site, property) {
-                Some(crate::jit::profile::ShapeAccess::Read { shape, .. })
-                | Some(crate::jit::profile::ShapeAccess::Overwrite { shape, .. }) => shape,
+                Some(crate::jit::profile::ShapeAccess::Read(layout)) => layout.shape,
+                Some(crate::jit::profile::ShapeAccess::Overwrite { shape, .. }) => shape,
                 _ => continue,
             };
             hints.entry(object).or_insert(shape);

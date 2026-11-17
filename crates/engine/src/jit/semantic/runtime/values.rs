@@ -171,6 +171,27 @@ fn predicate(graph: &mut Graph, facts: &Facts, inst: Inst) -> Option<Value> {
             SHAPE_OFFSET,
             shape,
         ),
+        Op::IsReadLayout(object, layout) => {
+            let mut at = Cursor::before(graph, inst);
+            let hit = field_is(&mut at, object, SHAPE_OFFSET, layout.shape);
+            match layout.storage {
+                None => hit,
+                Some(storage) => {
+                    // A failed receiver check may leave the recorded storage dead or reused.
+                    let holder = at.ins().iconst(types::I64, storage.identity as i64);
+                    let empty = at
+                        .ins()
+                        .iconst(types::I64, crate::heap::NO_ELEMENTS.as_ptr() as i64);
+                    let holder = at.ins().select(hit, holder, empty);
+                    let shape =
+                        at.ins()
+                            .load(types::I32, MemFlagsData::trusted(), holder, SHAPE_OFFSET);
+                    let expected = at.ins().iconst(types::I32, i64::from(storage.shape));
+                    let valid = at.ins().icmp(IntCC::Equal, shape, expected);
+                    at.ins().boolean_and(hit, valid)
+                }
+            }
+        }
         Op::IsTyped(object, Some(element)) => {
             let expected = kind::TYPED | TypedKind::element(element);
             field_is(

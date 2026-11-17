@@ -192,7 +192,9 @@ fn property_probes_report_shapes_and_specialize_region_entry() {
     let dump = String::from_utf8(output.stdout).unwrap();
     let (initial, feedback) = dump.split_once(".feedback").unwrap();
     assert!(initial.contains("helper_call SemanticPropertyProbeCached("));
-    assert!(feedback.contains("probe_shape_property"));
+    let feedback = feedback.split("\n[").next().unwrap();
+    assert!(!feedback.contains("helper_call SemanticPropertyProbeCached("));
+    assert!(feedback.contains("low_level Load"));
 }
 
 #[test]

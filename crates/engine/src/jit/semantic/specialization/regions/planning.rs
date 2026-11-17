@@ -7,6 +7,8 @@ use super::motion::JsMotion;
 use super::rewrites::{Candidates, RegionPlan, plan_region, property_assumptions};
 use super::versioning::{Bailouts, materialize};
 use super::*;
+#[cfg(test)]
+use crate::jit::layout::ReadLayout;
 use crate::{FxHashMap, FxHashSet};
 
 fn plan(
@@ -90,7 +92,7 @@ fn plan(
                 continue;
             }
             if entry.is_none()
-                && matches!(proposal.fact, Fact::Shape(_))
+                && matches!(proposal.fact, Fact::Shape(_) | Fact::ReadLayout(_))
                 && known.cfg.rpo.iter().any(|&block| {
                     matches!(
                         working.blocks[block].terminator.as_ref().unwrap().kind,
@@ -173,9 +175,7 @@ fn plan(
                     return None;
                 };
                 // The probe validates its own shape without a region-wide shape assumption.
-                shapes
-                    .read(&candidate, inst)
-                    .map(|(shape, index)| (inst, shape, index))
+                shapes.read(&candidate, inst).map(|layout| (inst, layout))
             })
             .collect();
         let speculation = Speculation {
@@ -552,7 +552,7 @@ mod tests {
                     inst,
                     super::super::super::properties::Access {
                         cache: None,
-                        shapes: vec![(10, 0), (20, 1)],
+                        shapes: vec![ReadLayout::own(10, 0), ReadLayout::own(20, 1)],
                     },
                 );
             }
@@ -1383,7 +1383,7 @@ pub(in crate::jit::semantic) fn materialize_properties(graph: &mut Graph) -> Res
                 access
                     .shapes
                     .iter()
-                    .any(|&(shape, _)| solved.holds(graph, &state, object, Fact::Shape(shape)))
+                    .any(|&layout| solved.holds(graph, &state, object, layout.requirement()))
             }) {
                 return None;
             }
@@ -1397,13 +1397,13 @@ pub(in crate::jit::semantic) fn materialize_properties(graph: &mut Graph) -> Res
         };
         let alternatives = shapes
             .into_iter()
-            .map(|(shape, index)| dispatch::Alternative {
-                requirements: vec![(object, Fact::Shape(shape))],
-                implementation: (shape, index),
+            .map(|layout| dispatch::Alternative {
+                requirements: vec![(object, layout.requirement())],
+                implementation: layout,
             })
             .collect();
         let first = graph.blocks.len();
-        dispatch::apply(graph, inst, alternatives, |graph, block, (shape, index)| {
+        dispatch::apply(graph, inst, alternatives, |graph, block, layout| {
             let (copy, value) =
                 graph.append(block, data.span, data.op.clone(), data.result().is_some());
             graph.insts[copy].source_name = data.source_name;
@@ -1412,7 +1412,7 @@ pub(in crate::jit::semantic) fn materialize_properties(graph: &mut Graph) -> Res
                 copy,
                 Access {
                     cache: None,
-                    shapes: vec![(shape, index)],
+                    shapes: vec![layout],
                 },
             );
             value

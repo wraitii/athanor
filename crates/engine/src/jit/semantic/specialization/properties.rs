@@ -1,4 +1,5 @@
 use crate::FxHashSet;
+use crate::jit::layout::ReadLayout;
 
 use super::super::guards::{Fact, Kind, Origin};
 use super::super::{Cfg, Facts, Graph, Inst, Op, Value, available, dispatch};
@@ -6,7 +7,7 @@ use super::super::{Cfg, Facts, Graph, Inst, Op, Value, available, dispatch};
 #[derive(Clone, Default)]
 pub(in crate::jit::semantic) struct Access {
     pub(in crate::jit::semantic) cache: Option<Value>,
-    pub(in crate::jit::semantic) shapes: Vec<(u32, u32)>,
+    pub(in crate::jit::semantic) shapes: Vec<ReadLayout>,
 }
 
 pub(in crate::jit::semantic) fn assume(graph: &mut Graph, shapes: &super::shapes::Plan) {
@@ -101,12 +102,12 @@ pub(in crate::jit::semantic) fn shape_writes(graph: &mut Graph) {
             let Op::Set(object, ref name, value) = graph.insts[inst].op else {
                 return None;
             };
-            let &[(shape, index)] = graph.property_accesses.get(&inst)?.shapes.as_slice() else {
+            let &[layout] = graph.property_accesses.get(&inst)?.shapes.as_slice() else {
                 return None;
             };
             let set = graph.insts[inst].op.clone();
-            graph.insts[inst].op = Op::ShapedSet(object, name.clone(), index, value);
-            Some((inst, object, shape, set))
+            graph.insts[inst].op = Op::ShapedSet(object, name.clone(), layout.index, value);
+            Some((inst, object, layout.shape, set))
         })
         .collect();
     while !candidates.is_empty() {
@@ -163,7 +164,7 @@ pub(in crate::jit::semantic) fn rewrite(graph: &mut Graph) -> super::super::Resu
             let shaped = read
                 .shapes
                 .iter()
-                .find(|&&(shape, _)| holds(Fact::Shape(shape)))
+                .find(|&&layout| holds(layout.requirement()))
                 .copied();
             let cached = read.cache.is_some_and(|cache| {
                 holds(Fact::Cached(cache, crate::builtins::builtin_method(name)))
@@ -177,11 +178,17 @@ pub(in crate::jit::semantic) fn rewrite(graph: &mut Graph) -> super::super::Resu
         let Op::Get(object, name) = data.op.clone() else {
             continue;
         };
-        if let Some((shape, index)) = shaped {
+        if let Some(layout) = shaped {
             if data.block == graph.entry {
-                super::super::guards::record_entry(graph, object, Fact::Shape(shape));
+                super::super::guards::record_entry(graph, object, Fact::Shape(layout.shape));
             }
-            graph.set_op(inst, Op::ShapedGet(object, name, index));
+            graph.set_op(
+                inst,
+                match layout.storage {
+                    None => Op::ShapedGet(object, name, layout.index),
+                    Some(_) => Op::LayoutGet(object, name, layout),
+                },
+            );
             continue;
         }
         let cache = read.cache.unwrap_or_else(|| {

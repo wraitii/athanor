@@ -427,6 +427,10 @@ pub(super) fn plan_region(
                         Access::read(graph, &Op::IsShape(value, shape), &shared)
                             .is_some_and(|read| !writes.clobbers(&read))
                     }
+                    Fact::ReadLayout(layout) if reentry.is_none() => {
+                        Access::read(graph, &Op::IsReadLayout(value, layout), &shared)
+                            .is_some_and(|read| !writes.clobbers(&read))
+                    }
                     Fact::Cached(cache, builtins) if reentry.is_none() => {
                         (!body.contains(&planning.def_block(cache)) || available.contains(&cache))
                             && Access::read(
@@ -539,10 +543,10 @@ pub(super) fn shaped_overwrites(
             let Op::Set(object, ..) = graph.insts[inst].op else {
                 return None;
             };
-            let &[(shape, _)] = graph.property_accesses.get(&inst)?.shapes.as_slice() else {
+            let &[layout] = graph.property_accesses.get(&inst)?.shapes.as_slice() else {
                 return None;
             };
-            let requirement = (object, Fact::Shape(shape));
+            let requirement = (object, Fact::Shape(layout.shape));
             assumes
                 .iter()
                 .any(|&(value, fact)| {
@@ -578,12 +582,12 @@ pub(super) fn property_assumptions(graph: &mut Graph, notes: &mut Vec<String>) {
                 (Op::Get(_, name), []) => {
                     Some(Fact::Cached(cache, crate::builtins::builtin_method(&name)))
                 }
-                (Op::Get(..) | Op::Set(..), &[(shape, _)]) => {
+                (Op::Get(..) | Op::Set(..), &[layout]) => {
                     (!solved.as_ref().is_some_and(|solved| {
                         let state = solved.before(graph, &facts, &facts.cfg, inst);
-                        solved.holds(graph, &state, object, Fact::Shape(shape))
+                        solved.holds(graph, &state, object, layout.requirement())
                     }))
-                    .then_some(Fact::Shape(shape))
+                    .then_some(layout.requirement())
                 }
                 _ => None,
             };
@@ -598,7 +602,11 @@ pub(super) fn property_assumptions(graph: &mut Graph, notes: &mut Vec<String>) {
     let mut shapes = FxHashMap::default();
     let mut conflicting = FxHashSet::default();
     for &(_, object, fact, _) in &proposals {
-        if let Some(Fact::Shape(shape)) = fact {
+        if let Some(shape) = match fact {
+            Some(Fact::Shape(shape)) => Some(shape),
+            Some(Fact::ReadLayout(layout)) => Some(layout.shape),
+            _ => None,
+        } {
             let object = canonical(object);
             if shapes
                 .insert(object, shape)
@@ -616,7 +624,8 @@ pub(super) fn property_assumptions(graph: &mut Graph, notes: &mut Vec<String>) {
     }
     for (inst, object, fact, origin) in proposals {
         let fact = fact.filter(|fact| {
-            !matches!(fact, Fact::Shape(_)) || !conflicting.contains(&canonical(object))
+            !matches!(fact, Fact::Shape(_) | Fact::ReadLayout(_))
+                || !conflicting.contains(&canonical(object))
         });
         if let Some(fact) = fact {
             graph.set_op(inst, Op::Assume(object, fact, origin));

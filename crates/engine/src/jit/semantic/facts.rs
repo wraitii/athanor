@@ -839,14 +839,17 @@ fn result_types(graph: &Graph, op: &Op, facts: &Facts) -> ValueType {
         Op::EntryAssume(..)
         | Op::IsUninitialized(_)
         | Op::IsPropertyCached(..)
-        | Op::IsShape(..) => ValueType::BOOLEAN,
+        | Op::IsShape(..)
+        | Op::IsReadLayout(..) => ValueType::BOOLEAN,
         Op::PropertyLoad(..)
+        | Op::RelatedPropertyLoad(..)
         | Op::ProbeProperty(..)
         | Op::ProbeShapeProperty(..)
         | Op::ProbeIndex(..)
         | Op::ConstructorPrototype(_)
         | Op::CachedProperty(..)
         | Op::ShapedGet(..)
+        | Op::LayoutGet(..)
         | Op::FillPropertyCache(..) => ValueType::ALL,
         Op::HelperCall { result_type, .. } => *result_type,
         Op::View(_) => ValueType::VIEW,
