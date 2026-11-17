@@ -46,4 +46,17 @@
             args[i - 1] = arguments[i];
         return $callSpread(this, thisArg, args);
     });
+
+    /**
+     * @this {Function}
+     * @param {*} thisArg
+     * @param {...*} boundArgs
+     * @returns {Function}
+     */
+    $defineHidden(Function.prototype, "bind", function(thisArg, ...boundArgs) {
+        const target = this;
+        if (typeof target !== "function")
+            throw new Error("bind requires a callable receiver");
+        return (...args) => $callSpread(target, thisArg, [...boundArgs, ...args]);
+    });
 })();

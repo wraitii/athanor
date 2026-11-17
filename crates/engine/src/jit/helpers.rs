@@ -605,6 +605,7 @@ extern "C" fn js_array_iteration_guard(
         x if x == ArrayMethod::ForEach as u64 => NativeFunction::ArrayForEach,
         x if x == ArrayMethod::Find as u64 => NativeFunction::ArrayFind,
         x if x == ArrayMethod::Push as u64 => NativeFunction::ArrayPush,
+        x if x == ArrayMethod::Reduce as u64 => NativeFunction::ArrayReduce,
         _ => unreachable!(),
     };
     let heap = unsafe { &*ctx }.global.heap();
@@ -1007,7 +1008,10 @@ pub(crate) extern "C" fn js_iterate_next(ctx: *mut JitCtx, state: Value) -> Valu
     let ctx = unsafe { &mut *ctx };
     let heap = ctx.global.heap();
     let iterable = heap.get(state, 0).unwrap();
-    let offset = heap.get(state, 1).unwrap().as_number().unwrap() as usize;
+    let Some(offset) = heap.get(state, 1).unwrap().as_number() else {
+        return Value::UNINITIALIZED;
+    };
+    let offset = offset as usize;
     if iterable.is_string() {
         let Some((character, next)) = heap.next_character(iterable, offset) else {
             return Value::UNINITIALIZED;
@@ -1022,6 +1026,7 @@ pub(crate) extern "C" fn js_iterate_next(ctx: *mut JitCtx, state: Value) -> Valu
         };
     }
     if offset >= heap.len(iterable).unwrap() {
+        heap.set(state, 1, Value::UNDEFINED);
         return Value::UNINITIALIZED;
     }
     let value = heap.get(iterable, offset).unwrap();

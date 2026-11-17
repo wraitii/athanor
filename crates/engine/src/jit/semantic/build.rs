@@ -2,12 +2,13 @@ use crate::jit::semantic::JsOp;
 use crate::{FxHashMap, FxHashSet};
 
 use oxc_ast::ast::{
-    Argument, ArrayExpressionElement, AssignmentExpression, BindingIdentifier, BindingPattern,
+    Argument, ArrayExpressionElement, AssignmentExpression, AssignmentTarget,
+    AssignmentTargetMaybeDefault, AssignmentTargetProperty, BindingIdentifier, BindingPattern,
     CallExpression, ChainElement, ChainExpression, DoWhileStatement, Expression, ForInStatement,
     ForOfStatement, ForStatement, ForStatementInit, ForStatementLeft, FormalParameters,
-    IfStatement, ObjectExpression, ObjectPropertyKind, PropertyKind, SimpleAssignmentTarget,
-    Statement, SwitchStatement, UpdateExpression, VariableDeclaration, VariableDeclarationKind,
-    WhileStatement,
+    IdentifierReference, IfStatement, ObjectExpression, ObjectPropertyKind, PropertyKind,
+    SimpleAssignmentTarget, Statement, SwitchStatement, UpdateExpression, VariableDeclaration,
+    VariableDeclarationKind, WhileStatement,
 };
 use oxc_semantic::Scoping;
 use oxc_span::{GetSpan, Span};
@@ -350,28 +351,28 @@ impl<'a> Builder<'a> {
         })
     }
 
+    fn identifier_place(&mut self, id: &IdentifierReference<'_>) -> Result<Place> {
+        let symbol = id
+            .reference_id
+            .get()
+            .and_then(|id| self.scoping.get_reference(id).symbol_id());
+        if symbol.is_some_and(|id| self.scoping.symbol_flags(id).is_const_variable()) {
+            return unsupported("assignment to const", id.span);
+        }
+        match self.resolve(&id.name, id.reference_id.get(), id.span)? {
+            Reference::Local(binding)
+                if self.graph.bindings[binding].kind != BindingKind::Const =>
+            {
+                Ok(Place::Binding(binding))
+            }
+            Reference::Local(_) => unsupported("assignment to const", id.span),
+            Reference::Global(_) | Reference::Constant(_) => Ok(Place::Global(id.name.to_string())),
+        }
+    }
+
     fn place(&mut self, target: &SimpleAssignmentTarget<'_>) -> Result<Place> {
         match target {
-            SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
-                let symbol = id
-                    .reference_id
-                    .get()
-                    .and_then(|id| self.scoping.get_reference(id).symbol_id());
-                if symbol.is_some_and(|id| self.scoping.symbol_flags(id).is_const_variable()) {
-                    return unsupported("assignment to const", id.span);
-                }
-                match self.resolve(&id.name, id.reference_id.get(), id.span)? {
-                    Reference::Local(binding)
-                        if self.graph.bindings[binding].kind != BindingKind::Const =>
-                    {
-                        Ok(Place::Binding(binding))
-                    }
-                    Reference::Local(_) => unsupported("assignment to const", id.span),
-                    Reference::Global(_) | Reference::Constant(_) => {
-                        Ok(Place::Global(id.name.to_string()))
-                    }
-                }
-            }
+            SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => self.identifier_place(id),
             SimpleAssignmentTarget::StaticMemberExpression(member) => {
                 let object = self.expression(&member.object)?;
                 Ok(Place::Property(object, member.property.name.to_string()))
@@ -920,7 +921,12 @@ impl<'a> Builder<'a> {
             },
         };
         let Some(target) = x.left.as_simple_assignment_target() else {
-            return unsupported("destructuring assignment", x.span);
+            if operator.is_some() {
+                return unsupported("compound destructuring assignment", x.span);
+            }
+            let value = self.expression(&x.right)?;
+            self.assign_pattern(&x.left, value)?;
+            return Ok(value);
         };
         let place = self.place(target)?;
         let value = match operator {
@@ -933,6 +939,106 @@ impl<'a> Builder<'a> {
         };
         self.store(x.span, place, value);
         Ok(value)
+    }
+
+    fn pattern_place(&mut self, target: &AssignmentTargetMaybeDefault<'_>) -> Result<Place> {
+        let Some(simple) = target
+            .as_assignment_target()
+            .and_then(AssignmentTarget::as_simple_assignment_target)
+        else {
+            return unsupported("destructuring assignment target", target.span());
+        };
+        self.place(simple)
+    }
+
+    fn assignment_property(
+        &mut self,
+        property: &AssignmentTargetProperty<'_>,
+    ) -> Result<(String, Place)> {
+        use AssignmentTargetProperty::*;
+
+        match property {
+            AssignmentTargetPropertyIdentifier(property) if property.init.is_none() => Ok((
+                property.binding.name.to_string(),
+                self.identifier_place(&property.binding)?,
+            )),
+            AssignmentTargetPropertyProperty(property) if !property.computed => {
+                let Some(name) = property
+                    .name
+                    .static_name()
+                    .and_then(|name| name.as_str().map(str::to_owned))
+                else {
+                    return unsupported("object assignment key", property.span);
+                };
+                Ok((name, self.pattern_place(&property.binding)?))
+            }
+            _ => unsupported("object assignment property", property.span()),
+        }
+    }
+
+    fn assign_pattern(&mut self, target: &AssignmentTarget<'_>, value: Value) -> Result<()> {
+        match target {
+            AssignmentTarget::ArrayAssignmentTarget(pattern) if pattern.rest.is_none() => {
+                let iterator = self.emit(pattern.span, Op::Javascript(JsOp::IteratorNew(value)));
+                for element in &pattern.elements {
+                    let Some(element) = element else {
+                        self.emit(pattern.span, Op::Javascript(JsOp::IteratorNext(iterator)));
+                        continue;
+                    };
+                    let place = self.pattern_place(element)?;
+                    let next = self.next_pattern_value(element.span(), iterator);
+                    self.store(element.span(), place, next);
+                }
+            }
+            AssignmentTarget::ObjectAssignmentTarget(pattern) if pattern.rest.is_none() => {
+                let nullish = self.emit(pattern.span, Op::Javascript(JsOp::IsNullish(value)));
+                let invalid = self.block();
+                let valid = self.block();
+                self.branch(
+                    pattern.span,
+                    nullish,
+                    Target::new(invalid),
+                    Target::new(valid),
+                );
+                self.switch(invalid);
+                // Raise the property access TypeError before evaluating any assignment target.
+                self.emit(
+                    pattern.span,
+                    Op::Javascript(JsOp::Get(value, String::new())),
+                );
+                self.jump(pattern.span, valid, Vec::new());
+                self.switch(valid);
+                for property in &pattern.properties {
+                    let (name, place) = self.assignment_property(property)?;
+                    let item = self.emit(property.span(), Op::Javascript(JsOp::Get(value, name)));
+                    self.store(property.span(), place, item);
+                }
+            }
+            _ => return unsupported("destructuring assignment", target.span()),
+        }
+        Ok(())
+    }
+
+    fn next_pattern_value(&mut self, span: Span, iterator: Value) -> Value {
+        let next = self.emit(span, Op::Javascript(JsOp::IteratorNext(iterator)));
+        let missing = self.emit(span, Op::Javascript(JsOp::IsUninitialized(next)));
+        let absent = self.block();
+        let done = self.block();
+        let result = self.param(done);
+        self.branch(
+            span,
+            missing,
+            Target::new(absent),
+            Target {
+                block: done,
+                args: vec![next],
+            },
+        );
+        self.switch(absent);
+        let undefined = self.constant(span, Constant::Undefined);
+        self.jump(span, done, vec![undefined]);
+        self.switch(done);
+        result
     }
 
     fn update(&mut self, x: &UpdateExpression<'_>) -> Result<Value> {
@@ -967,28 +1073,11 @@ impl<'a> Builder<'a> {
             BindingPattern::ArrayPattern(pattern) => {
                 let iterator = self.emit(pattern.span, Op::Javascript(JsOp::IteratorNew(value)));
                 for element in &pattern.elements {
-                    let next =
-                        self.emit(pattern.span, Op::Javascript(JsOp::IteratorNext(iterator)));
                     if let Some(element) = element {
-                        let missing =
-                            self.emit(element.span(), Op::Javascript(JsOp::IsUninitialized(next)));
-                        let absent = self.block();
-                        let done = self.block();
-                        let result = self.param(done);
-                        self.branch(
-                            element.span(),
-                            missing,
-                            Target::new(absent),
-                            Target {
-                                block: done,
-                                args: vec![next],
-                            },
-                        );
-                        self.switch(absent);
-                        let undefined = self.constant(element.span(), Constant::Undefined);
-                        self.jump(element.span(), done, vec![undefined]);
-                        self.switch(done);
-                        self.bind_pattern(element, result)?;
+                        let next = self.next_pattern_value(element.span(), iterator);
+                        self.bind_pattern(element, next)?;
+                    } else {
+                        self.emit(pattern.span, Op::Javascript(JsOp::IteratorNext(iterator)));
                     }
                 }
             }

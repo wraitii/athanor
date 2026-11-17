@@ -1235,6 +1235,55 @@ fn object_destructuring_declarations() {
 }
 
 #[test]
+fn array_destructuring_assignment() {
+    check(
+        "function main() {
+            let source = [4, 5];
+            let out = {};
+            let tail = 1;
+            let result = ([out[(source[0] = 8, 'first')], , tail] = source);
+            return result === source && out.first === 8 && tail === undefined;
+        }",
+        Value::TRUE,
+    );
+    check(
+        "function main() {
+            let source = [];
+            let first = 1;
+            let out = {};
+            [first, out[(source.push(7), 'next')]] = source;
+            return first === undefined && out.next === undefined && source.length === 1;
+        }",
+        Value::TRUE,
+    );
+}
+
+#[test]
+fn object_destructuring_assignment() {
+    check(
+        "function main() {
+            let source = {x: 3, y: 4};
+            let out = {};
+            let y = 0;
+            let calls = 0;
+            let result = ({x: out[(source.y = 9, 'first')], y} = (calls++, source));
+            return result === source && calls === 1 && out.first === 3 && y === 9;
+        }",
+        Value::TRUE,
+    );
+    check(
+        "function main() {
+            let calls = 0;
+            try { ({x: ({})[calls++]} = null); } catch (e) {
+                try { ({} = undefined); } catch (e) { return calls === 0; }
+            }
+            return false;
+        }",
+        Value::TRUE,
+    );
+}
+
+#[test]
 fn object_destructuring_rejects_unsupported_forms() {
     for source in [
         "function main(){ const {x = 1} = {}; }",

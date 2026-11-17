@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 
 use super::{arg, fail};
-use crate::heap::NativeFunction;
+use crate::heap::{Heap, NativeFunction};
 use crate::jit::session::{Held, JitCtx};
 use crate::value::Value;
 
@@ -211,7 +211,7 @@ fn flatten_into(
     true
 }
 
-fn sort_number(heap: &crate::heap::Heap, value: Value) -> Option<f64> {
+fn primitive_number(heap: &Heap, value: Value) -> Option<f64> {
     if let Some(number) = value.as_number() {
         return Some(number);
     }
@@ -276,7 +276,7 @@ fn sort(ctx: *mut JitCtx, receiver: Value, args: &[Value]) -> Value {
                 failed = true;
                 return Ordering::Equal;
             }
-            let number = sort_number(&heap, result);
+            let number = primitive_number(&heap, result);
             heap.release(result);
             let Some(number) = number else {
                 context.error = Some(Box::new(crate::Error::Runtime(
@@ -362,6 +362,130 @@ fn flat(ctx: *mut JitCtx, receiver: Value, args: &[Value]) -> Value {
     result
 }
 
+fn move_array_element(heap: &Heap, array: Value, from: usize, to: usize) -> bool {
+    if heap.present(array, from) {
+        return heap.set(array, to, heap.get(array, from).unwrap());
+    }
+    heap.mark_hole(array, to);
+    true
+}
+
+fn shift(context: &mut JitCtx, heap: &Heap, array: Value, length: usize) -> Value {
+    if let Some(first) = heap.shift_array(array) {
+        return first;
+    }
+    let mut first = Held::new(heap);
+    let value = first.push(context.retain(heap.get(array, 0).unwrap()));
+    for index in 1..length {
+        if !move_array_element(heap, array, index, index - 1) {
+            return fail(context, "cannot shift array element");
+        }
+    }
+    heap.truncate(array, length - 1);
+    first.take();
+    value
+}
+
+fn splice(context: &mut JitCtx, heap: &Heap, array: Value, length: usize, args: &[Value]) -> Value {
+    let Some(start) = primitive_number(heap, arg(args, 0)) else {
+        return fail(context, "object conversion in splice is unsupported");
+    };
+    let start = relative_index(Value::number(start), length, 0).unwrap();
+    let remaining = length - start;
+    let removed_count = match args.len() {
+        0 => 0,
+        1 => remaining,
+        _ => {
+            let Some(count) = primitive_number(heap, args[1]) else {
+                return fail(context, "object conversion in splice is unsupported");
+            };
+            (count as usize).min(remaining)
+        }
+    };
+    let inserted = args.get(2..).unwrap_or(&[]);
+    let new_length = length - removed_count + inserted.len();
+    let Some(removed) = heap.array_of_length(removed_count) else {
+        return fail(context, "array allocation failed");
+    };
+    let mut result = Held::new(heap);
+    result.push(removed);
+    for (index, source) in (start..start + removed_count).enumerate() {
+        if heap.present(array, source)
+            && !heap.set(removed, index, heap.get(array, source).unwrap())
+        {
+            return fail(context, "cannot copy removed array element");
+        }
+    }
+    let tail = length - start - removed_count;
+    let old_tail = start + removed_count;
+    let new_tail = start + inserted.len();
+    if new_length < length {
+        for offset in 0..tail {
+            if !move_array_element(heap, array, old_tail + offset, new_tail + offset) {
+                return fail(context, "cannot move array element");
+            }
+        }
+        heap.truncate(array, new_length);
+    } else if new_length > length {
+        if !heap.grow_array(array, new_length) {
+            return fail(context, "array allocation failed");
+        }
+        for offset in (0..tail).rev() {
+            if !move_array_element(heap, array, old_tail + offset, new_tail + offset) {
+                return fail(context, "cannot move array element");
+            }
+        }
+    }
+    for (offset, &value) in inserted.iter().enumerate() {
+        if !heap.set(array, start + offset, value) {
+            return fail(context, "cannot insert array element");
+        }
+    }
+    result.take();
+    removed
+}
+
+fn reduce(ctx: *mut JitCtx, heap: &Heap, array: Value, length: usize, args: &[Value]) -> Value {
+    let callback = arg(args, 0);
+    let context = unsafe { &mut *ctx };
+    if heap.closure_code(callback).is_none() && heap.native(callback).is_none() {
+        context.language_error("TypeError", "reduce callback is not callable");
+        return Value::UNDEFINED;
+    }
+    let mut accumulator = args.get(1).map(|&value| context.retain(value));
+    for index in 0..length {
+        if !heap.present(array, index) {
+            continue;
+        }
+        let value = unsafe { &mut *ctx }.retain(heap.get(array, index).unwrap());
+        let Some(previous) = accumulator else {
+            accumulator = Some(value);
+            continue;
+        };
+        let args = [previous, value, Value::number(index as f64), array];
+        let next = js_call(
+            ctx,
+            callback,
+            Value::UNDEFINED,
+            args.as_ptr(),
+            args.len() as u64,
+        );
+        heap.release(previous);
+        heap.release(value);
+        let context = unsafe { &mut *ctx };
+        if context.error.is_some() || context.exception_pending() {
+            heap.release(next);
+            return Value::UNDEFINED;
+        }
+        accumulator = Some(next);
+    }
+    accumulator.unwrap_or_else(|| {
+        unsafe { &mut *ctx }
+            .language_error("TypeError", "reduce of empty array with no initial value");
+        Value::UNDEFINED
+    })
+}
+
 pub(super) fn call(
     ctx: *mut JitCtx,
     function: NativeFunction,
@@ -385,6 +509,15 @@ pub(super) fn call(
         return fail(context, "array method requires an array receiver");
     }
     let length = heap.len(receiver).unwrap();
+    if function == ArrayShift {
+        return shift(context, &heap, receiver, length);
+    }
+    if function == ArraySplice {
+        return splice(context, &heap, receiver, length, args);
+    }
+    if function == ArrayReduce {
+        return reduce(ctx, &heap, receiver, length, args);
+    }
     if function == ArrayPush {
         for (offset, value) in args.iter().copied().enumerate() {
             if !heap.set(receiver, length + offset, value) {

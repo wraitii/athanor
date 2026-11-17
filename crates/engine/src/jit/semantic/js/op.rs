@@ -62,6 +62,7 @@ pub(in crate::jit) enum ArrayMethod {
     ForEach,
     Find,
     Push,
+    Reduce,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

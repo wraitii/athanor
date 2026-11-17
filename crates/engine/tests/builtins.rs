@@ -343,6 +343,36 @@ fn array_pop_preserves_returned_values_and_holes() {
 }
 
 #[test]
+fn array_shift_and_splice_preserve_elements_and_holes() {
+    assert_eq!(
+        run(r#"function main() {
+            const item = {value: 7};
+            const queue = new Array(3);
+            queue[0] = item;
+            queue[2] = 5;
+            if (queue.shift() !== item || queue.length !== 2 || 0 in queue || queue[1] !== 5)
+                return false;
+            Array.prototype[0] = 9;
+            if (queue.shift() !== 9 || queue.shift() !== 5 || queue.shift() !== undefined)
+                return false;
+            delete Array.prototype[0];
+
+            const values = [0, item, 2, 3];
+            delete values[2];
+            const removed = values.splice('-3', 2, 7, 8, 9);
+            if (removed.length !== 2 || removed[0] !== item || 1 in removed ||
+                values.join() !== '0,7,8,9,3')
+                return false;
+            const tail = values.splice(2);
+            return tail.join() === '8,9,3' && values.splice().length === 0 &&
+                values.splice(1, undefined, 6).length === 0 && values.join() === '0,6,7';
+        }"#)
+        .unwrap(),
+        Value::TRUE
+    );
+}
+
+#[test]
 fn array_index_of_uses_strict_equality_and_numeric_start() {
     let source = r#"function main() {
         let o = {}; let a = [3, 'é', o, undefined, 3, -0];
@@ -966,6 +996,28 @@ fn javascript_apply_propagates_exceptions_and_keeps_arguments_alive() {
         return result === 10 && caught && invalid && replaced === 23 && $call(3, 4) === 7 &&
             typeof $callSpread === 'undefined';
     }"#)
+        .unwrap(),
+        Value::TRUE
+    );
+}
+
+#[test]
+fn javascript_bind_preserves_receiver_and_prepends_arguments() {
+    assert_eq!(
+        run(r#"function main() {
+            const receiver = {base: 10};
+            function combine(a, b, c) { return this.base + 100 * a.value + 10 * b + c; }
+            const bound = combine.bind(receiver, {value: 2});
+            const rebound = bound.bind({base: 1000}, 3);
+            const native = Math.max.bind(null, 7);
+            let invalid = false;
+            try { Function.prototype.bind.call(7, null); } catch (e) {
+                invalid = e.message === 'bind requires a callable receiver';
+            }
+            return bound.call({base: 1000}, 4, 5) === 255 && rebound(4) === 244 &&
+                native(3, 9) === 9 && native() === 7 && invalid &&
+                Object.keys(Function.prototype).length === 0;
+        }"#)
         .unwrap(),
         Value::TRUE
     );

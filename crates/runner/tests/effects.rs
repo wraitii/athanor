@@ -437,9 +437,15 @@ fn loops_version_independently_of_their_function() {
 
 #[test]
 fn array_iteration_exposes_and_inlines_known_closures() {
-    for method in ["map", "some", "every", "filter"] {
+    for (method, callback_args) in [
+        ("map", "t=>createTerrain(t)"),
+        ("some", "t=>createTerrain(t)"),
+        ("every", "t=>createTerrain(t)"),
+        ("filter", "t=>createTerrain(t)"),
+        ("reduce", "(acc,t)=>acc + createTerrain(t), ''"),
+    ] {
         let source = format!(
-            "function createTerrain(terrain){{ return typeof terrain === 'string' ? terrain : terrain.{method}(t=>createTerrain(t)); }}"
+            "function createTerrain(terrain){{ return typeof terrain === 'string' ? terrain : terrain.{method}({callback_args}); }}"
         );
         for enabled in [false, true] {
             let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
@@ -606,6 +612,57 @@ function main() {
         assert_eq!(
             String::from_utf8(output.stdout).unwrap().trim(),
             "true:false:12125:1,3,7:5:false:true:10:true"
+        );
+    }
+}
+
+#[test]
+fn array_reduce_preserves_accumulator_and_observes_mutations() {
+    let source = r#"
+function main() {
+    const values = new Array(5);
+    values[1] = {n: 3};
+    values[3] = {n: 5};
+    const initial = {n: 1};
+    const result = values.reduce((acc, item, index, array) => {
+        if (index === 1) {
+            delete array[1];
+            array[2] = {n: 6};
+            delete array[3];
+            array.push({n: 100});
+            return {n: acc.n + item.n};
+        }
+        acc.n += item.n + index;
+        return acc;
+    }, initial);
+    const empty = new Array(2);
+    let caught = false;
+    try { empty.reduce((a, b) => a + b); } catch (e) { caught = e.name === 'TypeError'; }
+    const custom = {reduce: (callback, seed) => callback(seed, 4)};
+    const fallback = custom.reduce((a, b) => a + b, 3);
+    const missing = [1].reduce((a, b) => a === undefined ? b : 0, undefined);
+    Array.prototype[1] = 2;
+    const inherited = new Array(3).reduce((a, b) => a + b, 5);
+    delete Array.prototype[1];
+    return result.n + ':' + initial.n + ':' + values.reduce((a, b) => a + b.n, 0)
+        + ':' + empty.reduce(() => 0, initial).n + ':' + [2, 3].reduce((a, b) => a * b)
+        + ':' + caught + ':' + fallback + ':' + missing + ':' + inherited;
+}
+"#;
+    for opt in ["full", "none"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
+            .env("JS_JIT_OPT", opt)
+            .args(["--eval", source])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            "12:1:106:1:6:true:7:1:7"
         );
     }
 }

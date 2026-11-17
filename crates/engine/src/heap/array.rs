@@ -313,6 +313,50 @@ impl Heap {
         true
     }
 
+    pub(crate) fn shift_array(&self, value: Value) -> Option<Value> {
+        let id = heap_id(value)?;
+        let mut data = self.0.borrow_mut();
+        let indexed_prototypes = data.indexed_prototypes;
+        let array = data.array_mut(id)?;
+        if array.elements.is_empty() {
+            return Some(Value::UNDEFINED);
+        }
+        if indexed_prototypes && array.holes != 0 {
+            return None;
+        }
+        let mut first = array.elements.remove(0);
+        if first == HOLE {
+            array.holes -= 1;
+            first = Value::UNDEFINED;
+        }
+        data.sync(id);
+        Some(first)
+    }
+
+    pub(crate) fn grow_array(&self, value: Value, length: usize) -> bool {
+        if length > MAX_ARRAY_LENGTH {
+            return false;
+        }
+        let mut data = self.0.borrow_mut();
+        let Some(id) = heap_id(value) else {
+            return false;
+        };
+        let Some(array) = data.array_mut(id) else {
+            return false;
+        };
+        let added = length.saturating_sub(array.elements.len());
+        if added == 0 {
+            return true;
+        }
+        if array.elements.try_reserve(added).is_err() {
+            return false;
+        }
+        array.elements.resize(length, HOLE);
+        array.holes += added;
+        data.sync(id);
+        true
+    }
+
     pub(crate) fn truncate(&self, array: Value, length: usize) -> bool {
         let mut data = self.0.borrow_mut();
         let Some(id) = heap_id(array) else {

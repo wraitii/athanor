@@ -18,6 +18,7 @@ impl ArrayMethod {
             Self::ForEach => "forEach",
             Self::Find => "find",
             Self::Push => "push",
+            Self::Reduce => "reduce",
         }
     }
 
@@ -29,6 +30,7 @@ impl ArrayMethod {
             "filter" => Some(Self::Filter),
             "forEach" => Some(Self::ForEach),
             "find" => Some(Self::Find),
+            "reduce" => Some(Self::Reduce),
             _ => None,
         }
     }
@@ -65,7 +67,11 @@ pub(in crate::jit::semantic) fn expand(
             let Some(&callback) = args.first() else {
                 continue;
             };
-            if args
+            if method == ArrayMethod::Reduce {
+                if args.len() < 2 {
+                    continue;
+                }
+            } else if args
                 .get(1)
                 .is_some_and(|&value| !facts.of(value).within(ValueType::UNDEFINED))
             {
@@ -126,18 +132,24 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
         kind: TerminatorKind::Branch(check, Target::new(start), Target::new(fallback)),
     });
     let length = graph.append_value(start, span, Op::Javascript(JsOp::IndexedLength(receiver)));
-    let result_op = match method {
-        ArrayMethod::Map => Op::Javascript(JsOp::NewHoleyArray(length)),
-        ArrayMethod::Filter => Op::Javascript(JsOp::NewArray(Vec::new())),
-        ArrayMethod::Some | ArrayMethod::Every => Op::Javascript(JsOp::Constant(
-            Constant::Boolean(method == ArrayMethod::Every),
-        )),
-        ArrayMethod::ForEach | ArrayMethod::Find => {
-            Op::Javascript(JsOp::Constant(Constant::Undefined))
-        }
-        ArrayMethod::Push => unreachable!(),
-    };
-    let result = graph.append_value(start, span, result_op);
+    let index = graph.add_param(header);
+    let initial = (method == ArrayMethod::Reduce).then(|| args[1]);
+    let accumulator = initial.map(|_| graph.add_param(header));
+    let next_accumulator = initial.map(|_| graph.add_param(advance));
+    let result = accumulator.unwrap_or_else(|| {
+        let result_op = match method {
+            ArrayMethod::Map => Op::Javascript(JsOp::NewHoleyArray(length)),
+            ArrayMethod::Filter => Op::Javascript(JsOp::NewArray(Vec::new())),
+            ArrayMethod::Some | ArrayMethod::Every => Op::Javascript(JsOp::Constant(
+                Constant::Boolean(method == ArrayMethod::Every),
+            )),
+            ArrayMethod::ForEach | ArrayMethod::Find => {
+                Op::Javascript(JsOp::Constant(Constant::Undefined))
+            }
+            ArrayMethod::Push | ArrayMethod::Reduce => unreachable!(),
+        };
+        graph.append_value(start, span, result_op)
+    });
     let zero = graph.append_value(
         start,
         span,
@@ -148,14 +160,13 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
         span,
         Op::Javascript(JsOp::Constant(Constant::Undefined)),
     );
-    let index = graph.add_param(header);
     graph.blocks[start].terminator = Some(Terminator {
         source_name: call.source_name,
         emission_location: None,
         span,
         kind: TerminatorKind::Jump(Target {
             block: header,
-            args: vec![zero],
+            args: std::iter::once(zero).chain(initial).collect(),
         }),
     });
     let more = graph.append_value(
@@ -181,7 +192,10 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
             block: invoke,
             args: vec![undefined],
         },
-        _ => Target::new(advance),
+        _ => Target {
+            block: advance,
+            args: accumulator.into_iter().collect(),
+        },
     };
     let present = Target {
         block: invoke,
@@ -199,12 +213,26 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
         Op::Javascript(JsOp::Call {
             callee: callback,
             receiver: Some(undefined),
-            args: vec![value, index, receiver],
+            args: accumulator
+                .into_iter()
+                .chain([value, index, receiver])
+                .collect(),
             target: None,
         }),
     );
     match method {
         ArrayMethod::Push => unreachable!(),
+        ArrayMethod::Reduce => {
+            graph.blocks[invoke].terminator = Some(Terminator {
+                source_name: call.source_name,
+                emission_location: None,
+                span,
+                kind: TerminatorKind::Jump(Target {
+                    block: advance,
+                    args: vec![mapped],
+                }),
+            });
+        }
         ArrayMethod::ForEach => {
             graph.blocks[invoke].terminator = Some(Terminator {
                 source_name: call.source_name,
@@ -313,7 +341,7 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
         span,
         kind: TerminatorKind::Jump(Target {
             block: header,
-            args: vec![next],
+            args: std::iter::once(next).chain(next_accumulator).collect(),
         }),
     });
     graph.blocks[exit].terminator = Some(Terminator {
