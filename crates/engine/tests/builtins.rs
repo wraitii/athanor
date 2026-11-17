@@ -897,6 +897,27 @@ fn parse_int_handles_radices_prefixes_and_primitive_inputs() {
 }
 
 #[test]
+fn javascript_call_forwards_receiver_arguments_and_exceptions() {
+    assert_eq!(
+        run(r#"function add(a, b) { return this.offset + a + b; }
+    function main() {
+        function missing(a) { return this === undefined && a === undefined; }
+        function throws(value) { throw value; }
+        let caught = false;
+        try { throws.call(null, 17); } catch (e) { caught = e === 17; }
+        let invalid = false;
+        try { Function.prototype.call.call(1, null); } catch (e) { invalid = true; }
+        return add.call === Function.prototype.call && 'call' in Math.max &&
+            Object.keys(Function.prototype).length === 0 &&
+            add.call({offset: 4}, 2, 3) === 9 && missing.call() &&
+            Math.max.call(null, 1, 9, 3) === 9 && caught && invalid;
+    }"#)
+        .unwrap(),
+        Value::TRUE
+    );
+}
+
+#[test]
 fn javascript_apply_preserves_receivers_and_array_like_arguments() {
     assert_eq!(
         run(r#"function sum(a, b) { return this.offset + a + b; }

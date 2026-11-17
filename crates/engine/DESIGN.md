@@ -119,7 +119,8 @@ is required even without optimizations, and the names are not runtime globals.
 Packed calls expose their targets to profiling and guarded inlining. A facility
 for registering handwritten IR bodies is not implemented.
 
-`Function.prototype.apply` is a JS wrapper and argument-list helper. Its ordinary
+`Function.prototype.call` and `Function.prototype.apply` are JS wrappers.
+The latter uses an argument-list helper; its ordinary
 array path avoids an intermediate JS array. Argument lowering forwards fresh,
 unmodified argument arrays directly and sinks materialization to an exclusive
 fallback when needed. Fixed-argument calls can inline functions using `arguments`,

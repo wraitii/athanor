@@ -82,16 +82,18 @@ at `56d6718`. Other results are retained from 2026-11-16.
 | richards | 4204 | 1753 | 2835 | 33057 | 44947 | 51484 | 5454 | 15621 | 1139 |
 | navier-stokes | 23869 | 2370 | 3379 | 27788 | 40096 | 33700 | 20755 | 21390 | 1783 |
 | gaussian-blur | 289 | 12.9 | 19.9 | 229 | 645 | 1282 | 153 | 260 | 7.93 |
+| deltablue | 3253 | 1849 | 3124 | 47307 | 118384 | 77133 | — | 17515 | 1291 |
 
 All scores are medians of three runs, with benchmark processes run sequentially.
 The standard harness warms up each benchmark for one second before measurement.
 All engines produced a Gaussian blur output buffer sum of `2019780`.
+DeltaBlue was measured separately on 2026-11-17 with the `Function.prototype.call`
+change; Ant was unavailable for that run.
 
 Unsupported benchmarks:
 
 | benchmark | first error |
 |-----------|-------------|
-| deltablue | `cannot assign property "inheritsFrom" of undefined` |
 | earley-boyer | `unsupported unary operator in unary expression` |
 
 Additional scores on the same machine, medians of three sequential runs per
@@ -224,6 +226,12 @@ inside it compiles in 101.9 → 97.3 ms (medians of five runs).
 Belgian Uplands generation remains 758 → 758 ms (medians of three runs).
 All six map runs produce `heightHash: dd1de906`,
 `tileIndexHash: 3688e6a0`, and `tilePriorityHash: 3688e6a0`.
+
+### DeltaBlue call support, 2026-11-17
+
+`Function.prototype.call` lets the unmodified DeltaBlue benchmark complete its
+correctness checks. Median scores from three sequential runs per engine are in
+the results table above.
 
 ### Published results
 

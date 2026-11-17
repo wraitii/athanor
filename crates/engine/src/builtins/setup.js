@@ -37,4 +37,13 @@
         }
         return $callSpread(this, thisArg, argumentList(this, arrayLike));
     });
+
+    $defineHidden(Function.prototype, "call", function(thisArg) {
+        if (typeof this !== "function")
+            throw new Error("call requires a callable receiver");
+        const args = [];
+        for (let i = 1; i < arguments.length; ++i)
+            args[i - 1] = arguments[i];
+        return $callSpread(this, thisArg, args);
+    });
 })();
