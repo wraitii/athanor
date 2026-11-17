@@ -17,7 +17,7 @@ pub(super) fn prepare(graph: &mut Graph, conditional: &ConditionalPlan) -> Vec<P
     let numbers = super::propose::numbers(graph);
     super::propose::typed(graph, &numbers);
     let probes = super::propose::identities(graph, conditional);
-    let hints = super::super::observations::numeric_hints(graph);
+    let hints = super::super::observations::type_hints(graph);
     let cfg = Cfg::new(graph);
     let loops = natural_loops(graph, &cfg);
     let insts: Vec<_> = cfg
@@ -47,13 +47,16 @@ pub(super) fn prepare(graph: &mut Graph, conditional: &ConditionalPlan) -> Vec<P
             _ => None,
         };
         let local = match fact {
-            Fact::Type(_) => matches!(
-                hints.get(&value),
-                Some(ReadType::Integer | ReadType::Number)
-            ),
-            Fact::Typed(_) | Fact::Array => true,
+            Fact::Type(ValueType::STRING) => true,
+            Fact::Type(_) => {
+                matches!(
+                    hints.get(&value),
+                    Some(ReadType::Integer | ReadType::Number | ReadType::String)
+                ) && in_loop
+            }
+            Fact::Typed(_) | Fact::Array => in_loop,
             _ => false,
-        } && in_loop;
+        };
         let point = if matches!(fact, Fact::Code(_)) {
             data.block
         } else {

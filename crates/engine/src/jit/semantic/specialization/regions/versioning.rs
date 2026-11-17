@@ -17,6 +17,8 @@ fn retarget(graph: &mut Graph, blocks: &FxHashSet<Block>, from: Value, to: Value
                     | Op::AsNumber(_)
                     | Op::IsInteger(_)
                     | Op::AsInteger(_)
+                    | Op::AsString(_)
+                    | Op::IsString(_)
                     | Op::AsObject(_)
             ) {
                 for value in graph.insts[inst].op.operands_mut() {
@@ -454,16 +456,16 @@ fn entry_checks(
         if entry.is_none() {
             super::super::super::guards::record_entry(graph, value, fact);
         }
-        let check = if fact == Fact::Type(ValueType::INTEGER) {
-            Op::IsInteger(checked)
-        } else {
-            Op::IsNumber(checked)
-        };
+        let check = fact.test(checked).unwrap();
         let check = graph.append_value(current, span, check);
-        let failure = number_failure(
+        let primitive = super::super::observations::primitive_site(graph, checked)
+            .or_else(|| super::super::observations::primitive_site(graph, value));
+        let site = primitive.or_else(|| super::super::observations::numeric_site(graph, value));
+        let failure = type_failure(
             graph,
             checked,
-            super::super::observations::numeric_site(graph, value),
+            site,
+            primitive.is_some(),
             original.clone(),
             span,
         );
@@ -476,7 +478,9 @@ fn entry_checks(
             graph.append_value(
                 current,
                 span,
-                if fact == Fact::Type(ValueType::INTEGER) {
+                if fact == Fact::Type(ValueType::STRING) {
+                    Op::AsString(checked)
+                } else if fact == Fact::Type(ValueType::INTEGER) {
                     Op::AsInteger(checked)
                 } else {
                     Op::AsNumber(checked)
@@ -668,6 +672,7 @@ impl AssumeCfg {
         for inst in insts {
             let data = &graph.insts[inst];
             let (value, required) = match data.op {
+                Op::AsString(value) => (value, Fact::Type(ValueType::STRING)),
                 Op::AsNumber(value) => (value, Fact::Type(ValueType::NUMBER)),
                 Op::AsInteger(value) => (value, Fact::Type(ValueType::INTEGER)),
                 _ => continue,
@@ -711,10 +716,11 @@ impl AssumeCfg {
     }
 }
 
-fn number_failure(
+fn type_failure(
     graph: &mut Graph,
     value: Value,
     site: Option<crate::jit::profile::Site>,
+    primitive: bool,
     fallback: Target,
     span: oxc_span::Span,
 ) -> Target {
@@ -726,7 +732,15 @@ fn number_failure(
     graph.append(
         failure,
         span,
-        Op::Observe(value, Observation::NumberFailure, site),
+        Op::Observe(
+            value,
+            if primitive {
+                Observation::PrimitiveFailure
+            } else {
+                Observation::NumberFailure
+            },
+            site,
+        ),
         false,
     );
     graph.terminate(failure, span, TerminatorKind::Jump(fallback));
@@ -973,7 +987,7 @@ pub(super) fn materialize(
             object: requirement.object,
         })
         .collect();
-    let hints = super::super::observations::numeric_hints(graph);
+    let hints = super::super::observations::type_hints(graph);
     let tested = EntryGuard::at_entry(graph, entry.map_or(graph.entry, |(before, _)| before));
     let mut group = entry_checks(
         graph,
@@ -1024,7 +1038,14 @@ pub(super) fn materialize(
         let first = graph.blocks.len();
         let start = graph.blocks.push(BlockData::default());
         let exit = graph.blocks.push(BlockData::default());
-        let failure = number_failure(graph, value, origin.site, fallback.clone(), data.span);
+        let failure = type_failure(
+            graph,
+            value,
+            origin.site,
+            origin.kind == guards::Kind::Primitive,
+            fallback.clone(),
+            data.span,
+        );
         let check = graph.append_value(
             start,
             data.span,
@@ -1053,7 +1074,9 @@ pub(super) fn materialize(
                 data.block,
                 0,
                 data.span,
-                if types.within(ValueType::INTEGER) {
+                if types == ValueType::STRING {
+                    Op::AsString(value)
+                } else if types.within(ValueType::INTEGER) {
                     Op::AsInteger(value)
                 } else {
                     Op::AsNumber(value)

@@ -509,6 +509,7 @@ pub(super) enum Op {
     ToInt32(Value),
     Unary(UnaryOp, Value),
     Binary(BinaryOperator, Value, Value),
+    StringConcat(Vec<Value>),
     GuardedCompare {
         operator: BinaryOperator,
         left: Value,
@@ -556,6 +557,7 @@ pub(super) enum Op {
     StringSplitParts(Value, Vec<Value>),
     IsTypeof(Value, u8),
     AsNumber(Value),
+    AsString(Value),
     Convert(Value, Repr),
     Box(Value),
     AsBoxed(Value),
@@ -856,6 +858,7 @@ impl Op {
             | Op::Truthy(value)
             | Op::IsStringSplit(value)
             | Op::IsTypeof(value, _)
+            | Op::AsString(value)
             | Op::AsObject(value)
             | Op::AsNumber(value)
             | Op::Convert(value, _)
@@ -937,6 +940,7 @@ impl Op {
             | Op::FillPropertyStore(object, key, _, value, _)
             | Op::SetIndex(object, key, value) => ([Some(*object), Some(*key), Some(*value)], &[]),
             Op::HelperCall { args: values, .. }
+            | Op::StringConcat(values)
             | Op::NewArray(values)
             | Op::CallNative(_, values) => ([None; 3], values),
             Op::StringSplit(receiver, args) | Op::StringSplitParts(receiver, args) => {
@@ -1107,6 +1111,7 @@ impl Op {
             | Op::Truthy(value)
             | Op::IsStringSplit(value)
             | Op::IsTypeof(value, _)
+            | Op::AsString(value)
             | Op::AsObject(value)
             | Op::AsNumber(value)
             | Op::Convert(value, _)
@@ -1188,6 +1193,7 @@ impl Op {
             | Op::FillPropertyStore(object, key, _, value, _)
             | Op::SetIndex(object, key, value) => ([Some(object), Some(key), Some(value)], &mut []),
             Op::HelperCall { args: values, .. }
+            | Op::StringConcat(values)
             | Op::NewArray(values)
             | Op::CallNative(_, values) => ([None, None, None], values),
             Op::StringSplit(receiver, args) | Op::StringSplitParts(receiver, args) => {
@@ -1606,7 +1612,7 @@ impl Graph {
     pub(super) fn caller_rooted(&self, value: Value) -> bool {
         match self.defining_op(value) {
             Some(Op::This | Op::Callee | Op::Argument(_) | Op::Restored(_)) => true,
-            Some(Op::AsObject(source)) => self.caller_rooted(*source),
+            Some(Op::AsObject(source) | Op::AsString(source)) => self.caller_rooted(*source),
             _ => false,
         }
     }
@@ -2003,6 +2009,7 @@ impl Graph {
                 closed(GLOBAL_READ | INTERNAL | ERROR, Borrowed)
             }
             Op::RegExp(..) => closed(ALLOCATION | INTERNAL | ERROR, Owned),
+            Op::StringConcat(_) => closed(HEAP_READ | ALLOCATION | INTERNAL | ERROR, Owned),
             Op::PropertyKey(_) => closed(HEAP_READ | ALLOCATION | INTERNAL | ERROR, Owned),
             Op::GlobalWrite(..) | Op::GlobalInitialize(..) => {
                 closed(GLOBAL_WRITE | INTERNAL | ERROR, None)
@@ -2203,6 +2210,7 @@ impl Graph {
             | Op::SlotStore(_)
             | Op::SlotClear(_)
             | Op::ParamStore(..) => closed(INTERNAL, None),
+            Op::AsString(_) => closed(0, Borrowed),
             Op::AsObject(_) => closed(0, Unowned),
             Op::EnterCaptures(..) => closed(HEAP_READ | INTERNAL | ERROR, None),
             Op::EnterScope(scope) | Op::NextIteration(scope) | Op::FreshIteration(scope) => {

@@ -133,6 +133,7 @@ pub(in crate::jit) const RUNTIME_PASSES: &[&str] = &[
     "indexed-checks",
     "property-caches",
     "js-cleanup",
+    "string-concat",
     "numeric-specialization",
     "js",
     "typed-storage",
@@ -706,6 +707,9 @@ impl FunctionState {
         transforms::remove_trivial_params(&mut self.graph);
         self.graph.verify()?;
         after("js-cleanup", self);
+        js::strings::concatenate(self);
+        self.graph.verify()?;
+        after("string-concat", self);
         if numeric::lower(self) {
             reuse::reuse_loads(self);
             js::simplify(self);

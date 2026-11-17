@@ -36,6 +36,21 @@ impl Heap {
         Some(Value::from_bits(TAG_STRING | id))
     }
 
+    pub(crate) fn concat_string_parts(&self, values: &[Value]) -> Option<Value> {
+        self.drain(64);
+        let mut data = self.0.borrow_mut();
+        let length = values.iter().try_fold(0usize, |length, &value| {
+            length.checked_add(data.string(heap_id(value)?)?.len())
+        })?;
+        let mut text = String::with_capacity(length);
+        for &value in values {
+            text.push_str(data.string(heap_id(value)?)?);
+        }
+        let id = data.reserve()?;
+        data.store(id, Payload::String(text));
+        Some(Value::from_bits(TAG_STRING | id))
+    }
+
     // Appended values are owned by the caller, including partial results on failure.
     pub(crate) fn split_string_into(
         &self,

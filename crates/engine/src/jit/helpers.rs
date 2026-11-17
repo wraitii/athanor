@@ -131,6 +131,8 @@ define_helpers! {
     ObserveIndex => js_observe_index(Value, u64) -> Value;
     ObservePattern => js_observe_pattern(Value, u64) -> Value;
     ObserveNumber => js_observe_number(Value, u64) -> Value;
+    ObservePrimitive => js_observe_primitive(Value, u64) -> Value;
+    ObservePrimitiveFailure => js_observe_primitive_failure(Value, u64) -> Value;
     ObserveNumberFailure => js_observe_number_failure(Value, u64) -> Value;
     SemanticGlobalProbe => js_semantic_global_probe(*mut GlobalCache) -> Value, borrowed;
     SemanticPropertyProbeCached => js_semantic_property_probe_cached(Value, *mut PropertyCache) -> Value, borrowed;
@@ -189,6 +191,7 @@ define_helpers! {
     ShiftRight => js_shift_right(Value, Value) -> Value;
     ShiftRightUnsigned => js_shift_right_unsigned(Value, Value) -> Value;
     Add => js_add(Value, Value) -> Value, owned;
+    StringConcat => js_string_concat(*const Value, u64) -> Value, owned;
     HeapAllocationSite => js_heap_allocation_site(u64) -> Value;
     Sub => js_sub(Value, Value) -> Value;
     Mul => js_mul(Value, Value) -> Value;
@@ -672,6 +675,40 @@ extern "C" fn js_observe_number(ctx: *mut JitCtx, value: Value, cache: u64) -> V
     observe_read(ctx, value, cache, super::profile::ReadKind::Number)
 }
 
+extern "C" fn js_observe_primitive(ctx: *mut JitCtx, value: Value, cache: u64) -> Value {
+    observe_read(ctx, value, cache, super::profile::ReadKind::Primitive)
+}
+
+fn primitive_type(value: Value) -> super::profile::ReadType {
+    use super::profile::ReadType;
+    if value.is_string() {
+        return ReadType::String;
+    }
+    let Some(number) = value.as_number() else {
+        return ReadType::Unknown;
+    };
+    if number.abs() <= 9007199254740991.0
+        && number.trunc() == number
+        && !(number == 0.0 && number.is_sign_negative())
+    {
+        ReadType::Integer
+    } else {
+        ReadType::Number
+    }
+}
+
+extern "C" fn js_observe_primitive_failure(ctx: *mut JitCtx, value: Value, cache: u64) -> Value {
+    let context = unsafe { &*ctx };
+    let cache = unsafe { &mut *(cache as *mut super::profile::ObservationCache) };
+    if cache.complete == 0 {
+        context
+            .engine
+            .tiering
+            .observe_primitive_failure(cache, primitive_type(value));
+    }
+    Value::UNDEFINED
+}
+
 extern "C" fn js_observe_number_failure(ctx: *mut JitCtx, value: Value, cache: u64) -> Value {
     let context = unsafe { &*ctx };
     let cache = unsafe { &mut *(cache as *mut super::profile::ObservationCache) };
@@ -704,7 +741,9 @@ fn observe_read(
     let cache = unsafe { &mut *(cache as *mut super::profile::ObservationCache) };
     if cache.complete == 0 {
         let heap = context.global.heap();
-        let observed = if kind == super::profile::ReadKind::Number {
+        let observed = if kind == super::profile::ReadKind::Primitive {
+            Some(primitive_type(value))
+        } else if kind == super::profile::ReadKind::Number {
             value.as_number().map(|number| {
                 if number.abs() <= 9007199254740991.0
                     && number.trunc() == number

@@ -1,4 +1,5 @@
 use crate::{FxHashMap, FxHashSet};
+use oxc_syntax::operator::BinaryOperator;
 
 use crate::jit::profile::{Observation, ReadKind, ReadType, Site};
 
@@ -45,6 +46,16 @@ pub(in crate::jit::semantic) fn plan(
             _ => None,
         })
         .collect();
+    let primitive_uses: FxHashSet<_> = cfg
+        .rpo
+        .iter()
+        .flat_map(|&block| graph.blocks[block].insts.iter())
+        .filter_map(|&inst| match graph.insts[inst].op {
+            Op::Binary(BinaryOperator::Addition, left, right) => Some([left, right]),
+            _ => None,
+        })
+        .flatten()
+        .collect();
     let numeric_uses = numeric_uses(graph, &cfg);
     let mut numbers = Vec::new();
     for block in cfg.rpo {
@@ -66,8 +77,10 @@ pub(in crate::jit::semantic) fn plan(
             let mut hints = Vec::new();
             if let Some(value) = data.result() {
                 let mut origins = carried.get(&value).cloned().unwrap_or_default();
-                if !origins.iter().any(|(kind, _)| *kind == ReadKind::Number) {
-                    origins.push((ReadKind::Number, site));
+                for kind in [ReadKind::Number, ReadKind::Primitive] {
+                    if !origins.iter().any(|(known, _)| *known == kind) {
+                        origins.push((kind, site));
+                    }
                 }
                 for (kind, mut origin) in origins {
                     if origin.source == 0 {
@@ -77,7 +90,7 @@ pub(in crate::jit::semantic) fn plan(
                         .and_then(|(repository, _)| repository.read_feedback.get(&(origin, kind)))
                     {
                         let observed = if number_first
-                            && kind == ReadKind::Number
+                            && matches!(kind, ReadKind::Number | ReadKind::Primitive)
                             && observed == ReadType::Integer
                         {
                             ReadType::Number
@@ -139,10 +152,19 @@ pub(in crate::jit::semantic) fn plan(
             } else {
                 None
             };
-            let number = if matches!(
-                data.op,
-                Op::Get(..) | Op::GetIndex(..) | Op::ArrayGet(..) | Op::ArrayLoad(..)
-            ) {
+            let primitive = data
+                .result()
+                .filter(|value| {
+                    primitive_uses.contains(value)
+                        && !facts.of(*value).within(ValueType::STRING)
+                        && !facts.of(*value).within(ValueType::NUMBER)
+                })
+                .map(|value| (value, Observation::Read(ReadKind::Primitive)));
+            let number = if primitive.is_none()
+                && matches!(
+                    data.op,
+                    Op::Get(..) | Op::GetIndex(..) | Op::ArrayGet(..) | Op::ArrayLoad(..)
+                ) {
                 data.result()
                     .filter(|value| {
                         numeric_uses.contains(value)
@@ -168,7 +190,9 @@ pub(in crate::jit::semantic) fn plan(
                     false,
                 );
                 graph.insts[hint].source_name = source_name;
-                if kind == ReadKind::Number && observed != ReadType::Unknown {
+                if matches!(kind, ReadKind::Number | ReadKind::Primitive)
+                    && observed != ReadType::Unknown
+                {
                     numbers.push((origin, observed));
                 }
             }
@@ -177,6 +201,7 @@ pub(in crate::jit::semantic) fn plan(
                 (false, before),
                 (true, after),
                 (true, number),
+                (true, primitive),
             ] {
                 let Some((value, kind)) = observation else {
                     continue;
@@ -200,7 +225,12 @@ pub(in crate::jit::semantic) fn plan(
                 {
                     continue;
                 }
-                if observed.is_some() && kind == Observation::Read(ReadKind::Number) {
+                if observed.is_some()
+                    && matches!(
+                        kind,
+                        Observation::Read(ReadKind::Number | ReadKind::Primitive)
+                    )
+                {
                     continue;
                 }
                 let position = graph.blocks[block]
@@ -265,7 +295,7 @@ fn numeric_uses(graph: &Graph, cfg: &Cfg) -> FxHashSet<Value> {
     uses
 }
 
-pub(in crate::jit::semantic) fn numeric_hints(
+pub(in crate::jit::semantic) fn type_hints(
     graph: &Graph,
 ) -> FxHashMap<super::super::Value, ReadType> {
     graph
@@ -273,7 +303,9 @@ pub(in crate::jit::semantic) fn numeric_hints(
         .iter()
         .flat_map(|(_, block)| block.insts.iter())
         .filter_map(|&inst| match graph.insts[inst].op {
-            Op::ReadHint(value, ReadKind::Number, observed, _) => Some((value, observed)),
+            Op::ReadHint(value, ReadKind::Number | ReadKind::Primitive, observed, _) => {
+                Some((value, observed))
+            }
             _ => None,
         })
         .collect()
@@ -283,6 +315,9 @@ pub(in crate::jit::semantic) fn numeric_site(
     graph: &Graph,
     value: super::super::Value,
 ) -> Option<Site> {
+    if let Some(site) = primitive_site(graph, value) {
+        return Some(site);
+    }
     for (_, block) in graph.blocks.iter() {
         for &inst in &block.insts {
             if let Op::ReadHint(candidate, ReadKind::Number, _, site)
@@ -298,7 +333,7 @@ pub(in crate::jit::semantic) fn numeric_site(
         return None;
     };
     let data = &graph.insts[inst];
-    if let Op::AsNumber(input) | Op::AsInteger(input) = data.op {
+    if let Op::AsNumber(input) | Op::AsInteger(input) | Op::AsString(input) = data.op {
         return numeric_site(graph, input);
     }
     Some(Site {
@@ -323,4 +358,19 @@ pub(in crate::jit::semantic) fn read_hints(
             _ => None,
         })
         .collect()
+}
+
+pub(in crate::jit::semantic) fn primitive_site(graph: &Graph, value: Value) -> Option<Site> {
+    for (_, block) in graph.blocks.iter() {
+        for &inst in &block.insts {
+            if let Op::ReadHint(candidate, ReadKind::Primitive, _, site)
+            | Op::Observe(candidate, Observation::Read(ReadKind::Primitive), site) =
+                graph.insts[inst].op
+                && candidate == value
+            {
+                return Some(site);
+            }
+        }
+    }
+    None
 }

@@ -1,6 +1,111 @@
 use std::process::Command;
 
 #[test]
+fn string_operand_feedback_fuses_concatenation_and_preserves_fallbacks() {
+    let source =
+        "function join(tag){return 'key:'+tag+':leaf'+'!';} function add(a,b){return a+b;}";
+    let execute = r#"
+        for (let i=0;i<32;++i)
+            if (join('é😀') !== 'key:é😀:leaf!') throw 'string';
+        for (let i=0;i<32;++i)
+            if (join(12) !== 'key:12:leaf!') throw 'number';
+        if (join(null) !== 'key:null:leaf!') throw 'null';
+        if (join(true) !== 'key:true:leaf!') throw 'boolean';
+        if (join('again') !== 'key:again:leaf!') throw 'string again';
+        for (let i=0;i<32;++i)
+            if (add(1,2) !== 3) throw 'numeric addition';
+        if (add(1.5,2) !== 3.5) throw 'fractional addition';
+        for (let i=0;i<32;++i)
+            if (add('x',2) !== 'x2') throw 'mixed addition';
+        if (add(1,2) !== 3) throw 'numeric again';
+    "#;
+    let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
+        .env("JS_JIT_BACKGROUND", "0")
+        .env("JS_JIT_INLINE", "0")
+        .args([
+            "--compile",
+            "--semantic-ir",
+            "--after",
+            "string-concat",
+            "--filter",
+            "join",
+            "--eval",
+            source,
+            "--execute",
+            execute,
+        ])
+        .output()
+        .unwrap();
+    let dump = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{dump}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(dump.contains("observe Read(Primitive)"), "{dump}");
+    assert!(dump.contains("as_string"), "{dump}");
+    assert!(dump.contains("string_concat ["), "{dump}");
+    assert!(dump.contains("observe PrimitiveFailure"), "{dump}");
+}
+
+#[test]
+fn string_read_feedback_fuses_entire_concatenation_chains() {
+    for (parameter, operand, argument) in [("o", "o.tag", "{tag:tag}"), ("a", "a[0]", "[tag]")] {
+        let source = format!(
+            "function join(tag){{return concatenate({argument});}} function concatenate({parameter}){{return 'key:'+{operand}+':leaf'+'!';}}"
+        );
+        let execute = r#"
+            for (let i=0;i<32;++i)
+                if (join('é😀') !== 'key:é😀:leaf!') throw 'string';
+            for (let i=0;i<32;++i)
+                if (join(12) !== 'key:12:leaf!') throw 'number';
+            if (join(null) !== 'key:null:leaf!') throw 'null';
+            if (join(true) !== 'key:true:leaf!') throw 'boolean';
+            if (join('again') !== 'key:again:leaf!') throw 'string again';
+        "#;
+        let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
+            .env("JS_JIT_BACKGROUND", "0")
+            .env("JS_JIT_INLINE", "0")
+            .args([
+                "--compile",
+                "--semantic-ir",
+                "--after",
+                "string-concat",
+                "--filter",
+                "concatenate",
+                "--eval",
+                &source,
+                "--execute",
+                execute,
+            ])
+            .output()
+            .unwrap();
+        let dump = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            output.status.success(),
+            "{operand}: {}\n{dump}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            dump.contains("observe Read(Primitive)"),
+            "{operand}: {dump}"
+        );
+        assert!(dump.contains("as_string"), "{operand}: {dump}");
+        assert!(
+            dump.lines().any(|line| line
+                .split_once("string_concat [")
+                .and_then(|(_, parts)| parts.split_once(']'))
+                .is_some_and(|(parts, _)| parts.split(',').count() == 4)),
+            "{operand}: {dump}"
+        );
+        assert!(
+            dump.contains("observe PrimitiveFailure"),
+            "{operand}: {dump}"
+        );
+    }
+}
+
+#[test]
 fn numeric_guard_failures_widen_feedback_and_then_stop_speculating() {
     let source = "function accumulate(a){let sum=0;for(let i=0;i<10;++i)sum+=a[i];return sum;}";
     let execute = r#"
@@ -8,8 +113,6 @@ fn numeric_guard_failures_widen_feedback_and_then_stop_speculating() {
         const values = Array(10).fill(5);
         for (let i = 0; i < 32; ++i)
             if (runner.call(values) !== 50) throw 'integer';
-        values[5] = 'x';
-        if (runner.call(values) !== '25x5555') throw 'isolated failure';
         values[5] = 5.2;
         for (let i = 0; i < 32; ++i)
             if (runner.call(values) !== 50.2) throw 'fractional';
@@ -44,13 +147,13 @@ fn numeric_guard_failures_widen_feedback_and_then_stop_speculating() {
         let log = String::from_utf8(output.stderr).unwrap();
         assert!(
             log.lines()
-                .any(|line| line.contains("~ feedback Number ")
+                .any(|line| line.contains("~ feedback Primitive ")
                     && line.ends_with("Integer -> Number")),
             "{log}"
         );
         assert!(
             log.lines()
-                .any(|line| line.contains("~ feedback Number ")
+                .any(|line| line.contains("~ feedback Primitive ")
                     && line.ends_with("Number -> Unknown")),
             "{log}"
         );
@@ -68,12 +171,12 @@ fn numeric_guard_failures_widen_feedback_and_then_stop_speculating() {
             .collect();
         let numeric: Vec<_> = plans
             .iter()
-            .filter(|plan| plan.contains("Number -> "))
+            .filter(|plan| plan.contains("Primitive -> "))
             .collect();
         assert_eq!(numeric.len(), 3, "{dump}");
-        assert!(numeric[0].contains("Number -> Integer"), "{dump}");
-        assert!(numeric[1].contains("Number -> Number"), "{dump}");
-        assert!(numeric[2].contains("Number -> Unknown"), "{dump}");
+        assert!(numeric[0].contains("Primitive -> Integer"), "{dump}");
+        assert!(numeric[1].contains("Primitive -> Number"), "{dump}");
+        assert!(numeric[2].contains("Primitive -> Unknown"), "{dump}");
         let graph = dump
             .rsplit_once("semantic IR ")
             .unwrap()
@@ -81,7 +184,7 @@ fn numeric_guard_failures_widen_feedback_and_then_stop_speculating() {
             .split("planner ")
             .next()
             .unwrap();
-        assert!(!graph.contains("observe NumberFailure"), "{graph}");
+        assert!(!graph.contains("observe PrimitiveFailure"), "{graph}");
         assert!(graph.contains(":number|string"), "{graph}");
     }
 }

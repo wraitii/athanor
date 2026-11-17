@@ -939,11 +939,13 @@ fn result_types(graph: &Graph, op: &Op, facts: &Facts) -> ValueType {
         | Op::IsStringSplit(_)
         | Op::IsTypeof(..) => ValueType::BOOLEAN,
         Op::NewPack | Op::Spread(_) | Op::StringSplitParts(..) => ValueType::PACK,
+        Op::StringConcat(_) => ValueType::STRING,
         Op::StringSplit(..) => ValueType::OBJECT,
         Op::ArrayPosition(_) => ValueType::INT64,
         Op::ToInt32(_) => ValueType::INT32,
         Op::AsInteger(_) => ValueType::INT64,
         Op::NumericFloat(_) | Op::SaturatingInteger(_) => ValueType::NUMBER,
+        Op::AsString(_) => ValueType::STRING,
         Op::AsObject(_) => ValueType::OBJECT,
         Op::AsNumber(value) | Op::ToNumeric(value) | Op::Unary(UnaryOp::Plus, value)
             if facts.of(*value).within(ValueType::NUMBER) =>

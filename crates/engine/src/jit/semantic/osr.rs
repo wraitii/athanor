@@ -88,6 +88,10 @@ impl Feedback {
                     .copied(),
             },
             Observation::Read(kind) => Self::Read(kind, Self::read(repository, site, kind)),
+            Observation::PrimitiveFailure => Self::Read(
+                ReadKind::Primitive,
+                Self::read(repository, site, ReadKind::Primitive),
+            ),
             Observation::NumberFailure => Self::Read(
                 ReadKind::Number,
                 Self::read(repository, site, ReadKind::Number),
@@ -603,7 +607,7 @@ mod tests {
 
     #[test]
     fn numeric_feedback_ignores_first_unknowns_but_keeps_widening() {
-        let graph = graph("function f(xs,n){let sum=0;for(let i=0;i<n;++i)sum+=xs[i];return sum;}");
+        let graph = graph("function f(xs,n){let sum=0;for(let i=0;i<n;++i)sum-=xs[i];return sum;}");
         let original = Plan::discover(&graph, 7).unwrap();
         let site = original.loops[0]
             .opportunities
@@ -929,7 +933,7 @@ mod tests {
             .read_feedback
             .insert((site, ReadKind::Number), ReadType::Integer);
         super::super::specialization::observations::plan(&mut extracted, Some((&repository, 7)));
-        assert!(!super::super::specialization::observations::numeric_hints(&extracted).is_empty());
+        assert!(!super::super::specialization::observations::type_hints(&extracted).is_empty());
         let reads = super::super::specialization::reads::plan(&extracted, &repository, 7);
         assert!(
             reads

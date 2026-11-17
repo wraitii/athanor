@@ -64,6 +64,7 @@ impl Motion for JsMotion {
             for &inst in &graph.blocks[block].insts {
                 let op = &graph.insts[inst].op;
                 let required = match *op {
+                    Op::AsString(value) => Some((value, guards::Fact::Type(ValueType::STRING))),
                     Op::AsNumber(value) => Some((value, guards::Fact::Type(ValueType::NUMBER))),
                     Op::AsInteger(value) => Some((value, guards::Fact::Type(ValueType::INTEGER))),
                     _ => None,
@@ -89,6 +90,7 @@ impl Motion for JsMotion {
                         | Op::Observe(..)
                         | Op::AsNumber(_)
                         | Op::AsInteger(_)
+                        | Op::AsString(_)
                         | Op::AsObject(_)
                 ) && !writes.preserves(graph, inst)
                 {

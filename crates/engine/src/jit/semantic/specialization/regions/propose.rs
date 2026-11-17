@@ -43,7 +43,7 @@ fn numeric_demand(graph: &Graph, cfg: &Cfg, native_calls: &FxHashSet<Inst>) -> F
 pub(in crate::jit::semantic) fn numbers(graph: &mut Graph) -> Vec<(Value, Fact)> {
     let cfg = Cfg::new(graph);
     let facts = Facts::compute(graph);
-    let hints = super::super::observations::numeric_hints(graph);
+    let hints = super::super::observations::type_hints(graph);
     let native_calls: FxHashSet<Inst> = requirements(graph, &cfg.rpo)
         .into_iter()
         .map(|requirement| requirement.call)
@@ -56,10 +56,22 @@ pub(in crate::jit::semantic) fn numbers(graph: &mut Graph) -> Vec<(Value, Fact)>
             let op = &graph.insts[inst].op;
             for (index, value) in op.operands_iter().enumerate() {
                 let integer = hints.get(&value) == Some(&ReadType::Integer);
-                let desired = if integer { ValueType::INTEGER } else { NUMERIC };
+                let string = hints.get(&value) == Some(&ReadType::String);
+                let desired = if string {
+                    ValueType::STRING
+                } else if integer {
+                    ValueType::INTEGER
+                } else {
+                    NUMERIC
+                };
                 let observed = matches!(
                     op,
-                    Op::ReadHint(_, ReadKind::Number, ReadType::Integer | ReadType::Number, _)
+                    Op::ReadHint(
+                        _,
+                        ReadKind::Number | ReadKind::Primitive,
+                        ReadType::Integer | ReadType::Number | ReadType::String,
+                        _
+                    )
                 ) && demanded.contains(&value);
                 if hints.get(&value) == Some(&ReadType::Unknown)
                     || !(numeric_use(op, index)
@@ -72,7 +84,9 @@ pub(in crate::jit::semantic) fn numbers(graph: &mut Graph) -> Vec<(Value, Fact)>
                 {
                     continue;
                 }
-                let fact = Fact::Type(if integer {
+                let fact = Fact::Type(if string {
+                    ValueType::STRING
+                } else if integer {
                     ValueType::INTEGER
                 } else {
                     ValueType::NUMBER
@@ -106,7 +120,11 @@ pub(in crate::jit::semantic) fn numbers(graph: &mut Graph) -> Vec<(Value, Fact)>
             .unwrap();
         let origin = Origin {
             site,
-            kind: Kind::Number,
+            kind: if super::super::observations::primitive_site(graph, value).is_some() {
+                Kind::Primitive
+            } else {
+                Kind::Number
+            },
             gain: 1,
         };
         graph.insert(

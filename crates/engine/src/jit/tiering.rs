@@ -261,6 +261,23 @@ impl Tiering {
         );
     }
 
+    pub(crate) fn observe_primitive_failure(
+        &self,
+        cache: &mut jit::profile::ObservationCache,
+        observed: jit::profile::ReadType,
+    ) {
+        let update =
+            self.profile
+                .borrow_mut()
+                .observe_primitive_failure(cache.owner, cache.site, observed);
+        let site = cache.site;
+        self.apply_feedback(
+            cache,
+            update,
+            format_args!("primitive guard failure site={site} type={observed:?}"),
+        );
+    }
+
     pub(crate) fn observe_shape(
         &self,
         owner: u64,

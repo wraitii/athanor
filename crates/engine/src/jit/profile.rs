@@ -27,6 +27,7 @@ pub(crate) enum ReadKind {
     Receiver,
     Number,
     Pattern,
+    Primitive,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,6 +35,7 @@ pub(crate) enum ReadType {
     Unknown,
     Integer,
     Number,
+    String,
     Array,
     Typed(TypedKind),
     Pattern(crate::regex::PatternRef),
@@ -108,6 +110,7 @@ pub(crate) enum Observation {
     Call,
     Read(ReadKind),
     NumberFailure,
+    PrimitiveFailure,
 }
 
 pub(crate) struct Update {
@@ -281,6 +284,38 @@ impl Profile {
         self.number_first.iter().copied()
     }
 
+    pub(crate) fn observe_primitive_failure(
+        &mut self,
+        owner: u64,
+        site: Site,
+        observed: ReadType,
+    ) -> Update {
+        let key = (site, ReadKind::Primitive);
+        let known = self.reads.get(&key).copied();
+        let policy_changed = known == Some(ReadType::Integer)
+            && observed == ReadType::Number
+            && self.number_first.insert(owner);
+        let merged = match (known, observed) {
+            (None, observed) => observed,
+            (Some(known), observed) if known == observed => known,
+            (Some(ReadType::Integer | ReadType::Number), ReadType::Integer | ReadType::Number) => {
+                ReadType::Number
+            }
+            _ => ReadType::Unknown,
+        };
+        let changed = known != Some(merged);
+        if changed {
+            self.reads.insert(key, merged);
+        }
+        if changed || policy_changed {
+            self.revision += 1;
+        }
+        Update {
+            changed: changed || policy_changed,
+            complete: merged == ReadType::Unknown,
+        }
+    }
+
     pub(crate) fn observe_shape(
         &mut self,
         owner: u64,
@@ -377,6 +412,32 @@ mod tests {
             source: 1,
             start: 0,
             end: 10,
+        }
+    }
+
+    #[test]
+    fn primitive_feedback_widens_numbers_and_rejects_mixed_types() {
+        for initial in [ReadType::Integer, ReadType::String] {
+            let mut profile = Profile::default();
+            profile.observe_get(1, site(), ReadKind::Primitive, initial);
+            assert!(
+                !profile
+                    .observe_primitive_failure(1, site(), initial)
+                    .changed
+            );
+            if initial == ReadType::Integer {
+                let widened = profile.observe_primitive_failure(1, site(), ReadType::Number);
+                assert!(widened.changed && !widened.complete);
+            }
+            let other = if initial == ReadType::String {
+                ReadType::Number
+            } else {
+                ReadType::String
+            };
+            let mixed = profile.observe_primitive_failure(1, site(), other);
+            assert!(mixed.changed && mixed.complete);
+            let repeated = profile.observe_primitive_failure(1, site(), initial);
+            assert!(!repeated.changed && repeated.complete);
         }
     }
 

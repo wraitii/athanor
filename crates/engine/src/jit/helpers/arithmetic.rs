@@ -151,6 +151,24 @@ pub(crate) extern "C" fn js_add(ctx: *mut JitCtx, left: Value, right: Value) -> 
     number_binary(ctx, left, right, |left, right| left + right)
 }
 
+pub(crate) extern "C" fn js_string_concat(
+    ctx: *mut JitCtx,
+    argv: *const Value,
+    argc: u64,
+) -> Value {
+    let ctx = unsafe { &mut *ctx };
+    let values = unsafe { std::slice::from_raw_parts(argv, argc as usize) };
+    match ctx.global.heap().concat_string_parts(values) {
+        Some(value) => value,
+        None => {
+            ctx.error = Some(Box::new(crate::Error::Runtime(
+                "string heap exhausted".into(),
+            )));
+            Value::UNDEFINED
+        }
+    }
+}
+
 pub(crate) extern "C" fn js_sub(ctx: *mut JitCtx, left: Value, right: Value) -> Value {
     number_binary(ctx, left, right, |left, right| left - right)
 }

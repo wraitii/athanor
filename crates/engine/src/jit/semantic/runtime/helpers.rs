@@ -200,6 +200,7 @@ fn select(inst: super::super::Inst, op: &Op, facts: &Facts) -> Option<Call> {
             call(Helper::StringSplit, call_args, true)
         }
         Op::NewArray(args) => call(Helper::ArrayNew, vector(args).into(), true),
+        Op::StringConcat(args) => call(Helper::StringConcat, vector(args).into(), true),
         Op::CellNew(value) => call(Helper::CellNew, boxed(&[*value]), true),
         Op::CellGet(cell) => call(Helper::CellGet, boxed(&[*cell]), true),
         Op::CellSet(cell, value) => call(Helper::CellSet, boxed(&[*cell, *value]), false),

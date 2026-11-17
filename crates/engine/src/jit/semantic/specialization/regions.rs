@@ -502,11 +502,7 @@ fn entry_assumes(
             if !matches!(fact, guards::Fact::Type(_)) {
                 return false;
             }
-            let desired = if fact == guards::Fact::Type(ValueType::INTEGER) {
-                ValueType::INTEGER
-            } else {
-                NUMERIC
-            };
+            let desired = fact.mask().unwrap();
             !facts.of(value).within(desired)
                 && (!inside.contains(&graph.def_block(value)) || probed.contains(&value))
         })

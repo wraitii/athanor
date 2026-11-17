@@ -135,6 +135,9 @@ impl Repository {
             crate::jit::profile::Observation::NumberFailure => self
                 .read_feedback
                 .contains_key(&(site, crate::jit::profile::ReadKind::Number)),
+            crate::jit::profile::Observation::PrimitiveFailure => self
+                .read_feedback
+                .contains_key(&(site, crate::jit::profile::ReadKind::Primitive)),
         }
     }
 

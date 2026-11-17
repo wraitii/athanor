@@ -88,6 +88,7 @@ fn plan_accesses(
                     ReadType::Unknown
                     | ReadType::Integer
                     | ReadType::Number
+                    | ReadType::String
                     | ReadType::Pattern(_) => continue,
                 },
                 guard_number: !types.within(ValueType::NUMBER),

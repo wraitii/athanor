@@ -11,6 +11,7 @@ pub(super) mod intrinsics;
 pub(in crate::jit::semantic) mod memory;
 pub(in crate::jit::semantic) mod regexps;
 pub(in crate::jit::semantic) mod string_split;
+pub(in crate::jit::semantic) mod strings;
 mod typeof_comparisons;
 
 use super::ValueType;

@@ -26,6 +26,7 @@ pub(in crate::jit) enum Fact {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(in crate::jit) enum Kind {
     Number,
+    Primitive,
     Receiver,
     Bound,
     Identity,

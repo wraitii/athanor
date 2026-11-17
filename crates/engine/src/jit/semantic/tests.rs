@@ -55,6 +55,52 @@ fn ops(graph: &Graph) -> Vec<&Op> {
 }
 
 #[test]
+fn string_concatenation_fuses_single_use_chains_without_crossing_effects() {
+    for (source, expected) in [
+        ("function f(a){return 'x'+a+'y'+'z';}", 4),
+        (
+            "function f(a){let prefix='x'+a;return prefix+(prefix+'y');}",
+            0,
+        ),
+        ("function f(a,g){return 'x'+a+(g()+'y');}", 0),
+        ("function f(a){return a+('x'+'y');}", 0),
+    ] {
+        let mut function = canonicalize_graph(lower_source(source).unwrap(), true).unwrap();
+        let argument = function
+            .graph
+            .insts
+            .values()
+            .find_map(|data| matches!(data.op, Op::Argument(0)).then(|| data.result().unwrap()))
+            .unwrap();
+        function.graph.append(
+            function.graph.entry,
+            function.graph.span,
+            Op::EntryAssume(argument, guards::Fact::Type(ValueType::STRING)),
+            true,
+        );
+        function.invalidate_values();
+        js::strings::concatenate(&mut function);
+        let concatenations: Vec<_> = ops(&function.graph)
+            .into_iter()
+            .filter_map(|op| match op {
+                Op::StringConcat(parts) => Some(parts.len()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            concatenations,
+            if expected == 0 {
+                Vec::new()
+            } else {
+                vec![expected]
+            },
+            "{source}"
+        );
+        function.graph.verify().unwrap();
+    }
+}
+
+#[test]
 fn baseline_keeps_generic_property_accesses() {
     let graph =
         lower_source("function f(a, k, v) { a.x = v; return a.y + a[k] + shared; }").unwrap();
@@ -1183,7 +1229,7 @@ fn numeric_observations_skip_conditions_and_receivers() {
     use crate::jit::profile::{Observation, ReadKind};
 
     let source =
-        "function f(a) { if (a.flag) {} let x = a.shared; if (x) {} return a.object.value + x; }";
+        "function f(a) { if (a.flag) {} let x = a.shared; if (x) {} return a.object.value * x; }";
     let mut graph = canonicalize_graph(lower_source(source).unwrap(), true)
         .unwrap()
         .graph;
@@ -1208,7 +1254,7 @@ fn numeric_observations_skip_conditions_and_receivers() {
 fn unsupported_numeric_reads_are_not_observed_again() {
     use crate::jit::profile::{Observation, ReadKind, ReadType, Site};
 
-    let mut graph = lower_source("function f(point){return point.x + 1;}").unwrap();
+    let mut graph = lower_source("function f(point){return point.x * 2;}").unwrap();
     observations::plan(&mut graph, None);
     let (value, site) = ops(&graph)
         .into_iter()
@@ -1229,7 +1275,7 @@ fn unsupported_numeric_reads_are_not_observed_again() {
             .any(|op| matches!(op, Op::Observe(_, Observation::Read(ReadKind::Number), _)))
     );
     assert_eq!(
-        observations::numeric_hints(&graph).get(&value),
+        observations::type_hints(&graph).get(&value),
         Some(&ReadType::Unknown)
     );
     graph.verify().unwrap();

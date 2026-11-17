@@ -90,7 +90,12 @@ impl FunctionCompiler<'_, '_> {
             return;
         };
         use crate::jit::profile::Observation;
-        if !feedback.observations && kind != Observation::NumberFailure {
+        if !feedback.observations
+            && !matches!(
+                kind,
+                Observation::NumberFailure | Observation::PrimitiveFailure
+            )
+        {
             return;
         }
         if !feedback.get_refinement && kind != Observation::Call {
@@ -105,7 +110,9 @@ impl FunctionCompiler<'_, '_> {
             Observation::Read(crate::jit::profile::ReadKind::Receiver) => Helper::ObserveIndex,
             Observation::Read(crate::jit::profile::ReadKind::Number) => Helper::ObserveNumber,
             Observation::Read(crate::jit::profile::ReadKind::Pattern) => Helper::ObservePattern,
+            Observation::Read(crate::jit::profile::ReadKind::Primitive) => Helper::ObservePrimitive,
             Observation::NumberFailure => Helper::ObserveNumberFailure,
+            Observation::PrimitiveFailure => Helper::ObservePrimitiveFailure,
         };
         let address = self.function_data(crate::jit::profile::ObservationCache {
             complete: 0,
@@ -490,7 +497,8 @@ impl FunctionCompiler<'_, '_> {
                             }
                             Op::EntryAssume(..) => Some(self.constant(Value::boolean(true))),
                             Op::Assume(..) => None,
-                            Op::ReadHint(..)
+                            Op::StringConcat(..)
+                            | Op::ReadHint(..)
                             | Op::KeepAlive(..)
                             | Op::View(..)
                             | Op::BooleanAnd(..)
@@ -808,7 +816,7 @@ impl FunctionCompiler<'_, '_> {
                                 self.check_error();
                                 Some(pack)
                             }
-                            Op::AsObject(value) => Some(get(self, *value)),
+                            Op::AsObject(value) | Op::AsString(value) => Some(get(self, *value)),
                             Op::ToNumeric(value) => {
                                 let value = get(self, *value);
                                 Some(ops::to_number(self, value))
