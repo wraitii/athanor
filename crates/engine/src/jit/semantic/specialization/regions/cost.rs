@@ -7,11 +7,6 @@ pub(in crate::jit::semantic) struct Candidate<'a> {
     pub(in crate::jit::semantic) survivors: &'a [(Fact, Origin)],
 }
 
-pub(in crate::jit::semantic) enum Verdict {
-    Open,
-    Skip(String),
-}
-
 impl Candidate<'_> {
     pub(in crate::jit::semantic) fn gain(&self) -> u32 {
         self.survivors
@@ -32,12 +27,5 @@ impl Candidate<'_> {
                 "closed"
             }
         )
-    }
-}
-
-pub(in crate::jit::semantic) fn worth(candidate: &Candidate<'_>) -> Verdict {
-    match candidate.reentry {
-        Some(reason) => Verdict::Skip(reason.to_owned()),
-        None => Verdict::Open,
     }
 }

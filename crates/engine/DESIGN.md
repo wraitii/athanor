@@ -227,6 +227,11 @@ unknown calls must remain conservative. The graph's facts describe what is
 proven on a path, whereas observations describe what has happened at runtime.
 An observation alone cannot justify an unchecked operation.
 
+Region admission does not require every call to have bounded effects. Guard
+placement and motion check dependencies across the destination scope. Unknown
+calls still clobber potentially affected memory, while type facts about an
+available SSA value remain valid across calls.
+
 ## Dialects and regular expressions
 
 The graph infrastructure is meant to host more than one source language. Blocks,
@@ -284,6 +289,7 @@ Validation follows the layers: frontend against `regress`, the standalone
 regex graph against `regress`, and spliced against standalone code. The V8 v7
 RegExp benchmark (`bench/v8-v7/regexp.js`) is the main workload; all but two of
 its 237 executed patterns fit the automaton subset.
+
 
 ## Speculation, recovery and tiering
 

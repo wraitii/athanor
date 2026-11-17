@@ -2,24 +2,6 @@ use super::super::super::guards::{Fact, Origin};
 use super::super::calls::ConditionalCall;
 use super::*;
 
-fn pure_guard(graph: &Graph, block: Block) -> bool {
-    let Some(Terminator {
-        kind: TerminatorKind::Branch(condition, ..),
-        ..
-    }) = &graph.blocks[block].terminator
-    else {
-        return false;
-    };
-    let condition = super::super::super::guards::negated(graph, *condition).unwrap_or(*condition);
-    match graph.defining_op(condition) {
-        None => true,
-        Some(op) => matches!(
-            super::super::super::guards::implies(op),
-            Some((_, Fact::Type(_) | Fact::Typed(_) | Fact::Array))
-        ),
-    }
-}
-
 #[derive(Default)]
 pub(super) struct Candidates {
     pub(super) locals: Vec<Inst>,
@@ -374,9 +356,20 @@ pub(super) fn plan_region(
     let assumes = candidates.facts.clone();
     let numbers = entry_assumes(&planning, &body, &reads, &shared, &assumes);
     let mut guards = invariant_guards(&planning, &body, &blocks, &reads);
-    if reentry.is_some() {
-        guards.retain(|&block| pure_guard(&planning, block));
-    }
+    let writes = Writes::with_facts(&planning, &written, &shared);
+    guards.retain(|&block| {
+        let TerminatorKind::Branch(condition, ..) =
+            planning.blocks[block].terminator.as_ref().unwrap().kind
+        else {
+            return false;
+        };
+        let condition =
+            super::super::super::guards::negated(&planning, condition).unwrap_or(condition);
+        match planning.values[condition] {
+            ValueDef::Result(inst, _) => writes.preserves(&planning, inst),
+            ValueDef::Param(..) => true,
+        }
+    });
     // Candidate facts must not narrow the original graph before its guards execute.
     let assumptions = numbers
         .iter()
@@ -391,10 +384,7 @@ pub(super) fn plan_region(
     let typed = typed_entry(&planning, &body, &available, &facts, &assumes);
     let objects: Vec<Value> = typed.iter().map(|&(object, _)| object).collect();
     let mut bounded = bounded_reads(&planning, &facts.cfg, &body, &objects, &available, &facts);
-    bounded.retain(|_, &mut (object, bound)| {
-        assumes.contains(&(object, Fact::Bound(bound)))
-            && (reentry.is_none() || typed.iter().any(|&(typed, _)| typed == object))
-    });
+    bounded.retain(|_, &mut (object, bound)| assumes.contains(&(object, Fact::Bound(bound))));
     let mut bounds: Vec<_> = bounded.values().copied().collect();
     bounds.sort();
     bounds.dedup();
@@ -423,15 +413,13 @@ pub(super) fn plan_region(
                 }
                 match fact {
                     Fact::Array => true,
-                    Fact::Shape(shape) if reentry.is_none() => {
-                        Access::read(graph, &Op::IsShape(value, shape), &shared)
-                            .is_some_and(|read| !writes.clobbers(&read))
-                    }
-                    Fact::ReadLayout(layout) if reentry.is_none() => {
+                    Fact::Shape(shape) => Access::read(graph, &Op::IsShape(value, shape), &shared)
+                        .is_some_and(|read| !writes.clobbers(&read)),
+                    Fact::ReadLayout(layout) => {
                         Access::read(graph, &Op::IsReadLayout(value, layout), &shared)
                             .is_some_and(|read| !writes.clobbers(&read))
                     }
-                    Fact::Cached(cache, builtins) if reentry.is_none() => {
+                    Fact::Cached(cache, builtins) => {
                         (!body.contains(&planning.def_block(cache)) || available.contains(&cache))
                             && Access::read(
                                 graph,

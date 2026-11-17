@@ -1,7 +1,7 @@
 use super::super::super::guards::Fact;
 use super::super::calls::ConditionalPlan;
 use super::assumptions::Proposal;
-use super::cost::{Candidate, Verdict, worth};
+use super::cost::Candidate;
 use super::hoisting::RecoveryPoint;
 use super::motion::JsMotion;
 use super::rewrites::{Candidates, RegionPlan, plan_region, property_assumptions};
@@ -153,13 +153,7 @@ fn plan(
             reentry: parent.reentry.as_deref(),
             survivors: &parent.survivors,
         };
-        match worth(&cost) {
-            Verdict::Open => notes.push(format!("{label}: gate open: {}", cost.summary())),
-            Verdict::Skip(reason) => {
-                notes.push(format!("{label}: not versioned: {reason}"));
-                continue;
-            }
-        }
+        notes.push(format!("{label}: candidate: {}", cost.summary()));
         let blocks: Vec<_> = known
             .cfg
             .rpo
@@ -218,17 +212,6 @@ fn plan(
         parent.body.extend(candidate.blocks.keys().skip(added));
         let live: FxHashSet<_> = Cfg::new(&candidate).rpo.into_iter().collect();
         parent.body.retain(|block| live.contains(block));
-        if let Some(reason) = closure_failure(
-            &candidate,
-            &parent.body,
-            &guarded_accesses(&parent.requirements, &parent.identities),
-            &FxHashMap::default(),
-        ) {
-            notes.push(format!(
-                "{label}: not versioned: guarded candidate {reason}"
-            ));
-            continue;
-        }
         candidate
             .verify()
             .map_err(|reason| format!("{label}: {reason}"))?;
@@ -400,6 +383,50 @@ mod tests {
         assert!(
             targets.iter().all(|&target| target == generic_entry),
             "{targets:?}"
+        );
+        candidate.verify().unwrap();
+    }
+
+    #[test]
+    fn input_guards_hoist_across_calls_without_hoisting_mutable_reads() {
+        let mut graph = graph(
+            "function f(a,holder,n,g){let s=0;for(let i=0;i<n;++i){g(holder);s+=a*holder.x;}return s;}",
+        );
+        let proposals = super::super::assumptions::prepare(&mut graph, &ConditionalPlan::default());
+        let mut notes = Vec::new();
+        let (candidate, _) = plan(
+            &graph,
+            &ConditionalPlan::default(),
+            &proposals,
+            &mut notes,
+            &Default::default(),
+        )
+        .unwrap();
+        assert!(
+            notes.iter().any(|note| note.starts_with("assumption CFG")),
+            "{notes:?}"
+        );
+        let facts = Facts::compute(&candidate);
+        let operations: Vec<_> = facts
+            .cfg
+            .rpo
+            .iter()
+            .flat_map(|&block| candidate.blocks[block].insts.iter())
+            .copied()
+            .collect();
+        assert!(
+            operations
+                .iter()
+                .any(|&inst| matches!(&candidate.insts[inst].op, Op::Get(_, name) if name == "x"))
+        );
+        assert!(!operations.iter().any(
+            |&inst| matches!(&candidate.insts[inst].op, Op::ProbeProperty(_, name) if name == "x")
+        ));
+        assert!(
+            operations
+                .iter()
+                .any(|&inst| matches!(candidate.insts[inst].op, Op::Call { .. })
+                    && facts.memory(inst).reenters())
         );
         candidate.verify().unwrap();
     }
@@ -1331,15 +1358,29 @@ mod tests {
     }
 
     #[test]
-    fn reentrant_functions_are_not_versioned() {
+    fn input_type_guards_allow_reentrant_functions() {
         let mut graph = graph("function f(g,n){g();return n*2+1;}");
         let mut notes = Vec::new();
         let regions = version(&mut graph, &ConditionalPlan::default(), None, &mut notes).unwrap();
-        assert!(regions.is_empty());
+        assert!(!regions.is_empty());
+        let facts = Facts::compute(&graph);
+        let operations: Vec<_> = facts
+            .cfg
+            .rpo
+            .iter()
+            .flat_map(|&block| graph.blocks[block].insts.iter())
+            .copied()
+            .collect();
         assert!(
-            notes
+            operations
                 .iter()
-                .any(|note| note.starts_with("function: not versioned: reenters"))
+                .any(|&inst| matches!(graph.insts[inst].op, Op::IsNumber(_) | Op::IsInteger(_)))
+        );
+        assert!(
+            operations
+                .iter()
+                .any(|&inst| matches!(graph.insts[inst].op, Op::Call { .. })
+                    && facts.memory(inst).reenters())
         );
         graph.verify().unwrap();
     }
@@ -1350,7 +1391,7 @@ mod tests {
         let mut notes = Vec::new();
         let regions = version(&mut graph, &ConditionalPlan::default(), None, &mut notes).unwrap();
         assert!(!regions.is_empty());
-        assert!(notes.iter().any(|note| note.contains("gate open")));
+        assert!(notes.iter().any(|note| note.contains("candidate:")));
         graph.verify().unwrap();
     }
 }

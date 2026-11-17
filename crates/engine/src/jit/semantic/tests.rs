@@ -1869,7 +1869,10 @@ fn call_variant_contracts_only_lift_entry_guards() {
             vec![(Input::Argument(0), InputFact::Number)],
         ),
         ("function f(x){return x;}", vec![]),
-        ("function f(x, callback){callback();return x*2;}", vec![]),
+        (
+            "function f(x, callback){callback();return x*2;}",
+            vec![(Input::Argument(0), InputFact::Number)],
+        ),
     ] {
         let function = canonicalize_graph(lower_source(source).unwrap(), true).unwrap();
         assert_eq!(

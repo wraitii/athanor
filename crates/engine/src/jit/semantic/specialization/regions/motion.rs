@@ -25,13 +25,6 @@ impl Motion for JsMotion {
             .copied()
             .filter(|block| !graph.cold.contains(block) && !group.blocks.contains(block))
             .collect();
-        if written
-            .iter()
-            .flat_map(|&block| &graph.blocks[block].insts)
-            .any(|&inst| facts.memory(inst).reenters())
-        {
-            return None;
-        }
         let conditions: Vec<_> = group
             .blocks
             .iter()

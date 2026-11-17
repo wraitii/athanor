@@ -168,13 +168,12 @@ pub(in crate::jit::semantic) struct Conflicts {
 
 impl Conflicts {
     pub(in crate::jit::semantic) fn invalidates(&self, guards: &[Access]) -> bool {
-        self.reentry.is_some()
-            || self.writes.writes.iter().any(|(inst, write)| {
-                guards.iter().any(|guard| {
-                    (write.is_unknown() || write.location.intersects(guard.location))
-                        && self.writes.kills(*inst, write, guard)
-                })
+        self.writes.writes.iter().any(|(inst, write)| {
+            guards.iter().any(|guard| {
+                (write.is_unknown() || write.location.intersects(guard.location))
+                    && self.writes.kills(*inst, write, guard)
             })
+        })
     }
 }
 
