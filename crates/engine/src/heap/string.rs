@@ -23,6 +23,19 @@ impl Heap {
         Some(Value::from_bits(TAG_STRING | id))
     }
 
+    pub(crate) fn concat_strings(&self, left: Value, right: Value) -> Option<Value> {
+        self.drain(64);
+        let mut data = self.0.borrow_mut();
+        let left = data.string(heap_id(left)?)?;
+        let right = data.string(heap_id(right)?)?;
+        let mut text = String::with_capacity(left.len().checked_add(right.len())?);
+        text.push_str(left);
+        text.push_str(right);
+        let id = data.reserve()?;
+        data.store(id, Payload::String(text));
+        Some(Value::from_bits(TAG_STRING | id))
+    }
+
     // Appended values are owned by the caller, including partial results on failure.
     pub(crate) fn split_string_into(
         &self,

@@ -633,6 +633,29 @@ fn utf8_strings_use_scalar_indices_and_content_equality() {
 }
 
 #[test]
+fn string_addition_preserves_shared_inputs() {
+    check(
+        r#"
+        function add(a, b) { return a + b; }
+        function main() {
+            let left = 'é😀';
+            let alias = left;
+            let right = 'e\u0301';
+            let result = add(left, right);
+            let doubled = add(left, left);
+            return left === 'é😀' && alias === left && right === 'e\u0301'
+                && result === 'é😀e\u0301' && result.length === 4
+                && doubled === 'é😀é😀' && add('', left) === left
+                && add(right, '') === right && add('', '') === ''
+                && add(1, 2) === 3 && add('x', 1) === 'x1'
+                && add(2, 'x') === '2x';
+        }
+        "#,
+        Value::TRUE,
+    );
+}
+
+#[test]
 fn strings_reject_lone_surrogates() {
     let mut engine = Engine::new().unwrap();
     assert!(

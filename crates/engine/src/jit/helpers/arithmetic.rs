@@ -116,24 +116,29 @@ pub(crate) fn strict_equals(heap: &crate::heap::Heap, left: Value, right: Value)
 pub(crate) extern "C" fn js_add(ctx: *mut JitCtx, left: Value, right: Value) -> Value {
     if left.is_string() || right.is_string() {
         let ctx = unsafe { &mut *ctx };
-        if (left.is_object() && ctx.global.heap().error_text(left).is_none())
-            || (right.is_object() && ctx.global.heap().error_text(right).is_none())
-        {
-            ctx.error = Some(Box::new(crate::Error::Runtime(
-                "object-to-primitive conversion is unsupported".into(),
-            )));
-            return Value::UNDEFINED;
-        }
         let heap = ctx.global.heap();
-        let left = heap
-            .text(left)
-            .or_else(|| heap.error_text(left))
-            .unwrap_or_else(|| left.to_string());
-        let right = heap
-            .text(right)
-            .or_else(|| heap.error_text(right))
-            .unwrap_or_else(|| right.to_string());
-        return match heap.string(&(left + &right)) {
+        let result = if left.is_string() && right.is_string() {
+            heap.concat_strings(left, right)
+        } else {
+            if (left.is_object() && heap.error_text(left).is_none())
+                || (right.is_object() && heap.error_text(right).is_none())
+            {
+                ctx.error = Some(Box::new(crate::Error::Runtime(
+                    "object-to-primitive conversion is unsupported".into(),
+                )));
+                return Value::UNDEFINED;
+            }
+            let left = heap
+                .text(left)
+                .or_else(|| heap.error_text(left))
+                .unwrap_or_else(|| left.to_string());
+            let right = heap
+                .text(right)
+                .or_else(|| heap.error_text(right))
+                .unwrap_or_else(|| right.to_string());
+            heap.string(&(left + &right))
+        };
+        return match result {
             Some(value) => value,
             None => {
                 ctx.error = Some(Box::new(crate::Error::Runtime(
