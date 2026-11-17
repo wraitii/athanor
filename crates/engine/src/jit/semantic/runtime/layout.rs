@@ -51,6 +51,11 @@ pub(in crate::jit) fn object_view<I: Insert>(at: &mut I, word: Value) -> Value {
     view(at, word, object)
 }
 
+pub(in crate::jit) fn string_view<I: Insert>(at: &mut I, word: Value) -> Value {
+    let string = is_string(at, word);
+    view(at, word, string)
+}
+
 pub(in crate::jit) fn heap_view<I: Insert>(at: &mut I, word: Value) -> Value {
     let heap = is_heap(at, word);
     view(at, word, heap)

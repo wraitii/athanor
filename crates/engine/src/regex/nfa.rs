@@ -12,6 +12,9 @@ pub(super) enum State {
     Split(Vec<StateId>),
     Start(StateId),
     End(StateId),
+    WordBoundary { negated: bool, next: StateId },
+    Save { slot: usize, next: StateId },
+    Reset { slots: std::ops::Range<usize>, next: StateId },
     Match,
 }
 
@@ -57,6 +60,21 @@ impl Builder {
             Node::Empty => Ok(next),
             Node::Start => self.push(State::Start(next)),
             Node::End => self.push(State::End(next)),
+            Node::WordBoundary(negated) => self.push(State::WordBoundary {
+                negated: *negated,
+                next,
+            }),
+            Node::Group(index, node) => {
+                let close = self.push(State::Save {
+                    slot: 2 * index - 1,
+                    next,
+                })?;
+                let body = self.node(node, close)?;
+                self.push(State::Save {
+                    slot: 2 * index - 2,
+                    next: body,
+                })
+            }
             Node::Set(set) => self.set(set, next),
             Node::Concat(nodes) => nodes
                 .iter()
@@ -85,25 +103,36 @@ impl Builder {
                 let mut entry = match max {
                     None => {
                         let loop_state = self.push(State::Split(Vec::new()))?;
-                        let body = self.node(node, loop_state)?;
+                        let body = self.iteration(node, loop_state)?;
                         self.states[loop_state as usize] = State::Split(order(body));
                         loop_state
                     }
                     Some(max) => {
                         let mut entry = next;
                         for _ in *min..*max {
-                            let body = self.node(node, entry)?;
+                            let body = self.iteration(node, entry)?;
                             entry = self.push(State::Split(order(body)))?;
                         }
                         entry
                     }
                 };
                 for _ in 0..*min {
-                    entry = self.node(node, entry)?;
+                    entry = self.iteration(node, entry)?;
                 }
                 Ok(entry)
             }
         }
+    }
+
+    fn iteration(&mut self, node: &Node, next: StateId) -> Result<StateId, Unsupported> {
+        let body = self.node(node, next)?;
+        let Some((first, last)) = node.groups() else {
+            return Ok(body);
+        };
+        self.push(State::Reset {
+            slots: 2 * first - 2..2 * last,
+            next: body,
+        })
     }
 
     fn set(&mut self, set: &Set, next: StateId) -> Result<StateId, Unsupported> {

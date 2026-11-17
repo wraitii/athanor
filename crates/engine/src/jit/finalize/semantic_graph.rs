@@ -22,6 +22,8 @@ use super::repr::Operand;
 use crate::jit::semantic::Repr;
 use crate::jit::semantic::contracts::ResultReference;
 use crate::jit::semantic::ownership::{Holder, Plan};
+use crate::jit::semantic::regex;
+use crate::jit::semantic::runtime::layout;
 
 pub(super) struct Context<'a> {
     entry: Block,
@@ -102,6 +104,7 @@ impl FunctionCompiler<'_, '_> {
             Observation::Read(crate::jit::profile::ReadKind::Result) => Helper::ObserveGet,
             Observation::Read(crate::jit::profile::ReadKind::Receiver) => Helper::ObserveIndex,
             Observation::Read(crate::jit::profile::ReadKind::Number) => Helper::ObserveNumber,
+            Observation::Read(crate::jit::profile::ReadKind::Pattern) => Helper::ObservePattern,
             Observation::NumberFailure => Helper::ObserveNumberFailure,
         };
         let address = self.function_data(crate::jit::profile::ObservationCache {
@@ -320,7 +323,12 @@ impl FunctionCompiler<'_, '_> {
                     'lowered: {
                         let result = match &data.op {
                             Op::Aarch64(_) => unreachable!("target operation before selection"),
-                            Op::Regex(_) => unreachable!("regex operation before regex lowering"),
+                            Op::Regex(regex::Op::Class(..)) => {
+                                unreachable!("regex class before regex lowering")
+                            }
+                            Op::Regex(_) => {
+                                break 'lowered self.typed_op(&cx, inst, data, target)?;
+                            }
                             Op::LowLevel(_) => {
                                 return Err(Error::Compile(
                                     "low-level operation reached runtime lowering finalization"
@@ -1082,6 +1090,33 @@ impl FunctionCompiler<'_, '_> {
         Operand::new(clif, self.b.graph.repr(clif))
     }
 
+    fn regex_search(
+        &mut self,
+        subject: LoweredValue,
+        pattern: crate::regex::PatternRef,
+        mode: regex::Mode,
+    ) -> LoweredValue {
+        let word = self.b.as_word(subject);
+        // Speculative hoisting can run the search ahead of its string guard, so non-strings read
+        // as an empty slot.
+        let address = layout::string_view(self.b, word);
+        let flags = MemFlagsData::trusted();
+        let bytes = self
+            .b
+            .ins()
+            .load(self.pointer, flags, address, crate::heap::DATA_OFFSET);
+        let length = self
+            .b
+            .ins()
+            .load(types::I64, flags, address, crate::heap::LENGTH_OFFSET);
+        let from = self.b.ins().iconst(types::I64, 0);
+        let program = pattern
+            .get()
+            .program()
+            .expect("regex expansion requires a compiled program");
+        regex::emit(self.b, &program.dfa, mode, bytes, length, from)
+    }
+
     fn typed_op(
         &mut self,
         cx: &Context<'_>,
@@ -1197,6 +1232,59 @@ impl FunctionCompiler<'_, '_> {
             Op::ArrayKind(..) | Op::IndexedLength(..) | Op::ArrayLoad(..) => {
                 unreachable!("array storage must be lowered before emission")
             }
+            Op::Regex(regex::Op::IsPattern(value, pattern)) => {
+                let object = self.operand(cx, *value).value;
+                let view = self.view(object);
+                let data = self.b.ins().load(
+                    self.pointer,
+                    MemFlagsData::trusted(),
+                    view,
+                    crate::heap::DATA_OFFSET,
+                );
+                boolean(
+                    self.b
+                        .ins()
+                        .icmp_imm_s(IntCC::Equal, data, pattern.address() as i64),
+                )
+            }
+            Op::Regex(regex::Op::Test(subject, pattern)) => {
+                let subject = self.operand(cx, *subject).value;
+                boolean(self.regex_search(subject, *pattern, regex::Mode::Test))
+            }
+            Op::Regex(regex::Op::Exec(regexp, subject, pattern)) => {
+                let regexp = self.operand(cx, *regexp).value;
+                let subject = self.operand(cx, *subject).value;
+                let found = self.regex_search(subject, *pattern, regex::Mode::Search);
+                let missed =
+                    self.b
+                        .ins()
+                        .icmp_imm_s(IntCC::Equal, found, crate::regex::NO_MATCH as i64);
+                let matched = self.b.create_block();
+                let done = self.b.create_block();
+                self.b.append_block_param_repr(done, Repr::Boxed);
+                let null = self.constant(Value::NULL);
+                self.brif(missed, done, &[null.into()], matched, &[]);
+                self.switch(matched);
+                let shift = self.b.ins().iconst(types::I64, 32);
+                let start = self.b.ins().binary(
+                    crate::jit::semantic::low_level::Binary::ShiftRightUnsigned,
+                    found,
+                    shift,
+                );
+                let mask = self.b.ins().iconst(types::I64, u32::MAX as i64);
+                let end = self.b.ins().binary(
+                    crate::jit::semantic::low_level::Binary::And,
+                    found,
+                    mask,
+                );
+                let result =
+                    self.call_helper(Helper::RegExpExecResult, &[regexp, subject, start, end]);
+                self.check_error();
+                self.jump(done, &[result.into()]);
+                self.switch(done);
+                Some(Operand::new(self.b.block_params(done)[0], Repr::Boxed))
+            }
+            Op::Regex(regex::Op::Class(..)) => unreachable!(),
             Op::IsArray(object, layout) => {
                 let view = match self.b.graph.views.get(&inst).copied() {
                     Some(view) => self.operand(cx, view).value,

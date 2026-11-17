@@ -322,10 +322,7 @@ impl Compiler {
             continuations: Vec::new(),
             source_name: (0, 0),
             canonical: Arc::new(
-                super::semantic::specialization::calls::Repository::with_call_options(
-                    options.call_variants,
-                    options.call_specialization,
-                ),
+                super::semantic::specialization::calls::Repository::with_options(&options),
             ),
             module,
             signature,
@@ -514,7 +511,11 @@ impl Compiler {
         Ok(machine)
     }
 
-    pub(crate) fn compile_regex(&mut self, dfa: &crate::regex::Dfa) -> Result<crate::regex::Search, Error> {
+    pub(crate) fn compile_regex(
+        &mut self,
+        dfa: &crate::regex::Dfa,
+        label: &str,
+    ) -> Result<crate::regex::Search, Error> {
         let mut signature = self.module.make_signature();
         for _ in 0..3 {
             signature.params.push(AbiParam::new(types::I64));
@@ -528,6 +529,7 @@ impl Compiler {
             .map_err(|error| Error::Compile(error.to_string()))?;
         let mut graph = super::semantic::regex::matcher(dfa, signature.clone());
         super::semantic::regex::lower(&mut graph);
+        let listing = self.dump_ir.then(|| regex_listing(&mut graph, label));
         self.context.clear();
         self.context.func.signature = signature;
         if self.backend == crate::Backend::Cranelift || self.module.isa().name() != "aarch64" {
@@ -548,7 +550,27 @@ impl Compiler {
         self.module
             .finalize_definitions()
             .map_err(|error| Error::Compile(error.to_string()))?;
-        Ok(unsafe { std::mem::transmute(self.module.get_finalized_function(id)) })
+        let code = self.module.get_finalized_function(id);
+        if let Some(dump) = self.dump.as_mut() {
+            let bytes = unsafe { std::slice::from_raw_parts(code, machine.bytes.len()) };
+            let name = format!("{name} {label}");
+            match listing.map(|listing| dump.listing(&name, &listing)) {
+                Some(Ok((path, mapping))) => {
+                    let mut locations = BTreeMap::from([(0, 1)]);
+                    for range in &machine.locations {
+                        let line = range
+                            .location
+                            .and_then(|location| mapping.get(&location).copied())
+                            .unwrap_or(1);
+                        locations.insert(range.start, line);
+                    }
+                    let locations = locations.into_iter().collect::<Vec<_>>();
+                    dump.record(&name, path.to_str().unwrap_or(""), &locations, bytes);
+                }
+                _ => dump.record(&name, "", &[], bytes),
+            }
+        }
+        Ok(unsafe { std::mem::transmute(code) })
     }
 
     fn entry(&mut self, id: FuncId) -> Result<Entry, Error> {
@@ -2571,6 +2593,25 @@ fn line_at(starts: &[u32], offset: u32) -> u32 {
     starts.partition_point(|&start| start <= offset) as u32
 }
 
+fn regex_listing(graph: &mut super::semantic::Graph, label: &str) -> Vec<(u32, String)> {
+    let insts = graph.insts.keys().collect::<Vec<_>>();
+    for inst in insts {
+        graph.insts[inst].emission_location = Some(graph.inst_location(inst));
+    }
+    let blocks = graph.blocks.keys().collect::<Vec<_>>();
+    for block in blocks {
+        let location = graph.terminator_location(block);
+        if let Some(terminator) = &mut graph.blocks[block].terminator {
+            terminator.emission_location = Some(location);
+        }
+    }
+    let facts = super::semantic::Facts::compute(graph);
+    let lines = graph.listing(&facts).lines();
+    std::iter::once((0, format!("  ;;; REGEX {label}")))
+        .chain(lines.into_iter().map(|(id, _, text)| (id, text)))
+        .collect()
+}
+
 fn ir_lines(
     semantic: &[super::semantic::ListingLine],
     source: &str,
@@ -2931,7 +2972,7 @@ mod regex_tests {
             )
             .unwrap();
             crate::regex::tests::differential(&mut |dfa| {
-                let search = compiler.compile_regex(dfa).unwrap();
+                let search = compiler.compile_regex(dfa, "").unwrap();
                 Box::new(move |text: &str, from: usize| {
                     let found = search(text.as_ptr(), text.len() as u64, from as u64);
                     (found != NO_MATCH).then(|| ((found >> 32) as usize, found as u32 as usize))

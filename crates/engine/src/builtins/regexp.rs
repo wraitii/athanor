@@ -22,7 +22,11 @@ fn next_offset(text: &str, end: usize) -> Option<usize> {
         .map(|character| end + character.len_utf8())
 }
 
-fn match_ranges(pattern: &crate::regex::Pattern, text: &str, global: bool) -> Vec<std::ops::Range<usize>> {
+fn match_ranges(
+    pattern: &crate::regex::Pattern,
+    text: &str,
+    global: bool,
+) -> Vec<std::ops::Range<usize>> {
     let mut ranges = Vec::new();
     let mut offset = 0;
     while let Some(found) = pattern.find(text, offset) {
@@ -108,10 +112,12 @@ pub(super) fn call(
         };
         let found = offset.and_then(|offset| {
             if function == NativeFunction::RegExpTest {
-                return regex.find(text, offset).map(|range| crate::regex::Captures {
-                    range,
-                    groups: Vec::new(),
-                });
+                return regex
+                    .find(text, offset)
+                    .map(|range| crate::regex::Captures {
+                        range,
+                        groups: Vec::new(),
+                    });
             }
             regex.captures(text, offset)
         });
@@ -129,6 +135,29 @@ pub(super) fn call(
     if function == NativeFunction::RegExpTest {
         return Value::boolean(found.is_some());
     }
+    match found {
+        Some(found) => pieces(
+            ctx,
+            input,
+            std::iter::once(Some(found.range)).chain(found.groups),
+        ),
+        None => Value::NULL,
+    }
+}
+
+pub(crate) fn exec_result(
+    ctx: &mut JitCtx,
+    regexp: Value,
+    input: Value,
+    range: std::ops::Range<usize>,
+) -> Value {
+    let heap = ctx.global.heap().clone();
+    let Some(pattern) = heap.regexp_compiled(regexp) else {
+        return fail(ctx, "regular expression method requires a RegExp receiver");
+    };
+    let Some(found) = heap.with_text(input, |text| pattern.captures_at(text, range)) else {
+        return fail(ctx, "regular expression matching requires a string");
+    };
     match found {
         Some(found) => pieces(
             ctx,

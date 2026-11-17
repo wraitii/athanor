@@ -1,6 +1,7 @@
 use oxc_ast::ast::{RegExpFlags, RegExpLiteral, StringLiteral};
 use oxc_ast_visit::Visit;
 
+use super::dfa::is_word;
 use super::{DEAD, Dfa, Flags, Unsupported, compile};
 
 fn find(dfa: &Dfa, text: &str, from: usize) -> Option<(usize, usize)> {
@@ -11,6 +12,8 @@ fn find(dfa: &Dfa, text: &str, from: usize) -> Option<(usize, usize)> {
         }
         let mut state = if start == 0 {
             dfa.start_at_beginning
+        } else if is_word(bytes[start - 1]) {
+            dfa.start_after_word
         } else {
             dfa.start
         };
@@ -23,7 +26,7 @@ fn find(dfa: &Dfa, text: &str, from: usize) -> Option<(usize, usize)> {
                 }
                 break;
             }
-            if dfa.matching[state as usize] {
+            if dfa.matches_before(state, bytes[position]) {
                 last = Some(position);
             }
             state = dfa.next(state, bytes[position]);
@@ -94,19 +97,28 @@ fn check<'a>(
     rng: &mut Rng,
     matcher: &mut dyn FnMut(&Dfa) -> Search<'a>,
 ) -> Result<(), Unsupported> {
-    let dfa = compile(pattern, Flags::from_bits(bits))?.dfa;
-    let search = matcher(&dfa);
+    let program = compile(pattern, Flags::from_bits(bits))?;
+    let search = matcher(&program.dfa);
+    let mut scratch = Default::default();
     let oracle = regress::Regex::with_flags(pattern, crate::heap::regexp_flags(bits)).unwrap();
     for text in inputs(pattern, pool, rng) {
         for from in boundaries(&text) {
-            let expected = oracle
-                .find_from(&text, from)
-                .next()
+            let found = oracle.find_from(&text, from).next();
+            let expected = found
+                .as_ref()
                 .map(|found| (found.range.start, found.range.end));
             assert_eq!(
                 search(&text, from),
                 expected,
                 "/{pattern}/ (flags {bits}) on {text:?} from {from}"
+            );
+            let Some(found) = found else {
+                continue;
+            };
+            assert_eq!(
+                program.captures(&text, found.range.clone(), &mut scratch),
+                Some(found.captures),
+                "groups of /{pattern}/ (flags {bits}) on {text:?} from {from}"
             );
         }
     }
@@ -186,6 +198,29 @@ pub(crate) fn differential<'a>(matcher: &mut dyn FnMut(&Dfa) -> Search<'a>) {
         (r".+", 4),
         (r"[^]", 0),
         (r"\u{1F600}|é", 8),
+        (r"(a)|(b)", 0),
+        (r"(a|(b))+", 0),
+        (r"(?:(a)|b)*c", 0),
+        (r"(\d+)-(\d+)?", 0),
+        (r"^(?:(x)|(y))+$", 0),
+        (r"((a)|(b)){2,3}?(c)?", 0),
+        (r"(a*?)(a*)", 0),
+        (r"(a+|b+)*?(c)", 0),
+        (r"\b", 0),
+        (r"\B", 0),
+        (r"\ba", 0),
+        (r"a\b", 0),
+        (r"\Ba\B", 0),
+        (r"\b\w+\b", 0),
+        (r"(\$a)|(\$a\b)", 0),
+        (r"é\b|\bé", 0),
+        (r"\bB", 1),
+        (r"x\b|y\B|z", 0),
+        (r"(?:\b(a)|a\B)+", 0),
+        (r"a$\b", 0),
+        (r"a$\B", 0),
+        (r"b|a$\b", 0),
+        (r"\w$\b|\W$\B", 0),
     ];
     let patterns = corpus
         .iter()

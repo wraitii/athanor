@@ -20,6 +20,7 @@ use crate::jit::session::JitCtx;
 use crate::value::Value;
 
 pub(crate) use globals::install;
+pub(crate) use regexp::exec_result as regexp_exec_result;
 
 fn arg(args: &[Value], index: usize) -> Value {
     args.get(index).copied().unwrap_or(Value::UNDEFINED)

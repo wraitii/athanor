@@ -93,7 +93,7 @@ impl Tiering {
             return;
         };
         let native = pattern.program().ok().and_then(|program| {
-            match compiler.compile_regex(&program.dfa) {
+            match compiler.compile_regex(&program.dfa, &pattern.reference().to_string()) {
                 Ok(search) => Some((search, program.groups)),
                 Err(error) => {
                     eprintln!("js jit: regular expression compilation failed: {error}");

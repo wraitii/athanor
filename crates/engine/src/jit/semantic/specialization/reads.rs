@@ -85,7 +85,10 @@ fn plan_accesses(
                 element: match observed {
                     ReadType::Typed(kind) => Some(kind),
                     ReadType::Array => None,
-                    ReadType::Unknown | ReadType::Integer | ReadType::Number => continue,
+                    ReadType::Unknown
+                    | ReadType::Integer
+                    | ReadType::Number
+                    | ReadType::Pattern(_) => continue,
                 },
                 guard_number: !types.within(ValueType::NUMBER),
             });

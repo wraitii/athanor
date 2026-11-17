@@ -437,6 +437,8 @@ impl HeapData {
             Payload::SmallObject(object) => (object.values.as_ptr().cast(), object.len as usize),
             Payload::Closure(closure) => closure.properties.raw(),
             Payload::Cell(cell) => (std::ptr::from_ref(&cell.value).cast(), 1),
+            Payload::String(text) => (text.as_ptr(), text.len()),
+            Payload::RegExp(regexp) => (regexp.pattern.reference().address() as *const u8, 0),
             _ => (std::ptr::null(), 0),
         };
     }

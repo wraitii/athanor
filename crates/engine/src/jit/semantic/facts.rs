@@ -926,6 +926,10 @@ fn result_types(graph: &Graph, op: &Op, facts: &Facts) -> ValueType {
         Op::PropertyCache(..) | Op::GlobalCache(..) => ValueType::INT64,
         Op::CanOverwrite(..) => ValueType::BOOLEAN,
         Op::IndexedLength(_) => ValueType::INT64,
+        Op::Regex(super::regex::Op::IsPattern(..) | super::regex::Op::Test(..)) => {
+            ValueType::BOOLEAN
+        }
+        Op::Regex(super::regex::Op::Exec(..)) => ValueType::OBJECT.union(ValueType::NULL),
         Op::ArrayKind(_) => ValueType::INT32,
         Op::IsNumber(_)
         | Op::IsInteger(_)

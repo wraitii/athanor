@@ -26,6 +26,7 @@ pub(crate) enum ReadKind {
     Result,
     Receiver,
     Number,
+    Pattern,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,6 +36,7 @@ pub(crate) enum ReadType {
     Number,
     Array,
     Typed(TypedKind),
+    Pattern(crate::regex::PatternRef),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

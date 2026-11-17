@@ -268,7 +268,8 @@ pub(in crate::jit) fn intrinsic(op: &Op) -> Option<Repr> {
         | Op::IsUndefined(_)
         | Op::IsNullish(_)
         | Op::CanOverwrite(..)
-        | Op::IsArray(..) => Repr::Boolean,
+        | Op::IsArray(..)
+        | Op::Regex(super::regex::Op::IsPattern(..) | super::regex::Op::Test(..)) => Repr::Boolean,
         Op::TypedIndex(
             _,
             _,

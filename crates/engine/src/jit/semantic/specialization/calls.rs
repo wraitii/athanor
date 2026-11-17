@@ -23,6 +23,8 @@ pub(crate) const DEFAULT_RECOMPILE_INLINE_MULTIPLIER: usize = 2;
 pub(in crate::jit) struct Repository {
     pub(in crate::jit) call_variants: bool,
     pub(in crate::jit) call_specialization: bool,
+    pub(in crate::jit) regex_inline: bool,
+    pub(in crate::jit) regex_drop_unused_exec: bool,
     pub(in crate::jit) variants: crate::jit::variants::Registry,
     bodies: FxHashMap<FuncId, Arc<Body>>,
     regions: FxHashSet<FuncId>,
@@ -51,6 +53,8 @@ impl Default for Repository {
         Self {
             call_variants: true,
             call_specialization: true,
+            regex_inline: true,
+            regex_drop_unused_exec: true,
             variants: Default::default(),
             bodies: Default::default(),
             regions: Default::default(),
@@ -106,13 +110,12 @@ impl Repository {
             })
     }
 
-    pub(in crate::jit) fn with_call_options(
-        call_variants: bool,
-        call_specialization: bool,
-    ) -> Self {
+    pub(in crate::jit) fn with_options(options: &crate::EngineOptions) -> Self {
         Self {
-            call_variants,
-            call_specialization,
+            call_variants: options.call_variants,
+            call_specialization: options.call_specialization,
+            regex_inline: options.regex && options.regex_inline,
+            regex_drop_unused_exec: options.regex_drop_unused_exec,
             ..Default::default()
         }
     }

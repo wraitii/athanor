@@ -111,6 +111,22 @@ pub(in crate::jit::semantic) fn plan(
                 }
                 _ => {}
             }
+            let pattern = match &data.op {
+                Op::Call {
+                    callee,
+                    receiver: Some(receiver),
+                    target: None,
+                    ..
+                } if matches!(
+                    graph.defining_op(*callee),
+                    Some(Op::Get(object, name))
+                        if object == receiver && (name == "exec" || name == "test")
+                ) =>
+                {
+                    Some((*receiver, Observation::Read(ReadKind::Pattern)))
+                }
+                _ => None,
+            };
             let after = if matches!(
                 data.op,
                 Op::Get(..) | Op::GetIndex(..) | Op::ArrayGet(..) | Op::ArrayLoad(..)
@@ -156,7 +172,12 @@ pub(in crate::jit::semantic) fn plan(
                     numbers.push((origin, observed));
                 }
             }
-            for (after, observation) in [(false, before), (true, after), (true, number)] {
+            for (after, observation) in [
+                (false, pattern),
+                (false, before),
+                (true, after),
+                (true, number),
+            ] {
                 let Some((value, kind)) = observation else {
                     continue;
                 };

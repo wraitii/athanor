@@ -7,8 +7,8 @@ use super::{
     Block, Contract, FxHashMap, Graph, MemoryFormat, Op as GraphOp, Operands, OperandsMut,
     Ownership, Value,
 };
-use crate::jit::effects::Effects;
-use crate::regex::{DEAD, Dfa, NO_MATCH};
+use crate::jit::effects::{ALLOCATION, ERROR, Effects, HEAP_READ, INTERNAL};
+use crate::regex::{DEAD, Dfa, NO_MATCH, PatternRef};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(in crate::jit) struct ByteSet([u64; 4]);
@@ -44,25 +44,44 @@ impl ByteSet {
 #[derive(Clone, Debug)]
 pub(in crate::jit) enum Op {
     Class(Value, ByteSet),
+    IsPattern(Value, PatternRef),
+    Test(Value, PatternRef),
+    Exec(Value, Value, PatternRef),
 }
 
 impl Op {
     pub(in crate::jit) fn operands(&self) -> Operands<'_> {
         match self {
-            Self::Class(byte, _) => Operands::new([Some(*byte), None, None, None], &[]),
+            Self::Class(value, _) | Self::IsPattern(value, _) | Self::Test(value, _) => {
+                Operands::new([Some(*value), None, None, None], &[])
+            }
+            Self::Exec(regexp, subject, _) => {
+                Operands::new([Some(*regexp), Some(*subject), None, None], &[])
+            }
         }
     }
 
     pub(in crate::jit) fn operands_mut(&mut self) -> OperandsMut<'_> {
         match self {
-            Self::Class(byte, _) => OperandsMut::new([Some(byte), None, None, None], &mut []),
+            Self::Class(value, _) | Self::IsPattern(value, _) | Self::Test(value, _) => {
+                OperandsMut::new([Some(value), None, None, None], &mut [])
+            }
+            Self::Exec(regexp, subject, _) => {
+                OperandsMut::new([Some(regexp), Some(subject), None, None], &mut [])
+            }
         }
     }
 
     pub(in crate::jit) fn contract(&self) -> Contract {
-        Contract {
-            effects: Effects::of(0),
-            result: Ownership::Unowned,
+        match self {
+            Self::Exec(..) => Contract {
+                effects: Effects::of(HEAP_READ | ALLOCATION | INTERNAL | ERROR),
+                result: Ownership::Owned,
+            },
+            _ => Contract {
+                effects: Effects::of(0),
+                result: Ownership::Unowned,
+            },
         }
     }
 
@@ -81,6 +100,11 @@ impl Op {
                     })
                     .collect::<Vec<_>>();
                 format!("regex.class {byte} [{}]", ranges.join(" "))
+            }
+            Self::IsPattern(value, pattern) => format!("regex.is_pattern {value}, {pattern}"),
+            Self::Test(subject, pattern) => format!("regex.test {subject}, {pattern}"),
+            Self::Exec(regexp, subject, pattern) => {
+                format!("regex.exec {regexp}, {subject}, {pattern}")
             }
         }
     }
@@ -118,9 +142,16 @@ pub(in crate::jit) fn lower(graph: &mut Graph) {
     }
 }
 
-struct Matcher<'a, 'g> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(in crate::jit) enum Mode {
+    Search,
+    Test,
+}
+
+struct Matcher<'a, 'b, 'g> {
     dfa: &'a Dfa,
-    builder: Builder<'g>,
+    mode: Mode,
+    builder: &'b mut Builder<'g>,
     subject: Value,
     length: Value,
     states: FxHashMap<u32, Block>,
@@ -129,6 +160,7 @@ struct Matcher<'a, 'g> {
     after: Block,
     found: Block,
     none: Block,
+    exit: Block,
 }
 
 pub(in crate::jit) fn matcher(dfa: &Dfa, signature: Signature) -> Graph {
@@ -138,14 +170,43 @@ pub(in crate::jit) fn matcher(dfa: &Dfa, signature: Signature) -> Graph {
     builder.switch_to_block(entry);
     builder.append_block_params_for_function_params(entry);
     let params = builder.block_params(entry).to_vec();
-    let (subject, length, from) = (params[0], params[1], params[2]);
+    let result = emit(
+        &mut builder,
+        dfa,
+        Mode::Search,
+        params[0],
+        params[1],
+        params[2],
+    );
+    builder.ins().return_(&[result]);
+    drop(builder);
+    graph
+}
+
+pub(in crate::jit) fn emit(
+    builder: &mut Builder<'_>,
+    dfa: &Dfa,
+    mode: Mode,
+    subject: Value,
+    length: Value,
+    from: Value,
+) -> Value {
     let outer = builder.create_block();
     let after = builder.create_block();
     let found = builder.create_block();
     let none = builder.create_block();
+    let exit = builder.create_block();
+    let result = builder.append_block_param(
+        exit,
+        match mode {
+            Mode::Search => types::I64,
+            Mode::Test => types::I8,
+        },
+    );
     builder.ins().jump(outer, &[BlockArg::Value(from)]);
     let mut matcher = Matcher {
         dfa,
+        mode,
         builder,
         subject,
         length,
@@ -155,6 +216,7 @@ pub(in crate::jit) fn matcher(dfa: &Dfa, signature: Signature) -> Graph {
         after,
         found,
         none,
+        exit,
     };
     matcher.outer();
     matcher.after();
@@ -163,11 +225,11 @@ pub(in crate::jit) fn matcher(dfa: &Dfa, signature: Signature) -> Graph {
     while let Some(state) = matcher.pending.pop() {
         matcher.state(state);
     }
-    drop(matcher);
-    graph
+    matcher.builder.switch_to_block(exit);
+    result
 }
 
-impl Matcher<'_, '_> {
+impl Matcher<'_, '_, '_> {
     fn state_block(&mut self, state: u32) -> Block {
         if let Some(&block) = self.states.get(&state) {
             return block;
@@ -182,11 +244,12 @@ impl Matcher<'_, '_> {
     }
 
     fn first_bytes(&self) -> Option<ByteSet> {
-        let starts = [self.dfa.start_at_beginning, self.dfa.start];
-        if starts.iter().any(|&state| {
-            state != DEAD
-                && (self.dfa.matching[state as usize] || self.dfa.matching_at_end[state as usize])
-        }) {
+        let starts = [
+            self.dfa.start_at_beginning,
+            self.dfa.start,
+            self.dfa.start_after_word,
+        ];
+        if starts.iter().any(|&state| self.dfa.may_match(state)) {
             return None;
         }
         let mut first = ByteSet::default();
@@ -205,7 +268,10 @@ impl Matcher<'_, '_> {
         let start = self.builder.append_block_param(outer, types::I64);
         self.builder.switch_to_block(outer);
         let dispatch = self.builder.create_block();
-        let past_end = self.builder.ins().icmp(IntCC::UnsignedGreaterThan, start, self.length);
+        let past_end = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThan, start, self.length);
         let within = self.builder.create_block();
         self.builder
             .ins()
@@ -216,7 +282,9 @@ impl Matcher<'_, '_> {
         let inspect = self.builder.create_block();
         match self.first_bytes() {
             Some(first) => {
-                self.builder.ins().brif(at_end, self.none, &[], inspect, &[]);
+                self.builder
+                    .ins()
+                    .brif(at_end, self.none, &[], inspect, &[]);
                 self.builder.switch_to_block(inspect);
                 let byte = self.load(start);
                 let candidate = self.class(byte, first);
@@ -253,7 +321,23 @@ impl Matcher<'_, '_> {
         self.builder.switch_to_block(first);
         self.enter(beginning, &args);
         self.builder.switch_to_block(later);
-        if elsewhere == DEAD {
+        let after_word = self.dfa.start_after_word;
+        if after_word != elsewhere {
+            let one = self.builder.ins().iconst(types::I64, 1);
+            let previous = self.builder.ins().isub(start, one);
+            let byte = self.load(previous);
+            let mut word = ByteSet::default();
+            for byte in (0..=255u8).filter(|&byte| crate::regex::is_word(byte)) {
+                word.insert(byte);
+            }
+            let is_word = self.class(byte, word);
+            let (word, other) = (self.builder.create_block(), self.builder.create_block());
+            self.builder.ins().brif(is_word, word, &[], other, &[]);
+            self.builder.switch_to_block(word);
+            self.enter(after_word, &args);
+            self.builder.switch_to_block(other);
+        }
+        if elsewhere == DEAD && after_word == DEAD {
             self.builder.ins().jump(self.none, &[]);
             return;
         }
@@ -274,7 +358,18 @@ impl Matcher<'_, '_> {
         let params = self.builder.block_params(block).to_vec();
         let (start, position, last) = (params[0], params[1], params[2]);
         self.builder.switch_to_block(block);
-        let last = if self.dfa.matching[state as usize] {
+        let matching = self.dfa.matching(state);
+        if self.mode == Mode::Test
+            && matching == Some(true)
+            && self.dfa.matching_at_end[state as usize]
+        {
+            self.builder.ins().jump(
+                self.found,
+                &[BlockArg::Value(start), BlockArg::Value(position)],
+            );
+            return;
+        }
+        let last = if matching == Some(true) {
             position
         } else {
             last
@@ -285,9 +380,10 @@ impl Matcher<'_, '_> {
         self.builder.ins().brif(at_end, end, &[], step, &[]);
         self.builder.switch_to_block(end);
         if self.dfa.matching_at_end[state as usize] {
-            self.builder
-                .ins()
-                .jump(self.found, &[BlockArg::Value(start), BlockArg::Value(position)]);
+            self.builder.ins().jump(
+                self.found,
+                &[BlockArg::Value(start), BlockArg::Value(position)],
+            );
         } else {
             self.builder
                 .ins()
@@ -297,27 +393,41 @@ impl Matcher<'_, '_> {
         let byte = self.load(position);
         let one = self.builder.ins().iconst(types::I64, 1);
         let next = self.builder.ins().iadd(position, one);
-        let mut targets: Vec<(u32, ByteSet)> = Vec::new();
+        let mut targets: Vec<(u32, bool, ByteSet)> = Vec::new();
         for value in 0..=255u8 {
             let target = self.dfa.next(state, value);
-            if target == DEAD {
+            let matched = matching.is_none() && self.dfa.matches_before(state, value);
+            if target == DEAD && !matched {
                 continue;
             }
-            match targets.iter_mut().find(|(existing, _)| *existing == target) {
-                Some((_, set)) => set.insert(value),
+            match targets
+                .iter_mut()
+                .find(|(existing, was, _)| (*existing, *was) == (target, matched))
+            {
+                Some((_, _, set)) => set.insert(value),
                 None => {
                     let mut set = ByteSet::default();
                     set.insert(value);
-                    targets.push((target, set));
+                    targets.push((target, matched, set));
                 }
             }
         }
-        let args = [start, next, last].map(BlockArg::Value);
-        for (target, set) in targets {
-            let block = self.state_block(target);
+        for (target, matched, set) in targets {
+            let last = if matched { position } else { last };
             let otherwise = self.builder.create_block();
             let test = self.class(byte, set);
-            self.builder.ins().brif(test, block, &args, otherwise, &[]);
+            if matched && (self.mode == Mode::Test || target == DEAD) {
+                let args = [start, position].map(BlockArg::Value);
+                let exit = match self.mode {
+                    Mode::Test => self.found,
+                    Mode::Search => self.after,
+                };
+                self.builder.ins().brif(test, exit, &args, otherwise, &[]);
+            } else {
+                let block = self.state_block(target);
+                let args = [start, next, last].map(BlockArg::Value);
+                self.builder.ins().brif(test, block, &args, otherwise, &[]);
+            }
             self.builder.switch_to_block(otherwise);
         }
         self.builder
@@ -355,16 +465,28 @@ impl Matcher<'_, '_> {
         let start = self.builder.append_block_param(found, types::I64);
         let end = self.builder.append_block_param(found, types::I64);
         self.builder.switch_to_block(found);
-        let shift = self.builder.ins().iconst(types::I64, 32);
-        let high = self.builder.ins().binary(Binary::ShiftLeft, start, shift);
-        let packed = self.builder.ins().binary(Binary::Or, high, end);
-        self.builder.ins().return_(&[packed]);
+        let result = match self.mode {
+            Mode::Search => {
+                let shift = self.builder.ins().iconst(types::I64, 32);
+                let high = self.builder.ins().binary(Binary::ShiftLeft, start, shift);
+                self.builder.ins().binary(Binary::Or, high, end)
+            }
+            Mode::Test => self.builder.ins().iconst(types::I8, 1),
+        };
+        self.builder
+            .ins()
+            .jump(self.exit, &[BlockArg::Value(result)]);
     }
 
     fn none(&mut self) {
         self.builder.switch_to_block(self.none);
-        let none = self.builder.ins().iconst(types::I64, NO_MATCH as i64);
-        self.builder.ins().return_(&[none]);
+        let result = match self.mode {
+            Mode::Search => self.builder.ins().iconst(types::I64, NO_MATCH as i64),
+            Mode::Test => self.builder.ins().iconst(types::I8, 0),
+        };
+        self.builder
+            .ins()
+            .jump(self.exit, &[BlockArg::Value(result)]);
     }
 
     fn load(&mut self, position: Value) -> Value {

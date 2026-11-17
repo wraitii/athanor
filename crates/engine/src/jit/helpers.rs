@@ -129,6 +129,7 @@ define_helpers! {
     ObserveCall => js_observe_call(Value, u64) -> Value;
     ObserveGet => js_observe_get(Value, u64) -> Value;
     ObserveIndex => js_observe_index(Value, u64) -> Value;
+    ObservePattern => js_observe_pattern(Value, u64) -> Value;
     ObserveNumber => js_observe_number(Value, u64) -> Value;
     ObserveNumberFailure => js_observe_number_failure(Value, u64) -> Value;
     SemanticGlobalProbe => js_semantic_global_probe(*mut GlobalCache) -> Value, borrowed;
@@ -160,6 +161,7 @@ define_helpers! {
     PropertyKey => js_property_key(Value) -> Value, owned;
     StringConstant => js_string_constant(*mut u64, *const u8, u64) -> Value;
     RegExpNew => js_regexp_new(u64, *const u8, u64) -> Value, owned;
+    RegExpExecResult => js_regexp_exec_result(Value, Value, u64, u64) -> Value, owned;
     ArrayNew => js_array_new(*const Value, u64) -> Value, owned;
     Rest => js_rest(*const Value, u64, u64) -> Value, owned;
     IndexGet => js_index_get(Value, Value) -> Value, owned;
@@ -656,6 +658,10 @@ extern "C" fn js_observe_index(ctx: *mut JitCtx, value: Value, cache: u64) -> Va
     observe_read(ctx, value, cache, super::profile::ReadKind::Receiver)
 }
 
+extern "C" fn js_observe_pattern(ctx: *mut JitCtx, value: Value, cache: u64) -> Value {
+    observe_read(ctx, value, cache, super::profile::ReadKind::Pattern)
+}
+
 extern "C" fn js_observe_number(ctx: *mut JitCtx, value: Value, cache: u64) -> Value {
     observe_read(ctx, value, cache, super::profile::ReadKind::Number)
 }
@@ -703,6 +709,9 @@ fn observe_read(
                     super::profile::ReadType::Number
                 }
             })
+        } else if kind == super::profile::ReadKind::Pattern {
+            heap.regexp_compiled(value)
+                .map(|pattern| super::profile::ReadType::Pattern(pattern.reference()))
         } else if heap.is_array(value) {
             Some(super::profile::ReadType::Array)
         } else {
@@ -752,6 +761,21 @@ extern "C" fn js_regexp_new(ctx: *mut JitCtx, flags: u64, ptr: *const u8, len: u
             Value::UNDEFINED
         }
     }
+}
+
+extern "C" fn js_regexp_exec_result(
+    ctx: *mut JitCtx,
+    regexp: Value,
+    input: Value,
+    start: u64,
+    end: u64,
+) -> Value {
+    crate::builtins::regexp_exec_result(
+        unsafe { &mut *ctx },
+        regexp,
+        input,
+        start as usize..end as usize,
+    )
 }
 
 /// Creates a string literal's value on its first execution. The cache keeps the reference for

@@ -50,6 +50,8 @@ pub struct EngineOptions {
     pub recompile_inline_multiplier: usize,
     pub osr: bool,
     pub regex: bool,
+    pub regex_inline: bool,
+    pub regex_drop_unused_exec: bool,
     pub baseline_warmup: u64,
     pub continuations: bool,
     pub generic_first: bool,
@@ -90,6 +92,9 @@ impl Default for EngineOptions {
                 .unwrap_or(jit::DEFAULT_RECOMPILE_INLINE_MULTIPLIER),
             osr: std::env::var("JS_JIT_OSR").as_deref() != Ok("0"),
             regex: std::env::var("JS_JIT_REGEX").as_deref() != Ok("0"),
+            regex_inline: std::env::var("JS_JIT_REGEX_INLINE").as_deref() != Ok("0"),
+            regex_drop_unused_exec: std::env::var("JS_JIT_REGEX_DROP_UNUSED_EXEC").as_deref()
+                != Ok("0"),
             baseline_warmup: std::env::var("JS_JIT_BASELINE_WARMUP")
                 .ok()
                 .and_then(|value| value.parse().ok())

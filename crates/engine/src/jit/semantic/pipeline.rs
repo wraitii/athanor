@@ -8,7 +8,7 @@ use super::specialization::{
 use crate::{FxHashMap, FxHashSet};
 use cranelift_codegen::ir::Type;
 use cranelift_codegen::isa::CallConv;
-use js::{arrays, captures, comparisons, construction, string_split};
+use js::{arrays, captures, comparisons, construction, regexps, string_split};
 use oxc_ast::ast::{Expression, FormalParameters, Statement};
 use oxc_semantic::Scoping;
 use oxc_span::Span;
@@ -176,6 +176,7 @@ pub(in crate::jit) fn lower_low_level(
     pointer: Type,
     after: &mut dyn FnMut(&str, &Graph),
 ) -> Result<()> {
+    super::regex::lower(graph);
     super::runtime::cleanup::lower(graph);
     after("cleanup", graph);
     super::runtime::ownership::lower(graph, ctx, call_conv, pointer);
@@ -319,13 +320,21 @@ struct Expansions {
     arrays: FxHashSet<Inst>,
     constructors: FxHashSet<Inst>,
     splits: FxHashSet<Inst>,
+    regexps: FxHashSet<Inst>,
 }
 
 impl Expansions {
-    fn calls(&mut self, graph: &mut Graph, source: usize, notes: &mut Vec<String>) -> Result<()> {
+    fn calls(
+        &mut self,
+        graph: &mut Graph,
+        bodies: &calls::Repository,
+        source: usize,
+        notes: &mut Vec<String>,
+    ) -> Result<()> {
         js::arguments::lower(graph);
         arrays::expand(graph, source, notes, &mut self.arrays)?;
         string_split::expand(graph, &mut self.splits);
+        regexps::expand(graph, bodies, source, &mut self.regexps);
         Ok(())
     }
 
@@ -368,7 +377,7 @@ pub(super) fn inline_and_plan_inner(
     let mut expansions = Expansions::default();
     if let Some((bodies, source)) = specialization {
         function.invalidate_cfg();
-        expansions.calls(&mut function.graph, source, &mut function.notes)?;
+        expansions.calls(&mut function.graph, bodies, source, &mut function.notes)?;
         let requests = calls::requests(&function.graph, bodies, source, &inline_budget);
         let plan = calls::plan_round(
             &function.graph,
@@ -386,7 +395,7 @@ pub(super) fn inline_and_plan_inner(
         )?;
         js::simplify(&mut function);
         function.invalidate_cfg();
-        expansions.calls(&mut function.graph, source, &mut function.notes)?;
+        expansions.calls(&mut function.graph, bodies, source, &mut function.notes)?;
         function.graph.verify()?;
     }
     function.invalidate_cfg();
@@ -414,7 +423,7 @@ pub(super) fn inline_and_plan_inner(
             )?;
             js::simplify(&mut function);
             function.invalidate_cfg();
-            expansions.calls(&mut function.graph, source, &mut function.notes)?;
+            expansions.calls(&mut function.graph, bodies, source, &mut function.notes)?;
             expansions.constructors(&mut function.graph);
             function.graph.verify()?;
         }

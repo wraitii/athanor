@@ -19,6 +19,8 @@ pub(super) enum Node {
         max: Option<u32>,
         greedy: bool,
     },
+    Group(usize, Box<Node>),
+    WordBoundary(bool),
     Start,
     End,
 }
@@ -26,12 +28,31 @@ pub(super) enum Node {
 impl Node {
     fn nullable(&self) -> bool {
         match self {
-            Self::Empty | Self::Start | Self::End => true,
+            Self::Empty | Self::Start | Self::End | Self::WordBoundary(_) => true,
             Self::Set(_) => false,
             Self::Concat(nodes) => nodes.iter().all(Self::nullable),
             Self::Alternation(nodes) => nodes.iter().any(Self::nullable),
             Self::Repeat { node, min, .. } => *min == 0 || node.nullable(),
+            Self::Group(_, node) => node.nullable(),
         }
+    }
+
+    pub(super) fn groups(&self) -> Option<(usize, usize)> {
+        let children = match self {
+            Self::Empty | Self::Start | Self::End | Self::Set(_) | Self::WordBoundary(_) => {
+                return None;
+            }
+            Self::Concat(nodes) | Self::Alternation(nodes) => nodes.iter().collect(),
+            Self::Repeat { node, .. } => vec![node.as_ref()],
+            Self::Group(index, node) => {
+                let last = node.groups().map_or(*index, |(_, last)| last);
+                return Some((*index, last));
+            }
+        };
+        children
+            .into_iter()
+            .filter_map(Self::groups)
+            .reduce(|(first, _), (_, last)| (first, last))
     }
 }
 
@@ -88,10 +109,19 @@ impl Lowering {
     fn term(&self, term: &Term<'_>) -> Result<Node, Unsupported> {
         match term {
             Term::BoundaryAssertion(assertion) => match assertion.kind {
-                _ if self.flags.multiline => Err(Unsupported("multiline anchor")),
+                BoundaryAssertionKind::Start | BoundaryAssertionKind::End
+                    if self.flags.multiline =>
+                {
+                    Err(Unsupported("multiline anchor"))
+                }
                 BoundaryAssertionKind::Start => Ok(Node::Start),
                 BoundaryAssertionKind::End => Ok(Node::End),
-                _ => Err(Unsupported("word boundary")),
+                _ if self.flags.icase && self.flags.unicode => {
+                    Err(Unsupported("unicode case-insensitive word boundary"))
+                }
+                BoundaryAssertionKind::Boundary => Ok(Node::WordBoundary(false)),
+                BoundaryAssertionKind::NegativeBoundary => Ok(Node::WordBoundary(true)),
+                _ => Err(Unsupported("buffer anchor")),
             },
             Term::LookAroundAssertion(_) => Err(Unsupported("lookaround")),
             Term::Quantifier(quantifier) => {
@@ -133,8 +163,9 @@ impl Lowering {
                 }))
             }
             Term::CapturingGroup(group) => {
-                self.groups.set(self.groups.get() + 1);
-                self.disjunction(&group.body)
+                let index = self.groups.get() + 1;
+                self.groups.set(index);
+                Ok(Node::Group(index, Box::new(self.disjunction(&group.body)?)))
             }
             Term::IgnoreGroup(group) => {
                 if group.modifiers.is_some() {

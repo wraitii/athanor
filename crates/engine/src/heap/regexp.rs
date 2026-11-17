@@ -63,7 +63,7 @@ impl Heap {
             id,
             Payload::RegExp(Box::new(RegExp {
                 pattern: compiled,
-                global: flags & 16 != 0,
+                global: crate::regex::Flags::from_bits(flags).global,
                 last_index: 0.0,
             })),
         );

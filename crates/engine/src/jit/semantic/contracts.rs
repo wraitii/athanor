@@ -195,7 +195,11 @@ fn specific(graph: &Graph, inst: Inst) -> Option<Representations> {
             uses: smallvec![Use::Exact(Repr::Boxed), Use::Exact(Repr::Word)],
             produces: None,
         },
-        Op::IsIndexed(_) | Op::IsOrdinaryArray(_) | Op::IsString(_) | Op::Truthy(_) => {
+        Op::IsIndexed(_)
+        | Op::IsOrdinaryArray(_)
+        | Op::IsString(_)
+        | Op::Truthy(_)
+        | Op::Regex(super::regex::Op::IsPattern(..) | super::regex::Op::Test(..)) => {
             exact(&[Repr::Boxed], Repr::Boolean)
         }
         Op::IsNumber(_) | Op::IsUninitialized(_) | Op::IsUndefined(_) | Op::IsNullish(_) => {
