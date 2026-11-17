@@ -44,9 +44,9 @@ impl Payload {
                 value.properties.visit_values(&mut visit);
                 value.captures.iter().copied().for_each(visit);
             }
+            Self::Native(value) => value.properties.visit_values(&mut visit),
             Self::Vacant
             | Self::Reserved
-            | Self::Native(_)
             | Self::String(_)
             | Self::RegExp(_)
             | Self::TypedArray(_) => {}

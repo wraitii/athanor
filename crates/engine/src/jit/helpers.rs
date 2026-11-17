@@ -854,7 +854,9 @@ extern "C" fn js_instanceof(ctx: *mut JitCtx, value: Value, constructor: Value) 
     if heap.native(constructor) == Some(crate::heap::NativeFunction::Array) {
         return Value::boolean(heap.is_array(value));
     }
-    if heap.closure_code(constructor).is_none() {
+    if heap.closure_code(constructor).is_none()
+        && heap.native(constructor) != Some(crate::heap::NativeFunction::Object)
+    {
         ctx.error = Some(Box::new(crate::Error::Runtime(
             "instanceof requires a supported callable right operand".into(),
         )));

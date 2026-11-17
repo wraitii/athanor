@@ -29,6 +29,7 @@ use arena::*;
 use array::*;
 use function::*;
 use generator::*;
+use natives::*;
 use object::*;
 use properties::*;
 use regexp::*;
@@ -60,6 +61,9 @@ struct HeapData {
     atoms: Atoms,
     shapes: Shapes,
     natives: Vec<(NativeFunction, u64)>,
+    object_prototype: Option<Value>,
+    object_shape: ShapeId,
+    empty_object_shape: ShapeId,
     function_prototype: Option<Value>,
     interned: Vec<(&'static str, u64)>,
     regexp_cache: FxHashMap<(String, u8), Rc<crate::regex::Pattern>>,
@@ -70,7 +74,7 @@ struct HeapData {
 enum Payload {
     Vacant,
     Reserved,
-    Native(NativeFunction),
+    Native(Native),
     String(String),
     Generator(Box<Generator>),
     RegExp(Box<RegExp>),
@@ -236,6 +240,7 @@ impl Heap {
                     Payload::Closure(closure) => {
                         closure.properties.pop().or_else(|| closure.captures.pop())
                     }
+                    Payload::Native(native) => native.properties.pop(),
                     _ => None,
                 };
                 budget -= 1;
@@ -436,6 +441,7 @@ impl HeapData {
             Payload::Object(object) => object.properties.raw(),
             Payload::SmallObject(object) => (object.values.as_ptr().cast(), object.len as usize),
             Payload::Closure(closure) => closure.properties.raw(),
+            Payload::Native(native) => native.properties.raw(),
             Payload::Cell(cell) => (std::ptr::from_ref(&cell.value).cast(), 1),
             Payload::String(text) => (text.as_ptr(), text.len()),
             Payload::RegExp(regexp) => (regexp.pattern.reference().address() as *const u8, 0),
@@ -445,7 +451,9 @@ impl HeapData {
 
     fn store_shaped(&mut self, id: u64, payload: Payload) {
         let root = match &payload {
-            Payload::Closure(_) => self.shapes.closure_root(self.function_prototype),
+            Payload::Closure(_) | Payload::Native(_) => {
+                self.shapes.closure_root(self.function_prototype)
+            }
             _ => self.shapes.root(None),
         };
         self.store(id, payload);

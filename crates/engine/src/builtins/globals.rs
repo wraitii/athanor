@@ -25,6 +25,12 @@ pub(crate) fn install(global: &Environment) -> Result<(), Error> {
         Ok(object)
     };
 
+    let object_prototype = heap.object_without_prototype().ok_or_else(exhausted)?;
+    let installed = heap.install_object_prototype(object_prototype);
+    heap.release(object_prototype);
+    if !installed {
+        return Err(Error::Runtime("cannot install object prototype".into()));
+    }
     let prototype = heap.object().ok_or_else(exhausted)?;
     let installed = heap.install_function_prototype(prototype);
     heap.release(prototype);
@@ -40,6 +46,14 @@ pub(crate) fn install(global: &Environment) -> Result<(), Error> {
     for &(name, methods) in super::NAMESPACES {
         define(name, namespace(methods)?);
     }
+    for &(function, methods) in super::CONSTRUCTOR_METHODS {
+        let constructor = native(function)?;
+        add_methods(constructor, methods)?;
+        heap.release(constructor);
+    }
+    let constructor = native(NativeFunction::Object)?;
+    heap.define_property(constructor, "prototype", object_prototype, false);
+    heap.release(constructor);
     for (name, kind) in [
         ("Uint8Array", TypedKind::Uint8),
         ("Uint16Array", TypedKind::Uint16),

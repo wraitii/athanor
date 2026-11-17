@@ -10,6 +10,9 @@ pub(super) fn call(
     args: &[Value],
 ) -> Value {
     let ctx = unsafe { &mut *ctx };
+    if function == NativeFunction::Object {
+        return construct(ctx, args);
+    }
     let value = arg(args, 0);
     if function == NativeFunction::ObjectFreeze {
         return ctx.retain(value);
@@ -63,6 +66,21 @@ pub(super) fn call(
         heap.release(value);
     }
     match result {
+        Some(value) => value,
+        None => fail(ctx, "heap exhausted"),
+    }
+}
+
+pub(super) fn construct(ctx: *mut JitCtx, args: &[Value]) -> Value {
+    let ctx = unsafe { &mut *ctx };
+    let value = arg(args, 0);
+    if value.is_object() {
+        return ctx.retain(value);
+    }
+    if !value.is_nullish() {
+        return fail(ctx, "Object construction from primitives is unsupported");
+    }
+    match ctx.global.heap().object() {
         Some(value) => value,
         None => fail(ctx, "heap exhausted"),
     }

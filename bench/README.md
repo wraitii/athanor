@@ -109,6 +109,89 @@ All three benchmarks completed successfully in every engine.
 call; string conversion, character/range methods and `parseInt` use Rust
 implementations.
 
+### Compatibility audit, 2026-11-17
+
+Release build `c1a59fa`, default compiler settings, one sequential run per
+benchmark. These scores are smoke checks, not new performance medians:
+
+| benchmark | result |
+|-----------|-------:|
+| richards | 4413 |
+| navier-stokes | 24758 |
+| splay | 4079 |
+| raytrace | 5624 |
+| crypto | 7249 |
+| regexp | 5146 |
+| gaussian-blur | 293 |
+
+DeltaBlue still fails because `Object` is a namespace without a `prototype`.
+Temporary copies that redirect `Object.prototype.inheritsFrom` to
+`Function.prototype.inheritsFrom` and replace `new Object()` with `{}` expose
+another missing builtin: `Function.prototype.call`. Adding a temporary JS
+`call` wrapper around `apply` lets the modified benchmark complete its
+correctness checks and score 2900. This is a diagnostic result, not a passing
+run of the original benchmark or an implementation of Object semantics.
+
+Earley–Boyer first rejects `delete ht[key]` in `sc_rempropBang` at line 131.
+Replacing `delete` with `void` in a temporary copy, solely to probe compilation,
+exposes unsupported `finally` at line 1719. Both language features need work;
+runtime compatibility beyond these compile failures remains unchecked.
+
+Map probes use size 128, seed 0 and two players (`athen`, `brit`), with the same
+shared bootstrap in Athanor and SpiderMonkey. Belgian Uplands completes with
+identical map summaries, including all three hashes and 1137 entities:
+`heightHash: dd1de906`, `tileIndexHash: 3688e6a0`,
+`tilePriorityHash: 3688e6a0`. Generation takes 773 ms in Athanor versus 336 ms
+in SpiderMonkey in this single run.
+
+Several other maps first hit harness or settings gaps shared by both runners:
+`Engine.FileExists` is missing, the default settings omit `Biome` and
+`PlayerPlacement`, and the global `clone` helper is missing for Schwarzwald
+and Caledonian Meadows. Ambush and Mediterranean use imports that the
+bootstrap's script loader does not handle.
+
+With a temporary bootstrap implementing `Engine.FileExists` through directory
+listing, and settings `Biome: "generic/temperate"` and
+`PlayerPlacement: "circle"`, the following engine boundaries become visible:
+
+| maps | Athanor blocker | reference outcome |
+|------|------------------|-------------------|
+| mainland, islands, rivers, ardennes_forest, lake, cantabrian_highlands | Destructuring assignment in `rmbiome/generic/aegean.js` | SpiderMonkey completes |
+| alpine_lakes | Same biome-library destructuring | SpiderMonkey also fails later with undefined terrain under these settings |
+| oasis, northern_lights | Missing `Array.prototype.shift` in `SmoothElevationPainter` | SpiderMonkey completes |
+| latium | Object-to-primitive coercion at `t == tGrass` (line 314) | SpiderMonkey completes |
+| unknown | Object destructuring assignment (line 137) | Default reference run is blocked by missing `Engine.FileExists` |
+| caledonian_meadows | Destructured callback parameter (line 599) | Reference run is blocked by missing `clone` |
+| alpine_valley | Nested yield rejected | Reference probe also fails with undefined terrain |
+
+The biome-library error occurs while loading the generic library, including
+the uncalled Aegean setup function, even when selecting the temperate biome.
+Oasis, Northern Lights and Alpine Valley were probed with the temporary
+bootstrap and explicit biome, before adding the circle placement setting;
+Latium, Unknown and Caledonian Meadows used the original bootstrap and defaults.
+The diagnostic bootstrap and modified benchmark copies are not checked in.
+
+### Object root and constructor check, 2026-11-17
+
+The object root and native Object constructor now let unmodified DeltaBlue
+initialize its object model. Its remaining failure is
+`EqualityConstraint.superConstructor.call(...)`: `Function.prototype.call`
+is still missing. Primitive boxing and specialized builtin prototype chains
+remain outside this change.
+
+All seven previously supported benchmarks complete on the release build.
+A final paired run against `c1a59fa` gives object-churn scores of 3019 → 3121
+and missing-property-read scores of 2491 → 2617. These are single paired
+samples with the standard harness, using synthetic loops that publish each
+allocated object to a global. They are not performance medians.
+
+Allocation caches the default root shape, reuse preserves an unchanged prototype
+reference, and generic misses skip the shared root while its live shape is
+empty. Unknown property atoms skip shaped lookup while retaining dictionary
+lookup. Earlier focused comparisons exposed the extra root traversal cost and
+motivated these paths. Belgian Uplands still produces all three expected hashes
+and 1137 entities. The workspace's 787 Rust tests pass.
+
 ### Allocator loop liveness comparison
 
 Apple Silicon ARM64, 2026-11-17; release builds, baseline `5d919de` versus

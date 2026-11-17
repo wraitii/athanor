@@ -218,6 +218,7 @@ impl HeapData {
             }
             Payload::Object(object) => &object.properties,
             Payload::Closure(closure) => &closure.properties,
+            Payload::Native(native) => &native.properties,
             _ => return None,
         };
         Some(match properties {
@@ -316,10 +317,11 @@ impl HeapData {
                 prototype: object.prototype,
             });
         }
-        let is_closure = matches!(slot.payload, Payload::Closure(_));
+        let is_closure = matches!(slot.payload, Payload::Closure(_) | Payload::Native(_));
         let properties = match &mut slot.payload {
             Payload::Object(object) => &mut object.properties,
             Payload::Closure(closure) => &mut closure.properties,
+            Payload::Native(native) => &mut native.properties,
             _ => unreachable!(),
         };
         if let Properties::Shaped(values) = properties {

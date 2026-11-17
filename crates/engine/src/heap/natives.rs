@@ -1,6 +1,25 @@
 use super::*;
 
+pub(super) struct Native {
+    pub(super) function: NativeFunction,
+    pub(super) properties: Properties,
+}
+
 impl Heap {
+    pub(crate) fn install_object_prototype(&self, prototype: Value) -> bool {
+        let mut data = self.0.borrow_mut();
+        if data.object_prototype.is_some()
+            || heap_id(prototype).and_then(|id| data.object(id)).is_none()
+        {
+            return false;
+        }
+        data.retain(prototype);
+        data.object_prototype = Some(prototype);
+        data.object_shape = data.shapes.root(Some(prototype));
+        data.empty_object_shape = data.shapes.root(None);
+        true
+    }
+
     pub(crate) fn install_function_prototype(&self, prototype: Value) -> bool {
         let mut data = self.0.borrow_mut();
         if data.function_prototype.is_some()
@@ -19,7 +38,13 @@ impl Heap {
             *id
         } else {
             let id = data.reserve()?;
-            data.store(id, Payload::Native(function));
+            data.store_shaped(
+                id,
+                Payload::Native(Native {
+                    function,
+                    properties: Properties::default(),
+                }),
+            );
             data.natives.push((function, id));
             id
         };
@@ -31,7 +56,7 @@ impl Heap {
         let data = self.0.borrow();
         let slot = data.live(heap_id(value)?)?;
         match &slot.payload {
-            Payload::Native(function) => Some(*function),
+            Payload::Native(native) => Some(native.function),
             _ => None,
         }
     }

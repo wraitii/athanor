@@ -87,6 +87,10 @@ macro_rules! define_builtins {
             $(($namespace, &[$(($static_name, NativeFunction::$static),)*]),)*
         ];
 
+        const CONSTRUCTOR_METHODS: &[(NativeFunction, &[(&str, NativeFunction)])] = &[
+            $((NativeFunction::$owner, &[$(($property_name, NativeFunction::$property),)*]),)*
+        ];
+
         pub(crate) fn call(ctx: *mut JitCtx, function: NativeFunction, receiver: Value, args: &[Value]) -> Value {
             match function {
                 $(NativeFunction::$global => $global_call(ctx, function, receiver, args),)*
@@ -114,6 +118,7 @@ define_builtins! {
         Error: "Error" => error::call, new => error::construct;
         Set: "Set" => set::call, new => set::construct;
         Array: "Array" => array::call, new => array::construct;
+        Object: "Object" => object::call, new => object::construct;
         Print: "print" => console::call;
         Function: "Function" => function::call;
         StringConvert: "String" => string::convert;
@@ -127,13 +132,6 @@ define_builtins! {
         "JSON" {
             JsonParse: "parse" => json::call;
             JsonStringify: "stringify" => json::call;
-        }
-        "Object" {
-            ObjectKeys: "keys" => object::call;
-            ObjectValues: "values" => object::call;
-            ObjectGetOwnPropertyNames: "getOwnPropertyNames" => object::call;
-            ObjectFreeze: "freeze" => object::call;
-            ObjectIsFrozen: "isFrozen" => object::call;
         }
         "Date" {
             DateNow: "now" => date::call;
@@ -195,6 +193,13 @@ define_builtins! {
         }
     }
     statics {
+        Object {
+            ObjectKeys: "keys" => object::call;
+            ObjectValues: "values" => object::call;
+            ObjectGetOwnPropertyNames: "getOwnPropertyNames" => object::call;
+            ObjectFreeze: "freeze" => object::call;
+            ObjectIsFrozen: "isFrozen" => object::call;
+        }
         StringConvert {
             StringFromCharCode: "fromCharCode" => string::from_char_code;
         }

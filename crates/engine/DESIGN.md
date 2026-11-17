@@ -127,6 +127,21 @@ boxed `String` construction remain unsupported. Array index writes may grow the
 backing storage with holes, with a 256 MiB limit; assigning a larger `.length`
 remains unsupported.
 
+Ordinary objects share a heap-owned `Object.prototype`, whose own prototype is
+null. Object literals, lazy function prototypes, error objects and constructors
+with a non-object `.prototype` use this root. `Function.prototype` inherits from
+it, so closures and native functions see properties added to the object root.
+Arrays and other specialized payloads retain their existing lookup rules;
+this does not install a full hierarchy of builtin prototypes.
+
+`Object()` and `new Object()` allocate an ordinary object for absent or nullish
+arguments and preserve the identity of object arguments. Primitive boxing is
+unsupported. Native functions have shaped own properties, including writable,
+non-enumerable constructor statics. The Object and Function constructors reject
+assignment to their `prototype` property. The existing Function prototype object
+is still not callable. Ordinary object layout is unchanged, and allocation caches
+the default root shape; cached own-property reads require no prototype traversal.
+
 ### Observable differences
 
 Unicode scalar strings are an intentional semantic choice. Other differences

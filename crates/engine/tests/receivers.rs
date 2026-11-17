@@ -127,6 +127,88 @@ fn constructor_prototypes_preserve_identity_receivers_and_shadowing() {
 }
 
 #[test]
+fn ordinary_objects_and_functions_inherit_the_object_root() {
+    check(
+        "function C() {} function main() {
+            let literal = {}; let instance = new C();
+            Object.prototype.shared = 42;
+            let inherited = literal.shared === 42 && instance.shared === 42 &&
+                C.prototype.shared === 42 && C.shared === 42 && Math.max.shared === 42 &&
+                'shared' in C && 'shared' in Math.max;
+            literal.shared = 7;
+            Object.prototype.shared = 9;
+            let names = []; for (let name in C) names.push(name);
+            return inherited && literal.shared === 7 && instance.shared === 9 &&
+                names.join() === 'shared' && Object.keys(literal).join() === 'shared' &&
+                Object.keys(instance).length === 0 && literal instanceof Object &&
+                C instanceof Object && !(Object.prototype instanceof Object);
+        }",
+        Value::TRUE,
+    );
+}
+
+#[test]
+fn object_constructor_preserves_identity_and_the_intrinsic_root() {
+    check(
+        "function C() {} function main() {
+            let Constructor = Object; let prototype = Object.prototype;
+            prototype.shared = 42;
+            let original = {}; let array = []; let f = function() {};
+            let converted = Object(original) === original && new Object(original) === original &&
+                Object(array) === array && new Object(f) === f;
+            let fresh = Object() !== Object() && Object(null).shared === 42 &&
+                new Object().shared === 42 && new Object(undefined).shared === 42;
+            C.prototype = null;
+            let fallback = new C();
+            Object = function() { return { shared: 7 }; };
+            return converted && fresh && fallback.shared === 42 &&
+                ({}).shared === 42 && new Constructor().shared === 42 &&
+                new Constructor() instanceof Constructor;
+        }",
+        Value::TRUE,
+    );
+}
+
+#[test]
+fn native_constructor_properties_remain_mutable_and_non_enumerable() {
+    check(
+        "function main() {
+            let keys = Object.keys;
+            Object.keys = function() { return 17; };
+            let replaced = Object.keys({}) === 17;
+            Object.keys = keys;
+            Object.extra = { value: 42 };
+            let originalFrom = Array.from;
+            Array.from = function() { return 23; };
+            let changed = Array.from([]) === 23;
+            Array.from = originalFrom;
+            return replaced && changed && typeof Object === 'function' &&
+                Object.keys(Object).join() === 'extra' &&
+                Object.extra.value === 42 && keys({ x: 1 }).join() === 'x' &&
+                Object.getOwnPropertyNames(Object).includes('prototype');
+        }",
+        Value::TRUE,
+    );
+}
+
+#[test]
+fn root_mutations_remain_visible_after_repeated_property_reads() {
+    check(
+        "function read(o) { return o.rootValue; }
+        function main() {
+            let o = {}; let shadowed = { rootValue: undefined };
+            for (let i = 0; i < 256; ++i) if (read(o) !== undefined) return false;
+            Object.prototype.rootValue = { value: 7 };
+            for (let i = 0; i < 256; ++i) if (read(o).value !== 7) return false;
+            Object.prototype.rootValue = { value: 42 };
+            for (let i = 0; i < 256; ++i) if (read(o).value !== 42) return false;
+            return read(shadowed) === undefined;
+        }",
+        Value::TRUE,
+    );
+}
+
+#[test]
 fn instanceof_checks_prototype_identity_and_arrays() {
     check(
         "function A() {} function B() {} function main() { B.prototype = new A(); let b = new B(); let Alias = Array; return b instanceof B && b instanceof A && [] instanceof Alias && !({} instanceof Array) && !(1 instanceof A); }",

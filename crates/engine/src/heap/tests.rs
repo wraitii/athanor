@@ -1,6 +1,25 @@
 use super::*;
 
 #[test]
+fn native_properties_retain_values_and_participate_in_cycle_analysis() {
+    let heap = Heap::default();
+    let native = heap.native_function(NativeFunction::Object).unwrap();
+    let child = heap.object().unwrap();
+    assert!(heap.set_property(native, "child", child));
+    heap.release(child);
+    heap.release(native);
+
+    let stats = heap.cycle_stats();
+    assert_eq!((stats.live, stats.unreachable), (2, 0));
+    assert_eq!(heap.property(native, "child"), Some(child));
+    assert!(heap.set_property(native, "child", Value::UNDEFINED));
+    heap.drain(100);
+    assert!(!heap.valid(child));
+    let stats = heap.cycle_stats();
+    assert_eq!((stats.live, stats.unreachable), (1, 0));
+}
+
+#[test]
 fn cycle_stats_distinguish_rooted_and_unreachable_self_cycles() {
     let heap = Heap::default();
     let object = heap.object().unwrap();

@@ -54,6 +54,10 @@ impl Heap {
         self.object_with_prototype(Value::UNDEFINED)
     }
 
+    pub(crate) fn object_without_prototype(&self) -> Option<Value> {
+        self.allocate_object(None)
+    }
+
     pub(crate) fn has_properties(&self, value: Value) -> bool {
         heap_id(value).is_some_and(|id| self.0.borrow().object(id).is_some())
     }
@@ -67,7 +71,19 @@ impl Heap {
         let id = data.reserve()?;
         data.retain(message);
         data.retain(name);
-        data.store_shaped(id, Payload::SmallObject(SmallObject::new(true)));
+        let prototype = data.object_prototype;
+        if let Some(prototype) = prototype {
+            data.retain(prototype);
+        }
+        let shape = data.object_root(prototype);
+        data.store(
+            id,
+            Payload::SmallObject(SmallObject {
+                prototype,
+                ..SmallObject::new(true)
+            }),
+        );
+        data.slot_mut(id).shape = shape;
         data.put_property(id, "message", message, Some(false));
         data.put_property(id, "name", name, Some(false));
         Some(Value::from_bits(TAG_OBJECT | id))
@@ -82,7 +98,10 @@ impl Heap {
         let (holder, holder_shape, index) = if let Some(index) = data.shapes.get(shape).slot(atom) {
             (0, shape, index)
         } else {
-            let prototype = if data.closure(id).is_some() {
+            let prototype = if matches!(
+                data.live(id)?.payload,
+                Payload::Closure(_) | Payload::Native(_)
+            ) {
                 // Closures share shapes even when only some have a lazy own prototype.
                 if name == "prototype" {
                     return None;
@@ -220,11 +239,14 @@ impl Heap {
                     PropertyRead::Value(data.function_property_atom(name, atom))
                 });
             }
-            Payload::Native(function) => {
-                if *function == NativeFunction::Function && name == "prototype" {
+            Payload::Native(native) => {
+                if let Some(value) = data.properties(heap_id(receiver)?)?.get_atom(name, atom) {
+                    return Some(PropertyRead::Value(value));
+                }
+                if native.function == NativeFunction::Function && name == "prototype" {
                     return Some(PropertyRead::Value(data.function_prototype?));
                 }
-                match function.static_method(name) {
+                match native.function.static_method(name) {
                     Some(function) => function,
                     None => {
                         return Some(PropertyRead::Value(data.function_property_atom(name, atom)));
@@ -293,7 +315,12 @@ impl Heap {
             self.release(prototype);
         }
         let data = self.0.borrow();
-        if data.closure(id).is_some() {
+        if data.closure(id).is_some() || matches!(data.live(id)?.payload, Payload::Native(_)) {
+            if matches!(data.live(id)?.payload, Payload::Native(ref native) if native.function == NativeFunction::Function)
+                && name == "prototype"
+            {
+                return data.function_prototype;
+            }
             return Some(
                 data.properties(id)?
                     .get(name)
@@ -398,21 +425,30 @@ impl Heap {
             return false;
         };
         let mut data = self.0.borrow_mut();
-        let supported = data.object(id).is_some() || data.closure(id).is_some();
-        if !supported || !data.retain(value) {
-            return false;
-        }
-        let enumerable = if enumerable.is_none()
-            && name == "prototype"
-            && data
-                .closure(id)
-                .is_some_and(|closure| closure.constructable)
-            && !data.properties(id).unwrap().contains_key(name)
-        {
-            Some(false)
+        let enumerable = if enumerable.is_none() && name == "prototype" {
+            match data.live(id).map(|slot| &slot.payload) {
+                Some(Payload::Native(native))
+                    if matches!(
+                        native.function,
+                        NativeFunction::Object | NativeFunction::Function
+                    ) =>
+                {
+                    return false;
+                }
+                Some(Payload::Closure(closure))
+                    if closure.constructable
+                        && !data.properties(id).unwrap().contains_key(name) =>
+                {
+                    Some(false)
+                }
+                _ => enumerable,
+            }
         } else {
             enumerable
         };
+        if data.properties(id).is_none() || !data.retain(value) {
+            return false;
+        }
         let old = match cache {
             Some(cache) => {
                 let atom = cache.atom(self, &mut data, name);
@@ -529,10 +565,11 @@ impl Heap {
                     || data.function_has_property(name)
             });
         }
-        if let Payload::Native(function) = &data.live(id)?.payload {
+        if let Payload::Native(native) = &data.live(id)?.payload {
             return Some(
-                function.static_method(name).is_some()
-                    || (*function == NativeFunction::Function && name == "prototype")
+                data.properties(id)?.contains_key(name)
+                    || native.function.static_method(name).is_some()
+                    || (native.function == NativeFunction::Function && name == "prototype")
                     || data.function_has_property(name),
             );
         }
@@ -585,10 +622,7 @@ impl Heap {
     pub(crate) fn inherits(&self, value: Value, prototype: Value) -> bool {
         let data = self.0.borrow();
         let mut current = value;
-        while let Some(object) = heap_id(current).and_then(|id| data.object(id)) {
-            let Some(parent) = object.prototype else {
-                return false;
-            };
+        while let Some(parent) = data.enumeration_prototype(current) {
             if parent == prototype {
                 return true;
             }
@@ -612,17 +646,31 @@ impl Heap {
     }
 
     pub(crate) fn object_with_prototype(&self, prototype: Value) -> Option<Value> {
-        let prototype = prototype.is_object().then_some(prototype);
-        if let Some(id) = self.0.borrow_mut().reuse_object(prototype) {
-            return Some(Value::from_bits(TAG_OBJECT | id));
-        }
+        self.allocate_object(Some(prototype))
+    }
+
+    fn allocate_object(&self, prototype: Option<Value>) -> Option<Value> {
+        let prototype = {
+            let mut data = self.0.borrow_mut();
+            let prototype = prototype.and_then(|value| {
+                if value.is_object() {
+                    Some(value)
+                } else {
+                    data.object_prototype
+                }
+            });
+            if let Some(id) = data.reuse_object(prototype) {
+                return Some(Value::from_bits(TAG_OBJECT | id));
+            }
+            prototype
+        };
         self.drain(64);
         let mut data = self.0.borrow_mut();
         let id = data.reserve()?;
         if let Some(prototype) = prototype {
             data.retain(prototype);
         }
-        let root = data.shapes.root(prototype);
+        let root = data.object_root(prototype);
         data.store(
             id,
             Payload::SmallObject(SmallObject {
@@ -684,10 +732,25 @@ pub(crate) struct CachedProperty {
 
 impl HeapData {
     fn function_has_property(&self, name: &str) -> bool {
-        self.function_prototype
-            .and_then(heap_id)
-            .and_then(|id| self.properties(id))
-            .is_some_and(|properties| properties.contains_key(name))
+        let Some(mut id) = self.function_prototype.and_then(heap_id) else {
+            return false;
+        };
+        loop {
+            if self
+                .properties(id)
+                .is_some_and(|properties| properties.contains_key(name))
+            {
+                return true;
+            }
+            let Some(parent) = self
+                .object(id)
+                .and_then(|object| object.prototype)
+                .and_then(heap_id)
+            else {
+                return false;
+            };
+            id = parent;
+        }
     }
 
     fn function_property_atom(&self, name: &str, atom: Option<Atom>) -> Value {
@@ -713,10 +776,7 @@ impl HeapData {
             };
             self.release(value);
         }
-        let root = self.shapes.root(prototype);
-        if let Some(prototype) = prototype {
-            self.retain(prototype);
-        }
+        let root = self.object_root(prototype);
         let slot = self.slot_mut(id);
         let Payload::SmallObject(object) = &mut slot.payload else {
             unreachable!();
@@ -727,8 +787,13 @@ impl HeapData {
         slot.shape = root;
         slot.code = 0;
         slot.length = 0;
-        if let Some(prototype) = previous {
-            self.release(prototype);
+        if previous != prototype {
+            if let Some(prototype) = prototype {
+                self.retain(prototype);
+            }
+            if let Some(previous) = previous {
+                self.release(previous);
+            }
         }
         Some(id)
     }
@@ -737,25 +802,43 @@ impl HeapData {
         Some(self.live(id)?.shape).filter(|&shape| shape != NO_SHAPE && shape != DICTIONARY)
     }
 
+    fn object_root(&mut self, prototype: Option<Value>) -> ShapeId {
+        if prototype.is_some() && prototype == self.object_prototype {
+            return self.object_shape;
+        }
+        self.shapes.root(prototype)
+    }
+
     pub(super) fn object_property(&self, id: u64, name: &str) -> Option<Value> {
         self.object_property_atom(id, name, self.atoms.find(name))
     }
 
     fn object_property_atom(&self, mut id: u64, name: &str, atom: Option<Atom>) -> Option<Value> {
         loop {
-            if let Some(value) = self.properties(id)?.get_atom(name, atom) {
+            if (atom.is_some() || self.live(id)?.shape == DICTIONARY)
+                && let Some(value) = self.properties(id)?.get_atom(name, atom)
+            {
                 return Some(value);
             }
             let Some(prototype) = self.object(id)?.prototype else {
                 return Some(Value::UNDEFINED);
             };
             id = heap_id(prototype)?;
+            // Inline property additions update the root shape without calling this helper.
+            if Some(prototype) == self.object_prototype
+                && self.slot(id).shape == self.empty_object_shape
+            {
+                return Some(Value::UNDEFINED);
+            }
         }
     }
 
     pub(super) fn enumeration_keys(&self, value: Value) -> Option<Vec<String>> {
         let id = heap_id(value)?;
         if self.object(id).is_some() {
+            return Some(self.properties(id)?.keys());
+        }
+        if let Payload::Native(_) = &self.live(id)?.payload {
             return Some(self.properties(id)?.keys());
         }
         if let Some(closure) = self.closure(id) {
@@ -796,6 +879,9 @@ impl HeapData {
         if self.object(id).is_some() {
             return self.properties(id)?.enumerable(name);
         }
+        if let Payload::Native(_) = &self.live(id)?.payload {
+            return self.properties(id)?.enumerable(name);
+        }
         if let Some(closure) = self.closure(id) {
             return self
                 .properties(id)?
@@ -830,7 +916,10 @@ impl HeapData {
     }
 
     pub(super) fn enumeration_prototype(&self, value: Value) -> Option<Value> {
-        self.object(heap_id(value)?)
-            .and_then(|object| object.prototype)
+        let id = heap_id(value)?;
+        match self.live(id)?.payload {
+            Payload::Closure(_) | Payload::Native(_) => self.function_prototype,
+            _ => self.object(id).and_then(|object| object.prototype),
+        }
     }
 }
