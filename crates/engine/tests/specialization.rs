@@ -1,3 +1,5 @@
+mod common;
+
 use js_engine::{Engine, EngineOptions, Value};
 
 #[test]
@@ -638,8 +640,7 @@ fn map_fallbacks_and_callback_errors_match_generic_execution() {
 
 #[test]
 fn recursive_create_terrain_maps_strings_and_nested_arrays() {
-    let library =
-        include_str!("../../../../binaries/data/mods/public/maps/random/rmgen/library.js");
+    let library = common::map_library("library.js");
     let start = library.find("function createTerrain(terrain)").unwrap();
     let end = start + library[start..].find("\n}").unwrap() + 2;
     let source = format!(

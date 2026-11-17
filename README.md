@@ -116,6 +116,9 @@ sed 's/export function\* generateMap/function* generateMap/' \
 time target/release/js-runner --compile --no-ir /tmp/belgian_uplands.js
 ```
 
+Tests using map-library fixtures look first in `../binaries`, then in
+`../0ad/binaries` for a sibling 0 A.D. checkout.
+
 See [DESIGN.md](crates/engine/DESIGN.md) for architecture, supported semantics,
 ownership, compiler controls, and detailed inspection and profiling instructions.
 See [bench/README.md](bench/README.md) for benchmarks and [AGENTS.md](AGENTS.md)

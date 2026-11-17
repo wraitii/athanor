@@ -1,3 +1,5 @@
+mod common;
+
 use js_engine::{Engine, EngineOptions, Value};
 
 fn run(source: &str, ssa_opt: bool) -> Result<Value, String> {
@@ -432,7 +434,7 @@ fn semantic_construction_and_receivers_match_existing_emitter() {
 
 #[test]
 fn semantic_noise_constructor_executes_real_map_library_code() {
-    let library = include_str!("../../../../binaries/data/mods/public/maps/random/rmgen/Noise.js");
+    let library = common::map_library("Noise.js");
     let start = library.find("function Noise2D(freq)").unwrap();
     let end = library[start..].find("\nNoise2D.prototype.get").unwrap() + start;
     let source = format!(

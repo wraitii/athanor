@@ -1,3 +1,5 @@
+mod common;
+
 use js_engine::{Engine, EngineOptions, Value};
 
 fn check(source: &str) {
@@ -160,12 +162,10 @@ fn string_leaf_guards_preserve_constructor_errors_and_single_execution() {
 
 #[test]
 fn actual_terrain_constructors_preserve_leaf_and_array_validation() {
-    let library =
-        include_str!("../../../../binaries/data/mods/public/maps/random/rmgen/library.js");
+    let library = common::map_library("library.js");
     let start = library.find("function createTerrain(terrain)").unwrap();
     let end = start + library[start..].find("\n}").unwrap() + 2;
-    let constructors =
-        include_str!("../../../../binaries/data/mods/public/maps/random/rmgen/Terrain.js");
+    let constructors = common::map_library("Terrain.js");
     check(&format!(
         r#"
         var TERRAIN_SEPARATOR = '|';
