@@ -102,6 +102,7 @@ define_helpers! {
     VariantEntry => js_variant_entry(*const Variant) -> u64;
     OsrPoll => js_osr_poll(Value, *mut Value, *const Site) -> Value;
     CompileLeave => js_compile_leave(u64) -> Value;
+    BaselineWarm => js_baseline_warm(u64) -> Value;
     Instanceof => js_instanceof(Value, Value) -> Value;
     In => js_in(Value, Value) -> Value;
     GeneratorNew => js_generator_new(Value, Value, Value, u64) -> Value, owned;
@@ -242,6 +243,11 @@ extern "C" fn js_osr_poll(
     }
 }
 
+extern "C" fn js_baseline_warm(ctx: *mut JitCtx, code: u64) -> Value {
+    unsafe { &*ctx }.engine.tiering.baseline_warmed(code);
+    Value::UNDEFINED
+}
+
 extern "C" fn js_compile_leave(ctx: *mut JitCtx, code: u64) -> Value {
     unsafe { &*ctx }.engine.tiering.leave_function(code);
     Value::UNDEFINED
@@ -260,6 +266,7 @@ impl Helper {
                 | Self::StringConstant
                 | Self::CompilePoll
                 | Self::CompileLeave
+                | Self::BaselineWarm
                 | Self::LexicalReceiver
                 | Self::Release
                 | Self::FrameOverflow

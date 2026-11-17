@@ -1,3 +1,5 @@
+mod baseline_tiering;
+
 use crate::{FxHashMap, FxHashSet};
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -258,7 +260,10 @@ impl Tiering {
     }
 
     fn request_compilation(&self, code: u64) {
-        if self.options.optimization != crate::OptimizationLevel::Full {
+        if !matches!(
+            self.options.optimization,
+            crate::OptimizationLevel::Full | crate::OptimizationLevel::Baseline
+        ) {
             return;
         }
         if self.recompiles.borrow_mut().request(code) && self.recompile_log.enabled() {
@@ -574,7 +579,10 @@ impl Tiering {
         if current != 0 {
             return current;
         }
-        if self.options.optimization != crate::OptimizationLevel::Full {
+        if !matches!(
+            self.options.optimization,
+            crate::OptimizationLevel::Full | crate::OptimizationLevel::Baseline
+        ) {
             return ordinary.code;
         }
         variant.publish(ordinary);
@@ -737,6 +745,20 @@ impl Tiering {
                                         }
                                         self.variants.borrow_mut().publish(variant, entry);
                                         self.publish_variant(variant, entry);
+                                    }
+                                    jit::recompile::Key::Baseline(address) => {
+                                        let site = unsafe {
+                                            &*(address as *const jit::baseline_tiering::Site)
+                                        };
+                                        site.entry.set(entry.code);
+                                        self.log_recompilation(
+                                            code,
+                                            format_args!(
+                                                "baseline OSR installed header={} entries={}",
+                                                site.header,
+                                                site.entries.get()
+                                            ),
+                                        );
                                     }
                                     jit::recompile::Key::Loop(address) => {
                                         let site = unsafe { &*(address as *const jit::osr::Site) };

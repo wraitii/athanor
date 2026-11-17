@@ -1,3 +1,5 @@
+mod baseline_tiering;
+
 use crate::{FxHashMap, FxHashSet};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -78,6 +80,7 @@ pub(crate) struct RecompileJob {
     pub(super) label: String,
     pub(super) queued_at: Option<Instant>,
     region: Option<OsrRequest>,
+    observing: Option<super::baseline_tiering::Request>,
 }
 
 struct OsrRequest {
@@ -88,6 +91,9 @@ struct OsrRequest {
 
 impl RecompileJob {
     pub(crate) fn key(&self) -> super::recompile::Key {
+        if let Some(request) = &self.observing {
+            return super::recompile::Key::Baseline(request.site);
+        }
         self.region.as_ref().map_or(
             super::recompile::Key::Variant {
                 function: self.code.as_u32() as u64,
@@ -197,6 +203,7 @@ pub(crate) struct Compiler {
     inlining: bool,
     recompile_inline_multiplier: usize,
     osr: bool,
+    baseline_warmup: u64,
     speculative_continuations: bool,
     generic_first: bool,
     get_refinement: bool,
@@ -222,6 +229,15 @@ impl Compiler {
         self.data
             .iter()
             .flat_map(|data| data.pinned::<super::osr::Site>())
+            .map(|site| site.transfers.get())
+            .sum()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn baseline_osr_transfers(&self) -> u64 {
+        self.data
+            .iter()
+            .flat_map(|data| data.pinned::<super::baseline_tiering::Site>())
             .map(|site| site.transfers.get())
             .sum()
     }
@@ -288,7 +304,12 @@ impl Compiler {
         let dump_ir = dump.is_some() && options.jitdump_ir;
         Ok(Self {
             log,
-            osr: options.osr && options.optimization == crate::OptimizationLevel::Full,
+            osr: options.osr
+                && matches!(
+                    options.optimization,
+                    crate::OptimizationLevel::Full | crate::OptimizationLevel::Baseline
+                ),
+            baseline_warmup: options.baseline_warmup,
             speculative_continuations: options.continuations,
             generic_first: options.optimization == crate::OptimizationLevel::Initial
                 || options.generic_first && options.background_compile,
@@ -374,7 +395,11 @@ impl Compiler {
     fn feedback(&self, owner: FuncId, function_return: bool) -> finalize::Feedback {
         finalize::Feedback {
             function_return,
-            observations: true,
+            baseline_warmup: (self.optimization == crate::OptimizationLevel::Baseline
+                && !self.ssa_opt
+                && self.baseline_warmup != 0)
+                .then_some(self.baseline_warmup),
+            observations: self.ssa_opt,
             get_refinement: self.get_refinement,
             owner: owner.as_u32() as u64,
         }
@@ -942,6 +967,8 @@ impl Compiler {
                 super::aarch64::compile_baseline(
                     &graph.graph,
                     self.source_name,
+                    false,
+                    None,
                     self.dump_ir || self.inspection.is_some(),
                     &mut self.names,
                     &mut baseline_data,
@@ -1420,6 +1447,7 @@ impl Compiler {
         Some(RecompileJob {
             tier: CompilationTier::Optimized,
             region: None,
+            observing: None,
             code,
             variant,
             initial: false,
@@ -1498,7 +1526,15 @@ impl Compiler {
                 job.tier
             ));
         }
+        let ssa_opt = self.ssa_opt;
+        if job.observing.is_some()
+            || job.region.is_some()
+            || !job.initial && self.optimization == crate::OptimizationLevel::Baseline
+        {
+            self.ssa_opt = true;
+        }
         let result = self.recompile_inner(job, false);
+        self.ssa_opt = ssa_opt;
         if let Some((code, label, started)) = trace {
             let outcome = match &result {
                 Ok(Some(_)) => "compiled",
@@ -1535,10 +1571,17 @@ impl Compiler {
             label,
             queued_at: _,
             region,
+            observing,
         } = job;
         self.canonical = canonical;
         self.sources = sources;
-        let (source, mut canonical) = if let Some(region) = &region {
+        let (source, mut canonical) = if let Some(request) = &observing {
+            (
+                emission.source_name.0,
+                super::semantic::canonicalize_graph((*request.graph).clone(), true)
+                    .map_err(Error::Unsupported)?,
+            )
+        } else if let Some(region) = &region {
             (
                 emission.source_name.0,
                 super::semantic::FunctionState::from_graph(
@@ -1552,9 +1595,18 @@ impl Compiler {
             let Some(canonical) = self.canonical.emission(code) else {
                 return Ok(None);
             };
-            canonical
+            if self.optimization == crate::OptimizationLevel::Baseline && self.ssa_opt {
+                (
+                    canonical.0,
+                    super::semantic::canonicalize_graph(canonical.1.graph, true)
+                        .map_err(Error::Unsupported)?,
+                )
+            } else {
+                canonical
+            }
         };
         if region.is_none()
+            && observing.is_none()
             && let Some(variant) = self.variant(variant)
         {
             super::semantic::specialization::call_variants::assume(
@@ -1607,6 +1659,7 @@ impl Compiler {
             ));
         }
         if !initial
+            && observing.is_none()
             && emission.specialized
             && emission.tier == tier
             && region.is_none()
@@ -1621,7 +1674,8 @@ impl Compiler {
             );
             return Ok(None);
         }
-        let versioning = if initial && region.is_none() && self.generic_first {
+        let versioning = if observing.is_some() || initial && region.is_none() && self.generic_first
+        {
             super::semantic::Versioning::Generic
         } else {
             super::semantic::Versioning::Speculate {
@@ -1633,6 +1687,7 @@ impl Compiler {
             code,
             &label,
             match versioning {
+                _ if observing.is_some() => "compile-observing",
                 super::semantic::Versioning::Generic => "compile-generic",
                 _ if region.is_some() => "compile-osr",
                 _ => "compile-specialized",
@@ -1641,11 +1696,17 @@ impl Compiler {
             specialization.as_deref(),
         );
         emission.specialization = specialization;
-        emission.tier = tier;
-        emission.specialized = matches!(versioning, super::semantic::Versioning::Speculate { .. });
+        emission.tier = if initial && self.optimization == crate::OptimizationLevel::Baseline {
+            CompilationTier::Baseline
+        } else {
+            tier
+        };
+        emission.specialized =
+            self.ssa_opt && matches!(versioning, super::semantic::Versioning::Speculate { .. });
         let mut passes = super::inspect::PassInspection::new(self.inspection.as_deref());
         let osr_source =
-            (self.osr && region.is_none() && !self.canonical.is_region(code)).then_some(source);
+            (self.osr && self.ssa_opt && region.is_none() && !self.canonical.is_region(code))
+                .then_some(source);
         let mut graph = super::semantic::specialize_observed(
             planned,
             versioning,
@@ -1658,10 +1719,10 @@ impl Compiler {
         let mut listing = self
             .listing()
             .then(|| jitdump::Listing::new(graph.listing_lines()));
-        let mut feedback = self.feedback(code, region.is_none());
+        let mut feedback = self.feedback(code, region.is_none() && observing.is_none());
         // Observer placement belongs before OSR extraction; replanning can introduce
         // sites incompatible with the enclosing function's feedback.
-        feedback.observations = region.is_none();
+        feedback.observations = self.ssa_opt && region.is_none();
         let continuations = self.compile_continuations(
             &graph.graph,
             emission.source_name,
@@ -1673,7 +1734,9 @@ impl Compiler {
             }),
         )?;
         let signature = self.graph_signature(Some(&graph.graph));
-        let feedback = (self.ssa_opt && !self.canonical.is_region(code)).then_some(feedback);
+        let feedback = ((self.ssa_opt || self.optimization == crate::OptimizationLevel::Baseline)
+            && !self.canonical.is_region(code))
+        .then_some(feedback);
         let mut baseline_data = super::function_data::FunctionData::new();
         let baseline = if initial
             && region.is_none()
@@ -1684,6 +1747,8 @@ impl Compiler {
             super::aarch64::compile_baseline(
                 &graph.graph,
                 emission.source_name,
+                self.osr,
+                Some((u64::from(code.as_u32()), self.baseline_warmup)),
                 self.dump_ir || self.inspection.is_some(),
                 &mut self.names,
                 &mut baseline_data,
@@ -1779,7 +1844,7 @@ impl Compiler {
             initial,
             entry,
             emission,
-            region: region.is_some(),
+            region: region.is_some() || observing.is_some(),
         }))
     }
 
@@ -1801,6 +1866,7 @@ impl Compiler {
         Some(RecompileJob {
             tier: CompilationTier::Optimized,
             region: None,
+            observing: None,
             code: id,
             variant: VariantId::ordinary(code),
             initial: true,
@@ -1970,6 +2036,8 @@ impl Compiler {
             super::aarch64::compile_baseline(
                 &state.graph,
                 source_name,
+                false,
+                None,
                 self.dump_ir || self.inspection.is_some(),
                 &mut self.names,
                 &mut data,
@@ -2221,14 +2289,18 @@ impl Compiler {
                         }
                     },
                     self.report_regions(),
-                    self.osr.then_some(self.source_name.0),
+                    (self.osr && self.ssa_opt).then_some(self.source_name.0),
                     false,
                     &mut |name, state| passes.observe(name, state),
                 )
             })
             .transpose()
             .map_err(Error::Unsupported)?;
-        let feedback = if self.ssa_opt && matches!(kind, finalize::FunctionKind::Ordinary) {
+        let feedback = if (self.ssa_opt
+            || self.osr
+            || self.optimization == crate::OptimizationLevel::Baseline)
+            && matches!(kind, finalize::FunctionKind::Ordinary)
+        {
             semantic_function.and_then(|span| self.canonical.code(self.source_name.0, span.start))
         } else {
             None
@@ -2245,8 +2317,12 @@ impl Compiler {
             self.emissions.insert(
                 VariantId::ordinary(code.as_u32() as u64),
                 Emission {
-                    tier: CompilationTier::Optimized,
-                    specialized: true,
+                    tier: if self.optimization == crate::OptimizationLevel::Baseline {
+                        CompilationTier::Baseline
+                    } else {
+                        CompilationTier::Optimized
+                    },
+                    specialized: self.ssa_opt,
                     callees: self
                         .canonical
                         .graph_callees(&graph.graph, self.source_name.0),
@@ -2270,6 +2346,8 @@ impl Compiler {
                     super::aarch64::compile_baseline(
                         &graph.graph,
                         self.source_name,
+                        self.osr,
+                        feedback.map(|code| (u64::from(code.as_u32()), self.baseline_warmup)),
                         self.dump_ir || self.inspection.is_some(),
                         &mut self.names,
                         &mut baseline_data,

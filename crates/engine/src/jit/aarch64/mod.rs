@@ -33,9 +33,19 @@ pub(super) fn compile_graph(
 pub(super) fn compile_baseline(
     graph: &super::semantic::Graph,
     source_name: (usize, usize),
+    osr: bool,
+    owner: Option<(u64, u64)>,
     semantic_locations: bool,
     names: &mut Vec<Box<str>>,
     data: &mut super::function_data::FunctionData,
 ) -> Result<MachineCode, Unsupported> {
-    baseline::compile(graph, source_name, semantic_locations, names, data)
+    baseline::compile(
+        graph,
+        source_name,
+        osr,
+        owner,
+        semantic_locations,
+        names,
+        data,
+    )
 }

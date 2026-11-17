@@ -1,3 +1,7 @@
+mod baseline;
+
+pub(in crate::jit) use baseline::{baseline_headers, baseline_resume};
+
 use crate::{FxHashMap, FxHashSet};
 use std::sync::Arc;
 

@@ -1,3 +1,4 @@
+mod baseline_tiering;
 mod ops;
 mod poll;
 mod references;
@@ -31,6 +32,7 @@ pub(super) enum FunctionKind {
 #[derive(Clone, Copy)]
 pub(super) struct Feedback {
     pub(super) function_return: bool,
+    pub(super) baseline_warmup: Option<u64>,
     pub(super) observations: bool,
     pub(super) get_refinement: bool,
     pub(super) owner: u64,
@@ -430,7 +432,12 @@ impl FunctionCompiler<'_, '_> {
     }
 
     pub(super) fn return_value(&mut self, value: LoweredValue) {
-        if let Some(feedback) = self.feedback.filter(|feedback| feedback.function_return)
+        if let Some(feedback) = self
+            .feedback
+            .filter(|feedback| feedback.function_return && feedback.baseline_warmup.is_some())
+        {
+            self.baseline_warmup(feedback.owner, feedback.baseline_warmup.unwrap());
+        } else if let Some(feedback) = self.feedback.filter(|feedback| feedback.function_return)
             && self.stubs.compilation_state != 0
             && feedback.owner >= crate::jit::entries::DIRECT_ENTRIES as u64
         {

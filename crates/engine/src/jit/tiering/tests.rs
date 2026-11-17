@@ -2237,3 +2237,6 @@ mod call_variant_tests {
         );
     }
 }
+
+#[cfg(target_arch = "aarch64")]
+mod baseline;

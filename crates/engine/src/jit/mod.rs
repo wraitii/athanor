@@ -2,6 +2,7 @@ mod aarch64;
 mod alloc;
 mod analysis;
 pub(crate) mod bailouts;
+pub(crate) mod baseline_tiering;
 mod clif;
 mod compiler;
 mod continuation;

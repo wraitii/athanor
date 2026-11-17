@@ -257,6 +257,33 @@ or declined, execution continues in the original loop. This is distinct from a
 function-entry replacement and does not apply to every loop. See
 `semantic/osr.rs` and `jit/osr.rs`.
 
+Direct AArch64 baseline code has an experimental entry into this machinery.
+Hot loop headers request an observing continuation covering the rest of the
+function. Extraction restores the active bindings and live values, then promotes
+locals to SSA and compiles generic code with observations and normal loop OSR.
+The baseline frame keeps its inputs alive until the continuation returns, then
+forwards its final result. Continuations can compile synchronously or in the
+background; baseline execution continues while a background request is pending.
+This currently excludes script initializers, captured binding state, generators,
+handlers and resumes that still require the original argument or closure frame.
+Cold baseline compilation discovers headers and preserves a graph snapshot,
+deferring transfer analysis until a header becomes hot. `JS_JIT_OSR=0` disables
+both transfers.
+
+Baseline functions also request regular whole-function compilation after 128
+calls by default, including functions emitted through the shared compiler. This
+upgrade does not require observations or loop OSR. Background mode keeps the
+baseline entry available until publication; synchronous mode compiles when
+dispatch next needs the function. The replacement gathers feedback and uses normal specialization,
+recompilation and loop OSR. `JS_JIT_BASELINE_WARMUP`
+(`EngineOptions::baseline_warmup`) selects the call threshold; zero disables the
+call trigger.
+
+The experimental transfer state and request types live in `jit/baseline_tiering.rs`.
+Its compiler, tiering, finalization and AArch64 emission code lives in dedicated
+child modules; baseline continuation extraction lives in `semantic/osr/baseline.rs`.
+The shared paths retain the configuration, dispatch and publication hooks.
+
 Background compilation uses a queue with tickets and dependencies. Workers
 produce unpublished code and associated data; the execution side publishes
 completed replacements. The engine retains the code and metadata needed by

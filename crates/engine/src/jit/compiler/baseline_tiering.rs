@@ -1,0 +1,30 @@
+use super::{Compiler, Entry, RecompileJob};
+use crate::error::Error;
+use crate::jit;
+use std::sync::Arc;
+
+impl Compiler {
+    pub(crate) fn baseline_osr_compilation(
+        &self,
+        site: &jit::baseline_tiering::Site,
+    ) -> Result<Option<RecompileJob>, Error> {
+        let Some(code) = self
+            .canonical
+            .code(site.source_name.0, site.graph.span.start)
+        else {
+            return Ok(None);
+        };
+        let Some(mut job) = self.recompilation(u64::from(code.as_u32()), Entry::generic(0)) else {
+            return Ok(None);
+        };
+        let (graph, inputs) = jit::semantic::osr::baseline_resume(&site.graph, site.header)
+            .map_err(Error::Unsupported)?;
+        *site.inputs.borrow_mut() = Some(inputs);
+        job.observing = Some(jit::baseline_tiering::Request {
+            site: site as *const _ as usize,
+            graph: Arc::new(graph),
+        });
+        job.label += &format!(".observing.{}", site.header);
+        Ok(Some(job))
+    }
+}

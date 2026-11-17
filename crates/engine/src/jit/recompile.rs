@@ -46,6 +46,7 @@ pub(crate) enum Key {
         variant: super::entries::VariantId,
     },
     Loop(usize),
+    Baseline(usize),
 }
 
 impl Key {

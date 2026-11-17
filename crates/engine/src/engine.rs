@@ -49,6 +49,7 @@ pub struct EngineOptions {
     pub call_specialization: bool,
     pub recompile_inline_multiplier: usize,
     pub osr: bool,
+    pub baseline_warmup: u64,
     pub continuations: bool,
     pub generic_first: bool,
     pub recompile_log: bool,
@@ -87,6 +88,10 @@ impl Default for EngineOptions {
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(jit::DEFAULT_RECOMPILE_INLINE_MULTIPLIER),
             osr: std::env::var("JS_JIT_OSR").as_deref() != Ok("0"),
+            baseline_warmup: std::env::var("JS_JIT_BASELINE_WARMUP")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(jit::baseline_tiering::DEFAULT_WARMUP),
             continuations: true,
             generic_first: true,
             recompile_log: std::env::var("JS_JIT_RECOMPILE_LOG").as_deref() == Ok("1"),

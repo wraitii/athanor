@@ -1,3 +1,5 @@
+mod tiering;
+
 use cranelift_codegen::entity::{EntityRef, SecondaryMap};
 use oxc_syntax::operator::BinaryOperator;
 
@@ -13,6 +15,8 @@ use crate::value::Value;
 pub(super) fn compile(
     graph: &Graph,
     source_name: (usize, usize),
+    osr: bool,
+    owner: Option<(u64, u64)>,
     semantic_locations: bool,
     names: &mut Vec<Box<str>>,
     function_data: &mut crate::jit::function_data::FunctionData,
@@ -21,6 +25,8 @@ pub(super) fn compile(
     emit(
         graph,
         source_name,
+        osr,
+        owner,
         semantic_locations,
         names,
         function_data,
@@ -43,6 +49,8 @@ fn refuse<T>(reason: &mut String, message: impl Into<String>) -> Option<T> {
 fn emit(
     graph: &Graph,
     source_name: (usize, usize),
+    osr: bool,
+    owner: Option<(u64, u64)>,
     semantic_locations: bool,
     names: &mut Vec<Box<str>>,
     function_data: &mut crate::jit::function_data::FunctionData,
@@ -60,6 +68,7 @@ fn emit(
     if graph.has_handlers {
         return refuse(reason, "exception handlers");
     }
+    let osr = osr && !graph.bindings.values().any(|binding| binding.captured);
     let values_size = graph.values.len().checked_mul(8)?;
     let temporary_offset = values_size.checked_add(graph.bindings.len().checked_mul(8)?)?;
     let edge_slots = graph
@@ -68,7 +77,8 @@ fn emit(
         .map(|block| block.params.len())
         .max()
         .unwrap_or(0);
-    let context_offset = temporary_offset.checked_add(edge_slots.checked_mul(8)?)?;
+    let osr_result_offset = temporary_offset.checked_add(edge_slots.checked_mul(8)?)?;
+    let context_offset = osr_result_offset.checked_add(usize::from(osr) * 8)?;
     let slot_count = context_offset / 8;
     let receiver_offset = context_offset.checked_add(8)?;
     let closure_offset = receiver_offset.checked_add(8)?;
@@ -99,6 +109,8 @@ fn emit(
     }
     let mut asm = Assembler::new(true);
     let failed = asm.label();
+    let resumed = asm.label();
+    let returned = asm.label();
     let mut labels = SecondaryMap::new();
     for (block, _) in graph.blocks.iter() {
         labels[block] = Some(asm.label());
@@ -175,13 +187,44 @@ fn emit(
             asm.emit(e::mem_scaled(Mem::StrX, 9, e::SP, offset)?);
         }
     }
+    if let Some((owner, warmup)) = owner.filter(|(_, warmup)| *warmup != 0) {
+        tiering::warmup(
+            &mut asm,
+            function_data,
+            owner,
+            warmup,
+            context_offset as u32,
+        )?;
+    }
     asm.jump(e::B, labels[graph.entry]?);
     let error_source = function_data.pin(source_name);
+    let headers = if osr {
+        crate::jit::semantic::osr::baseline_headers(graph)
+    } else {
+        crate::FxHashSet::default()
+    };
+    let osr_graph = (!headers.is_empty()).then(|| std::sync::Arc::new(graph.clone()));
     let mut block_starts = Vec::new();
     let mut locations = Vec::new();
     for (block, data) in graph.blocks.iter() {
         block_starts.push(asm.offset());
         asm.bind(labels[block]?);
+        if headers.contains(&block) {
+            let site = function_data.pin(crate::jit::baseline_tiering::Site::new(
+                osr_graph.as_ref()?.clone(),
+                block,
+                source_name,
+            ));
+            tiering::poll(
+                &mut asm,
+                site,
+                context_offset as u32,
+                receiver_offset as u32,
+                osr_result_offset as u32,
+                failed,
+                resumed,
+            )?;
+        }
         for &inst in &data.insts {
             let data = &graph.insts[inst];
             let start = asm.offset();
@@ -1082,30 +1125,8 @@ fn emit(
             }
             TerminatorKind::Return(value) => {
                 let offset = value.index().checked_mul(8)? as u32;
-                asm.emit(e::mem_scaled(Mem::LdrX, 0, e::SP, context_offset as u32)?);
                 asm.emit(e::mem_scaled(Mem::LdrX, 3, e::SP, offset)?);
-                asm.emit(e::mov_sp(1, e::SP));
-                e::mov_imm(Width::X, 2, slot_count as u64, |word| asm.emit(word));
-                e::mov_imm(Width::X, 16, finish as *const () as u64, |word| {
-                    asm.emit(word)
-                });
-                asm.emit(e::blr(16));
-                asm.emit(e::mov(Width::X, 2, 0));
-                asm.emit(e::mem_scaled(Mem::LdrX, 9, e::SP, context_offset as u32)?);
-                asm.emit(e::mem_scaled(
-                    Mem::LdrX,
-                    9,
-                    9,
-                    crate::jit::session::ERROR_OFFSET as u32,
-                )?);
-                asm.emit(e::alu(Alu::Subs, Width::X, e::ZR, 9, e::ZR));
-                asm.emit(e::cset(3, Cond::Ne));
-                stack_address(&mut asm, e::SP, size as u32);
-                asm.emit(e::LDP_FP_LR_POST);
-                if incoming != 0 {
-                    asm.emit(e::add_imm(Width::X, e::SP, e::SP, incoming as u32, false));
-                }
-                asm.emit(e::RET);
+                asm.jump(e::B, returned);
             }
             TerminatorKind::CheckException(..) => {
                 return refuse(reason, "exception check terminator");
@@ -1133,6 +1154,39 @@ fn emit(
             });
         }
     }
+    if osr_graph.is_some() {
+        asm.bind(resumed);
+        asm.emit(e::mem_scaled(
+            Mem::LdrX,
+            3,
+            e::SP,
+            osr_result_offset as u32,
+        )?);
+    }
+    asm.bind(returned);
+    asm.emit(e::mem_scaled(Mem::LdrX, 0, e::SP, context_offset as u32)?);
+    asm.emit(e::mov_sp(1, e::SP));
+    e::mov_imm(Width::X, 2, slot_count as u64, |word| asm.emit(word));
+    e::mov_imm(Width::X, 16, finish as *const () as u64, |word| {
+        asm.emit(word)
+    });
+    asm.emit(e::blr(16));
+    asm.emit(e::mov(Width::X, 2, 0));
+    asm.emit(e::mem_scaled(Mem::LdrX, 9, e::SP, context_offset as u32)?);
+    asm.emit(e::mem_scaled(
+        Mem::LdrX,
+        9,
+        9,
+        crate::jit::session::ERROR_OFFSET as u32,
+    )?);
+    asm.emit(e::alu(Alu::Subs, Width::X, e::ZR, 9, e::ZR));
+    asm.emit(e::cset(3, Cond::Ne));
+    stack_address(&mut asm, e::SP, size as u32);
+    asm.emit(e::LDP_FP_LR_POST);
+    if incoming != 0 {
+        asm.emit(e::add_imm(Width::X, e::SP, e::SP, incoming as u32, false));
+    }
+    asm.emit(e::RET);
     asm.bind(failed);
     asm.emit(e::mem_scaled(Mem::LdrX, 0, e::SP, context_offset as u32)?);
     e::mov_imm(Width::X, 1, error_source as u64, |word| asm.emit(word));
