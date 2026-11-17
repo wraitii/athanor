@@ -116,11 +116,25 @@ pub(super) extern "C" fn js_property_get(
 }
 
 fn property_get(ctx: &mut JitCtx, object: Value, name: &str, owned: bool) -> Value {
+    property_get_with_cache(ctx, object, name, owned, None)
+}
+
+fn property_get_with_cache(
+    ctx: &mut JitCtx,
+    object: Value,
+    name: &str,
+    owned: bool,
+    cache: Option<&mut crate::heap::PropertyReadCache>,
+) -> Value {
     if object == Value::GLOBAL_OBJECT {
         let value = ctx.global.get_object_raw(name).unwrap_or(Value::UNDEFINED);
         return if owned { ctx.retain(value) } else { value };
     }
-    match ctx.global.heap().read_property(object, name) {
+    let read = match cache {
+        Some(cache) => ctx.global.heap().read_property_cached(object, name, cache),
+        None => ctx.global.heap().read_property(object, name),
+    };
+    match read {
         Some(PropertyRead::Value(value)) => return if owned { ctx.retain(value) } else { value },
         Some(PropertyRead::Native(function)) => {
             return match ctx.global.heap().native_function(function) {
@@ -190,6 +204,7 @@ pub(crate) struct PropertyCache {
     megamorphic: u32,
     misses: u32,
     pub(crate) name: Box<str>,
+    read: crate::heap::PropertyReadCache,
     write: crate::heap::PropertyWriteCache,
     observer: Option<(u64, crate::jit::profile::Site)>,
     reported: Option<ShapeAccess>,
@@ -239,6 +254,7 @@ impl PropertyCache {
             len: 0,
             megamorphic: u32::from(megamorphic),
             misses: 0,
+            read: Default::default(),
             write: Default::default(),
             name: name.into(),
             observer,
@@ -390,7 +406,28 @@ pub(super) extern "C" fn js_property_get_cached(
     if let Some(value) = cache.fill(context.engine, context.global.heap(), object) {
         return value;
     }
-    property_get(unsafe { &mut *ctx }, object, &cache.name, false)
+    property_get_with_cache(
+        unsafe { &mut *ctx },
+        object,
+        &cache.name,
+        false,
+        Some(&mut cache.read),
+    )
+}
+
+pub(super) extern "C" fn js_property_get_megamorphic(
+    ctx: *mut JitCtx,
+    object: Value,
+    cache: *mut PropertyCache,
+) -> Value {
+    let cache = unsafe { &mut *cache };
+    property_get_with_cache(
+        unsafe { &mut *ctx },
+        object,
+        &cache.name,
+        false,
+        Some(&mut cache.read),
+    )
 }
 
 pub(super) extern "C" fn js_property_get_baseline(

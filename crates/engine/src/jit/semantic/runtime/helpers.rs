@@ -250,9 +250,14 @@ pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) {
     for &block in &function.facts.cfg.rpo {
         insts.clone_from(&graph.blocks[block].insts);
         for &inst in &insts {
-            let Some(call) = select(inst, &graph.insts[inst].op, &function.facts) else {
+            let Some(mut call) = select(inst, &graph.insts[inst].op, &function.facts) else {
                 continue;
             };
+            if call.helper == Helper::PropertyGetCached
+                && function.plan.shapes.megamorphic(graph, inst)
+            {
+                call.helper = Helper::PropertyGetMegamorphic;
+            }
             let contract = graph.contract(&graph.insts[inst].op, &function.facts);
             let result_type = graph.insts[inst]
                 .result()

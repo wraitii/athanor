@@ -170,25 +170,54 @@ impl Heap {
 
     /// Returned values are borrowed; native functions and lazy prototypes are resolved by the caller.
     pub(crate) fn read_property(&self, receiver: Value, name: &str) -> Option<PropertyRead> {
+        self.read_property_with_cache(receiver, name, None)
+    }
+
+    pub(crate) fn read_property_cached(
+        &self,
+        receiver: Value,
+        name: &str,
+        cache: &mut PropertyReadCache,
+    ) -> Option<PropertyRead> {
+        self.read_property_with_cache(receiver, name, Some(cache))
+    }
+
+    fn read_property_with_cache(
+        &self,
+        receiver: Value,
+        name: &str,
+        cache: Option<&mut PropertyReadCache>,
+    ) -> Option<PropertyRead> {
         if receiver.is_number() {
             return Some(PropertyRead::Native(ReceiverKind::Number.method(name)?));
         }
         let data = self.0.borrow();
         let payload = &data.live(heap_id(receiver)?)?.payload;
+        let atom = if matches!(
+            payload,
+            Payload::Object(_) | Payload::SmallObject(_) | Payload::Closure(_) | Payload::Native(_)
+        ) {
+            match cache {
+                Some(cache) => cache.atom(self, &data, name),
+                None => data.atoms.find(name),
+            }
+        } else {
+            None
+        };
         let function = match payload {
             Payload::Object(_) | Payload::SmallObject(_) => {
                 return data
-                    .object_property(heap_id(receiver)?, name)
+                    .object_property_atom(heap_id(receiver)?, name, atom)
                     .map(PropertyRead::Value);
             }
             Payload::Closure(closure) => {
-                if let Some(value) = data.properties(heap_id(receiver)?)?.get(name) {
+                if let Some(value) = data.properties(heap_id(receiver)?)?.get_atom(name, atom) {
                     return Some(PropertyRead::Value(value));
                 }
                 return Some(if closure.constructable && name == "prototype" {
                     PropertyRead::Prototype
                 } else {
-                    PropertyRead::Value(data.function_property(name))
+                    PropertyRead::Value(data.function_property_atom(name, atom))
                 });
             }
             Payload::Native(function) => {
@@ -197,7 +226,9 @@ impl Heap {
                 }
                 match function.static_method(name) {
                     Some(function) => function,
-                    None => return Some(PropertyRead::Value(data.function_property(name))),
+                    None => {
+                        return Some(PropertyRead::Value(data.function_property_atom(name, atom)));
+                    }
                 }
             }
             Payload::TypedArray(array) => match name {
@@ -266,7 +297,7 @@ impl Heap {
             return Some(
                 data.properties(id)?
                     .get(name)
-                    .unwrap_or_else(|| data.function_property(name)),
+                    .unwrap_or_else(|| data.function_property_atom(name, data.atoms.find(name))),
             );
         }
         data.object(id)?;
@@ -659,10 +690,10 @@ impl HeapData {
             .is_some_and(|properties| properties.contains_key(name))
     }
 
-    fn function_property(&self, name: &str) -> Value {
+    fn function_property_atom(&self, name: &str, atom: Option<Atom>) -> Value {
         self.function_prototype
             .and_then(heap_id)
-            .and_then(|id| self.object_property(id, name))
+            .and_then(|id| self.object_property_atom(id, name, atom))
             .unwrap_or(Value::UNDEFINED)
     }
 
@@ -706,9 +737,13 @@ impl HeapData {
         Some(self.live(id)?.shape).filter(|&shape| shape != NO_SHAPE && shape != DICTIONARY)
     }
 
-    pub(super) fn object_property(&self, mut id: u64, name: &str) -> Option<Value> {
+    pub(super) fn object_property(&self, id: u64, name: &str) -> Option<Value> {
+        self.object_property_atom(id, name, self.atoms.find(name))
+    }
+
+    fn object_property_atom(&self, mut id: u64, name: &str, atom: Option<Atom>) -> Option<Value> {
         loop {
-            if let Some(value) = self.properties(id)?.get(name) {
+            if let Some(value) = self.properties(id)?.get_atom(name, atom) {
                 return Some(value);
             }
             let Some(prototype) = self.object(id)?.prototype else {

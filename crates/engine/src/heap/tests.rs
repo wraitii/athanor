@@ -1084,3 +1084,36 @@ fn generator_plan(code: u64) -> std::sync::Arc<crate::continuation::Plan> {
         .into_boxed_slice(),
     })
 }
+
+#[test]
+fn property_read_cache_handles_mutation_and_heap_identity() {
+    let mut cache = PropertyReadCache::default();
+    for padding in [0, 5, 1] {
+        let heap = Heap::default();
+        let prototype = heap.object().unwrap();
+        let object = heap.object_with_prototype(prototype).unwrap();
+        for index in 0..padding {
+            assert!(heap.set_property(prototype, &format!("padding{index}"), Value::TRUE));
+        }
+        let read = |cache: &mut PropertyReadCache| match heap
+            .read_property_cached(object, "value", cache)
+        {
+            Some(PropertyRead::Value(value)) => value,
+            _ => panic!("expected an object property value"),
+        };
+        assert_eq!(read(&mut cache), Value::UNDEFINED);
+        assert!(heap.set_property(prototype, "value", Value::number(7.0)));
+        assert_eq!(read(&mut cache), Value::number(7.0));
+        assert!(heap.set_property(prototype, "value", Value::number(11.0)));
+        assert_eq!(read(&mut cache), Value::number(11.0));
+        assert!(heap.set_property(prototype, "0", Value::TRUE));
+        assert_eq!(read(&mut cache), Value::number(11.0));
+        assert!(heap.set_property(object, "value", Value::FALSE));
+        assert_eq!(read(&mut cache), Value::FALSE);
+        assert!(heap.set_property(object, "0", Value::TRUE));
+        assert_eq!(read(&mut cache), Value::FALSE);
+        heap.release(object);
+        heap.release(prototype);
+        heap.drain(1000);
+    }
+}

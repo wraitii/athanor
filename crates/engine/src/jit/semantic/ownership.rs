@@ -126,7 +126,7 @@ pub(super) fn plan(graph: &mut Graph, facts: &mut Facts, borrows: borrow::Plan) 
             Some(Op::Get(_, name)) => name != "length",
             Some(Op::Read(binding)) => !graph.bindings[*binding].captured,
             Some(Op::HelperCall {
-                helper: Helper::PropertyGetCached,
+                helper: Helper::PropertyGetCached | Helper::PropertyGetMegamorphic,
                 args,
                 ..
             }) => {

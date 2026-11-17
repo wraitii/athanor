@@ -44,7 +44,8 @@ pub(crate) use arena::{
 pub(crate) use array::HOLE;
 pub use owned::OwnedValue;
 pub(crate) use properties::{
-    PropertyAdditionCache, PropertyOverwriteCache, PropertyWrite, PropertyWriteCache,
+    PropertyAdditionCache, PropertyOverwriteCache, PropertyReadCache, PropertyWrite,
+    PropertyWriteCache,
 };
 pub(crate) use regexp::regexp_flags;
 pub(crate) use shape::{DICTIONARY, NO_SHAPE};

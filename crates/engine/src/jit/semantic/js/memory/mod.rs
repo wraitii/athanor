@@ -49,6 +49,7 @@ impl Field {
             Op::HelperCall {
                 helper:
                     Helper::PropertyGetCached
+                    | Helper::PropertyGetMegamorphic
                     | Helper::SemanticPropertyProbeCached
                     | Helper::PropertySetCached,
                 args,
@@ -172,6 +173,10 @@ impl Access {
             | Op::IsPropertyCached(object, ..) => (Locations::CODE, Base::Known(*object)),
             Op::CellGet(cell) => (Locations::HEAP, Base::Known(*cell)),
             Op::GlobalRead(_) | Op::ProbeGlobal(_) => (Locations::GLOBAL, Base::External),
+            Op::HelperCall {
+                helper: Helper::PropertyGetMegamorphic,
+                ..
+            } => (Locations::HEAP, Base::Unknown),
             Op::HelperCall {
                 helper: Helper::PropertyGetCached | Helper::SemanticPropertyProbeCached,
                 args,

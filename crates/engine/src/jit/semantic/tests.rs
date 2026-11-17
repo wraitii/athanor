@@ -4931,3 +4931,42 @@ fn lowered_property_accesses_preserve_borrowed_slots() {
         }
     }
 }
+
+#[test]
+fn megamorphic_helpers_preserve_borrow_anchors_and_field_conflicts() {
+    use crate::jit::helpers::Helper;
+    for (write, expected) in [
+        ("o.y=null;", true),
+        ("o.x=null;", false),
+        ("p.x=null;", false),
+    ] {
+        let source = format!("function f(o,p){{const value=o.x;{write}return value.n;}}");
+        let graph = canonicalize_graph(lower_source(&source).unwrap(), true)
+            .unwrap()
+            .graph;
+        let value = graph
+            .insts
+            .values()
+            .find_map(|data| {
+                matches!(&data.op, Op::Get(_, name) if name == "x").then(|| data.result().unwrap())
+            })
+            .unwrap();
+        let mut function = FunctionState::new(graph, Vec::new(), true);
+        runtime::helpers::lower(&mut function);
+        for data in function.graph.insts.values_mut() {
+            if data.result() == Some(value) {
+                let Op::HelperCall { helper, .. } = &mut data.op else {
+                    panic!()
+                };
+                *helper = Helper::PropertyGetMegamorphic;
+            }
+        }
+        let facts = Facts::compute(&function.graph);
+        borrow::borrows(&mut function.graph, &facts, &mut Vec::new());
+        assert_eq!(
+            function.graph.borrowed.contains(&value),
+            expected,
+            "{source}"
+        );
+    }
+}

@@ -167,6 +167,7 @@ define_helpers! {
     IndexSet => js_index_set(Value, Value, Value) -> Value;
     PropertySet => js_property_set(Value, *const u8, u64, Value) -> Value;
     PropertyGetCached => js_property_get_cached(Value, *mut PropertyCache) -> Value, borrowed;
+    PropertyGetMegamorphic => js_property_get_megamorphic(Value, *mut PropertyCache) -> Value, borrowed;
     PropertyGetBaseline => js_property_get_baseline(Value, *mut PropertyCache) -> Value, owned;
     PropertyCachePrime => js_property_cache_prime(Value, *mut PropertyCache) -> Value;
     PropertySetCached => js_property_set_cached(Value, *mut PropertyCache, Value) -> Value;
@@ -274,6 +275,7 @@ impl Helper {
                 | Self::IndexGet
                 | Self::IndexGetNumeric
                 | Self::PropertyGetCached
+                | Self::PropertyGetMegamorphic
                 | Self::GlobalGetBorrowed
                 | Self::GlobalGetOptionalBorrowed
                 | Self::BitwiseAnd

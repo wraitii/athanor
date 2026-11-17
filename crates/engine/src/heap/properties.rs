@@ -3,6 +3,26 @@ use crate::FxHashMap;
 
 const SHAPED_LIMIT: usize = 64;
 
+/// Caches one fixed property name; a weak heap identity protects its atom ID.
+#[derive(Default)]
+pub(crate) struct PropertyReadCache {
+    heap: std::rc::Weak<RefCell<HeapData>>,
+    atom: Option<Atom>,
+}
+
+impl PropertyReadCache {
+    pub(super) fn atom(&mut self, heap: &Heap, data: &HeapData, name: &str) -> Option<Atom> {
+        if self.heap.as_ptr() != Rc::as_ptr(&heap.0) {
+            self.heap = Rc::downgrade(&heap.0);
+            self.atom = None;
+        }
+        if self.atom.is_none() {
+            self.atom = data.atoms.find(name);
+        }
+        self.atom
+    }
+}
+
 /// A cache for one fixed property name. The weak heap reference prevents address reuse
 /// from making atom and shape IDs from a previous heap appear valid.
 #[derive(Default)]
@@ -145,8 +165,16 @@ impl PropertyView<'_> {
     }
 
     pub(super) fn get(&self, name: &str) -> Option<Value> {
+        let atom = match self {
+            Self::Shaped { atoms, .. } => atoms.find(name),
+            Self::Dictionary(_) => None,
+        };
+        self.get_atom(name, atom)
+    }
+
+    pub(super) fn get_atom(&self, name: &str, atom: Option<Atom>) -> Option<Value> {
         match self {
-            Self::Shaped { values, .. } => self.slot(name).map(|slot| values[slot]),
+            Self::Shaped { shape, values, .. } => shape.slot(atom?).map(|slot| values[slot]),
             Self::Dictionary(table) => table.get(name).copied(),
         }
     }

@@ -303,6 +303,12 @@ conditions hold. The slow helpers implement generic behavior when those
 conditions are not established. `heap/shape.rs`, `heap/properties.rs`,
 `semantic/runtime/` and `jit/helpers/` are the important boundaries.
 
+Fixed-name read caches retain a heap-specific property atom for generic lookup,
+including megamorphic sites. Prototype traversal reuses that atom; dictionary
+properties and special receiver behavior still use the name. Missing atoms are
+retried so later property additions remain visible. Known megamorphic reads call
+a dedicated helper without attempting inline-cache lookup or filling.
+
 Observed slot reads use `jit/layout.rs` descriptors that distinguish receiver
 storage from related storage. The language-specific lookup supplies the layout
 and storage relationship; the shared guard, dispatch and recovery machinery

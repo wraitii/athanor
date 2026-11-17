@@ -16,6 +16,7 @@ pub(in crate::jit) fn receiver(op: &Op) -> Option<Value> {
         Op::HelperCall {
             helper:
                 crate::jit::helpers::Helper::PropertyGetCached
+                | crate::jit::helpers::Helper::PropertyGetMegamorphic
                 | crate::jit::helpers::Helper::SemanticPropertyProbeCached,
             args,
             ..
@@ -54,6 +55,7 @@ fn anchored_read(op: &Op, facts: &Facts) -> Option<BorrowedRead> {
             | Op::ShapedGet(..)
             | Op::HelperCall {
                 helper: crate::jit::helpers::Helper::PropertyGetCached
+                    | crate::jit::helpers::Helper::PropertyGetMegamorphic
                     | crate::jit::helpers::Helper::SemanticPropertyProbeCached,
                 ..
             }
