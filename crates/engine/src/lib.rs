@@ -7,6 +7,7 @@ mod heap;
 mod host;
 mod jit;
 mod parse;
+mod regex;
 mod value;
 
 pub use engine::{Backend, Engine, EngineOptions, OptimizationLevel};
