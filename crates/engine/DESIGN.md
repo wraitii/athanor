@@ -316,6 +316,14 @@ retained. `semantic/borrow.rs`, `semantic/contracts.rs`,
 show this contract. In particular, helper lowering follows borrow analysis
 because it can erase the receiver information that proves a borrow.
 
+Memory effects describe broad reads and writes independently of access details.
+`semantic/memory.rs` adds optional JS access information to those locations and
+provides the shared conflict query used by load reuse and region analysis.
+`semantic/js/memory/` owns receiver and field rules and flow-sensitive freshness;
+`Facts` caches the analysis and invalidates it when effects are recomputed.
+An access without JS information remains broad. This separation does not add
+address-range analysis or change call summaries and ownership proofs.
+
 Representation selection is separate from semantic type facts and ownership.
 Values may be boxed or held in scalar integer, floating-point, boolean or word
 representations; operation contracts determine required representations and

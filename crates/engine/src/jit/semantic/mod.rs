@@ -1,4 +1,3 @@
-mod access;
 mod available;
 pub(in crate::jit) mod bits;
 mod borrow;
@@ -10,13 +9,13 @@ pub(in crate::jit) mod contracts;
 pub(in crate::jit) mod cursor;
 mod dispatch;
 pub(in crate::jit) mod facts;
-mod fresh;
 mod guards;
 mod js;
 pub(in crate::jit) mod legalize;
 mod listing;
 mod liveness;
 pub(in crate::jit) mod low_level;
+mod memory;
 pub(super) mod osr;
 pub(in crate::jit) mod ownership;
 mod pipeline;
@@ -1189,24 +1188,6 @@ impl Op {
         };
         let [a, b, c] = fixed;
         OperandsMut::new([a, b, c, None], rest)
-    }
-
-    pub(super) fn write_target(&self) -> Option<Value> {
-        match self {
-            Op::CellSet(object, _)
-            | Op::Define(object, ..)
-            | Op::Set(object, ..)
-            | Op::ShapedSet(object, ..)
-            | Op::ArrayStore(object, ..)
-            | Op::PropertyStore(object, ..)
-            | Op::PropertyAdd(object, ..)
-            | Op::FillPropertyStore(object, ..)
-            | Op::SetIndex(object, ..)
-            | Op::ArrayAppend(object, ..)
-            | Op::IteratorNext(object)
-            | Op::EnumerateNext(object) => Some(*object),
-            _ => None,
-        }
     }
 }
 

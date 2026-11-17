@@ -6,11 +6,10 @@ use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use oxc_syntax::operator::BinaryOperator;
 
 use super::super::effects::{Control, Memory};
-use super::access::Access;
 use super::available;
-use super::fresh::Fresh;
 use super::guards;
 use super::low_level::{Binary as LowBinary, Op as LowOp};
+use super::memory::{Access, Analysis};
 use super::{Block, Cfg, Constant, Graph, Inst, MemoryFormat, Op, TerminatorKind, UnaryOp, Value};
 use crate::heap::TypedKind;
 use cranelift_module::FuncId;
@@ -131,7 +130,7 @@ pub(in crate::jit) struct Facts {
     types: SecondaryMap<Value, ValueType>,
     indexed: FxHashSet<Value>,
     known: bool,
-    fresh: std::cell::OnceCell<std::rc::Rc<Fresh>>,
+    memory_analysis: std::cell::OnceCell<std::rc::Rc<Analysis>>,
     memory: SecondaryMap<Inst, Memory>,
     control: SecondaryMap<Inst, Control>,
 }
@@ -148,7 +147,7 @@ impl Default for Facts {
             types: SecondaryMap::new(),
             indexed: FxHashSet::default(),
             known: false,
-            fresh: Default::default(),
+            memory_analysis: Default::default(),
             memory: SecondaryMap::with_default(Memory::UNKNOWN),
             control: SecondaryMap::with_default(Control::UNKNOWN),
         }
@@ -172,9 +171,9 @@ impl Facts {
         self.types[value] = types;
     }
 
-    pub(super) fn fresh(&self, graph: &Graph) -> std::rc::Rc<Fresh> {
-        self.fresh
-            .get_or_init(|| std::rc::Rc::new(Fresh::compute(graph, &self.cfg)))
+    pub(super) fn memory_analysis(&self, graph: &Graph) -> std::rc::Rc<Analysis> {
+        self.memory_analysis
+            .get_or_init(|| std::rc::Rc::new(Analysis::compute(graph, &self.cfg)))
             .clone()
     }
 
@@ -211,9 +210,7 @@ impl Facts {
     }
 
     pub(super) fn kills(&self, graph: &Graph, inst: Inst, write: &Access, read: &Access) -> bool {
-        write.overlaps(read)
-            && self.fresh(graph).may_alias(inst, write, read)
-            && write.field.conflicts(&read.field)
+        self.memory_analysis(graph).may_clobber(inst, write, read)
     }
 
     fn unavailable_probes(&self, graph: &Graph) -> Vec<Inst> {
@@ -428,7 +425,7 @@ impl Facts {
             types: SecondaryMap::with_capacity(graph.values.len()),
             indexed,
             known: true,
-            fresh: Default::default(),
+            memory_analysis: Default::default(),
             memory: SecondaryMap::with_default(Memory::UNKNOWN),
             control: SecondaryMap::with_default(Control::UNKNOWN),
         };
@@ -515,7 +512,7 @@ impl Facts {
 
     pub(super) fn compute_effects(&mut self, graph: &Graph) {
         self.rejected.clear();
-        self.fresh.take();
+        self.memory_analysis.take();
         self.memory.clear();
         self.control.clear();
         loop {

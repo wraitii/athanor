@@ -8,6 +8,7 @@ pub(in crate::jit::semantic) mod construction;
 pub(in crate::jit::semantic) mod conversions;
 mod folding;
 pub(super) mod intrinsics;
+pub(in crate::jit::semantic) mod memory;
 pub(in crate::jit::semantic) mod string_split;
 mod typeof_comparisons;
 

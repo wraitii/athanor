@@ -1,10 +1,11 @@
-use super::super::super::fresh::Fresh;
+use super::super::super::js::memory::Field;
+use super::super::super::memory::Analysis;
 use super::*;
 use crate::{FxHashMap, FxHashSet};
 
 pub(in crate::jit::semantic) struct Writes<F = Facts> {
     writes: Vec<(Inst, Access)>,
-    fresh: std::rc::Rc<Fresh>,
+    memory: std::rc::Rc<Analysis>,
     pub(in crate::jit::semantic) facts: F,
 }
 
@@ -32,7 +33,7 @@ impl<F: std::borrow::Borrow<Facts>> Writes<F> {
     ) -> Self {
         let known = facts.borrow();
         let mut writes = Vec::new();
-        let fresh = known.fresh(graph);
+        let memory = known.memory_analysis(graph);
         for &block in blocks {
             for &inst in &graph.blocks[block].insts {
                 let memory = known.memory(inst);
@@ -46,7 +47,7 @@ impl<F: std::borrow::Borrow<Facts>> Writes<F> {
         }
         Self {
             writes,
-            fresh,
+            memory,
             facts,
         }
     }
@@ -69,9 +70,7 @@ impl<F: std::borrow::Borrow<Facts>> Writes<F> {
         write: &Access,
         read: &Access,
     ) -> bool {
-        write.overlaps(read)
-            && self.fresh.may_alias(inst, write, read)
-            && write.field.conflicts(&read.field)
+        self.memory.may_clobber(inst, write, read)
     }
 
     pub(in crate::jit::semantic) fn clobbers(&self, read: &Access) -> bool {
@@ -88,11 +87,7 @@ impl<F: std::borrow::Borrow<Facts>> Writes<F> {
         if !facts.removable(inst) || facts.memory(inst).reenters() {
             return false;
         }
-        let read = Access {
-            location: facts.memory(inst).reads,
-            base: None,
-            field: Field::Any,
-        };
+        let read = Access::broad(facts.memory(inst).reads);
         !self.writes.iter().any(|(_, write)| write.overlaps(&read))
     }
 }
@@ -101,16 +96,14 @@ pub(in crate::jit::semantic) fn guarded_accesses(
     requirements: &[Requirement],
     identities: &[(String, cranelift_module::FuncId)],
 ) -> Vec<Access> {
-    let global = |name: &String| Access {
-        location: Locations::HEAP.union(Locations::GLOBAL),
-        base: None,
-        field: Field::Named(name.clone()),
+    let global = |name: &String| {
+        Access::js(
+            Locations::HEAP.union(Locations::GLOBAL),
+            None,
+            Field::Named(name.clone()),
+        )
     };
-    let property = |name: &String| Access {
-        location: Locations::HEAP,
-        base: None,
-        field: Field::Named(name.clone()),
-    };
+    let property = |name: &String| Access::js(Locations::HEAP, None, Field::Named(name.clone()));
     let mut guards: Vec<Access> = requirements
         .iter()
         .filter(|r| r.captured.is_none() && r.object.is_none())
@@ -155,7 +148,7 @@ pub(in crate::jit::semantic) fn closure_failure_with(
             }
             let write = Access::written(op, facts, memory.writes);
             if guards.iter().any(|guard| {
-                (write.field == Field::Any || write.location.intersects(guard.location))
+                (write.is_unknown() || write.location.intersects(guard.location))
                     && writes.kills(inst, &write, guard)
             }) {
                 return Some(format!(
@@ -178,7 +171,7 @@ impl Conflicts {
         self.reentry.is_some()
             || self.writes.writes.iter().any(|(inst, write)| {
                 guards.iter().any(|guard| {
-                    (write.field == Field::Any || write.location.intersects(guard.location))
+                    (write.is_unknown() || write.location.intersects(guard.location))
                         && self.writes.kills(*inst, write, guard)
                 })
             })

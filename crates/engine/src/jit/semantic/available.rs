@@ -5,8 +5,8 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::rc::Rc;
 
-use super::access::Access;
 use super::guards::{Fact, implies};
+use super::memory::Access;
 use super::{Block, Cfg, Facts, Graph, Inst, Op, TerminatorKind, Value, resolve};
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -99,11 +99,9 @@ fn load_key(op: &Op, probes: bool, aliases: &FxHashMap<Value, Value>) -> Option<
 
 fn read_access(op: &Op, facts: &Facts) -> Option<Access> {
     match op {
-        Op::LowLevel(super::low_level::Op::Load { .. }) => Some(Access {
-            location: super::super::effects::Locations::HEAP,
-            base: None,
-            field: super::access::Field::Any,
-        }),
+        Op::LowLevel(super::low_level::Op::Load { .. }) => {
+            Some(Access::broad(super::super::effects::Locations::HEAP))
+        }
         Op::ProbeGlobal(name) => Access::read(&Op::GlobalRead(name.clone()), facts),
         _ => Access::read(op, facts),
     }
@@ -170,7 +168,9 @@ fn step(
         _ => false,
     };
     let read = read_access(&data.op, facts).map(|mut read| {
-        read.base = read.base.map(|base| resolve(aliases, base));
+        if let Some(js) = &mut read.js {
+            js.base = js.base.map(|base| resolve(aliases, base));
+        }
         read
     });
     Rc::make_mut(state).insert(

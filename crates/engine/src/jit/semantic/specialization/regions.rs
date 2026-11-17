@@ -4,9 +4,11 @@ use crate::{FxHashMap, FxHashSet};
 use oxc_syntax::operator::BinaryOperator;
 
 use super::super::super::effects::Locations;
-use super::super::access::{Access, Field};
 use super::super::guards;
 use super::super::js::NUMERIC;
+#[cfg(test)]
+use super::super::js::memory::Field;
+use super::super::memory::Access;
 use super::super::{
     Block, BlockData, Cfg, Constant, Facts, FunctionState, Graph, Inst, Native, Op, Region,
     RegionFallback, RegionId, Result, Target, Terminator, TerminatorKind, TypedRead, UnaryOp,
@@ -590,19 +592,11 @@ mod tests {
     }
 
     fn heap(base: Value, field: Field) -> Access {
-        Access {
-            location: Locations::HEAP,
-            base: Some(base),
-            field,
-        }
+        Access::js(Locations::HEAP, Some(base), field)
     }
 
     fn global(name: &str) -> Access {
-        Access {
-            location: Locations::GLOBAL,
-            base: None,
-            field: Field::Named(name.into()),
-        }
+        Access::js(Locations::GLOBAL, None, Field::Named(name.into()))
     }
 
     #[test]

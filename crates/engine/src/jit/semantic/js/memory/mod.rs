@@ -1,8 +1,12 @@
-use super::super::effects::Locations;
-use super::{Facts, Op, Value, ValueType};
+use super::super::{Facts, Op, Value, ValueType};
+use crate::jit::effects::Locations;
+
+mod fresh;
+
+pub(in crate::jit::semantic) use fresh::Fresh;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(super) enum Field {
+pub(in crate::jit::semantic) enum Field {
     Named(String),
     // Cells can alias other captures, but cannot alias JavaScript properties.
     Cells,
@@ -59,7 +63,7 @@ impl Field {
         }
     }
 
-    pub(super) fn conflicts(&self, read: &Self) -> bool {
+    pub(in crate::jit::semantic) fn conflicts(&self, read: &Self) -> bool {
         match (self, read) {
             (Self::Iteration, _) | (_, Self::Iteration) => false,
             (Self::Any, _) | (_, Self::Any) => true,
@@ -72,21 +76,22 @@ impl Field {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(super) struct Access {
-    pub(super) location: Locations,
-    pub(super) base: Option<Value>,
-    pub(super) field: Field,
+pub(in crate::jit::semantic) struct Access {
+    pub(in crate::jit::semantic) base: Option<Value>,
+    pub(in crate::jit::semantic) field: Field,
 }
 
 impl Access {
-    pub(super) fn overlaps(&self, read: &Self) -> bool {
-        let data = Locations::HEAP.union(Locations::GLOBAL);
-        let code = Locations::CODE;
-        (self.location.intersects(data) && read.location.intersects(data))
-            || (self.location.intersects(code) && read.location.intersects(code))
+    pub(in crate::jit::semantic) const UNKNOWN: Self = Self {
+        base: None,
+        field: Field::Any,
+    };
+
+    pub(in crate::jit::semantic) fn is_unknown(&self) -> bool {
+        self.field == Field::Any
     }
 
-    pub(super) fn read(op: &Op, facts: &Facts) -> Option<Self> {
+    pub(in crate::jit::semantic) fn read(op: &Op, facts: &Facts) -> Option<(Locations, Self)> {
         let (location, base) = match op {
             Op::Get(object, _)
             | Op::ProbeProperty(object, _)
@@ -102,29 +107,60 @@ impl Access {
             Op::ProbeShapeProperty(object, ..) => {
                 (Locations::HEAP.union(Locations::CODE), Some(*object))
             }
-            Op::EntryAssume(object, super::guards::Fact::Shape(_))
+            Op::EntryAssume(object, super::super::guards::Fact::Shape(_))
             | Op::IsShape(object, _)
             | Op::IsPropertyCached(object, ..) => (Locations::CODE, Some(*object)),
             Op::CellGet(cell) => (Locations::HEAP, Some(*cell)),
             Op::GlobalRead(_) => (Locations::GLOBAL, None),
             _ => return None,
         };
-        Some(Self {
+        Some((
             location,
-            base,
-            field: Field::of(op, facts),
-        })
+            Self {
+                base,
+                field: Field::of(op, facts),
+            },
+        ))
     }
 
-    pub(super) fn written(op: &Op, facts: &Facts, location: Locations) -> Self {
+    pub(in crate::jit::semantic) fn written(op: &Op, facts: &Facts) -> Option<Self> {
         let field = match Field::of(op, facts) {
             Field::Length => Field::Any,
             field => field,
         };
-        Self {
-            location,
-            base: op.write_target(),
-            field,
-        }
+        let base = write_target(op);
+        (base.is_some() || field != Field::Any).then_some(Self { base, field })
+    }
+}
+
+fn write_target(op: &Op) -> Option<Value> {
+    match op {
+        Op::CellSet(object, _)
+        | Op::Define(object, ..)
+        | Op::Set(object, ..)
+        | Op::ShapedSet(object, ..)
+        | Op::ArrayStore(object, ..)
+        | Op::PropertyStore(object, ..)
+        | Op::PropertyAdd(object, ..)
+        | Op::FillPropertyStore(object, ..)
+        | Op::SetIndex(object, ..)
+        | Op::ArrayAppend(object, ..)
+        | Op::IteratorNext(object)
+        | Op::EnumerateNext(object) => Some(*object),
+        _ => None,
+    }
+}
+
+impl Fresh {
+    pub(in crate::jit::semantic) fn may_clobber(
+        &self,
+        inst: super::super::Inst,
+        write: Option<&Access>,
+        read: Option<&Access>,
+    ) -> bool {
+        // Broad accesses retain the JS conflict rules for unknown fields.
+        let write = write.unwrap_or(&Access::UNKNOWN);
+        let read = read.unwrap_or(&Access::UNKNOWN);
+        self.may_alias(inst, write, read) && write.field.conflicts(&read.field)
     }
 }

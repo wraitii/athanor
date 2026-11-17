@@ -1,8 +1,8 @@
 use cranelift_codegen::entity::SecondaryMap;
 use oxc_syntax::operator::BinaryOperator;
 
-use super::access::Access;
-use super::{Block, Cfg, Graph, Inst, Op, TerminatorKind, Value};
+use super::super::super::{Block, Cfg, Graph, Inst, Op, TerminatorKind, Value};
+use super::Access;
 
 fn contained_use(op: &Op, index: usize) -> bool {
     match op {
@@ -99,7 +99,7 @@ impl Terminal<'_> {
     }
 }
 
-pub(super) struct Fresh {
+pub(in crate::jit::semantic) struct Fresh {
     classes: SecondaryMap<Value, u32>,
     positions: SecondaryMap<Inst, Option<(Block, u32)>>,
     words: usize,
@@ -108,7 +108,7 @@ pub(super) struct Fresh {
 }
 
 impl Fresh {
-    pub(super) fn compute(graph: &Graph, cfg: &Cfg) -> Self {
+    pub(in crate::jit::semantic) fn compute(graph: &Graph, cfg: &Cfg) -> Self {
         let mut reachable = SecondaryMap::<Block, bool>::new();
         for &block in &cfg.rpo {
             reachable[block] = true;
@@ -323,7 +323,12 @@ impl Fresh {
         (class != NONE).then_some(class)
     }
 
-    pub(super) fn may_alias(&self, inst: Inst, write: &Access, read: &Access) -> bool {
+    pub(in crate::jit::semantic) fn may_alias(
+        &self,
+        inst: Inst,
+        write: &Access,
+        read: &Access,
+    ) -> bool {
         match write.base.and_then(|target| self.at(target, inst)) {
             Some(class) => Some(class) == read.base.and_then(|base| self.class(base)),
             None => true,

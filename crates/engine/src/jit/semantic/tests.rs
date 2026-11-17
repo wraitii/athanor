@@ -1605,18 +1605,18 @@ fn unchanged_hoisting_preserves_facts() {
     });
     function.ensure_facts();
     assert!(!loops::natural_loops(&function.graph, &function.facts.cfg).is_empty());
-    let fresh = function.facts.fresh(&function.graph);
+    let fresh = function.facts.memory_analysis(&function.graph);
     regions::hoist(&mut function, region);
     function.ensure_facts();
     assert!(std::rc::Rc::ptr_eq(
         &fresh,
-        &function.facts.fresh(&function.graph)
+        &function.facts.memory_analysis(&function.graph)
     ));
     function.invalidate_effects();
     function.ensure_facts();
     assert!(!std::rc::Rc::ptr_eq(
         &fresh,
-        &function.facts.fresh(&function.graph)
+        &function.facts.memory_analysis(&function.graph)
     ));
 }
 
