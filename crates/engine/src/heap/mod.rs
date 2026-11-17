@@ -20,6 +20,7 @@ mod properties;
 mod regexp;
 mod set;
 mod shape;
+pub(crate) mod stats;
 mod string;
 #[cfg(test)]
 mod tests;
@@ -55,7 +56,6 @@ pub(crate) use typed::TypedKind;
 #[derive(Clone, Default)]
 pub(crate) struct Heap(Rc<RefCell<HeapData>>);
 
-#[derive(Default)]
 struct HeapData {
     arena: Arena,
     atoms: Atoms,
@@ -69,6 +69,27 @@ struct HeapData {
     regexp_cache: FxHashMap<(String, u8), Rc<crate::regex::Pattern>>,
     pending: VecDeque<u64>,
     epoch: u64,
+    stats: Option<Box<stats::Stats>>,
+}
+
+impl Default for HeapData {
+    fn default() -> Self {
+        Self {
+            arena: Arena::default(),
+            atoms: Atoms::default(),
+            shapes: Shapes::default(),
+            natives: Vec::new(),
+            object_prototype: None,
+            object_shape: ShapeId::default(),
+            empty_object_shape: ShapeId::default(),
+            function_prototype: None,
+            interned: Vec::new(),
+            regexp_cache: FxHashMap::default(),
+            pending: VecDeque::new(),
+            epoch: 0,
+            stats: stats::enabled().then(|| Box::new(stats::Stats::default())),
+        }
+    }
 }
 
 enum Payload {
@@ -219,6 +240,12 @@ impl Heap {
 
     pub(crate) fn drain(&self, mut budget: usize) {
         let mut data = self.0.borrow_mut();
+        let empty = data.pending.is_empty();
+        if let Some(stats) = &mut data.stats {
+            stats.drains += 1;
+            stats.empty_drains += u64::from(empty);
+            stats.disposing = true;
+        }
         while budget > 0 {
             let Some(id) = data.pending.pop_front() else {
                 break;
@@ -244,6 +271,12 @@ impl Heap {
                     _ => None,
                 };
                 budget -= 1;
+                if let Some(stats) = &mut data.stats {
+                    stats.work += 1;
+                    stats.edges += u64::from(edge.is_some());
+                    stats.heap_edges +=
+                        u64::from(edge.is_some_and(|value| heap_id(value).is_some()));
+                }
                 if let Some(value) = edge {
                     data.release(value);
                     if budget == 0 {
@@ -283,6 +316,9 @@ impl Heap {
                 }
                 break;
             }
+        }
+        if let Some(stats) = &mut data.stats {
+            stats.disposing = false;
         }
     }
 }
@@ -424,6 +460,9 @@ impl HeapData {
     }
 
     fn store(&mut self, id: u64, payload: Payload) {
+        if let Some(stats) = &mut self.stats {
+            stats.allocate(id, payload.cycle_kind());
+        }
         self.slot_mut(id).payload = payload;
         self.sync(id);
     }
@@ -461,6 +500,9 @@ impl HeapData {
     }
 
     fn vacate(&mut self, id: u64) -> Payload {
+        if let Some(stats) = &mut self.stats {
+            stats.dispose(id, false);
+        }
         let slot = self.slot_mut(id);
         slot.kind = 0;
         slot.shape = NO_SHAPE;
@@ -544,6 +586,9 @@ impl HeapData {
             // Disposal pops property values, so no site cache may match while it runs.
             slot.shape = NO_SHAPE;
             self.pending.push_back(id);
+            if let Some(stats) = &mut self.stats {
+                stats.queue(id);
+            }
         }
     }
 }

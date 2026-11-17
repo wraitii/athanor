@@ -231,6 +231,19 @@ fn emit(
             let span = u64::from(data.span.start) | (u64::from(data.span.end) << 32);
             e::mov_imm(Width::X, 9, span, |word| asm.emit(word));
             asm.emit(e::mem_scaled(Mem::StrX, 9, e::SP, span_offset as u32)?);
+            if crate::heap::stats::enabled() {
+                let site = crate::heap::stats::register(format!(
+                    "{} {} baseline",
+                    graph.name,
+                    crate::heap::stats::location(
+                        data.source_name.unwrap_or(source_name),
+                        data.span
+                    )
+                ));
+                asm.emit(e::mem_scaled(Mem::LdrX, 0, e::SP, context_offset as u32)?);
+                e::mov_imm(Width::X, 1, site, |word| asm.emit(word));
+                call(&mut asm, Helper::HeapAllocationSite);
+            }
             match &data.op {
                 Op::This => {
                     asm.emit(e::mem_scaled(Mem::LdrX, 9, e::SP, receiver_offset as u32)?);

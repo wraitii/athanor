@@ -355,6 +355,9 @@ impl FunctionCompiler<'_, '_> {
         args: &[LoweredValue],
         track: bool,
     ) -> LoweredValue {
+        if helper != Helper::HeapAllocationSite && crate::heap::stats::enabled() {
+            self.note_allocation_site(&format!("{helper:?}"));
+        }
         let target = self.module.target_config();
         let signature = *self.helper_signatures.entry(helper).or_insert_with(|| {
             self.b.import_signature(helpers::signature(
@@ -383,6 +386,20 @@ impl FunctionCompiler<'_, '_> {
             self.unchecked = Some(self.references.own(self.b, result));
         }
         result
+    }
+
+    fn note_allocation_site(&mut self, operation: &str) {
+        if !crate::heap::stats::enabled() {
+            return;
+        }
+        let site = crate::heap::stats::register(format!(
+            "{} {} {}",
+            self.b.graph.name,
+            crate::heap::stats::location(self.source_name, self.source_span),
+            operation
+        ));
+        let site = self.b.ins().iconst(types::I64, site as i64);
+        self.call_helper_tracked(Helper::HeapAllocationSite, &[site], false);
     }
 }
 
@@ -571,6 +588,7 @@ impl FunctionCompiler<'_, '_> {
         receiver: LoweredValue,
         args: &[LoweredValue],
     ) -> (LoweredValue, LoweredValue) {
+        self.note_allocation_site("Call");
         let arity = usize::from(arity);
         let signature = self.fixed_signature(arity as u16);
         let mut call_args = vec![self.ctx, callee, receiver];

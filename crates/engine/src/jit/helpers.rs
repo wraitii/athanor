@@ -189,6 +189,7 @@ define_helpers! {
     ShiftRight => js_shift_right(Value, Value) -> Value;
     ShiftRightUnsigned => js_shift_right_unsigned(Value, Value) -> Value;
     Add => js_add(Value, Value) -> Value, owned;
+    HeapAllocationSite => js_heap_allocation_site(u64) -> Value;
     Sub => js_sub(Value, Value) -> Value;
     Mul => js_mul(Value, Value) -> Value;
     Div => js_div(Value, Value) -> Value;
@@ -402,6 +403,11 @@ extern "C" fn js_retain(ctx: *mut JitCtx, value: Value) -> Value {
     }
     ctx.retain(value)
 }
+extern "C" fn js_heap_allocation_site(ctx: *mut JitCtx, site: u64) -> Value {
+    unsafe { &*ctx }.global.heap().allocation_site(site);
+    Value::UNDEFINED
+}
+
 extern "C" fn js_array_new(ctx: *mut JitCtx, argv: *const Value, argc: u64) -> Value {
     let ctx = unsafe { &mut *ctx };
     let values = if argc == 0 {

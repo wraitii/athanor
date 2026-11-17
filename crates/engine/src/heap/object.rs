@@ -767,6 +767,10 @@ impl HeapData {
         }
         debug_assert_eq!(self.slot(id).references, 0);
         self.pending.pop_front();
+        if let Some(stats) = &mut self.stats {
+            stats.dispose(id, true);
+            stats.disposing = true;
+        }
         loop {
             let Payload::SmallObject(object) = &mut self.slot_mut(id).payload else {
                 unreachable!();
@@ -794,6 +798,10 @@ impl HeapData {
             if let Some(previous) = previous {
                 self.release(previous);
             }
+        }
+        if let Some(stats) = &mut self.stats {
+            stats.disposing = false;
+            stats.allocate(id, "object");
         }
         Some(id)
     }

@@ -99,6 +99,9 @@ impl Heap {
         data.store(disposal, Payload::Set(Box::new(Set { entries })));
         data.slot_mut(disposal).references = 0;
         data.pending.push_back(disposal);
+        if let Some(stats) = &mut data.stats {
+            stats.queue(disposal);
+        }
         true
     }
 }

@@ -474,3 +474,15 @@ Run `cargo test --workspace` for compiler or runtime changes. Tests under
 continuations and backends. For map-affecting changes, use the release map
 command in the workspace README and compare the output hash as well as timing.
 The map runner is a useful workload, not a conformance suite.
+
+`JS_JIT_HEAP_STATS=1` enables allocation-site instrumentation in generated code
+and prints heap counters to stderr when the engine is dropped. Rows identify
+the source file, byte span and helper at construction, with counts for
+allocation, zero-reference queuing, cascading queuing during parent disposal,
+completed disposal and object-slot reuse. Remaining allocations include pending
+disposals and their still-owned children; reporting does not drain the queue.
+Drain counters distinguish empty checks, budget work, outgoing edges and heap
+edges. Allocations before JIT execution are unattributed. Tags describe the
+most recent instrumented JIT operation, so runtime allocations after nested JS
+callbacks can inherit the callback's last site. Instrumentation changes timing;
+use fixed workloads to compare counts, and disable it for performance results.

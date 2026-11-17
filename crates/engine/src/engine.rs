@@ -128,6 +128,7 @@ pub struct Engine {
 
 impl Drop for Engine {
     fn drop(&mut self) {
+        self.global.heap().report_stats();
         if std::env::var_os("JS_JIT_HEAP_CYCLES").is_some_and(|value| value == "1") {
             let start = std::time::Instant::now();
             let stats = self.global.heap().cycle_stats();

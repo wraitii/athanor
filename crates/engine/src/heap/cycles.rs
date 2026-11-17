@@ -53,7 +53,7 @@ impl Payload {
         }
     }
 
-    fn cycle_kind(&self) -> &'static str {
+    pub(super) fn cycle_kind(&self) -> &'static str {
         match self {
             Self::Vacant => "vacant",
             Self::Reserved => "reserved",
