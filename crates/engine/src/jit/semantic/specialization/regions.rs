@@ -1,4 +1,5 @@
 use super::super::transforms::loops::{natural_loop, natural_loops, preheader};
+use crate::jit::semantic::JsOp;
 use crate::{FxHashMap, FxHashSet};
 
 use oxc_syntax::operator::BinaryOperator;
@@ -51,11 +52,14 @@ pub(in crate::jit::semantic) fn version_string_leaves(
         else {
             continue;
         };
-        if !matches!(graph.defining_op(*condition), Some(Op::IsStringSplit(_))) {
+        if !matches!(
+            graph.defining_op(*condition),
+            Some(Op::Javascript(JsOp::IsStringSplit(_)))
+        ) {
             continue;
         }
         let Some((receiver, header)) = graph.blocks[fast.block].insts.iter().find_map(|&inst| {
-            let Op::StringSplit(receiver, _) = graph.insts[inst].op else {
+            let Op::Javascript(JsOp::StringSplit(receiver, _)) = graph.insts[inst].op else {
                 return None;
             };
             let Some(Terminator {
@@ -77,7 +81,7 @@ pub(in crate::jit::semantic) fn version_string_leaves(
             else {
                 return false;
             };
-            matches!(graph.defining_op(*check), Some(Op::IsString(value)) if *value == receiver)
+            matches!(graph.defining_op(*check), Some(Op::Javascript(JsOp::IsString(value))) if *value == receiver)
                 && yes.block != no.block
                 && yes.block != graph.entry
                 && initial.preds[yes.block].len() == 1
@@ -131,16 +135,20 @@ pub(in crate::jit::semantic) fn version_string_leaves(
                     return false;
                 }
                 match graph.defining_op(*condition) {
-                    Some(Op::IsUninitialized(_)) => graph.cold.contains(&yes.block),
-                    Some(Op::IsUndefined(_)) => true,
-                    Some(Op::Binary(BinaryOperator::StrictEquality, left, right)) => {
-                        [left, right].into_iter().any(|&value| {
-                            matches!(
-                                graph.defining_op(value),
-                                Some(Op::Constant(Constant::Undefined))
-                            )
-                        })
+                    Some(Op::Javascript(JsOp::IsUninitialized(_))) => {
+                        graph.cold.contains(&yes.block)
                     }
+                    Some(Op::Javascript(JsOp::IsUndefined(_))) => true,
+                    Some(Op::Javascript(JsOp::Binary(
+                        BinaryOperator::StrictEquality,
+                        left,
+                        right,
+                    ))) => [left, right].into_iter().any(|&value| {
+                        matches!(
+                            graph.defining_op(value),
+                            Some(Op::Javascript(JsOp::Constant(Constant::Undefined)))
+                        )
+                    }),
                     _ => false,
                 }
             })
@@ -150,7 +158,7 @@ pub(in crate::jit::semantic) fn version_string_leaves(
         }
         for &block in &cfg.preds[preheader] {
             if matches!(&graph.blocks[block].terminator, Some(Terminator { kind: TerminatorKind::Branch(condition, yes, _), .. })
-                if yes.block == preheader && matches!(graph.defining_op(*condition), Some(Op::IsStringSplit(_))))
+                if yes.block == preheader && matches!(graph.defining_op(*condition), Some(Op::Javascript(JsOp::IsStringSplit(_)))))
             {
                 exits.push(block);
             }
@@ -226,7 +234,10 @@ fn cold_exit(graph: &Graph, block: Block) -> Option<Block> {
     else {
         return None;
     };
-    if matches!(graph.defining_op(*condition), Some(Op::GuardValid(_))) {
+    if matches!(
+        graph.defining_op(*condition),
+        Some(Op::Javascript(JsOp::GuardValid(_)))
+    ) {
         return None;
     }
     graph
@@ -271,7 +282,8 @@ fn typed_entry(
     let mut typed = FxHashMap::default();
     for &block in body {
         for &inst in &graph.blocks[block].insts {
-            if let Op::GetIndex(object, key) | Op::TypedIndex(object, key, _) = graph.insts[inst].op
+            if let Op::Javascript(JsOp::GetIndex(object, key) | JsOp::TypedIndex(object, key, _)) =
+                graph.insts[inst].op
                 && (!body.contains(&graph.def_block(object)) || available.contains(&object))
                 && facts.of(key).within(NUMERIC)
                 && let Some(element) = candidates.iter().find_map(|&(value, fact)| match fact {
@@ -317,20 +329,24 @@ fn element_guess_at(graph: &Graph, object: Value, depth: usize) -> Option<TypedK
             .filter(|target| target.block == block)
             .find_map(|target| element_guess_at(graph, *target.args.get(index)?, depth + 1));
     }
-    if let Some(Op::ConstructorResult(result, _)) = graph.defining_op(object) {
+    if let Some(Op::Javascript(JsOp::ConstructorResult(result, _))) = graph.defining_op(object) {
         return element_guess_at(graph, *result, depth + 1);
     }
     let constructor = match graph.defining_op(object)? {
-        Op::Construct { callee, .. }
-        | Op::ConstructResolved { callee, .. }
-        | Op::ConstructorCall { callee, .. } => *callee,
-        Op::Call { callee, .. } => match graph.defining_op(*callee)? {
-            Op::Get(constructor, name) if name == "from" || name == "of" => *constructor,
+        Op::Javascript(
+            JsOp::Construct { callee, .. }
+            | JsOp::ConstructResolved { callee, .. }
+            | JsOp::ConstructorCall { callee, .. },
+        ) => *callee,
+        Op::Javascript(JsOp::Call { callee, .. }) => match graph.defining_op(*callee)? {
+            Op::Javascript(JsOp::Get(constructor, name)) if name == "from" || name == "of" => {
+                *constructor
+            }
             _ => return None,
         },
         _ => return None,
     };
-    let Op::GlobalRead(name) = graph.defining_op(constructor)? else {
+    let Op::Javascript(JsOp::GlobalRead(name)) = graph.defining_op(constructor)? else {
         return None;
     };
     Some(match name.as_str() {
@@ -384,15 +400,15 @@ fn bounded_reads(
         else {
             continue;
         };
-        let Some(
-            &(Op::Binary(BinaryOperator::LessThan, counter, bound)
-            | Op::GuardedCompare {
+        let Some(&Op::Javascript(
+            JsOp::Binary(BinaryOperator::LessThan, counter, bound)
+            | JsOp::GuardedCompare {
                 operator: BinaryOperator::LessThan,
                 left: counter,
                 right: bound,
                 ..
-            }),
-        ) = graph.defining_op(*condition)
+            },
+        )) = graph.defining_op(*condition)
         else {
             continue;
         };
@@ -409,7 +425,8 @@ fn bounded_reads(
     let mut reads = FxHashMap::default();
     for &block in region {
         for &inst in &graph.blocks[block].insts {
-            if let Op::GetIndex(object, key) | Op::TypedIndex(object, key, _) = graph.insts[inst].op
+            if let Op::Javascript(JsOp::GetIndex(object, key) | JsOp::TypedIndex(object, key, _)) =
+                graph.insts[inst].op
                 && objects.contains(&object)
                 && let Some(&(inside, bound)) = counters.get(&key)
                 && cfg.dominates(inside, block)
@@ -444,15 +461,15 @@ fn counts_up(
             .all(|target| {
                 let arg = target.args[index];
                 match graph.defining_op(arg) {
-                    Some(Op::Constant(Constant::Number(start))) => {
+                    Some(Op::Javascript(JsOp::Constant(Constant::Number(start)))) => {
                         !body.contains(&pred) && *start >= 0.0 && start.fract() == 0.0
                     }
-                    Some(&Op::Unary(UnaryOp::Increment, operand)) => operand == counter,
-                    Some(&Op::Binary(BinaryOperator::Addition, operand, step)) => {
+                    Some(&Op::Javascript(JsOp::Unary(UnaryOp::Increment, operand))) => operand == counter,
+                    Some(&Op::Javascript(JsOp::Binary(BinaryOperator::Addition, operand, step))) => {
                         operand == counter
                             && matches!(
                                 graph.defining_op(step),
-                                Some(Op::Constant(Constant::Number(step))) if *step == 1.0
+                                Some(Op::Javascript(JsOp::Constant(Constant::Number(step)))) if *step == 1.0
                             )
                     }
                     _ => false,
@@ -463,8 +480,8 @@ fn counts_up(
 
 fn numeric_use(op: &Op, index: usize) -> bool {
     match op {
-        Op::GuardedCompare { .. } => index < 2,
-        Op::Binary(operator, ..) => !matches!(
+        Op::Javascript(JsOp::GuardedCompare { .. }) => index < 2,
+        Op::Javascript(JsOp::Binary(operator, ..)) => !matches!(
             operator,
             BinaryOperator::In
                 | BinaryOperator::Instanceof
@@ -473,13 +490,17 @@ fn numeric_use(op: &Op, index: usize) -> bool {
                 | BinaryOperator::StrictEquality
                 | BinaryOperator::StrictInequality
         ),
-        Op::Unary(operator, _) => !matches!(operator, UnaryOp::Not | UnaryOp::Typeof),
-        Op::ToNumeric(_) | Op::CallNative(..) => true,
-        Op::GetIndex(..)
-        | Op::TypedIndex(..)
-        | Op::ArrayGet(..)
-        | Op::ArrayLoad(..)
-        | Op::SetIndex(..) => index == 1,
+        Op::Javascript(JsOp::Unary(operator, _)) => {
+            !matches!(operator, UnaryOp::Not | UnaryOp::Typeof)
+        }
+        Op::Javascript(JsOp::ToNumeric(_) | JsOp::CallNative(..)) => true,
+        Op::Javascript(
+            JsOp::GetIndex(..)
+            | JsOp::TypedIndex(..)
+            | JsOp::ArrayGet(..)
+            | JsOp::ArrayLoad(..)
+            | JsOp::SetIndex(..),
+        ) => index == 1,
         _ => false,
     }
 }
@@ -539,18 +560,20 @@ fn probe_reads(
     for &block in scan {
         for &inst in &graph.blocks[block].insts {
             let data = &graph.insts[inst];
-            let input = matches!(data.op, Op::PropertyCache(..))
-                || inputs && matches!(data.op, Op::Argument(_) | Op::This);
+            let input = matches!(data.op, Op::Javascript(JsOp::PropertyCache(..)))
+                || inputs && matches!(data.op, Op::Argument(_) | Op::Javascript(JsOp::This));
             if (input
                 || matches!(
                     data.op,
-                    Op::Get(..)
-                        | Op::ShapedGet(..)
-                        | Op::ProbeProperty(..)
-                        | Op::ProbeShapeProperty(..)
-                        | Op::GetIndex(..)
-                        | Op::ArrayGet(..)
-                        | Op::GlobalRead(_)
+                    Op::Javascript(
+                        JsOp::Get(..)
+                            | JsOp::ShapedGet(..)
+                            | JsOp::ProbeProperty(..)
+                            | JsOp::ProbeShapeProperty(..)
+                            | JsOp::GetIndex(..)
+                            | JsOp::ArrayGet(..)
+                            | JsOp::GlobalRead(_)
+                    )
                 ))
                 && data.op.operands_iter().all(|value| {
                     !inside.contains(&graph.def_block(value)) || probed.contains(&value)
@@ -603,7 +626,12 @@ mod tests {
             let span = graph.span;
             let array = graph.append_value(block, span, Op::Argument(0));
             let value = graph.append_value(block, span, Op::Argument(1));
-            graph.append(block, span, Op::ArrayAppend(array, value, spread), false);
+            graph.append(
+                block,
+                span,
+                Op::Javascript(JsOp::ArrayAppend(array, value, spread)),
+                false,
+            );
             let scope = Cfg::new(&graph).rpo.into_iter().collect();
             let writes = Writes::collect(&graph, &scope);
             assert!(writes.clobbers(&heap(array, Field::Elements)));
@@ -618,19 +646,28 @@ mod tests {
         let mut graph = empty_graph();
         let block = graph.entry;
         let span = graph.span;
-        let object = graph.append_value(block, span, Op::NewObject);
+        let object = graph.append_value(block, span, Op::Javascript(JsOp::NewObject));
         let value = graph.append_value(
             block,
             span,
-            Op::Constant(super::super::super::Constant::Number(1.0)),
+            Op::Javascript(JsOp::Constant(super::super::super::Constant::Number(1.0))),
         );
-        let (store, _) = graph.append(block, span, Op::Set(object, "x".into(), value), false);
+        let (store, _) = graph.append(
+            block,
+            span,
+            Op::Javascript(JsOp::Set(object, "x".into(), value)),
+            false,
+        );
         let scope = Cfg::new(&graph).rpo.into_iter().collect();
         let writes = Writes::collect(&graph, &scope);
         let facts = Facts::compute(&graph);
         let read = Access::read(
             &graph,
-            &Op::RelatedPropertyLoad(object, object, Field::Named("x".into())),
+            &Op::Javascript(JsOp::RelatedPropertyLoad(
+                object,
+                object,
+                Field::Named("x".into()),
+            )),
             &facts,
         )
         .unwrap();
@@ -650,7 +687,7 @@ mod tests {
             let entry = graph.entry;
             let span = graph.span;
             let object = graph.append_value(entry, span, Op::Argument(0));
-            let check = graph.append_value(entry, span, Op::IsShape(object, 2));
+            let check = graph.append_value(entry, span, Op::Javascript(JsOp::IsShape(object, 2)));
             let yes = graph.blocks.push(BlockData::default());
             let no = graph.blocks.push(BlockData::default());
             let join = graph.blocks.push(BlockData::default());
@@ -660,14 +697,22 @@ mod tests {
                 TerminatorKind::Branch(check, Target::new(yes), Target::new(no)),
             );
             if writes_shape {
-                graph.append(yes, span, Op::Set(object, "extra".into(), object), false);
+                graph.append(
+                    yes,
+                    span,
+                    Op::Javascript(JsOp::Set(object, "extra".into(), object)),
+                    false,
+                );
             }
-            let (positive, _) = graph.append(yes, span, Op::IsShape(object, 1), true);
-            let (negative, _) = graph.append(no, span, Op::IsShape(object, 1), true);
+            let (positive, _) =
+                graph.append(yes, span, Op::Javascript(JsOp::IsShape(object, 1)), true);
+            let (negative, _) =
+                graph.append(no, span, Op::Javascript(JsOp::IsShape(object, 1)), true);
             for block in [yes, no] {
                 graph.terminate(block, span, TerminatorKind::Jump(Target::new(join)));
             }
-            let (merged, result) = graph.append(join, span, Op::IsShape(object, 1), true);
+            let (merged, result) =
+                graph.append(join, span, Op::Javascript(JsOp::IsShape(object, 1)), true);
             graph.terminate(join, span, TerminatorKind::Return(result.unwrap()));
             graph.verify().unwrap();
             let facts = Facts::compute(&graph);
@@ -697,16 +742,23 @@ mod tests {
         let span = graph.span;
         let object = graph.append_value(block, span, Op::Argument(0));
         let value = graph.append_value(block, span, Op::Argument(1));
-        let first = graph.append(block, span, Op::IsShape(object, 1), true).1;
+        let first = graph
+            .append(block, span, Op::Javascript(JsOp::IsShape(object, 1)), true)
+            .1;
         graph.append(
             block,
             span,
-            Op::ShapedSet(object, "x".into(), 0, value),
+            Op::Javascript(JsOp::ShapedSet(object, "x".into(), 0, value)),
             false,
         );
-        let (second, _) = graph.append(block, span, Op::IsShape(object, 1), true);
-        graph.append(block, span, Op::Set(object, "y".into(), value), false);
-        let (third, _) = graph.append(block, span, Op::IsShape(object, 1), true);
+        let (second, _) = graph.append(block, span, Op::Javascript(JsOp::IsShape(object, 1)), true);
+        graph.append(
+            block,
+            span,
+            Op::Javascript(JsOp::Set(object, "y".into(), value)),
+            false,
+        );
+        let (third, _) = graph.append(block, span, Op::Javascript(JsOp::IsShape(object, 1)), true);
         graph.terminate(block, span, TerminatorKind::Return(first.unwrap()));
         graph.verify().unwrap();
         let facts = Facts::compute(&graph);
@@ -729,10 +781,15 @@ mod tests {
         let mut graph = empty_graph();
         let block = graph.entry;
         let span = graph.span;
-        let pack = graph.append_value(block, span, Op::NewPack);
+        let pack = graph.append_value(block, span, Op::Javascript(JsOp::NewPack));
         let value = graph.append_value(block, span, Op::Argument(0));
-        graph.append(block, span, Op::PackAppend(pack, value, false), false);
-        graph.append(block, span, Op::PackRelease(pack), false);
+        graph.append(
+            block,
+            span,
+            Op::Javascript(JsOp::PackAppend(pack, value, false)),
+            false,
+        );
+        graph.append(block, span, Op::Javascript(JsOp::PackRelease(pack)), false);
         let scope = Cfg::new(&graph).rpo.into_iter().collect();
         let writes = Writes::collect(&graph, &scope);
         assert!(writes.clobbers(&heap(pack, Field::Packs)));
@@ -747,10 +804,11 @@ mod tests {
             let mut graph = empty_graph();
             let entry = graph.entry;
             let span = graph.span;
-            let object = graph.append_value(entry, span, Op::NewObject);
-            let other = graph.append_value(entry, span, Op::NewObject);
+            let object = graph.append_value(entry, span, Op::Javascript(JsOp::NewObject));
+            let other = graph.append_value(entry, span, Op::Javascript(JsOp::NewObject));
             let argument = graph.append_value(entry, span, Op::Argument(0));
-            let check = graph.append_value(entry, span, Op::IsUndefined(argument));
+            let check =
+                graph.append_value(entry, span, Op::Javascript(JsOp::IsUndefined(argument)));
             let left = graph.blocks.push(BlockData::default());
             let right = graph.blocks.push(BlockData::default());
             let merge = graph.blocks.push(BlockData::default());
@@ -773,7 +831,12 @@ mod tests {
                     }),
                 );
             }
-            graph.append(merge, span, Op::Set(receiver, "x".into(), argument), false);
+            graph.append(
+                merge,
+                span,
+                Op::Javascript(JsOp::Set(receiver, "x".into(), argument)),
+                false,
+            );
             graph.terminate(merge, span, TerminatorKind::Return(receiver));
             graph.verify().unwrap();
             let scope = Cfg::new(&graph).rpo.into_iter().collect();
@@ -784,7 +847,12 @@ mod tests {
                 external
             );
             let mut after = graph.clone();
-            after.append(merge, span, Op::GlobalWrite("leak".into(), receiver), false);
+            after.append(
+                merge,
+                span,
+                Op::Javascript(JsOp::GlobalWrite("leak".into(), receiver)),
+                false,
+            );
             let writes = Writes::collect(&after, &scope);
             assert_eq!(
                 writes.clobbers(&heap(other, Field::Named("x".into()))),
@@ -792,7 +860,12 @@ mod tests {
             );
             for value in [object, receiver] {
                 let mut before = graph.clone();
-                before.append(entry, span, Op::GlobalWrite("leak".into(), value), false);
+                before.append(
+                    entry,
+                    span,
+                    Op::Javascript(JsOp::GlobalWrite("leak".into(), value)),
+                    false,
+                );
                 let writes = Writes::collect(&before, &scope);
                 assert!(writes.clobbers(&heap(other, Field::Named("x".into()))));
             }
@@ -806,7 +879,8 @@ mod tests {
             let entry = graph.entry;
             let span = graph.span;
             let argument = graph.append_value(entry, span, Op::Argument(0));
-            let check = graph.append_value(entry, span, Op::IsUndefined(argument));
+            let check =
+                graph.append_value(entry, span, Op::Javascript(JsOp::IsUndefined(argument)));
             let [yes, no, inner_yes, inner_no] =
                 std::array::from_fn(|_| graph.blocks.push(BlockData::default()));
             graph.terminate(
@@ -815,7 +889,7 @@ mod tests {
                 TerminatorKind::Branch(check, Target::new(yes), Target::new(no)),
             );
             let repeated = if inverted {
-                graph.append_value(yes, span, Op::Unary(UnaryOp::Not, check))
+                graph.append_value(yes, span, Op::Javascript(JsOp::Unary(UnaryOp::Not, check)))
             } else {
                 check
             };
@@ -825,7 +899,11 @@ mod tests {
                 TerminatorKind::Branch(repeated, Target::new(inner_yes), Target::new(inner_no)),
             );
             for block in [no, inner_yes, inner_no] {
-                let zero = graph.append_value(block, span, Op::Constant(Constant::Number(0.0)));
+                let zero = graph.append_value(
+                    block,
+                    span,
+                    Op::Javascript(JsOp::Constant(Constant::Number(0.0))),
+                );
                 graph.terminate(block, span, TerminatorKind::Return(zero));
             }
             graph.verify().unwrap();
@@ -854,8 +932,9 @@ mod tests {
             )]));
             let entry = graph.entry;
             let span = graph.span;
-            let probe = graph.append_value(entry, span, Op::ProbeGlobal("f".into()));
-            let check = graph.append_value(entry, span, Op::IsCode(probe, code));
+            let probe =
+                graph.append_value(entry, span, Op::Javascript(JsOp::ProbeGlobal("f".into())));
+            let check = graph.append_value(entry, span, Op::Javascript(JsOp::IsCode(probe, code)));
             let body = graph.blocks.push(BlockData::default());
             let exit = graph.blocks.push(BlockData::default());
             graph.terminate(
@@ -863,23 +942,36 @@ mod tests {
                 span,
                 TerminatorKind::Branch(check, Target::new(body), Target::new(exit)),
             );
-            let value = graph.append_value(body, span, Op::Constant(Constant::Number(1.0)));
+            let value = graph.append_value(
+                body,
+                span,
+                Op::Javascript(JsOp::Constant(Constant::Number(1.0))),
+            );
             if written {
-                graph.append(body, span, Op::GlobalWrite("f".into(), value), false);
+                graph.append(
+                    body,
+                    span,
+                    Op::Javascript(JsOp::GlobalWrite("f".into(), value)),
+                    false,
+                );
             }
             let (call, result) = graph.append(
                 body,
                 span,
-                Op::Call {
+                Op::Javascript(JsOp::Call {
                     callee: probe,
                     receiver: None,
                     args: Vec::new(),
                     target: None,
-                },
+                }),
                 true,
             );
             graph.terminate(body, span, TerminatorKind::Return(result.unwrap()));
-            let zero = graph.append_value(exit, span, Op::Constant(Constant::Number(0.0)));
+            let zero = graph.append_value(
+                exit,
+                span,
+                Op::Javascript(JsOp::Constant(Constant::Number(0.0))),
+            );
             graph.terminate(exit, span, TerminatorKind::Return(zero));
             graph.verify().unwrap();
             let facts = Facts::compute(&graph);
@@ -892,7 +984,7 @@ mod tests {
         let mut graph = empty_graph();
         let entry = graph.entry;
         let span = graph.span;
-        let object = graph.append_value(entry, span, Op::NewObject);
+        let object = graph.append_value(entry, span, Op::Javascript(JsOp::NewObject));
         let header = graph.blocks.push(BlockData::default());
         let receiver = graph.add_param(header);
         graph.terminate(
@@ -911,9 +1003,18 @@ mod tests {
                 args: vec![receiver],
             }),
         );
-        let other = graph.append_value(entry, span, Op::NewObject);
-        let one = graph.append_value(header, span, Op::Constant(Constant::Number(1.0)));
-        graph.append(header, span, Op::Set(receiver, "x".into(), one), false);
+        let other = graph.append_value(entry, span, Op::Javascript(JsOp::NewObject));
+        let one = graph.append_value(
+            header,
+            span,
+            Op::Javascript(JsOp::Constant(Constant::Number(1.0))),
+        );
+        graph.append(
+            header,
+            span,
+            Op::Javascript(JsOp::Set(receiver, "x".into(), one)),
+            false,
+        );
         graph.verify().unwrap();
         let scope = FxHashSet::from_iter([entry, header]);
         let writes = Writes::collect(&graph, &scope);
@@ -923,7 +1024,7 @@ mod tests {
         graph.append(
             header,
             span,
-            Op::GlobalWrite("leak".into(), receiver),
+            Op::Javascript(JsOp::GlobalWrite("leak".into(), receiver)),
             false,
         );
         let writes = Writes::collect(&graph, &scope);
@@ -965,7 +1066,7 @@ mod tests {
                 .rpo
                 .iter()
                 .flat_map(|&block| &graph.blocks[block].insts)
-                .filter(|&&inst| matches!(graph.insts[inst].op, Op::IsTyped(..)))
+                .filter(|&&inst| matches!(graph.insts[inst].op, Op::Javascript(JsOp::IsTyped(..))))
                 .count(),
             1
         );
@@ -994,27 +1095,45 @@ mod tests {
                 .unwrap();
         let block = graph.entry;
         let span = graph.span;
-        let prototype = graph.append_value(block, span, Op::Constant(Constant::Null));
-        let object = graph.append_value(block, span, Op::NewInstance(prototype));
-        let undefined = graph.append_value(block, span, Op::Constant(Constant::Undefined));
-        let result = graph.append_value(block, span, Op::ConstructorResult(undefined, object));
+        let prototype =
+            graph.append_value(block, span, Op::Javascript(JsOp::Constant(Constant::Null)));
+        let object = graph.append_value(block, span, Op::Javascript(JsOp::NewInstance(prototype)));
+        let undefined = graph.append_value(
+            block,
+            span,
+            Op::Javascript(JsOp::Constant(Constant::Undefined)),
+        );
+        let result = graph.append_value(
+            block,
+            span,
+            Op::Javascript(JsOp::ConstructorResult(undefined, object)),
+        );
         graph.terminate(block, span, TerminatorKind::Return(result));
-        let other = graph.append_value(block, span, Op::NewObject);
-        let one = graph.append_value(block, span, Op::Constant(Constant::Number(1.0)));
-        graph.append(block, span, Op::Set(object, "x".into(), one), false);
+        let other = graph.append_value(block, span, Op::Javascript(JsOp::NewObject));
+        let one = graph.append_value(
+            block,
+            span,
+            Op::Javascript(JsOp::Constant(Constant::Number(1.0))),
+        );
+        graph.append(
+            block,
+            span,
+            Op::Javascript(JsOp::Set(object, "x".into(), one)),
+            false,
+        );
         let scope = FxHashSet::from_iter([block]);
         let writes = Writes::collect(&graph, &scope);
         assert!(!writes.clobbers(&heap(other, Field::Named("x".into()))));
         let position = graph.blocks[block]
             .insts
             .iter()
-            .position(|&inst| matches!(graph.insts[inst].op, Op::Set(..)))
+            .position(|&inst| matches!(graph.insts[inst].op, Op::Javascript(JsOp::Set(..))))
             .unwrap();
         graph.insert(
             block,
             position,
             span,
-            Op::GlobalWrite("leak".into(), result),
+            Op::Javascript(JsOp::GlobalWrite("leak".into(), result)),
             false,
         );
         let writes = Writes::collect(&graph, &scope);

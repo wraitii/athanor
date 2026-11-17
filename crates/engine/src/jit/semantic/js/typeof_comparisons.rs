@@ -1,3 +1,4 @@
+use crate::jit::semantic::JsOp;
 use oxc_syntax::operator::BinaryOperator;
 
 use super::super::{Cfg, Constant, Graph, Op, UnaryOp, ValueDef};
@@ -6,7 +7,7 @@ pub(in crate::jit::semantic) fn typeof_comparisons(graph: &mut Graph) {
     let uses = graph.use_counts();
     for block in Cfg::new(graph).rpo {
         for inst in graph.blocks[block].insts.clone() {
-            let Op::Binary(operator, left, right) = graph.insts[inst].op else {
+            let Op::Javascript(JsOp::Binary(operator, left, right)) = graph.insts[inst].op else {
                 continue;
             };
             if !matches!(
@@ -18,10 +19,14 @@ pub(in crate::jit::semantic) fn typeof_comparisons(graph: &mut Graph) {
             let pair = [(left, right), (right, left)]
                 .into_iter()
                 .find_map(|(value, literal)| {
-                    let Op::Unary(UnaryOp::Typeof, operand) = graph.defining_op(value)? else {
+                    let Op::Javascript(JsOp::Unary(UnaryOp::Typeof, operand)) =
+                        graph.defining_op(value)?
+                    else {
                         return None;
                     };
-                    let Op::Constant(Constant::String(text)) = graph.defining_op(literal)? else {
+                    let Op::Javascript(JsOp::Constant(Constant::String(text))) =
+                        graph.defining_op(literal)?
+                    else {
                         return None;
                     };
                     let kind = [
@@ -43,7 +48,7 @@ pub(in crate::jit::semantic) fn typeof_comparisons(graph: &mut Graph) {
                 unreachable!();
             };
             // Keep TDZ errors at the original typeof evaluation point.
-            graph.set_op(typeof_inst, Op::CheckInitialized(operand));
+            graph.set_op(typeof_inst, Op::Javascript(JsOp::CheckInitialized(operand)));
             graph.insts[typeof_inst].results.clear();
             if uses[literal] == 1 {
                 let ValueDef::Result(literal_inst, _) = graph.values[literal] else {
@@ -52,11 +57,11 @@ pub(in crate::jit::semantic) fn typeof_comparisons(graph: &mut Graph) {
                 graph.remove_inst(literal_inst);
             }
             let test = if kind == 0 {
-                Op::IsString(operand)
+                Op::Javascript(JsOp::IsString(operand))
             } else if kind == 1 {
-                Op::IsNumber(operand)
+                Op::Javascript(JsOp::IsNumber(operand))
             } else {
-                Op::IsTypeof(operand, kind)
+                Op::Javascript(JsOp::IsTypeof(operand, kind))
             };
             let op = if operator == BinaryOperator::StrictEquality {
                 test
@@ -68,7 +73,7 @@ pub(in crate::jit::semantic) fn typeof_comparisons(graph: &mut Graph) {
                     .unwrap();
                 let span = graph.insts[inst].span;
                 let (_, result) = graph.insert(block, position, span, test, true);
-                Op::Unary(UnaryOp::Not, result.unwrap())
+                Op::Javascript(JsOp::Unary(UnaryOp::Not, result.unwrap()))
             };
             graph.set_op(inst, op);
         }

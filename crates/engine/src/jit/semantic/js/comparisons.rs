@@ -1,4 +1,5 @@
 use crate::FxHashMap;
+use crate::jit::semantic::JsOp;
 
 use oxc_syntax::operator::BinaryOperator;
 
@@ -16,7 +17,7 @@ pub(in crate::jit::semantic) fn expose(function: &mut super::super::FunctionStat
     for &block in &cfg.rpo {
         for inst in graph.blocks[block].insts.clone() {
             let data = graph.insts[inst].clone();
-            if let Op::IsNumber(value) = data.op {
+            if let Op::Javascript(JsOp::IsNumber(value)) = data.op {
                 let earlier = checks.get(&value).and_then(|checks| {
                     checks
                         .iter()
@@ -34,7 +35,7 @@ pub(in crate::jit::semantic) fn expose(function: &mut super::super::FunctionStat
                 }
                 continue;
             }
-            let Op::Binary(operator, left, right) = data.op else {
+            let Op::Javascript(JsOp::Binary(operator, left, right)) = data.op else {
                 continue;
             };
             if matches!(
@@ -55,19 +56,26 @@ pub(in crate::jit::semantic) fn expose(function: &mut super::super::FunctionStat
                 if let Some(value) = value {
                     changed = true;
                     if operator == BinaryOperator::StrictEquality {
-                        graph.set_op(inst, Op::IsUndefined(value));
+                        graph.set_op(inst, Op::Javascript(JsOp::IsUndefined(value)));
                     } else {
                         let position = graph.blocks[block]
                             .insts
                             .iter()
                             .position(|&current| current == inst)
                             .unwrap();
-                        let (check, result) =
-                            graph.insert(block, position, data.span, Op::IsUndefined(value), true);
+                        let (check, result) = graph.insert(
+                            block,
+                            position,
+                            data.span,
+                            Op::Javascript(JsOp::IsUndefined(value)),
+                            true,
+                        );
                         graph.insts[check].source_name = data.source_name;
                         graph.insts[check].inline_context = data.inline_context;
-                        graph.insts[inst].op =
-                            Op::Unary(super::super::UnaryOp::Not, result.unwrap());
+                        graph.insts[inst].op = Op::Javascript(JsOp::Unary(
+                            super::super::UnaryOp::Not,
+                            result.unwrap(),
+                        ));
                     }
                     continue;
                 }
@@ -99,9 +107,9 @@ pub(in crate::jit::semantic) fn expose(function: &mut super::super::FunctionStat
                     continue;
                 }
                 let op = if facts.of(value).within(ValueType::NUMBER) {
-                    Op::Constant(Constant::Boolean(true))
+                    Op::Javascript(JsOp::Constant(Constant::Boolean(true)))
                 } else {
-                    Op::IsNumber(value)
+                    Op::Javascript(JsOp::IsNumber(value))
                 };
                 let position = graph.blocks[block]
                     .insts
@@ -117,12 +125,12 @@ pub(in crate::jit::semantic) fn expose(function: &mut super::super::FunctionStat
             changed = true;
             graph.set_op(
                 inst,
-                Op::GuardedCompare {
+                Op::Javascript(JsOp::GuardedCompare {
                     operator,
                     left,
                     right,
                     numbers,
-                },
+                }),
             );
         }
     }

@@ -1,3 +1,4 @@
+use crate::jit::semantic::JsOp;
 use crate::{FxHashMap, FxHashSet};
 
 use cranelift_codegen::entity::SecondaryMap;
@@ -59,8 +60,10 @@ pub(super) fn scopes(graph: &Graph) -> SecondaryMap<Block, Vec<Scope>> {
         let mut stack = stacks[block].clone().unwrap();
         for &inst in &graph.blocks[block].insts {
             match graph.insts[inst].op {
-                Op::EnterScope(scope) | Op::EnterCaptures(scope, _) => stack.push(scope),
-                Op::LeaveScope(_) => {
+                Op::Javascript(JsOp::EnterScope(scope) | JsOp::EnterCaptures(scope, _)) => {
+                    stack.push(scope)
+                }
+                Op::Javascript(JsOp::LeaveScope(_)) => {
                     stack.pop();
                 }
                 _ => {}
@@ -91,7 +94,11 @@ pub(super) fn store_exit(graph: &mut Graph, block: Block, values: Vec<Value>, ex
             _ => terminator.span,
         });
     graph.append(block, span, Op::ContinuationStore(values), false);
-    let index = graph.append_value(block, span, Op::Constant(Constant::Number(exit as f64)));
+    let index = graph.append_value(
+        block,
+        span,
+        Op::Javascript(JsOp::Constant(Constant::Number(exit as f64))),
+    );
     graph.terminate(block, span, TerminatorKind::Return(index));
 }
 
@@ -119,14 +126,19 @@ pub(super) fn enter(
         definitions.insert(value, vec![argument]);
     }
     for &scope in scopes {
-        graph.append(entry, graph.span, Op::EnterScope(scope), false);
+        graph.append(
+            entry,
+            graph.span,
+            Op::Javascript(JsOp::EnterScope(scope)),
+            false,
+        );
     }
     for (index, &binding) in bindings.iter().enumerate() {
         let argument = graph.append_value(entry, graph.span, Op::Restored(values.len() + index));
         graph.append(
             entry,
             graph.span,
-            Op::BindingRestore(binding, argument),
+            Op::Javascript(JsOp::BindingRestore(binding, argument)),
             false,
         );
     }
@@ -186,7 +198,9 @@ pub(super) fn compact(graph: &mut Graph) {
             *value = values[value];
         }
         match &mut data.op {
-            Op::PropertyCache(site, _) => *site = *caches.entry(*site).or_insert(inst),
+            Op::Javascript(JsOp::PropertyCache(site, _)) => {
+                *site = *caches.entry(*site).or_insert(inst)
+            }
             _ => {}
         }
     }
@@ -243,9 +257,9 @@ pub(super) fn unbox(
     let op = if types.intersects(super::ValueType::INTEGER)
         && types.within(super::ValueType::INTEGER)
     {
-        Op::AsInteger(value)
+        Op::Javascript(JsOp::AsInteger(value))
     } else if types.intersects(super::ValueType::NUMBER) && types.within(super::ValueType::NUMBER) {
-        Op::AsNumber(value)
+        Op::Javascript(JsOp::AsNumber(value))
     } else {
         return value;
     };

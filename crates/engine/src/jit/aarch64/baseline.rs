@@ -1,3 +1,4 @@
+use crate::jit::semantic::JsOp;
 mod tiering;
 
 use cranelift_codegen::entity::{EntityRef, SecondaryMap};
@@ -91,10 +92,10 @@ fn emit(
         .insts
         .values()
         .filter_map(|data| match &data.op {
-            Op::Call { args, .. } | Op::Construct { args, .. } | Op::NewArray(args) => {
-                Some(args.len())
-            }
-            Op::Closure(_, _, _, _, _, captures, _) => Some(captures.len()),
+            Op::Javascript(
+                JsOp::Call { args, .. } | JsOp::Construct { args, .. } | JsOp::NewArray(args),
+            ) => Some(args.len()),
+            Op::Javascript(JsOp::Closure(_, _, _, _, _, captures, _)) => Some(captures.len()),
             _ => None,
         })
         .max()
@@ -245,7 +246,7 @@ fn emit(
                 call(&mut asm, Helper::HeapAllocationSite);
             }
             match &data.op {
-                Op::This => {
+                Op::Javascript(JsOp::This) => {
                     asm.emit(e::mem_scaled(Mem::LdrX, 9, e::SP, receiver_offset as u32)?);
                     store(
                         &mut asm,
@@ -256,7 +257,7 @@ fn emit(
                         failed,
                     )?;
                 }
-                Op::RegExp(pattern, flags) => {
+                Op::Javascript(JsOp::RegExp(pattern, flags)) => {
                     asm.emit(e::mem_scaled(Mem::LdrX, 0, e::SP, context_offset as u32)?);
                     e::mov_imm(Width::X, 1, u64::from(*flags), |word| asm.emit(word));
                     literal(&mut asm, &mut literals, pattern, 2, 3);
@@ -270,7 +271,15 @@ fn emit(
                         failed,
                     )?;
                 }
-                Op::Closure(_, id, arrow, generator, lexical_this, captures, lexical_receiver) => {
+                Op::Javascript(JsOp::Closure(
+                    _,
+                    id,
+                    arrow,
+                    generator,
+                    lexical_this,
+                    captures,
+                    lexical_receiver,
+                )) => {
                     for (index, binding) in captures.iter().enumerate() {
                         asm.emit(e::mem_scaled(
                             Mem::LdrX,
@@ -312,7 +321,7 @@ fn emit(
                         check_error(&mut asm, context_offset as u32, failed)?;
                     }
                 }
-                Op::Initialize(binding, value) | Op::Write(binding, value)
+                Op::Javascript(JsOp::Initialize(binding, value) | JsOp::Write(binding, value))
                     if graph.bindings[*binding].captured =>
                 {
                     asm.emit(e::mem_scaled(Mem::LdrX, 0, e::SP, context_offset as u32)?);
@@ -331,13 +340,13 @@ fn emit(
                     e::mov_imm(
                         Width::X,
                         3,
-                        u64::from(matches!(data.op, Op::Initialize(..))),
+                        u64::from(matches!(data.op, Op::Javascript(JsOp::Initialize(..)))),
                         |word| asm.emit(word),
                     );
                     call_address(&mut asm, write_cell as *const () as u64);
                     check_error(&mut asm, context_offset as u32, failed)?;
                 }
-                Op::Read(binding) if graph.bindings[*binding].captured => {
+                Op::Javascript(JsOp::Read(binding)) if graph.bindings[*binding].captured => {
                     asm.emit(e::mem_scaled(Mem::LdrX, 0, e::SP, context_offset as u32)?);
                     asm.emit(e::mem_scaled(
                         Mem::LdrX,
@@ -355,7 +364,7 @@ fn emit(
                         failed,
                     )?;
                 }
-                Op::MarkClass(value) | Op::DisableConstructor(value) => {
+                Op::Javascript(JsOp::MarkClass(value) | JsOp::DisableConstructor(value)) => {
                     asm.emit(e::mem_scaled(Mem::LdrX, 0, e::SP, context_offset as u32)?);
                     asm.emit(e::mem_scaled(
                         Mem::LdrX,
@@ -365,7 +374,7 @@ fn emit(
                     )?);
                     call(
                         &mut asm,
-                        if matches!(data.op, Op::MarkClass(_)) {
+                        if matches!(data.op, Op::Javascript(JsOp::MarkClass(_))) {
                             Helper::MarkClass
                         } else {
                             Helper::DisableConstructor
@@ -373,7 +382,7 @@ fn emit(
                     );
                     check_error(&mut asm, context_offset as u32, failed)?;
                 }
-                Op::Throw(value) => {
+                Op::Javascript(JsOp::Throw(value)) => {
                     asm.emit(e::mem_scaled(Mem::LdrX, 0, e::SP, context_offset as u32)?);
                     asm.emit(e::mem_scaled(
                         Mem::LdrX,
@@ -384,7 +393,7 @@ fn emit(
                     call(&mut asm, Helper::Throw);
                     check_error(&mut asm, context_offset as u32, failed)?;
                 }
-                Op::NewObject => {
+                Op::Javascript(JsOp::NewObject) => {
                     asm.emit(e::mem_scaled(Mem::LdrX, 0, e::SP, context_offset as u32)?);
                     e::mov_imm(Width::X, 1, Value::UNDEFINED.bits(), |word| asm.emit(word));
                     call(&mut asm, Helper::ObjectNew);
@@ -397,7 +406,7 @@ fn emit(
                         failed,
                     )?;
                 }
-                Op::NewArray(args) => {
+                Op::Javascript(JsOp::NewArray(args)) => {
                     for (index, value) in args.iter().enumerate() {
                         asm.emit(e::mem_scaled(
                             Mem::LdrX,
@@ -425,7 +434,7 @@ fn emit(
                         failed,
                     )?;
                 }
-                Op::IsIndexed(value) | Op::IndexedLength(value) => {
+                Op::Javascript(JsOp::IsIndexed(value) | JsOp::IndexedLength(value)) => {
                     asm.emit(e::mem_scaled(Mem::LdrX, 0, e::SP, context_offset as u32)?);
                     asm.emit(e::mem_scaled(
                         Mem::LdrX,
@@ -436,7 +445,7 @@ fn emit(
                     e::mov_imm(
                         Width::X,
                         2,
-                        u64::from(matches!(data.op, Op::IndexedLength(_))),
+                        u64::from(matches!(data.op, Op::Javascript(JsOp::IndexedLength(_)))),
                         |word| asm.emit(word),
                     );
                     call_address(&mut asm, indexed as *const () as u64);
@@ -449,10 +458,12 @@ fn emit(
                         failed,
                     )?;
                 }
-                Op::IteratorNew(value)
-                | Op::IteratorNext(value)
-                | Op::EnumerateNew(value)
-                | Op::EnumerateNext(value) => {
+                Op::Javascript(
+                    JsOp::IteratorNew(value)
+                    | JsOp::IteratorNext(value)
+                    | JsOp::EnumerateNew(value)
+                    | JsOp::EnumerateNext(value),
+                ) => {
                     asm.emit(e::mem_scaled(Mem::LdrX, 0, e::SP, context_offset as u32)?);
                     asm.emit(e::mem_scaled(
                         Mem::LdrX,
@@ -461,10 +472,10 @@ fn emit(
                         (value.index() * 8) as u32,
                     )?);
                     let helper = match data.op {
-                        Op::IteratorNew(_) => Helper::IterateNew,
-                        Op::IteratorNext(_) => Helper::IterateNext,
-                        Op::EnumerateNew(_) => Helper::EnumerateNew,
-                        Op::EnumerateNext(_) => Helper::EnumerateNext,
+                        Op::Javascript(JsOp::IteratorNew(_)) => Helper::IterateNew,
+                        Op::Javascript(JsOp::IteratorNext(_)) => Helper::IterateNext,
+                        Op::Javascript(JsOp::EnumerateNew(_)) => Helper::EnumerateNew,
+                        Op::Javascript(JsOp::EnumerateNext(_)) => Helper::EnumerateNext,
                         _ => unreachable!(),
                     };
                     call(&mut asm, helper);
@@ -477,7 +488,7 @@ fn emit(
                         failed,
                     )?;
                 }
-                Op::Construct { callee, args } => {
+                Op::Javascript(JsOp::Construct { callee, args }) => {
                     for (index, value) in args.iter().enumerate() {
                         asm.emit(e::mem_scaled(
                             Mem::LdrX,
@@ -511,12 +522,12 @@ fn emit(
                         failed,
                     )?;
                 }
-                Op::Call {
+                Op::Javascript(JsOp::Call {
                     callee,
                     receiver,
                     args,
                     ..
-                } => {
+                }) => {
                     for (index, value) in args.iter().enumerate() {
                         asm.emit(e::mem_scaled(
                             Mem::LdrX,
@@ -560,7 +571,9 @@ fn emit(
                         failed,
                     )?;
                 }
-                Op::GlobalWrite(name, value) | Op::GlobalInitialize(name, value) => {
+                Op::Javascript(
+                    JsOp::GlobalWrite(name, value) | JsOp::GlobalInitialize(name, value),
+                ) => {
                     asm.emit(e::mem_scaled(Mem::LdrX, 0, e::SP, context_offset as u32)?);
                     literal(&mut asm, &mut literals, name, 1, 2);
                     asm.emit(e::mem_scaled(
@@ -571,7 +584,7 @@ fn emit(
                     )?);
                     call(
                         &mut asm,
-                        if matches!(data.op, Op::GlobalInitialize(..)) {
+                        if matches!(data.op, Op::Javascript(JsOp::GlobalInitialize(..))) {
                             Helper::GlobalInitialize
                         } else {
                             Helper::GlobalSet
@@ -579,13 +592,16 @@ fn emit(
                     );
                     check_error(&mut asm, context_offset as u32, failed)?;
                 }
-                Op::GlobalRead(name) | Op::GlobalReadOptional(name) => {
+                Op::Javascript(JsOp::GlobalRead(name) | JsOp::GlobalReadOptional(name)) => {
                     asm.emit(e::mem_scaled(Mem::LdrX, 0, e::SP, context_offset as u32)?);
                     literal(&mut asm, &mut literals, name, 1, 2);
                     e::mov_imm(
                         Width::X,
                         3,
-                        u64::from(matches!(data.op, Op::GlobalReadOptional(_))),
+                        u64::from(matches!(
+                            data.op,
+                            Op::Javascript(JsOp::GlobalReadOptional(_))
+                        )),
                         |word| asm.emit(word),
                     );
                     call_address(&mut asm, global as *const () as u64);
@@ -598,7 +614,11 @@ fn emit(
                         failed,
                     )?;
                 }
-                Op::IsNullish(value) | Op::IsUndefined(value) | Op::IsUninitialized(value) => {
+                Op::Javascript(
+                    JsOp::IsNullish(value)
+                    | JsOp::IsUndefined(value)
+                    | JsOp::IsUninitialized(value),
+                ) => {
                     asm.emit(e::mem_scaled(
                         Mem::LdrX,
                         0,
@@ -609,8 +629,8 @@ fn emit(
                         Width::X,
                         1,
                         match data.op {
-                            Op::IsNullish(_) => 1,
-                            Op::IsUninitialized(_) => 2,
+                            Op::Javascript(JsOp::IsNullish(_)) => 1,
+                            Op::Javascript(JsOp::IsUninitialized(_)) => 2,
                             _ => 0,
                         },
                         |word| asm.emit(word),
@@ -625,14 +645,14 @@ fn emit(
                         failed,
                     )?;
                 }
-                Op::Unary(
+                Op::Javascript(JsOp::Unary(
                     UnaryOp::Not
                     | UnaryOp::BitwiseNot
                     | UnaryOp::Negate
                     | UnaryOp::Plus
                     | UnaryOp::Typeof,
                     value,
-                ) => {
+                )) => {
                     asm.emit(e::mem_scaled(Mem::LdrX, 0, e::SP, context_offset as u32)?);
                     asm.emit(e::mem_scaled(
                         Mem::LdrX,
@@ -641,10 +661,10 @@ fn emit(
                         (value.index() * 8) as u32,
                     )?);
                     let helper = match data.op {
-                        Op::Unary(UnaryOp::Not, _) => Helper::LogicalNot,
-                        Op::Unary(UnaryOp::BitwiseNot, _) => Helper::BitwiseNot,
-                        Op::Unary(UnaryOp::Negate, _) => Helper::UnaryNegation,
-                        Op::Unary(UnaryOp::Typeof, _) => Helper::Typeof,
+                        Op::Javascript(JsOp::Unary(UnaryOp::Not, _)) => Helper::LogicalNot,
+                        Op::Javascript(JsOp::Unary(UnaryOp::BitwiseNot, _)) => Helper::BitwiseNot,
+                        Op::Javascript(JsOp::Unary(UnaryOp::Negate, _)) => Helper::UnaryNegation,
+                        Op::Javascript(JsOp::Unary(UnaryOp::Typeof, _)) => Helper::Typeof,
                         _ => Helper::UnaryPlus,
                     };
                     call(&mut asm, helper);
@@ -657,7 +677,7 @@ fn emit(
                         failed,
                     )?;
                 }
-                Op::Get(object, name) => {
+                Op::Javascript(JsOp::Get(object, name)) => {
                     asm.emit(e::mem_scaled(Mem::LdrX, 0, e::SP, context_offset as u32)?);
                     asm.emit(e::mem_scaled(
                         Mem::LdrX,
@@ -678,9 +698,11 @@ fn emit(
                         failed,
                     )?;
                 }
-                Op::Set(object, name, value)
-                | Op::Define(object, name, value)
-                | Op::DefineHidden(object, name, value) => {
+                Op::Javascript(
+                    JsOp::Set(object, name, value)
+                    | JsOp::Define(object, name, value)
+                    | JsOp::DefineHidden(object, name, value),
+                ) => {
                     asm.emit(e::mem_scaled(Mem::LdrX, 0, e::SP, context_offset as u32)?);
                     asm.emit(e::mem_scaled(
                         Mem::LdrX,
@@ -697,7 +719,7 @@ fn emit(
                     )?);
                     call(
                         &mut asm,
-                        if matches!(data.op, Op::DefineHidden(..)) {
+                        if matches!(data.op, Op::Javascript(JsOp::DefineHidden(..))) {
                             Helper::PropertyDefineHidden
                         } else {
                             Helper::PropertySet
@@ -732,7 +754,7 @@ fn emit(
                         failed,
                     )?;
                 }
-                Op::BindingLoad(binding) => {
+                Op::Javascript(JsOp::BindingLoad(binding)) => {
                     asm.emit(e::mem_scaled(
                         Mem::LdrX,
                         9,
@@ -748,7 +770,7 @@ fn emit(
                         failed,
                     )?;
                 }
-                Op::BindingRestore(binding, value) => {
+                Op::Javascript(JsOp::BindingRestore(binding, value)) => {
                     asm.emit(e::mem_scaled(
                         Mem::LdrX,
                         9,
@@ -784,7 +806,7 @@ fn emit(
                     asm.emit(e::mem_scaled(Mem::LdrX, 9, e::SP, source)?);
                     store(&mut asm, context_offset as u32, dest, 9, false, failed)?;
                 }
-                Op::Constant(constant) => {
+                Op::Javascript(JsOp::Constant(constant)) => {
                     if let Constant::String(text) = constant {
                         asm.emit(e::mem_scaled(Mem::LdrX, 0, e::SP, context_offset as u32)?);
                         literal(&mut asm, &mut literals, text, 1, 2);
@@ -823,23 +845,23 @@ fn emit(
                     e::mov_imm(Width::X, 9, value.bits(), |word| asm.emit(word));
                     store_primitive(&mut asm, context_offset as u32, offset, 9, failed)?;
                 }
-                Op::Initialize(binding, value) | Op::Write(binding, value) => {
+                Op::Javascript(JsOp::Initialize(binding, value) | JsOp::Write(binding, value)) => {
                     let source = value.index().checked_mul(8)? as u32;
                     let dest = (values_size + binding.index() * 8) as u32;
-                    if matches!(data.op, Op::Write(..)) {
+                    if matches!(data.op, Op::Javascript(JsOp::Write(..))) {
                         check_initialized(&mut asm, context_offset as u32, dest, failed)?;
                     }
                     asm.emit(e::mem_scaled(Mem::LdrX, 9, e::SP, source)?);
                     store(&mut asm, context_offset as u32, dest, 9, false, failed)?;
                 }
-                Op::Read(binding) => {
+                Op::Javascript(JsOp::Read(binding)) => {
                     let source = (values_size + binding.index() * 8) as u32;
                     let dest = data.result()?.index().checked_mul(8)? as u32;
                     check_initialized(&mut asm, context_offset as u32, source, failed)?;
                     asm.emit(e::mem_scaled(Mem::LdrX, 9, e::SP, source)?);
                     store(&mut asm, context_offset as u32, dest, 9, false, failed)?;
                 }
-                Op::Binary(operator, left, right) => {
+                Op::Javascript(JsOp::Binary(operator, left, right)) => {
                     let helper = match operator {
                         BinaryOperator::In => Helper::In,
                         BinaryOperator::Instanceof => Helper::Instanceof,
@@ -893,7 +915,7 @@ fn emit(
                         failed,
                     )?;
                 }
-                Op::ToNumeric(value) => {
+                Op::Javascript(JsOp::ToNumeric(value)) => {
                     asm.emit(e::mem_scaled(Mem::LdrX, 0, e::SP, context_offset as u32)?);
                     asm.emit(e::mem_scaled(
                         Mem::LdrX,
@@ -917,7 +939,7 @@ fn emit(
                         failed,
                     )?;
                 }
-                Op::Unary(UnaryOp::Increment | UnaryOp::Decrement, value)
+                Op::Javascript(JsOp::Unary(UnaryOp::Increment | UnaryOp::Decrement, value))
                     if numeric(graph, *value, 0) =>
                 {
                     asm.emit(e::mem_scaled(Mem::LdrX, 0, e::SP, context_offset as u32)?);
@@ -930,11 +952,12 @@ fn emit(
                     e::mov_imm(Width::X, 2, Value::number(1.0).bits(), |word| {
                         asm.emit(word)
                     });
-                    let helper = if matches!(data.op, Op::Unary(UnaryOp::Increment, _)) {
-                        Helper::Add
-                    } else {
-                        Helper::Sub
-                    };
+                    let helper =
+                        if matches!(data.op, Op::Javascript(JsOp::Unary(UnaryOp::Increment, _))) {
+                            Helper::Add
+                        } else {
+                            Helper::Sub
+                        };
                     e::mov_imm(
                         Width::X,
                         16,
@@ -952,7 +975,7 @@ fn emit(
                         failed,
                     )?;
                 }
-                Op::GetIndex(array, index) | Op::ArrayGet(array, index) => {
+                Op::Javascript(JsOp::GetIndex(array, index) | JsOp::ArrayGet(array, index)) => {
                     asm.emit(e::mem_scaled(Mem::LdrX, 0, e::SP, context_offset as u32)?);
                     asm.emit(e::mem_scaled(
                         Mem::LdrX,
@@ -982,7 +1005,7 @@ fn emit(
                         failed,
                     )?;
                 }
-                Op::SetIndex(array, index, value) => {
+                Op::Javascript(JsOp::SetIndex(array, index, value)) => {
                     asm.emit(e::mem_scaled(Mem::LdrX, 0, e::SP, context_offset as u32)?);
                     asm.emit(e::mem_scaled(
                         Mem::LdrX,
@@ -1011,12 +1034,12 @@ fn emit(
                     asm.emit(e::blr(16));
                     check_error(&mut asm, context_offset as u32, failed)?;
                 }
-                Op::EnterScope(scope) | Op::EnterCaptures(scope, _) => {
+                Op::Javascript(JsOp::EnterScope(scope) | JsOp::EnterCaptures(scope, _)) => {
                     for (index, binding) in graph.scopes[*scope].bindings.iter().enumerate() {
                         let dest = (values_size + binding.index() * 8) as u32;
                         if graph.scopes[*scope].kind == ScopeKind::Captures {
                             let source = match data.op {
-                                Op::EnterCaptures(_, value) => value.index() * 8,
+                                Op::Javascript(JsOp::EnterCaptures(_, value)) => value.index() * 8,
                                 _ => closure_offset,
                             };
                             asm.emit(e::mem_scaled(Mem::LdrX, 0, e::SP, context_offset as u32)?);
@@ -1039,7 +1062,7 @@ fn emit(
                         }
                     }
                 }
-                Op::LeaveScope(scope) => {
+                Op::Javascript(JsOp::LeaveScope(scope)) => {
                     for binding in &graph.scopes[*scope].bindings {
                         e::mov_imm(Width::X, 9, Value::UNDEFINED.bits(), |word| asm.emit(word));
                         store_primitive(
@@ -1051,7 +1074,7 @@ fn emit(
                         )?;
                     }
                 }
-                Op::NextIteration(scope) | Op::FreshIteration(scope) => {
+                Op::Javascript(JsOp::NextIteration(scope) | JsOp::FreshIteration(scope)) => {
                     for binding in &graph.scopes[*scope].bindings {
                         if !graph.bindings[*binding].captured {
                             continue;
@@ -1062,7 +1085,7 @@ fn emit(
                         e::mov_imm(
                             Width::X,
                             2,
-                            u64::from(matches!(data.op, Op::FreshIteration(_))),
+                            u64::from(matches!(data.op, Op::Javascript(JsOp::FreshIteration(_)))),
                             |word| asm.emit(word),
                         );
                         call_address(&mut asm, next_cell as *const () as u64);
@@ -1495,9 +1518,9 @@ fn numeric(graph: &Graph, value: SemanticValue, depth: usize) -> bool {
         return false;
     };
     match graph.insts[inst].op {
-        Op::Constant(Constant::Number(_)) => true,
-        Op::ToNumeric(_) => true,
-        Op::Binary(
+        Op::Javascript(JsOp::Constant(Constant::Number(_))) => true,
+        Op::Javascript(JsOp::ToNumeric(_)) => true,
+        Op::Javascript(JsOp::Binary(
             BinaryOperator::Addition
             | BinaryOperator::Subtraction
             | BinaryOperator::Multiplication
@@ -1505,7 +1528,7 @@ fn numeric(graph: &Graph, value: SemanticValue, depth: usize) -> bool {
             | BinaryOperator::Remainder,
             left,
             right,
-        ) => numeric(graph, left, depth + 1) && numeric(graph, right, depth + 1),
+        )) => numeric(graph, left, depth + 1) && numeric(graph, right, depth + 1),
         _ => false,
     }
 }

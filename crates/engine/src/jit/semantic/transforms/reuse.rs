@@ -1,5 +1,6 @@
 use super::super::{Facts, FunctionState, Graph, Op, TerminatorKind, Value, available};
 use crate::FxHashMap;
+use crate::jit::semantic::JsOp;
 
 pub(in crate::jit::semantic) fn reuse_loads(function: &mut FunctionState) {
     let graph = &function.graph;
@@ -56,7 +57,10 @@ fn reuse(graph: &mut Graph, facts: &Facts, mut notes: Option<&mut Vec<String>>) 
         .collect();
     graph.replace_uses(&aliases);
     for &(inst, value) in &solved.folded {
-        graph.set_op(inst, Op::Constant(super::super::Constant::Boolean(value)));
+        graph.set_op(
+            inst,
+            Op::Javascript(JsOp::Constant(super::super::Constant::Boolean(value))),
+        );
     }
     for &(inst, value) in &solved.reused {
         if let Some(notes) = &mut notes {
@@ -79,7 +83,9 @@ fn guarded_floats(function: &mut FunctionState) {
             else {
                 return None;
             };
-            let Op::IntegerCheck(_, float, exact) = graph.defining_op(*condition)? else {
+            let Op::Javascript(JsOp::IntegerCheck(_, float, exact)) =
+                graph.defining_op(*condition)?
+            else {
                 return None;
             };
             (yes.block != no.block && cfg.preds[yes.block][..] == [block])

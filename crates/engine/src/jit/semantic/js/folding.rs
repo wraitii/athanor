@@ -1,4 +1,5 @@
 use crate::FxHashMap;
+use crate::jit::semantic::JsOp;
 
 use oxc_syntax::operator::BinaryOperator;
 
@@ -26,36 +27,44 @@ impl Folder for Rules {
 
     fn fold(&mut self, graph: &Graph, facts: &Facts, inst: Inst) -> Option<Fold> {
         let data = &graph.insts[inst];
-        let boolean = |value| Some(Fold::Op(Op::Constant(Constant::Boolean(value))));
+        let boolean = |value| {
+            Some(Fold::Op(Op::Javascript(JsOp::Constant(Constant::Boolean(
+                value,
+            )))))
+        };
         match data.op {
-            Op::IsOrdinaryArray(value)
+            Op::Javascript(JsOp::IsOrdinaryArray(value))
                 if matches!(
                     graph.defining_op(value),
-                    Some(Op::Arguments | Op::NewArray(_) | Op::NewHoleyArray(_))
+                    Some(Op::Javascript(
+                        JsOp::Arguments | JsOp::NewArray(_) | JsOp::NewHoleyArray(_)
+                    ))
                 ) =>
             {
                 boolean(true)
             }
-            Op::GuardedCompare {
+            Op::Javascript(JsOp::GuardedCompare {
                 operator,
                 left,
                 right,
                 ..
-            } if [left, right]
+            }) if [left, right]
                 .iter()
                 .all(|&value| facts.of(value).within(NUMERIC)) =>
             {
-                Some(Fold::Op(Op::Binary(operator, left, right)))
+                Some(Fold::Op(Op::Javascript(JsOp::Binary(
+                    operator, left, right,
+                ))))
             }
-            Op::IsExactPosition(key, position)
+            Op::Javascript(JsOp::IsExactPosition(key, position))
                 if facts.of(key).within(ValueType::INTEGER)
-                    && matches!(graph.defining_op(position), Some(Op::ArrayPosition(value)) if *value == key) =>
+                    && matches!(graph.defining_op(position), Some(Op::Javascript(JsOp::ArrayPosition(value))) if *value == key) =>
             {
                 boolean(true)
             }
             Op::BooleanAnd(left, right) => {
                 for (constant, other) in [(left, right), (right, left)] {
-                    if let Some(Op::Constant(Constant::Boolean(value))) =
+                    if let Some(Op::Javascript(JsOp::Constant(Constant::Boolean(value)))) =
                         graph.defining_op(constant)
                     {
                         return if *value {
@@ -67,14 +76,18 @@ impl Folder for Rules {
                 }
                 None
             }
-            Op::IsIndexed(value) if facts.indexed(value) => boolean(true),
-            Op::IsString(value) => boolean(known(facts.of(value), ValueType::STRING)?),
-            Op::IsUndefined(value) => boolean(known(facts.of(value), ValueType::UNDEFINED)?),
-            Op::Binary(
+            Op::Javascript(JsOp::IsIndexed(value)) if facts.indexed(value) => boolean(true),
+            Op::Javascript(JsOp::IsString(value)) => {
+                boolean(known(facts.of(value), ValueType::STRING)?)
+            }
+            Op::Javascript(JsOp::IsUndefined(value)) => {
+                boolean(known(facts.of(value), ValueType::UNDEFINED)?)
+            }
+            Op::Javascript(JsOp::Binary(
                 operator @ (BinaryOperator::StrictEquality | BinaryOperator::StrictInequality),
                 left,
                 right,
-            ) => {
+            )) => {
                 let (left, right) = (facts.of(left), facts.of(right));
                 let compared = if known(left, ValueType::UNDEFINED) == Some(true) {
                     right
@@ -86,14 +99,22 @@ impl Folder for Rules {
                 let equal = known(compared, ValueType::UNDEFINED)?;
                 boolean(equal == (operator == BinaryOperator::StrictEquality))
             }
-            Op::IsNumber(value) if facts.of(value).within(ValueType::NUMBER) => boolean(true),
-            Op::IsNumber(value) if !facts.of(value).intersects(ValueType::NUMBER) => boolean(false),
-            Op::ToNumeric(value) | Op::Unary(UnaryOp::Plus, value) | Op::AsNumber(value)
-                if data.result().is_some() && facts.of(value).within(ValueType::NUMBER) =>
+            Op::Javascript(JsOp::IsNumber(value)) if facts.of(value).within(ValueType::NUMBER) => {
+                boolean(true)
+            }
+            Op::Javascript(JsOp::IsNumber(value))
+                if !facts.of(value).intersects(ValueType::NUMBER) =>
             {
+                boolean(false)
+            }
+            Op::Javascript(
+                JsOp::ToNumeric(value) | JsOp::Unary(UnaryOp::Plus, value) | JsOp::AsNumber(value),
+            ) if data.result().is_some() && facts.of(value).within(ValueType::NUMBER) => {
                 Some(Fold::Alias(value))
             }
-            Op::ConstructorResult(returned, instance) if data.result().is_some() => {
+            Op::Javascript(JsOp::ConstructorResult(returned, instance))
+                if data.result().is_some() =>
+            {
                 let types = facts.of(returned);
                 if types == ValueType::default() {
                     None
@@ -134,8 +155,8 @@ fn refine_string_guards(graph: &mut Graph, cfg: &Cfg) -> bool {
             continue;
         }
         let key = match graph.defining_op(*condition) {
-            Some(Op::IsString(value)) => (false, *value),
-            Some(Op::IsStringSplit(value)) => (true, *value),
+            Some(Op::Javascript(JsOp::IsString(value))) => (false, *value),
+            Some(Op::Javascript(JsOp::IsStringSplit(value))) => (true, *value),
             _ => continue,
         };
         for (target, result) in [(yes.block, true), (no.block, false)] {
@@ -154,8 +175,8 @@ fn refine_string_guards(graph: &mut Graph, cfg: &Cfg) -> bool {
     for &block in &cfg.rpo {
         for inst in graph.blocks[block].insts.clone() {
             let key = match graph.insts[inst].op {
-                Op::IsString(value) => (false, value),
-                Op::IsStringSplit(value) => (true, value),
+                Op::Javascript(JsOp::IsString(value)) => (false, value),
+                Op::Javascript(JsOp::IsStringSplit(value)) => (true, value),
                 _ => continue,
             };
             let Some((_, result)) = checks
@@ -164,7 +185,10 @@ fn refine_string_guards(graph: &mut Graph, cfg: &Cfg) -> bool {
             else {
                 continue;
             };
-            graph.set_op(inst, Op::Constant(Constant::Boolean(*result)));
+            graph.set_op(
+                inst,
+                Op::Javascript(JsOp::Constant(Constant::Boolean(*result))),
+            );
             changed = true;
         }
     }

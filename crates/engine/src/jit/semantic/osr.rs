@@ -1,3 +1,4 @@
+use crate::jit::semantic::JsOp;
 mod baseline;
 
 pub(in crate::jit) use baseline::{baseline_headers, baseline_resume};
@@ -247,10 +248,17 @@ impl Plan {
             let values = transfer.inputs.iter().chain(&params).copied().collect();
             let append = |graph: &mut Graph, op| graph.append_value(poll, span, op);
             let start = append(graph, Op::OsrStart(self.clone(), index, values));
-            let declined = append(graph, Op::Constant(Constant::Number(-1.0)));
             let declined = append(
                 graph,
-                Op::Binary(BinaryOperator::StrictEquality, start, declined),
+                Op::Javascript(JsOp::Constant(Constant::Number(-1.0))),
+            );
+            let declined = append(
+                graph,
+                Op::Javascript(JsOp::Binary(
+                    BinaryOperator::StrictEquality,
+                    start,
+                    declined,
+                )),
             );
             let dispatch = graph.blocks.push(BlockData::default());
             graph.terminate(
@@ -281,10 +289,12 @@ impl Plan {
             graph.blocks[block].insts.retain(|&inst| {
                 !matches!(
                     graph.insts[inst].op,
-                    Op::EnterScope(_)
-                        | Op::LeaveScope(_)
-                        | Op::NextIteration(_)
-                        | Op::FreshIteration(_)
+                    Op::Javascript(
+                        JsOp::EnterScope(_)
+                            | JsOp::LeaveScope(_)
+                            | JsOp::NextIteration(_)
+                            | JsOp::FreshIteration(_)
+                    )
                 )
             });
         }
@@ -301,8 +311,12 @@ impl Plan {
         let span = graph.span;
         let facts = Facts::compute(&self.graph);
         let argument = |graph: &mut Graph, index: usize, value: Value| {
-            if let Some(Op::Constant(constant)) = self.graph.defining_op(value) {
-                return graph.append_value(entry, span, Op::Constant(constant.clone()));
+            if let Some(Op::Javascript(JsOp::Constant(constant))) = self.graph.defining_op(value) {
+                return graph.append_value(
+                    entry,
+                    span,
+                    Op::Javascript(JsOp::Constant(constant.clone())),
+                );
             }
             let input = facts.of(value);
             if input.intersects(ValueType::UNINITIALIZED) {
@@ -458,7 +472,7 @@ fn transfer(
                 }
                 if inside
                     && !defined
-                    && let Some(Op::View(object)) = graph.defining_op(view)
+                    && let Some(Op::Javascript(JsOp::View(object))) = graph.defining_op(view)
                 {
                     inputs.insert(*object);
                 }
@@ -467,20 +481,24 @@ fn transfer(
                 continue;
             }
             match graph.insts[inst].op {
-                Op::Read(_)
-                | Op::Write(..)
-                | Op::Initialize(..)
-                | Op::Closure(..)
-                | Op::ClosureCells(..)
-                | Op::CellNew(_)
+                Op::Javascript(
+                    JsOp::Read(_)
+                    | JsOp::Write(..)
+                    | JsOp::Initialize(..)
+                    | JsOp::Closure(..)
+                    | JsOp::ClosureCells(..)
+                    | JsOp::CellNew(_),
+                )
                 | Op::Argument(_)
                 | Op::Restored(_)
-                | Op::EnterCaptures(..)
-                | Op::Callee
-                | Op::Arguments
-                | Op::CallForward(..)
+                | Op::Javascript(
+                    JsOp::EnterCaptures(..)
+                    | JsOp::Callee
+                    | JsOp::Arguments
+                    | JsOp::CallForward(..),
+                )
                 | Op::ArgumentCount
-                | Op::Rest(_) => {
+                | Op::Javascript(JsOp::Rest(_)) => {
                     return Err(format!(
                         "requires non-SSA frame state: {}",
                         graph.op_text(&graph.insts[inst].op)
@@ -488,10 +506,12 @@ fn transfer(
                 }
                 _ => {}
             }
-            if let Op::EnterScope(scope)
-            | Op::LeaveScope(scope)
-            | Op::NextIteration(scope)
-            | Op::FreshIteration(scope) = graph.insts[inst].op
+            if let Op::Javascript(
+                JsOp::EnterScope(scope)
+                | JsOp::LeaveScope(scope)
+                | JsOp::NextIteration(scope)
+                | JsOp::FreshIteration(scope),
+            ) = graph.insts[inst].op
                 && graph.materialized(scope)
             {
                 return Err("requires materialized scope state".into());
@@ -704,7 +724,9 @@ mod tests {
             .graph
             .insts
             .iter()
-            .filter_map(|(inst, data)| matches!(data.op, Op::PropertyCache(..)).then_some(inst))
+            .filter_map(|(inst, data)| {
+                matches!(data.op, Op::Javascript(JsOp::PropertyCache(..))).then_some(inst)
+            })
             .collect();
         assert!(!caches.is_empty());
         for inst in caches {
@@ -728,21 +750,23 @@ mod tests {
         let inst = graph
             .insts
             .iter()
-            .find_map(|(inst, data)| matches!(data.op, Op::GetIndex(..)).then_some(inst))
+            .find_map(|(inst, data)| {
+                matches!(data.op, Op::Javascript(JsOp::GetIndex(..))).then_some(inst)
+            })
             .unwrap();
-        let Op::GetIndex(object, index) = graph.insts[inst].op else {
+        let Op::Javascript(JsOp::GetIndex(object, index)) = graph.insts[inst].op else {
             unreachable!()
         };
         graph.set_op(
             inst,
-            Op::TypedIndex(
+            Op::Javascript(JsOp::TypedIndex(
                 object,
                 index,
                 TypedRead {
                     element: Some(TypedKind::Uint16),
                     bounded: true,
                 },
-            ),
+            )),
         );
         let mut function = FunctionState::from_graph(graph);
         function.instrument_osr(0, None).unwrap();
@@ -752,7 +776,7 @@ mod tests {
             plan.graph
                 .insts
                 .values()
-                .any(|data| matches!(data.op, Op::TypedIndex(..)))
+                .any(|data| matches!(data.op, Op::Javascript(JsOp::TypedIndex(..))))
         );
         assert!(
             !plan
@@ -863,14 +887,14 @@ mod tests {
                 .any(|block| block.insts.iter().any(|&inst| {
                     matches!(
                         extracted.insts[inst].op,
-                        Op::TypedIndex(
+                        Op::Javascript(JsOp::TypedIndex(
                             _,
                             _,
                             super::super::TypedRead {
                                 element: Some(TypedKind::Int32),
                                 ..
                             }
-                        )
+                        ))
                     )
                 }))
         );
@@ -891,7 +915,7 @@ mod tests {
             .filter(|(block, _)| !body.contains(block))
             .flat_map(|(_, block)| &block.insts)
             .find_map(|&inst| {
-                matches!(&graph.insts[inst].op, Op::Get(_, name) if name == "row")
+                matches!(&graph.insts[inst].op, Op::Javascript(JsOp::Get(_, name)) if name == "row")
                     .then(|| graph.insts[inst].result().unwrap())
             })
             .unwrap();

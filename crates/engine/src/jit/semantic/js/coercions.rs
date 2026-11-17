@@ -1,3 +1,4 @@
+use crate::jit::semantic::JsOp;
 use oxc_syntax::operator::BinaryOperator;
 
 use super::super::{Op, UnaryOp, ValueType};
@@ -13,16 +14,18 @@ pub(in crate::jit::semantic) fn coercions(function: &mut super::super::FunctionS
             let op = &graph.insts[inst].op;
             let bitwise = matches!(
                 op,
-                Op::Unary(UnaryOp::BitwiseNot, _)
-                    | Op::Binary(
-                        BinaryOperator::BitwiseAnd
-                            | BinaryOperator::BitwiseOR
-                            | BinaryOperator::BitwiseXOR
-                            | BinaryOperator::ShiftLeft
-                            | BinaryOperator::ShiftRight
-                            | BinaryOperator::ShiftRightZeroFill,
-                        ..
-                    )
+                Op::Javascript(
+                    JsOp::Unary(UnaryOp::BitwiseNot, _)
+                        | JsOp::Binary(
+                            BinaryOperator::BitwiseAnd
+                                | BinaryOperator::BitwiseOR
+                                | BinaryOperator::BitwiseXOR
+                                | BinaryOperator::ShiftLeft
+                                | BinaryOperator::ShiftRight
+                                | BinaryOperator::ShiftRightZeroFill,
+                            ..
+                        )
+                )
             );
             if !bitwise {
                 continue;
@@ -47,7 +50,12 @@ pub(in crate::jit::semantic) fn coercions(function: &mut super::super::FunctionS
                 if facts.of(*operand).within(ValueType::INT32) {
                     continue;
                 }
-                *operand = graph.insert_value(block, position, span, Op::ToInt32(*operand));
+                *operand = graph.insert_value(
+                    block,
+                    position,
+                    span,
+                    Op::Javascript(JsOp::ToInt32(*operand)),
+                );
                 position += 1;
             }
             graph.set_op(inst, op);

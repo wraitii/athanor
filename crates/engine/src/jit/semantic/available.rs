@@ -1,4 +1,5 @@
 use crate::jit::layout::ReadLayout;
+use crate::jit::semantic::JsOp;
 use crate::{FxHashMap, FxHashSet};
 use cranelift_codegen::entity::SecondaryMap;
 use smallvec::SmallVec;
@@ -60,18 +61,22 @@ enum Reuse {
 fn load_key(op: &Op, probes: bool, aliases: &FxHashMap<Value, Value>) -> Option<LoadKey> {
     let at = |value: &Value| resolve(aliases, *value);
     Some(match op {
-        Op::Get(object, name) | Op::ShapedGet(object, name, _) | Op::LayoutGet(object, name, _) => {
-            LoadKey::Property(at(object), name.clone())
-        }
-        Op::GetIndex(object, key)
-        | Op::TypedIndex(object, key, _)
-        | Op::ArrayGet(object, key)
-        | Op::ArrayLoad(object, key, _) => LoadKey::Index(at(object), at(key)),
-        Op::ConstructorPrototype(callee) => LoadKey::Constructor(at(callee)),
-        Op::CellGet(cell) => LoadKey::Cell(at(cell)),
-        Op::GlobalRead(name) => LoadKey::Global(name.clone()),
-        Op::ProbeGlobal(name) if probes => LoadKey::Probe(name.clone()),
-        Op::ProbeShapeProperty(object, name, layout) => {
+        Op::Javascript(
+            JsOp::Get(object, name)
+            | JsOp::ShapedGet(object, name, _)
+            | JsOp::LayoutGet(object, name, _),
+        ) => LoadKey::Property(at(object), name.clone()),
+        Op::Javascript(
+            JsOp::GetIndex(object, key)
+            | JsOp::TypedIndex(object, key, _)
+            | JsOp::ArrayGet(object, key)
+            | JsOp::ArrayLoad(object, key, _),
+        ) => LoadKey::Index(at(object), at(key)),
+        Op::Javascript(JsOp::ConstructorPrototype(callee)) => LoadKey::Constructor(at(callee)),
+        Op::Javascript(JsOp::CellGet(cell)) => LoadKey::Cell(at(cell)),
+        Op::Javascript(JsOp::GlobalRead(name)) => LoadKey::Global(name.clone()),
+        Op::Javascript(JsOp::ProbeGlobal(name)) if probes => LoadKey::Probe(name.clone()),
+        Op::Javascript(JsOp::ProbeShapeProperty(object, name, layout)) => {
             LoadKey::ShapeProbe(at(object), name.clone(), *layout)
         }
         Op::LowLevel(super::low_level::Op::Load {
@@ -80,9 +85,9 @@ fn load_key(op: &Op, probes: bool, aliases: &FxHashMap<Value, Value>) -> Option<
             offset,
             flags,
         }) => LoadKey::Load(*ty, at(address), *offset, *flags),
-        Op::IndexedLength(object) => LoadKey::Length(at(object)),
-        Op::ArrayKind(object) => LoadKey::ArrayKind(at(object)),
-        Op::IsArray(object, layout) => LoadKey::Array(at(object), *layout),
+        Op::Javascript(JsOp::IndexedLength(object)) => LoadKey::Length(at(object)),
+        Op::Javascript(JsOp::ArrayKind(object)) => LoadKey::ArrayKind(at(object)),
+        Op::Javascript(JsOp::IsArray(object, layout)) => LoadKey::Array(at(object), *layout),
         _ => match implies(op)? {
             (
                 value,
@@ -104,7 +109,11 @@ fn read_access(graph: &Graph, op: &Op, facts: &Facts) -> Option<Access> {
         Op::LowLevel(super::low_level::Op::Load { .. }) => {
             Some(Access::broad(super::super::effects::Locations::HEAP))
         }
-        Op::ProbeGlobal(name) => Access::read(graph, &Op::GlobalRead(name.clone()), facts),
+        Op::Javascript(JsOp::ProbeGlobal(name)) => Access::read(
+            graph,
+            &Op::Javascript(JsOp::GlobalRead(name.clone())),
+            facts,
+        ),
         _ => Access::read(graph, op, facts),
     }
 }
@@ -143,8 +152,10 @@ fn step(
         return None;
     }
     if let Some((object, wanted)) = match data.op {
-        Op::IsShape(object, shape) => Some((object, Fact::Shape(shape))),
-        Op::IsReadLayout(object, layout) => Some((object, Fact::ReadLayout(layout))),
+        Op::Javascript(JsOp::IsShape(object, shape)) => Some((object, Fact::Shape(shape))),
+        Op::Javascript(JsOp::IsReadLayout(object, layout)) => {
+            Some((object, Fact::ReadLayout(layout)))
+        }
         _ => None,
     } && state.iter().any(|(key, entry)| {
         matches!(key, LoadKey::ShapeProbe(receiver, _, layout)
@@ -238,7 +249,7 @@ fn entering(
         };
         if matches!(key, LoadKey::ShapeProbe(..)) {
             // Probe truth records success, independently of the property's value.
-            if let Some(Op::IsUninitialized(value)) = graph.defining_op(condition)
+            if let Some(Op::Javascript(JsOp::IsUninitialized(value))) = graph.defining_op(condition)
                 && resolve(aliases, *value) == resolve(aliases, entry.value)
             {
                 return Some(!truth);
@@ -489,7 +500,7 @@ impl Solved {
     ) -> bool {
         let original = |mut value| {
             value = self.canonical(value);
-            while let Some(Op::AsObject(source)) = graph.defining_op(value) {
+            while let Some(Op::Javascript(JsOp::AsObject(source))) = graph.defining_op(value) {
                 value = self.canonical(*source);
             }
             value

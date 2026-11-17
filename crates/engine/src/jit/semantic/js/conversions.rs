@@ -1,3 +1,4 @@
+use crate::jit::semantic::JsOp;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types;
 
@@ -25,7 +26,7 @@ pub(in crate::jit::semantic) fn convert(
         return value;
     }
     let number = match builder.graph.defining_op(value) {
-        Some(Op::Constant(Constant::Number(number))) => Some(*number),
+        Some(Op::Javascript(JsOp::Constant(Constant::Number(number)))) => Some(*number),
         Some(Op::LowLevel(LowOp::Float64(bits))) => Some(f64::from_bits(*bits)),
         _ => None,
     };

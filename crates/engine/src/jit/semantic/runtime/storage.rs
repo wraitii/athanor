@@ -1,3 +1,4 @@
+use crate::jit::semantic::JsOp;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{MemFlagsData, types};
 
@@ -15,20 +16,20 @@ pub(in crate::jit::semantic) fn lower_metadata(function: &mut FunctionState) -> 
         for &inst in &insts {
             let data = &graph.insts[inst];
             let (object, existing_view, ty, offset) = match data.op {
-                Op::ArrayKind(object) => (
+                Op::Javascript(JsOp::ArrayKind(object)) => (
                     object,
                     graph.views.remove(&inst),
                     types::I32,
                     crate::heap::KIND_OFFSET,
                 ),
-                Op::IndexedLength(object) => (
+                Op::Javascript(JsOp::IndexedLength(object)) => (
                     object,
                     graph.views.remove(&inst),
                     types::I64,
                     crate::heap::LENGTH_OFFSET,
                 ),
-                Op::TypedData(view) => {
-                    let Some(Op::View(object)) = graph.defining_op(view) else {
+                Op::Javascript(JsOp::TypedData(view)) => {
+                    let Some(Op::Javascript(JsOp::View(object))) = graph.defining_op(view) else {
                         unreachable!()
                     };
                     (*object, Some(view), types::I64, crate::heap::DATA_OFFSET)
@@ -37,7 +38,7 @@ pub(in crate::jit::semantic) fn lower_metadata(function: &mut FunctionState) -> 
             };
             let view = existing_view.unwrap_or_else(|| {
                 Cursor::before(graph, inst)
-                    .place(Op::View(object), true)
+                    .place(Op::Javascript(JsOp::View(object)), true)
                     .1
                     .unwrap()
             });
@@ -69,7 +70,7 @@ pub(in crate::jit::semantic) fn lower_array_loads(function: &mut FunctionState) 
         insts.clone_from(&graph.blocks[block].insts);
         for &inst in &insts {
             let data = &graph.insts[inst];
-            let Op::ArrayLoad(object, position, layout) = data.op else {
+            let Op::Javascript(JsOp::ArrayLoad(object, position, layout)) = data.op else {
                 continue;
             };
             let existing_view = graph.views.remove(&inst);
@@ -78,8 +79,12 @@ pub(in crate::jit::semantic) fn lower_array_loads(function: &mut FunctionState) 
                 function.facts.set(value, value_type);
                 value
             };
-            let view = existing_view
-                .unwrap_or_else(|| typed(at.add(Op::View(object), Repr::Boxed), ValueType::VIEW));
+            let view = existing_view.unwrap_or_else(|| {
+                typed(
+                    at.add(Op::Javascript(JsOp::View(object)), Repr::Boxed),
+                    ValueType::VIEW,
+                )
+            });
             let base = typed(
                 at.ins().load(
                     types::I64,
@@ -131,22 +136,28 @@ pub(in crate::jit::semantic) fn lower_stores(function: &mut FunctionState) {
         for &inst in &insts {
             let data = &graph.insts[inst];
             let (object, key, value, addition) = match data.op {
-                Op::ArrayStore(object, key, value)
-                | Op::PropertyStore(object, key, value, _, _) => (object, key, value, false),
-                Op::PropertyAdd(object, key, value, _) => (object, key, value, true),
-                Op::CanOverwrite(object, key, _) => (object, key, object, false),
+                Op::Javascript(
+                    JsOp::ArrayStore(object, key, value)
+                    | JsOp::PropertyStore(object, key, value, _, _),
+                ) => (object, key, value, false),
+                Op::Javascript(JsOp::PropertyAdd(object, key, value, _)) => {
+                    (object, key, value, true)
+                }
+                Op::Javascript(JsOp::CanOverwrite(object, key, _)) => (object, key, object, false),
                 _ => continue,
             };
             let span = data.span;
-            let checking = matches!(data.op, Op::CanOverwrite(..));
+            let checking = matches!(data.op, Op::Javascript(JsOp::CanOverwrite(..)));
             let reuse = checked.remove(&inst);
             let store = checked_store(graph, inst, object, key);
-            let indexed = matches!(data.op, Op::ArrayStore(..))
-                || matches!(
-                    data.op,
-                    Op::PropertyStore(_, _, _, super::super::js::memory::Field::Cells, _)
-                        | Op::CanOverwrite(_, _, super::super::js::memory::Field::Elements)
-                );
+            let indexed = matches!(
+                data.op,
+                Op::Javascript(
+                    JsOp::ArrayStore(..)
+                        | JsOp::PropertyStore(_, _, _, super::super::js::memory::Field::Cells, _)
+                        | JsOp::CanOverwrite(_, _, super::super::js::memory::Field::Elements)
+                )
+            );
             let data_offset = if indexed {
                 crate::heap::DATA_OFFSET
             } else {
@@ -157,7 +168,8 @@ pub(in crate::jit::semantic) fn lower_stores(function: &mut FunctionState) {
             let (address, old, addition_data) = if let Some((address, old)) = reuse {
                 (address, Some(old), None)
             } else {
-                let view = existing_view.unwrap_or_else(|| at.add(Op::View(object), Repr::Boxed));
+                let view = existing_view
+                    .unwrap_or_else(|| at.add(Op::Javascript(JsOp::View(object)), Repr::Boxed));
                 let base = at
                     .ins()
                     .load(types::I64, MemFlagsData::trusted(), view, data_offset);
@@ -293,7 +305,7 @@ fn checked_store(
     key: super::super::Value,
 ) -> Option<super::super::Inst> {
     let data = &graph.insts[inst];
-    if !matches!(data.op, Op::CanOverwrite(..)) {
+    if !matches!(data.op, Op::Javascript(JsOp::CanOverwrite(..))) {
         return None;
     }
     let super::super::TerminatorKind::Branch(condition, yes, _) =
@@ -306,9 +318,10 @@ fn checked_store(
     }
     for &inst in &graph.blocks[yes.block].insts {
         match graph.insts[inst].op {
-            Op::ArrayStore(receiver, position, _) | Op::PropertyStore(receiver, position, ..)
-                if receiver == object && position == key =>
-            {
+            Op::Javascript(
+                JsOp::ArrayStore(receiver, position, _)
+                | JsOp::PropertyStore(receiver, position, ..),
+            ) if receiver == object && position == key => {
                 return Some(inst);
             }
             Op::Convert(..)

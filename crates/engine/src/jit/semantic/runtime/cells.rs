@@ -5,6 +5,7 @@ use super::super::{
     Binding, BindingData, BindingKind, Block, BlockData, Constant, FunctionState, Graph, Inst, Op,
     PropertyWrite, Scope, ScopeKind, Target, TerminatorKind, Value,
 };
+use crate::jit::semantic::JsOp;
 use crate::{FxHashMap, FxHashSet};
 
 pub(in crate::jit::semantic) fn lower_accesses(function: &mut FunctionState) {
@@ -15,25 +16,35 @@ pub(in crate::jit::semantic) fn lower_accesses(function: &mut FunctionState) {
     for &block in &function.facts.cfg.rpo {
         for inst in graph.blocks[block].insts.clone() {
             match graph.insts[inst].op {
-                Op::CellGet(cell) => {
+                Op::Javascript(JsOp::CellGet(cell)) => {
                     let result = graph.insts[inst].result().unwrap();
                     let mut at = Cursor::before(graph, inst);
-                    let view = at.add_unassigned(Op::View(cell));
+                    let view = at.add_unassigned(Op::Javascript(JsOp::View(cell)));
                     let address = at.ins().load(
                         types::I64,
                         MemFlagsData::trusted(),
                         view,
                         crate::heap::DATA_OFFSET,
                     );
-                    graph.set_op(inst, Op::PropertyLoad(cell, address, Field::Cells));
-                    Cursor::after(graph, inst).add_effect(Op::CheckInitialized(result));
-                }
-                Op::CellSet(cell, value) => {
-                    let index = Cursor::before(graph, inst)
-                        .add_unassigned(Op::Constant(Constant::Number(0.0)));
                     graph.set_op(
                         inst,
-                        Op::PropertyStore(cell, index, value, Field::Cells, PropertyWrite::Set),
+                        Op::Javascript(JsOp::PropertyLoad(cell, address, Field::Cells)),
+                    );
+                    Cursor::after(graph, inst)
+                        .add_effect(Op::Javascript(JsOp::CheckInitialized(result)));
+                }
+                Op::Javascript(JsOp::CellSet(cell, value)) => {
+                    let index = Cursor::before(graph, inst)
+                        .add_unassigned(Op::Javascript(JsOp::Constant(Constant::Number(0.0))));
+                    graph.set_op(
+                        inst,
+                        Op::Javascript(JsOp::PropertyStore(
+                            cell,
+                            index,
+                            value,
+                            Field::Cells,
+                            PropertyWrite::Set,
+                        )),
                     );
                 }
                 _ => {}
@@ -50,7 +61,7 @@ pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) -> bool {
         .graph
         .insts
         .values()
-        .any(|data| matches!(data.op, Op::Closure(..)));
+        .any(|data| matches!(data.op, Op::Javascript(JsOp::Closure(..))));
     if lowered.is_empty() && lazy.is_empty() && !closures {
         return false;
     }
@@ -109,13 +120,15 @@ fn lower_inst(
 ) {
     let op = graph.insts[inst].op.clone();
     let lowered_op = match op {
-        Op::EnterScope(scope) if graph.scopes[scope].kind == ScopeKind::Captures => {
+        Op::Javascript(JsOp::EnterScope(scope))
+            if graph.scopes[scope].kind == ScopeKind::Captures =>
+        {
             let mut at = Cursor::after(graph, inst);
-            let closure = at.add_unassigned(Op::Callee);
+            let closure = at.add_unassigned(Op::Javascript(JsOp::Callee));
             capture_cells(&mut at, lowered, scope, closure);
             None
         }
-        Op::EnterScope(scope) => {
+        Op::Javascript(JsOp::EnterScope(scope)) => {
             let fresh = scope_bindings(graph, lowered, scope);
             let cells = lazy_scope_bindings(graph, lazy, scope);
             let mut at = Cursor::after(graph, inst);
@@ -123,37 +136,39 @@ fn lower_inst(
                 initialize_fresh(&mut at, binding);
             }
             for (_, cell) in cells {
-                let undefined = at.add_unassigned(Op::Constant(Constant::Undefined));
-                at.add_effect(Op::Initialize(cell, undefined));
+                let undefined =
+                    at.add_unassigned(Op::Javascript(JsOp::Constant(Constant::Undefined)));
+                at.add_effect(Op::Javascript(JsOp::Initialize(cell, undefined)));
             }
             None
         }
-        Op::EnterCaptures(scope, closure) => {
+        Op::Javascript(JsOp::EnterCaptures(scope, closure)) => {
             let mut at = Cursor::after(graph, inst);
             capture_cells(&mut at, lowered, scope, closure);
-            Some(Op::EnterScope(scope))
+            Some(Op::Javascript(JsOp::EnterScope(scope)))
         }
-        Op::NextIteration(scope) => {
+        Op::Javascript(JsOp::NextIteration(scope)) => {
             for (binding, cell) in lazy_scope_bindings(graph, lazy, scope) {
                 let split = split_on_cell(graph, inst, cell);
                 let mut shared = Cursor::at_end(graph, split.shared, inst);
-                let value = shared.add_unassigned(Op::CellGet(split.cell));
-                shared.add_effect(Op::Initialize(binding, value));
-                let undefined = shared.add_unassigned(Op::Constant(Constant::Undefined));
-                shared.add_effect(Op::Initialize(cell, undefined));
+                let value = shared.add_unassigned(Op::Javascript(JsOp::CellGet(split.cell)));
+                shared.add_effect(Op::Javascript(JsOp::Initialize(binding, value)));
+                let undefined =
+                    shared.add_unassigned(Op::Javascript(JsOp::Constant(Constant::Undefined)));
+                shared.add_effect(Op::Javascript(JsOp::Initialize(cell, undefined)));
                 shared.terminate_current(jump(split.fallback, Vec::new()));
             }
             let copied = scope_bindings(graph, lowered, scope);
             let mut at = Cursor::after(graph, inst);
             for binding in copied {
-                let current = at.add_unassigned(Op::BindingLoad(binding));
-                let value = at.add_unassigned(Op::CellGet(current));
-                let cell = at.add_unassigned(Op::CellNew(value));
-                at.add_effect(Op::Initialize(binding, cell));
+                let current = at.add_unassigned(Op::Javascript(JsOp::BindingLoad(binding)));
+                let value = at.add_unassigned(Op::Javascript(JsOp::CellGet(current)));
+                let cell = at.add_unassigned(Op::Javascript(JsOp::CellNew(value)));
+                at.add_effect(Op::Javascript(JsOp::Initialize(binding, cell)));
             }
             None
         }
-        Op::FreshIteration(scope) => {
+        Op::Javascript(JsOp::FreshIteration(scope)) => {
             let fresh = scope_bindings(graph, lowered, scope);
             let cells = lazy_scope_bindings(graph, lazy, scope);
             let mut at = Cursor::after(graph, inst);
@@ -161,50 +176,62 @@ fn lower_inst(
                 initialize_fresh(&mut at, binding);
             }
             for (binding, cell) in cells {
-                let undefined = at.add_unassigned(Op::Constant(Constant::Undefined));
-                at.add_effect(Op::Initialize(cell, undefined));
-                let uninitialized = at.add_unassigned(Op::Constant(Constant::Uninitialized));
-                at.add_effect(Op::Initialize(binding, uninitialized));
+                let undefined =
+                    at.add_unassigned(Op::Javascript(JsOp::Constant(Constant::Undefined)));
+                at.add_effect(Op::Javascript(JsOp::Initialize(cell, undefined)));
+                let uninitialized =
+                    at.add_unassigned(Op::Javascript(JsOp::Constant(Constant::Uninitialized)));
+                at.add_effect(Op::Javascript(JsOp::Initialize(binding, uninitialized)));
             }
             None
         }
-        Op::Read(binding) if lowered.contains(&binding) => {
-            let cell = Cursor::before(graph, inst).add_unassigned(Op::BindingLoad(binding));
-            Some(Op::CellGet(cell))
+        Op::Javascript(JsOp::Read(binding)) if lowered.contains(&binding) => {
+            let cell = Cursor::before(graph, inst)
+                .add_unassigned(Op::Javascript(JsOp::BindingLoad(binding)));
+            Some(Op::Javascript(JsOp::CellGet(cell)))
         }
-        Op::Read(binding) if lazy.contains_key(&binding) => {
+        Op::Javascript(JsOp::Read(binding)) if lazy.contains_key(&binding) => {
             let split = split_on_cell(graph, inst, lazy[&binding]);
             let mut shared = Cursor::at_end(graph, split.shared, inst);
-            let value = shared.add_unassigned(Op::CellGet(split.cell));
+            let value = shared.add_unassigned(Op::Javascript(JsOp::CellGet(split.cell)));
             shared.terminate_current(jump(split.continuation, vec![value]));
             None
         }
-        Op::Write(binding, value) if lowered.contains(&binding) => {
+        Op::Javascript(JsOp::Write(binding, value)) if lowered.contains(&binding) => {
             let mut at = Cursor::before(graph, inst);
-            let cell = at.add_unassigned(Op::BindingLoad(binding));
-            at.add_unassigned(Op::CellGet(cell));
-            Some(Op::CellSet(cell, value))
+            let cell = at.add_unassigned(Op::Javascript(JsOp::BindingLoad(binding)));
+            at.add_unassigned(Op::Javascript(JsOp::CellGet(cell)));
+            Some(Op::Javascript(JsOp::CellSet(cell, value)))
         }
-        Op::Write(binding, value) if lazy.contains_key(&binding) => {
+        Op::Javascript(JsOp::Write(binding, value)) if lazy.contains_key(&binding) => {
             let split = split_on_cell(graph, inst, lazy[&binding]);
             let mut shared = Cursor::at_end(graph, split.shared, inst);
-            shared.add_unassigned(Op::CellGet(split.cell));
-            shared.add_effect(Op::CellSet(split.cell, value));
+            shared.add_unassigned(Op::Javascript(JsOp::CellGet(split.cell)));
+            shared.add_effect(Op::Javascript(JsOp::CellSet(split.cell, value)));
             shared.terminate_current(jump(split.continuation, Vec::new()));
             None
         }
-        Op::Initialize(binding, value) if lowered.contains(&binding) => {
-            let cell = Cursor::before(graph, inst).add_unassigned(Op::BindingLoad(binding));
-            Some(Op::CellSet(cell, value))
+        Op::Javascript(JsOp::Initialize(binding, value)) if lowered.contains(&binding) => {
+            let cell = Cursor::before(graph, inst)
+                .add_unassigned(Op::Javascript(JsOp::BindingLoad(binding)));
+            Some(Op::Javascript(JsOp::CellSet(cell, value)))
         }
-        Op::Initialize(binding, value) if lazy.contains_key(&binding) => {
+        Op::Javascript(JsOp::Initialize(binding, value)) if lazy.contains_key(&binding) => {
             let split = split_on_cell(graph, inst, lazy[&binding]);
             let mut shared = Cursor::at_end(graph, split.shared, inst);
-            shared.add_effect(Op::CellSet(split.cell, value));
+            shared.add_effect(Op::Javascript(JsOp::CellSet(split.cell, value)));
             shared.terminate_current(jump(split.continuation, Vec::new()));
             None
         }
-        Op::Closure(span, id, arrow, generator, lexical_this, captures, receiver) => {
+        Op::Javascript(JsOp::Closure(
+            span,
+            id,
+            arrow,
+            generator,
+            lexical_this,
+            captures,
+            receiver,
+        )) => {
             let cells = if captures.iter().any(|binding| lazy.contains_key(binding)) {
                 materialize_cells(graph, inst, lazy, &captures)
             } else {
@@ -215,11 +242,11 @@ fn lower_inst(
             for binding in captures {
                 let value = match cells.get(&binding) {
                     Some(&cell) => cell,
-                    None => at.add_unassigned(Op::BindingLoad(binding)),
+                    None => at.add_unassigned(Op::Javascript(JsOp::BindingLoad(binding))),
                 };
                 values.push(value);
             }
-            Some(Op::ClosureCells(
+            Some(Op::Javascript(JsOp::ClosureCells(
                 span,
                 id,
                 arrow,
@@ -227,7 +254,7 @@ fn lower_inst(
                 lexical_this,
                 values,
                 receiver,
-            ))
+            )))
         }
         _ => None,
     };
@@ -240,16 +267,16 @@ fn capture_cells(at: &mut Cursor, lowered: &FxHashSet<Binding>, scope: Scope, cl
     let bindings = at.graph().scopes[scope].bindings.clone();
     for (index, binding) in bindings.into_iter().enumerate() {
         if lowered.contains(&binding) {
-            let cell = at.add_unassigned(Op::CaptureGet(closure, index));
-            at.add_effect(Op::Initialize(binding, cell));
+            let cell = at.add_unassigned(Op::Javascript(JsOp::CaptureGet(closure, index)));
+            at.add_effect(Op::Javascript(JsOp::Initialize(binding, cell)));
         }
     }
 }
 
 fn initialize_fresh(at: &mut Cursor, binding: Binding) {
-    let uninitialized = at.add_unassigned(Op::Constant(Constant::Uninitialized));
-    let cell = at.add_unassigned(Op::CellNew(uninitialized));
-    at.add_effect(Op::Initialize(binding, cell));
+    let uninitialized = at.add_unassigned(Op::Javascript(JsOp::Constant(Constant::Uninitialized)));
+    let cell = at.add_unassigned(Op::Javascript(JsOp::CellNew(uninitialized)));
+    at.add_effect(Op::Javascript(JsOp::Initialize(binding, cell)));
 }
 
 fn scope_bindings(graph: &Graph, lowered: &FxHashSet<Binding>, scope: Scope) -> Vec<Binding> {
@@ -290,8 +317,8 @@ fn split_on_cell(graph: &mut Graph, inst: Inst, cell: Binding) -> LazySplit {
     }
     let shared = graph.blocks.push(BlockData::default());
     let mut at = Cursor::at_end(graph, block, inst);
-    let cell_value = at.add_unassigned(Op::BindingLoad(cell));
-    let is_undefined = at.add_unassigned(Op::IsUndefined(cell_value));
+    let cell_value = at.add_unassigned(Op::Javascript(JsOp::BindingLoad(cell)));
+    let is_undefined = at.add_unassigned(Op::Javascript(JsOp::IsUndefined(cell_value)));
     at.terminate_current(TerminatorKind::Branch(
         is_undefined,
         Target::new(fallback),
@@ -328,8 +355,8 @@ fn materialize_cells(
         let join = graph.blocks.push(BlockData::default());
         let joined = graph.add_param(join);
         let mut at = Cursor::at_end(graph, current, inst);
-        let existing = at.add_unassigned(Op::BindingLoad(cell));
-        let is_undefined = at.add_unassigned(Op::IsUndefined(existing));
+        let existing = at.add_unassigned(Op::Javascript(JsOp::BindingLoad(cell)));
+        let is_undefined = at.add_unassigned(Op::Javascript(JsOp::IsUndefined(existing)));
         at.terminate_current(TerminatorKind::Branch(
             is_undefined,
             Target::new(create),
@@ -339,11 +366,11 @@ fn materialize_cells(
             },
         ));
         let mut at = Cursor::at_end(graph, create, inst);
-        let raw = at.add_unassigned(Op::BindingLoad(binding));
-        let created = at.add_unassigned(Op::CellNew(raw));
-        at.add_effect(Op::Initialize(cell, created));
-        let undefined = at.add_unassigned(Op::Constant(Constant::Undefined));
-        at.add_effect(Op::Initialize(binding, undefined));
+        let raw = at.add_unassigned(Op::Javascript(JsOp::BindingLoad(binding)));
+        let created = at.add_unassigned(Op::Javascript(JsOp::CellNew(raw)));
+        at.add_effect(Op::Javascript(JsOp::Initialize(cell, created)));
+        let undefined = at.add_unassigned(Op::Javascript(JsOp::Constant(Constant::Undefined)));
+        at.add_effect(Op::Javascript(JsOp::Initialize(binding, undefined)));
         at.terminate_current(jump(join, vec![created]));
         cells.insert(binding, joined);
         current = join;

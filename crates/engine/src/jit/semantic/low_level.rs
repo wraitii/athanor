@@ -1,3 +1,4 @@
+use crate::jit::semantic::JsOp;
 use cranelift_codegen::ir::{
     MemFlagsData, Signature, Type,
     condcodes::{FloatCC, IntCC},
@@ -764,8 +765,10 @@ impl<I: Insert + ?Sized> Instructions<'_, I> {
         fcvt_from_uint => FloatFromUnsigned, fcvt_to_sint_sat => SignedSaturatingFromFloat);
 
     pub(in crate::jit) fn boolean(&mut self, value: bool) -> Value {
-        self.inserter
-            .add(GraphOp::Constant(Constant::Boolean(value)), Repr::Boolean)
+        self.inserter.add(
+            GraphOp::Javascript(JsOp::Constant(Constant::Boolean(value))),
+            Repr::Boolean,
+        )
     }
 
     pub(in crate::jit) fn f64const(&mut self, value: f64) -> Value {

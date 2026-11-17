@@ -1,3 +1,4 @@
+use crate::jit::semantic::JsOp;
 use cranelift_codegen::entity::SecondaryMap;
 use cranelift_codegen::ir::condcodes::{CondCode, FloatCC, IntCC};
 use cranelift_codegen::ir::{ArgumentExtension, Type, types};
@@ -484,7 +485,7 @@ fn instruction(graph: &mut Graph, inst: Inst, patterns: &Patterns) -> Result<a::
         |ty| super::abi::memory(ty, false).ok_or_else(|| Unsupported(format!("store {ty}")));
     match &data.op {
         Op::Convert(value, to) => return select.convert(*value, *to),
-        Op::Constant(Constant::Number(number)) => {
+        Op::Javascript(JsOp::Constant(Constant::Number(number))) => {
             return Ok(match ty.unwrap() {
                 types::I32 => a::Op::Constant {
                     bits: *number as i32 as u32 as u64,
@@ -501,7 +502,7 @@ fn instruction(graph: &mut Graph, inst: Inst, patterns: &Patterns) -> Result<a::
                 ty => return Err(Unsupported(format!("number constant {ty}"))),
             });
         }
-        Op::Constant(Constant::Boolean(value)) => {
+        Op::Javascript(JsOp::Constant(Constant::Boolean(value))) => {
             return Ok(a::Op::Constant {
                 bits: u64::from(*value),
                 class: RegClass::Int,
@@ -1160,7 +1161,7 @@ fn constant(graph: &Graph, value: Value) -> Option<u64> {
             bits,
             class: RegClass::Int,
         }) => bits,
-        Op::Constant(Constant::Number(number))
+        Op::Javascript(JsOp::Constant(Constant::Number(number)))
             if matches!(graph.repr(value), Repr::I32 | Repr::I64) =>
         {
             if graph.repr(value) == Repr::I32 {
@@ -1169,7 +1170,7 @@ fn constant(graph: &Graph, value: Value) -> Option<u64> {
                 number as i64 as u64
             }
         }
-        Op::Constant(Constant::Boolean(value)) => u64::from(value),
+        Op::Javascript(JsOp::Constant(Constant::Boolean(value))) => u64::from(value),
         Op::Convert(input, to) => {
             let bits = constant(graph, input)?;
             match (graph.repr(input), to) {

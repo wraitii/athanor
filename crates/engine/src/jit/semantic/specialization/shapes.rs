@@ -1,6 +1,7 @@
 use crate::FxHashMap;
 use crate::jit::layout::ReadLayout;
 use crate::jit::profile::{PropertyAccess, ShapeAccess, Site};
+use crate::jit::semantic::JsOp;
 
 use super::super::{Cfg, Graph, Inst, Op};
 
@@ -58,10 +59,10 @@ impl Plan {
 
 fn property_access(op: &Op) -> Option<PropertyAccess> {
     match op {
-        Op::Get(_, name) | Op::ProbeProperty(_, name) if name != "length" => {
+        Op::Javascript(JsOp::Get(_, name) | JsOp::ProbeProperty(_, name)) if name != "length" => {
             Some(PropertyAccess::Get)
         }
-        Op::Set(..) => Some(PropertyAccess::Set),
+        Op::Javascript(JsOp::Set(..)) => Some(PropertyAccess::Set),
         _ => None,
     }
 }
@@ -119,11 +120,13 @@ pub(in crate::jit::semantic) fn plan(
             let observed = bodies.shape_feedback(site, property);
             let callee = data.result().is_some_and(|value| callees.contains(&value));
             let object = match data.op {
-                Op::Get(object, _) | Op::ProbeProperty(object, _) | Op::Set(object, ..) => object,
+                Op::Javascript(
+                    JsOp::Get(object, _) | JsOp::ProbeProperty(object, _) | JsOp::Set(object, ..),
+                ) => object,
                 _ => continue,
             };
             if let Some(ShapeAccess::PolymorphicRead { entries, len }) = observed
-                && matches!(data.op, Op::Get(..))
+                && matches!(data.op, Op::Javascript(JsOp::Get(..)))
                 && (callee
                     || !assumed.get(&object).is_some_and(|shape| {
                         entries[..usize::from(len)]

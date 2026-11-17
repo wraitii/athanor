@@ -1,6 +1,7 @@
 use super::super::{Facts, Graph, Op, Value, ValueType};
 use crate::jit::effects::Locations;
 use crate::jit::helpers::Helper;
+use crate::jit::semantic::JsOp;
 
 mod fresh;
 
@@ -33,17 +34,19 @@ impl Field {
 
     pub(in crate::jit::semantic) fn cached(graph: &Graph, cache: Value) -> Self {
         match graph.defining_op(cache) {
-            Some(Op::PropertyCache(_, name)) => Self::named(name),
+            Some(Op::Javascript(JsOp::PropertyCache(_, name))) => Self::named(name),
             _ => Self::Any,
         }
     }
 
     fn of(graph: &Graph, op: &Op, facts: &Facts) -> Self {
         match op {
-            Op::PropertyLoad(_, _, field)
-            | Op::RelatedPropertyLoad(_, _, field)
-            | Op::PropertyStore(_, _, _, field, _) => field.clone(),
-            Op::CachedProperty(_, cache, _) | Op::PropertyAdd(_, cache, ..) => {
+            Op::Javascript(
+                JsOp::PropertyLoad(_, _, field)
+                | JsOp::RelatedPropertyLoad(_, _, field)
+                | JsOp::PropertyStore(_, _, _, field, _),
+            ) => field.clone(),
+            Op::Javascript(JsOp::CachedProperty(_, cache, _) | JsOp::PropertyAdd(_, cache, ..)) => {
                 Self::cached(graph, *cache)
             }
             Op::HelperCall {
@@ -55,35 +58,39 @@ impl Field {
                 args,
                 ..
             } => Self::cached(graph, args[1]),
-            Op::Read(_) | Op::Initialize(..) | Op::Write(..) | Op::CellGet(_) | Op::CellSet(..) => {
-                Self::Cells
-            }
-            Op::Get(_, name)
-            | Op::FillPropertyStore(_, _, name, _, _)
-            | Op::Set(_, name, _)
-            | Op::Define(_, name, _)
-            | Op::ShapedGet(_, name, _)
-            | Op::LayoutGet(_, name, _)
-            | Op::ProbeProperty(_, name)
-            | Op::ShapedSet(_, name, _, _)
-            | Op::GlobalRead(name)
-            | Op::ProbeGlobal(name)
-            | Op::GlobalWrite(name, _)
-            | Op::GlobalInitialize(name, _) => Self::named(name),
-            Op::GetIndex(_, key)
-            | Op::TypedIndex(_, key, _)
-            | Op::ArrayGet(_, key)
-            | Op::ArrayLoad(_, key, _)
-            | Op::ArrayStore(_, key, _)
-            | Op::SetIndex(_, key, _)
-                if facts.of(*key).within(ValueType::NUMBER) =>
-            {
-                Self::Elements
-            }
-            Op::IndexedLength(_) => Self::Length,
-            Op::ArrayAppend(..) | Op::MapElement(..) => Self::Elements,
-            Op::PackAppend(..) | Op::PackRelease(_) => Self::Packs,
-            Op::IteratorNext(_) | Op::EnumerateNext(_) => Self::Iteration,
+            Op::Javascript(
+                JsOp::Read(_)
+                | JsOp::Initialize(..)
+                | JsOp::Write(..)
+                | JsOp::CellGet(_)
+                | JsOp::CellSet(..),
+            ) => Self::Cells,
+            Op::Javascript(
+                JsOp::Get(_, name)
+                | JsOp::FillPropertyStore(_, _, name, _, _)
+                | JsOp::Set(_, name, _)
+                | JsOp::Define(_, name, _)
+                | JsOp::ShapedGet(_, name, _)
+                | JsOp::LayoutGet(_, name, _)
+                | JsOp::ProbeProperty(_, name)
+                | JsOp::ShapedSet(_, name, _, _)
+                | JsOp::GlobalRead(name)
+                | JsOp::ProbeGlobal(name)
+                | JsOp::GlobalWrite(name, _)
+                | JsOp::GlobalInitialize(name, _),
+            ) => Self::named(name),
+            Op::Javascript(
+                JsOp::GetIndex(_, key)
+                | JsOp::TypedIndex(_, key, _)
+                | JsOp::ArrayGet(_, key)
+                | JsOp::ArrayLoad(_, key, _)
+                | JsOp::ArrayStore(_, key, _)
+                | JsOp::SetIndex(_, key, _),
+            ) if facts.of(*key).within(ValueType::NUMBER) => Self::Elements,
+            Op::Javascript(JsOp::IndexedLength(_)) => Self::Length,
+            Op::Javascript(JsOp::ArrayAppend(..) | JsOp::MapElement(..)) => Self::Elements,
+            Op::Javascript(JsOp::PackAppend(..) | JsOp::PackRelease(_)) => Self::Packs,
+            Op::Javascript(JsOp::IteratorNext(_) | JsOp::EnumerateNext(_)) => Self::Iteration,
             _ => Self::Any,
         }
     }
@@ -147,32 +154,39 @@ impl Access {
         facts: &Facts,
     ) -> Option<(Locations, Self)> {
         let (location, base) = match op {
-            Op::LayoutGet(..) | Op::RelatedPropertyLoad(..) => (Locations::HEAP, Base::Unknown),
-            Op::IsReadLayout(..) => (Locations::CODE, Base::Unknown),
-            Op::ProbeShapeProperty(_, _, layout) if layout.storage.is_some() => {
+            Op::Javascript(JsOp::LayoutGet(..) | JsOp::RelatedPropertyLoad(..)) => {
+                (Locations::HEAP, Base::Unknown)
+            }
+            Op::Javascript(JsOp::IsReadLayout(..)) => (Locations::CODE, Base::Unknown),
+            Op::Javascript(JsOp::ProbeShapeProperty(_, _, layout)) if layout.storage.is_some() => {
                 (Locations::HEAP.union(Locations::CODE), Base::Unknown)
             }
-            Op::PropertyLoad(object, ..)
-            | Op::CachedProperty(object, ..)
-            | Op::Get(object, _)
-            | Op::ProbeProperty(object, _)
-            | Op::ShapedGet(object, ..)
-            | Op::GetIndex(object, _)
-            | Op::TypedIndex(object, ..)
-            | Op::ArrayGet(object, _)
-            | Op::ArrayLoad(object, _, _)
-            | Op::IndexedLength(object)
-            | Op::ArrayKind(object)
-            | Op::IsArray(object, _)
-            | Op::ConstructorPrototype(object) => (Locations::HEAP, Base::Known(*object)),
-            Op::ProbeShapeProperty(object, ..) => {
+            Op::Javascript(
+                JsOp::PropertyLoad(object, ..)
+                | JsOp::CachedProperty(object, ..)
+                | JsOp::Get(object, _)
+                | JsOp::ProbeProperty(object, _)
+                | JsOp::ShapedGet(object, ..)
+                | JsOp::GetIndex(object, _)
+                | JsOp::TypedIndex(object, ..)
+                | JsOp::ArrayGet(object, _)
+                | JsOp::ArrayLoad(object, _, _)
+                | JsOp::IndexedLength(object)
+                | JsOp::ArrayKind(object)
+                | JsOp::IsArray(object, _)
+                | JsOp::ConstructorPrototype(object),
+            ) => (Locations::HEAP, Base::Known(*object)),
+            Op::Javascript(JsOp::ProbeShapeProperty(object, ..)) => {
                 (Locations::HEAP.union(Locations::CODE), Base::Known(*object))
             }
             Op::EntryAssume(object, super::super::guards::Fact::Shape(_))
-            | Op::IsShape(object, _)
-            | Op::IsPropertyCached(object, ..) => (Locations::CODE, Base::Known(*object)),
-            Op::CellGet(cell) => (Locations::HEAP, Base::Known(*cell)),
-            Op::GlobalRead(_) | Op::ProbeGlobal(_) => (Locations::GLOBAL, Base::External),
+            | Op::Javascript(JsOp::IsShape(object, _) | JsOp::IsPropertyCached(object, ..)) => {
+                (Locations::CODE, Base::Known(*object))
+            }
+            Op::Javascript(JsOp::CellGet(cell)) => (Locations::HEAP, Base::Known(*cell)),
+            Op::Javascript(JsOp::GlobalRead(_) | JsOp::ProbeGlobal(_)) => {
+                (Locations::GLOBAL, Base::External)
+            }
             Op::HelperCall {
                 helper: Helper::PropertyGetMegamorphic,
                 ..
@@ -215,18 +229,20 @@ impl Access {
 
 fn write_target(op: &Op) -> Option<Value> {
     match op {
-        Op::CellSet(object, _)
-        | Op::Define(object, ..)
-        | Op::Set(object, ..)
-        | Op::ShapedSet(object, ..)
-        | Op::ArrayStore(object, ..)
-        | Op::PropertyStore(object, ..)
-        | Op::PropertyAdd(object, ..)
-        | Op::FillPropertyStore(object, ..)
-        | Op::SetIndex(object, ..)
-        | Op::ArrayAppend(object, ..)
-        | Op::IteratorNext(object)
-        | Op::EnumerateNext(object) => Some(*object),
+        Op::Javascript(
+            JsOp::CellSet(object, _)
+            | JsOp::Define(object, ..)
+            | JsOp::Set(object, ..)
+            | JsOp::ShapedSet(object, ..)
+            | JsOp::ArrayStore(object, ..)
+            | JsOp::PropertyStore(object, ..)
+            | JsOp::PropertyAdd(object, ..)
+            | JsOp::FillPropertyStore(object, ..)
+            | JsOp::SetIndex(object, ..)
+            | JsOp::ArrayAppend(object, ..)
+            | JsOp::IteratorNext(object)
+            | JsOp::EnumerateNext(object),
+        ) => Some(*object),
         _ => None,
     }
 }

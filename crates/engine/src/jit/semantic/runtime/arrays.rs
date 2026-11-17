@@ -4,6 +4,7 @@ use super::super::cursor::{Cursor, Insert};
 #[cfg(test)]
 use super::super::dispatch::append;
 use super::super::{Constant, FunctionState, Graph, Inst, Op, Repr, Value, ValueType, low_level};
+use crate::jit::semantic::JsOp;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 
 pub(in crate::jit::semantic) fn generic_cold(function: &mut FunctionState) {
@@ -12,10 +13,12 @@ pub(in crate::jit::semantic) fn generic_cold(function: &mut FunctionState) {
     for block in graph.cold.clone() {
         for inst in graph.blocks[block].insts.clone() {
             let op = match graph.insts[inst].op {
-                Op::ArrayLoad(object, index, _) | Op::TypedIndex(object, index, _) => {
-                    Op::GetIndex(object, index)
+                Op::Javascript(
+                    JsOp::ArrayLoad(object, index, _) | JsOp::TypedIndex(object, index, _),
+                ) => Op::Javascript(JsOp::GetIndex(object, index)),
+                Op::Javascript(JsOp::ArrayStore(object, index, value)) => {
+                    Op::Javascript(JsOp::SetIndex(object, index, value))
                 }
-                Op::ArrayStore(object, index, value) => Op::SetIndex(object, index, value),
                 _ => continue,
             };
             graph.set_op(inst, op);
@@ -37,18 +40,18 @@ pub(in crate::jit::semantic) fn lower_arrays(function: &mut FunctionState) -> bo
         insts.clone_from(&graph.blocks[block].insts);
         for &inst in &insts {
             let data = &graph.insts[inst];
-            let Op::IsArrayIndex(object, key, position, layout) = data.op else {
+            let Op::Javascript(JsOp::IsArrayIndex(object, key, position, layout)) = data.op else {
                 continue;
             };
             let mut at = Cursor::before(graph, inst);
-            let matching = at.add_unassigned(Op::IsArray(object, layout));
+            let matching = at.add_unassigned(Op::Javascript(JsOp::IsArray(object, layout)));
             let exact = if facts.of(key).within(ValueType::INTEGER) {
-                at.add_unassigned(Op::Constant(Constant::Boolean(true)))
+                at.add_unassigned(Op::Javascript(JsOp::Constant(Constant::Boolean(true))))
             } else {
-                at.add_unassigned(Op::IsExactPosition(key, position))
+                at.add_unassigned(Op::Javascript(JsOp::IsExactPosition(key, position)))
             };
-            let length = at.add_unassigned(Op::IndexedLength(object));
-            let inside = at.add_unassigned(Op::IsInBounds(position, length));
+            let length = at.add_unassigned(Op::Javascript(JsOp::IndexedLength(object)));
+            let inside = at.add_unassigned(Op::Javascript(JsOp::IsInBounds(position, length)));
             let valid = at.add_unassigned(Op::BooleanAnd(exact, inside));
             graph.set_op(inst, Op::BooleanAnd(matching, valid));
             changed = true;
@@ -73,12 +76,12 @@ pub(in crate::jit::semantic) fn lower_checks(function: &mut FunctionState) -> bo
                     left,
                     right,
                 },
-                Op::IsExactPosition(left, right) => low_level::Op::FloatCompare {
+                Op::Javascript(JsOp::IsExactPosition(left, right)) => low_level::Op::FloatCompare {
                     condition: FloatCC::Equal,
                     left,
                     right,
                 },
-                Op::IsInBounds(position, length) => low_level::Op::IntCompare {
+                Op::Javascript(JsOp::IsInBounds(position, length)) => low_level::Op::IntCompare {
                     condition: IntCC::UnsignedLessThan,
                     left: integer(graph, inst, position),
                     right: integer(graph, inst, length),
@@ -107,19 +110,21 @@ pub(in crate::jit::semantic) fn lower_array_kinds(function: &mut FunctionState) 
         insts.clone_from(&graph.blocks[block].insts);
         for &inst in &insts {
             let data = &graph.insts[inst];
-            let Op::IsArray(object, layout) = data.op else {
+            let Op::Javascript(JsOp::IsArray(object, layout)) = data.op else {
                 continue;
             };
             let mut at = Cursor::before(graph, inst);
-            let kind = at.add_unassigned(Op::ArrayKind(object));
-            let expected = at.add_unassigned(Op::Constant(Constant::Number(layout.kind() as f64)));
+            let kind = at.add_unassigned(Op::Javascript(JsOp::ArrayKind(object)));
+            let expected = at.add_unassigned(Op::Javascript(JsOp::Constant(Constant::Number(
+                layout.kind() as f64,
+            ))));
             graph.set_op(
                 inst,
-                Op::Binary(
+                Op::Javascript(JsOp::Binary(
                     oxc_syntax::operator::BinaryOperator::StrictEquality,
                     kind,
                     expected,
-                ),
+                )),
             );
             changed = true;
         }
@@ -168,9 +173,11 @@ mod tests {
             let inst = graph
                 .insts
                 .iter()
-                .find_map(|(inst, data)| matches!(data.op, Op::GetIndex(..)).then_some(inst))
+                .find_map(|(inst, data)| {
+                    matches!(data.op, Op::Javascript(JsOp::GetIndex(..))).then_some(inst)
+                })
                 .unwrap();
-            let Op::GetIndex(object, key) = graph.insts[inst].op else {
+            let Op::Javascript(JsOp::GetIndex(object, key)) = graph.insts[inst].op else {
                 unreachable!()
             };
             let data = graph.insts[inst].clone();
@@ -180,35 +187,45 @@ mod tests {
                 .iter()
                 .position(|&i| i == inst)
                 .unwrap();
-            let position = graph.insert_value(block, at, data.span, Op::ArrayPosition(key));
+            let position = graph.insert_value(
+                block,
+                at,
+                data.span,
+                Op::Javascript(JsOp::ArrayPosition(key)),
+            );
             graph.set_op(
                 inst,
-                Op::IsArrayIndex(
+                Op::Javascript(JsOp::IsArrayIndex(
                     object,
                     key,
                     position,
                     super::super::super::ArrayLayout::Packed,
-                ),
+                )),
             );
             if mutate {
-                graph.append(block, data.span, Op::ArrayAppend(object, key, false), false);
+                graph.append(
+                    block,
+                    data.span,
+                    Op::Javascript(JsOp::ArrayAppend(object, key, false)),
+                    false,
+                );
             }
             let second = append(
                 &mut graph,
                 &data,
                 block,
-                Op::IsArrayIndex(
+                Op::Javascript(JsOp::IsArrayIndex(
                     object,
                     key,
                     position,
                     super::super::super::ArrayLayout::Holey,
-                ),
+                )),
             );
             let result = append(
                 &mut graph,
                 &data,
                 block,
-                Op::NewArray(vec![data.result().unwrap(), second]),
+                Op::Javascript(JsOp::NewArray(vec![data.result().unwrap(), second])),
             );
             graph.blocks[block].terminator.as_mut().unwrap().kind = TerminatorKind::Return(result);
             let mut function = FunctionState::new(graph, Vec::new(), true);
@@ -225,16 +242,22 @@ mod tests {
                     .filter(|&&inst| predicate(&graph.insts[inst].op))
                     .count()
             };
-            assert_eq!(count(|op| matches!(op, Op::IsExactPosition(..))), 1);
             assert_eq!(
-                count(|op| matches!(op, Op::IndexedLength(..))),
+                count(|op| matches!(op, Op::Javascript(JsOp::IsExactPosition(..)))),
+                1
+            );
+            assert_eq!(
+                count(|op| matches!(op, Op::Javascript(JsOp::IndexedLength(..)))),
                 if mutate { 2 } else { 1 }
             );
             assert_eq!(
-                count(|op| matches!(op, Op::IsInBounds(..))),
+                count(|op| matches!(op, Op::Javascript(JsOp::IsInBounds(..)))),
                 if mutate { 2 } else { 1 }
             );
-            assert_eq!(count(|op| matches!(op, Op::IsArrayIndex(..))), 0);
+            assert_eq!(
+                count(|op| matches!(op, Op::Javascript(JsOp::IsArrayIndex(..)))),
+                0
+            );
         }
     }
 }

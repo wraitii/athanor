@@ -1,6 +1,7 @@
 use super::super::super::js::memory::Field;
 use super::super::super::memory::Analysis;
 use super::*;
+use crate::jit::semantic::JsOp;
 use crate::{FxHashMap, FxHashSet};
 
 pub(in crate::jit::semantic) struct Writes<F = Facts> {
@@ -214,13 +215,14 @@ pub(in crate::jit::semantic) fn requirements(graph: &Graph, blocks: &[Block]) ->
     let inside: FxHashSet<Block> = blocks.iter().copied().collect();
     for &block in blocks {
         for &inst in &graph.blocks[block].insts {
-            let Op::Call { callee, .. } = graph.insts[inst].op else {
+            let Op::Javascript(JsOp::Call { callee, .. }) = graph.insts[inst].op else {
                 continue;
             };
-            let Some(Op::Get(object, property)) = graph.defining_op(callee) else {
+            let Some(Op::Javascript(JsOp::Get(object, property))) = graph.defining_op(callee)
+            else {
                 continue;
             };
-            let Some(Op::GlobalRead(global)) = graph.defining_op(*object) else {
+            let Some(Op::Javascript(JsOp::GlobalRead(global))) = graph.defining_op(*object) else {
                 continue;
             };
             if let Some(native) = Native::lookup(global, property) {

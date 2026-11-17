@@ -1,4 +1,5 @@
 use super::super::effects::Locations;
+use crate::jit::semantic::JsOp;
 use crate::{FxHashMap, FxHashSet};
 
 use cranelift_codegen::entity::SecondaryMap;
@@ -21,17 +22,19 @@ pub(in crate::jit) fn receiver(op: &Op) -> Option<Value> {
             args,
             ..
         } => args.first().copied(),
-        Op::Get(object, _)
-        | Op::PropertyLoad(object, ..)
-        | Op::RelatedPropertyLoad(object, ..)
-        | Op::CachedProperty(object, _, _)
-        | Op::ShapedGet(object, ..)
-        | Op::LayoutGet(object, ..)
-        | Op::ProbeProperty(object, _)
-        | Op::ProbeShapeProperty(object, ..)
-        | Op::GetIndex(object, _)
-        | Op::ArrayGet(object, _)
-        | Op::ArrayLoad(object, _, _) => Some(*object),
+        Op::Javascript(
+            JsOp::Get(object, _)
+            | JsOp::PropertyLoad(object, ..)
+            | JsOp::RelatedPropertyLoad(object, ..)
+            | JsOp::CachedProperty(object, _, _)
+            | JsOp::ShapedGet(object, ..)
+            | JsOp::LayoutGet(object, ..)
+            | JsOp::ProbeProperty(object, _)
+            | JsOp::ProbeShapeProperty(object, ..)
+            | JsOp::GetIndex(object, _)
+            | JsOp::ArrayGet(object, _)
+            | JsOp::ArrayLoad(object, _, _),
+        ) => Some(*object),
         _ => None,
     }
 }
@@ -44,21 +47,22 @@ fn anchored_read(op: &Op, facts: &Facts) -> Option<BorrowedRead> {
     let receiver = receiver(op)?;
     if matches!(
         op,
-        Op::ArrayGet(..)
-            | Op::ArrayLoad(..)
-            | Op::ProbeProperty(..)
-            | Op::ProbeShapeProperty(..)
-            | Op::PropertyLoad(..)
-            | Op::RelatedPropertyLoad(..)
-            | Op::LayoutGet(..)
-            | Op::CachedProperty(..)
-            | Op::ShapedGet(..)
-            | Op::HelperCall {
-                helper: crate::jit::helpers::Helper::PropertyGetCached
-                    | crate::jit::helpers::Helper::PropertyGetMegamorphic
-                    | crate::jit::helpers::Helper::SemanticPropertyProbeCached,
-                ..
-            }
+        Op::Javascript(
+            JsOp::ArrayGet(..)
+                | JsOp::ArrayLoad(..)
+                | JsOp::ProbeProperty(..)
+                | JsOp::ProbeShapeProperty(..)
+                | JsOp::PropertyLoad(..)
+                | JsOp::RelatedPropertyLoad(..)
+                | JsOp::LayoutGet(..)
+                | JsOp::CachedProperty(..)
+                | JsOp::ShapedGet(..)
+        ) | Op::HelperCall {
+            helper: crate::jit::helpers::Helper::PropertyGetCached
+                | crate::jit::helpers::Helper::PropertyGetMegamorphic
+                | crate::jit::helpers::Helper::SemanticPropertyProbeCached,
+            ..
+        }
     ) || facts.of(receiver).within(ValueType::OBJECT)
     {
         return Some(BorrowedRead { receiver });
@@ -169,17 +173,19 @@ fn closure(dependencies: &FxHashMap<Value, Vec<Value>>, value: Value) -> Vec<Val
 fn stores(op: &Op) -> bool {
     matches!(
         op,
-        Op::Set(..)
-            | Op::ShapedSet(..)
-            | Op::ArrayStore(..)
-            | Op::PropertyStore(..)
-            | Op::PropertyAdd(..)
-            | Op::FillPropertyStore(..)
-            | Op::SetIndex(..)
-            | Op::Define(..)
-            | Op::ArrayAppend(..)
-            | Op::Initialize(..)
-            | Op::Write(..)
+        Op::Javascript(
+            JsOp::Set(..)
+                | JsOp::ShapedSet(..)
+                | JsOp::ArrayStore(..)
+                | JsOp::PropertyStore(..)
+                | JsOp::PropertyAdd(..)
+                | JsOp::FillPropertyStore(..)
+                | JsOp::SetIndex(..)
+                | JsOp::Define(..)
+                | JsOp::ArrayAppend(..)
+                | JsOp::Initialize(..)
+                | JsOp::Write(..)
+        )
     )
 }
 
@@ -302,7 +308,7 @@ pub(super) fn borrows(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>)
     for block in graph.blocks.values() {
         for &inst in &block.insts {
             let data = &graph.insts[inst];
-            if let (Op::ProbeGlobal(_), Some(value)) = (&data.op, data.result()) {
+            if let (Op::Javascript(JsOp::ProbeGlobal(_)), Some(value)) = (&data.op, data.result()) {
                 chains.insert(value, Vec::new());
                 objects.insert(value);
             }

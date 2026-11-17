@@ -1,5 +1,6 @@
 use crate::FxHashSet;
 use crate::jit::profile::{ReadKind, ReadType, Site};
+use crate::jit::semantic::JsOp;
 use crate::regex::PatternRef;
 
 use super::super::specialization::calls::Repository;
@@ -29,16 +30,16 @@ pub(in crate::jit::semantic) fn expand(
                 continue;
             }
             let data = &graph.insts[inst];
-            let Op::Call {
+            let Op::Javascript(JsOp::Call {
                 callee,
                 receiver: Some(receiver),
                 args,
                 target: None,
-            } = &data.op
+            }) = &data.op
             else {
                 continue;
             };
-            let Some(Op::Get(object, name)) = graph.defining_op(*callee) else {
+            let Some(Op::Javascript(JsOp::Get(object, name))) = graph.defining_op(*callee) else {
                 continue;
             };
             let method = match name.as_str() {
@@ -90,11 +91,11 @@ fn expand_site(
     drop_unused: bool,
 ) {
     let call = graph.insts[inst].clone();
-    let Op::Call {
+    let Op::Javascript(JsOp::Call {
         receiver: Some(receiver),
         ref args,
         ..
-    } = call.op
+    }) = call.op
     else {
         unreachable!()
     };
@@ -128,7 +129,7 @@ fn expand_site(
         block,
         TerminatorKind::Branch(is_pattern, Target::new(string), Target::new(fallback)),
     );
-    let is_string = append(graph, string, Op::IsString(subject));
+    let is_string = append(graph, string, Op::Javascript(JsOp::IsString(subject)));
     terminate(
         graph,
         string,
@@ -136,7 +137,7 @@ fn expand_site(
     );
     let op = match method {
         Method::Test => Op::Regex(regex::Op::Test(subject, pattern)),
-        Method::Exec if drop_unused => Op::Constant(Constant::Null),
+        Method::Exec if drop_unused => Op::Javascript(JsOp::Constant(Constant::Null)),
         Method::Exec => Op::Regex(regex::Op::Exec(receiver, subject, pattern)),
     };
     let result = append(graph, fast, op);

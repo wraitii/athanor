@@ -1,10 +1,9 @@
 use crate::jit::helpers::Helper;
+use crate::jit::semantic::JsOp;
 use smallvec::{SmallVec, smallvec};
 
-use super::repr::{FloatWidth, IntegerWidth, element};
-use super::{
-    Constant, Facts, Graph, Inst, MemoryFormat, MemoryOp, Op, Ownership, Repr, TypedRead, Value,
-};
+use super::repr::{FloatWidth, IntegerWidth};
+use super::{Facts, Graph, Inst, MemoryOp, Op, Ownership, Repr};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(in crate::jit) enum Use {
@@ -15,26 +14,6 @@ pub(in crate::jit) enum Use {
 pub(in crate::jit) struct Representations {
     pub(in crate::jit) uses: SmallVec<[Use; 4]>,
     pub(in crate::jit) produces: Option<Repr>,
-}
-
-fn integer(repr: Repr) -> bool {
-    matches!(repr, Repr::Integer(_))
-}
-
-fn view_object(graph: &Graph, inst: Inst) -> Use {
-    if graph.views.contains_key(&inst) {
-        Use::Any
-    } else {
-        Use::Exact(Repr::Boxed)
-    }
-}
-
-fn position(graph: &Graph, value: Value) -> Use {
-    if integer(graph.repr(value)) {
-        Use::Exact(Repr::I64)
-    } else {
-        Use::Exact(Repr::F64)
-    }
 }
 
 fn specific(graph: &Graph, inst: Inst) -> Option<Representations> {
@@ -49,6 +28,7 @@ fn specific(graph: &Graph, inst: Inst) -> Option<Representations> {
         produces,
     };
     Some(match &data.op {
+        Op::Javascript(op) => return Some(super::js::contracts::representations(graph, inst, op)),
         Op::Aarch64(op) => any(op.operands().count(), target),
         Op::HelperCall { uses, produces, .. } => Representations {
             uses: uses.iter().copied().map(Use::Exact).collect(),
@@ -76,9 +56,6 @@ fn specific(graph: &Graph, inst: Inst) -> Option<Representations> {
                 uses,
                 produces: data.results.first().map(|&value| graph.repr(value)),
             }
-        }
-        Op::PropertyLoad(..) | Op::RelatedPropertyLoad(..) => {
-            exact(&[Repr::Boxed, Repr::Word], Repr::Boxed)
         }
         Op::LowLevel(super::low_level::Op::Load { ty, .. }) => {
             any(1, Some(Repr::from_machine(*ty)))
@@ -123,35 +100,10 @@ fn specific(graph: &Graph, inst: Inst) -> Option<Representations> {
         Op::Convert(_, repr) | Op::Unbox(_, repr) => any(1, Some(*repr)),
         Op::Box(_) | Op::AsBoxed(_) => any(1, Some(Repr::Boxed)),
         Op::AsWord(_) => exact(&[Repr::Boxed], Repr::Word),
-        Op::Constant(Constant::Number(_)) => match target {
-            Some(repr @ (Repr::Float(_) | Repr::Integer(_))) => any(0, Some(repr)),
-            _ => return None,
-        },
-        Op::Constant(Constant::Boolean(_)) if target == Some(Repr::Boolean) => {
-            any(0, Some(Repr::Boolean))
-        }
-        Op::TypedData(_) => any(1, Some(Repr::Word)),
         Op::Memory(MemoryOp::Address { .. }) => any(2, Some(Repr::Word)),
         Op::Memory(MemoryOp::Load { format, .. }) => any(1, Some(format.repr())),
         Op::Memory(MemoryOp::IndexedLoad { format, .. }) => any(2, Some(format.repr())),
-        Op::MemoryNumber(_, format) => any(
-            1,
-            Some(match format {
-                MemoryFormat::U32 | MemoryFormat::F32 | MemoryFormat::F64 => Repr::F64,
-                _ => Repr::I32,
-            }),
-        ),
         Op::KeepAlive(_) => any(1, None),
-        Op::PropertyCache(..) | Op::GlobalCache(..) => any(0, Some(Repr::Word)),
-        Op::CanOverwrite(..) => exact(&[Repr::Boxed, Repr::I64], Repr::Boolean),
-        Op::ArrayStore(..) | Op::PropertyStore(..) | Op::PropertyAdd(..) => Representations {
-            uses: smallvec![
-                Use::Exact(Repr::Boxed),
-                Use::Exact(Repr::I64),
-                Use::Exact(Repr::Boxed),
-            ],
-            produces: None,
-        },
         Op::LowLevel(super::low_level::Op::Store { .. }) => any(2, None),
         Op::LowLevel(super::low_level::Op::ExtractBits { value, .. }) => {
             any(1, Some(graph.repr(*value)))
@@ -175,72 +127,9 @@ fn specific(graph: &Graph, inst: Inst) -> Option<Representations> {
                 _ => Repr::numeric(*ty),
             }),
         },
-        Op::NumericFloat(_) => exact(&[Repr::F64], Repr::F64),
-        Op::SaturatingInteger(_) | Op::AsInteger(_) => exact(&[Repr::I64], Repr::I64),
-        Op::IntegerCheck(..) => Representations {
-            uses: smallvec![Use::Exact(Repr::Boxed), Use::Any, Use::Any],
-            produces: Some(Repr::Boolean),
-        },
-        Op::IsInteger(_) => exact(&[Repr::Boxed], Repr::Boolean),
-        Op::ToInt32(_) => exact(&[Repr::I32], Repr::I32),
-        Op::AsNumber(_) => any(1, target),
-        Op::IsCode(..) | Op::IsShape(..) | Op::IsReadLayout(..) | Op::IsTyped(..) => {
+        Op::Regex(super::regex::Op::IsPattern(..) | super::regex::Op::Test(..)) => {
             exact(&[Repr::Boxed], Repr::Boolean)
         }
-        Op::IsPropertyCached(..) => exact(&[Repr::Boxed, Repr::Word], Repr::Boolean),
-        Op::CachedProperty(..) | Op::FillPropertyCache(..) => {
-            exact(&[Repr::Boxed, Repr::Word], Repr::Boxed)
-        }
-        Op::PrimePropertyCache(..) => Representations {
-            uses: smallvec![Use::Exact(Repr::Boxed), Use::Exact(Repr::Word)],
-            produces: None,
-        },
-        Op::IsIndexed(_)
-        | Op::IsOrdinaryArray(_)
-        | Op::IsString(_)
-        | Op::Truthy(_)
-        | Op::Regex(super::regex::Op::IsPattern(..) | super::regex::Op::Test(..)) => {
-            exact(&[Repr::Boxed], Repr::Boolean)
-        }
-        Op::IsNumber(_) | Op::IsUninitialized(_) | Op::IsUndefined(_) | Op::IsNullish(_) => {
-            any(1, Some(Repr::Boolean))
-        }
-        Op::ArrayPosition(_) => exact(&[Repr::I64], Repr::I64),
-        Op::ArrayKind(_) => Representations {
-            uses: smallvec![view_object(graph, inst)],
-            produces: Some(Repr::I32),
-        },
-        Op::IsArray(..) => Representations {
-            uses: smallvec![view_object(graph, inst)],
-            produces: Some(Repr::Boolean),
-        },
-        Op::ArrayLoad(..) => Representations {
-            uses: smallvec![view_object(graph, inst), Use::Exact(Repr::I64)],
-            produces: Some(Repr::Boxed),
-        },
-        Op::IndexedLength(_) => Representations {
-            uses: smallvec![view_object(graph, inst)],
-            produces: Some(if target == Some(Repr::I64) {
-                Repr::I64
-            } else {
-                Repr::F64
-            }),
-        },
-        Op::TypedIndex(
-            _,
-            index,
-            TypedRead {
-                element: Some(kind),
-                bounded,
-            },
-        ) => Representations {
-            uses: smallvec![view_object(graph, inst), position(graph, *index)],
-            produces: Some(if *bounded {
-                element(*kind)
-            } else {
-                Repr::Boxed
-            }),
-        },
         _ => return None,
     })
 }
@@ -254,11 +143,6 @@ fn generic(graph: &Graph, inst: Inst) -> Representations {
         | Op::Assume(..)
         | Op::ContinuationOutput(..)
         | Op::LowLevel(_) => smallvec![Use::Any; count],
-        Op::MapElement(..) => smallvec![Use::Exact(Repr::Boxed), Use::Exact(Repr::I64)],
-        Op::GuardedCompare { numbers, .. } => [Use::Exact(Repr::Boxed); 2]
-            .into_iter()
-            .chain(numbers.iter().map(|_| Use::Exact(Repr::Boolean)))
-            .collect(),
         _ => smallvec![Use::Exact(Repr::Boxed); count],
     };
     let produces = match &data.op {
@@ -341,10 +225,10 @@ pub(in crate::jit) enum ResultReference {
 pub(super) fn fresh_reference(op: &Op) -> bool {
     matches!(
         op,
-        Op::Call {
+        Op::Javascript(JsOp::Call {
             target: Some(_),
             ..
-        } | Op::HelperCall {
+        }) | Op::HelperCall {
             helper: Helper::ArrayMapNew
                 | Helper::ObjectNew
                 | Helper::ArrayNew
@@ -363,7 +247,8 @@ pub(in crate::jit) fn result_reference(
     slot: bool,
 ) -> ResultReference {
     let op = &graph.insts[inst].op;
-    let allocation = fresh_reference(op) || matches!(op, Op::StringSplitParts(..));
+    let allocation =
+        fresh_reference(op) || matches!(op, Op::Javascript(JsOp::StringSplitParts(..)));
     match graph.contract(op, facts).result {
         Ownership::Owned if allocation && slot => ResultReference::Slot,
         Ownership::Owned if allocation => ResultReference::Managed,

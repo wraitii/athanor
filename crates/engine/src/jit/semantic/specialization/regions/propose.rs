@@ -3,6 +3,7 @@ use super::super::calls::ConditionalPlan;
 use super::*;
 use crate::FxHashSet;
 use crate::jit::profile::{ReadKind, ReadType};
+use crate::jit::semantic::JsOp;
 
 fn numeric_demand(graph: &Graph, cfg: &Cfg, native_calls: &FxHashSet<Inst>) -> FxHashSet<Value> {
     let mut pending = Vec::new();
@@ -13,7 +14,7 @@ fn numeric_demand(graph: &Graph, cfg: &Cfg, native_calls: &FxHashSet<Inst>) -> F
                 if matches!(graph.values[value], ValueDef::Param(..))
                     && (numeric_use(op, index)
                         || native_calls.contains(&inst)
-                            && matches!(op, Op::Call { args, .. } if args.contains(&value)))
+                            && matches!(op, Op::Javascript(JsOp::Call { args, .. }) if args.contains(&value)))
                 {
                     pending.push(value);
                 }
@@ -76,11 +77,14 @@ pub(in crate::jit::semantic) fn numbers(graph: &mut Graph) -> Vec<(Value, Fact)>
                 if hints.get(&value) == Some(&ReadType::Unknown)
                     || !(numeric_use(op, index)
                         || native_calls.contains(&inst)
-                            && matches!(op, Op::Call { args, .. } if args.contains(&value))
+                            && matches!(op, Op::Javascript(JsOp::Call { args, .. }) if args.contains(&value))
                         || observed)
                     || !facts.of(value).intersects(desired)
                     || facts.of(value).within(desired)
-                    || matches!(graph.defining_op(value), Some(Op::Constant(_)))
+                    || matches!(
+                        graph.defining_op(value),
+                        Some(Op::Javascript(JsOp::Constant(_)))
+                    )
                 {
                     continue;
                 }
@@ -149,7 +153,8 @@ pub(in crate::jit::semantic) fn typed(graph: &mut Graph, numbers: &[(Value, Fact
     let mut objects = FxHashSet::default();
     for &block in &cfg.rpo {
         for &inst in &graph.blocks[block].insts {
-            if let Op::GetIndex(object, key) | Op::TypedIndex(object, key, _) = graph.insts[inst].op
+            if let Op::Javascript(JsOp::GetIndex(object, key) | JsOp::TypedIndex(object, key, _)) =
+                graph.insts[inst].op
                 && under.of(key).within(NUMERIC)
                 && let Some(element) = element_guess(graph, object)
             {
@@ -203,7 +208,8 @@ pub(super) fn identities(graph: &mut Graph, conditional: &ConditionalPlan) -> Ve
     let span = graph.span;
     let mut added = Vec::new();
     for (block, name, code) in proposals {
-        let (probe_inst, probe) = graph.append(block, span, Op::ProbeGlobal(name), true);
+        let (probe_inst, probe) =
+            graph.append(block, span, Op::Javascript(JsOp::ProbeGlobal(name)), true);
         let origin = Origin {
             site: None,
             kind: Kind::Identity,

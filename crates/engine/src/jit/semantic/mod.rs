@@ -1,4 +1,3 @@
-use crate::jit::layout::ReadLayout;
 mod available;
 pub(in crate::jit) mod bits;
 mod borrow;
@@ -45,21 +44,18 @@ pub(super) use pipeline::{
 use pipeline::{analyze, lower_planned, optimize_canonical, plan_specialization};
 
 use crate::{FxHashMap, FxHashSet};
-use std::fmt;
 
 use cranelift_codegen::entity::{EntityRef, PrimaryMap, SecondaryMap};
 use oxc_span::Span;
-use oxc_syntax::operator::BinaryOperator;
 
-use super::effects::{
-    ALLOCATION, CODE_READ, CODE_WRITE, Control, ERROR, Effects, GLOBAL_READ, GLOBAL_WRITE,
-    HEAP_READ, HEAP_WRITE, INTERNAL, Memory,
-};
-use super::math::METHODS;
-use crate::heap::TypedKind;
+use super::effects::{Control, Effects, HEAP_READ, HEAP_WRITE, INTERNAL, Memory};
 
 pub(in crate::jit) use facts::{Facts, Identity, ValueType};
 pub(super) use ids::{Binding, Block, Inst, RegionId, Scope, Value};
+pub(in crate::jit) use js::{
+    ArrayLayout, ArrayMethod, Constant, DirectTarget, Native, Op as JsOp, PropertyWrite, TypedRead,
+    UnaryOp,
+};
 pub(in crate::jit) use listing::ListingLine;
 #[cfg(test)]
 pub(in crate::jit) use listing::SourceLocation;
@@ -219,87 +215,6 @@ pub(super) enum ScopeKind {
     Loop,
 }
 
-#[derive(Clone, Debug)]
-pub(super) enum Constant {
-    Undefined,
-    Null,
-    Boolean(bool),
-    Number(f64),
-    String(String),
-    Uninitialized,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum UnaryOp {
-    Negate,
-    Plus,
-    Not,
-    BitwiseNot,
-    Typeof,
-    Increment,
-    Decrement,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(super) struct Native(usize);
-
-impl Native {
-    pub(in crate::jit) fn index(self) -> usize {
-        self.0
-    }
-
-    pub(super) fn lookup(global: &str, property: &str) -> Option<Self> {
-        if global != "Math" {
-            return None;
-        }
-        METHODS
-            .iter()
-            .position(|(name, _)| *name == property)
-            .map(Self)
-    }
-}
-
-impl fmt::Display for Native {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Math.{}", METHODS[self.0].0)
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum ArrayMethod {
-    Map,
-    Some,
-    Every,
-    Filter,
-    ForEach,
-    Find,
-    Push,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::jit) struct DirectTarget {
-    pub(in crate::jit) variant: crate::jit::entries::VariantId,
-    pub(in crate::jit) code: cranelift_module::FuncId,
-    pub(in crate::jit) arity: u16,
-    pub(in crate::jit) lexical_this: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(in crate::jit) enum ArrayLayout {
-    Packed,
-    Holey,
-}
-
-impl ArrayLayout {
-    pub(in crate::jit) fn kind(self) -> u32 {
-        crate::heap::kind::ARRAY
-            | match self {
-                Self::Packed => 0,
-                Self::Holey => crate::heap::kind::HOLEY,
-            }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(in crate::jit) enum MemoryFormat {
     U8,
@@ -341,14 +256,9 @@ pub(in crate::jit) enum MemoryOp {
     },
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(super) enum PropertyWrite {
-    Set,
-    Define,
-}
-
 #[derive(Clone, Debug)]
 pub(super) enum Op {
+    Javascript(js::Op),
     LowLevel(low_level::Op),
     Regex(regex::Op),
     Aarch64(crate::jit::aarch64::inst::Op),
@@ -368,115 +278,9 @@ pub(super) enum Op {
     ContinuationStore(Vec<Value>),
     Argument(usize),
     Restored(usize),
-    Arguments,
     ArgumentCount,
-    Rest(usize),
-    This,
-    Callee,
-    ClosureThis(Value),
-    Throw(Value),
-    Catch,
-    Closure(
-        Span,
-        cranelift_module::FuncId,
-        bool,
-        bool,
-        bool,
-        Vec<Binding>,
-        Option<Value>,
-    ),
-    ClosureCells(
-        Span,
-        cranelift_module::FuncId,
-        bool,
-        bool,
-        bool,
-        Vec<Value>,
-        Option<Value>,
-    ),
-    CellNew(Value),
-    CellGet(Value),
-    CellSet(Value, Value),
-    CaptureGet(Value, usize),
-    Constant(Constant),
-    GlobalRead(String),
-    GlobalReadOptional(String),
-    RegExp(String, u8),
-    PropertyKey(Value),
-    GlobalWrite(String, Value),
-    GlobalInitialize(String, Value),
-    Read(Binding),
-    BindingLoad(Binding),
-    BindingRestore(Binding, Value),
-    Initialize(Binding, Value),
-    Write(Binding, Value),
-    CheckInitialized(Value),
-    NewObject,
-    NewArray(Vec<Value>),
-    NewHoleyArray(Value),
-    MapElement(Value, Value),
-    IsArrayIteration(Value, Value, ArrayMethod),
-    ArrayAppend(Value, Value, bool),
-    NewPack,
-    Spread(Value),
-    PackRelease(Value),
-    PackAppend(Value, Value, bool),
-    CallPack(Value, Value, Value),
-    // Borrows the current frame's original arguments, which inlining substitutes.
-    CallForward(Value, Value),
-    ConstructPack(Value, Value),
-    // UNINITIALIZED leaves native constructors and lazy prototypes to generic construction.
-    ConstructorPrototype(Value),
-    ConstructPackResolved(Value, Value, Value),
-    ConstructResolved {
-        callee: Value,
-        prototype: Value,
-        args: Vec<Value>,
-    },
-    NewInstance(Value),
-    ConstructorResult(Value, Value),
-    // Calls a validated constructor with its allocated receiver; class constructors are allowed.
-    ConstructorCall {
-        callee: Value,
-        receiver: Value,
-        args: Vec<Value>,
-    },
-    ConstructorCallPack(Value, Value, Value),
-    IteratorNew(Value),
-    IteratorNext(Value),
-    IsIndexed(Value),
-    IsOrdinaryArray(Value),
-    // Saturating numeric conversion; validity is checked separately by IsArrayIndex or IsExactPosition.
-    ArrayPosition(Value),
-    // Compare a numeric key with its integer position converted back to a number.
-    IsExactPosition(Value, Value),
-    // Compare integer position and length as unsigned values.
-    IsInBounds(Value, Value),
-    IsArrayIndex(Value, Value, Value, ArrayLayout),
-    IsArray(Value, ArrayLayout),
     // Non-short-circuit conjunction of boolean operands.
     BooleanAnd(Value, Value),
-    // Requires matching layout, exact position and bounds checks with no intervening array mutation.
-    // The array holds the borrowed result; holes produce undefined.
-    ArrayLoad(Value, Value, ArrayLayout),
-    IndexedLength(Value),
-    ArrayKind(Value),
-    // Array or typed-array receiver; retains generic key and bounds handling.
-    ArrayGet(Value, Value),
-    // Extracted values stay rooted independently of the pack across argument initialization.
-    PackTake(Value, Value),
-    EnumerateNew(Value),
-    EnumerateNext(Value),
-    IsUninitialized(Value),
-    Define(Value, String, Value),
-    DefineHidden(Value, String, Value),
-    MarkClass(Value),
-    DisableConstructor(Value),
-    Get(Value, String),
-    PropertyCache(Inst, String),
-    GlobalCache(String),
-    PropertyLoad(Value, Value, js::memory::Field),
-    RelatedPropertyLoad(Value, Value, js::memory::Field),
     HelperCall {
         helper: super::helpers::Helper,
         args: Vec<Value>,
@@ -485,80 +289,8 @@ pub(super) enum Op {
         result_type: ValueType,
         effects: Effects,
     },
-    IsPropertyCached(Value, Value, bool),
-    CachedProperty(Value, Value, bool),
-    IsShape(Value, u32),
-    IsReadLayout(Value, crate::jit::layout::LayoutGuard),
-    LayoutGet(Value, String, ReadLayout),
-    ShapedGet(Value, String, u32),
-    ShapedSet(Value, String, u32, Value),
-    FillPropertyCache(Value, Value, String),
-    PrimePropertyCache(Value, Value),
-    GetIndex(Value, Value),
-    Delete(Value, Value),
-    Set(Value, String, Value),
-    SetIndex(Value, Value, Value),
-    // Bounded packed-array replacement; storage retains the incoming value before releasing the old one.
-    ArrayStore(Value, Value, Value),
-    PropertyStore(Value, Value, Value, js::memory::Field, PropertyWrite),
-    PropertyAdd(Value, Value, Value, PropertyWrite),
-    // Native slot replacement must go through the runtime setter.
-    CanOverwrite(Value, Value, js::memory::Field),
-    FillPropertyStore(Value, Value, String, Value, PropertyWrite),
-    ToNumeric(Value),
-    // Pure integer coercion of a value proven to be a number or undefined.
-    ToInt32(Value),
-    Unary(UnaryOp, Value),
-    Binary(BinaryOperator, Value, Value),
-    StringConcat(Vec<Value>),
-    GuardedCompare {
-        operator: BinaryOperator,
-        left: Value,
-        right: Value,
-        numbers: [Value; 2],
-    },
-    Call {
-        callee: Value,
-        receiver: Option<Value>,
-        args: Vec<Value>,
-        target: Option<DirectTarget>,
-    },
-    Construct {
-        callee: Value,
-        args: Vec<Value>,
-    },
-    CallNative(Native, Vec<Value>),
-    IsUndefined(Value),
-    IsNullish(Value),
-    ProbeGlobal(String),
-    ProbeProperty(Value, String),
-    ProbeShapeProperty(Value, String, ReadLayout),
-    ProbeIndex(Value, Value),
-    IsNative(Value, Native),
-    IsCode(Value, cranelift_module::FuncId),
-    GuardValid(usize),
-    GuardCommit(usize),
-    View(Value),
-    IsTyped(Value, Option<TypedKind>),
-    TypedIndex(Value, Value, TypedRead),
-    TypedData(Value),
     Memory(MemoryOp),
-    MemoryNumber(Value, MemoryFormat),
     KeepAlive(Value),
-    IsNumber(Value),
-    IsInteger(Value),
-    AsInteger(Value),
-    NumericFloat(Value),
-    SaturatingInteger(Value),
-    IntegerCheck(Value, Value, Value),
-    IsString(Value),
-    Truthy(Value),
-    IsStringSplit(Value),
-    StringSplit(Value, Vec<Value>),
-    StringSplitParts(Value, Vec<Value>),
-    IsTypeof(Value, u8),
-    AsNumber(Value),
-    AsString(Value),
     Convert(Value, Repr),
     Box(Value),
     AsBoxed(Value),
@@ -569,12 +301,6 @@ pub(super) enum Op {
     SlotStore(Value),
     SlotClear(Value),
     ParamStore(Value, Value),
-    AsObject(Value),
-    EnterScope(Scope),
-    EnterCaptures(Scope, Value),
-    LeaveScope(Scope),
-    NextIteration(Scope),
-    FreshIteration(Scope),
 }
 
 #[derive(Clone)]
@@ -708,6 +434,7 @@ impl Op {
 
     pub(super) fn operands_iter(&self) -> Operands<'_> {
         let (fixed, rest): ([Option<Value>; 3], &[Value]) = match self {
+            Op::Javascript(op) => return op.operands_iter(),
             Op::Aarch64(op) => return op.operands(),
             Op::Regex(op) => return op.operands(),
             Op::LowLevel(op) => return op.operands(),
@@ -724,99 +451,9 @@ impl Op {
                 _,
             ) => ([Some(*value), Some(*cache), None], &[]),
             Op::Assume(value, ..) => ([Some(*value), None, None], &[]),
-            Op::PropertyCache(..)
-            | Op::GlobalCache(..)
-            | Op::Argument(_)
-            | Op::Restored(_)
-            | Op::Arguments
-            | Op::ArgumentCount
-            | Op::Rest(_)
-            | Op::This
-            | Op::Callee
-            | Op::Catch
-            | Op::Constant(_)
-            | Op::GlobalRead(_)
-            | Op::GlobalReadOptional(_)
-            | Op::RegExp(_, _)
-            | Op::Read(_)
-            | Op::BindingLoad(_)
-            | Op::NewPack
-            | Op::NewObject
-            | Op::ProbeGlobal(_)
-            | Op::GuardValid(_)
-            | Op::GuardCommit(_)
-            | Op::EnterScope(_)
-            | Op::LeaveScope(_)
-            | Op::NextIteration(_)
-            | Op::FreshIteration(_) => ([None; 3], &[]),
-            Op::Closure(_, _, _, _, _, _, receiver) => ([*receiver, None, None], &[]),
-            Op::ClosureCells(_, _, _, _, _, cells, receiver) => {
-                ([*receiver, None, None], cells.as_slice())
-            }
-            Op::CellSet(cell, value) => ([Some(*cell), Some(*value), None], &[]),
-            Op::CellNew(value) | Op::CellGet(value) | Op::CaptureGet(value, _) => {
-                ([Some(*value), None, None], &[])
-            }
-            Op::ClosureThis(value)
-            | Op::NewHoleyArray(value)
-            | Op::EnterCaptures(_, value)
-            | Op::Throw(value)
-            | Op::GlobalInitialize(_, value)
-            | Op::GlobalWrite(_, value)
-            | Op::Initialize(_, value)
-            | Op::BindingRestore(_, value)
-            | Op::Write(_, value)
-            | Op::CheckInitialized(value)
-            | Op::PackRelease(value)
-            | Op::Spread(value)
-            | Op::IteratorNew(value)
-            | Op::IteratorNext(value)
-            | Op::IsIndexed(value)
-            | Op::IsOrdinaryArray(value)
-            | Op::ArrayKind(value)
-            | Op::IndexedLength(value)
-            | Op::EnumerateNew(value)
-            | Op::EnumerateNext(value)
-            | Op::IsUninitialized(value)
-            | Op::Get(value, _)
-            | Op::IsShape(value, _)
-            | Op::IsReadLayout(value, _)
-            | Op::LayoutGet(value, _, _)
-            | Op::ShapedGet(value, _, _)
-            | Op::MarkClass(value)
-            | Op::DisableConstructor(value)
-            | Op::PropertyKey(value)
-            | Op::ToNumeric(value)
-            | Op::ToInt32(value)
-            | Op::ArrayPosition(value)
-            | Op::Unary(_, value)
-            | Op::IsUndefined(value)
-            | Op::IsNullish(value)
-            | Op::ProbeProperty(value, _)
-            | Op::ProbeShapeProperty(value, _, _)
-            | Op::IsNative(value, _)
-            | Op::NewInstance(value)
-            | Op::ConstructorPrototype(value)
-            | Op::IsCode(value, _)
-            | Op::View(value)
-            | Op::TypedData(value)
-            | Op::MemoryNumber(value, _)
-            | Op::KeepAlive(value)
+            Op::Argument(_) | Op::Restored(_) | Op::ArgumentCount => ([None; 3], &[]),
+            Op::KeepAlive(value)
             | Op::Memory(MemoryOp::Load { address: value, .. })
-            | Op::IsArray(value, _)
-            | Op::IsTyped(value, _)
-            | Op::IsNumber(value)
-            | Op::IsInteger(value)
-            | Op::AsInteger(value)
-            | Op::NumericFloat(value)
-            | Op::SaturatingInteger(value)
-            | Op::IsString(value)
-            | Op::Truthy(value)
-            | Op::IsStringSplit(value)
-            | Op::IsTypeof(value, _)
-            | Op::AsString(value)
-            | Op::AsObject(value)
-            | Op::AsNumber(value)
             | Op::Convert(value, _)
             | Op::Box(value)
             | Op::AsBoxed(value)
@@ -827,16 +464,6 @@ impl Op {
             | Op::SlotStore(value)
             | Op::SlotClear(value)
             | Op::ParamStore(_, value) => ([Some(*value), None, None], &[]),
-            Op::PropertyLoad(object, cache, _)
-            | Op::RelatedPropertyLoad(object, cache, _)
-            | Op::IsPropertyCached(object, cache, _)
-            | Op::CachedProperty(object, cache, _)
-            | Op::FillPropertyCache(object, cache, _)
-            | Op::PrimePropertyCache(object, cache) => ([Some(*object), Some(*cache), None], &[]),
-            Op::Define(object, _, value)
-            | Op::DefineHidden(object, _, value)
-            | Op::ShapedSet(object, _, _, value)
-            | Op::Set(object, _, value) => ([Some(*object), Some(*value), None], &[]),
             Op::Memory(MemoryOp::IndexedLoad {
                 base: object,
                 index: key,
@@ -847,69 +474,8 @@ impl Op {
                 index: key,
                 ..
             })
-            | Op::MapElement(object, key)
-            | Op::IsArrayIteration(object, key, _)
-            | Op::CanOverwrite(object, key, _)
-            | Op::Delete(object, key)
-            | Op::GetIndex(object, key)
-            | Op::TypedIndex(object, key, _)
-            | Op::ArrayGet(object, key)
-            | Op::ArrayLoad(object, key, _)
-            | Op::PackTake(object, key)
-            | Op::ProbeIndex(object, key)
-            | Op::IsExactPosition(object, key)
-            | Op::IsInBounds(object, key)
-            | Op::BooleanAnd(object, key)
-            | Op::Binary(_, object, key)
-            | Op::PackAppend(object, key, _)
-            | Op::ArrayAppend(object, key, _)
-            | Op::ConstructorResult(object, key)
-            | Op::ConstructPack(object, key) => ([Some(*object), Some(*key), None], &[]),
-            Op::CallForward(callee, receiver) => ([Some(*callee), Some(*receiver), None], &[]),
-            Op::IntegerCheck(object, key, position)
-            | Op::IsArrayIndex(object, key, position, _) => {
-                ([Some(*object), Some(*key), Some(*position)], &[])
-            }
-            Op::CallPack(callee, receiver, args)
-            | Op::ConstructorCallPack(callee, receiver, args)
-            | Op::ConstructPackResolved(callee, receiver, args) => {
-                ([Some(*callee), Some(*receiver), Some(*args)], &[])
-            }
-            Op::ConstructorCall {
-                callee,
-                receiver,
-                args,
-            } => ([Some(*callee), Some(*receiver), None], args),
-            Op::ConstructResolved {
-                callee,
-                prototype,
-                args,
-            } => ([Some(*callee), Some(*prototype), None], args),
-            Op::GuardedCompare {
-                left,
-                right,
-                numbers,
-                ..
-            } => ([Some(*left), Some(*right), None], numbers),
-            Op::ArrayStore(object, key, value)
-            | Op::PropertyStore(object, key, value, _, _)
-            | Op::PropertyAdd(object, key, value, _)
-            | Op::FillPropertyStore(object, key, _, value, _)
-            | Op::SetIndex(object, key, value) => ([Some(*object), Some(*key), Some(*value)], &[]),
-            Op::HelperCall { args: values, .. }
-            | Op::StringConcat(values)
-            | Op::NewArray(values)
-            | Op::CallNative(_, values) => ([None; 3], values),
-            Op::StringSplit(receiver, args) | Op::StringSplitParts(receiver, args) => {
-                ([Some(*receiver), None, None], args)
-            }
-            Op::Construct { callee, args } => ([Some(*callee), None, None], args),
-            Op::Call {
-                callee,
-                receiver,
-                args,
-                ..
-            } => ([Some(*callee), *receiver, None], args),
+            | Op::BooleanAnd(object, key) => ([Some(*object), Some(*key), None], &[]),
+            Op::HelperCall { args: values, .. } => ([None; 3], values),
         };
         let [a, b, c] = fixed;
         Operands::new([a, b, c, None], rest)
@@ -917,6 +483,7 @@ impl Op {
 
     pub(super) fn operands_mut(&mut self) -> OperandsMut<'_> {
         let (fixed, rest): ([Option<&mut Value>; 3], &mut [Value]) = match self {
+            Op::Javascript(op) => return op.operands_mut(),
             Op::Aarch64(op) => return op.operands_mut(),
             Op::Regex(op) => return op.operands_mut(),
             Op::LowLevel(op) => return op.operands_mut(),
@@ -933,99 +500,9 @@ impl Op {
                 _,
             ) => ([Some(value), Some(cache), None], &mut []),
             Op::Assume(value, ..) => ([Some(value), None, None], &mut []),
-            Op::PropertyCache(..)
-            | Op::GlobalCache(..)
-            | Op::Argument(_)
-            | Op::Restored(_)
-            | Op::Arguments
-            | Op::ArgumentCount
-            | Op::Rest(_)
-            | Op::This
-            | Op::Callee
-            | Op::Catch
-            | Op::Constant(_)
-            | Op::GlobalRead(_)
-            | Op::GlobalReadOptional(_)
-            | Op::RegExp(_, _)
-            | Op::Read(_)
-            | Op::BindingLoad(_)
-            | Op::NewPack
-            | Op::NewObject
-            | Op::ProbeGlobal(_)
-            | Op::GuardValid(_)
-            | Op::GuardCommit(_)
-            | Op::EnterScope(_)
-            | Op::LeaveScope(_)
-            | Op::NextIteration(_)
-            | Op::FreshIteration(_) => ([None, None, None], &mut []),
-            Op::Closure(_, _, _, _, _, _, receiver) => ([receiver.as_mut(), None, None], &mut []),
-            Op::ClosureCells(_, _, _, _, _, cells, receiver) => {
-                ([receiver.as_mut(), None, None], cells.as_mut_slice())
-            }
-            Op::CellSet(cell, value) => ([Some(cell), Some(value), None], &mut []),
-            Op::CellNew(value) | Op::CellGet(value) | Op::CaptureGet(value, _) => {
-                ([Some(value), None, None], &mut [])
-            }
-            Op::ClosureThis(value)
-            | Op::NewHoleyArray(value)
-            | Op::EnterCaptures(_, value)
-            | Op::Throw(value)
-            | Op::GlobalInitialize(_, value)
-            | Op::GlobalWrite(_, value)
-            | Op::Initialize(_, value)
-            | Op::BindingRestore(_, value)
-            | Op::Write(_, value)
-            | Op::CheckInitialized(value)
-            | Op::PackRelease(value)
-            | Op::Spread(value)
-            | Op::IteratorNew(value)
-            | Op::IteratorNext(value)
-            | Op::IsIndexed(value)
-            | Op::IsOrdinaryArray(value)
-            | Op::ArrayKind(value)
-            | Op::IndexedLength(value)
-            | Op::EnumerateNew(value)
-            | Op::EnumerateNext(value)
-            | Op::IsUninitialized(value)
-            | Op::Get(value, _)
-            | Op::IsShape(value, _)
-            | Op::IsReadLayout(value, _)
-            | Op::LayoutGet(value, _, _)
-            | Op::ShapedGet(value, _, _)
-            | Op::MarkClass(value)
-            | Op::DisableConstructor(value)
-            | Op::PropertyKey(value)
-            | Op::ToNumeric(value)
-            | Op::ToInt32(value)
-            | Op::ArrayPosition(value)
-            | Op::Unary(_, value)
-            | Op::IsUndefined(value)
-            | Op::IsNullish(value)
-            | Op::ProbeProperty(value, _)
-            | Op::ProbeShapeProperty(value, _, _)
-            | Op::IsNative(value, _)
-            | Op::NewInstance(value)
-            | Op::ConstructorPrototype(value)
-            | Op::IsCode(value, _)
-            | Op::View(value)
-            | Op::TypedData(value)
-            | Op::MemoryNumber(value, _)
-            | Op::KeepAlive(value)
+            Op::Argument(_) | Op::Restored(_) | Op::ArgumentCount => ([None, None, None], &mut []),
+            Op::KeepAlive(value)
             | Op::Memory(MemoryOp::Load { address: value, .. })
-            | Op::IsArray(value, _)
-            | Op::IsTyped(value, _)
-            | Op::IsNumber(value)
-            | Op::IsInteger(value)
-            | Op::AsInteger(value)
-            | Op::NumericFloat(value)
-            | Op::SaturatingInteger(value)
-            | Op::IsString(value)
-            | Op::Truthy(value)
-            | Op::IsStringSplit(value)
-            | Op::IsTypeof(value, _)
-            | Op::AsString(value)
-            | Op::AsObject(value)
-            | Op::AsNumber(value)
             | Op::Convert(value, _)
             | Op::Box(value)
             | Op::AsBoxed(value)
@@ -1036,16 +513,6 @@ impl Op {
             | Op::SlotStore(value)
             | Op::SlotClear(value)
             | Op::ParamStore(_, value) => ([Some(value), None, None], &mut []),
-            Op::PropertyLoad(object, cache, _)
-            | Op::RelatedPropertyLoad(object, cache, _)
-            | Op::IsPropertyCached(object, cache, _)
-            | Op::CachedProperty(object, cache, _)
-            | Op::FillPropertyCache(object, cache, _)
-            | Op::PrimePropertyCache(object, cache) => ([Some(object), Some(cache), None], &mut []),
-            Op::Define(object, _, value)
-            | Op::DefineHidden(object, _, value)
-            | Op::ShapedSet(object, _, _, value)
-            | Op::Set(object, _, value) => ([Some(object), Some(value), None], &mut []),
             Op::Memory(MemoryOp::IndexedLoad {
                 base: object,
                 index: key,
@@ -1056,69 +523,8 @@ impl Op {
                 index: key,
                 ..
             })
-            | Op::MapElement(object, key)
-            | Op::IsArrayIteration(object, key, _)
-            | Op::CanOverwrite(object, key, _)
-            | Op::Delete(object, key)
-            | Op::GetIndex(object, key)
-            | Op::TypedIndex(object, key, _)
-            | Op::ArrayGet(object, key)
-            | Op::ArrayLoad(object, key, _)
-            | Op::PackTake(object, key)
-            | Op::ProbeIndex(object, key)
-            | Op::IsExactPosition(object, key)
-            | Op::IsInBounds(object, key)
-            | Op::BooleanAnd(object, key)
-            | Op::Binary(_, object, key)
-            | Op::PackAppend(object, key, _)
-            | Op::ArrayAppend(object, key, _)
-            | Op::ConstructorResult(object, key)
-            | Op::ConstructPack(object, key) => ([Some(object), Some(key), None], &mut []),
-            Op::CallForward(callee, receiver) => ([Some(callee), Some(receiver), None], &mut []),
-            Op::IntegerCheck(object, key, position)
-            | Op::IsArrayIndex(object, key, position, _) => {
-                ([Some(object), Some(key), Some(position)], &mut [])
-            }
-            Op::CallPack(callee, receiver, args)
-            | Op::ConstructorCallPack(callee, receiver, args)
-            | Op::ConstructPackResolved(callee, receiver, args) => {
-                ([Some(callee), Some(receiver), Some(args)], &mut [])
-            }
-            Op::ConstructorCall {
-                callee,
-                receiver,
-                args,
-            } => ([Some(callee), Some(receiver), None], args),
-            Op::ConstructResolved {
-                callee,
-                prototype,
-                args,
-            } => ([Some(callee), Some(prototype), None], args),
-            Op::GuardedCompare {
-                left,
-                right,
-                numbers,
-                ..
-            } => ([Some(left), Some(right), None], numbers),
-            Op::ArrayStore(object, key, value)
-            | Op::PropertyStore(object, key, value, _, _)
-            | Op::PropertyAdd(object, key, value, _)
-            | Op::FillPropertyStore(object, key, _, value, _)
-            | Op::SetIndex(object, key, value) => ([Some(object), Some(key), Some(value)], &mut []),
-            Op::HelperCall { args: values, .. }
-            | Op::StringConcat(values)
-            | Op::NewArray(values)
-            | Op::CallNative(_, values) => ([None, None, None], values),
-            Op::StringSplit(receiver, args) | Op::StringSplitParts(receiver, args) => {
-                ([Some(receiver), None, None], args)
-            }
-            Op::Construct { callee, args } => ([Some(callee), None, None], args),
-            Op::Call {
-                callee,
-                receiver,
-                args,
-                ..
-            } => ([Some(callee), receiver.as_mut(), None], args),
+            | Op::BooleanAnd(object, key) => ([Some(object), Some(key), None], &mut []),
+            Op::HelperCall { args: values, .. } => ([None, None, None], values),
         };
         let [a, b, c] = fixed;
         OperandsMut::new([a, b, c, None], rest)
@@ -1266,14 +672,6 @@ pub(super) fn resolve(aliases: &(impl Aliases + ?Sized), mut value: Value) -> Va
         value = next;
     }
     value
-}
-
-/// What a typed-array read may assume: a fixed element kind, and a key proven to be an
-/// integral index below the length.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(in crate::jit) struct TypedRead {
-    pub(in crate::jit) element: Option<TypedKind>,
-    pub(in crate::jit) bounded: bool,
 }
 
 #[derive(Clone, Default)]
@@ -1513,9 +911,11 @@ impl Graph {
         self.insts
             .values()
             .filter_map(|data| match data.op {
-                Op::Call { callee, .. } | Op::CallPack(callee, ..) | Op::CallForward(callee, _) => {
-                    Some(callee)
-                }
+                Op::Javascript(
+                    JsOp::Call { callee, .. }
+                    | JsOp::CallPack(callee, ..)
+                    | JsOp::CallForward(callee, _),
+                ) => Some(callee),
                 _ => None,
             })
             .collect()
@@ -1523,8 +923,12 @@ impl Graph {
 
     pub(super) fn caller_rooted(&self, value: Value) -> bool {
         match self.defining_op(value) {
-            Some(Op::This | Op::Callee | Op::Argument(_) | Op::Restored(_)) => true,
-            Some(Op::AsObject(source) | Op::AsString(source)) => self.caller_rooted(*source),
+            Some(Op::Javascript(JsOp::This | JsOp::Callee) | Op::Argument(_) | Op::Restored(_)) => {
+                true
+            }
+            Some(Op::Javascript(JsOp::AsObject(source) | JsOp::AsString(source))) => {
+                self.caller_rooted(*source)
+            }
             _ => false,
         }
     }
@@ -1547,7 +951,7 @@ impl Graph {
 
     pub(in crate::jit) fn set_op(&mut self, inst: Inst, op: Op) {
         let kept = match (&op, self.insts[inst].result()) {
-            (Op::Constant(constant), Some(value)) => {
+            (Op::Javascript(JsOp::Constant(constant)), Some(value)) => {
                 self.reprs[value].filter(|&repr| repr == Repr::Boxed || repr::fits(constant, repr))
             }
             _ => None,
@@ -1818,7 +1222,7 @@ impl Graph {
     fn inst_contract(&self, inst: Inst, facts: &Facts) -> Contract {
         let op = &self.insts[inst].op;
         let mut contract = self.contract(op, facts);
-        if let Op::Call { callee, .. } = op
+        if let Op::Javascript(JsOp::Call { callee, .. }) = op
             && let Some(summary) = self.call_summary(inst, *callee, facts)
         {
             contract.effects.memory = summary.memory;
@@ -1850,21 +1254,8 @@ impl Graph {
             effects: Effects::of(flags),
             result,
         };
-        const COERCING: u16 = HEAP_READ | ALLOCATION | INTERNAL | ERROR;
-        let operands = || {
-            op.operands_iter()
-                .fold(ValueType::default(), |types, value| {
-                    types.union(facts.of(value))
-                })
-        };
-        let coercing = |result| {
-            if operands().within(ValueType::NUMBER) {
-                closed(0, Unowned)
-            } else {
-                closed(COERCING, result)
-            }
-        };
         match op {
+            Op::Javascript(op) => js::contracts::contract(self, op, facts),
             Op::Aarch64(op) => op.contract(),
             Op::Regex(op) => op.contract(),
             Op::LowLevel(low_level::Op::Reference { .. } | low_level::Op::Cleanup { .. }) => {
@@ -1902,89 +1293,8 @@ impl Graph {
             }
             Op::Assume(..) => closed(0, None),
             Op::EntryAssume(..) => closed(0, Unowned),
-            Op::NewInstance(_) => closed(ALLOCATION | INTERNAL | ERROR, Owned),
-            Op::ConstructorResult(..) => closed(0, Borrowed),
-            Op::Rest(_) | Op::Arguments => closed(ALLOCATION | INTERNAL | ERROR, Owned),
-            Op::Throw(_) => closed(INTERNAL | ERROR, None),
-            Op::Catch => closed(INTERNAL, Owned),
             Op::ArgumentCount => closed(0, Unowned),
-            Op::Argument(_) | Op::Restored(_) | Op::This | Op::Callee => closed(0, Borrowed),
-            Op::ClosureThis(_) => closed(HEAP_READ, Borrowed),
-            Op::NewHoleyArray(_) => closed(ALLOCATION | INTERNAL | ERROR, Owned),
-            Op::MapElement(..) => closed(HEAP_READ | INTERNAL, Owned),
-            Op::IsArrayIteration(..) | Op::IsStringSplit(_) => closed(HEAP_READ, Unowned),
-            Op::StringSplit(..) | Op::StringSplitParts(..) => {
-                closed(HEAP_READ | ALLOCATION | INTERNAL | ERROR, Owned)
-            }
-            Op::Constant(_) => closed(0, Unowned),
-            Op::GlobalRead(_) | Op::GlobalReadOptional(_) => {
-                closed(GLOBAL_READ | INTERNAL | ERROR, Borrowed)
-            }
-            Op::RegExp(..) => closed(ALLOCATION | INTERNAL | ERROR, Owned),
-            Op::StringConcat(_) => closed(HEAP_READ | ALLOCATION | INTERNAL | ERROR, Owned),
-            Op::PropertyKey(_) => closed(HEAP_READ | ALLOCATION | INTERNAL | ERROR, Owned),
-            Op::GlobalWrite(..) | Op::GlobalInitialize(..) => {
-                closed(GLOBAL_WRITE | INTERNAL | ERROR, None)
-            }
-            Op::BindingLoad(_) => closed(INTERNAL, Borrowed),
-            Op::BindingRestore(..) => closed(INTERNAL, None),
-            Op::Read(binding) => closed(
-                if self.bindings[*binding].captured {
-                    HEAP_READ | INTERNAL | ERROR
-                } else {
-                    ERROR
-                },
-                if self.bindings[*binding].captured || self.lazy_captures.contains(binding) {
-                    Owned
-                } else {
-                    Borrowed
-                },
-            ),
-            Op::Initialize(binding, _) | Op::Write(binding, _)
-                if self.bindings[*binding].captured =>
-            {
-                closed(HEAP_WRITE | INTERNAL | ERROR, None)
-            }
-            Op::Initialize(..) => closed(INTERNAL, None),
-            Op::Write(..) => closed(INTERNAL | ERROR, None),
-            Op::CellGet(_) | Op::CaptureGet(..) => closed(HEAP_READ | INTERNAL | ERROR, Owned),
-            Op::CellSet(..) => closed(HEAP_WRITE | INTERNAL | ERROR, None),
-            Op::CheckInitialized(_) => {
-                if operands().intersects(ValueType::UNINITIALIZED) {
-                    closed(ERROR, None)
-                } else {
-                    closed(0, None)
-                }
-            }
-            Op::Closure(..)
-            | Op::ClosureCells(..)
-            | Op::CellNew(_)
-            | Op::NewPack
-            | Op::NewObject
-            | Op::NewArray(_)
-            | Op::IteratorNew(_)
-            | Op::EnumerateNew(_) => closed(ALLOCATION | INTERNAL | ERROR, Owned),
-            Op::PackRelease(_) => closed(HEAP_WRITE | INTERNAL, None),
-            Op::Spread(_) => closed(HEAP_READ | ALLOCATION | INTERNAL | ERROR, Owned),
-            Op::IteratorNext(_) | Op::EnumerateNext(_) => closed(
-                HEAP_READ | HEAP_WRITE | ALLOCATION | INTERNAL | ERROR,
-                Owned,
-            ),
-            Op::IsUninitialized(_) => closed(0, Unowned),
-            // Defines only target the literal being built, which nothing has read yet, so the
-            // HEAP write is left out to keep borrows and loads alive across object construction.
-            Op::Define(..) => closed(HEAP_READ | CODE_WRITE | ALLOCATION | INTERNAL | ERROR, None),
-            Op::DefineHidden(..) | Op::MarkClass(_) | Op::DisableConstructor(_) => closed(
-                HEAP_WRITE | CODE_WRITE | ALLOCATION | INTERNAL | ERROR,
-                None,
-            ),
-            Op::PackAppend(..) | Op::ArrayAppend(..) => {
-                closed(HEAP_READ | HEAP_WRITE | ALLOCATION | INTERNAL | ERROR, None)
-            }
-            Op::Get(..) | Op::GetIndex(..) | Op::FillPropertyCache(..) => closed(
-                HEAP_READ | GLOBAL_READ | ALLOCATION | INTERNAL | ERROR,
-                Borrowed,
-            ),
+            Op::Argument(_) | Op::Restored(_) => closed(0, Borrowed),
             Op::HelperCall {
                 helper,
                 produces,
@@ -1998,126 +1308,12 @@ impl Graph {
                     None
                 },
             },
-            Op::PropertyLoad(..) | Op::RelatedPropertyLoad(..) => closed(HEAP_READ, Borrowed),
-            Op::PropertyCache(..) | Op::GlobalCache(..) => closed(0, Unowned),
-            Op::IsPropertyCached(..) | Op::IsShape(..) | Op::IsReadLayout(..) => {
-                closed(CODE_READ, Unowned)
-            }
-            Op::ShapedGet(..) | Op::LayoutGet(..) => closed(HEAP_READ | INTERNAL | ERROR, Borrowed),
-            Op::ShapedSet(..) => {
-                closed(HEAP_READ | HEAP_WRITE | ALLOCATION | INTERNAL | ERROR, None)
-            }
-            Op::PrimePropertyCache(..) => closed(HEAP_READ | CODE_READ | INTERNAL, None),
-            Op::CachedProperty(..) => closed(HEAP_READ | INTERNAL | ERROR, Borrowed),
-            Op::FillPropertyStore(.., PropertyWrite::Define) => {
-                closed(HEAP_READ | CODE_WRITE | ALLOCATION | INTERNAL | ERROR, None)
-            }
-            Op::PropertyStore(.., PropertyWrite::Define)
-            | Op::PropertyAdd(.., PropertyWrite::Define) => {
-                closed(HEAP_READ | CODE_WRITE | INTERNAL, None)
-            }
-            Op::Delete(..) => closed(
-                HEAP_READ | HEAP_WRITE | CODE_WRITE | ALLOCATION | INTERNAL | ERROR,
-                Unowned,
-            ),
-            Op::Set(..) | Op::SetIndex(..) | Op::FillPropertyStore(..) => closed(
-                HEAP_READ | HEAP_WRITE | CODE_WRITE | ALLOCATION | INTERNAL | ERROR,
-                None,
-            ),
-            Op::Unary(UnaryOp::Not, _) => closed(HEAP_READ, Unowned),
-            Op::Unary(UnaryOp::Typeof, _) => closed(HEAP_READ | ALLOCATION | ERROR, Owned),
-            Op::Unary(UnaryOp::Increment | UnaryOp::Decrement, _) => {
-                if operands().within(ValueType::NUMBER) {
-                    closed(0, Unowned)
-                } else {
-                    closed(ALLOCATION | INTERNAL | ERROR, Owned)
-                }
-            }
-            Op::ToInt32(_) => closed(0, Unowned),
-            Op::ToNumeric(_) | Op::Unary(..) => coercing(Owned),
-            Op::GuardedCompare {
-                operator,
-                left,
-                right,
-                ..
-            } => self.contract(&Op::Binary(*operator, *left, *right), facts),
-            Op::Binary(operator, ..) => match operator {
-                BinaryOperator::StrictEquality | BinaryOperator::StrictInequality => closed(
-                    if operands().within(ValueType::NUMBER) {
-                        0
-                    } else {
-                        HEAP_READ
-                    },
-                    Unowned,
-                ),
-                BinaryOperator::Equality
-                | BinaryOperator::Inequality
-                | BinaryOperator::LessThan
-                | BinaryOperator::LessEqualThan
-                | BinaryOperator::GreaterThan
-                | BinaryOperator::GreaterEqualThan => coercing(Unowned),
-                BinaryOperator::In | BinaryOperator::Instanceof => Contract {
-                    effects: Effects::UNKNOWN,
-                    result: Unowned,
-                },
-                _ => coercing(Owned),
-            },
-            Op::Call { .. }
-            | Op::Construct { .. }
-            | Op::CallPack(..)
-            | Op::CallForward(..)
-            | Op::ConstructPack(..)
-            | Op::ConstructorCall { .. }
-            | Op::ConstructorCallPack(..)
-            | Op::ConstructResolved { .. }
-            | Op::ConstructPackResolved(..) => Contract {
-                effects: Effects::UNKNOWN,
-                result: Owned,
-            },
-            Op::CallNative(native, _)
-                if METHODS[native.index()].1 == crate::heap::MathFunction::Random =>
-            {
-                closed(INTERNAL, Unowned)
-            }
-            Op::CallNative(..) => coercing(Unowned),
-            Op::IsUndefined(_) | Op::IsNullish(_) | Op::IsNative(..) => closed(0, Unowned),
-            Op::ConstructorPrototype(_) => closed(HEAP_READ, Borrowed),
-            Op::IsCode(..) => closed(HEAP_READ, Unowned),
-            Op::ProbeGlobal(_) => closed(GLOBAL_READ, Borrowed),
-            Op::ProbeProperty(..) | Op::ProbeIndex(..) => closed(HEAP_READ, Borrowed),
-            Op::ProbeShapeProperty(..) => closed(HEAP_READ | CODE_READ, Borrowed),
-            Op::GuardValid(_) => closed(GLOBAL_READ, Unowned),
-            Op::GuardCommit(_) => closed(INTERNAL, None),
-            Op::View(_)
-            | Op::TypedData(_)
-            | Op::Memory(MemoryOp::IndexedLoad { .. } | MemoryOp::Load { .. }) => {
+            Op::Memory(MemoryOp::IndexedLoad { .. } | MemoryOp::Load { .. }) => {
                 closed(HEAP_READ, Unowned)
             }
-            Op::Memory(MemoryOp::Address { .. }) | Op::MemoryNumber(..) => closed(0, Unowned),
+            Op::Memory(MemoryOp::Address { .. }) => closed(0, Unowned),
             Op::KeepAlive(_) => closed(INTERNAL, None),
-            Op::IsTyped(..) | Op::IsIndexed(_) | Op::IsOrdinaryArray(_) => closed(0, Unowned),
-            Op::IsArrayIndex(..) | Op::IsArray(..) => closed(HEAP_READ, Unowned),
-            Op::ArrayPosition(_) => closed(INTERNAL, Unowned),
-            Op::IsExactPosition(..) | Op::IsInBounds(..) | Op::BooleanAnd(..) => closed(0, Unowned),
-            Op::ArrayKind(_) | Op::IndexedLength(_) => closed(HEAP_READ, Unowned),
-            Op::ArrayGet(..) => closed(HEAP_READ | INTERNAL | ERROR, Borrowed),
-            Op::ArrayLoad(..) => closed(HEAP_READ, Borrowed),
-            Op::ArrayStore(..) | Op::PropertyStore(..) => {
-                closed(HEAP_READ | HEAP_WRITE | INTERNAL, None)
-            }
-            Op::PropertyAdd(..) => closed(HEAP_READ | HEAP_WRITE | CODE_WRITE | INTERNAL, None),
-            Op::CanOverwrite(..) => closed(HEAP_READ, Unowned),
-            Op::PackTake(..) => closed(HEAP_READ | HEAP_WRITE | INTERNAL, Owned),
-            Op::TypedIndex(..) => closed(HEAP_READ, Unowned),
-            Op::IsNumber(_)
-            | Op::IsInteger(_)
-            | Op::AsInteger(_)
-            | Op::NumericFloat(_)
-            | Op::SaturatingInteger(_)
-            | Op::IntegerCheck(..)
-            | Op::IsString(_) => closed(0, Unowned),
-            Op::IsTypeof(..) | Op::Truthy(_) => closed(HEAP_READ, Unowned),
-            Op::AsNumber(_) => closed(INTERNAL, Unowned),
+            Op::BooleanAnd(..) => closed(0, Unowned),
             Op::Convert(..) | Op::Box(_) | Op::AsBoxed(_) | Op::AsWord(_) | Op::Unbox(..) => {
                 closed(0, Unowned)
             }
@@ -2126,23 +1322,6 @@ impl Graph {
             | Op::SlotStore(_)
             | Op::SlotClear(_)
             | Op::ParamStore(..) => closed(INTERNAL, None),
-            Op::AsString(_) => closed(0, Borrowed),
-            Op::AsObject(_) => closed(0, Unowned),
-            Op::EnterCaptures(..) => closed(HEAP_READ | INTERNAL | ERROR, None),
-            Op::EnterScope(scope) | Op::NextIteration(scope) | Op::FreshIteration(scope) => {
-                if self.materialized(*scope) {
-                    closed(ALLOCATION | INTERNAL | ERROR, None)
-                } else {
-                    closed(0, None)
-                }
-            }
-            Op::LeaveScope(scope) => {
-                if self.materialized(*scope) {
-                    closed(INTERNAL, None)
-                } else {
-                    closed(0, None)
-                }
-            }
         }
     }
 
@@ -2189,18 +1368,18 @@ impl Graph {
                     return Err(format!("{inst} ({op:?}) produces a boxed word"));
                 }
                 match self.insts[inst].op {
-                    Op::EnterScope(scope) | Op::EnterCaptures(scope, _) => {
+                    Op::Javascript(JsOp::EnterScope(scope) | JsOp::EnterCaptures(scope, _)) => {
                         if self.scopes[scope].parent != stack.last().copied() {
                             return Err(format!("{inst} enters {scope} outside its parent"));
                         }
                         stack.push(scope);
                     }
-                    Op::LeaveScope(scope) => {
+                    Op::Javascript(JsOp::LeaveScope(scope)) => {
                         if stack.pop() != Some(scope) {
                             return Err(format!("{inst} leaves {scope} out of order"));
                         }
                     }
-                    Op::NextIteration(scope) | Op::FreshIteration(scope)
+                    Op::Javascript(JsOp::NextIteration(scope) | JsOp::FreshIteration(scope))
                         if stack.last() != Some(&scope) =>
                     {
                         return Err(format!("{inst} steps {scope} while it is not innermost"));
@@ -2257,7 +1436,7 @@ impl Graph {
             for value in terminator.kind.operands() {
                 if matches!(
                     self.defining_op(value),
-                    Some(Op::TypedData(_) | Op::Memory(_))
+                    Some(Op::Javascript(JsOp::TypedData(_)) | Op::Memory(_))
                 ) && !self.lowered_memory_scalar(value)
                 {
                     return Err(format!("raw value {value} escapes {block}"));
@@ -2376,7 +1555,7 @@ impl Graph {
                     let Some(def) = self.defining_op(value) else {
                         continue;
                     };
-                    let raw = matches!(def, Op::TypedData(_) | Op::Memory(_));
+                    let raw = matches!(def, Op::Javascript(JsOp::TypedData(_)) | Op::Memory(_));
                     if !raw {
                         continue;
                     }
@@ -2386,12 +1565,14 @@ impl Graph {
                             Op::LowLevel(_)
                                 | Op::Box(_)
                                 | Op::Convert(..)
-                                | Op::NumericFloat(_)
-                                | Op::SaturatingInteger(_)
-                                | Op::AsInteger(_)
-                                | Op::ArrayPosition(_)
-                                | Op::ToInt32(_)
-                                | Op::AsNumber(_)
+                                | Op::Javascript(
+                                    JsOp::NumericFloat(_)
+                                        | JsOp::SaturatingInteger(_)
+                                        | JsOp::AsInteger(_)
+                                        | JsOp::ArrayPosition(_)
+                                        | JsOp::ToInt32(_)
+                                        | JsOp::AsNumber(_)
+                                )
                         )
                     {
                         continue;
@@ -2404,14 +1585,15 @@ impl Graph {
                             Op::Memory(
                                 MemoryOp::IndexedLoad { base, .. } | MemoryOp::Address { base, .. },
                             ),
-                            Op::TypedData(_) | Op::Memory(MemoryOp::Address { .. }),
+                            Op::Javascript(JsOp::TypedData(_))
+                            | Op::Memory(MemoryOp::Address { .. }),
                         ) => *base == value,
                         (
                             Op::Memory(MemoryOp::Load { address, .. }),
                             Op::Memory(MemoryOp::Address { .. }),
                         ) => *address == value,
                         (
-                            Op::MemoryNumber(input, format),
+                            Op::Javascript(JsOp::MemoryNumber(input, format)),
                             Op::Memory(
                                 MemoryOp::IndexedLoad { format: source, .. }
                                 | MemoryOp::Load { format: source, .. },

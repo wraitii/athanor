@@ -1,5 +1,6 @@
 use super::hoisting::{AssumeCfg, Motion, RecoveryPoint};
 use super::*;
+use crate::jit::semantic::JsOp;
 
 pub(super) struct JsMotion;
 
@@ -35,7 +36,7 @@ impl Motion for JsMotion {
             .iter()
             .flat_map(|&block| &graph.blocks[block].insts)
             .filter(|&&inst| {
-                let Op::Set(object, ..) = graph.insts[inst].op else {
+                let Op::Javascript(JsOp::Set(object, ..)) = graph.insts[inst].op else {
                     return false;
                 };
                 let Some(access) = graph.property_accesses.get(&inst) else {
@@ -64,9 +65,15 @@ impl Motion for JsMotion {
             for &inst in &graph.blocks[block].insts {
                 let op = &graph.insts[inst].op;
                 let required = match *op {
-                    Op::AsString(value) => Some((value, guards::Fact::Type(ValueType::STRING))),
-                    Op::AsNumber(value) => Some((value, guards::Fact::Type(ValueType::NUMBER))),
-                    Op::AsInteger(value) => Some((value, guards::Fact::Type(ValueType::INTEGER))),
+                    Op::Javascript(JsOp::AsString(value)) => {
+                        Some((value, guards::Fact::Type(ValueType::STRING)))
+                    }
+                    Op::Javascript(JsOp::AsNumber(value)) => {
+                        Some((value, guards::Fact::Type(ValueType::NUMBER)))
+                    }
+                    Op::Javascript(JsOp::AsInteger(value)) => {
+                        Some((value, guards::Fact::Type(ValueType::INTEGER)))
+                    }
                     _ => None,
                 };
                 if let Some((value, required)) = required
@@ -83,15 +90,19 @@ impl Motion for JsMotion {
                 if !matches!(
                     op,
                     Op::Argument(_)
-                        | Op::This
-                        | Op::PropertyCache(..)
-                        | Op::GuardValid(_)
-                        | Op::GuardCommit(_)
+                        | Op::Javascript(
+                            JsOp::This
+                                | JsOp::PropertyCache(..)
+                                | JsOp::GuardValid(_)
+                                | JsOp::GuardCommit(_)
+                        )
                         | Op::Observe(..)
-                        | Op::AsNumber(_)
-                        | Op::AsInteger(_)
-                        | Op::AsString(_)
-                        | Op::AsObject(_)
+                        | Op::Javascript(
+                            JsOp::AsNumber(_)
+                                | JsOp::AsInteger(_)
+                                | JsOp::AsString(_)
+                                | JsOp::AsObject(_)
+                        )
                 ) && !writes.preserves(graph, inst)
                 {
                     return None;
@@ -157,7 +168,7 @@ fn collect(
     };
     if !matches!(
         graph.insts[inst].op,
-        Op::Argument(_) | Op::This | Op::PropertyCache(..)
+        Op::Argument(_) | Op::Javascript(JsOp::This | JsOp::PropertyCache(..))
     ) && !facts.is_pure(inst)
     {
         return None;

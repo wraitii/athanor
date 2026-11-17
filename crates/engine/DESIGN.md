@@ -251,18 +251,24 @@ The graph infrastructure is meant to host more than one source language. Blocks,
 block parameters, terminators, values, representations, contracts and the passes
 that only consult them are the shared core. DCE and LICM already reason through
 `facts.is_pure`, and loop, parameter and trimming transforms do not inspect
-operations. Each language contributes a dialect: operations in the same `Op`
-enum, with their own contract, operand, representation and listing arms, their
-own passes, and a lowering towards `LowLevel`. A shared graph is not the goal by
-itself; sharing the infrastructure lets bodies from different frontends be
-combined, lets general passes apply across them, and lets a path occasionally
-skip phases that another path needs. The big enums (`Op`, `Value`, `Repr`) may
-grow dialect variants where that is cleaner than overloading JS meanings.
+operations. Each language contributes a dialect through a subenum of `Op`: JS
+operations live in `Javascript(js::Op)`, alongside `Regex`, `LowLevel` and
+`Aarch64`. The JS dialect owns its operation definitions, operand traversal,
+contracts, result typing, representation requirements and listing under
+`semantic/js/`. Shared queries dispatch to the dialect, while passes can inspect
+its operations directly. Dialects contribute their own passes and lower towards
+`LowLevel`. A shared graph is not the goal by itself; sharing the infrastructure
+lets bodies from different frontends be combined, lets general passes apply
+across them, and lets a path occasionally skip phases that another path needs.
+The big enums (`Op`, `Value`, `Repr`) may grow dialect variants where that is
+cleaner than overloading JS meanings.
 
-Much of the core is still JS-shaped. JS operations are listed inline in central
-tables, facts use JS value types, `Locations` and `js::Access` model JS memory,
-and the inliner mixes body cloning with scopes, `this` and captures. These are
-seams to generalize as a second dialect needs them, not a refactor to do ahead.
+Much of the core is still JS-shaped. Facts use JS value types, `Locations`
+and `js::Access` model JS memory, and the inliner mixes body cloning with scopes,
+`this` and captures. The JS subenum includes both language operations and JS
+runtime operations such as shape checks and cached property accesses; these can
+coexist with other dialects at different lowering stages. The remaining shared
+JS assumptions are seams to generalize as another dialect needs them.
 
 Regular expressions are the intended second dialect. They are the opposite of
 JS in most respects: no dynamic types, heap or exceptions, machine integers

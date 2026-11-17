@@ -1,3 +1,4 @@
+use crate::jit::semantic::JsOp;
 use crate::{FxHashMap, FxHashSet};
 use oxc_syntax::operator::BinaryOperator;
 
@@ -38,11 +39,11 @@ pub(in crate::jit::semantic) fn plan(
         .filter(|block| !graph.cold.contains(block))
         .flat_map(|&block| graph.blocks[block].insts.iter())
         .filter_map(|&inst| match graph.insts[inst].op {
-            Op::GetIndex(object, _)
-            | Op::SetIndex(object, _, _)
-            | Op::TypedIndex(object, _, super::super::TypedRead { element: None, .. }) => {
-                Some(object)
-            }
+            Op::Javascript(
+                JsOp::GetIndex(object, _)
+                | JsOp::SetIndex(object, _, _)
+                | JsOp::TypedIndex(object, _, super::super::TypedRead { element: None, .. }),
+            ) => Some(object),
             _ => None,
         })
         .collect();
@@ -51,7 +52,9 @@ pub(in crate::jit::semantic) fn plan(
         .iter()
         .flat_map(|&block| graph.blocks[block].insts.iter())
         .filter_map(|&inst| match graph.insts[inst].op {
-            Op::Binary(BinaryOperator::Addition, left, right) => Some([left, right]),
+            Op::Javascript(JsOp::Binary(BinaryOperator::Addition, left, right)) => {
+                Some([left, right])
+            }
             _ => None,
         })
         .flatten()
@@ -61,7 +64,9 @@ pub(in crate::jit::semantic) fn plan(
     for block in cfg.rpo {
         for inst in graph.blocks[block].insts.clone() {
             let data = &graph.insts[inst];
-            if graph.cold.contains(&block) && !matches!(data.op, Op::Call { target: None, .. }) {
+            if graph.cold.contains(&block)
+                && !matches!(data.op, Op::Javascript(JsOp::Call { target: None, .. }))
+            {
                 continue;
             }
             let site = Site {
@@ -105,34 +110,38 @@ pub(in crate::jit::semantic) fn plan(
             let source_name = data.source_name;
             let mut before = None;
             match data.op {
-                Op::GetIndex(object, _)
-                | Op::SetIndex(object, _, _)
-                | Op::TypedIndex(object, _, super::super::TypedRead { element: None, .. }) => {
+                Op::Javascript(
+                    JsOp::GetIndex(object, _)
+                    | JsOp::SetIndex(object, _, _)
+                    | JsOp::TypedIndex(object, _, super::super::TypedRead { element: None, .. }),
+                ) => {
                     // OSR inputs lose constructor-based guesses, so keep receiver feedback.
                     before = Some((object, Observation::Read(ReadKind::Receiver)));
                 }
-                Op::Call {
-                    callee,
-                    target: None,
-                    ..
-                }
-                | Op::CallPack(callee, ..)
-                | Op::CallForward(callee, _)
-                | Op::Construct { callee, .. }
-                | Op::ConstructorCall { callee, .. } => {
+                Op::Javascript(
+                    JsOp::Call {
+                        callee,
+                        target: None,
+                        ..
+                    }
+                    | JsOp::CallPack(callee, ..)
+                    | JsOp::CallForward(callee, _)
+                    | JsOp::Construct { callee, .. }
+                    | JsOp::ConstructorCall { callee, .. },
+                ) => {
                     before = Some((callee, Observation::Call));
                 }
                 _ => {}
             }
             let pattern = match &data.op {
-                Op::Call {
+                Op::Javascript(JsOp::Call {
                     callee,
                     receiver: Some(receiver),
                     target: None,
                     ..
-                } if matches!(
+                }) if matches!(
                     graph.defining_op(*callee),
-                    Some(Op::Get(object, name))
+                    Some(Op::Javascript(JsOp::Get(object, name)))
                         if object == receiver && (name == "exec" || name == "test")
                 ) =>
                 {
@@ -142,7 +151,9 @@ pub(in crate::jit::semantic) fn plan(
             };
             let after = if matches!(
                 data.op,
-                Op::Get(..) | Op::GetIndex(..) | Op::ArrayGet(..) | Op::ArrayLoad(..)
+                Op::Javascript(
+                    JsOp::Get(..) | JsOp::GetIndex(..) | JsOp::ArrayGet(..) | JsOp::ArrayLoad(..)
+                )
             ) {
                 data.result()
                     .filter(|value| {
@@ -163,7 +174,12 @@ pub(in crate::jit::semantic) fn plan(
             let number = if primitive.is_none()
                 && matches!(
                     data.op,
-                    Op::Get(..) | Op::GetIndex(..) | Op::ArrayGet(..) | Op::ArrayLoad(..)
+                    Op::Javascript(
+                        JsOp::Get(..)
+                            | JsOp::GetIndex(..)
+                            | JsOp::ArrayGet(..)
+                            | JsOp::ArrayLoad(..)
+                    )
                 ) {
                 data.result()
                     .filter(|value| {
@@ -267,16 +283,20 @@ fn numeric_uses(graph: &Graph, cfg: &Cfg) -> FxHashSet<Value> {
             let op = &graph.insts[inst].op;
             for (index, value) in op.operands_iter().enumerate() {
                 let non_numeric = match op {
-                    Op::Truthy(_)
-                    | Op::IsNullish(_)
-                    | Op::IsUndefined(_)
-                    | Op::Unary(UnaryOp::Not, _) => true,
-                    Op::Get(..)
-                    | Op::Set(..)
-                    | Op::Define(..)
-                    | Op::GetIndex(..)
-                    | Op::SetIndex(..)
-                    | Op::TypedIndex(..) => index == 0,
+                    Op::Javascript(
+                        JsOp::Truthy(_)
+                        | JsOp::IsNullish(_)
+                        | JsOp::IsUndefined(_)
+                        | JsOp::Unary(UnaryOp::Not, _),
+                    ) => true,
+                    Op::Javascript(
+                        JsOp::Get(..)
+                        | JsOp::Set(..)
+                        | JsOp::Define(..)
+                        | JsOp::GetIndex(..)
+                        | JsOp::SetIndex(..)
+                        | JsOp::TypedIndex(..),
+                    ) => index == 0,
                     _ => false,
                 };
                 if !non_numeric {
@@ -333,7 +353,9 @@ pub(in crate::jit::semantic) fn numeric_site(
         return None;
     };
     let data = &graph.insts[inst];
-    if let Op::AsNumber(input) | Op::AsInteger(input) | Op::AsString(input) = data.op {
+    if let Op::Javascript(JsOp::AsNumber(input) | JsOp::AsInteger(input) | JsOp::AsString(input)) =
+        data.op
+    {
         return numeric_site(graph, input);
     }
     Some(Site {

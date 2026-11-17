@@ -1,4 +1,5 @@
 use crate::FxHashSet;
+use crate::jit::semantic::JsOp;
 
 use oxc_syntax::operator::BinaryOperator;
 
@@ -46,16 +47,16 @@ pub(in crate::jit::semantic) fn expand(
             if expanded.contains(&inst) {
                 continue;
             }
-            let Op::Call {
+            let Op::Javascript(JsOp::Call {
                 callee,
                 receiver: Some(_),
                 args,
                 ..
-            } = &graph.insts[inst].op
+            }) = &graph.insts[inst].op
             else {
                 continue;
             };
-            let Some(Op::Get(_, name)) = graph.defining_op(*callee) else {
+            let Some(Op::Javascript(JsOp::Get(_, name))) = graph.defining_op(*callee) else {
                 continue;
             };
             let Some(method) = ArrayMethod::from_name(name) else {
@@ -72,7 +73,7 @@ pub(in crate::jit::semantic) fn expand(
             }
             if !matches!(
                 graph.defining_op(callback),
-                Some(Op::Closure(_, _, _, false, _, _, _))
+                Some(Op::Javascript(JsOp::Closure(_, _, _, false, _, _, _)))
             ) {
                 continue;
             }
@@ -95,12 +96,12 @@ pub(in crate::jit::semantic) fn expand(
 fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
     let call = graph.insts[inst].clone();
     let first_new = graph.insts.len();
-    let Op::Call {
+    let Op::Javascript(JsOp::Call {
         callee,
         receiver: Some(receiver),
         args,
         ..
-    } = call.op
+    }) = call.op
     else {
         unreachable!();
     };
@@ -113,26 +114,40 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
     let advance = graph.blocks.push(BlockData::default());
     let exit = graph.blocks.push(BlockData::default());
     let span = call.span;
-    let check = graph.append_value(block, span, Op::IsArrayIteration(callee, receiver, method));
+    let check = graph.append_value(
+        block,
+        span,
+        Op::Javascript(JsOp::IsArrayIteration(callee, receiver, method)),
+    );
     graph.blocks[block].terminator = Some(Terminator {
         source_name: call.source_name,
         emission_location: None,
         span,
         kind: TerminatorKind::Branch(check, Target::new(start), Target::new(fallback)),
     });
-    let length = graph.append_value(start, span, Op::IndexedLength(receiver));
+    let length = graph.append_value(start, span, Op::Javascript(JsOp::IndexedLength(receiver)));
     let result_op = match method {
-        ArrayMethod::Map => Op::NewHoleyArray(length),
-        ArrayMethod::Filter => Op::NewArray(Vec::new()),
-        ArrayMethod::Some | ArrayMethod::Every => {
-            Op::Constant(Constant::Boolean(method == ArrayMethod::Every))
+        ArrayMethod::Map => Op::Javascript(JsOp::NewHoleyArray(length)),
+        ArrayMethod::Filter => Op::Javascript(JsOp::NewArray(Vec::new())),
+        ArrayMethod::Some | ArrayMethod::Every => Op::Javascript(JsOp::Constant(
+            Constant::Boolean(method == ArrayMethod::Every),
+        )),
+        ArrayMethod::ForEach | ArrayMethod::Find => {
+            Op::Javascript(JsOp::Constant(Constant::Undefined))
         }
-        ArrayMethod::ForEach | ArrayMethod::Find => Op::Constant(Constant::Undefined),
         ArrayMethod::Push => unreachable!(),
     };
     let result = graph.append_value(start, span, result_op);
-    let zero = graph.append_value(start, span, Op::Constant(Constant::Number(0.0)));
-    let undefined = graph.append_value(start, span, Op::Constant(Constant::Undefined));
+    let zero = graph.append_value(
+        start,
+        span,
+        Op::Javascript(JsOp::Constant(Constant::Number(0.0))),
+    );
+    let undefined = graph.append_value(
+        start,
+        span,
+        Op::Javascript(JsOp::Constant(Constant::Undefined)),
+    );
     let index = graph.add_param(header);
     graph.blocks[start].terminator = Some(Terminator {
         source_name: call.source_name,
@@ -146,7 +161,7 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
     let more = graph.append_value(
         header,
         span,
-        Op::Binary(BinaryOperator::LessThan, index, length),
+        Op::Javascript(JsOp::Binary(BinaryOperator::LessThan, index, length)),
     );
     graph.blocks[header].terminator = Some(Terminator {
         source_name: call.source_name,
@@ -154,8 +169,12 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
         span,
         kind: TerminatorKind::Branch(more, Target::new(read), Target::new(exit)),
     });
-    let element = graph.append_value(read, span, Op::MapElement(receiver, index));
-    let absent = graph.append_value(read, span, Op::IsUninitialized(element));
+    let element = graph.append_value(
+        read,
+        span,
+        Op::Javascript(JsOp::MapElement(receiver, index)),
+    );
+    let absent = graph.append_value(read, span, Op::Javascript(JsOp::IsUninitialized(element)));
     let value = graph.add_param(invoke);
     let hole = match method {
         ArrayMethod::Find => Target {
@@ -177,12 +196,12 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
     let mapped = graph.append_value(
         invoke,
         span,
-        Op::Call {
+        Op::Javascript(JsOp::Call {
             callee: callback,
             receiver: Some(undefined),
             args: vec![value, index, receiver],
             target: None,
-        },
+        }),
     );
     match method {
         ArrayMethod::Push => unreachable!(),
@@ -213,7 +232,12 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
             });
         }
         ArrayMethod::Map => {
-            graph.append(invoke, span, Op::SetIndex(result, index, mapped), false);
+            graph.append(
+                invoke,
+                span,
+                Op::Javascript(JsOp::SetIndex(result, index, mapped)),
+                false,
+            );
             graph.blocks[invoke].terminator = Some(Terminator {
                 source_name: call.source_name,
                 emission_location: None,
@@ -229,7 +253,12 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
                 span,
                 kind: TerminatorKind::Branch(mapped, Target::new(keep), Target::new(advance)),
             });
-            graph.append(keep, span, Op::ArrayAppend(result, value, false), false);
+            graph.append(
+                keep,
+                span,
+                Op::Javascript(JsOp::ArrayAppend(result, value, false)),
+                false,
+            );
             graph.blocks[keep].terminator = Some(Terminator {
                 source_name: call.source_name,
                 emission_location: None,
@@ -253,7 +282,9 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
             let found = graph.append_value(
                 stop,
                 span,
-                Op::Constant(Constant::Boolean(method == ArrayMethod::Some)),
+                Op::Javascript(JsOp::Constant(Constant::Boolean(
+                    method == ArrayMethod::Some,
+                ))),
             );
             graph.blocks[stop].terminator = Some(Terminator {
                 source_name: call.source_name,
@@ -266,11 +297,15 @@ fn iteration(graph: &mut Graph, inst: Inst, method: ArrayMethod) {
             });
         }
     }
-    let one = graph.append_value(advance, span, Op::Constant(Constant::Number(1.0)));
+    let one = graph.append_value(
+        advance,
+        span,
+        Op::Javascript(JsOp::Constant(Constant::Number(1.0))),
+    );
     let next = graph.append_value(
         advance,
         span,
-        Op::Binary(BinaryOperator::Addition, index, one),
+        Op::Javascript(JsOp::Binary(BinaryOperator::Addition, index, one)),
     );
     graph.blocks[advance].terminator = Some(Terminator {
         source_name: call.source_name,
@@ -306,11 +341,11 @@ pub(in crate::jit::semantic) fn push_calls(
     for block in Cfg::new(graph).rpo {
         for &inst in &graph.blocks[block].insts {
             let data = &graph.insts[inst];
-            let Op::Call {
+            let Op::Javascript(JsOp::Call {
                 callee,
                 receiver: Some(receiver),
                 ..
-            } = data.op
+            }) = data.op
             else {
                 continue;
             };
@@ -322,8 +357,8 @@ pub(in crate::jit::semantic) fn push_calls(
             };
             let known_array = matches!(
                 graph.defining_op(receiver),
-                Some(Op::NewArray(_) | Op::NewHoleyArray(_))
-            ) && matches!(graph.defining_op(callee), Some(Op::Get(object, name)) if *object == receiver && name == "push");
+                Some(Op::Javascript(JsOp::NewArray(_) | JsOp::NewHoleyArray(_)))
+            ) && matches!(graph.defining_op(callee), Some(Op::Javascript(JsOp::Get(object, name))) if *object == receiver && name == "push");
             if known_array
                 || bodies.native_feedback.get(&site)
                     == Some(&crate::heap::NativeFunction::ArrayPush)
@@ -335,12 +370,12 @@ pub(in crate::jit::semantic) fn push_calls(
     for &(inst, site, known_array) in &sites {
         let call = graph.insts[inst].clone();
         let first_new = graph.insts.len();
-        let Op::Call {
+        let Op::Javascript(JsOp::Call {
             callee,
             receiver: Some(receiver),
             args,
             ..
-        } = call.op
+        }) = call.op
         else {
             unreachable!()
         };
@@ -349,7 +384,7 @@ pub(in crate::jit::semantic) fn push_calls(
         let check = graph.append_value(
             block,
             call.span,
-            Op::IsArrayIteration(callee, receiver, ArrayMethod::Push),
+            Op::Javascript(JsOp::IsArrayIteration(callee, receiver, ArrayMethod::Push)),
         );
         let kind = TerminatorKind::Branch(check, Target::new(fast), Target::new(fallback));
         graph.blocks[block].terminator = Some(Terminator {
@@ -362,11 +397,15 @@ pub(in crate::jit::semantic) fn push_calls(
             graph.append(
                 fast,
                 call.span,
-                Op::ArrayAppend(receiver, value, false),
+                Op::Javascript(JsOp::ArrayAppend(receiver, value, false)),
                 false,
             );
         }
-        let length = graph.append_value(fast, call.span, Op::IndexedLength(receiver));
+        let length = graph.append_value(
+            fast,
+            call.span,
+            Op::Javascript(JsOp::IndexedLength(receiver)),
+        );
         graph.blocks[fast].terminator = Some(Terminator {
             source_name: call.source_name,
             emission_location: None,

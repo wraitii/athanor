@@ -1,6 +1,7 @@
 use super::hoisting::AssumeCfg;
 use crate::jit::layout::ReadLayout;
 use crate::jit::profile::{Observation, ReadKind};
+use crate::jit::semantic::JsOp;
 use crate::{FxHashMap, FxHashSet};
 
 use super::super::super::available::LoadKey;
@@ -13,13 +14,15 @@ fn retarget(graph: &mut Graph, blocks: &FxHashSet<Block>, from: Value, to: Value
         for inst in graph.blocks[block].insts.clone() {
             if !matches!(
                 graph.insts[inst].op,
-                Op::IsNumber(_)
-                    | Op::AsNumber(_)
-                    | Op::IsInteger(_)
-                    | Op::AsInteger(_)
-                    | Op::AsString(_)
-                    | Op::IsString(_)
-                    | Op::AsObject(_)
+                Op::Javascript(
+                    JsOp::IsNumber(_)
+                        | JsOp::AsNumber(_)
+                        | JsOp::IsInteger(_)
+                        | JsOp::AsInteger(_)
+                        | JsOp::AsString(_)
+                        | JsOp::IsString(_)
+                        | JsOp::AsObject(_)
+                )
             ) {
                 for value in graph.insts[inst].op.operands_mut() {
                     *value = resolve(&aliases, *value);
@@ -135,9 +138,13 @@ fn entry_checks(
     let mut current = start;
     let mut guarded_probes = FxHashMap::default();
     for (name, code) in code_guards {
-        let global = graph.append_value(current, span, Op::ProbeGlobal(name.clone()));
+        let global = graph.append_value(
+            current,
+            span,
+            Op::Javascript(JsOp::ProbeGlobal(name.clone())),
+        );
         guarded_probes.insert(name.clone(), global);
-        let check = graph.append_value(current, span, Op::IsCode(global, *code));
+        let check = graph.append_value(current, span, Op::Javascript(JsOp::IsCode(global, *code)));
         current = continue_if(graph, current, check, &original);
     }
     if requirements
@@ -150,7 +157,7 @@ fn entry_checks(
         let commit = graph.blocks.push(BlockData::default());
         graph.cold.extend([probes, commit]);
         let validated = graph.blocks.push(BlockData::default());
-        let valid = graph.append_value(current, span, Op::GuardValid(guard));
+        let valid = graph.append_value(current, span, Op::Javascript(JsOp::GuardValid(guard)));
         graph.terminate(
             current,
             span,
@@ -166,7 +173,7 @@ fn entry_checks(
             let global = match globals.get(&requirement.global) {
                 Some(&value) => value,
                 None => {
-                    let op = Op::ProbeGlobal(requirement.global.clone());
+                    let op = Op::Javascript(JsOp::ProbeGlobal(requirement.global.clone()));
                     let value = graph.append_value(probes, span, op);
                     globals.insert(requirement.global.clone(), value);
                     value
@@ -175,9 +182,9 @@ fn entry_checks(
             if !methods.insert((requirement.global.clone(), requirement.property.clone())) {
                 continue;
             }
-            let op = Op::ProbeProperty(global, requirement.property.clone());
+            let op = Op::Javascript(JsOp::ProbeProperty(global, requirement.property.clone()));
             let method = graph.append_value(probes, span, op);
-            let op = Op::IsNative(method, requirement.native);
+            let op = Op::Javascript(JsOp::IsNative(method, requirement.native));
             probed.push(graph.append_value(probes, span, op));
         }
         let mut chain = probes;
@@ -196,7 +203,12 @@ fn entry_checks(
             );
             chain = next;
         }
-        graph.append(commit, span, Op::GuardCommit(guard), false);
+        graph.append(
+            commit,
+            span,
+            Op::Javascript(JsOp::GuardCommit(guard)),
+            false,
+        );
         graph.terminate(commit, span, TerminatorKind::Jump(Target::new(validated)));
         current = validated;
     }
@@ -209,10 +221,17 @@ fn entry_checks(
             None => graph.append_value(
                 current,
                 span,
-                Op::ProbeProperty(requirement.object.unwrap(), requirement.property.clone()),
+                Op::Javascript(JsOp::ProbeProperty(
+                    requirement.object.unwrap(),
+                    requirement.property.clone(),
+                )),
             ),
         };
-        let check = graph.append_value(current, span, Op::IsNative(method, requirement.native));
+        let check = graph.append_value(
+            current,
+            span,
+            Op::Javascript(JsOp::IsNative(method, requirement.native)),
+        );
         current = continue_if(graph, current, check, &original);
     }
     let mut probes = FxHashMap::default();
@@ -224,24 +243,30 @@ fn entry_checks(
     for &inst in reads {
         let data = graph.insts[inst].clone();
         let mut op = match data.op.clone() {
-            Op::Get(object, name)
-            | Op::ShapedGet(object, name, _)
-            | Op::ProbeProperty(object, name) => {
+            Op::Javascript(
+                JsOp::Get(object, name)
+                | JsOp::ShapedGet(object, name, _)
+                | JsOp::ProbeProperty(object, name),
+            ) => {
                 match speculation
                     .shaped_reads
                     .iter()
                     .find(|&&(read, _)| read == inst)
                 {
-                    Some(&(_, layout)) => Op::ProbeShapeProperty(object, name, layout),
-                    None => Op::ProbeProperty(object, name),
+                    Some(&(_, layout)) => {
+                        Op::Javascript(JsOp::ProbeShapeProperty(object, name, layout))
+                    }
+                    None => Op::Javascript(JsOp::ProbeProperty(object, name)),
                 }
             }
-            Op::ProbeShapeProperty(..) => data.op.clone(),
-            Op::GetIndex(object, key) | Op::ArrayGet(object, key) => Op::ProbeIndex(object, key),
-            Op::GlobalRead(name) => Op::ProbeGlobal(name),
+            Op::Javascript(JsOp::ProbeShapeProperty(..)) => data.op.clone(),
+            Op::Javascript(JsOp::GetIndex(object, key) | JsOp::ArrayGet(object, key)) => {
+                Op::Javascript(JsOp::ProbeIndex(object, key))
+            }
+            Op::Javascript(JsOp::GlobalRead(name)) => Op::Javascript(JsOp::ProbeGlobal(name)),
             Op::Argument(index) => Op::Argument(index),
-            Op::This => Op::This,
-            Op::PropertyCache(..) => data.op.clone(),
+            Op::Javascript(JsOp::This) => Op::Javascript(JsOp::This),
+            Op::Javascript(JsOp::PropertyCache(..)) => data.op.clone(),
             _ => unreachable!(),
         };
         for value in op.operands_mut() {
@@ -250,23 +275,30 @@ fn entry_checks(
             }
         }
         let key = match &op {
-            Op::ProbeGlobal(name) => LoadKey::Global(name.clone()),
-            Op::ProbeProperty(object, name) | Op::ProbeShapeProperty(object, name, ..) => {
-                LoadKey::Property(*object, name.clone())
-            }
-            Op::ProbeIndex(object, key) => LoadKey::Index(*object, *key),
+            Op::Javascript(JsOp::ProbeGlobal(name)) => LoadKey::Global(name.clone()),
+            Op::Javascript(
+                JsOp::ProbeProperty(object, name) | JsOp::ProbeShapeProperty(object, name, ..),
+            ) => LoadKey::Property(*object, name.clone()),
+            Op::Javascript(JsOp::ProbeIndex(object, key)) => LoadKey::Index(*object, *key),
             Op::Argument(index) => LoadKey::Argument(*index),
-            Op::This => LoadKey::This,
-            Op::PropertyCache(site, _) => LoadKey::PropertyCache(*site),
+            Op::Javascript(JsOp::This) => LoadKey::This,
+            Op::Javascript(JsOp::PropertyCache(site, _)) => LoadKey::PropertyCache(*site),
             _ => unreachable!(),
         };
         let value = match available.get(&key) {
             Some(&value) => value,
             None => {
-                let input = matches!(op, Op::Argument(_) | Op::This | Op::PropertyCache(..));
+                let input = matches!(
+                    op,
+                    Op::Argument(_) | Op::Javascript(JsOp::This | JsOp::PropertyCache(..))
+                );
                 let value = graph.append_value(current, data.span, op);
                 if !input {
-                    let failed = graph.append_value(current, data.span, Op::IsUninitialized(value));
+                    let failed = graph.append_value(
+                        current,
+                        data.span,
+                        Op::Javascript(JsOp::IsUninitialized(value)),
+                    );
                     let next = graph.blocks.push(BlockData::default());
                     graph.blocks[current].terminator = Some(Terminator {
                         source_name: data.source_name,
@@ -316,7 +348,10 @@ fn entry_checks(
             let ValueDef::Result(inst, _) = graph.values[condition] else {
                 unreachable!();
             };
-            graph.set_op(inst, Op::Constant(Constant::Boolean(true)));
+            graph.set_op(
+                inst,
+                Op::Javascript(JsOp::Constant(Constant::Boolean(true))),
+            );
             (Some(op), key)
         } else {
             let key = graph
@@ -340,10 +375,10 @@ fn entry_checks(
             super::super::super::guards::record_entry(graph, value, fact);
         }
         let otherwise = match &test {
-            Some(Op::IsPropertyCached(object, site, _)) => {
+            Some(Op::Javascript(JsOp::IsPropertyCached(object, site, _))) => {
                 let prime = graph.blocks.push(BlockData::default());
                 graph.cold.insert(prime);
-                let op = Op::PrimePropertyCache(*object, *site);
+                let op = Op::Javascript(JsOp::PrimePropertyCache(*object, *site));
                 graph.append(prime, span, op, false);
                 graph.blocks[prime].terminator = Some(Terminator {
                     source_name,
@@ -356,10 +391,14 @@ fn entry_checks(
             _ => original.clone(),
         };
         let shaped = match &test {
-            Some(Op::IsPropertyCached(object, _, false)) if graph.caller_rooted(*object) => {
+            Some(Op::Javascript(JsOp::IsPropertyCached(object, _, false)))
+                if graph.caller_rooted(*object) =>
+            {
                 Some(*object)
             }
-            Some(Op::IsShape(object, _)) if graph.caller_rooted(*object) => Some(*object),
+            Some(Op::Javascript(JsOp::IsShape(object, _))) if graph.caller_rooted(*object) => {
+                Some(*object)
+            }
             _ => None,
         };
         let condition = test.map_or(condition, |op| graph.append_value(current, span, op));
@@ -374,7 +413,7 @@ fn entry_checks(
         if let Some(object) = shaped
             && !objects.contains_key(&object)
         {
-            let alias = graph.append_value(current, span, Op::AsObject(object));
+            let alias = graph.append_value(current, span, Op::Javascript(JsOp::AsObject(object)));
             objects.insert(object, alias);
             retarget(graph, copies, object, alias);
             for arg in &mut args {
@@ -387,14 +426,14 @@ fn entry_checks(
     for &(value, fact) in assumes {
         let checked = values.get(&value).copied().unwrap_or(value);
         let test = match fact {
-            Fact::Array => Op::IsOrdinaryArray(checked),
-            Fact::Shape(shape) => Op::IsShape(checked, shape),
-            Fact::ReadLayout(layout) => Op::IsReadLayout(checked, layout),
-            Fact::Cached(cache, builtins) => Op::IsPropertyCached(
+            Fact::Array => Op::Javascript(JsOp::IsOrdinaryArray(checked)),
+            Fact::Shape(shape) => Op::Javascript(JsOp::IsShape(checked, shape)),
+            Fact::ReadLayout(layout) => Op::Javascript(JsOp::IsReadLayout(checked, layout)),
+            Fact::Cached(cache, builtins) => Op::Javascript(JsOp::IsPropertyCached(
                 checked,
                 values.get(&cache).copied().unwrap_or(cache),
                 builtins,
-            ),
+            )),
             _ => continue,
         };
         let guard = EntryGuard::Fact(checked, fact);
@@ -402,18 +441,25 @@ fn entry_checks(
             continue;
         }
         tested.insert(guard);
-        let otherwise = if let Op::IsPropertyCached(object, site, _) = &test {
+        let otherwise = if let Op::Javascript(JsOp::IsPropertyCached(object, site, _)) = &test {
             let prime = graph.blocks.push(BlockData::default());
             graph.cold.insert(prime);
-            graph.append(prime, span, Op::PrimePropertyCache(*object, *site), false);
+            graph.append(
+                prime,
+                span,
+                Op::Javascript(JsOp::PrimePropertyCache(*object, *site)),
+                false,
+            );
             graph.terminate(prime, span, TerminatorKind::Jump(original.clone()));
             Target::new(prime)
         } else {
             original.clone()
         };
         let shaped = match &test {
-            Op::IsPropertyCached(object, _, builtins) => !builtins && graph.caller_rooted(*object),
-            Op::IsShape(object, _) => graph.caller_rooted(*object),
+            Op::Javascript(JsOp::IsPropertyCached(object, _, builtins)) => {
+                !builtins && graph.caller_rooted(*object)
+            }
+            Op::Javascript(JsOp::IsShape(object, _)) => graph.caller_rooted(*object),
             _ => false,
         };
         if entry.is_none() {
@@ -430,7 +476,7 @@ fn entry_checks(
         );
         current = next;
         if shaped && !objects.contains_key(&checked) {
-            let alias = graph.append_value(current, span, Op::AsObject(checked));
+            let alias = graph.append_value(current, span, Op::Javascript(JsOp::AsObject(checked)));
             objects.insert(checked, alias);
             retarget(graph, copies, checked, alias);
             for arg in &mut args {
@@ -479,11 +525,11 @@ fn entry_checks(
                 current,
                 span,
                 if fact == Fact::Type(ValueType::STRING) {
-                    Op::AsString(checked)
+                    Op::Javascript(JsOp::AsString(checked))
                 } else if fact == Fact::Type(ValueType::INTEGER) {
-                    Op::AsInteger(checked)
+                    Op::Javascript(JsOp::AsInteger(checked))
                 } else {
-                    Op::AsNumber(checked)
+                    Op::Javascript(JsOp::AsNumber(checked))
                 },
             )
         });
@@ -616,7 +662,9 @@ impl AssumeCfg {
                 .insts
                 .iter()
                 .copied()
-                .take_while(|&inst| matches!(graph.insts[inst].op, Op::AsObject(_)))
+                .take_while(|&inst| {
+                    matches!(graph.insts[inst].op, Op::Javascript(JsOp::AsObject(_)))
+                })
                 .collect();
             for inst in aliases {
                 graph.move_inst(inst, exit);
@@ -672,9 +720,9 @@ impl AssumeCfg {
         for inst in insts {
             let data = &graph.insts[inst];
             let (value, required) = match data.op {
-                Op::AsString(value) => (value, Fact::Type(ValueType::STRING)),
-                Op::AsNumber(value) => (value, Fact::Type(ValueType::NUMBER)),
-                Op::AsInteger(value) => (value, Fact::Type(ValueType::INTEGER)),
+                Op::Javascript(JsOp::AsString(value)) => (value, Fact::Type(ValueType::STRING)),
+                Op::Javascript(JsOp::AsNumber(value)) => (value, Fact::Type(ValueType::NUMBER)),
+                Op::Javascript(JsOp::AsInteger(value)) => (value, Fact::Type(ValueType::INTEGER)),
                 _ => continue,
             };
             let block = data.block;
@@ -789,12 +837,16 @@ fn typed_guards(
 ) -> Block {
     let span = graph.span;
     for &(object, element) in typed {
-        let check = graph.append_value(current, span, Op::IsTyped(object, element));
+        let check = graph.append_value(
+            current,
+            span,
+            Op::Javascript(JsOp::IsTyped(object, element)),
+        );
         current = continue_if(graph, current, check, fallback);
     }
     for &(object, bound) in bounds {
-        let length = graph.append_value(current, span, Op::IndexedLength(object));
-        let fits = Op::Binary(BinaryOperator::LessEqualThan, bound, length);
+        let length = graph.append_value(current, span, Op::Javascript(JsOp::IndexedLength(object)));
+        let fits = Op::Javascript(JsOp::Binary(BinaryOperator::LessEqualThan, bound, length));
         let fits = graph.append_value(current, span, fits);
         current = continue_if(graph, current, fits, fallback);
     }
@@ -850,7 +902,7 @@ mod tests {
         let condition = graph.append_value(
             branch,
             graph.span,
-            Op::IsTyped(xs, Some(TypedKind::Float32)),
+            Op::Javascript(JsOp::IsTyped(xs, Some(TypedKind::Float32))),
         );
         let TerminatorKind::Branch(test, yes, no) =
             &mut graph.blocks[branch].terminator.as_mut().unwrap().kind
@@ -973,8 +1025,10 @@ pub(super) fn materialize(
         .collect();
     let scope = region.iter().copied().collect();
     for &(inst, read) in speculation.typed_reads {
-        if let Op::GetIndex(object, key) | Op::TypedIndex(object, key, _) = graph.insts[inst].op {
-            graph.set_op(inst, Op::TypedIndex(object, key, read));
+        if let Op::Javascript(JsOp::GetIndex(object, key) | JsOp::TypedIndex(object, key, _)) =
+            graph.insts[inst].op
+        {
+            graph.set_op(inst, Op::Javascript(JsOp::TypedIndex(object, key, read)));
         }
     }
     let native: Vec<_> = requirements
@@ -1075,11 +1129,11 @@ pub(super) fn materialize(
                 0,
                 data.span,
                 if types == ValueType::STRING {
-                    Op::AsString(value)
+                    Op::Javascript(JsOp::AsString(value))
                 } else if types.within(ValueType::INTEGER) {
-                    Op::AsInteger(value)
+                    Op::Javascript(JsOp::AsInteger(value))
                 } else {
-                    Op::AsNumber(value)
+                    Op::Javascript(JsOp::AsNumber(value))
                 },
                 true,
             );
@@ -1139,11 +1193,13 @@ pub(super) fn materialize(
             let span = graph.blocks[block].terminator.as_ref().unwrap().span;
             crate::jit::bailouts::note_guard(span, graph.op_text(op));
         }
-        if let Some(Op::IsPropertyCached(object, site, _)) = graph.defining_op(condition) {
+        if let Some(Op::Javascript(JsOp::IsPropertyCached(object, site, _))) =
+            graph.defining_op(condition)
+        {
             graph.append(
                 failure.block,
                 graph.span,
-                Op::PrimePropertyCache(*object, *site),
+                Op::Javascript(JsOp::PrimePropertyCache(*object, *site)),
                 false,
             );
         }
@@ -1257,7 +1313,12 @@ pub(super) fn finish(
                 Op::Continuation(piece.body.clone(), inputs),
             );
             for &scope in scopes[block].iter().rev() {
-                graph.append(block, term.span, Op::LeaveScope(scope), false);
+                graph.append(
+                    block,
+                    term.span,
+                    Op::Javascript(JsOp::LeaveScope(scope)),
+                    false,
+                );
             }
             graph.terminate(block, term.span, TerminatorKind::Return(result));
             notes.push(format!(
@@ -1320,7 +1381,12 @@ pub(super) fn finish(
                 let result =
                     graph.append_value(current, generic.span, Op::Continuation(piece.body, inputs));
                 for scope in scopes.into_iter().rev() {
-                    graph.append(current, generic.span, Op::LeaveScope(scope), false);
+                    graph.append(
+                        current,
+                        generic.span,
+                        Op::Javascript(JsOp::LeaveScope(scope)),
+                        false,
+                    );
                 }
                 graph.terminate(current, generic.span, TerminatorKind::Return(result));
             }

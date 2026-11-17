@@ -1,5 +1,6 @@
 use super::super::dispatch::append;
 use super::super::{BlockData, Facts, Graph, Inst, Target, TerminatorKind};
+use crate::jit::semantic::JsOp;
 use cranelift_codegen::ir::{
     condcodes::{FloatCC, IntCC},
     types,
@@ -25,19 +26,20 @@ pub(in crate::jit::semantic) fn relax_checks(function: &mut FunctionState) -> bo
     for &block in &function.facts.cfg.rpo {
         insts.clone_from(&graph.blocks[block].insts);
         for &inst in &insts {
-            let Op::IntegerCheck(value, float, exact) = graph.insts[inst].op else {
+            let Op::Javascript(JsOp::IntegerCheck(value, float, exact)) = graph.insts[inst].op
+            else {
                 continue;
             };
-            let Some(Op::NumericFloat(integer)) = graph.defining_op(exact) else {
+            let Some(Op::Javascript(JsOp::NumericFloat(integer))) = graph.defining_op(exact) else {
                 continue;
             };
             // The round trip now serves only the guard, with no integer consumers.
             if uses[exact] == 1
                 && uses[*integer] == 1
-                && matches!(graph.defining_op(*integer), Some(Op::SaturatingInteger(input)) if *input == float)
-                && matches!(graph.defining_op(float), Some(Op::NumericFloat(input)) if *input == value)
+                && matches!(graph.defining_op(*integer), Some(Op::Javascript(JsOp::SaturatingInteger(input))) if *input == float)
+                && matches!(graph.defining_op(float), Some(Op::Javascript(JsOp::NumericFloat(input))) if *input == value)
             {
-                graph.set_op(inst, Op::IsNumber(value));
+                graph.set_op(inst, Op::Javascript(JsOp::IsNumber(value)));
                 changed = true;
             }
         }
@@ -61,21 +63,25 @@ fn lower_checks(function: &mut FunctionState) -> bool {
         insts.clone_from(&graph.blocks[block].insts);
         for &inst in &insts {
             let op = &graph.insts[inst].op;
-            let integer_check = matches!(op, Op::IsInteger(_));
+            let integer_check = matches!(op, Op::Javascript(JsOp::IsInteger(_)));
             let value = match *op {
-                Op::IsInteger(value) => value,
-                Op::AsInteger(value) if !facts.of(value).within(ValueType::INTEGER) => value,
+                Op::Javascript(JsOp::IsInteger(value)) => value,
+                Op::Javascript(JsOp::AsInteger(value))
+                    if !facts.of(value).within(ValueType::INTEGER) =>
+                {
+                    value
+                }
                 _ => continue,
             };
             changed = true;
             let mut at = Cursor::before(graph, inst);
-            let float = at.add_unassigned(Op::NumericFloat(value));
-            let integer = at.add_unassigned(Op::SaturatingInteger(float));
+            let float = at.add_unassigned(Op::Javascript(JsOp::NumericFloat(value)));
+            let integer = at.add_unassigned(Op::Javascript(JsOp::SaturatingInteger(float)));
             let op = if integer_check {
-                let exact = at.add_unassigned(Op::NumericFloat(integer));
-                Op::IntegerCheck(value, float, exact)
+                let exact = at.add_unassigned(Op::Javascript(JsOp::NumericFloat(integer)));
+                Op::Javascript(JsOp::IntegerCheck(value, float, exact))
             } else {
-                Op::AsInteger(integer)
+                Op::Javascript(JsOp::AsInteger(integer))
             };
             graph.set_op(inst, op);
         }
@@ -132,7 +138,7 @@ pub(in crate::jit::semantic) fn operations(function: &mut FunctionState) -> bool
 fn arithmetic_inst(graph: &mut Graph, facts: &Facts, inst: Inst) -> bool {
     let numeric = ValueType::NUMBER.union(ValueType::UNDEFINED);
     let data = &graph.insts[inst];
-    let Op::Binary(operator, mut left, mut right) = data.op else {
+    let Op::Javascript(JsOp::Binary(operator, mut left, mut right)) = data.op else {
         return false;
     };
     if !matches!(
@@ -164,8 +170,8 @@ fn arithmetic_inst(graph: &mut Graph, facts: &Facts, inst: Inst) -> bool {
     };
     if !integer {
         let mut at = Cursor::before(graph, inst);
-        left = at.add_unassigned(Op::NumericFloat(left));
-        right = at.add_unassigned(Op::NumericFloat(right));
+        left = at.add_unassigned(Op::Javascript(JsOp::NumericFloat(left)));
+        right = at.add_unassigned(Op::Javascript(JsOp::NumericFloat(right)));
     }
     graph.set_op(inst, Op::LowLevel(LowLevel::Binary { op, left, right }));
 
@@ -175,7 +181,7 @@ fn arithmetic_inst(graph: &mut Graph, facts: &Facts, inst: Inst) -> bool {
 fn integer_operations_inst(graph: &mut Graph, facts: &Facts, inst: Inst) -> bool {
     let numeric = ValueType::NUMBER.union(ValueType::UNDEFINED);
     let data = &graph.insts[inst];
-    let Op::Binary(operator, left, right) = data.op else {
+    let Op::Javascript(JsOp::Binary(operator, left, right)) = data.op else {
         return false;
     };
     let result = data.result().unwrap();
@@ -197,7 +203,7 @@ fn integer_operations_inst(graph: &mut Graph, facts: &Facts, inst: Inst) -> bool
         if types != ValueType::default() && types.within(ValueType::INT32) {
             return value;
         }
-        at.add_unassigned(Op::ToInt32(value))
+        at.add_unassigned(Op::Javascript(JsOp::ToInt32(value)))
     };
     let left = integer(left);
     let right = integer(right);
@@ -222,7 +228,7 @@ fn natives_inst(graph: &mut Graph, facts: &Facts, inst: Inst) -> bool {
     use crate::heap::MathFunction;
 
     let numeric = ValueType::NUMBER.union(ValueType::UNDEFINED);
-    let Op::CallNative(native, args) = &graph.insts[inst].op else {
+    let Op::Javascript(JsOp::CallNative(native, args)) = &graph.insts[inst].op else {
         return false;
     };
     let function = crate::jit::math::METHODS[native.index()].1;
@@ -238,14 +244,14 @@ fn natives_inst(graph: &mut Graph, facts: &Facts, inst: Inst) -> bool {
     }
 
     if unary.is_none() && args.len() == 1 {
-        graph.set_op(inst, Op::NumericFloat(args[0]));
+        graph.set_op(inst, Op::Javascript(JsOp::NumericFloat(args[0])));
         return true;
     }
     let args = args.clone();
     let mut at = Cursor::before(graph, inst);
     let floats: Vec<_> = args
         .iter()
-        .map(|&arg| at.add_unassigned(Op::NumericFloat(arg)))
+        .map(|&arg| at.add_unassigned(Op::Javascript(JsOp::NumericFloat(arg))))
         .collect();
     let replacement = match unary {
         Some(op) => Op::LowLevel(LowLevel::Unary {
@@ -287,20 +293,24 @@ fn comparisons_and_unary_inst(
     let known = |value, types| facts.of(value).intersects(types) && facts.of(value).within(types);
     if !matches!(
         graph.insts[inst].op,
-        Op::Binary(..) | Op::GuardedCompare { .. } | Op::Unary(..) | Op::ToNumeric(..)
+        Op::Javascript(
+            JsOp::Binary(..) | JsOp::GuardedCompare { .. } | JsOp::Unary(..) | JsOp::ToNumeric(..)
+        )
     ) {
         return false;
     }
     let data = graph.insts[inst].clone();
     let mut at = Cursor::before(graph, inst);
     let replacement = match data.op {
-        Op::Binary(operator, left, right)
-        | Op::GuardedCompare {
-            operator,
-            left,
-            right,
-            ..
-        } => {
+        Op::Javascript(
+            JsOp::Binary(operator, left, right)
+            | JsOp::GuardedCompare {
+                operator,
+                left,
+                right,
+                ..
+            },
+        ) => {
             use BinaryOperator as B;
             let (integer_condition, float_condition, equality) = match operator {
                 B::LessThan => (IntCC::SignedLessThan, FloatCC::LessThan, false),
@@ -340,8 +350,8 @@ fn comparisons_and_unary_inst(
                     right,
                 })
             } else {
-                let left = at.add_unassigned(Op::NumericFloat(left));
-                let right = at.add_unassigned(Op::NumericFloat(right));
+                let left = at.add_unassigned(Op::Javascript(JsOp::NumericFloat(left)));
+                let right = at.add_unassigned(Op::Javascript(JsOp::NumericFloat(right)));
                 Op::LowLevel(LowLevel::FloatCompare {
                     condition: float_condition,
                     left,
@@ -349,25 +359,29 @@ fn comparisons_and_unary_inst(
                 })
             }
         }
-        Op::Unary(UnaryOp::Plus, value) | Op::ToNumeric(value) if known(value, numeric) => {
+        Op::Javascript(JsOp::Unary(UnaryOp::Plus, value) | JsOp::ToNumeric(value))
+            if known(value, numeric) =>
+        {
             if known(value, ValueType::NUMBER) {
                 aliases.insert(data.result().unwrap(), value);
                 removed.push(inst);
                 return true;
             }
-            Op::NumericFloat(value)
+            Op::Javascript(JsOp::NumericFloat(value))
         }
-        Op::Unary(UnaryOp::Increment | UnaryOp::Decrement, value) if known(value, numeric) => {
-            let increment = matches!(data.op, Op::Unary(UnaryOp::Increment, _));
+        Op::Javascript(JsOp::Unary(UnaryOp::Increment | UnaryOp::Decrement, value))
+            if known(value, numeric) =>
+        {
+            let increment = matches!(data.op, Op::Javascript(JsOp::Unary(UnaryOp::Increment, _)));
             let integer = data
                 .result()
                 .is_some_and(|value| known(value, ValueType::INTEGER));
             let value = if integer {
                 value
             } else {
-                at.add_unassigned(Op::NumericFloat(value))
+                at.add_unassigned(Op::Javascript(JsOp::NumericFloat(value)))
             };
-            let one = at.add_unassigned(Op::Constant(Constant::Number(1.0)));
+            let one = at.add_unassigned(Op::Javascript(JsOp::Constant(Constant::Number(1.0))));
             let op = match (integer, increment) {
                 (true, true) => Binary::Add,
                 (true, false) => Binary::Subtract,
@@ -380,42 +394,43 @@ fn comparisons_and_unary_inst(
                 right: one,
             })
         }
-        Op::Unary(UnaryOp::Negate, value) if known(value, numeric) => {
-            let value = at.add_unassigned(Op::NumericFloat(value));
+        Op::Javascript(JsOp::Unary(UnaryOp::Negate, value)) if known(value, numeric) => {
+            let value = at.add_unassigned(Op::Javascript(JsOp::NumericFloat(value)));
             Op::LowLevel(LowLevel::Unary {
                 op: Unary::FloatNeg,
                 ty: types::F64,
                 value,
             })
         }
-        Op::Unary(UnaryOp::BitwiseNot, value) if known(value, numeric) => {
-            let value = at.add_unassigned(Op::ToInt32(value));
+        Op::Javascript(JsOp::Unary(UnaryOp::BitwiseNot, value)) if known(value, numeric) => {
+            let value = at.add_unassigned(Op::Javascript(JsOp::ToInt32(value)));
             Op::LowLevel(LowLevel::Unary {
                 op: Unary::BitNot,
                 ty: types::I32,
                 value,
             })
         }
-        Op::Unary(UnaryOp::Not, value)
+        Op::Javascript(JsOp::Unary(UnaryOp::Not, value))
             if known(value, numeric) || known(value, ValueType::BOOLEAN) =>
         {
             if known(value, ValueType::BOOLEAN) {
-                let zero = at.add_unassigned(Op::Constant(Constant::Boolean(false)));
+                let zero =
+                    at.add_unassigned(Op::Javascript(JsOp::Constant(Constant::Boolean(false))));
                 Op::LowLevel(LowLevel::Binary {
                     op: Binary::BooleanEqual,
                     left: value,
                     right: zero,
                 })
             } else if known(value, ValueType::INTEGER) {
-                let zero = at.add_unassigned(Op::Constant(Constant::Number(0.0)));
+                let zero = at.add_unassigned(Op::Javascript(JsOp::Constant(Constant::Number(0.0))));
                 Op::LowLevel(LowLevel::IntCompare {
                     condition: IntCC::Equal,
                     left: value,
                     right: zero,
                 })
             } else {
-                let value = at.add_unassigned(Op::NumericFloat(value));
-                let zero = at.add_unassigned(Op::Constant(Constant::Number(0.0)));
+                let value = at.add_unassigned(Op::Javascript(JsOp::NumericFloat(value)));
+                let zero = at.add_unassigned(Op::Javascript(JsOp::Constant(Constant::Number(0.0))));
                 Op::LowLevel(LowLevel::FloatCompare {
                     condition: FloatCC::UnorderedOrEqual,
                     left: value,
@@ -443,23 +458,23 @@ pub(in crate::jit::semantic) fn bitwise(function: &mut FunctionState) -> bool {
         .filter(|block| !graph.cold.contains(block))
         .flat_map(|&block| graph.blocks[block].insts.iter().copied())
         .filter(|&inst| {
-            matches!(graph.insts[inst].op, Op::Binary(
+            matches!(graph.insts[inst].op, Op::Javascript(JsOp::Binary(
             BinaryOperator::BitwiseAnd | BinaryOperator::BitwiseOR
             | BinaryOperator::BitwiseXOR | BinaryOperator::ShiftLeft
             | BinaryOperator::ShiftRight | BinaryOperator::ShiftRightZeroFill,
             left, right,
-        ) if !facts.of(left).within(ValueType::NUMBER) || !facts.of(right).within(ValueType::NUMBER))
+        )) if !facts.of(left).within(ValueType::NUMBER) || !facts.of(right).within(ValueType::NUMBER))
         })
         .collect();
     for &inst in &candidates {
         let data = graph.insts[inst].clone();
-        let Op::Binary(operator, left, right) = data.op else {
+        let Op::Javascript(JsOp::Binary(operator, left, right)) = data.op else {
             unreachable!()
         };
         let (block, continuation, fallback) = super::super::dispatch::split(graph, inst);
         let fast = graph.blocks.push(BlockData::default());
-        let left_number = append(graph, &data, block, Op::IsNumber(left));
-        let right_number = append(graph, &data, block, Op::IsNumber(right));
+        let left_number = append(graph, &data, block, Op::Javascript(JsOp::IsNumber(left)));
+        let right_number = append(graph, &data, block, Op::Javascript(JsOp::IsNumber(right)));
         let both = append(
             graph,
             &data,
@@ -471,11 +486,16 @@ pub(in crate::jit::semantic) fn bitwise(function: &mut FunctionState) -> bool {
             data.span,
             TerminatorKind::Branch(both, Target::new(fast), Target::new(fallback)),
         );
-        let left = append(graph, &data, fast, Op::AsNumber(left));
-        let right = append(graph, &data, fast, Op::AsNumber(right));
-        let left = append(graph, &data, fast, Op::ToInt32(left));
-        let right = append(graph, &data, fast, Op::ToInt32(right));
-        let result = append(graph, &data, fast, Op::Binary(operator, left, right));
+        let left = append(graph, &data, fast, Op::Javascript(JsOp::AsNumber(left)));
+        let right = append(graph, &data, fast, Op::Javascript(JsOp::AsNumber(right)));
+        let left = append(graph, &data, fast, Op::Javascript(JsOp::ToInt32(left)));
+        let right = append(graph, &data, fast, Op::Javascript(JsOp::ToInt32(right)));
+        let result = append(
+            graph,
+            &data,
+            fast,
+            Op::Javascript(JsOp::Binary(operator, left, right)),
+        );
         graph.terminate(
             fast,
             data.span,
@@ -522,13 +542,13 @@ pub(in crate::jit::semantic) fn dispatch(function: &mut FunctionState) -> bool {
         let fast = graph.blocks.push(BlockData::default());
         let mut at = Cursor::at_end(graph, block, inst);
         let condition = match data.op {
-            Op::GuardedCompare { numbers, .. } => {
+            Op::Javascript(JsOp::GuardedCompare { numbers, .. }) => {
                 at.add_unassigned(Op::BooleanAnd(numbers[0], numbers[1]))
             }
             _ => {
                 let checks: Vec<_> = operands
                     .iter()
-                    .map(|&value| at.add_unassigned(Op::IsNumber(value)))
+                    .map(|&value| at.add_unassigned(Op::Javascript(JsOp::IsNumber(value))))
                     .collect();
                 let mut condition = checks[0];
                 for &check in &checks[1..] {
@@ -545,7 +565,7 @@ pub(in crate::jit::semantic) fn dispatch(function: &mut FunctionState) -> bool {
         let mut at = Cursor::at_end(graph, fast, inst);
         let numbers: Vec<_> = operands
             .iter()
-            .map(|&value| at.add_unassigned(Op::AsNumber(value)))
+            .map(|&value| at.add_unassigned(Op::Javascript(JsOp::AsNumber(value))))
             .collect();
         let result = at.add_unassigned(numeric_op(&data.op, numbers));
         at.terminate_current(TerminatorKind::Jump(Target {
@@ -563,31 +583,35 @@ pub(in crate::jit::semantic) fn dispatch(function: &mut FunctionState) -> bool {
 fn numeric_operands(op: &Op) -> Option<Vec<Value>> {
     use BinaryOperator as B;
     Some(match op {
-        Op::Binary(
-            B::Addition
-            | B::Subtraction
-            | B::Multiplication
-            | B::Division
-            | B::LessThan
-            | B::LessEqualThan
-            | B::GreaterThan
-            | B::GreaterEqualThan
-            | B::Equality
-            | B::Inequality
-            | B::StrictEquality
-            | B::StrictInequality
-            | B::BitwiseAnd
-            | B::BitwiseOR
-            | B::BitwiseXOR
-            | B::ShiftLeft
-            | B::ShiftRight
-            | B::ShiftRightZeroFill,
-            left,
-            right,
-        )
-        | Op::GuardedCompare { left, right, .. } => vec![*left, *right],
-        Op::Unary(UnaryOp::Increment | UnaryOp::Decrement, value) => vec![*value],
-        Op::CallNative(native, args) if inline_math(*native, args.len()) => args.clone(),
+        Op::Javascript(
+            JsOp::Binary(
+                B::Addition
+                | B::Subtraction
+                | B::Multiplication
+                | B::Division
+                | B::LessThan
+                | B::LessEqualThan
+                | B::GreaterThan
+                | B::GreaterEqualThan
+                | B::Equality
+                | B::Inequality
+                | B::StrictEquality
+                | B::StrictInequality
+                | B::BitwiseAnd
+                | B::BitwiseOR
+                | B::BitwiseXOR
+                | B::ShiftLeft
+                | B::ShiftRight
+                | B::ShiftRightZeroFill,
+                left,
+                right,
+            )
+            | JsOp::GuardedCompare { left, right, .. },
+        ) => vec![*left, *right],
+        Op::Javascript(JsOp::Unary(UnaryOp::Increment | UnaryOp::Decrement, value)) => vec![*value],
+        Op::Javascript(JsOp::CallNative(native, args)) if inline_math(*native, args.len()) => {
+            args.clone()
+        }
         _ => return None,
     })
 }
@@ -605,11 +629,15 @@ fn inline_math(native: super::super::Native, arguments: usize) -> bool {
 
 fn numeric_op(op: &Op, numbers: Vec<Value>) -> Op {
     match *op {
-        Op::Binary(operator, ..) | Op::GuardedCompare { operator, .. } => {
-            Op::Binary(operator, numbers[0], numbers[1])
+        Op::Javascript(JsOp::Binary(operator, ..) | JsOp::GuardedCompare { operator, .. }) => {
+            Op::Javascript(JsOp::Binary(operator, numbers[0], numbers[1]))
         }
-        Op::Unary(operator, _) => Op::Unary(operator, numbers[0]),
-        Op::CallNative(native, _) => Op::CallNative(native, numbers),
+        Op::Javascript(JsOp::Unary(operator, _)) => {
+            Op::Javascript(JsOp::Unary(operator, numbers[0]))
+        }
+        Op::Javascript(JsOp::CallNative(native, _)) => {
+            Op::Javascript(JsOp::CallNative(native, numbers))
+        }
         _ => unreachable!(),
     }
 }

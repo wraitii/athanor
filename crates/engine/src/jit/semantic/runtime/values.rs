@@ -1,3 +1,4 @@
+use crate::jit::semantic::JsOp;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{MemFlagsData, types};
 
@@ -18,7 +19,7 @@ pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) {
     for &block in &facts.cfg.rpo {
         insts.clone_from(&graph.blocks[block].insts);
         for &inst in &insts {
-            if let Op::View(object) = graph.insts[inst].op {
+            if let Op::Javascript(JsOp::View(object)) = graph.insts[inst].op {
                 let result = graph.insts[inst].result().unwrap();
                 let view = view(graph, inst, object);
                 aliases.insert(result, view);
@@ -31,7 +32,8 @@ pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) {
                 removed.push(inst);
                 continue;
             }
-            let Op::ConstructorResult(result, instance) = graph.insts[inst].op else {
+            let Op::Javascript(JsOp::ConstructorResult(result, instance)) = graph.insts[inst].op
+            else {
                 continue;
             };
             let mut at = Cursor::before(graph, inst);
@@ -108,10 +110,10 @@ fn predicate(graph: &mut Graph, facts: &Facts, inst: Inst) -> Option<Value> {
     let op = &graph.insts[inst].op;
     let boxed = |_: &Graph, value: Value| !scalar(facts.of(value));
     Some(match *op {
-        Op::IntegerCheck(value, float, exact) => {
+        Op::Javascript(JsOp::IntegerCheck(value, float, exact)) => {
             integer_check(&mut Cursor::before(graph, inst), value, float, exact)
         }
-        Op::IsInteger(value) => {
+        Op::Javascript(JsOp::IsInteger(value)) => {
             let mut at = Cursor::before(graph, inst);
             let bits = at.as_word(value);
             let float = at.ins().bitcast(types::F64, MemFlagsData::new(), bits);
@@ -119,31 +121,31 @@ fn predicate(graph: &mut Graph, facts: &Facts, inst: Inst) -> Option<Value> {
             let exact = at.ins().fcvt_from_sint(types::F64, integer);
             integer_check(&mut at, value, float, exact)
         }
-        Op::IsNumber(value) if boxed(graph, value) => {
+        Op::Javascript(JsOp::IsNumber(value)) if boxed(graph, value) => {
             let mut at = Cursor::before(graph, inst);
             let word = at.as_word(value);
             layout::is_number(&mut at, word)
         }
-        Op::IsNumber(value) => {
+        Op::Javascript(JsOp::IsNumber(value)) => {
             let number = !facts.of(value).within(ValueType::BOOLEAN);
             let mut at = Cursor::before(graph, inst);
             at.ins().boolean(number)
         }
-        Op::IsUninitialized(value) | Op::IsUndefined(value) | Op::IsNullish(value)
-            if !boxed(graph, value) =>
-        {
+        Op::Javascript(
+            JsOp::IsUninitialized(value) | JsOp::IsUndefined(value) | JsOp::IsNullish(value),
+        ) if !boxed(graph, value) => {
             let mut at = Cursor::before(graph, inst);
             at.ins().boolean(false)
         }
-        Op::IsUninitialized(value) => equals(
+        Op::Javascript(JsOp::IsUninitialized(value)) => equals(
             &mut Cursor::before(graph, inst),
             value,
             JsValue::UNINITIALIZED,
         ),
-        Op::IsUndefined(value) => {
+        Op::Javascript(JsOp::IsUndefined(value)) => {
             equals(&mut Cursor::before(graph, inst), value, JsValue::UNDEFINED)
         }
-        Op::IsNullish(value) => {
+        Op::Javascript(JsOp::IsNullish(value)) => {
             let mut at = Cursor::before(graph, inst);
             let word = at.as_word(value);
             let undefined =
@@ -154,24 +156,24 @@ fn predicate(graph: &mut Graph, facts: &Facts, inst: Inst) -> Option<Value> {
                 .icmp_imm_s(IntCC::Equal, word, JsValue::NULL.bits() as i64);
             at.ins().boolean_or(undefined, null)
         }
-        Op::IsString(value) => {
+        Op::Javascript(JsOp::IsString(value)) => {
             let mut at = Cursor::before(graph, inst);
             let word = at.as_word(value);
             layout::is_string(&mut at, word)
         }
-        Op::IsCode(value, code) => field_is(
+        Op::Javascript(JsOp::IsCode(value, code)) => field_is(
             &mut Cursor::before(graph, inst),
             value,
             CODE_OFFSET,
             code.as_u32() + 1,
         ),
-        Op::IsShape(object, shape) => field_is(
+        Op::Javascript(JsOp::IsShape(object, shape)) => field_is(
             &mut Cursor::before(graph, inst),
             object,
             SHAPE_OFFSET,
             shape,
         ),
-        Op::IsReadLayout(object, layout) => {
+        Op::Javascript(JsOp::IsReadLayout(object, layout)) => {
             let mut at = Cursor::before(graph, inst);
             let hit = field_is(&mut at, object, SHAPE_OFFSET, layout.shape);
             match layout.storage {
@@ -192,7 +194,7 @@ fn predicate(graph: &mut Graph, facts: &Facts, inst: Inst) -> Option<Value> {
                 }
             }
         }
-        Op::IsTyped(object, Some(element)) => {
+        Op::Javascript(JsOp::IsTyped(object, Some(element))) => {
             let expected = kind::TYPED | TypedKind::element(element);
             field_is(
                 &mut Cursor::before(graph, inst),
@@ -201,13 +203,13 @@ fn predicate(graph: &mut Graph, facts: &Facts, inst: Inst) -> Option<Value> {
                 expected,
             )
         }
-        Op::IsTyped(object, None) => {
+        Op::Javascript(JsOp::IsTyped(object, None)) => {
             has_kind(&mut Cursor::before(graph, inst), object, kind::TYPED)
         }
-        Op::IsOrdinaryArray(object) => {
+        Op::Javascript(JsOp::IsOrdinaryArray(object)) => {
             has_kind(&mut Cursor::before(graph, inst), object, kind::ARRAY)
         }
-        Op::IsIndexed(object) => has_kind(
+        Op::Javascript(JsOp::IsIndexed(object)) => has_kind(
             &mut Cursor::before(graph, inst),
             object,
             kind::ARRAY | kind::TYPED,

@@ -1,3 +1,4 @@
+use crate::jit::semantic::JsOp;
 use crate::{FxHashMap, FxHashSet};
 
 use cranelift_codegen::entity::SecondaryMap;
@@ -123,17 +124,17 @@ pub(super) fn plan(graph: &mut Graph, facts: &mut Facts, borrows: borrow::Plan) 
                 && !graph.caller_rooted(value)
         },
         |value| match graph.defining_op(value) {
-            Some(Op::Get(_, name)) => name != "length",
-            Some(Op::Read(binding)) => !graph.bindings[*binding].captured,
+            Some(Op::Javascript(JsOp::Get(_, name))) => name != "length",
+            Some(Op::Javascript(JsOp::Read(binding))) => !graph.bindings[*binding].captured,
             Some(Op::HelperCall {
                 helper: Helper::PropertyGetCached | Helper::PropertyGetMegamorphic,
                 args,
                 ..
             }) => {
-                matches!(graph.defining_op(args[1]), Some(Op::PropertyCache(_, name)) if name != "length")
+                matches!(graph.defining_op(args[1]), Some(Op::Javascript(JsOp::PropertyCache(_, name))) if name != "length")
             }
             Some(
-                Op::TypedIndex(..)
+                Op::Javascript(JsOp::TypedIndex(..))
                 | Op::HelperCall {
                     helper:
                         Helper::IndexGet
@@ -142,9 +143,9 @@ pub(super) fn plan(graph: &mut Graph, facts: &mut Facts, borrows: borrow::Plan) 
                         | Helper::GlobalGetOptionalBorrowed,
                     ..
                 }
-                | Op::ArrayLoad(..)
-                | Op::GlobalRead(_)
-                | Op::GlobalReadOptional(_),
+                | Op::Javascript(
+                    JsOp::ArrayLoad(..) | JsOp::GlobalRead(_) | JsOp::GlobalReadOptional(_),
+                ),
             ) => true,
             Some(op) => super::contracts::fresh_reference(op),
             _ => false,

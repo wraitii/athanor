@@ -1,4 +1,5 @@
 use super::{Binding, Block, Cfg, Graph, Op, Scope, Target, TerminatorKind, boundary};
+use crate::jit::semantic::JsOp;
 use crate::{FxHashMap, FxHashSet};
 
 pub(in crate::jit) struct Plan {
@@ -82,12 +83,17 @@ impl Plan {
                             outputs.push(region.append_value(
                                 block,
                                 graph.span,
-                                Op::BindingLoad(binding),
+                                Op::Javascript(JsOp::BindingLoad(binding)),
                             ));
                         }
                         boundary::store_exit(&mut region, block, outputs, target);
                         for &scope in next.scopes.iter().rev() {
-                            region.append(block, graph.span, Op::LeaveScope(scope), false);
+                            region.append(
+                                block,
+                                graph.span,
+                                Op::Javascript(JsOp::LeaveScope(scope)),
+                                false,
+                            );
                         }
                     }
                     _ => {}

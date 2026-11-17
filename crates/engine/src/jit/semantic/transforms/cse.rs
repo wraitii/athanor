@@ -1,4 +1,5 @@
 use crate::FxHashMap;
+use crate::jit::semantic::JsOp;
 
 use cranelift_codegen::entity::SecondaryMap;
 use cranelift_codegen::ir::Type;
@@ -40,17 +41,22 @@ fn expression(
 ) -> Option<Expression> {
     let at = |value: &Value| resolve(aliases, *value);
     Some(match op {
-        Op::Constant(Constant::Undefined) => Expression::Undefined,
-        Op::Constant(Constant::Null) => Expression::Null,
-        Op::Constant(Constant::Boolean(value)) => Expression::Boolean(*value),
-        Op::Constant(Constant::Number(value)) => Expression::Number(value.to_bits()),
+        Op::Javascript(JsOp::Constant(Constant::Undefined)) => Expression::Undefined,
+        Op::Javascript(JsOp::Constant(Constant::Null)) => Expression::Null,
+        Op::Javascript(JsOp::Constant(Constant::Boolean(value))) => Expression::Boolean(*value),
+        Op::Javascript(JsOp::Constant(Constant::Number(value))) => {
+            Expression::Number(value.to_bits())
+        }
         Op::LowLevel(low_level::Op::Integer { ty, bits }) => Expression::Integer(*ty, *bits),
         Op::LowLevel(low_level::Op::Float64(bits)) => Expression::Float64(*bits),
-        Op::NumericFloat(value) => {
+        Op::Javascript(JsOp::NumericFloat(value)) => {
             let value = at(value);
             let value = match graph.defining_op(value) {
-                Some(Op::AsInteger(input))
-                    if matches!(graph.defining_op(at(input)), Some(Op::SaturatingInteger(_))) =>
+                Some(Op::Javascript(JsOp::AsInteger(input)))
+                    if matches!(
+                        graph.defining_op(at(input)),
+                        Some(Op::Javascript(JsOp::SaturatingInteger(_)))
+                    ) =>
                 {
                     at(input)
                 }
@@ -58,8 +64,8 @@ fn expression(
             };
             Expression::NumericFloat(value)
         }
-        Op::SaturatingInteger(value) => Expression::SaturatingInteger(at(value)),
-        Op::ToInt32(value) => Expression::ToInt32(at(value)),
+        Op::Javascript(JsOp::SaturatingInteger(value)) => Expression::SaturatingInteger(at(value)),
+        Op::Javascript(JsOp::ToInt32(value)) => Expression::ToInt32(at(value)),
         Op::Convert(value, repr) if pure => Expression::Convert(at(value), *repr),
         Op::LowLevel(low_level::Op::Binary { op, left, right }) if pure => {
             Expression::ScalarBinary(*op, at(left), at(right))
@@ -78,19 +84,25 @@ fn expression(
             right,
         }) if pure => Expression::FloatCompare(*condition, at(left), at(right)),
         // The dominating conversion has already succeeded, including its internal error check.
-        Op::ArrayPosition(value) => Expression::Position(at(value)),
-        Op::IsExactPosition(key, position) => Expression::ExactPosition(at(key), at(position)),
+        Op::Javascript(JsOp::ArrayPosition(value)) => Expression::Position(at(value)),
+        Op::Javascript(JsOp::IsExactPosition(key, position)) => {
+            Expression::ExactPosition(at(key), at(position))
+        }
         Op::BooleanAnd(left, right) => Expression::BooleanAnd(at(left), at(right)),
-        Op::IsInBounds(position, length) => Expression::InBounds(at(position), at(length)),
-        Op::This => Expression::This,
+        Op::Javascript(JsOp::IsInBounds(position, length)) => {
+            Expression::InBounds(at(position), at(length))
+        }
+        Op::Javascript(JsOp::This) => Expression::This,
         Op::Argument(index) => Expression::Argument(*index),
-        Op::Binary(operator, left, right)
-        | Op::GuardedCompare {
-            operator,
-            left,
-            right,
-            ..
-        } if pure => Expression::Binary(*operator, at(left), at(right)),
+        Op::Javascript(
+            JsOp::Binary(operator, left, right)
+            | JsOp::GuardedCompare {
+                operator,
+                left,
+                right,
+                ..
+            },
+        ) if pure => Expression::Binary(*operator, at(left), at(right)),
         _ => return None,
     })
 }

@@ -1,3 +1,4 @@
+use crate::jit::semantic::JsOp;
 use oxc_syntax::operator::BinaryOperator;
 
 use super::super::{FunctionState, Op, ValueDef, ValueType};
@@ -10,7 +11,9 @@ pub(in crate::jit::semantic) fn concatenate(function: &mut FunctionState) {
     let mut changed = false;
     for &block in &facts.cfg.rpo {
         for inst in graph.blocks[block].insts.clone() {
-            let Op::Binary(BinaryOperator::Addition, left, right) = graph.insts[inst].op else {
+            let Op::Javascript(JsOp::Binary(BinaryOperator::Addition, left, right)) =
+                graph.insts[inst].op
+            else {
                 continue;
             };
             if uses[left] != 1
@@ -26,13 +29,13 @@ pub(in crate::jit::semantic) fn concatenate(function: &mut FunctionState) {
                 continue;
             }
             let mut parts = match &graph.insts[inner].op {
-                Op::Binary(BinaryOperator::Addition, first, second)
+                Op::Javascript(JsOp::Binary(BinaryOperator::Addition, first, second))
                     if facts.of(*first).within(ValueType::STRING)
                         && facts.of(*second).within(ValueType::STRING) =>
                 {
                     vec![*first, *second]
                 }
-                Op::StringConcat(parts) => parts.clone(),
+                Op::Javascript(JsOp::StringConcat(parts)) => parts.clone(),
                 _ => continue,
             };
             let instructions = &graph.blocks[block].insts;
@@ -51,7 +54,7 @@ pub(in crate::jit::semantic) fn concatenate(function: &mut FunctionState) {
                 continue;
             }
             parts.push(right);
-            graph.set_op(inst, Op::StringConcat(parts));
+            graph.set_op(inst, Op::Javascript(JsOp::StringConcat(parts)));
             graph.remove_inst(inner);
             changed = true;
         }

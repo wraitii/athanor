@@ -1,6 +1,7 @@
 use super::{
     Block, BlockData, Cfg, Constant, Facts, Graph, Op, Target, TerminatorKind, Value, ValueType,
 };
+use crate::jit::semantic::JsOp;
 use crate::{FxHashMap, FxHashSet};
 use cranelift_codegen::entity::SecondaryMap;
 use oxc_syntax::operator::BinaryOperator;
@@ -81,35 +82,40 @@ fn extract(graph: &Graph, target: Target, facts: &Facts) -> super::Result<(Graph
         }
         for &inst in &data.insts {
             match result.insts[inst].op {
-                Op::Read(_)
-                | Op::Write(..)
-                | Op::Initialize(..)
-                | Op::Closure(..)
-                | Op::ClosureCells(..)
-                | Op::CellNew(_)
+                Op::Javascript(
+                    JsOp::Read(_)
+                    | JsOp::Write(..)
+                    | JsOp::Initialize(..)
+                    | JsOp::Closure(..)
+                    | JsOp::ClosureCells(..)
+                    | JsOp::CellNew(_),
+                )
                 | Op::Argument(_)
                 | Op::Restored(_)
-                | Op::ClosureThis(_)
-                | Op::Callee
-                | Op::EnterCaptures(..)
-                | Op::Arguments
-                | Op::CallForward(..)
+                | Op::Javascript(
+                    JsOp::ClosureThis(_)
+                    | JsOp::Callee
+                    | JsOp::EnterCaptures(..)
+                    | JsOp::Arguments
+                    | JsOp::CallForward(..),
+                )
                 | Op::ArgumentCount
-                | Op::Rest(_)
+                | Op::Javascript(JsOp::Rest(_))
                 | Op::OsrStart(..)
-                | Op::BindingLoad(..)
-                | Op::BindingRestore(..) => {
+                | Op::Javascript(JsOp::BindingLoad(..) | JsOp::BindingRestore(..)) => {
                     return Err("continuation requires SSA frame state".into());
                 }
-                Op::EnterScope(scope)
-                | Op::LeaveScope(scope)
-                | Op::NextIteration(scope)
-                | Op::FreshIteration(scope)
-                    if result.materialized(scope) =>
-                {
+                Op::Javascript(
+                    JsOp::EnterScope(scope)
+                    | JsOp::LeaveScope(scope)
+                    | JsOp::NextIteration(scope)
+                    | JsOp::FreshIteration(scope),
+                ) if result.materialized(scope) => {
                     return Err("continuation requires materialized scope state".into());
                 }
-                Op::View(_) => return Err("continuation requires a heap view".into()),
+                Op::Javascript(JsOp::View(_)) => {
+                    return Err("continuation requires a heap view".into());
+                }
                 _ => {}
             }
             if result.views.contains_key(&inst) {
@@ -121,11 +127,12 @@ fn extract(graph: &Graph, target: Target, facts: &Facts) -> super::Result<(Graph
         result.blocks[block].insts.retain(|&inst| {
             !matches!(
                 result.insts[inst].op,
-                Op::EnterScope(_)
-                    | Op::LeaveScope(_)
-                    | Op::NextIteration(_)
-                    | Op::FreshIteration(_)
-                    | Op::Assume(..)
+                Op::Javascript(
+                    JsOp::EnterScope(_)
+                        | JsOp::LeaveScope(_)
+                        | JsOp::NextIteration(_)
+                        | JsOp::FreshIteration(_)
+                ) | Op::Assume(..)
             )
         });
     }
@@ -263,12 +270,12 @@ impl Shape {
             let constant = append(
                 result,
                 current,
-                Op::Constant(Constant::Number(index as f64)),
+                Op::Javascript(JsOp::Constant(Constant::Number(index as f64))),
             );
             let test = append(
                 result,
                 current,
-                Op::Binary(BinaryOperator::StrictEquality, call, constant),
+                Op::Javascript(JsOp::Binary(BinaryOperator::StrictEquality, call, constant)),
             );
             let next = result.blocks.push(BlockData::default());
             terminate(
@@ -609,7 +616,7 @@ mod tests {
         assert!(uses(
             &driver.body,
             &|op| matches!(op, Op::Continuation(body, _)
-            if body.outputs > 0 && uses(body, &|op| matches!(op, Op::This)))
+            if body.outputs > 0 && uses(body, &|op| matches!(op, Op::Javascript(JsOp::This))))
         ));
         let resume = pieces.resume(&graph, &target).unwrap();
         resume.body.graph.verify().unwrap();

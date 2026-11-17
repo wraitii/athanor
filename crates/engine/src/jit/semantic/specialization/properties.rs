@@ -1,5 +1,6 @@
 use crate::FxHashSet;
 use crate::jit::layout::ReadLayout;
+use crate::jit::semantic::JsOp;
 
 use super::super::guards::{Fact, Kind, Origin};
 use super::super::{Cfg, Facts, Graph, Inst, Op, Value, available, dispatch};
@@ -17,9 +18,11 @@ pub(in crate::jit::semantic) fn assume(graph: &mut Graph, shapes: &super::shapes
         .values()
         .filter_map(|data| match data.op {
             Op::Assume(value, Fact::Native(_), _)
-            | Op::IsNative(value, _)
-            | Op::IsArrayIteration(value, ..)
-            | Op::IsStringSplit(value) => Some(value),
+            | Op::Javascript(
+                JsOp::IsNative(value, _)
+                | JsOp::IsArrayIteration(value, ..)
+                | JsOp::IsStringSplit(value),
+            ) => Some(value),
             _ => None,
         })
         .collect();
@@ -28,15 +31,17 @@ pub(in crate::jit::semantic) fn assume(graph: &mut Graph, shapes: &super::shapes
         .into_iter()
         .flat_map(|block| graph.blocks[block].insts.clone())
         .filter(|&inst| match graph.insts[inst].op {
-            Op::Get(_, ref name) => name != "length" && !shapes.megamorphic(graph, inst),
-            Op::Set(..) => shapes.write(graph, inst).is_some(),
+            Op::Javascript(JsOp::Get(_, ref name)) => {
+                name != "length" && !shapes.megamorphic(graph, inst)
+            }
+            Op::Javascript(JsOp::Set(..)) => shapes.write(graph, inst).is_some(),
             _ => false,
         })
         .collect();
     for inst in accesses {
         let data = graph.insts[inst].clone();
         let (object, name, alternatives) = match data.op.clone() {
-            Op::Get(object, name) => (
+            Op::Javascript(JsOp::Get(object, name)) => (
                 object,
                 name,
                 shapes
@@ -45,7 +50,7 @@ pub(in crate::jit::semantic) fn assume(graph: &mut Graph, shapes: &super::shapes
                     .or_else(|| shapes.read(graph, inst).map(|access| vec![access]))
                     .unwrap_or_default(),
             ),
-            Op::Set(object, name, _) => (
+            Op::Javascript(JsOp::Set(object, name, _)) => (
                 object,
                 name,
                 shapes.write(graph, inst).into_iter().collect(),
@@ -66,7 +71,7 @@ pub(in crate::jit::semantic) fn assume(graph: &mut Graph, shapes: &super::shapes
             data.block,
             at,
             data.span,
-            Op::PropertyCache(inst, name),
+            Op::Javascript(JsOp::PropertyCache(inst, name)),
             true,
         );
         graph.insts[allocation].source_name = data.source_name;
@@ -99,14 +104,15 @@ pub(in crate::jit::semantic) fn shape_writes(graph: &mut Graph) {
         .into_iter()
         .flat_map(|block| graph.blocks[block].insts.clone())
         .filter_map(|inst| {
-            let Op::Set(object, ref name, value) = graph.insts[inst].op else {
+            let Op::Javascript(JsOp::Set(object, ref name, value)) = graph.insts[inst].op else {
                 return None;
             };
             let &[layout] = graph.property_accesses.get(&inst)?.shapes.as_slice() else {
                 return None;
             };
             let set = graph.insts[inst].op.clone();
-            graph.insts[inst].op = Op::ShapedSet(object, name.clone(), layout.index, value);
+            graph.insts[inst].op =
+                Op::Javascript(JsOp::ShapedSet(object, name.clone(), layout.index, value));
             Some((inst, object, layout.shape, set))
         })
         .collect();
@@ -149,7 +155,7 @@ pub(in crate::jit::semantic) fn rewrite(graph: &mut Graph) -> super::super::Resu
         .copied()
         .flat_map(|block| graph.blocks[block].insts.iter().copied())
         .filter_map(|inst| {
-            let Op::Get(object, ref name) = graph.insts[inst].op else {
+            let Op::Javascript(JsOp::Get(object, ref name)) = graph.insts[inst].op else {
                 return None;
             };
             let read = graph.property_accesses.get(&inst)?.clone();
@@ -175,7 +181,7 @@ pub(in crate::jit::semantic) fn rewrite(graph: &mut Graph) -> super::super::Resu
     for (inst, read, shaped, cached) in reads {
         graph.property_accesses.remove(&inst);
         let data = graph.insts[inst].clone();
-        let Op::Get(object, name) = data.op.clone() else {
+        let Op::Javascript(JsOp::Get(object, name)) = data.op.clone() else {
             continue;
         };
         if let Some(layout) = shaped {
@@ -185,8 +191,8 @@ pub(in crate::jit::semantic) fn rewrite(graph: &mut Graph) -> super::super::Resu
             graph.set_op(
                 inst,
                 match layout.storage {
-                    None => Op::ShapedGet(object, name, layout.index),
-                    Some(_) => Op::LayoutGet(object, name, layout),
+                    None => Op::Javascript(JsOp::ShapedGet(object, name, layout.index)),
+                    Some(_) => Op::Javascript(JsOp::LayoutGet(object, name, layout)),
                 },
             );
             continue;
@@ -201,7 +207,7 @@ pub(in crate::jit::semantic) fn rewrite(graph: &mut Graph) -> super::super::Resu
                 data.block,
                 at,
                 data.span,
-                Op::PropertyCache(inst, name.clone()),
+                Op::Javascript(JsOp::PropertyCache(inst, name.clone())),
                 true,
             );
             graph.insts[allocation].source_name = data.source_name;
@@ -209,8 +215,11 @@ pub(in crate::jit::semantic) fn rewrite(graph: &mut Graph) -> super::super::Resu
             cache.unwrap()
         });
         if cached {
-            graph.insts[inst].op =
-                Op::CachedProperty(object, cache, crate::builtins::builtin_method(&name));
+            graph.insts[inst].op = Op::Javascript(JsOp::CachedProperty(
+                object,
+                cache,
+                crate::builtins::builtin_method(&name),
+            ));
             continue;
         }
         lower_cache(graph, inst, cache, object, &name);
@@ -230,19 +239,30 @@ pub(in crate::jit::semantic) fn lower_cache(
     let first = graph.blocks.len();
     let (block, done, fallback) = dispatch::split(graph, inst);
     graph.cold.remove(&fallback);
-    graph.set_op(inst, Op::FillPropertyCache(object, cache, name.to_owned()));
+    graph.set_op(
+        inst,
+        Op::Javascript(JsOp::FillPropertyCache(object, cache, name.to_owned())),
+    );
     let check = dispatch::append(
         graph,
         &data,
         block,
-        Op::IsPropertyCached(object, cache, crate::builtins::builtin_method(name)),
+        Op::Javascript(JsOp::IsPropertyCached(
+            object,
+            cache,
+            crate::builtins::builtin_method(name),
+        )),
     );
     let fast = dispatch::branch(graph, inst, block, check, fallback);
     let value = dispatch::append(
         graph,
         &data,
         fast,
-        Op::CachedProperty(object, cache, crate::builtins::builtin_method(name)),
+        Op::Javascript(JsOp::CachedProperty(
+            object,
+            cache,
+            crate::builtins::builtin_method(name),
+        )),
     );
     graph.terminate(
         fast,
@@ -269,7 +289,7 @@ pub(in crate::jit::semantic) fn assume_natives(graph: &mut Graph) {
         .collect();
     for requirement in super::regions::requirements(graph, &blocks) {
         let data = graph.insts[requirement.call].clone();
-        let Op::Call { callee, .. } = data.op else {
+        let Op::Javascript(JsOp::Call { callee, .. }) = data.op else {
             continue;
         };
         if seen.insert((data.block, callee, requirement.native)) {

@@ -1,3 +1,4 @@
+use crate::jit::semantic::JsOp;
 use cranelift_codegen::ir::{MemFlagsData, types};
 
 use super::super::cursor::{Cursor, Insert};
@@ -51,8 +52,11 @@ fn key(facts: &Facts, key: Value) -> (Helper, Arg) {
 }
 
 fn select(inst: super::super::Inst, op: &Op, facts: &Facts) -> Option<Call> {
+    let Op::Javascript(op) = op else {
+        return None;
+    };
     match op {
-        Op::Get(object, name) => call(
+        JsOp::Get(object, name) => call(
             Helper::PropertyGetCached,
             vec![
                 Arg::Value(*object, Repr::Boxed),
@@ -60,9 +64,9 @@ fn select(inst: super::super::Inst, op: &Op, facts: &Facts) -> Option<Call> {
             ],
             true,
         ),
-        Op::Set(object, name, value)
-        | Op::Define(object, name, value)
-        | Op::ShapedSet(object, name, _, value) => call(
+        JsOp::Set(object, name, value)
+        | JsOp::Define(object, name, value)
+        | JsOp::ShapedSet(object, name, _, value) => call(
             Helper::PropertySetCached,
             vec![
                 Arg::Value(*object, Repr::Boxed),
@@ -71,7 +75,7 @@ fn select(inst: super::super::Inst, op: &Op, facts: &Facts) -> Option<Call> {
             ],
             false,
         ),
-        Op::ProbeProperty(object, name) => call(
+        JsOp::ProbeProperty(object, name) => call(
             Helper::SemanticPropertyProbeCached,
             vec![
                 Arg::Value(*object, Repr::Boxed),
@@ -79,32 +83,32 @@ fn select(inst: super::super::Inst, op: &Op, facts: &Facts) -> Option<Call> {
             ],
             true,
         ),
-        Op::GlobalRead(name) | Op::GlobalReadOptional(name) | Op::ProbeGlobal(name) => call(
+        JsOp::GlobalRead(name) | JsOp::GlobalReadOptional(name) | JsOp::ProbeGlobal(name) => call(
             match op {
-                Op::GlobalRead(_) => Helper::GlobalGetBorrowed,
-                Op::GlobalReadOptional(_) => Helper::GlobalGetOptionalBorrowed,
+                JsOp::GlobalRead(_) => Helper::GlobalGetBorrowed,
+                JsOp::GlobalReadOptional(_) => Helper::GlobalGetOptionalBorrowed,
                 _ => Helper::SemanticGlobalProbe,
             },
             vec![Arg::GlobalCache(name.clone())],
             true,
         ),
-        Op::GetIndex(object, index)
-        | Op::ArrayGet(object, index)
-        | Op::TypedIndex(object, index, TypedRead { element: None, .. }) => {
+        JsOp::GetIndex(object, index)
+        | JsOp::ArrayGet(object, index)
+        | JsOp::TypedIndex(object, index, TypedRead { element: None, .. }) => {
             let (helper, index) = key(facts, *index);
             call(helper, vec![Arg::Value(*object, Repr::Boxed), index], true)
         }
-        Op::Delete(object, index) => call(Helper::Delete, boxed(&[*object, *index]), true),
-        Op::SetIndex(object, index, value) => {
+        JsOp::Delete(object, index) => call(Helper::Delete, boxed(&[*object, *index]), true),
+        JsOp::SetIndex(object, index, value) => {
             call(Helper::IndexSet, boxed(&[*object, *index, *value]), false)
         }
-        Op::ClosureThis(value) => call(Helper::ClosureThis, boxed(&[*value]), true),
-        Op::IsArrayIteration(callee, receiver, method) => {
+        JsOp::ClosureThis(value) => call(Helper::ClosureThis, boxed(&[*value]), true),
+        JsOp::IsArrayIteration(callee, receiver, method) => {
             let mut args = boxed(&[*callee, *receiver]);
             args.push(Arg::Integer(*method as i64));
             call(Helper::ArrayIterationGuard, args, true)
         }
-        Op::MapElement(receiver, index) => call(
+        JsOp::MapElement(receiver, index) => call(
             Helper::ArrayMapElement,
             vec![
                 Arg::Value(*receiver, Repr::Boxed),
@@ -112,32 +116,34 @@ fn select(inst: super::super::Inst, op: &Op, facts: &Facts) -> Option<Call> {
             ],
             true,
         ),
-        Op::Throw(value) => call(Helper::Throw, boxed(&[*value]), false),
-        Op::PropertyKey(value) => call(Helper::PropertyKey, boxed(&[*value]), true),
-        Op::MarkClass(value) => call(Helper::MarkClass, boxed(&[*value]), false),
-        Op::DisableConstructor(value) => call(Helper::DisableConstructor, boxed(&[*value]), false),
-        Op::IsTypeof(value, kind) => {
+        JsOp::Throw(value) => call(Helper::Throw, boxed(&[*value]), false),
+        JsOp::PropertyKey(value) => call(Helper::PropertyKey, boxed(&[*value]), true),
+        JsOp::MarkClass(value) => call(Helper::MarkClass, boxed(&[*value]), false),
+        JsOp::DisableConstructor(value) => {
+            call(Helper::DisableConstructor, boxed(&[*value]), false)
+        }
+        JsOp::IsTypeof(value, kind) => {
             let mut args = boxed(&[*value]);
             args.push(Arg::Boxed(JsValue::number(*kind as f64)));
             call(Helper::IsTypeof, args, true)
         }
-        Op::IsNative(value, native) => {
+        JsOp::IsNative(value, native) => {
             let mut args = boxed(&[*value]);
             args.push(Arg::Integer(native.index() as i64));
             call(Helper::SemanticMathNative, args, true)
         }
-        Op::IsStringSplit(value) => call(Helper::IsStringSplit, boxed(&[*value]), true),
-        Op::ProbeIndex(object, key) => {
+        JsOp::IsStringSplit(value) => call(Helper::IsStringSplit, boxed(&[*value]), true),
+        JsOp::ProbeIndex(object, key) => {
             call(Helper::SemanticIndexProbe, boxed(&[*object, *key]), true)
         }
-        Op::ConstructorPrototype(callee) => {
+        JsOp::ConstructorPrototype(callee) => {
             call(Helper::ConstructorPrototype, boxed(&[*callee]), true)
         }
-        Op::IteratorNew(value) => call(Helper::IterateNew, boxed(&[*value]), true),
-        Op::IteratorNext(value) => call(Helper::IterateNext, boxed(&[*value]), true),
-        Op::EnumerateNew(value) => call(Helper::EnumerateNew, boxed(&[*value]), true),
-        Op::EnumerateNext(value) => call(Helper::EnumerateNext, boxed(&[*value]), true),
-        Op::ArrayAppend(array, value, spread) => call(
+        JsOp::IteratorNew(value) => call(Helper::IterateNew, boxed(&[*value]), true),
+        JsOp::IteratorNext(value) => call(Helper::IterateNext, boxed(&[*value]), true),
+        JsOp::EnumerateNew(value) => call(Helper::EnumerateNew, boxed(&[*value]), true),
+        JsOp::EnumerateNext(value) => call(Helper::EnumerateNext, boxed(&[*value]), true),
+        JsOp::ArrayAppend(array, value, spread) => call(
             if *spread {
                 Helper::ArrayExtend
             } else {
@@ -146,7 +152,7 @@ fn select(inst: super::super::Inst, op: &Op, facts: &Facts) -> Option<Call> {
             boxed(&[*array, *value]),
             false,
         ),
-        Op::PackAppend(pack, value, spread) => call(
+        JsOp::PackAppend(pack, value, spread) => call(
             if *spread {
                 Helper::PackExtend
             } else {
@@ -155,29 +161,29 @@ fn select(inst: super::super::Inst, op: &Op, facts: &Facts) -> Option<Call> {
             boxed(&[*pack, *value]),
             false,
         ),
-        Op::PackRelease(pack) => call(Helper::PackRelease, boxed(&[*pack]), false),
-        Op::CallPack(callee, receiver, args) => {
+        JsOp::PackRelease(pack) => call(Helper::PackRelease, boxed(&[*pack]), false),
+        JsOp::CallPack(callee, receiver, args) => {
             call(Helper::CallPack, boxed(&[*callee, *receiver, *args]), true)
         }
-        Op::ConstructPack(callee, args) => {
+        JsOp::ConstructPack(callee, args) => {
             call(Helper::ConstructPack, boxed(&[*callee, *args]), true)
         }
-        Op::ConstructorCallPack(callee, receiver, args) => call(
+        JsOp::ConstructorCallPack(callee, receiver, args) => call(
             Helper::ConstructorCallPack,
             boxed(&[*callee, *receiver, *args]),
             true,
         ),
-        Op::ConstructPackResolved(callee, prototype, args) => call(
+        JsOp::ConstructPackResolved(callee, prototype, args) => call(
             Helper::ConstructPackResolved,
             boxed(&[*callee, *prototype, *args]),
             true,
         ),
-        Op::Construct { callee, args } => {
+        JsOp::Construct { callee, args } => {
             let mut call_args = boxed(&[*callee]);
             call_args.extend(vector(args));
             call(Helper::Construct, call_args, true)
         }
-        Op::ConstructResolved {
+        JsOp::ConstructResolved {
             callee,
             prototype,
             args,
@@ -186,7 +192,7 @@ fn select(inst: super::super::Inst, op: &Op, facts: &Facts) -> Option<Call> {
             call_args.extend(vector(args));
             call(Helper::ConstructResolved, call_args, true)
         }
-        Op::ConstructorCall {
+        JsOp::ConstructorCall {
             callee,
             receiver,
             args,
@@ -195,17 +201,17 @@ fn select(inst: super::super::Inst, op: &Op, facts: &Facts) -> Option<Call> {
             call_args.extend(vector(args));
             call(Helper::ConstructorCall, call_args, true)
         }
-        Op::StringSplit(receiver, args) => {
+        JsOp::StringSplit(receiver, args) => {
             let mut call_args = vec![Arg::Integer(0), Arg::Value(*receiver, Repr::Boxed)];
             call_args.extend(vector(args));
             call(Helper::StringSplit, call_args, true)
         }
-        Op::NewArray(args) => call(Helper::ArrayNew, vector(args).into(), true),
-        Op::StringConcat(args) => call(Helper::StringConcat, vector(args).into(), true),
-        Op::CellNew(value) => call(Helper::CellNew, boxed(&[*value]), true),
-        Op::CellGet(cell) => call(Helper::CellGet, boxed(&[*cell]), true),
-        Op::CellSet(cell, value) => call(Helper::CellSet, boxed(&[*cell, *value]), false),
-        Op::CaptureGet(closure, index) => call(
+        JsOp::NewArray(args) => call(Helper::ArrayNew, vector(args).into(), true),
+        JsOp::StringConcat(args) => call(Helper::StringConcat, vector(args).into(), true),
+        JsOp::CellNew(value) => call(Helper::CellNew, boxed(&[*value]), true),
+        JsOp::CellGet(cell) => call(Helper::CellGet, boxed(&[*cell]), true),
+        JsOp::CellSet(cell, value) => call(Helper::CellSet, boxed(&[*cell, *value]), false),
+        JsOp::CaptureGet(closure, index) => call(
             Helper::CaptureGet,
             vec![
                 Arg::Value(*closure, Repr::Boxed),
@@ -213,14 +219,14 @@ fn select(inst: super::super::Inst, op: &Op, facts: &Facts) -> Option<Call> {
             ],
             true,
         ),
-        Op::NewHoleyArray(length) => call(Helper::ArrayMapNew, boxed(&[*length]), true),
-        Op::NewInstance(prototype) => call(Helper::NewInstance, boxed(&[*prototype]), true),
-        Op::NewObject => call(
+        JsOp::NewHoleyArray(length) => call(Helper::ArrayMapNew, boxed(&[*length]), true),
+        JsOp::NewInstance(prototype) => call(Helper::NewInstance, boxed(&[*prototype]), true),
+        JsOp::NewObject => call(
             Helper::ObjectNew,
             vec![Arg::Boxed(JsValue::UNDEFINED)],
             true,
         ),
-        Op::PackTake(pack, index) => call(Helper::PackTake, boxed(&[*pack, *index]), true),
+        JsOp::PackTake(pack, index) => call(Helper::PackTake, boxed(&[*pack, *index]), true),
         _ => None,
     }
 }
@@ -271,12 +277,14 @@ pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) {
             for arg in call.args {
                 let (value, repr) = match arg {
                     Arg::Value(value, repr) => (value, repr),
-                    Arg::GlobalCache(name) => {
-                        (at.add_unassigned(Op::GlobalCache(name)), Repr::Word)
-                    }
-                    Arg::PropertyCache(site, name) => {
-                        (at.add_unassigned(Op::PropertyCache(site, name)), Repr::Word)
-                    }
+                    Arg::GlobalCache(name) => (
+                        at.add_unassigned(Op::Javascript(JsOp::GlobalCache(name))),
+                        Repr::Word,
+                    ),
+                    Arg::PropertyCache(site, name) => (
+                        at.add_unassigned(Op::Javascript(JsOp::PropertyCache(site, name))),
+                        Repr::Word,
+                    ),
                     Arg::Integer(bits) => (at.ins().iconst(types::I64, bits), Repr::Word),
                     Arg::Boxed(value) => {
                         let word = at.ins().iconst(types::I64, value.bits() as i64);

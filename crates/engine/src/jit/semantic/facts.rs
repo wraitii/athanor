@@ -1,3 +1,4 @@
+use crate::jit::semantic::JsOp;
 use crate::{FxHashMap, FxHashSet};
 use std::fmt;
 
@@ -10,8 +11,7 @@ use super::available;
 use super::guards;
 use super::low_level::{Binary as LowBinary, Op as LowOp};
 use super::memory::{Access, Analysis};
-use super::{Block, Cfg, Constant, Graph, Inst, MemoryFormat, Op, TerminatorKind, UnaryOp, Value};
-use crate::heap::TypedKind;
+use super::{Block, Cfg, Constant, Graph, Inst, Op, TerminatorKind, UnaryOp, Value};
 use cranelift_module::FuncId;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -217,7 +217,7 @@ impl Facts {
         let mut pending = Vec::new();
         for &block in &self.cfg.rpo {
             for &inst in &graph.blocks[block].insts {
-                let Op::Call { callee, .. } = graph.insts[inst].op else {
+                let Op::Javascript(JsOp::Call { callee, .. }) = graph.insts[inst].op else {
                     continue;
                 };
                 if self.rejected.contains(&inst) || self.assumes(callee) {
@@ -241,7 +241,7 @@ impl Facts {
         pending
             .into_iter()
             .filter(|&inst| {
-                let Op::Call { callee, .. } = graph.insts[inst].op else {
+                let Op::Javascript(JsOp::Call { callee, .. }) = graph.insts[inst].op else {
                     return false;
                 };
                 let Some(summary) = graph.call_summary(inst, callee, self) else {
@@ -397,7 +397,7 @@ impl Facts {
         let (indexed, reads) = super::js::string_split::result_facts(graph, &cfg);
         let mut probes = Vec::new();
         for (&value, entries) in &refinements {
-            let Some(Op::ProbeGlobal(name)) = graph.defining_op(value) else {
+            let Some(Op::Javascript(JsOp::ProbeGlobal(name))) = graph.defining_op(value) else {
                 continue;
             };
             for refinement in entries {
@@ -411,7 +411,7 @@ impl Facts {
             .insts
             .values()
             .filter_map(|data| match data.op {
-                Op::MarkClass(value) => Some(value),
+                Op::Javascript(JsOp::MarkClass(value)) => Some(value),
                 _ => None,
             })
             .collect();
@@ -443,8 +443,10 @@ impl Facts {
                 for &inst in &graph.blocks[block].insts {
                     let data = &graph.insts[inst];
                     for &result in &data.results {
-                        if let Op::Closure(_, target, _, false, _, _, _)
-                        | Op::ClosureCells(_, target, _, false, _, _, _) = data.op
+                        if let Op::Javascript(
+                            JsOp::Closure(_, target, _, false, _, _, _)
+                            | JsOp::ClosureCells(_, target, _, false, _, _, _),
+                        ) = data.op
                             && !marked.contains(&result)
                         {
                             facts.join_identity(result, Identity::Code(target));
@@ -568,13 +570,15 @@ enum Relation {
 impl Relation {
     fn comparison(op: &Op) -> Option<(Self, Value, Value)> {
         let (relation, left, right) = match *op {
-            Op::Binary(operator, left, right)
-            | Op::GuardedCompare {
-                operator,
-                left,
-                right,
-                ..
-            } => (Self::of(operator)?, left, right),
+            Op::Javascript(
+                JsOp::Binary(operator, left, right)
+                | JsOp::GuardedCompare {
+                    operator,
+                    left,
+                    right,
+                    ..
+                },
+            ) => (Self::of(operator)?, left, right),
             Op::LowLevel(LowOp::IntCompare {
                 condition,
                 left,
@@ -638,15 +642,15 @@ impl Relation {
 }
 
 fn one(graph: &Graph, value: Value) -> bool {
-    matches!(graph.defining_op(value), Some(Op::Constant(Constant::Number(n))) if *n == 1.0)
+    matches!(graph.defining_op(value), Some(Op::Javascript(JsOp::Constant(Constant::Number(n)))) if *n == 1.0)
 }
 
 fn step(op: &Op) -> Option<(Value, bool)> {
     match *op {
-        Op::Unary(UnaryOp::Increment, operand) => Some((operand, true)),
-        Op::Unary(UnaryOp::Decrement, operand) => Some((operand, false)),
-        Op::Binary(BinaryOperator::Addition, left, _) => Some((left, true)),
-        Op::Binary(BinaryOperator::Subtraction, left, _) => Some((left, false)),
+        Op::Javascript(JsOp::Unary(UnaryOp::Increment, operand)) => Some((operand, true)),
+        Op::Javascript(JsOp::Unary(UnaryOp::Decrement, operand)) => Some((operand, false)),
+        Op::Javascript(JsOp::Binary(BinaryOperator::Addition, left, _)) => Some((left, true)),
+        Op::Javascript(JsOp::Binary(BinaryOperator::Subtraction, left, _)) => Some((left, false)),
         Op::LowLevel(LowOp::Binary {
             op: LowBinary::Add,
             left,
@@ -682,7 +686,7 @@ fn steps(graph: &Graph, cfg: &Cfg) -> FxHashMap<Inst, Vec<Value>> {
             continue;
         };
         let source = |mut value| {
-            while let Some(Op::NumericFloat(inner)) = graph.defining_op(value) {
+            while let Some(Op::Javascript(JsOp::NumericFloat(inner))) = graph.defining_op(value) {
                 value = *inner;
             }
             value
@@ -705,8 +709,8 @@ fn steps(graph: &Graph, cfg: &Cfg) -> FxHashMap<Inst, Vec<Value>> {
             let Some((operand, up)) = step(op) else {
                 continue;
             };
-            if let Op::Binary(_, left, right) | Op::LowLevel(LowOp::Binary { left, right, .. }) =
-                *op
+            if let Op::Javascript(JsOp::Binary(_, left, right))
+            | Op::LowLevel(LowOp::Binary { left, right, .. }) = *op
                 && (left != operand || !one(graph, right))
             {
                 continue;
@@ -741,7 +745,7 @@ fn range(
 ) -> (i64, i64) {
     const FULL: (i64, i64) = (i32::MIN as i64, i32::MAX as i64);
     let constant = |value: Value| match graph.defining_op(value) {
-        Some(Op::Constant(Constant::Number(n)))
+        Some(Op::Javascript(JsOp::Constant(Constant::Number(n))))
             if n.fract() == 0.0 && *n >= i32::MIN as f64 && *n <= i32::MAX as f64 =>
         {
             Some(*n as i64)
@@ -756,7 +760,7 @@ fn range(
     }
     match graph.defining_op(value) {
         Some(
-            &Op::Binary(BinaryOperator::BitwiseAnd, left, right)
+            &Op::Javascript(JsOp::Binary(BinaryOperator::BitwiseAnd, left, right))
             | &Op::LowLevel(LowOp::Binary {
                 op: super::low_level::Binary::And,
                 left,
@@ -767,7 +771,7 @@ fn range(
             _ => FULL,
         },
         Some(
-            &Op::Binary(BinaryOperator::ShiftRight, _, count)
+            &Op::Javascript(JsOp::Binary(BinaryOperator::ShiftRight, _, count))
             | &Op::LowLevel(LowOp::Binary {
                 op: super::low_level::Binary::ShiftRightSigned,
                 right: count,
@@ -787,72 +791,18 @@ fn range(
     }
 }
 
-fn number(value: f64) -> ValueType {
-    let integral = value.fract() == 0.0 && value >= i32::MIN as f64 && value <= i32::MAX as f64;
-    if integral && !(value == 0.0 && value.is_sign_negative()) {
-        ValueType::INT32
-    } else {
-        ValueType::DOUBLE
-    }
-}
-
-fn integer_product(graph: &Graph, facts: &Facts, left: Value, right: Value) -> bool {
-    // Positive factors avoid negative zero; 2^31 * 2^22 stays exactly representable.
-    let scaled = |value, factor| {
-        facts.of(value).within(ValueType::INT32)
-            && matches!(graph.defining_op(factor), Some(Op::Constant(Constant::Number(n)))
-                if *n > 0.0 && n.fract() == 0.0 && *n <= 4_194_304.0)
-    };
-    scaled(left, right) || scaled(right, left)
-}
-
 fn result_types(graph: &Graph, op: &Op, facts: &Facts) -> ValueType {
     match op {
+        Op::Javascript(op) => super::js::facts::result_types(graph, op, facts),
         Op::OsrStart(..) => ValueType::INT32,
         Op::Continuation(body, _) => body.result,
-        Op::ContinuationOutput(..) | Op::BindingLoad(_) | Op::Restored(_) => ValueType::ALL,
-        Op::CellGet(_) => ValueType::VALUE,
-        Op::BindingRestore(..)
-        | Op::ContinuationStore(..)
-        | Op::Observe(..)
-        | Op::ReadHint(..)
-        | Op::Assume(..) => ValueType::default(),
-        Op::Constant(constant) => match constant {
-            Constant::Undefined => ValueType::UNDEFINED,
-            Constant::Null => ValueType::NULL,
-            Constant::Boolean(_) => ValueType::BOOLEAN,
-            Constant::Number(value) => number(*value),
-            Constant::String(_) => ValueType::STRING,
-            Constant::Uninitialized => ValueType::UNINITIALIZED,
-        },
+        Op::ContinuationOutput(..) | Op::Restored(_) => ValueType::ALL,
+        Op::ContinuationStore(..) | Op::Observe(..) | Op::ReadHint(..) | Op::Assume(..) => {
+            ValueType::default()
+        }
         Op::ArgumentCount => ValueType::INTEGER,
-        Op::NewObject
-        | Op::NewInstance(_)
-        | Op::ConstructorResult(..)
-        | Op::NewArray(_)
-        | Op::NewHoleyArray(_)
-        | Op::IteratorNew(_)
-        | Op::EnumerateNew(_) => ValueType::OBJECT,
-        Op::MapElement(..) => ValueType::ALL,
-        Op::IsArrayIteration(..) => ValueType::BOOLEAN,
-        Op::IteratorNext(_) | Op::EnumerateNext(_) => ValueType::ALL,
-        Op::EntryAssume(..)
-        | Op::IsUninitialized(_)
-        | Op::IsPropertyCached(..)
-        | Op::IsShape(..)
-        | Op::IsReadLayout(..) => ValueType::BOOLEAN,
-        Op::PropertyLoad(..)
-        | Op::RelatedPropertyLoad(..)
-        | Op::ProbeProperty(..)
-        | Op::ProbeShapeProperty(..)
-        | Op::ProbeIndex(..)
-        | Op::ConstructorPrototype(_)
-        | Op::CachedProperty(..)
-        | Op::ShapedGet(..)
-        | Op::LayoutGet(..)
-        | Op::FillPropertyCache(..) => ValueType::ALL,
+        Op::EntryAssume(..) => ValueType::BOOLEAN,
         Op::HelperCall { result_type, .. } => *result_type,
-        Op::View(_) => ValueType::VIEW,
         Op::Convert(value, repr) | Op::Unbox(value, repr) => repr.coerce(facts.of(*value)),
         Op::Box(value) => facts.of(*value),
         Op::AsBoxed(_) => ValueType::ALL,
@@ -902,115 +852,13 @@ fn result_types(graph: &Graph, op: &Op, facts: &Facts) -> ValueType {
         Op::LowLevel(LowOp::Load { ty, .. }) if *ty == cranelift_codegen::ir::types::I64 => {
             ValueType::INT64
         }
-        Op::LowLevel(_) | Op::TypedData(_) | Op::Memory(_) => ValueType::default(),
-        Op::MemoryNumber(_, format) => match format {
-            MemoryFormat::U32 | MemoryFormat::F32 | MemoryFormat::F64 => ValueType::NUMBER,
-            _ => ValueType::INT32,
-        },
+        Op::LowLevel(_) | Op::Memory(_) => ValueType::default(),
         Op::KeepAlive(_) => ValueType::default(),
-        Op::TypedIndex(.., read) if read.bounded => match read.element {
-            Some(TypedKind::Float32 | TypedKind::Float64 | TypedKind::Uint32) | None => {
-                ValueType::NUMBER
-            }
-            Some(_) => ValueType::INT32,
-        },
-        Op::TypedIndex(..) => ValueType::NUMBER.union(ValueType::UNDEFINED),
-        Op::IsTyped(..)
-        | Op::IsIndexed(_)
-        | Op::IsOrdinaryArray(_)
-        | Op::IsArrayIndex(..)
-        | Op::IsArray(..)
-        | Op::IsExactPosition(..)
-        | Op::IsInBounds(..)
-        | Op::BooleanAnd(..) => ValueType::BOOLEAN,
-        Op::PropertyCache(..) | Op::GlobalCache(..) => ValueType::INT64,
-        Op::CanOverwrite(..) => ValueType::BOOLEAN,
-        Op::IndexedLength(_) => ValueType::INT64,
+        Op::BooleanAnd(..) => ValueType::BOOLEAN,
         Op::Regex(super::regex::Op::IsPattern(..) | super::regex::Op::Test(..)) => {
             ValueType::BOOLEAN
         }
         Op::Regex(super::regex::Op::Exec(..)) => ValueType::OBJECT.union(ValueType::NULL),
-        Op::ArrayKind(_) => ValueType::INT32,
-        Op::IsNumber(_)
-        | Op::IsInteger(_)
-        | Op::IntegerCheck(..)
-        | Op::IsString(_)
-        | Op::Truthy(_)
-        | Op::IsStringSplit(_)
-        | Op::IsTypeof(..) => ValueType::BOOLEAN,
-        Op::NewPack | Op::Spread(_) | Op::StringSplitParts(..) => ValueType::PACK,
-        Op::StringConcat(_) => ValueType::STRING,
-        Op::StringSplit(..) => ValueType::OBJECT,
-        Op::ArrayPosition(_) => ValueType::INT64,
-        Op::ToInt32(_) => ValueType::INT32,
-        Op::AsInteger(_) => ValueType::INT64,
-        Op::NumericFloat(_) | Op::SaturatingInteger(_) => ValueType::NUMBER,
-        Op::AsString(_) => ValueType::STRING,
-        Op::AsObject(_) => ValueType::OBJECT,
-        Op::AsNumber(value) | Op::ToNumeric(value) | Op::Unary(UnaryOp::Plus, value)
-            if facts.of(*value).within(ValueType::NUMBER) =>
-        {
-            facts.of(*value)
-        }
-        Op::AsNumber(_) | Op::ToNumeric(_) => ValueType::NUMBER,
-        Op::Unary(UnaryOp::Increment | UnaryOp::Decrement, value)
-            if facts.of(*value).within(ValueType::INTEGER) =>
-        {
-            ValueType::INT64
-        }
-        Op::Unary(operator, _) => match operator {
-            UnaryOp::Not => ValueType::BOOLEAN,
-            UnaryOp::Typeof => ValueType::STRING,
-            UnaryOp::Plus => ValueType::NUMBER,
-            UnaryOp::BitwiseNot => ValueType::INT32,
-            UnaryOp::Negate | UnaryOp::Increment | UnaryOp::Decrement => ValueType::NUMBER,
-        },
-        Op::Binary(BinaryOperator::Addition | BinaryOperator::Subtraction, left, right)
-            if facts.of(*left).within(ValueType::INTEGER)
-                && facts.of(*right).within(ValueType::INTEGER) =>
-        {
-            ValueType::INT64
-        }
-        Op::Binary(BinaryOperator::Multiplication, left, right)
-            if integer_product(graph, facts, *left, *right) =>
-        {
-            ValueType::INT64
-        }
-        Op::Binary(operator, left, right) => match operator {
-            BinaryOperator::Addition => {
-                let (left, right) = (facts.of(*left), facts.of(*right));
-                let nonstring = ValueType::NUMBER
-                    .union(ValueType::BOOLEAN)
-                    .union(ValueType::UNDEFINED)
-                    .union(ValueType::NULL);
-                if left.within(nonstring) && right.within(nonstring) {
-                    ValueType::NUMBER
-                } else if left.within(ValueType::STRING) || right.within(ValueType::STRING) {
-                    ValueType::STRING
-                } else {
-                    ValueType::NUMBER.union(ValueType::STRING)
-                }
-            }
-            BinaryOperator::Subtraction
-            | BinaryOperator::Multiplication
-            | BinaryOperator::Division
-            | BinaryOperator::Remainder
-            | BinaryOperator::Exponential => ValueType::NUMBER,
-            BinaryOperator::ShiftLeft
-            | BinaryOperator::ShiftRight
-            | BinaryOperator::BitwiseOR
-            | BinaryOperator::BitwiseXOR
-            | BinaryOperator::BitwiseAnd => ValueType::INT32,
-            BinaryOperator::ShiftRightZeroFill => ValueType::NUMBER,
-            _ => ValueType::BOOLEAN,
-        },
-        Op::GuardedCompare { .. } => ValueType::BOOLEAN,
-        Op::CallNative(..) => ValueType::NUMBER,
-        Op::IsUndefined(_)
-        | Op::IsNullish(_)
-        | Op::IsNative(..)
-        | Op::IsCode(..)
-        | Op::GuardValid(_) => ValueType::BOOLEAN,
         _ => ValueType::VALUE,
     }
 }

@@ -1,4 +1,5 @@
 use crate::FxHashMap;
+use crate::jit::semantic::JsOp;
 use std::collections::BTreeMap;
 
 use super::super::dispatch::{self, Alternative};
@@ -10,7 +11,7 @@ use crate::jit::variants::{Fact as InputFact, Input, Requirements};
 
 fn input(graph: &Graph, value: Value) -> Option<Input> {
     match graph.defining_op(value)? {
-        Op::This => Some(Input::This),
+        Op::Javascript(JsOp::This) => Some(Input::This),
         Op::Argument(index) => Some(Input::Argument(*index)),
         _ => None,
     }
@@ -68,14 +69,17 @@ fn shape_hints(graph: &Graph, bodies: &Repository, source: usize) -> FxHashMap<V
         for &inst in &graph.blocks[block].insts {
             let data = &graph.insts[inst];
             let (object, property) = match data.op {
-                Op::EntryAssume(value, Fact::Shape(shape)) | Op::IsShape(value, shape) => {
+                Op::EntryAssume(value, Fact::Shape(shape))
+                | Op::Javascript(JsOp::IsShape(value, shape)) => {
                     hints.entry(value).or_insert(shape);
                     continue;
                 }
-                Op::Get(object, _) | Op::ProbeProperty(object, _) => {
+                Op::Javascript(JsOp::Get(object, _) | JsOp::ProbeProperty(object, _)) => {
                     (object, crate::jit::profile::PropertyAccess::Get)
                 }
-                Op::Set(object, ..) => (object, crate::jit::profile::PropertyAccess::Set),
+                Op::Javascript(JsOp::Set(object, ..)) => {
+                    (object, crate::jit::profile::PropertyAccess::Set)
+                }
                 _ => continue,
             };
             let site = Site {
@@ -98,7 +102,7 @@ fn shape_hints(graph: &Graph, bodies: &Repository, source: usize) -> FxHashMap<V
 pub(in crate::jit) fn assume(graph: &mut Graph, requirements: &Requirements) {
     for (index, &(input, fact)) in requirements.iter().enumerate() {
         let op = match input {
-            Input::This => Op::This,
+            Input::This => Op::Javascript(JsOp::This),
             Input::Argument(index) => Op::Argument(index),
         };
         let (_, value) = graph.insert(graph.entry, index * 2, graph.span, op, true);
@@ -150,12 +154,12 @@ pub(in crate::jit::semantic) fn apply(
         .collect();
     for inst in calls {
         let data = graph.insts[inst].clone();
-        let Op::Call {
+        let Op::Javascript(JsOp::Call {
             callee,
             receiver,
             ref args,
             target,
-        } = data.op
+        }) = data.op
         else {
             continue;
         };
@@ -260,19 +264,19 @@ pub(in crate::jit::semantic) fn apply(
         if alternatives.is_empty() {
             continue;
         }
-        if let Op::Call { target, .. } = &mut graph.insts[inst].op {
+        if let Op::Javascript(JsOp::Call { target, .. }) = &mut graph.insts[inst].op {
             *target = None;
         }
         dispatch::apply(graph, inst, alternatives, |graph, block, target| {
             let (call, result) = graph.append(
                 block,
                 data.span,
-                Op::Call {
+                Op::Javascript(JsOp::Call {
                     callee,
                     receiver,
                     args: args.clone(),
                     target: Some(target),
-                },
+                }),
                 true,
             );
             graph.insts[call].source_name = data.source_name;

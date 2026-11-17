@@ -1,3 +1,4 @@
+use crate::jit::semantic::JsOp;
 use cranelift_codegen::entity::SecondaryMap;
 use oxc_syntax::operator::BinaryOperator;
 
@@ -7,27 +8,37 @@ use super::Access;
 fn contained_use(op: &Op, index: usize) -> bool {
     match op {
         Op::Observe(..) | Op::ReadHint(..) | Op::Assume(..) | Op::EntryAssume(..) => true,
-        Op::Get(..)
-        | Op::ShapedGet(..)
-        | Op::ShapedSet(..)
-        | Op::GetIndex(..)
-        | Op::TypedIndex(..)
-        | Op::ArrayGet(..)
-        | Op::ArrayLoad(..)
-        | Op::Set(..)
-        | Op::SetIndex(..)
-        | Op::Define(..)
-        | Op::ArrayAppend(..) => index == 0,
-        Op::IsUndefined(_)
-        | Op::IsNullish(_)
-        | Op::CheckInitialized(_)
-        | Op::IsIndexed(_)
-        | Op::IsOrdinaryArray(_)
-        | Op::IndexedLength(_) => true,
-        Op::Binary(BinaryOperator::StrictEquality | BinaryOperator::StrictInequality, ..) => true,
-        Op::IteratorNew(_) | Op::IteratorNext(_) | Op::EnumerateNew(_) | Op::EnumerateNext(_) => {
-            true
-        }
+        Op::Javascript(
+            JsOp::Get(..)
+            | JsOp::ShapedGet(..)
+            | JsOp::ShapedSet(..)
+            | JsOp::GetIndex(..)
+            | JsOp::TypedIndex(..)
+            | JsOp::ArrayGet(..)
+            | JsOp::ArrayLoad(..)
+            | JsOp::Set(..)
+            | JsOp::SetIndex(..)
+            | JsOp::Define(..)
+            | JsOp::ArrayAppend(..),
+        ) => index == 0,
+        Op::Javascript(
+            JsOp::IsUndefined(_)
+            | JsOp::IsNullish(_)
+            | JsOp::CheckInitialized(_)
+            | JsOp::IsIndexed(_)
+            | JsOp::IsOrdinaryArray(_)
+            | JsOp::IndexedLength(_),
+        ) => true,
+        Op::Javascript(JsOp::Binary(
+            BinaryOperator::StrictEquality | BinaryOperator::StrictInequality,
+            ..,
+        )) => true,
+        Op::Javascript(
+            JsOp::IteratorNew(_)
+            | JsOp::IteratorNext(_)
+            | JsOp::EnumerateNew(_)
+            | JsOp::EnumerateNext(_),
+        ) => true,
         _ => false,
     }
 }
@@ -125,10 +136,13 @@ impl Fresh {
             for &inst in &data.insts {
                 let data = &graph.insts[inst];
                 match data.op {
-                    Op::NewObject | Op::NewInstance(_) | Op::NewArray(_) | Op::NewHoleyArray(_) => {
-                        allocations.extend(data.result())
-                    }
-                    Op::IteratorNew(source) | Op::EnumerateNew(source) => {
+                    Op::Javascript(
+                        JsOp::NewObject
+                        | JsOp::NewInstance(_)
+                        | JsOp::NewArray(_)
+                        | JsOp::NewHoleyArray(_),
+                    ) => allocations.extend(data.result()),
+                    Op::Javascript(JsOp::IteratorNew(source) | JsOp::EnumerateNew(source)) => {
                         if let Some(iterator) = data.result() {
                             allocations.push(iterator);
                             sources.push((iterator, source));
@@ -255,7 +269,7 @@ impl Fresh {
                         continue;
                     }
                     let terminal_constructor = position == 1
-                        && matches!(op, Op::ConstructorResult(..))
+                        && matches!(op, Op::Javascript(JsOp::ConstructorResult(..)))
                         && graph.insts[inst]
                             .result()
                             .is_some_and(|result| terminal.result(result));

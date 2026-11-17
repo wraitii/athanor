@@ -1,3 +1,4 @@
+use crate::jit::semantic::JsOp;
 use crate::{FxHashMap, FxHashSet};
 
 use cranelift_codegen::entity::SecondaryMap;
@@ -91,25 +92,30 @@ pub(in crate::jit::semantic) fn promote(graph: &mut Graph, notes: &mut Vec<Strin
     let cfg = Cfg::new(graph);
     let entry = graph.entry;
     let span = graph.span;
-    let (_, uninitialized) =
-        graph.insert(entry, 0, span, Op::Constant(Constant::Uninitialized), true);
+    let (_, uninitialized) = graph.insert(
+        entry,
+        0,
+        span,
+        Op::Javascript(JsOp::Constant(Constant::Uninitialized)),
+        true,
+    );
     let uninitialized = uninitialized.unwrap();
     let mut end_defs = FxHashMap::default();
     for &block in &cfg.rpo {
         for &inst in &graph.blocks[block].insts {
             match graph.insts[inst].op {
-                Op::EnterScope(scope) => {
+                Op::Javascript(JsOp::EnterScope(scope)) => {
                     for &binding in &graph.scopes[scope].bindings {
                         if promoted.contains(&binding) {
                             end_defs.insert((block, binding), uninitialized);
                         }
                     }
                 }
-                Op::Initialize(binding, value)
-                | Op::BindingRestore(binding, value)
-                | Op::Write(binding, value)
-                    if promoted.contains(&binding) =>
-                {
+                Op::Javascript(
+                    JsOp::Initialize(binding, value)
+                    | JsOp::BindingRestore(binding, value)
+                    | JsOp::Write(binding, value),
+                ) if promoted.contains(&binding) => {
                     end_defs.insert((block, binding), value);
                 }
                 _ => {}
@@ -128,7 +134,7 @@ pub(in crate::jit::semantic) fn promote(graph: &mut Graph, notes: &mut Vec<Strin
         let mut current: FxHashMap<Binding, Value> = FxHashMap::default();
         for inst in promoter.graph.blocks[block].insts.clone() {
             let (binding, access) = match promoter.graph.insts[inst].op {
-                Op::EnterScope(scope) => {
+                Op::Javascript(JsOp::EnterScope(scope)) => {
                     for &binding in &promoter.graph.scopes[scope].bindings {
                         if promoted.contains(&binding) {
                             current.insert(binding, uninitialized);
@@ -136,12 +142,12 @@ pub(in crate::jit::semantic) fn promote(graph: &mut Graph, notes: &mut Vec<Strin
                     }
                     continue;
                 }
-                Op::Read(binding) => (binding, Access::Read),
-                Op::BindingLoad(binding) => (binding, Access::Load),
-                Op::Write(binding, value) => (binding, Access::Write(value)),
-                Op::Initialize(binding, value) | Op::BindingRestore(binding, value) => {
-                    (binding, Access::Initialize(value))
-                }
+                Op::Javascript(JsOp::Read(binding)) => (binding, Access::Read),
+                Op::Javascript(JsOp::BindingLoad(binding)) => (binding, Access::Load),
+                Op::Javascript(JsOp::Write(binding, value)) => (binding, Access::Write(value)),
+                Op::Javascript(
+                    JsOp::Initialize(binding, value) | JsOp::BindingRestore(binding, value),
+                ) => (binding, Access::Initialize(value)),
                 _ => continue,
             };
             if !promoted.contains(&binding) {
@@ -172,7 +178,7 @@ pub(in crate::jit::semantic) fn promote(graph: &mut Graph, notes: &mut Vec<Strin
                 }
                 Access::Load | Access::Initialize(_) => unreachable!(),
             }
-            data.op = Op::CheckInitialized(old);
+            data.op = Op::Javascript(JsOp::CheckInitialized(old));
         }
     }
     promoter.graph.replace_uses(&aliases);

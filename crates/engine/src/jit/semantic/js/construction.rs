@@ -1,4 +1,5 @@
 use crate::FxHashSet;
+use crate::jit::semantic::JsOp;
 
 use super::super::{BlockData, Cfg, Graph, Inst, Op, Target, Terminator, TerminatorKind};
 
@@ -6,7 +7,9 @@ pub(in crate::jit::semantic) fn resolve(graph: &mut Graph) {
     for block in Cfg::new(graph).rpo {
         for inst in graph.blocks[block].insts.clone() {
             let callee = match graph.insts[inst].op {
-                Op::Construct { callee, .. } | Op::ConstructPack(callee, _) => callee,
+                Op::Javascript(JsOp::Construct { callee, .. } | JsOp::ConstructPack(callee, _)) => {
+                    callee
+                }
                 _ => continue,
             };
             let position = graph.blocks[block]
@@ -19,7 +22,7 @@ pub(in crate::jit::semantic) fn resolve(graph: &mut Graph) {
                 block,
                 position,
                 span,
-                Op::ConstructorPrototype(callee),
+                Op::Javascript(JsOp::ConstructorPrototype(callee)),
                 true,
             );
             graph.insts[probe].source_name = graph.insts[inst].source_name;
@@ -27,13 +30,15 @@ pub(in crate::jit::semantic) fn resolve(graph: &mut Graph) {
             graph.set_op(
                 inst,
                 match graph.insts[inst].op.clone() {
-                    Op::Construct { callee, args } => Op::ConstructResolved {
-                        callee,
-                        prototype,
-                        args,
-                    },
-                    Op::ConstructPack(callee, args) => {
-                        Op::ConstructPackResolved(callee, prototype, args)
+                    Op::Javascript(JsOp::Construct { callee, args }) => {
+                        Op::Javascript(JsOp::ConstructResolved {
+                            callee,
+                            prototype,
+                            args,
+                        })
+                    }
+                    Op::Javascript(JsOp::ConstructPack(callee, args)) => {
+                        Op::Javascript(JsOp::ConstructPackResolved(callee, prototype, args))
                     }
                     _ => unreachable!(),
                 },
@@ -51,7 +56,9 @@ pub(in crate::jit::semantic) fn expand(graph: &mut Graph, expanded: &mut FxHashS
             !expanded.contains(&inst)
                 && matches!(
                     graph.insts[inst].op,
-                    Op::ConstructResolved { .. } | Op::ConstructPackResolved(..)
+                    Op::Javascript(
+                        JsOp::ConstructResolved { .. } | JsOp::ConstructPackResolved(..)
+                    )
                 )
         })
         .collect();
@@ -59,16 +66,22 @@ pub(in crate::jit::semantic) fn expand(graph: &mut Graph, expanded: &mut FxHashS
         expanded.insert(inst);
         let data = graph.insts[inst].clone();
         let (callee, prototype) = match data.op {
-            Op::ConstructResolved {
-                callee, prototype, ..
-            }
-            | Op::ConstructPackResolved(callee, prototype, _) => (callee, prototype),
+            Op::Javascript(
+                JsOp::ConstructResolved {
+                    callee, prototype, ..
+                }
+                | JsOp::ConstructPackResolved(callee, prototype, _),
+            ) => (callee, prototype),
             _ => unreachable!(),
         };
         let (block, continuation, fallback) = super::super::dispatch::split(graph, inst);
         let fast = graph.blocks.push(BlockData::default());
-        let (check, unresolved) =
-            graph.append(block, data.span, Op::IsUninitialized(prototype), true);
+        let (check, unresolved) = graph.append(
+            block,
+            data.span,
+            Op::Javascript(JsOp::IsUninitialized(prototype)),
+            true,
+        );
         let unresolved = unresolved.unwrap();
         graph.insts[check].source_name = data.source_name;
         graph.insts[check].inline_context = data.inline_context;
@@ -78,20 +91,30 @@ pub(in crate::jit::semantic) fn expand(graph: &mut Graph, expanded: &mut FxHashS
             span: data.span,
             kind: TerminatorKind::Branch(unresolved, Target::new(fallback), Target::new(fast)),
         });
-        let instance = graph.append_value(fast, data.span, Op::NewInstance(prototype));
+        let instance = graph.append_value(
+            fast,
+            data.span,
+            Op::Javascript(JsOp::NewInstance(prototype)),
+        );
         let call = match data.op {
-            Op::ConstructResolved { args, .. } => Op::ConstructorCall {
-                callee,
-                receiver: instance,
-                args,
-            },
-            Op::ConstructPackResolved(_, _, args) => {
-                Op::ConstructorCallPack(callee, instance, args)
+            Op::Javascript(JsOp::ConstructResolved { args, .. }) => {
+                Op::Javascript(JsOp::ConstructorCall {
+                    callee,
+                    receiver: instance,
+                    args,
+                })
+            }
+            Op::Javascript(JsOp::ConstructPackResolved(_, _, args)) => {
+                Op::Javascript(JsOp::ConstructorCallPack(callee, instance, args))
             }
             _ => unreachable!(),
         };
         let result = graph.append_value(fast, data.span, call);
-        let result = graph.append_value(fast, data.span, Op::ConstructorResult(result, instance));
+        let result = graph.append_value(
+            fast,
+            data.span,
+            Op::Javascript(JsOp::ConstructorResult(result, instance)),
+        );
         for &inst in &graph.blocks[fast].insts {
             graph.insts[inst].source_name = data.source_name;
             graph.insts[inst].inline_context = data.inline_context;

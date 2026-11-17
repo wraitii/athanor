@@ -1,3 +1,4 @@
+use crate::jit::semantic::JsOp;
 use oxc_syntax::operator::BinaryOperator;
 
 use super::super::{Constant, Op, TerminatorKind, ValueDef, ValueType};
@@ -17,7 +18,7 @@ pub(in crate::jit::semantic) fn bit_tests(function: &mut super::super::FunctionS
         if uses[condition] != 1 {
             continue;
         }
-        let Some(&Op::Binary(BinaryOperator::BitwiseAnd, left, right)) =
+        let Some(&Op::Javascript(JsOp::Binary(BinaryOperator::BitwiseAnd, left, right))) =
             graph.defining_op(condition)
         else {
             continue;
@@ -25,13 +26,14 @@ pub(in crate::jit::semantic) fn bit_tests(function: &mut super::super::FunctionS
         let test = [(left, right), (right, left)]
             .into_iter()
             .find_map(|(word, mask)| {
-                let &Op::Binary(BinaryOperator::ShiftLeft, one, index) = graph.defining_op(mask)?
+                let &Op::Javascript(JsOp::Binary(BinaryOperator::ShiftLeft, one, index)) =
+                    graph.defining_op(mask)?
                 else {
                     return None;
                 };
                 (matches!(
                     graph.defining_op(one),
-                    Some(Op::Constant(Constant::Number(1.0)))
+                    Some(Op::Javascript(JsOp::Constant(Constant::Number(1.0))))
                 ) && facts.of(word).within(ValueType::INT32)
                     && facts.of(index).within(ValueType::INT32))
                 .then_some((word, index, one))
@@ -55,11 +57,15 @@ pub(in crate::jit::semantic) fn bit_tests(function: &mut super::super::FunctionS
             block,
             position,
             span,
-            Op::Binary(BinaryOperator::ShiftRight, word, index),
+            Op::Javascript(JsOp::Binary(BinaryOperator::ShiftRight, word, index)),
             true,
         );
         graph.insts[shift].source_name = source_name;
-        graph.insts[inst].op = Op::Binary(BinaryOperator::BitwiseAnd, shifted.unwrap(), one);
+        graph.insts[inst].op = Op::Javascript(JsOp::Binary(
+            BinaryOperator::BitwiseAnd,
+            shifted.unwrap(),
+            one,
+        ));
         changed = true;
     }
     if changed {

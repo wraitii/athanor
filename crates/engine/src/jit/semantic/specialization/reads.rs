@@ -1,4 +1,5 @@
 use crate::jit::profile::{ReadKind, ReadType, Site};
+use crate::jit::semantic::JsOp;
 
 use super::super::{
     BlockData, Cfg, Constant, Facts, Graph, Inst, Op, Target, Terminator, TerminatorKind,
@@ -41,9 +42,11 @@ fn plan_accesses(
     for block in Cfg::new(graph).rpo {
         for &inst in &graph.blocks[block].insts {
             let (object, key) = match graph.insts[inst].op {
-                Op::SetIndex(object, key, _) if stores => (object, key),
-                Op::GetIndex(object, key) if !stores => (object, key),
-                Op::TypedIndex(object, key, TypedRead { element: None, .. }) if !stores => {
+                Op::Javascript(JsOp::SetIndex(object, key, _)) if stores => (object, key),
+                Op::Javascript(JsOp::GetIndex(object, key)) if !stores => (object, key),
+                Op::Javascript(JsOp::TypedIndex(object, key, TypedRead { element: None, .. }))
+                    if !stores =>
+                {
                     (object, key)
                 }
                 _ => continue,
@@ -103,9 +106,11 @@ pub(in crate::jit::semantic) fn assume(graph: &mut Graph, reads: &[Read]) {
     for read in reads {
         let data = graph.insts[read.inst].clone();
         let (object, key) = match data.op {
-            Op::GetIndex(object, key)
-            | Op::TypedIndex(object, key, _)
-            | Op::SetIndex(object, key, _) => (object, key),
+            Op::Javascript(
+                JsOp::GetIndex(object, key)
+                | JsOp::TypedIndex(object, key, _)
+                | JsOp::SetIndex(object, key, _),
+            ) => (object, key),
             _ => unreachable!(),
         };
         let at = graph.blocks[data.block]
@@ -167,7 +172,9 @@ pub(in crate::jit::semantic) fn lower(
             let data = &graph.insts[inst];
             if !matches!(
                 data.op,
-                Op::GetIndex(..) | Op::TypedIndex(_, _, TypedRead { element: None, .. })
+                Op::Javascript(
+                    JsOp::GetIndex(..) | JsOp::TypedIndex(_, _, TypedRead { element: None, .. })
+                )
             ) {
                 return None;
             }
@@ -192,7 +199,7 @@ pub(in crate::jit::semantic) fn lower(
         .filter(|block| !graph.cold.contains(block))
         .flat_map(|&block| graph.blocks[block].insts.iter().copied())
         .filter_map(|inst| {
-            let Op::ArrayGet(object, key) = graph.insts[inst].op else {
+            let Op::Javascript(JsOp::ArrayGet(object, key)) = graph.insts[inst].op else {
                 return None;
             };
             facts.of(key).within(ValueType::NUMBER).then(|| {
@@ -228,8 +235,10 @@ pub(in crate::jit::semantic) fn apply(
         let site = graph.note_inst(read.inst);
         let data = graph.insts[read.inst].clone();
         let (object, key) = match data.op {
-            Op::GetIndex(object, key)
-            | Op::TypedIndex(object, key, TypedRead { element: None, .. }) => (object, key),
+            Op::Javascript(
+                JsOp::GetIndex(object, key)
+                | JsOp::TypedIndex(object, key, TypedRead { element: None, .. }),
+            ) => (object, key),
             _ => unreachable!(),
         };
         let cfg = Cfg::new(graph);
@@ -245,7 +254,7 @@ pub(in crate::jit::semantic) fn apply(
             )
             && facts.of(key).within(ValueType::NUMBER)
         {
-            graph.set_op(read.inst, Op::ArrayGet(object, key));
+            graph.set_op(read.inst, Op::Javascript(JsOp::ArrayGet(object, key)));
             continue;
         }
         if read.typed
@@ -260,14 +269,14 @@ pub(in crate::jit::semantic) fn apply(
         {
             graph.set_op(
                 read.inst,
-                Op::TypedIndex(
+                Op::Javascript(JsOp::TypedIndex(
                     object,
                     key,
                     TypedRead {
                         element: read.element,
                         bounded: false,
                     },
-                ),
+                )),
             );
             continue;
         }
@@ -279,7 +288,11 @@ pub(in crate::jit::semantic) fn apply(
         let first_block = graph.blocks.len();
         let (block, continuation, fallback) = super::super::dispatch::split(graph, read.inst);
         let fast = graph.blocks.push(BlockData::default());
-        let check = graph.append_value(block, data.span, Op::IsTyped(object, read.element));
+        let check = graph.append_value(
+            block,
+            data.span,
+            Op::Javascript(JsOp::IsTyped(object, read.element)),
+        );
         graph.blocks[block].terminator = Some(Terminator {
             source_name: data.source_name,
             emission_location: None,
@@ -288,14 +301,14 @@ pub(in crate::jit::semantic) fn apply(
         });
         let (fast, key) = if read.guard_number {
             let typed = graph.blocks.push(BlockData::default());
-            let check = graph.append_value(fast, data.span, Op::IsNumber(key));
+            let check = graph.append_value(fast, data.span, Op::Javascript(JsOp::IsNumber(key)));
             graph.blocks[fast].terminator = Some(Terminator {
                 source_name: data.source_name,
                 emission_location: None,
                 span: data.span,
                 kind: TerminatorKind::Branch(check, Target::new(typed), Target::new(fallback)),
             });
-            let key = graph.append_value(typed, data.span, Op::AsNumber(key));
+            let key = graph.append_value(typed, data.span, Op::Javascript(JsOp::AsNumber(key)));
             (typed, key)
         } else {
             (fast, key)
@@ -303,14 +316,14 @@ pub(in crate::jit::semantic) fn apply(
         let (inst, value) = graph.append(
             fast,
             data.span,
-            Op::TypedIndex(
+            Op::Javascript(JsOp::TypedIndex(
                 object,
                 key,
                 TypedRead {
                     element: read.element,
                     bounded: false,
                 },
-            ),
+            )),
             true,
         );
         graph.insts[inst].source_name = data.source_name;
@@ -333,7 +346,7 @@ pub(in crate::jit::semantic) fn apply(
 fn lower_array(graph: &mut Graph, inst: Inst, guard_number: bool, array: bool) {
     let data = graph.insts[inst].clone();
     let (object, key) = match data.op {
-        Op::GetIndex(object, key) | Op::ArrayGet(object, key) => (object, key),
+        Op::Javascript(JsOp::GetIndex(object, key) | JsOp::ArrayGet(object, key)) => (object, key),
         _ => unreachable!(),
     };
     let terminate = |graph: &mut Graph, block, kind| {
@@ -348,41 +361,49 @@ fn lower_array(graph: &mut Graph, inst: Inst, guard_number: bool, array: bool) {
     let (block, continuation, fallback) = super::super::dispatch::split(graph, inst);
     let (mut fast, key) = if guard_number {
         let fast = graph.blocks.push(BlockData::default());
-        let check = graph.append_value(block, data.span, Op::IsNumber(key));
+        let check = graph.append_value(block, data.span, Op::Javascript(JsOp::IsNumber(key)));
         terminate(
             graph,
             block,
             TerminatorKind::Branch(check, Target::new(fast), Target::new(fallback)),
         );
-        let key = graph.append_value(fast, data.span, Op::AsNumber(key));
+        let key = graph.append_value(fast, data.span, Op::Javascript(JsOp::AsNumber(key)));
         (fast, key)
     } else {
         (block, key)
     };
-    let position = graph.append_value(fast, data.span, Op::ArrayPosition(key));
+    let position = graph.append_value(fast, data.span, Op::Javascript(JsOp::ArrayPosition(key)));
     if array {
-        let kind = graph.append_value(fast, data.span, Op::ArrayKind(object));
+        let kind = graph.append_value(fast, data.span, Op::Javascript(JsOp::ArrayKind(object)));
         let mask = graph.append_value(
             fast,
             data.span,
-            Op::Constant(Constant::Number(
+            Op::Javascript(JsOp::Constant(Constant::Number(
                 crate::heap::kind::PROTOTYPE_INDEXED as f64,
-            )),
+            ))),
         );
         let indexed = graph.append_value(
             fast,
             data.span,
-            Op::Binary(oxc_syntax::operator::BinaryOperator::BitwiseAnd, kind, mask),
+            Op::Javascript(JsOp::Binary(
+                oxc_syntax::operator::BinaryOperator::BitwiseAnd,
+                kind,
+                mask,
+            )),
         );
-        let zero = graph.append_value(fast, data.span, Op::Constant(Constant::Number(0.0)));
+        let zero = graph.append_value(
+            fast,
+            data.span,
+            Op::Javascript(JsOp::Constant(Constant::Number(0.0))),
+        );
         let regular = graph.append_value(
             fast,
             data.span,
-            Op::Binary(
+            Op::Javascript(JsOp::Binary(
                 oxc_syntax::operator::BinaryOperator::StrictEquality,
                 indexed,
                 zero,
-            ),
+            )),
         );
         let checked = graph.blocks.push(BlockData::default());
         terminate(
@@ -394,9 +415,18 @@ fn lower_array(graph: &mut Graph, inst: Inst, guard_number: bool, array: bool) {
         let load = graph.blocks.push(BlockData::default());
         let outside = graph.blocks.push(BlockData::default());
         let absent = graph.blocks.push(BlockData::default());
-        let exact = graph.append_value(fast, data.span, Op::IsExactPosition(key, position));
-        let length = graph.append_value(fast, data.span, Op::IndexedLength(object));
-        let inside = graph.append_value(fast, data.span, Op::IsInBounds(position, length));
+        let exact = graph.append_value(
+            fast,
+            data.span,
+            Op::Javascript(JsOp::IsExactPosition(key, position)),
+        );
+        let length =
+            graph.append_value(fast, data.span, Op::Javascript(JsOp::IndexedLength(object)));
+        let inside = graph.append_value(
+            fast,
+            data.span,
+            Op::Javascript(JsOp::IsInBounds(position, length)),
+        );
         let valid = graph.append_value(fast, data.span, Op::BooleanAnd(exact, inside));
         terminate(
             graph,
@@ -406,7 +436,11 @@ fn lower_array(graph: &mut Graph, inst: Inst, guard_number: bool, array: bool) {
         let value = graph.append_value(
             load,
             data.span,
-            Op::ArrayLoad(object, position, super::super::ArrayLayout::Holey),
+            Op::Javascript(JsOp::ArrayLoad(
+                object,
+                position,
+                super::super::ArrayLayout::Holey,
+            )),
         );
         terminate(
             graph,
@@ -419,16 +453,24 @@ fn lower_array(graph: &mut Graph, inst: Inst, guard_number: bool, array: bool) {
         let limit = graph.append_value(
             outside,
             data.span,
-            Op::Constant(Constant::Number(u32::MAX as f64)),
+            Op::Javascript(JsOp::Constant(Constant::Number(u32::MAX as f64))),
         );
-        let canonical = graph.append_value(outside, data.span, Op::IsInBounds(position, limit));
+        let canonical = graph.append_value(
+            outside,
+            data.span,
+            Op::Javascript(JsOp::IsInBounds(position, limit)),
+        );
         let canonical = graph.append_value(outside, data.span, Op::BooleanAnd(exact, canonical));
         terminate(
             graph,
             outside,
             TerminatorKind::Branch(canonical, Target::new(absent), Target::new(fallback)),
         );
-        let undefined = graph.append_value(absent, data.span, Op::Constant(Constant::Undefined));
+        let undefined = graph.append_value(
+            absent,
+            data.span,
+            Op::Javascript(JsOp::Constant(Constant::Undefined)),
+        );
         terminate(
             graph,
             absent,
@@ -454,7 +496,7 @@ fn lower_array(graph: &mut Graph, inst: Inst, guard_number: bool, array: bool) {
         let valid = graph.append_value(
             guard,
             data.span,
-            Op::IsArrayIndex(object, key, position, layout),
+            Op::Javascript(JsOp::IsArrayIndex(object, key, position, layout)),
         );
         terminate(
             graph,
@@ -464,7 +506,7 @@ fn lower_array(graph: &mut Graph, inst: Inst, guard_number: bool, array: bool) {
         let (load_inst, value) = graph.append(
             load,
             data.span,
-            Op::ArrayLoad(object, position, layout),
+            Op::Javascript(JsOp::ArrayLoad(object, position, layout)),
             true,
         );
         graph.insts[load_inst].source_name = data.source_name;
@@ -525,10 +567,13 @@ mod tests {
             .graph;
         let mut bodies = super::super::calls::Repository::default();
         for data in graph.insts.values() {
-            let Op::GetIndex(object, _) = data.op else {
+            let Op::Javascript(JsOp::GetIndex(object, _)) = data.op else {
                 continue;
             };
-            let observed = if matches!(graph.defining_op(object), Some(Op::GetIndex(..))) {
+            let observed = if matches!(
+                graph.defining_op(object),
+                Some(Op::Javascript(JsOp::GetIndex(..)))
+            ) {
                 ReadType::Typed(TypedKind::Float64)
             } else {
                 ReadType::Array
@@ -557,7 +602,7 @@ mod tests {
             !graph
                 .insts
                 .values()
-                .any(|data| matches!(data.op, Op::ArrayLoad(..)))
+                .any(|data| matches!(data.op, Op::Javascript(JsOp::ArrayLoad(..))))
         );
         assert!(
             graph
@@ -571,7 +616,7 @@ mod tests {
             graph
                 .insts
                 .values()
-                .filter(|data| matches!(data.op, Op::ArrayLoad(..)))
+                .filter(|data| matches!(data.op, Op::Javascript(JsOp::ArrayLoad(..))))
                 .count(),
             2
         );
@@ -581,14 +626,14 @@ mod tests {
                 .values()
                 .filter(|data| matches!(
                     data.op,
-                    Op::TypedIndex(
+                    Op::Javascript(JsOp::TypedIndex(
                         _,
                         _,
                         TypedRead {
                             element: Some(TypedKind::Float64),
                             ..
                         }
-                    )
+                    ))
                 ))
                 .count(),
             1

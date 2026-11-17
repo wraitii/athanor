@@ -1,5 +1,6 @@
 #[cfg(test)]
 use crate::jit::layout::ReadLayout;
+use crate::jit::semantic::JsOp;
 use crate::{FxHashMap, FxHashSet};
 use std::sync::Arc;
 
@@ -153,14 +154,16 @@ impl Repository {
         for block in Cfg::new(graph).rpo {
             for &call in &graph.blocks[block].insts {
                 let callee = match graph.insts[call].op {
-                    Op::Call { callee, .. }
-                    | Op::CallPack(callee, ..)
-                    | Op::Construct { callee, .. }
-                    | Op::ConstructorCall { callee, .. }
-                    | Op::ConstructPack(callee, ..)
-                    | Op::ConstructPackResolved(callee, ..)
-                    | Op::ConstructorCallPack(callee, ..)
-                    | Op::ConstructResolved { callee, .. } => callee,
+                    Op::Javascript(
+                        JsOp::Call { callee, .. }
+                        | JsOp::CallPack(callee, ..)
+                        | JsOp::Construct { callee, .. }
+                        | JsOp::ConstructorCall { callee, .. }
+                        | JsOp::ConstructPack(callee, ..)
+                        | JsOp::ConstructPackResolved(callee, ..)
+                        | JsOp::ConstructorCallPack(callee, ..)
+                        | JsOp::ConstructResolved { callee, .. },
+                    ) => callee,
                     _ => continue,
                 };
                 if let Some(target) = call_target(graph, self, source, call, callee)
@@ -326,43 +329,53 @@ fn assumptions(op: &Op, facts: &Facts) -> &'static [Assumption] {
         }
     };
     match op {
-        Op::Get(..)
-        | Op::GetIndex(..)
-        | Op::FillPropertyCache(..)
-        | Op::Set(..)
-        | Op::SetIndex(..)
-        | Op::Define(..) => PROPERTY,
-        Op::Spread(_) | Op::IteratorNext(_) | Op::EnumerateNext(_) => {
+        Op::Javascript(
+            JsOp::Get(..)
+            | JsOp::GetIndex(..)
+            | JsOp::FillPropertyCache(..)
+            | JsOp::Set(..)
+            | JsOp::SetIndex(..)
+            | JsOp::Define(..),
+        ) => PROPERTY,
+        Op::Javascript(JsOp::Spread(_) | JsOp::IteratorNext(_) | JsOp::EnumerateNext(_)) => {
             &[Assumption::DirectIteration]
         }
-        Op::ConstructorPrototype(_)
-        | Op::ProbeGlobal(_)
-        | Op::ProbeProperty(..)
-        | Op::ProbeShapeProperty(..)
-        | Op::ProbeIndex(..) => &[Assumption::NoAccessors],
-        Op::View(_) | Op::TypedIndex(..) => &[Assumption::FixedTypedStorage],
-        Op::GuardedCompare {
+        Op::Javascript(
+            JsOp::ConstructorPrototype(_)
+            | JsOp::ProbeGlobal(_)
+            | JsOp::ProbeProperty(..)
+            | JsOp::ProbeShapeProperty(..)
+            | JsOp::ProbeIndex(..),
+        ) => &[Assumption::NoAccessors],
+        Op::Javascript(JsOp::View(_) | JsOp::TypedIndex(..)) => &[Assumption::FixedTypedStorage],
+        Op::Javascript(JsOp::GuardedCompare {
             operator,
             left,
             right,
             ..
-        } => assumptions(&Op::Binary(*operator, *left, *right), facts),
-        Op::Binary(
+        }) => assumptions(
+            &Op::Javascript(JsOp::Binary(*operator, *left, *right)),
+            facts,
+        ),
+        Op::Javascript(JsOp::Binary(
             BinaryOperator::StrictEquality
             | BinaryOperator::StrictInequality
             | BinaryOperator::In
             | BinaryOperator::Instanceof,
             ..,
-        ) => &[],
-        Op::Unary(UnaryOp::Not | UnaryOp::Typeof | UnaryOp::Increment | UnaryOp::Decrement, _) => {
-            &[]
-        }
-        Op::CallNative(native, _)
+        )) => &[],
+        Op::Javascript(JsOp::Unary(
+            UnaryOp::Not | UnaryOp::Typeof | UnaryOp::Increment | UnaryOp::Decrement,
+            _,
+        )) => &[],
+        Op::Javascript(JsOp::CallNative(native, _))
             if METHODS[native.index()].1 == crate::heap::MathFunction::Random =>
         {
             &[]
         }
-        Op::Binary(..) | Op::ToNumeric(_) | Op::Unary(..) | Op::CallNative(..) => coercing(),
+        Op::Javascript(
+            JsOp::Binary(..) | JsOp::ToNumeric(_) | JsOp::Unary(..) | JsOp::CallNative(..),
+        ) => coercing(),
         _ => &[],
     }
 }
@@ -418,48 +431,58 @@ impl Repository {
             for &inst in &graph.blocks[block].insts {
                 let op = &graph.insts[inst].op;
                 match op {
-                    Op::GlobalRead(name) | Op::GlobalReadOptional(name) => {
+                    Op::Javascript(JsOp::GlobalRead(name) | JsOp::GlobalReadOptional(name)) => {
                         effects.globals_read.insert(name.clone());
                     }
-                    Op::GlobalWrite(name, _) | Op::GlobalInitialize(name, _) => {
+                    Op::Javascript(
+                        JsOp::GlobalWrite(name, _) | JsOp::GlobalInitialize(name, _),
+                    ) => {
                         effects.globals_written.insert(name.clone());
                     }
-                    Op::Get(_, name) | Op::FillPropertyCache(_, _, name) => {
+                    Op::Javascript(JsOp::Get(_, name) | JsOp::FillPropertyCache(_, _, name)) => {
                         effects.properties_read.insert(name.clone());
                     }
-                    Op::IsPropertyCached(..) | Op::CachedProperty(..) => {
+                    Op::Javascript(JsOp::IsPropertyCached(..) | JsOp::CachedProperty(..)) => {
                         effects.properties_read.insert("*".into());
                     }
-                    Op::Set(_, name, _) | Op::Define(_, name, _) | Op::DefineHidden(_, name, _) => {
+                    Op::Javascript(
+                        JsOp::Set(_, name, _)
+                        | JsOp::Define(_, name, _)
+                        | JsOp::DefineHidden(_, name, _),
+                    ) => {
                         effects.properties_written.insert(name.clone());
                         effects.memory.writes = effects.memory.writes.union(Locations::HEAP);
                     }
-                    Op::GetIndex(..)
-                    | Op::ArrayGet(..)
-                    | Op::ArrayLoad(..)
-                    | Op::TypedIndex(..) => {
+                    Op::Javascript(
+                        JsOp::GetIndex(..)
+                        | JsOp::ArrayGet(..)
+                        | JsOp::ArrayLoad(..)
+                        | JsOp::TypedIndex(..),
+                    ) => {
                         effects.properties_read.insert("*".into());
                     }
-                    Op::SetIndex(..) | Op::ArrayAppend(..) => {
+                    Op::Javascript(JsOp::SetIndex(..) | JsOp::ArrayAppend(..)) => {
                         effects.properties_written.insert("*".into());
                         effects.memory.writes = effects.memory.writes.union(Locations::HEAP);
                     }
                     _ => {}
                 }
-                if let Op::Call {
+                if let Op::Javascript(JsOp::Call {
                     callee,
                     receiver,
                     args,
                     ..
-                } = op
+                }) = op
                 {
                     let target = match graph.defining_op(*callee) {
-                        Some(Op::GlobalRead(name)) => {
+                        Some(Op::Javascript(JsOp::GlobalRead(name))) => {
                             self.globals.get(name).copied().inspect(|&target| {
                                 requires.identities.insert((name.clone(), target));
                             })
                         }
-                        Some(Op::Closure(_, target, _, false, _, _, _)) => Some(*target),
+                        Some(Op::Javascript(JsOp::Closure(_, target, _, false, _, _, _))) => {
+                            Some(*target)
+                        }
                         _ => None,
                     };
                     if let Some(target) = target.filter(|target| self.body(*target).is_some()) {
@@ -467,24 +490,27 @@ impl Repository {
                         calls.push((inst, target));
                         continue;
                     }
-                    if let Some(Op::Get(object, property)) = graph.defining_op(*callee)
+                    if let Some(Op::Javascript(JsOp::Get(object, property))) =
+                        graph.defining_op(*callee)
                         && property == "split"
                         && *receiver == Some(*object)
                     {
                         requires.string_splits.insert((code, inst));
-                        let lowered = Op::StringSplit(*object, args.clone());
+                        let lowered = Op::Javascript(JsOp::StringSplit(*object, args.clone()));
                         effects.absorb(graph.contract(&lowered, &facts).effects);
                         requires
                             .assumptions
                             .extend(assumptions(&lowered, &facts).iter().copied());
                         continue;
                     }
-                    if let Some(Op::Get(object, property)) = graph.defining_op(*callee)
-                        && let Some(Op::GlobalRead(global)) = graph.defining_op(*object)
+                    if let Some(Op::Javascript(JsOp::Get(object, property))) =
+                        graph.defining_op(*callee)
+                        && let Some(Op::Javascript(JsOp::GlobalRead(global))) =
+                            graph.defining_op(*object)
                         && let Some(native) = Native::lookup(global, property)
                     {
                         requires.natives.insert(native);
-                        let lowered = Op::CallNative(native, args.clone());
+                        let lowered = Op::Javascript(JsOp::CallNative(native, args.clone()));
                         effects.absorb(graph.contract(&lowered, &facts).effects);
                         requires
                             .assumptions
@@ -602,26 +628,30 @@ impl Repository {
 
 fn unresolved_operation(graph: &Graph, op: &Op) -> String {
     let (callee, constructor) = match op {
-        Op::Call { callee, .. } | Op::CallPack(callee, ..) => (*callee, false),
-        Op::Construct { callee, .. }
-        | Op::ConstructorCall { callee, .. }
-        | Op::ConstructPack(callee, ..)
-        | Op::ConstructPackResolved(callee, ..)
-        | Op::ConstructorCallPack(callee, ..)
-        | Op::ConstructResolved { callee, .. } => (*callee, true),
+        Op::Javascript(JsOp::Call { callee, .. } | JsOp::CallPack(callee, ..)) => (*callee, false),
+        Op::Javascript(
+            JsOp::Construct { callee, .. }
+            | JsOp::ConstructorCall { callee, .. }
+            | JsOp::ConstructPack(callee, ..)
+            | JsOp::ConstructPackResolved(callee, ..)
+            | JsOp::ConstructorCallPack(callee, ..)
+            | JsOp::ConstructResolved { callee, .. },
+        ) => (*callee, true),
         _ => return graph.op_text(op),
     };
     match graph.defining_op(callee) {
-        Some(Op::Get(_, name)) if constructor => {
+        Some(Op::Javascript(JsOp::Get(_, name))) if constructor => {
             format!("constructor .{name}: requires runtime constructor identity and effects")
         }
-        Some(Op::Get(_, name)) => {
+        Some(Op::Javascript(JsOp::Get(_, name))) => {
             format!("method .{name}: requires runtime callee identity and receiver effects")
         }
-        Some(Op::GlobalRead(name) | Op::GlobalReadOptional(name)) if constructor => {
+        Some(Op::Javascript(JsOp::GlobalRead(name) | JsOp::GlobalReadOptional(name)))
+            if constructor =>
+        {
             format!("constructor {name}: requires runtime constructor identity and effects")
         }
-        Some(Op::GlobalRead(name) | Op::GlobalReadOptional(name)) => {
+        Some(Op::Javascript(JsOp::GlobalRead(name) | JsOp::GlobalReadOptional(name))) => {
             format!("call {name}: requires runtime callee identity and effects")
         }
         _ if constructor => format!(
@@ -644,7 +674,7 @@ pub(in crate::jit::semantic) fn install_summaries(
         .insts
         .values()
         .filter_map(|data| match data.op {
-            Op::MarkClass(value) => Some(value),
+            Op::Javascript(JsOp::MarkClass(value)) => Some(value),
             _ => None,
         })
         .collect();
@@ -652,15 +682,17 @@ pub(in crate::jit::semantic) fn install_summaries(
     let mut roots = Vec::new();
     for block in Cfg::new(graph).rpo {
         for &inst in &graph.blocks[block].insts {
-            let Op::Call { callee, .. } = graph.insts[inst].op else {
+            let Op::Javascript(JsOp::Call { callee, .. }) = graph.insts[inst].op else {
                 continue;
             };
             match graph.defining_op(callee) {
-                Some(Op::Closure(_, target, _, false, _, _, _)) if !marked.contains(&callee) => {
+                Some(Op::Javascript(JsOp::Closure(_, target, _, false, _, _, _)))
+                    if !marked.contains(&callee) =>
+                {
                     closures.push((inst, *target));
                     roots.push(*target);
                 }
-                Some(Op::GlobalRead(name)) => {
+                Some(Op::Javascript(JsOp::GlobalRead(name))) => {
                     roots.extend(bodies.globals.get(name).copied());
                 }
                 _ => {}
@@ -735,10 +767,10 @@ pub(in crate::jit::semantic) fn conditional_plan(
     let mut candidates = Vec::new();
     for block in Cfg::new(graph).rpo {
         for &inst in &graph.blocks[block].insts {
-            let Op::Call { callee, .. } = graph.insts[inst].op else {
+            let Op::Javascript(JsOp::Call { callee, .. }) = graph.insts[inst].op else {
                 continue;
             };
-            let Some(Op::GlobalRead(name)) = graph.defining_op(callee) else {
+            let Some(Op::Javascript(JsOp::GlobalRead(name))) = graph.defining_op(callee) else {
                 continue;
             };
             let Some(&target) = bodies.globals.get(name) else {
@@ -863,9 +895,14 @@ fn eligible(graph: &Graph, body_limit: usize, spread: bool) -> bool {
                 || spread
                     && matches!(
                         graph.insts[inst].op,
-                        Op::Arguments | Op::ArgumentCount | Op::CallForward(..)
+                        Op::Javascript(JsOp::Arguments)
+                            | Op::ArgumentCount
+                            | Op::Javascript(JsOp::CallForward(..))
                     )
-                || matches!(graph.insts[inst].op, Op::Rest(_) | Op::Catch)
+                || matches!(
+                    graph.insts[inst].op,
+                    Op::Javascript(JsOp::Rest(_) | JsOp::Catch)
+                )
             {
                 return false;
             }
@@ -895,8 +932,8 @@ fn call_target(
         };
     }
     match graph.defining_op(callee) {
-        Some(Op::GlobalRead(name)) => bodies.globals.get(name).copied(),
-        Some(Op::Closure(_, target, _, false, _, _, _)) => Some(*target),
+        Some(Op::Javascript(JsOp::GlobalRead(name))) => bodies.globals.get(name).copied(),
+        Some(Op::Javascript(JsOp::Closure(_, target, _, false, _, _, _))) => Some(*target),
         _ => None,
     }
 }
@@ -912,7 +949,7 @@ pub(in crate::jit::semantic) fn direct_calls(
             continue;
         }
         for &call in &graph.blocks[block].insts {
-            let Op::Call { callee, .. } = graph.insts[call].op else {
+            let Op::Javascript(JsOp::Call { callee, .. }) = graph.insts[call].op else {
                 continue;
             };
             let Some(target) = call_target(graph, bodies, source, call, callee) else {
@@ -937,7 +974,7 @@ pub(in crate::jit::semantic) fn direct_calls(
         }
     }
     for (call, direct) in targets {
-        if let Op::Call { target, .. } = &mut graph.insts[call].op {
+        if let Op::Javascript(JsOp::Call { target, .. }) = &mut graph.insts[call].op {
             *target = Some(direct);
         }
     }
@@ -956,10 +993,12 @@ pub(in crate::jit::semantic) fn requests(
     for block in Cfg::new(graph).rpo {
         for &call in &graph.blocks[block].insts {
             let callee = match &graph.insts[call].op {
-                Op::Call { callee, .. }
-                | Op::CallPack(callee, ..)
-                | Op::ConstructorCall { callee, .. }
-                | Op::ConstructorCallPack(callee, ..) => callee,
+                Op::Javascript(
+                    JsOp::Call { callee, .. }
+                    | JsOp::CallPack(callee, ..)
+                    | JsOp::ConstructorCall { callee, .. }
+                    | JsOp::ConstructorCallPack(callee, ..),
+                ) => callee,
                 _ => continue,
             };
             let Some(target) = call_target(graph, bodies, source, call, *callee) else {
@@ -971,7 +1010,7 @@ pub(in crate::jit::semantic) fn requests(
                     budget.body_limit,
                     matches!(
                         graph.insts[call].op,
-                        Op::CallPack(..) | Op::ConstructorCallPack(..)
+                        Op::Javascript(JsOp::CallPack(..) | JsOp::ConstructorCallPack(..))
                     ),
                 )
             }) {
@@ -1007,17 +1046,19 @@ pub(in crate::jit::semantic) fn plan_round(
                 budget.body_limit,
                 matches!(
                     graph.insts[request.call].op,
-                    Op::CallPack(..) | Op::ConstructorCallPack(..)
+                    Op::Javascript(JsOp::CallPack(..) | JsOp::ConstructorCallPack(..))
                 ),
             )
         }) else {
             continue;
         };
         let callee = match &graph.insts[request.call].op {
-            Op::Call { callee, .. }
-            | Op::CallPack(callee, ..)
-            | Op::ConstructorCall { callee, .. }
-            | Op::ConstructorCallPack(callee, ..) => callee,
+            Op::Javascript(
+                JsOp::Call { callee, .. }
+                | JsOp::CallPack(callee, ..)
+                | JsOp::ConstructorCall { callee, .. }
+                | JsOp::ConstructorCallPack(callee, ..),
+            ) => callee,
             _ => continue,
         };
         let cost: usize = Cfg::new(body)
@@ -1056,9 +1097,9 @@ pub(in crate::jit::semantic) fn plan_round(
             target: request.target,
             source_name,
             arrow: bodies.bodies[&request.target].arrow,
-            guard_code: !matches!(graph.defining_op(*callee), Some(Op::Closure(_, code, _, false, _, _, _))
+            guard_code: !matches!(graph.defining_op(*callee), Some(Op::Javascript(JsOp::Closure(_, code, _, false, _, _, _)))
                 if *code == request.target
-                && !graph.insts.values().any(|data| matches!(data.op, Op::MarkClass(value) if value == *callee))),
+                && !graph.insts.values().any(|data| matches!(data.op, Op::Javascript(JsOp::MarkClass(value)) if value == *callee))),
         });
     }
     budget.inlines.extend(inlines.iter().cloned());
@@ -1145,13 +1186,11 @@ mod tests {
         assert!(
             operations(&graph)
                 .iter()
-                .any(|op| matches!(op, Op::CallPack(..)))
+                .any(|op| matches!(op, Op::Javascript(JsOp::CallPack(..))))
         );
-        assert!(
-            !operations(&graph)
-                .iter()
-                .any(|op| matches!(op, Op::GlobalRead(name) if name == "$callSpread"))
-        );
+        assert!(!operations(&graph).iter().any(
+            |op| matches!(op, Op::Javascript(JsOp::GlobalRead(name)) if name == "$callSpread")
+        ));
         let requests = requests(&graph, &bodies, 0, &Budget::default());
         assert_eq!(requests.len(), 1);
         let plan = plan(&graph, &bodies, 0, &requests);
@@ -1159,12 +1198,12 @@ mod tests {
         assert!(
             operations(&graph)
                 .iter()
-                .any(|op| matches!(op, Op::PackTake(..)))
+                .any(|op| matches!(op, Op::Javascript(JsOp::PackTake(..))))
         );
         assert!(
             operations(&graph)
                 .iter()
-                .any(|op| matches!(op, Op::Get(_, name) if name == "offset"))
+                .any(|op| matches!(op, Op::Javascript(JsOp::Get(_, name)) if name == "offset"))
         );
         graph.verify().unwrap();
     }
@@ -1214,10 +1253,12 @@ mod tests {
         let graph = &analysis.graph;
         let cfg = Cfg::new(graph);
         assert!(
-            cfg.rpo.iter().any(|&block| graph.blocks[block]
-                .insts
-                .iter()
-                .any(|&inst| matches!(graph.insts[inst].op, Op::StringSplitParts(..)))),
+            cfg.rpo.iter().any(
+                |&block| graph.blocks[block].insts.iter().any(|&inst| matches!(
+                    graph.insts[inst].op,
+                    Op::Javascript(JsOp::StringSplitParts(..))
+                ))
+            ),
             "{analysis}"
         );
         let setters: Vec<_> = cfg
@@ -1225,7 +1266,7 @@ mod tests {
             .iter()
             .flat_map(|&block| &graph.blocks[block].insts)
             .filter_map(|&inst| match graph.insts[inst].op {
-                Op::FillPropertyStore(_, cache, ref name, value, _)
+                Op::Javascript(JsOp::FillPropertyStore(_, cache, ref name, value, _))
                     if name == "template" && !graph.cold.contains(&graph.def_block(cache)) =>
                 {
                     Some(value)
@@ -1319,7 +1360,7 @@ mod tests {
             .rpo
             .into_iter()
             .flat_map(|block| graph.blocks[block].insts.clone())
-            .filter(|&inst| matches!(graph.insts[inst].op, Op::Call { .. }))
+            .filter(|&inst| matches!(graph.insts[inst].op, Op::Javascript(JsOp::Call { .. })))
             .filter(|&inst| !graph.inst_contract(inst, &facts).effects.memory.reenters())
             .collect()
     }
@@ -1348,7 +1389,7 @@ mod tests {
         assert_eq!(
             operations(&graph)
                 .iter()
-                .filter(|op| matches!(op, Op::IsCode(..)))
+                .filter(|op| matches!(op, Op::Javascript(JsOp::IsCode(..))))
                 .count(),
             2
         );
@@ -1383,12 +1424,12 @@ mod tests {
         assert!(
             operations(&graph)
                 .iter()
-                .any(|op| matches!(op, Op::CallNative(..)))
+                .any(|op| matches!(op, Op::Javascript(JsOp::CallNative(..))))
         );
         assert_eq!(
             operations(&graph)
                 .iter()
-                .filter(|op| matches!(op, Op::IsCode(..)))
+                .filter(|op| matches!(op, Op::Javascript(JsOp::IsCode(..))))
                 .count(),
             1
         );
@@ -1411,7 +1452,7 @@ mod tests {
         let probes: Vec<_> = operations(&graph)
             .into_iter()
             .filter_map(|op| match op {
-                Op::ProbeGlobal(name) => Some(name.as_str()),
+                Op::Javascript(JsOp::ProbeGlobal(name)) => Some(name.as_str()),
                 _ => None,
             })
             .collect();
@@ -1451,7 +1492,7 @@ mod tests {
         else {
             panic!();
         };
-        graph.set_op(inst, Op::GlobalRead("other".into()));
+        graph.set_op(inst, Op::Javascript(JsOp::GlobalRead("other".into())));
         let regions =
             super::super::regions::version(&mut graph, &plan, None, &mut Vec::new()).unwrap();
         assert!(regions.is_empty());
@@ -1479,7 +1520,7 @@ mod tests {
         let request = requests(&graph, &bodies, 0, &Budget::default())
             .pop()
             .unwrap();
-        let Op::Call { callee, .. } = graph.insts[request.call].op else {
+        let Op::Javascript(JsOp::Call { callee, .. }) = graph.insts[request.call].op else {
             panic!()
         };
         let super::super::super::ValueDef::Result(def, _) = graph.values[callee] else {
@@ -1487,7 +1528,7 @@ mod tests {
         };
         graph.set_op(
             def,
-            Op::Closure(
+            Op::Javascript(JsOp::Closure(
                 graph.insts[def].span,
                 request.target,
                 false,
@@ -1495,7 +1536,7 @@ mod tests {
                 false,
                 vec![],
                 None,
-            ),
+            )),
         );
         install_summaries(&mut graph, &bodies, &mut Vec::new());
         assert!(!closed_calls(&graph).contains(&request.call));
@@ -1509,7 +1550,7 @@ mod tests {
         let request = requests(&graph, &bodies, 0, &Budget::default())
             .pop()
             .unwrap();
-        let Op::Call { callee, .. } = graph.insts[request.call].op else {
+        let Op::Javascript(JsOp::Call { callee, .. }) = graph.insts[request.call].op else {
             panic!()
         };
         let super::super::super::ValueDef::Result(def, _) = graph.values[callee] else {
@@ -1517,7 +1558,7 @@ mod tests {
         };
         graph.set_op(
             def,
-            Op::Closure(
+            Op::Javascript(JsOp::Closure(
                 graph.insts[def].span,
                 request.target,
                 false,
@@ -1525,7 +1566,7 @@ mod tests {
                 false,
                 vec![],
                 None,
-            ),
+            )),
         );
         install_summaries(&mut graph, &bodies, &mut Vec::new());
         assert!(closed_calls(&graph).contains(&request.call));
@@ -1548,7 +1589,7 @@ mod tests {
                 for block in Cfg::new(&callee.graph).rpo {
                     for &inst in &callee.graph.blocks[block].insts {
                         let data = &callee.graph.insts[inst];
-                        if matches!(data.op, Op::Get(..)) {
+                        if matches!(data.op, Op::Javascript(JsOp::Get(..))) {
                             bodies.shape_feedback.insert(
                                 (
                                     Site {
@@ -1581,7 +1622,7 @@ mod tests {
                 assert_eq!(planned.plan.inlines.len(), 1);
                 assert!(planned.plan.shapes.polymorphic_reads().is_empty());
                 for data in planned.graph.insts.values() {
-                    if !matches!(&data.op, Op::Get(_, name) if name == "x") {
+                    if !matches!(&data.op, Op::Javascript(JsOp::Get(_, name)) if name == "x") {
                         continue;
                     }
                     assert_ne!(data.inline_context, 0);
@@ -1629,7 +1670,7 @@ mod tests {
                 assert_eq!(
                     operations
                         .iter()
-                        .filter(|op| matches!(op, Op::ShapedGet(..)))
+                        .filter(|op| matches!(op, Op::Javascript(JsOp::ShapedGet(..))))
                         .count(),
                     if invalidated || shape.is_none() {
                         2
@@ -1640,21 +1681,21 @@ mod tests {
                 assert_eq!(
                     operations
                         .iter()
-                        .filter(|op| matches!(op, Op::IsShape(..)))
+                        .filter(|op| matches!(op, Op::Javascript(JsOp::IsShape(..))))
                         .count(),
                     if invalidated || shape.is_none() { 2 } else { 0 }
                 );
                 if let Some(shape) = shape.filter(|shape| *shape != 30 && !invalidated) {
-                    assert!(operations.iter().any(|op| matches!(op, Op::ShapedGet(_, _, index) if *index == u32::from(shape == 20))));
+                    assert!(operations.iter().any(|op| matches!(op, Op::Javascript(JsOp::ShapedGet(_, _, index)) if *index == u32::from(shape == 20))));
                     assert!(
                         !operations.iter().any(
-                            |op| matches!(op, Op::FillPropertyCache(_, _, name) if name == "x")
+                            |op| matches!(op, Op::Javascript(JsOp::FillPropertyCache(_, _, name)) if name == "x")
                         )
                     );
                 } else {
                     assert!(
                         operations.iter().any(
-                            |op| matches!(op, Op::FillPropertyCache(_, _, name) if name == "x")
+                            |op| matches!(op, Op::Javascript(JsOp::FillPropertyCache(_, _, name)) if name == "x")
                         )
                     );
                 }
@@ -1673,7 +1714,7 @@ mod tests {
             .graph
             .insts
             .values()
-            .find(|data| matches!(data.op, Op::Get(..)))
+            .find(|data| matches!(data.op, Op::Javascript(JsOp::Get(..))))
             .unwrap();
         let original = Site {
             inline_context: 0,
@@ -1799,7 +1840,7 @@ mod tests {
         let mut graph = canonical.graph;
         assert!(requests(&graph, &bodies, 0, &Budget::default()).is_empty());
         for data in graph.insts.values() {
-            if matches!(data.op, Op::Call { .. }) {
+            if matches!(data.op, Op::Javascript(JsOp::Call { .. })) {
                 bodies.feedback.insert(
                     crate::jit::profile::Site {
                         inline_context: 0,
@@ -1821,14 +1862,17 @@ mod tests {
         assert_eq!(
             operations(&graph)
                 .iter()
-                .filter(|op| matches!(op, Op::IsCode(..)))
+                .filter(|op| matches!(op, Op::Javascript(JsOp::IsCode(..))))
                 .count(),
             2
         );
         assert_eq!(
             operations(&graph)
                 .iter()
-                .filter(|op| matches!(op, Op::Binary(BinaryOperator::Multiplication, ..)))
+                .filter(|op| matches!(
+                    op,
+                    Op::Javascript(JsOp::Binary(BinaryOperator::Multiplication, ..))
+                ))
                 .count(),
             2
         );
@@ -1842,7 +1886,7 @@ mod tests {
             ));
             let mut graph = canonical.graph;
             for data in graph.insts.values() {
-                if matches!(data.op, Op::Call { .. }) {
+                if matches!(data.op, Op::Javascript(JsOp::Call { .. })) {
                     bodies.feedback.insert(
                         crate::jit::profile::Site {
                             inline_context: 0,
@@ -1859,7 +1903,7 @@ mod tests {
             assert!(
                 operations(&graph)
                     .iter()
-                    .any(|op| matches!(op, Op::Call { target: None, .. }))
+                    .any(|op| matches!(op, Op::Javascript(JsOp::Call { target: None, .. })))
             );
             let variants = super::super::call_variants::apply(&mut graph, &bodies, 0).unwrap();
             for code in [0, 1] {
@@ -1877,8 +1921,8 @@ mod tests {
             "function method(x){return Math.floor(x);} function main(objects,n){let sum=0;for(let i=0;i<n;++i)sum+=objects[i].method(i);return sum;}",
         );
         for data in canonical.graph.insts.values() {
-            if let Op::Call { callee, .. } = data.op
-                && matches!(canonical.graph.defining_op(callee), Some(Op::Get(_, name)) if name == "method")
+            if let Op::Javascript(JsOp::Call { callee, .. }) = data.op
+                && matches!(canonical.graph.defining_op(callee), Some(Op::Javascript(JsOp::Get(_, name))) if name == "method")
             {
                 bodies.feedback.insert(
                     crate::jit::profile::Site {
@@ -1915,7 +1959,7 @@ mod tests {
                     kind: TerminatorKind::Branch(condition, _, otherwise),
                     ..
                 }) = &graph.blocks[block].terminator
-                    && matches!(graph.defining_op(*condition), Some(Op::IsCode(_, code)) if *code == FuncId::from_u32(0))
+                    && matches!(graph.defining_op(*condition), Some(Op::Javascript(JsOp::IsCode(_, code))) if *code == FuncId::from_u32(0))
                 {
                     fallbacks.push(otherwise.block);
                 }
@@ -1934,7 +1978,7 @@ mod tests {
             assert!(
                 operations(graph)
                     .iter()
-                    .any(|op| matches!(op, Op::CallNative(..)))
+                    .any(|op| matches!(op, Op::Javascript(JsOp::CallNative(..))))
             );
             assert_eq!(
                 Cfg::new(graph)
@@ -1970,23 +2014,28 @@ mod tests {
         let ops = operations(&graph);
         assert_eq!(
             ops.iter()
-                .filter(|op| matches!(op, Op::Call { .. }))
+                .filter(|op| matches!(op, Op::Javascript(JsOp::Call { .. })))
                 .count(),
             1
         );
         assert_eq!(
             ops.iter()
-                .filter(|op| matches!(op, Op::Binary(BinaryOperator::Multiplication, ..)))
+                .filter(|op| matches!(
+                    op,
+                    Op::Javascript(JsOp::Binary(BinaryOperator::Multiplication, ..))
+                ))
                 .count(),
             1
         );
         assert_eq!(
-            ops.iter().filter(|op| matches!(op, Op::IsCode(..))).count(),
+            ops.iter()
+                .filter(|op| matches!(op, Op::Javascript(JsOp::IsCode(..))))
+                .count(),
             1
         );
         assert_eq!(
             ops.iter()
-                .filter(|op| matches!(op, Op::IsNumber(_)))
+                .filter(|op| matches!(op, Op::Javascript(JsOp::IsNumber(_))))
                 .count(),
             0
         );
@@ -2001,7 +2050,7 @@ mod tests {
         assert!(
             !operations(body)
                 .iter()
-                .any(|op| matches!(op, Op::IsNumber(_) | Op::IsCode(..)))
+                .any(|op| matches!(op, Op::Javascript(JsOp::IsNumber(_) | JsOp::IsCode(..))))
         );
     }
 
@@ -2015,20 +2064,21 @@ mod tests {
             let requests = requests(&graph, &bodies, 0, &Budget::default());
             let plan = plan(&graph, &bodies, 0, &requests);
             apply(&mut graph, &bodies, 0, plan, &mut Vec::new()).unwrap();
-            assert!(
-                operations(&graph)
-                    .iter()
-                    .any(|op| matches!(op, Op::Binary(BinaryOperator::Addition, ..)))
-            );
+            assert!(operations(&graph).iter().any(|op| matches!(
+                op,
+                Op::Javascript(JsOp::Binary(BinaryOperator::Addition, ..))
+            )));
             let ops = operations(&graph);
             assert_eq!(
                 ops.iter()
-                    .filter(|op| matches!(op, Op::IsNumber(_)))
+                    .filter(|op| matches!(op, Op::Javascript(JsOp::IsNumber(_))))
                     .count(),
                 0
             );
             assert_eq!(
-                ops.iter().filter(|op| matches!(op, Op::IsCode(..))).count(),
+                ops.iter()
+                    .filter(|op| matches!(op, Op::Javascript(JsOp::IsCode(..))))
+                    .count(),
                 1
             );
         }

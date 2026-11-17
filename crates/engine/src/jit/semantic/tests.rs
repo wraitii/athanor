@@ -10,11 +10,13 @@ use super::variables::Variables;
 use super::*;
 use crate::FxHashSet;
 use crate::jit::layout::ReadLayout;
+use crate::jit::semantic::JsOp;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::Statement;
 use oxc_parser::Parser;
 use oxc_semantic::Scoping;
 use oxc_span::SourceType;
+use oxc_syntax::operator::BinaryOperator;
 
 fn with_function<T>(
     source: &str,
@@ -83,7 +85,7 @@ fn string_concatenation_fuses_single_use_chains_without_crossing_effects() {
         let concatenations: Vec<_> = ops(&function.graph)
             .into_iter()
             .filter_map(|op| match op {
-                Op::StringConcat(parts) => Some(parts.len()),
+                Op::Javascript(JsOp::StringConcat(parts)) => Some(parts.len()),
                 _ => None,
             })
             .collect();
@@ -124,7 +126,7 @@ fn baseline_keeps_generic_property_accesses() {
                 assert!(
                     !ops(&function.graph)
                         .iter()
-                        .any(|op| matches!(op, Op::Get(..)))
+                        .any(|op| matches!(op, Op::Javascript(JsOp::Get(..))))
                 );
                 let helper = ops(&function.graph)
                     .into_iter()
@@ -150,12 +152,10 @@ fn baseline_keeps_generic_property_accesses() {
                         op, Op::HelperCall { helper: selected, .. } if *selected == helper
                     )));
                 }
-                assert!(
-                    !ops(&function.graph).iter().any(|op| matches!(
-                        op,
-                        Op::Set(..) | Op::ShapedSet(..) | Op::GlobalRead(..)
-                    ))
-                );
+                assert!(!ops(&function.graph).iter().any(|op| matches!(
+                    op,
+                    Op::Javascript(JsOp::Set(..) | JsOp::ShapedSet(..) | JsOp::GlobalRead(..))
+                )));
                 checked_helpers = true;
             }
             if stage != "property-accesses" {
@@ -165,18 +165,22 @@ fn baseline_keeps_generic_property_accesses() {
             assert!(
                 operations
                     .iter()
-                    .any(|op| matches!(op, Op::Get(_, name) if name == "y"))
+                    .any(|op| matches!(op, Op::Javascript(JsOp::Get(_, name)) if name == "y"))
             );
             assert!(
                 operations
                     .iter()
-                    .any(|op| matches!(op, Op::Set(_, name, _) if name == "x"))
+                    .any(|op| matches!(op, Op::Javascript(JsOp::Set(_, name, _)) if name == "x"))
             );
-            assert!(operations.iter().any(|op| matches!(op, Op::GetIndex(..))));
+            assert!(
+                operations
+                    .iter()
+                    .any(|op| matches!(op, Op::Javascript(JsOp::GetIndex(..))))
+            );
             assert!(
                 !operations
                     .iter()
-                    .any(|op| matches!(op, Op::PropertyCache(..)))
+                    .any(|op| matches!(op, Op::Javascript(JsOp::PropertyCache(..))))
             );
             checked = true;
         })
@@ -200,14 +204,15 @@ fn cold_property_accesses_keep_helpers() {
         assert_eq!(function.graph.blocks.len(), blocks);
         assert!(!ops(&function.graph).iter().any(|op| matches!(
             op,
-            Op::PropertyCache(..) | Op::CachedProperty(..) | Op::FillPropertyStore(..)
+            Op::Javascript(
+                JsOp::PropertyCache(..) | JsOp::CachedProperty(..) | JsOp::FillPropertyStore(..)
+            )
         )));
         runtime::helpers::lower(&mut function);
-        assert!(
-            !ops(&function.graph)
-                .iter()
-                .any(|op| matches!(op, Op::Get(..) | Op::Set(..) | Op::Define(..)))
-        );
+        assert!(!ops(&function.graph).iter().any(|op| matches!(
+            op,
+            Op::Javascript(JsOp::Get(..) | JsOp::Set(..) | JsOp::Define(..))
+        )));
         function.graph.verify().unwrap();
     }
 }
@@ -273,22 +278,26 @@ fn cfg_preserves_edge_order_and_deduplicates_successors() {
 #[test]
 fn constructor_result_facts_and_folding_preserve_object_returns() {
     for returned in [
-        Op::Constant(Constant::Undefined),
-        Op::Constant(Constant::Null),
-        Op::Constant(Constant::Number(7.0)),
-        Op::Constant(Constant::Boolean(true)),
-        Op::Constant(Constant::String("ignored".into())),
-        Op::NewObject,
+        Op::Javascript(JsOp::Constant(Constant::Undefined)),
+        Op::Javascript(JsOp::Constant(Constant::Null)),
+        Op::Javascript(JsOp::Constant(Constant::Number(7.0))),
+        Op::Javascript(JsOp::Constant(Constant::Boolean(true))),
+        Op::Javascript(JsOp::Constant(Constant::String("ignored".into()))),
+        Op::Javascript(JsOp::NewObject),
         Op::Argument(0),
     ] {
         let mut graph = lower_source("function f(){return 0;}").unwrap();
         let block = graph.entry;
         let span = graph.span;
-        let instance = graph.append_value(block, span, Op::NewObject);
-        let object_return = matches!(returned, Op::NewObject);
+        let instance = graph.append_value(block, span, Op::Javascript(JsOp::NewObject));
+        let object_return = matches!(returned, Op::Javascript(JsOp::NewObject));
         let unknown_return = matches!(returned, Op::Argument(_));
         let returned = graph.append_value(block, span, returned);
-        let result = graph.append_value(block, span, Op::ConstructorResult(returned, instance));
+        let result = graph.append_value(
+            block,
+            span,
+            Op::Javascript(JsOp::ConstructorResult(returned, instance)),
+        );
         graph.terminate(block, span, TerminatorKind::Return(result));
         assert_eq!(Facts::compute(&graph).of(result), ValueType::OBJECT);
         let mut function = FunctionState::new(graph, Vec::new(), true);
@@ -320,14 +329,20 @@ fn block_arguments_retain_type_test_facts_without_narrowing_unrelated_edges() {
         let span = graph.span;
         let value = graph.append_value(entry, span, Op::Argument(0));
         let (op, mask) = match kind {
-            0 => (Op::IsUndefined(value), ValueType::UNDEFINED),
+            0 => (
+                Op::Javascript(JsOp::IsUndefined(value)),
+                ValueType::UNDEFINED,
+            ),
             1 => (
-                Op::IsNullish(value),
+                Op::Javascript(JsOp::IsNullish(value)),
                 ValueType::UNDEFINED.union(ValueType::NULL),
             ),
-            2 => (Op::IsString(value), ValueType::STRING),
-            3 => (Op::IsNumber(value), ValueType::NUMBER),
-            _ => (Op::IsUninitialized(value), ValueType::UNINITIALIZED),
+            2 => (Op::Javascript(JsOp::IsString(value)), ValueType::STRING),
+            3 => (Op::Javascript(JsOp::IsNumber(value)), ValueType::NUMBER),
+            _ => (
+                Op::Javascript(JsOp::IsUninitialized(value)),
+                ValueType::UNINITIALIZED,
+            ),
         };
         let condition = graph.append_value(entry, span, op);
         let yes = graph.blocks.push(BlockData::default());
@@ -403,7 +418,7 @@ fn comparisons_share_number_checks_with_refined_reads_without_splitting() {
         .unwrap();
     let mut bodies = calls::Repository::default();
     for data in graph.insts.values() {
-        if matches!(data.op, Op::GetIndex(..)) {
+        if matches!(data.op, Op::Javascript(JsOp::GetIndex(..))) {
             bodies.read_feedback.insert(
                 (
                     crate::jit::profile::Site {
@@ -428,13 +443,15 @@ fn comparisons_share_number_checks_with_refined_reads_without_splitting() {
     assert_eq!(graph.blocks.len(), blocks);
     let checks: Vec<_> = ops(&graph)
         .into_iter()
-        .filter(|op| matches!(op, Op::IsNumber(value) if *value == x))
+        .filter(|op| matches!(op, Op::Javascript(JsOp::IsNumber(value)) if *value == x))
         .collect();
     assert_eq!(checks.len(), 1);
     let guards: Vec<_> = ops(&graph)
         .into_iter()
         .filter_map(|op| match op {
-            Op::GuardedCompare { left, numbers, .. } if *left == x => Some(numbers[0]),
+            Op::Javascript(JsOp::GuardedCompare { left, numbers, .. }) if *left == x => {
+                Some(numbers[0])
+            }
             _ => None,
         })
         .collect();
@@ -451,14 +468,17 @@ fn late_number_facts_remove_refinement_guards_and_assertions() {
         .insts
         .values()
         .find_map(|data| {
-            matches!(data.op, Op::Binary(BinaryOperator::Addition, ..))
-                .then_some(data.result())
-                .flatten()
+            matches!(
+                data.op,
+                Op::Javascript(JsOp::Binary(BinaryOperator::Addition, ..))
+            )
+            .then_some(data.result())
+            .flatten()
         })
         .unwrap();
     let mut bodies = calls::Repository::default();
     for data in graph.insts.values() {
-        if matches!(data.op, Op::GetIndex(..)) {
+        if matches!(data.op, Op::Javascript(JsOp::GetIndex(..))) {
             bodies.read_feedback.insert(
                 (
                     crate::jit::profile::Site {
@@ -481,12 +501,12 @@ fn late_number_facts_remove_refinement_guards_and_assertions() {
     assert!(
         ops(&graph)
             .iter()
-            .any(|op| matches!(op, Op::IsNumber(value) if *value == sum))
+            .any(|op| matches!(op, Op::Javascript(JsOp::IsNumber(value)) if *value == sum))
     );
     assert!(
         ops(&graph)
             .iter()
-            .any(|op| matches!(op, Op::AsNumber(value) if *value == sum))
+            .any(|op| matches!(op, Op::Javascript(JsOp::AsNumber(value)) if *value == sum))
     );
     let branches = Cfg::new(&graph)
         .rpo
@@ -500,7 +520,7 @@ fn late_number_facts_remove_refinement_guards_and_assertions() {
         .count();
     for data in graph.insts.values_mut() {
         if matches!(data.op, Op::Argument(1)) {
-            data.op = Op::Constant(Constant::Number(2.0));
+            data.op = Op::Javascript(JsOp::Constant(Constant::Number(2.0)));
         }
     }
     let mut function = FunctionState::new(graph, Vec::new(), true);
@@ -510,7 +530,7 @@ fn late_number_facts_remove_refinement_guards_and_assertions() {
     assert!(
         !ops(&graph)
             .iter()
-            .any(|op| matches!(op, Op::IsNumber(value) | Op::AsNumber(value) if *value == sum))
+            .any(|op| matches!(op, Op::Javascript(JsOp::IsNumber(value) | JsOp::AsNumber(value)) if *value == sum))
     );
     assert!(
         Cfg::new(&graph)
@@ -535,10 +555,14 @@ fn folding_guard_edges_recomputes_number_facts_at_joins() {
     let mut function = FunctionState::new(graph, Vec::new(), true);
     comparisons::expose(&mut function);
     let mut graph = function.graph;
-    assert!(ops(&graph).iter().any(|op| matches!(op, Op::IsNumber(_))));
+    assert!(
+        ops(&graph)
+            .iter()
+            .any(|op| matches!(op, Op::Javascript(JsOp::IsNumber(_))))
+    );
     for data in graph.insts.values_mut() {
         if matches!(data.op, Op::Argument(0)) {
-            data.op = Op::Constant(Constant::Boolean(true));
+            data.op = Op::Javascript(JsOp::Constant(Constant::Boolean(true)));
         }
     }
     let mut function = FunctionState::new(graph, Vec::new(), true);
@@ -547,7 +571,12 @@ fn folding_guard_edges_recomputes_number_facts_at_joins() {
     graph.verify().unwrap();
     assert!(!ops(&graph).iter().any(|op| matches!(
         op,
-        Op::IsNumber(_) | Op::AsNumber(_) | Op::ToNumeric(_) | Op::Unary(UnaryOp::Plus, _)
+        Op::Javascript(
+            JsOp::IsNumber(_)
+                | JsOp::AsNumber(_)
+                | JsOp::ToNumeric(_)
+                | JsOp::Unary(UnaryOp::Plus, _)
+        )
     )));
 }
 
@@ -560,7 +589,7 @@ fn loop_versioning_reuses_exposed_comparison_checks() {
     assert_eq!(
         ops(graph)
             .into_iter()
-            .filter(|op| matches!(op, Op::IsNumber(value) if matches!(graph.defining_op(*value), Some(Op::Argument(0)))))
+            .filter(|op| matches!(op, Op::Javascript(JsOp::IsNumber(value)) if matches!(graph.defining_op(*value), Some(Op::Argument(0)))))
             .count(),
         1
     );
@@ -577,7 +606,7 @@ fn comparison_checks_do_not_cross_non_dominating_branches() {
     assert_eq!(
         ops(&graph)
             .into_iter()
-            .filter(|op| matches!(op, Op::IsNumber(_)))
+            .filter(|op| matches!(op, Op::Javascript(JsOp::IsNumber(_))))
             .count(),
         4
     );
@@ -588,8 +617,8 @@ fn array_reads_are_reused_and_probed_without_implicit_views() {
     let graph = lower_source("function f(array){const zero=0;let sum=0;for(let i=0;i<2;++i){sum+=array[zero]+array[zero];}return sum;}").unwrap();
     let mut canonical = canonicalize_graph(graph, true).unwrap();
     for data in canonical.graph.insts.values_mut() {
-        if let Op::GetIndex(object, key) = data.op {
-            data.op = Op::ArrayGet(object, key);
+        if let Op::Javascript(JsOp::GetIndex(object, key)) = data.op {
+            data.op = Op::Javascript(JsOp::ArrayGet(object, key));
         }
     }
     let viewed = canonical.graph.clone();
@@ -600,7 +629,7 @@ fn array_reads_are_reused_and_probed_without_implicit_views() {
         viewed
             .views
             .keys()
-            .all(|&inst| !matches!(viewed.insts[inst].op, Op::ArrayGet(..)))
+            .all(|&inst| !matches!(viewed.insts[inst].op, Op::Javascript(JsOp::ArrayGet(..))))
     );
     let analysis = optimize_canonical(canonical, true, None).unwrap();
     assert!(ops(&analysis.graph).iter().any(|op| matches!(
@@ -628,7 +657,7 @@ fn indexed_rows_borrow_from_owned_receivers_through_guards() {
         let canonical = canonicalize_graph(lower_source(&source).unwrap(), true).unwrap();
         let mut repository = calls::Repository::default();
         for data in canonical.graph.insts.values() {
-            if !matches!(data.op, Op::GetIndex(..)) {
+            if !matches!(data.op, Op::Javascript(JsOp::GetIndex(..))) {
                 continue;
             }
             let text = &source[data.span.start as usize..data.span.end as usize];
@@ -655,14 +684,14 @@ fn indexed_rows_borrow_from_owned_receivers_through_guards() {
             .insts
             .values()
             .filter(|data| {
-                matches!(data.op, Op::ArrayLoad(..))
+                matches!(data.op, Op::Javascript(JsOp::ArrayLoad(..)))
                     && &source[data.span.start as usize..data.span.end as usize] == "height[i&1]"
             })
             .collect();
         assert!(!rows.is_empty());
         assert_eq!(
             analysis.graph.insts.values().any(|data| {
-                matches!(data.op, Op::TypedIndex(object, ..) if analysis.graph.borrowed.contains(&object))
+                matches!(data.op, Op::Javascript(JsOp::TypedIndex(object, ..)) if analysis.graph.borrowed.contains(&object))
             }),
             borrowed
         );
@@ -679,7 +708,7 @@ fn guard_only_region_borrows_rows_without_entry_assumptions() {
     let canonical = canonicalize_graph(lower_source(source).unwrap(), true).unwrap();
     let mut repository = calls::Repository::default();
     for data in canonical.graph.insts.values() {
-        if !matches!(data.op, Op::GetIndex(..)) {
+        if !matches!(data.op, Op::Javascript(JsOp::GetIndex(..))) {
             continue;
         }
         let text = &source[data.span.start as usize..data.span.end as usize];
@@ -710,14 +739,14 @@ fn guard_only_region_borrows_rows_without_entry_assumptions() {
         .filter(|block| !graph.cold.contains(block))
         .flat_map(|&block| graph.blocks[block].insts.iter())
         .filter_map(|&inst| match graph.insts[inst].op {
-            Op::TypedIndex(
+            Op::Javascript(JsOp::TypedIndex(
                 object,
                 _,
                 TypedRead {
                     element: Some(crate::heap::TypedKind::Float32),
                     ..
                 },
-            ) => Some(object),
+            )) => Some(object),
             _ => None,
         })
         .collect();
@@ -736,7 +765,7 @@ fn typed_loop_reads_are_reused_before_inner_loop_versioning() {
         .graph
         .insts
         .values()
-        .filter(|data| matches!(data.op, Op::GetIndex(..)))
+        .filter(|data| matches!(data.op, Op::Javascript(JsOp::GetIndex(..))))
         .min_by_key(|data| data.span.start)
         .unwrap();
     let mut bodies = calls::Repository::default();
@@ -754,8 +783,16 @@ fn typed_loop_reads_are_reused_before_inner_loop_versioning() {
     );
     let analysis = optimize_canonical(canonical, true, Some((&bodies, 0))).unwrap();
     let operations = ops(&analysis.graph);
-    assert!(operations.iter().any(|op| matches!(op, Op::TypedIndex(..))));
-    assert!(!operations.iter().any(|op| matches!(op, Op::ProbeIndex(..))));
+    assert!(
+        operations
+            .iter()
+            .any(|op| matches!(op, Op::Javascript(JsOp::TypedIndex(..))))
+    );
+    assert!(
+        !operations
+            .iter()
+            .any(|op| matches!(op, Op::Javascript(JsOp::ProbeIndex(..))))
+    );
     analysis.graph.verify().unwrap();
 }
 
@@ -769,10 +806,14 @@ fn typeof_string_comparisons_avoid_string_materialization() {
     ] {
         let analysis = analyze_source(&format!("function f(value) {{ return {expression}; }}"));
         let operations = ops(&analysis.graph);
-        assert!(operations.iter().any(|op| matches!(op, Op::IsString(_))));
+        assert!(
+            operations
+                .iter()
+                .any(|op| matches!(op, Op::Javascript(JsOp::IsString(_))))
+        );
         assert!(!operations.iter().any(|op| matches!(
             op,
-            Op::Constant(Constant::String(_)) | Op::Unary(UnaryOp::Typeof, _)
+            Op::Javascript(JsOp::Constant(Constant::String(_)) | JsOp::Unary(UnaryOp::Typeof, _))
         )));
     }
 }
@@ -785,14 +826,14 @@ fn string_guard_refines_only_the_dominated_edge() {
     assert_eq!(
         ops(&analysis.graph)
             .iter()
-            .filter(|op| matches!(op, Op::IsString(_)))
+            .filter(|op| matches!(op, Op::Javascript(JsOp::IsString(_))))
             .count(),
         1
     );
     assert!(
         !ops(&analysis.graph)
             .iter()
-            .any(|op| matches!(op, Op::Constant(Constant::Number(number)) if *number == 2.0))
+            .any(|op| matches!(op, Op::Javascript(JsOp::Constant(Constant::Number(number))) if *number == 2.0))
     );
 }
 
@@ -809,7 +850,9 @@ fn typeof_comparisons_avoid_string_materialization() {
                 let operations = ops(&analysis.graph);
                 assert!(!operations.iter().any(|op| matches!(
                     op,
-                    Op::Constant(Constant::String(_)) | Op::Unary(UnaryOp::Typeof, _)
+                    Op::Javascript(
+                        JsOp::Constant(Constant::String(_)) | JsOp::Unary(UnaryOp::Typeof, _)
+                    )
                 )));
             }
         }
@@ -836,11 +879,9 @@ const CONTROL_FLOW: &str = "function f(a, b = g.h) {
 #[test]
 fn lowers_control_flow_into_verified_ssa() {
     let graph = lower_source(CONTROL_FLOW).unwrap();
-    assert!(
-        ops(&graph)
-            .iter()
-            .any(|op| matches!(op, Op::Constant(Constant::Number(n)) if n.is_infinite()))
-    );
+    assert!(ops(&graph).iter().any(
+        |op| matches!(op, Op::Javascript(JsOp::Constant(Constant::Number(n))) if n.is_infinite())
+    ));
     assert!(graph.blocks.values().any(|block| !block.params.is_empty()));
     analyze_source(CONTROL_FLOW);
 }
@@ -852,7 +893,10 @@ fn postfix_update_yields_numeric_old_value() {
     let TerminatorKind::Return(value) = block.terminator.as_ref().unwrap().kind else {
         panic!()
     };
-    assert!(matches!(graph.defining_op(value), Some(Op::ToNumeric(_))));
+    assert!(matches!(
+        graph.defining_op(value),
+        Some(Op::Javascript(JsOp::ToNumeric(_)))
+    ));
 }
 
 #[test]
@@ -862,21 +906,21 @@ fn keeps_shadowed_bindings_and_call_order() {
     let ops = ops(&graph);
     let get = ops
         .iter()
-        .position(|op| matches!(op, Op::Get(_, name) if name == "m"))
+        .position(|op| matches!(op, Op::Javascript(JsOp::Get(_, name)) if name == "m"))
         .unwrap();
     let read = ops
         .iter()
-        .position(|op| matches!(op, Op::Read(binding) if binding.index() == 1))
+        .position(|op| matches!(op, Op::Javascript(JsOp::Read(binding)) if binding.index() == 1))
         .unwrap();
     let call = ops
         .iter()
         .position(|op| {
             matches!(
                 op,
-                Op::Call {
+                Op::Javascript(JsOp::Call {
                     receiver: Some(_),
                     ..
-                }
+                })
             )
         })
         .unwrap();
@@ -899,7 +943,9 @@ fn promotes_bindings_and_infers_numbers() {
     let graph = &analysis.graph;
     assert!(!ops(graph).iter().any(|op| matches!(
         op,
-        Op::Read(_) | Op::Write(..) | Op::Initialize(..) | Op::CheckInitialized(_)
+        Op::Javascript(
+            JsOp::Read(_) | JsOp::Write(..) | JsOp::Initialize(..) | JsOp::CheckInitialized(_)
+        )
     )));
     let returned = graph
         .blocks
@@ -918,7 +964,7 @@ fn keeps_initialization_check_before_declaration() {
     assert!(
         ops(&analysis.graph)
             .iter()
-            .any(|op| matches!(op, Op::CheckInitialized(_)))
+            .any(|op| matches!(op, Op::Javascript(JsOp::CheckInitialized(_))))
     );
 }
 
@@ -933,7 +979,7 @@ fn resets_promoted_bindings_on_scope_entry() {
         let checks: Vec<_> = ops(graph)
             .into_iter()
             .filter_map(|op| match op {
-                Op::CheckInitialized(value) => Some(*value),
+                Op::Javascript(JsOp::CheckInitialized(value)) => Some(*value),
                 _ => None,
             })
             .collect();
@@ -941,7 +987,7 @@ fn resets_promoted_bindings_on_scope_entry() {
         for value in checks {
             assert!(matches!(
                 graph.defining_op(value),
-                Some(Op::Constant(Constant::Uninitialized))
+                Some(Op::Javascript(JsOp::Constant(Constant::Uninitialized)))
             ));
         }
     }
@@ -953,14 +999,20 @@ fn global_writes_prevent_versioning_and_load_reuse() {
         "function f() { let before = shared; Math = shared; shared = Math.min(3, 4); return before + shared; }",
     );
     let ops = ops(&analysis.graph);
-    assert!(ops.iter().any(|op| matches!(op, Op::GlobalWrite(..))));
+    assert!(
+        ops.iter()
+            .any(|op| matches!(op, Op::Javascript(JsOp::GlobalWrite(..))))
+    );
     assert_eq!(
         ops.iter()
-            .filter(|op| matches!(op, Op::GlobalRead(name) if name == "shared"))
+            .filter(|op| matches!(op, Op::Javascript(JsOp::GlobalRead(name)) if name == "shared"))
             .count(),
         2
     );
-    assert!(!ops.iter().any(|op| matches!(op, Op::CallNative(..))));
+    assert!(
+        !ops.iter()
+            .any(|op| matches!(op, Op::Javascript(JsOp::CallNative(..))))
+    );
 }
 
 #[test]
@@ -980,8 +1032,11 @@ fn small_constant_products_preserve_integer_types() {
                 .insts
                 .values()
                 .find_map(|data| {
-                    matches!(data.op, Op::Binary(BinaryOperator::Multiplication, ..))
-                        .then(|| data.result().unwrap())
+                    matches!(
+                        data.op,
+                        Op::Javascript(JsOp::Binary(BinaryOperator::Multiplication, ..))
+                    )
+                    .then(|| data.result().unwrap())
                 })
                 .unwrap();
             assert_eq!(facts.of(result), expected, "{expression}");
@@ -1001,7 +1056,12 @@ fn integer_coercions_are_reused_and_hoisted_out_of_bit_loops() {
         .iter()
         .flat_map(|&block| &graph.blocks[block].insts)
         .filter_map(|&inst| match graph.insts[inst].op {
-            Op::ToInt32(value) if matches!(graph.defining_op(value), Some(Op::TypedIndex(..))) => {
+            Op::Javascript(JsOp::ToInt32(value))
+                if matches!(
+                    graph.defining_op(value),
+                    Some(Op::Javascript(JsOp::TypedIndex(..)))
+                ) =>
+            {
                 Some(inst)
             }
             _ => None,
@@ -1026,14 +1086,14 @@ fn integer_coercions_are_reused_and_hoisted_out_of_bit_loops() {
             else {
                 return false;
             };
-            let Some(&Op::Binary(BinaryOperator::LessThan, _, bound)) =
+            let Some(&Op::Javascript(JsOp::Binary(BinaryOperator::LessThan, _, bound))) =
                 graph.defining_op(*condition)
             else {
                 return false;
             };
             matches!(
                 graph.defining_op(bound),
-                Some(Op::Constant(Constant::Number(16.0)))
+                Some(Op::Javascript(JsOp::Constant(Constant::Number(16.0))))
             ) && conversion.block != header
                 && cfg.dominates(conversion.block, header)
                 && cfg.dominates(header, graph.insts[user].block)
@@ -1067,17 +1127,17 @@ fn capture_cell_writes_preserve_guarded_globals_and_properties() {
     assert!(
         ops(&graph)
             .iter()
-            .any(|op| matches!(op, Op::CallNative(..)))
+            .any(|op| matches!(op, Op::Javascript(JsOp::CallNative(..))))
     );
     assert!(
         ops(&graph)
             .iter()
-            .any(|op| matches!(op, Op::Write(id, _) if *id == binding))
+            .any(|op| matches!(op, Op::Javascript(JsOp::Write(id, _)) if *id == binding))
     );
     let analysis = optimize_canonical(canonical, true, None).unwrap();
     assert!(!analysis.graph.bindings[binding].captured);
     assert!(!ops(&analysis.graph).iter().any(|op| matches!(op,
-            Op::Read(id) | Op::Write(id, _) | Op::Initialize(id, _) if *id == binding)));
+            Op::Javascript(JsOp::Read(id) | JsOp::Write(id, _) | JsOp::Initialize(id, _)) if *id == binding)));
 }
 
 #[test]
@@ -1091,13 +1151,17 @@ fn versions_on_native_calls_only_when_closed() {
         }";
     let analysis = analyze_source(source);
     let versioned = ops(&analysis.graph);
-    assert!(versioned.iter().any(|op| matches!(op, Op::CallNative(..))));
+    assert!(
+        versioned
+            .iter()
+            .any(|op| matches!(op, Op::Javascript(JsOp::CallNative(..))))
+    );
     assert!(
         super::continuation::bodies(&analysis.graph)
             .iter()
             .any(|body| ops(&body.graph)
                 .iter()
-                .any(|op| matches!(op, Op::Call { .. })))
+                .any(|op| matches!(op, Op::Javascript(JsOp::Call { .. }))))
     );
     let unknown = analyze_source(
         "function f(m) { let s = 0; for (let x = 0; x < m.length; ++x) s = Math.min(s, g(x)); return s; }",
@@ -1105,7 +1169,7 @@ fn versions_on_native_calls_only_when_closed() {
     assert!(
         !ops(&unknown.graph)
             .iter()
-            .any(|op| matches!(op, Op::CallNative(..)))
+            .any(|op| matches!(op, Op::Javascript(JsOp::CallNative(..))))
     );
 }
 
@@ -1168,20 +1232,20 @@ fn borrowed_rows_flow_through_phi_parameters() {
             .graph;
         let mut result = None;
         for (_, data) in graph.insts.iter_mut() {
-            if let Op::GetIndex(object, key) = data.op {
+            if let Op::Javascript(JsOp::GetIndex(object, key)) = data.op {
                 let text = &source[data.span.start as usize..data.span.end as usize];
                 if text == "row[0]" {
                     result = Some(object);
-                    data.op = Op::TypedIndex(
+                    data.op = Op::Javascript(JsOp::TypedIndex(
                         object,
                         key,
                         TypedRead {
                             element: Some(crate::heap::TypedKind::Float32),
                             bounded: false,
                         },
-                    );
+                    ));
                 } else {
-                    data.op = Op::ArrayGet(object, key);
+                    data.op = Op::Javascript(JsOp::ArrayGet(object, key));
                 }
             }
         }
@@ -1205,8 +1269,10 @@ fn integer_facts_survive_loop_backedges_without_length_bounds() {
         for data in graph.insts.values() {
             if matches!(
                 data.op,
-                Op::Unary(UnaryOp::Increment | UnaryOp::Decrement, _)
-                    | Op::Binary(BinaryOperator::Addition | BinaryOperator::Subtraction, ..)
+                Op::Javascript(
+                    JsOp::Unary(UnaryOp::Increment | UnaryOp::Decrement, _)
+                        | JsOp::Binary(BinaryOperator::Addition | BinaryOperator::Subtraction, ..)
+                )
             ) {
                 assert!(facts.of(data.result().unwrap()).within(ValueType::INTEGER));
                 steps += 1;
@@ -1292,24 +1358,26 @@ fn checked_typed_reads_expose_shared_numeric_checks() {
     let reads: Vec<_> = graph
         .insts
         .iter()
-        .filter_map(|(inst, data)| matches!(data.op, Op::GetIndex(..)).then_some(inst))
+        .filter_map(|(inst, data)| {
+            matches!(data.op, Op::Javascript(JsOp::GetIndex(..))).then_some(inst)
+        })
         .collect();
     assert_eq!(reads.len(), 2);
-    let Op::GetIndex(_, key) = graph.insts[reads[0]].op else {
+    let Op::Javascript(JsOp::GetIndex(_, key)) = graph.insts[reads[0]].op else {
         unreachable!()
     };
     for &inst in &reads {
-        let Op::GetIndex(object, _) = graph.insts[inst].op else {
+        let Op::Javascript(JsOp::GetIndex(object, _)) = graph.insts[inst].op else {
             unreachable!()
         };
-        graph.insts[inst].op = Op::TypedIndex(
+        graph.insts[inst].op = Op::Javascript(JsOp::TypedIndex(
             object,
             key,
             TypedRead {
                 element: Some(crate::heap::TypedKind::Float64),
                 bounded: false,
             },
-        );
+        ));
     }
     let region = graph.regions.push(Region {
         blocks: graph.blocks.keys().collect(),
@@ -1348,7 +1416,7 @@ fn checked_typed_reads_expose_shared_numeric_checks() {
         assert_ne!(no.block, load);
         assert!(matches!(
             graph.defining_op(*condition),
-            Some(Op::IsInBounds(..))
+            Some(Op::Javascript(JsOp::IsInBounds(..)))
         ));
         assert_eq!(cfg.preds[bounds].len(), 1);
         let check = cfg.preds[bounds][0];
@@ -1361,7 +1429,7 @@ fn checked_typed_reads_expose_shared_numeric_checks() {
         assert_ne!(no.block, bounds);
         assert!(matches!(
             graph.defining_op(*condition),
-            Some(Op::IsExactPosition(..))
+            Some(Op::Javascript(JsOp::IsExactPosition(..)))
         ));
     }
     let mut function = FunctionState::new(graph, Vec::new(), true);
@@ -1380,25 +1448,28 @@ fn checked_typed_reads_expose_shared_numeric_checks() {
         .collect();
     assert_eq!(
         ops.iter()
-            .filter(|op| matches!(op, Op::ArrayPosition(_)))
+            .filter(|op| matches!(op, Op::Javascript(JsOp::ArrayPosition(_))))
             .count(),
         1
     );
     assert_eq!(
         ops.iter()
-            .filter(|op| matches!(op, Op::IsExactPosition(..)))
+            .filter(|op| matches!(op, Op::Javascript(JsOp::IsExactPosition(..))))
             .count(),
         1
     );
     assert_eq!(
         ops.iter()
-            .filter(|op| matches!(op, Op::IsInBounds(..)))
+            .filter(|op| matches!(op, Op::Javascript(JsOp::IsInBounds(..))))
             .count(),
         2
     );
     assert_eq!(
         ops.iter()
-            .filter(|op| matches!(op, Op::TypedIndex(_, _, TypedRead { bounded: true, .. })))
+            .filter(|op| matches!(
+                op,
+                Op::Javascript(JsOp::TypedIndex(_, _, TypedRead { bounded: true, .. }))
+            ))
             .count(),
         2
     );
@@ -1423,31 +1494,35 @@ fn integer_typed_read_skips_exactness_roundtrip() {
     let inst = graph
         .insts
         .iter()
-        .find_map(|(inst, data)| matches!(data.op, Op::GetIndex(..)).then_some(inst))
+        .find_map(|(inst, data)| {
+            matches!(data.op, Op::Javascript(JsOp::GetIndex(..))).then_some(inst)
+        })
         .unwrap();
-    let Op::GetIndex(object, key) = graph.insts[inst].op else {
+    let Op::Javascript(JsOp::GetIndex(object, key)) = graph.insts[inst].op else {
         unreachable!()
     };
-    graph.insts[inst].op = Op::TypedIndex(
+    graph.insts[inst].op = Op::Javascript(JsOp::TypedIndex(
         object,
         key,
         TypedRead {
             element: Some(crate::heap::TypedKind::Int32),
             bounded: false,
         },
-    );
+    ));
     let mut function = FunctionState::new(graph, Vec::new(), true);
     assert!(typed::lower(&mut function).unwrap());
     let graph = function.graph;
     assert!(matches!(
         graph.insts[inst].op,
-        Op::TypedIndex(_, _, TypedRead { bounded: true, .. })
+        Op::Javascript(JsOp::TypedIndex(_, _, TypedRead { bounded: true, .. }))
     ));
     assert!(!Cfg::new(&graph).rpo.iter().any(|&block| {
-        graph.blocks[block]
-            .insts
-            .iter()
-            .any(|&inst| matches!(graph.insts[inst].op, Op::IsExactPosition(..)))
+        graph.blocks[block].insts.iter().any(|&inst| {
+            matches!(
+                graph.insts[inst].op,
+                Op::Javascript(JsOp::IsExactPosition(..))
+            )
+        })
     }));
 }
 
@@ -1465,19 +1540,21 @@ fn undefined_comparisons_refine_typed_read_results() {
         let inst = graph
             .insts
             .iter()
-            .find_map(|(inst, data)| matches!(data.op, Op::GetIndex(..)).then_some(inst))
+            .find_map(|(inst, data)| {
+                matches!(data.op, Op::Javascript(JsOp::GetIndex(..))).then_some(inst)
+            })
             .unwrap();
-        let Op::GetIndex(object, key) = graph.insts[inst].op else {
+        let Op::Javascript(JsOp::GetIndex(object, key)) = graph.insts[inst].op else {
             unreachable!()
         };
-        graph.insts[inst].op = Op::TypedIndex(
+        graph.insts[inst].op = Op::Javascript(JsOp::TypedIndex(
             object,
             key,
             TypedRead {
                 element: Some(crate::heap::TypedKind::Float64),
                 bounded: false,
             },
-        );
+        ));
         let mut function = FunctionState::new(graph, Vec::new(), true);
         comparisons::expose(&mut function);
         let graph = function.graph;
@@ -1485,7 +1562,7 @@ fn undefined_comparisons_refine_typed_read_results() {
         assert!(
             ops(&graph)
                 .iter()
-                .any(|op| matches!(op, Op::IsUndefined(_)))
+                .any(|op| matches!(op, Op::Javascript(JsOp::IsUndefined(_))))
         );
         let result = graph
             .blocks
@@ -1519,7 +1596,7 @@ fn undefined_comparisons_refine_typed_read_results() {
         assert!(
             !ops(&graph)
                 .iter()
-                .any(|op| matches!(op, Op::IsUndefined(_))),
+                .any(|op| matches!(op, Op::Javascript(JsOp::IsUndefined(_)))),
             "{source}"
         );
     }
@@ -1531,7 +1608,7 @@ fn forwarded_undefined_facts_stop_at_joins_and_alternate_predecessors() {
     let entry = graph.entry;
     let span = graph.span;
     let value = graph.append_value(entry, span, Op::Argument(0));
-    let condition = graph.append_value(entry, span, Op::IsUndefined(value));
+    let condition = graph.append_value(entry, span, Op::Javascript(JsOp::IsUndefined(value)));
     let yes = graph.blocks.push(BlockData::default());
     let no = graph.blocks.push(BlockData::default());
     let forward = graph.blocks.push(BlockData::default());
@@ -1608,13 +1685,16 @@ fn facts_refresh_after_instruction_and_control_flow_changes() {
         .insts
         .iter()
         .find_map(|(inst, data)| {
-            matches!(data.op, Op::Constant(Constant::Number(1.0)))
-                .then_some((inst, data.result().unwrap()))
+            matches!(
+                data.op,
+                Op::Javascript(JsOp::Constant(Constant::Number(1.0)))
+            )
+            .then_some((inst, data.result().unwrap()))
         })
         .unwrap();
     let cfg_storage = function.facts.cfg.rpo.as_ptr();
     assert_eq!(function.facts.of(value), ValueType::INT32);
-    function.graph.insts[inst].op = Op::Constant(Constant::String("one".into()));
+    function.graph.insts[inst].op = Op::Javascript(JsOp::Constant(Constant::String("one".into())));
     function.invalidate_values();
     function.ensure_facts();
     assert_eq!(function.facts.of(value), ValueType::STRING);
@@ -1697,7 +1777,7 @@ fn trusted_numeric_inputs_do_not_acquire_speculative_entry_guards() {
     assert!(
         !ops(&function.graph)
             .iter()
-            .any(|op| matches!(op, Op::IsNumber(_)))
+            .any(|op| matches!(op, Op::Javascript(JsOp::IsNumber(_))))
     );
 }
 
@@ -1720,7 +1800,7 @@ fn trusted_shapes_expire_after_writes_and_reentry() {
             .into_iter()
             .flat_map(|block| function.graph.blocks[block].insts.clone())
             .filter_map(|inst| match function.graph.insts[inst].op {
-                Op::Get(object, _) => Some((inst, object)),
+                Op::Javascript(JsOp::Get(object, _)) => Some((inst, object)),
                 _ => None,
             })
             .collect();
@@ -1736,7 +1816,7 @@ fn trusted_shapes_expire_after_writes_and_reentry() {
                 data.block,
                 position,
                 data.span,
-                Op::IsShape(object, 10),
+                Op::Javascript(JsOp::IsShape(object, 10)),
                 true,
             );
         }
@@ -1746,7 +1826,7 @@ fn trusted_shapes_expire_after_writes_and_reentry() {
         assert_eq!(
             ops(&function.graph)
                 .iter()
-                .filter(|op| matches!(op, Op::IsShape(_, 10)))
+                .filter(|op| matches!(op, Op::Javascript(JsOp::IsShape(_, 10))))
                 .count(),
             1
         );
@@ -1764,7 +1844,7 @@ fn trusted_input_shapes_remove_redundant_callee_checks() {
     for block in Cfg::new(&function.graph).rpo {
         for &inst in &function.graph.blocks[block].insts {
             let data = &function.graph.insts[inst];
-            if matches!(data.op, Op::Get(..)) {
+            if matches!(data.op, Op::Javascript(JsOp::Get(..))) {
                 repository.shape_feedback.insert(
                     (
                         crate::jit::profile::Site {
@@ -1801,12 +1881,12 @@ fn trusted_input_shapes_remove_redundant_callee_checks() {
     assert!(
         ops(&function.graph)
             .iter()
-            .any(|op| matches!(op, Op::ShapedGet(..)))
+            .any(|op| matches!(op, Op::Javascript(JsOp::ShapedGet(..))))
     );
     assert!(
         !ops(&function.graph)
             .iter()
-            .any(|op| matches!(op, Op::IsShape(..)))
+            .any(|op| matches!(op, Op::Javascript(JsOp::IsShape(..))))
     );
 }
 
@@ -1827,7 +1907,7 @@ fn caller_shapes_select_useful_polymorphic_callee_contracts() {
         for block in Cfg::new(&function.graph).rpo {
             for &inst in &function.graph.blocks[block].insts {
                 let data = &function.graph.insts[inst];
-                if matches!(data.op, Op::Get(..)) {
+                if matches!(data.op, Op::Javascript(JsOp::Get(..))) {
                     repository.shape_feedback.insert(
                         (
                             Site {
@@ -1895,12 +1975,12 @@ fn caller_shapes_select_useful_polymorphic_callee_contracts() {
             )
             .unwrap();
             assert!(ops(&specialized.graph).iter().any(
-                |op| matches!(op, Op::ShapedGet(_, _, index) if *index == u32::from(shape == 20))
+                |op| matches!(op, Op::Javascript(JsOp::ShapedGet(_, _, index)) if *index == u32::from(shape == 20))
             ));
             assert!(
                 !ops(&specialized.graph)
                     .iter()
-                    .any(|op| matches!(op, Op::IsShape(..)))
+                    .any(|op| matches!(op, Op::Javascript(JsOp::IsShape(..))))
             );
         }
     }
@@ -1952,7 +2032,7 @@ fn call_variant_contracts_do_not_lift_shape_guards_after_reentry() {
         for block in Cfg::new(&function.graph).rpo {
             for &inst in &function.graph.blocks[block].insts {
                 let data = &function.graph.insts[inst];
-                if matches!(data.op, Op::Get(..)) {
+                if matches!(data.op, Op::Javascript(JsOp::Get(..))) {
                     repository.shape_feedback.insert(
                         (
                             Site {
@@ -2055,11 +2135,10 @@ fn arithmetic_lowering_preserves_value_contracts_before_legalization() {
     let graph = lower_source("function f(a,b){return a+b;}").unwrap();
     let mut function = FunctionState::new(graph, Vec::new(), true);
     assert!(!numeric::arithmetic(&mut function));
-    assert!(
-        ops(&function.graph)
-            .iter()
-            .any(|op| matches!(op, Op::Binary(BinaryOperator::Addition, ..)))
-    );
+    assert!(ops(&function.graph).iter().any(|op| matches!(
+        op,
+        Op::Javascript(JsOp::Binary(BinaryOperator::Addition, ..))
+    )));
 }
 
 #[test]
@@ -2081,8 +2160,13 @@ fn lowered_comparisons_and_steps_preserve_loop_facts() {
             .filter_map(|data| {
                 matches!(
                     data.op,
-                    Op::Unary(UnaryOp::Increment | UnaryOp::Decrement, _)
-                        | Op::Binary(BinaryOperator::Addition | BinaryOperator::Subtraction, ..)
+                    Op::Javascript(
+                        JsOp::Unary(UnaryOp::Increment | UnaryOp::Decrement, _)
+                            | JsOp::Binary(
+                                BinaryOperator::Addition | BinaryOperator::Subtraction,
+                                ..
+                            )
+                    )
                 )
                 .then(|| data.result().unwrap())
             })
@@ -2118,7 +2202,7 @@ fn numeric_lowering_reuses_guard_conversions_across_calls() {
     let success = graph.blocks.push(BlockData::default());
     let fallback = graph.blocks.push(BlockData::default());
     let callback = graph.append_value(block, span, Op::Argument(1));
-    let guard = graph.append_value(block, span, Op::IsInteger(value));
+    let guard = graph.append_value(block, span, Op::Javascript(JsOp::IsInteger(value)));
     graph.terminate(
         block,
         span,
@@ -2127,19 +2211,27 @@ fn numeric_lowering_reuses_guard_conversions_across_calls() {
     graph.append_value(
         success,
         span,
-        Op::Call {
+        Op::Javascript(JsOp::Call {
             callee: callback,
             receiver: None,
             args: Vec::new(),
             target: None,
-        },
+        }),
     );
-    let integer = graph.append_value(success, span, Op::AsInteger(value));
-    let factor = graph.append_value(success, span, Op::Constant(Constant::Number(0.5)));
+    let integer = graph.append_value(success, span, Op::Javascript(JsOp::AsInteger(value)));
+    let factor = graph.append_value(
+        success,
+        span,
+        Op::Javascript(JsOp::Constant(Constant::Number(0.5))),
+    );
     let product = graph.append_value(
         success,
         span,
-        Op::Binary(BinaryOperator::Multiplication, integer, factor),
+        Op::Javascript(JsOp::Binary(
+            BinaryOperator::Multiplication,
+            integer,
+            factor,
+        )),
     );
     graph.terminate(success, span, TerminatorKind::Return(product));
     graph.terminate(fallback, span, TerminatorKind::Return(value));
@@ -2150,7 +2242,7 @@ fn numeric_lowering_reuses_guard_conversions_across_calls() {
     function.ensure_values();
     assert_eq!(function.facts.of(integer), ValueType::INT64);
     let graph = &function.graph;
-    let Some(Op::IntegerCheck(_, float, _)) = graph.defining_op(guard) else {
+    let Some(Op::Javascript(JsOp::IntegerCheck(_, float, _))) = graph.defining_op(guard) else {
         panic!()
     };
     let Some(Op::LowLevel(low_level::Op::Binary {
@@ -2165,7 +2257,7 @@ fn numeric_lowering_reuses_guard_conversions_across_calls() {
     assert_eq!(
         ops(graph)
             .iter()
-            .filter(|op| matches!(op, Op::SaturatingInteger(_)))
+            .filter(|op| matches!(op, Op::Javascript(JsOp::SaturatingInteger(_))))
             .count(),
         1
     );
@@ -2174,12 +2266,12 @@ fn numeric_lowering_reuses_guard_conversions_across_calls() {
     super::js::simplify(&mut function);
     assert!(matches!(
         function.graph.defining_op(guard),
-        Some(Op::IsNumber(_))
+        Some(Op::Javascript(JsOp::IsNumber(_)))
     ));
     assert!(
         !ops(&function.graph)
             .iter()
-            .any(|op| matches!(op, Op::SaturatingInteger(_)))
+            .any(|op| matches!(op, Op::Javascript(JsOp::SaturatingInteger(_))))
     );
 }
 
@@ -2197,9 +2289,17 @@ fn hoisting_moves_constant_arithmetic_and_lowered_conversions() {
         let block = *body.iter().find(|&&block| block != header).unwrap();
         let span = graph.span;
         let input = graph.append_value(preheader, span, Op::Argument(1));
-        let integer = graph.append_value(preheader, span, Op::AsInteger(input));
-        let factor = graph.append_value(block, span, Op::Constant(Constant::Number(0.5)));
-        let product = graph.append_value(block, span, Op::Binary(operator, integer, factor));
+        let integer = graph.append_value(preheader, span, Op::Javascript(JsOp::AsInteger(input)));
+        let factor = graph.append_value(
+            block,
+            span,
+            Op::Javascript(JsOp::Constant(Constant::Number(0.5))),
+        );
+        let product = graph.append_value(
+            block,
+            span,
+            Op::Javascript(JsOp::Binary(operator, integer, factor)),
+        );
         let mut function = FunctionState::new(graph, Vec::new(), true);
         let region = function.graph.regions.push(Region {
             blocks: function.graph.blocks.keys().collect(),
@@ -2223,7 +2323,7 @@ fn hoisting_moves_constant_arithmetic_and_lowered_conversions() {
             graph.blocks[block]
                 .insts
                 .iter()
-                .any(|&inst| matches!(graph.insts[inst].op, Op::Get(..)))
+                .any(|&inst| matches!(graph.insts[inst].op, Op::Javascript(JsOp::Get(..))))
         );
     }
 }
@@ -2237,12 +2337,16 @@ fn cell_reads_hoist_across_elements_but_not_cell_writes_or_calls() {
         let cell = graph.append_value(entry, span, Op::Argument(0));
         let array = graph.append_value(entry, span, Op::Argument(1));
         let condition = graph.append_value(entry, span, Op::Argument(2));
-        let index = graph.append_value(entry, span, Op::Constant(Constant::Number(0.0)));
+        let index = graph.append_value(
+            entry,
+            span,
+            Op::Javascript(JsOp::Constant(Constant::Number(0.0))),
+        );
         let header = graph.blocks.push(BlockData::default());
         let body = graph.blocks.push(BlockData::default());
         let exit = graph.blocks.push(BlockData::default());
         graph.terminate(entry, span, TerminatorKind::Jump(Target::new(header)));
-        let read = graph.append_value(header, span, Op::CellGet(cell));
+        let read = graph.append_value(header, span, Op::Javascript(JsOp::CellGet(cell)));
         graph.terminate(
             header,
             span,
@@ -2250,21 +2354,31 @@ fn cell_reads_hoist_across_elements_but_not_cell_writes_or_calls() {
         );
         match mutation {
             0 => {
-                graph.append(body, span, Op::ArrayStore(array, index, index), false);
+                graph.append(
+                    body,
+                    span,
+                    Op::Javascript(JsOp::ArrayStore(array, index, index)),
+                    false,
+                );
             }
             1 => {
-                graph.append(body, span, Op::CellSet(cell, index), false);
+                graph.append(
+                    body,
+                    span,
+                    Op::Javascript(JsOp::CellSet(cell, index)),
+                    false,
+                );
             }
             _ => {
                 graph.append_value(
                     body,
                     span,
-                    Op::Call {
+                    Op::Javascript(JsOp::Call {
                         callee: condition,
                         receiver: None,
                         args: vec![],
                         target: None,
-                    },
+                    }),
                 );
             }
         }
@@ -2292,30 +2406,48 @@ fn cell_read_reuse_stops_at_cell_writes_and_reentry() {
         let span = graph.span;
         let cell = graph.append_value(entry, span, Op::Argument(0));
         let array = graph.append_value(entry, span, Op::Argument(1));
-        let index = graph.append_value(entry, span, Op::Constant(Constant::Number(0.0)));
-        let first = graph.append_value(entry, span, Op::CellGet(cell));
+        let index = graph.append_value(
+            entry,
+            span,
+            Op::Javascript(JsOp::Constant(Constant::Number(0.0))),
+        );
+        let first = graph.append_value(entry, span, Op::Javascript(JsOp::CellGet(cell)));
         match mutation {
             0 => {
-                graph.append(entry, span, Op::ArrayStore(array, index, index), false);
+                graph.append(
+                    entry,
+                    span,
+                    Op::Javascript(JsOp::ArrayStore(array, index, index)),
+                    false,
+                );
             }
             1 => {
-                graph.append(entry, span, Op::CellSet(cell, index), false);
+                graph.append(
+                    entry,
+                    span,
+                    Op::Javascript(JsOp::CellSet(cell, index)),
+                    false,
+                );
             }
             _ => {
                 graph.append_value(
                     entry,
                     span,
-                    Op::Call {
+                    Op::Javascript(JsOp::Call {
                         callee: array,
                         receiver: None,
                         args: vec![],
                         target: None,
-                    },
+                    }),
                 );
             }
         }
-        let second = graph.append_value(entry, span, Op::CellGet(cell));
-        let result = graph.append_value(entry, span, Op::NewArray(vec![first, second]));
+        let second = graph.append_value(entry, span, Op::Javascript(JsOp::CellGet(cell)));
+        let result = graph.append_value(
+            entry,
+            span,
+            Op::Javascript(JsOp::NewArray(vec![first, second])),
+        );
         graph.terminate(entry, span, TerminatorKind::Return(result));
         let mut function = FunctionState::new(graph, Vec::new(), true);
         reuse::reuse_loads(&mut function);
@@ -2323,7 +2455,7 @@ fn cell_read_reuse_stops_at_cell_writes_and_reentry() {
         assert_eq!(
             ops(&function.graph)
                 .iter()
-                .filter(|op| matches!(op, Op::CellGet(_)))
+                .filter(|op| matches!(op, Op::Javascript(JsOp::CellGet(_))))
                 .count(),
             if mutation == 0 { 1 } else { 2 }
         );
@@ -2337,26 +2469,45 @@ fn array_kind_reuse_stops_at_calls_and_writes() {
         let block = graph.entry;
         let span = graph.span;
         let object = graph.append_value(block, span, Op::Argument(0));
-        graph.append_value(block, span, Op::IsArray(object, super::ArrayLayout::Packed));
-        graph.append_value(block, span, Op::IsArray(object, super::ArrayLayout::Holey));
+        graph.append_value(
+            block,
+            span,
+            Op::Javascript(JsOp::IsArray(object, super::ArrayLayout::Packed)),
+        );
+        graph.append_value(
+            block,
+            span,
+            Op::Javascript(JsOp::IsArray(object, super::ArrayLayout::Holey)),
+        );
         if call {
             let callback = graph.append_value(block, span, Op::Argument(1));
             graph.append_value(
                 block,
                 span,
-                Op::Call {
+                Op::Javascript(JsOp::Call {
                     callee: callback,
                     receiver: None,
                     args: vec![object],
                     target: None,
-                },
+                }),
             );
         } else {
-            let index = graph.append_value(block, span, Op::Constant(Constant::Number(100.0)));
-            graph.append_value(block, span, Op::SetIndex(object, index, index));
+            let index = graph.append_value(
+                block,
+                span,
+                Op::Javascript(JsOp::Constant(Constant::Number(100.0))),
+            );
+            graph.append_value(
+                block,
+                span,
+                Op::Javascript(JsOp::SetIndex(object, index, index)),
+            );
         }
-        let result =
-            graph.append_value(block, span, Op::IsArray(object, super::ArrayLayout::Packed));
+        let result = graph.append_value(
+            block,
+            span,
+            Op::Javascript(JsOp::IsArray(object, super::ArrayLayout::Packed)),
+        );
         graph.terminate(block, span, TerminatorKind::Return(result));
         let mut function = FunctionState::new(graph, Vec::new(), true);
         array_checks::lower_array_kinds(&mut function);
@@ -2365,7 +2516,7 @@ fn array_kind_reuse_stops_at_calls_and_writes() {
         assert_eq!(
             ops(&function.graph)
                 .iter()
-                .filter(|op| matches!(op, Op::ArrayKind(_)))
+                .filter(|op| matches!(op, Op::Javascript(JsOp::ArrayKind(_))))
                 .count(),
             2
         );
@@ -2381,9 +2532,17 @@ fn array_metadata_uses_shared_loop_views() {
     let block = *body.iter().find(|&&block| block != header).unwrap();
     let span = graph.span;
     let object = graph.append_value(preheader, span, Op::Argument(1));
-    graph.append_value(block, span, Op::IsArray(object, super::ArrayLayout::Packed));
-    graph.append_value(block, span, Op::IsArray(object, super::ArrayLayout::Holey));
-    graph.append_value(block, span, Op::IndexedLength(object));
+    graph.append_value(
+        block,
+        span,
+        Op::Javascript(JsOp::IsArray(object, super::ArrayLayout::Packed)),
+    );
+    graph.append_value(
+        block,
+        span,
+        Op::Javascript(JsOp::IsArray(object, super::ArrayLayout::Holey)),
+    );
+    graph.append_value(block, span, Op::Javascript(JsOp::IndexedLength(object)));
     let mut function = FunctionState::new(graph, Vec::new(), true);
     array_checks::lower_array_kinds(&mut function);
     reuse::reuse_loads(&mut function);
@@ -2396,7 +2555,7 @@ fn array_metadata_uses_shared_loop_views() {
         .filter(|(inst, _)| {
             matches!(
                 function.graph.insts[**inst].op,
-                Op::ArrayKind(_) | Op::IndexedLength(_)
+                Op::Javascript(JsOp::ArrayKind(_) | JsOp::IndexedLength(_))
             )
         })
         .map(|(_, view)| *view)
@@ -2414,13 +2573,17 @@ fn hoisting_distinguishes_pure_unknown_reads_and_ordered_operations() {
         let span = graph.span;
         let input = graph.append_value(entry, span, Op::Argument(0));
         let other = graph.append_value(entry, span, Op::Argument(1));
-        let number = graph.append_value(entry, span, Op::Constant(Constant::Number(2.0)));
+        let number = graph.append_value(
+            entry,
+            span,
+            Op::Javascript(JsOp::Constant(Constant::Number(2.0))),
+        );
         let header = graph.blocks.push(BlockData::default());
         let body = graph.blocks.push(BlockData::default());
         let exit = graph.blocks.push(BlockData::default());
         graph.terminate(entry, span, TerminatorKind::Jump(Target::new(header)));
-        let ordered = graph.append_value(header, span, Op::ArrayPosition(number));
-        let allocated = graph.append_value(header, span, Op::NewObject);
+        let ordered = graph.append_value(header, span, Op::Javascript(JsOp::ArrayPosition(number)));
+        let allocated = graph.append_value(header, span, Op::Javascript(JsOp::NewObject));
         graph.terminate(
             header,
             span,
@@ -2429,36 +2592,48 @@ fn hoisting_distinguishes_pure_unknown_reads_and_ordered_operations() {
         let unknown = graph.append_value(
             body,
             span,
-            Op::Binary(BinaryOperator::StrictEquality, input, other),
+            Op::Javascript(JsOp::Binary(BinaryOperator::StrictEquality, input, other)),
         );
         let pure = graph.append_value(
             body,
             span,
-            Op::Binary(BinaryOperator::StrictEquality, number, number),
+            Op::Javascript(JsOp::Binary(BinaryOperator::StrictEquality, number, number)),
         );
         let unequal = graph.append_value(
             body,
             span,
-            Op::Binary(BinaryOperator::StrictInequality, number, number),
+            Op::Javascript(JsOp::Binary(
+                BinaryOperator::StrictInequality,
+                number,
+                number,
+            )),
         );
         match write {
             0 => {}
             1 => {
-                graph.append_value(body, span, Op::SetIndex(input, number, other));
+                graph.append_value(
+                    body,
+                    span,
+                    Op::Javascript(JsOp::SetIndex(input, number, other)),
+                );
             }
             2 => {
-                graph.append_value(body, span, Op::GlobalWrite("value".into(), other));
+                graph.append_value(
+                    body,
+                    span,
+                    Op::Javascript(JsOp::GlobalWrite("value".into(), other)),
+                );
             }
             _ => {
                 graph.append_value(
                     body,
                     span,
-                    Op::Call {
+                    Op::Javascript(JsOp::Call {
                         callee: other,
                         receiver: None,
                         args: vec![input],
                         target: None,
-                    },
+                    }),
                 );
             }
         }
@@ -2547,29 +2722,39 @@ fn property_lowering_exposes_named_reads_and_leaves_computed_reads_generic() {
     assert!(properties::lower(&mut function).unwrap());
     function.graph.verify().unwrap();
     let operations = ops(&function.graph);
-    assert!(!operations.iter().any(|op| matches!(op, Op::Get(..))));
     assert!(
-        operations
+        !operations
             .iter()
-            .any(|op| matches!(op, Op::IsPropertyCached(..)))
+            .any(|op| matches!(op, Op::Javascript(JsOp::Get(..))))
     );
     assert!(
         operations
             .iter()
-            .any(|op| matches!(op, Op::CachedProperty(..)))
+            .any(|op| matches!(op, Op::Javascript(JsOp::IsPropertyCached(..))))
     );
     assert!(
         operations
             .iter()
-            .any(|op| matches!(op, Op::FillPropertyCache(_, _, name) if name == "x"))
+            .any(|op| matches!(op, Op::Javascript(JsOp::CachedProperty(..))))
+    );
+    assert!(operations.iter().any(
+        |op| matches!(op, Op::Javascript(JsOp::FillPropertyCache(_, _, name)) if name == "x")
+    ));
+    assert!(
+        operations
+            .iter()
+            .any(|op| matches!(op, Op::Javascript(JsOp::IndexedLength(..))))
     );
     assert!(
         operations
             .iter()
-            .any(|op| matches!(op, Op::IndexedLength(..)))
+            .any(|op| matches!(op, Op::Javascript(JsOp::GetIndex(..))))
     );
-    assert!(operations.iter().any(|op| matches!(op, Op::GetIndex(..))));
-    assert!(!operations.iter().any(|op| matches!(op, Op::ArrayLoad(..))));
+    assert!(
+        !operations
+            .iter()
+            .any(|op| matches!(op, Op::Javascript(JsOp::ArrayLoad(..))))
+    );
     assert!(!properties::lower(&mut function).unwrap());
     function.lower_runtime().unwrap();
 }
@@ -2588,13 +2773,13 @@ fn array_storage_lowering_preserves_planned_ownership() {
             let mut load = None;
             for (inst, data) in graph.insts.iter_mut() {
                 match &data.op {
-                    Op::GetIndex(object, key) => {
+                    Op::Javascript(JsOp::GetIndex(object, key)) => {
                         let result = data.result().unwrap();
                         load = Some((inst, result));
-                        data.op = Op::ArrayLoad(*object, *key, layout);
+                        data.op = Op::Javascript(JsOp::ArrayLoad(*object, *key, layout));
                     }
-                    Op::Get(object, name) if name == "length" => {
-                        data.op = Op::IndexedLength(*object)
+                    Op::Javascript(JsOp::Get(object, name)) if name == "length" => {
+                        data.op = Op::Javascript(JsOp::IndexedLength(*object))
                     }
                     _ => {}
                 }
@@ -2605,12 +2790,15 @@ fn array_storage_lowering_preserves_planned_ownership() {
             function.ensure_facts();
             let borrows =
                 borrow::borrows(&mut function.graph, &function.facts, &mut function.notes);
-            assert!(matches!(function.graph.insts[inst].op, Op::ArrayLoad(..)));
+            assert!(matches!(
+                function.graph.insts[inst].op,
+                Op::Javascript(JsOp::ArrayLoad(..))
+            ));
             assert_eq!(function.graph.borrowed.contains(&result), !mutate);
             assert!(
                 !ops(&function.graph)
                     .iter()
-                    .any(|op| matches!(op, Op::IndexedLength(..)))
+                    .any(|op| matches!(op, Op::Javascript(JsOp::IndexedLength(..))))
             );
             function.ensure_facts();
             repr::assign(&mut function.graph, &function.facts);
@@ -2653,7 +2841,7 @@ fn array_storage_lowering_preserves_planned_ownership() {
             assert!(
                 !ops(&function.graph)
                     .iter()
-                    .any(|op| matches!(op, Op::ArrayLoad(..)))
+                    .any(|op| matches!(op, Op::Javascript(JsOp::ArrayLoad(..))))
             );
             let Op::AsBoxed(word) = function.graph.insts[inst].op else {
                 panic!("{inst} is not reinterpreted as boxed");
@@ -2692,24 +2880,26 @@ fn typed_loads_lower_to_explicit_memory_operations() {
         let inst = graph
             .insts
             .iter()
-            .find_map(|(inst, data)| matches!(data.op, Op::GetIndex(..)).then_some(inst))
+            .find_map(|(inst, data)| {
+                matches!(data.op, Op::Javascript(JsOp::GetIndex(..))).then_some(inst)
+            })
             .unwrap();
-        let Op::GetIndex(object, key) = graph.insts[inst].op else {
+        let Op::Javascript(JsOp::GetIndex(object, key)) = graph.insts[inst].op else {
             unreachable!()
         };
-        graph.insts[inst].op = Op::TypedIndex(
+        graph.insts[inst].op = Op::Javascript(JsOp::TypedIndex(
             object,
             key,
             TypedRead {
                 element: Some(kind),
                 bounded: true,
             },
-        );
+        ));
         let mut function = FunctionState::new(graph, Vec::new(), true);
         assert!(typed::lower_memory(&mut function));
         let graph = function.graph;
         graph.verify().unwrap();
-        let Op::MemoryNumber(raw, actual) = graph.insts[inst].op else {
+        let Op::Javascript(JsOp::MemoryNumber(raw, actual)) = graph.insts[inst].op else {
             panic!()
         };
         assert_eq!(actual, format);
@@ -2901,7 +3091,11 @@ fn low_level_variables_resolve_diamond_and_loop() {
     let join = graph.blocks.push(BlockData::default());
     let body = graph.blocks.push(BlockData::default());
     let exit = graph.blocks.push(BlockData::default());
-    let changed = graph.append_value(left, span, Op::Constant(Constant::Number(7.0)));
+    let changed = graph.append_value(
+        left,
+        span,
+        Op::Javascript(JsOp::Constant(Constant::Number(7.0))),
+    );
     graph.terminate(
         entry,
         span,
@@ -3051,7 +3245,11 @@ fn low_level_ssa_same_target_edges_receive_one_argument() {
     let join = graph.blocks.push(BlockData::default());
     let body = graph.blocks.push(BlockData::default());
     let exit = graph.blocks.push(BlockData::default());
-    let changed = graph.append_value(body, span, Op::Constant(Constant::Number(2.0)));
+    let changed = graph.append_value(
+        body,
+        span,
+        Op::Javascript(JsOp::Constant(Constant::Number(2.0))),
+    );
     graph.terminate(
         entry,
         span,
@@ -3300,11 +3498,20 @@ fn semantic_constant_cse_preserves_bits_and_representations() {
     let mut originals = Vec::new();
     let mut repeated = Vec::new();
     for constant in constants {
-        originals.push(builder.semantic(Op::Constant(constant.clone()), Repr::Boxed));
-        repeated.push(builder.semantic(Op::Constant(constant), Repr::Boxed));
+        originals.push(builder.semantic(
+            Op::Javascript(JsOp::Constant(constant.clone())),
+            Repr::Boxed,
+        ));
+        repeated.push(builder.semantic(Op::Javascript(JsOp::Constant(constant)), Repr::Boxed));
     }
-    let integer = builder.semantic(Op::Constant(Constant::Number(7.0)), Repr::I64);
-    let string = builder.semantic(Op::Constant(Constant::String("7".into())), Repr::Boxed);
+    let integer = builder.semantic(
+        Op::Javascript(JsOp::Constant(Constant::Number(7.0))),
+        Repr::I64,
+    );
+    let string = builder.semantic(
+        Op::Javascript(JsOp::Constant(Constant::String("7".into()))),
+        Repr::Boxed,
+    );
     let mut results = originals.clone();
     results.extend(repeated);
     results.extend([integer, string]);
@@ -3609,8 +3816,11 @@ fn conversion_hoisting_keeps_heap_values_inside_the_loop() {
         .insts
         .iter()
         .find_map(|&inst| {
-            matches!(graph.insts[inst].op, Op::Constant(Constant::Number(_)))
-                .then(|| graph.insts[inst].result().unwrap())
+            matches!(
+                graph.insts[inst].op,
+                Op::Javascript(JsOp::Constant(Constant::Number(_)))
+            )
+            .then(|| graph.insts[inst].result().unwrap())
         })
         .unwrap();
     graph.reprs[constant] = Some(Repr::I32);
@@ -3641,14 +3851,14 @@ fn cache_requirements_leave_property_accesses_until_lowering() {
         .insts
         .values()
         .find_map(|data| {
-            matches!(data.op, Op::Get(_, ref name) if name == "method")
+            matches!(data.op, Op::Javascript(JsOp::Get(_, ref name)) if name == "method")
                 .then(|| (data.block, data.span, data.result().unwrap()))
         })
         .unwrap();
     graph.append_value(
         block,
         span,
-        Op::IsCode(callee, cranelift_module::FuncId::from_u32(0)),
+        Op::Javascript(JsOp::IsCode(callee, cranelift_module::FuncId::from_u32(0))),
     );
     let blocks = graph.blocks.len();
     property_accesses::assume(&mut graph, &shapes::Plan::default());
@@ -3657,7 +3867,7 @@ fn cache_requirements_leave_property_accesses_until_lowering() {
     assert!(
         ops(&graph)
             .iter()
-            .any(|op| matches!(op, Op::Get(_, name) if name == "method"))
+            .any(|op| matches!(op, Op::Javascript(JsOp::Get(_, name)) if name == "method"))
     );
     assert!(
         ops(&graph)
@@ -3666,7 +3876,9 @@ fn cache_requirements_leave_property_accesses_until_lowering() {
     );
     assert!(!ops(&graph).iter().any(|op| matches!(
         op,
-        Op::IsPropertyCached(..) | Op::CachedProperty(..) | Op::FillPropertyCache(..)
+        Op::Javascript(
+            JsOp::IsPropertyCached(..) | JsOp::CachedProperty(..) | JsOp::FillPropertyCache(..)
+        )
     )));
     graph.strip_assumes();
     regions::materialize_properties(&mut graph).unwrap();
@@ -3674,12 +3886,12 @@ fn cache_requirements_leave_property_accesses_until_lowering() {
     assert!(
         ops(&graph)
             .iter()
-            .any(|op| matches!(op, Op::CachedProperty(..)))
+            .any(|op| matches!(op, Op::Javascript(JsOp::CachedProperty(..))))
     );
     assert!(
         ops(&graph)
             .iter()
-            .any(|op| matches!(op, Op::FillPropertyCache(..)))
+            .any(|op| matches!(op, Op::Javascript(JsOp::FillPropertyCache(..))))
     );
     graph.verify().unwrap();
 }
@@ -3695,21 +3907,23 @@ fn cache_entry_guards_preserve_receiver_proofs() {
             .insts
             .values()
             .find_map(|data| {
-                matches!(data.op, Op::Get(..))
+                matches!(data.op, Op::Javascript(JsOp::Get(..)))
                     .then(|| (data.block, data.span, data.result().unwrap()))
             })
             .unwrap();
         graph.append_value(
             block,
             span,
-            Op::IsCode(callee, cranelift_module::FuncId::from_u32(0)),
+            Op::Javascript(JsOp::IsCode(callee, cranelift_module::FuncId::from_u32(0))),
         );
         property_accesses::assume(&mut graph, &shapes::Plan::default());
         let regions =
             regions::version(&mut graph, &Default::default(), Some(1), &mut Vec::new()).unwrap();
         assert!(!regions.is_empty());
         assert_eq!(
-            ops(&graph).iter().any(|op| matches!(op, Op::AsObject(..))),
+            ops(&graph)
+                .iter()
+                .any(|op| matches!(op, Op::Javascript(JsOp::AsObject(..)))),
             !builtins
         );
         let blocks = graph.blocks.len();
@@ -3732,7 +3946,7 @@ fn guarded_cache_loads_preserve_their_builtin_mode() {
             .insts
             .iter()
             .find_map(|(inst, data)| {
-                if let Op::Get(object, _) = data.op {
+                if let Op::Javascript(JsOp::Get(object, _)) = data.op {
                     Some((inst, object))
                 } else {
                     None
@@ -3755,9 +3969,17 @@ fn guarded_cache_loads_preserve_their_builtin_mode() {
             TerminatorKind::Jump(target) if target.args == [fallback_result]
         ));
         let failed = graph.blocks.push(BlockData::default());
-        let undefined = graph.append_value(failed, span, Op::Constant(Constant::Undefined));
+        let undefined = graph.append_value(
+            failed,
+            span,
+            Op::Javascript(JsOp::Constant(Constant::Undefined)),
+        );
         graph.terminate(failed, span, TerminatorKind::Return(undefined));
-        let check = graph.append_value(before, span, Op::IsPropertyCached(object, cache, builtins));
+        let check = graph.append_value(
+            before,
+            span,
+            Op::Javascript(JsOp::IsPropertyCached(object, cache, builtins)),
+        );
         graph.terminate(
             before,
             span,
@@ -3767,7 +3989,9 @@ fn guarded_cache_loads_preserve_their_builtin_mode() {
         regions::materialize_properties(&mut graph).unwrap();
         property_accesses::rewrite(&mut graph).unwrap();
         assert_eq!(graph.blocks.len(), blocks);
-        assert!(matches!(graph.insts[inst].op, Op::CachedProperty(_, _, mode) if mode == builtins));
+        assert!(
+            matches!(graph.insts[inst].op, Op::Javascript(JsOp::CachedProperty(_, _, mode)) if mode == builtins)
+        );
         graph.verify().unwrap();
     }
 }
@@ -3786,7 +4010,7 @@ fn write_lowering_keeps_generic_keys_and_materializes_selected_stores() {
         .iter()
         .flat_map(|&block| &graph.blocks[block].insts)
         .copied()
-        .find(|&inst| matches!(graph.insts[inst].op, Op::SetIndex(..)))
+        .find(|&inst| matches!(graph.insts[inst].op, Op::Javascript(JsOp::SetIndex(..))))
         .unwrap();
     for element in [
         None,
@@ -3819,11 +4043,15 @@ fn write_lowering_keeps_generic_keys_and_materializes_selected_stores() {
         let planned = reads::plan_stores(&graph, &repository, 0);
         assert_eq!(planned.len(), 1);
         writes::lower(&mut graph, &planned).unwrap();
-        assert!(ops(&graph).iter().any(|op| matches!(op, Op::SetIndex(..))));
+        assert!(
+            ops(&graph)
+                .iter()
+                .any(|op| matches!(op, Op::Javascript(JsOp::SetIndex(..))))
+        );
         assert_eq!(
             ops(&graph)
                 .iter()
-                .any(|op| matches!(op, Op::ArrayStore(..))),
+                .any(|op| matches!(op, Op::Javascript(JsOp::ArrayStore(..)))),
             element.is_none()
         );
         let mut function = FunctionState::new(graph, Vec::new(), true);
@@ -3833,7 +4061,7 @@ fn write_lowering_keeps_generic_keys_and_materializes_selected_stores() {
         assert!(
             !ops(&function.graph)
                 .iter()
-                .any(|op| matches!(op, Op::ArrayStore(..)))
+                .any(|op| matches!(op, Op::Javascript(JsOp::ArrayStore(..))))
         );
         assert!(
             ops(&function.graph)
@@ -3848,11 +4076,10 @@ fn write_lowering_keeps_generic_keys_and_materializes_selected_stores() {
     }
     let mut function = FunctionState::new(graph, Vec::new(), true);
     function.lower_runtime().unwrap();
-    assert!(
-        !ops(&function.graph)
-            .iter()
-            .any(|op| matches!(op, Op::ArrayStore(..) | Op::CanOverwrite(..)))
-    );
+    assert!(!ops(&function.graph).iter().any(|op| matches!(
+        op,
+        Op::Javascript(JsOp::ArrayStore(..) | JsOp::CanOverwrite(..))
+    )));
 }
 
 #[test]
@@ -3866,21 +4093,25 @@ fn property_write_lowering_exposes_addition_and_overwrite() {
     let mut function = FunctionState::new(graph, Vec::new(), true);
     assert!(properties::lower(&mut function).unwrap());
     let operations = ops(&function.graph);
-    assert!(!operations.iter().any(|op| matches!(op, Op::Set(..))));
     assert!(
-        operations
+        !operations
             .iter()
-            .any(|op| matches!(op, Op::PropertyAdd(..)))
+            .any(|op| matches!(op, Op::Javascript(JsOp::Set(..))))
     );
     assert!(
         operations
             .iter()
-            .any(|op| matches!(op, Op::PropertyStore(..)))
+            .any(|op| matches!(op, Op::Javascript(JsOp::PropertyAdd(..))))
     );
     assert!(
         operations
             .iter()
-            .any(|op| matches!(op, Op::FillPropertyStore(..)))
+            .any(|op| matches!(op, Op::Javascript(JsOp::PropertyStore(..))))
+    );
+    assert!(
+        operations
+            .iter()
+            .any(|op| matches!(op, Op::Javascript(JsOp::FillPropertyStore(..))))
     );
     assert!(!properties::lower(&mut function).unwrap());
     function.ensure_facts();
@@ -3891,9 +4122,11 @@ fn property_write_lowering_exposes_addition_and_overwrite() {
         .filter(|&&inst| {
             matches!(
                 function.graph.insts[inst].op,
-                Op::PropertyStore(.., PropertyWrite::Define)
-                    | Op::PropertyAdd(.., PropertyWrite::Define)
-                    | Op::FillPropertyStore(.., PropertyWrite::Define)
+                Op::Javascript(
+                    JsOp::PropertyStore(.., PropertyWrite::Define)
+                        | JsOp::PropertyAdd(.., PropertyWrite::Define)
+                        | JsOp::FillPropertyStore(.., PropertyWrite::Define)
+                )
             )
         })
         .copied()
@@ -3905,11 +4138,10 @@ fn property_write_lowering_exposes_addition_and_overwrite() {
             .all(|&inst| !function.facts.memory(inst).writes_data())
     );
     function.lower_runtime().unwrap();
-    assert!(
-        !ops(&function.graph)
-            .iter()
-            .any(|op| matches!(op, Op::PropertyAdd(..) | Op::PropertyStore(..)))
-    );
+    assert!(!ops(&function.graph).iter().any(|op| matches!(
+        op,
+        Op::Javascript(JsOp::PropertyAdd(..) | JsOp::PropertyStore(..))
+    )));
     let operations = ops(&function.graph);
     assert!(operations.iter().any(|op| matches!(
         op,
@@ -3941,7 +4173,7 @@ fn polymorphic_property_dispatch_is_planned_before_read_rewriting() {
         .insts
         .iter()
         .find_map(|(inst, data)| {
-            matches!(data.op, Op::Get(..)).then_some((
+            matches!(data.op, Op::Javascript(JsOp::Get(..))).then_some((
                 inst,
                 Site {
                     inline_context: 0,
@@ -3972,38 +4204,46 @@ fn polymorphic_property_dispatch_is_planned_before_read_rewriting() {
         Op::Assume(_, guards::Fact::Property(value), _) if *value == cache)));
     assert!(!ops(&graph).iter().any(|op| matches!(
         op,
-        Op::Assume(_, guards::Fact::Shape(_), _) | Op::IsShape(..)
+        Op::Assume(_, guards::Fact::Shape(_), _) | Op::Javascript(JsOp::IsShape(..))
     )));
     regions::version(&mut graph, &Default::default(), None, &mut Vec::new()).unwrap();
     assert_eq!(
         ops(&graph)
             .iter()
-            .filter(|op| matches!(op, Op::Get(..)))
+            .filter(|op| matches!(op, Op::Javascript(JsOp::Get(..))))
             .count(),
         3
     );
     assert_eq!(
         ops(&graph)
             .iter()
-            .filter(|op| matches!(op, Op::IsShape(..)))
+            .filter(|op| matches!(op, Op::Javascript(JsOp::IsShape(..))))
             .count(),
         2
     );
-    assert!(!ops(&graph).iter().any(|op| matches!(op, Op::ShapedGet(..))));
+    assert!(
+        !ops(&graph)
+            .iter()
+            .any(|op| matches!(op, Op::Javascript(JsOp::ShapedGet(..))))
+    );
     graph.verify().unwrap();
     property_accesses::rewrite(&mut graph).unwrap();
     assert_eq!(
         ops(&graph)
             .iter()
-            .filter(|op| matches!(op, Op::ShapedGet(..)))
+            .filter(|op| matches!(op, Op::Javascript(JsOp::ShapedGet(..))))
             .count(),
         2
     );
-    assert!(!ops(&graph).iter().any(|op| matches!(op, Op::Get(..))));
+    assert!(
+        !ops(&graph)
+            .iter()
+            .any(|op| matches!(op, Op::Javascript(JsOp::Get(..))))
+    );
     assert!(
         ops(&graph)
             .iter()
-            .any(|op| matches!(op, Op::FillPropertyCache(..)))
+            .any(|op| matches!(op, Op::Javascript(JsOp::FillPropertyCache(..))))
     );
     assert!(graph.property_accesses.is_empty());
     graph.verify().unwrap();
@@ -4028,7 +4268,7 @@ fn cache_dependencies_follow_versioning_and_compaction() {
         .unwrap();
     assert!(matches!(
         graph.defining_op(cache),
-        Some(Op::PropertyCache(..))
+        Some(Op::Javascript(JsOp::PropertyCache(..)))
     ));
     regions::version(&mut graph, &Default::default(), None, &mut Vec::new()).unwrap();
     graph.verify().unwrap();
@@ -4037,15 +4277,17 @@ fn cache_dependencies_follow_versioning_and_compaction() {
     property_accesses::rewrite(&mut graph).unwrap();
     for op in ops(&graph) {
         let cache = match op {
-            Op::IsPropertyCached(_, cache, _)
-            | Op::CachedProperty(_, cache, _)
-            | Op::FillPropertyCache(_, cache, _)
-            | Op::PrimePropertyCache(_, cache) => *cache,
+            Op::Javascript(
+                JsOp::IsPropertyCached(_, cache, _)
+                | JsOp::CachedProperty(_, cache, _)
+                | JsOp::FillPropertyCache(_, cache, _)
+                | JsOp::PrimePropertyCache(_, cache),
+            ) => *cache,
             _ => continue,
         };
         assert!(matches!(
             graph.defining_op(cache),
-            Some(Op::PropertyCache(..))
+            Some(Op::Javascript(JsOp::PropertyCache(..)))
         ));
     }
     graph.verify().unwrap();
@@ -4076,7 +4318,12 @@ fn cache_guards_hoist_only_when_the_receiver_is_available() {
             .iter()
             .copied()
             .flat_map(|block| graph.blocks[block].insts.iter().copied())
-            .filter(|&inst| matches!(graph.insts[inst].op, Op::IsPropertyCached(..)))
+            .filter(|&inst| {
+                matches!(
+                    graph.insts[inst].op,
+                    Op::Javascript(JsOp::IsPropertyCached(..))
+                )
+            })
             .collect();
         assert!(!guards.is_empty());
         assert_eq!(
@@ -4102,7 +4349,7 @@ fn conflicting_property_shapes_remain_alternative_local_guards() {
     .graph;
     let mut repository = calls::Repository::default();
     for data in graph.insts.values() {
-        if let Op::Get(_, name) = &data.op {
+        if let Op::Javascript(JsOp::Get(_, name)) = &data.op {
             let site = Site {
                 inline_context: 0,
                 source: 0,
@@ -4129,7 +4376,7 @@ fn conflicting_property_shapes_remain_alternative_local_guards() {
     assert_eq!(
         ops(&graph)
             .iter()
-            .filter(|op| matches!(op, Op::IsShape(..)))
+            .filter(|op| matches!(op, Op::Javascript(JsOp::IsShape(..))))
             .count(),
         2
     );
@@ -4137,7 +4384,7 @@ fn conflicting_property_shapes_remain_alternative_local_guards() {
     assert_eq!(
         ops(&graph)
             .iter()
-            .filter(|op| matches!(op, Op::ShapedGet(..)))
+            .filter(|op| matches!(op, Op::Javascript(JsOp::ShapedGet(..))))
             .count(),
         2
     );
@@ -4156,14 +4403,20 @@ fn successful_shape_probes_eliminate_only_valid_shape_checks() {
         let inst = graph
             .insts
             .iter()
-            .find_map(|(inst, data)| matches!(data.op, Op::Get(..)).then_some(inst))
+            .find_map(|(inst, data)| {
+                matches!(data.op, Op::Javascript(JsOp::Get(..))).then_some(inst)
+            })
             .unwrap();
-        let Op::Get(object, _) = graph.insts[inst].op else {
+        let Op::Javascript(JsOp::Get(object, _)) = graph.insts[inst].op else {
             unreachable!()
         };
         graph.set_op(
             inst,
-            Op::ProbeShapeProperty(object, "x".into(), ReadLayout::own(34, 0)),
+            Op::Javascript(JsOp::ProbeShapeProperty(
+                object,
+                "x".into(),
+                ReadLayout::own(34, 0),
+            )),
         );
         let probe = graph.insts[inst].result().unwrap();
         let block = graph.insts[inst].block;
@@ -4171,33 +4424,53 @@ fn successful_shape_probes_eliminate_only_valid_shape_checks() {
         let success = graph.blocks.push(BlockData::default());
         let failure = graph.blocks.push(BlockData::default());
         if mutation == Some(false) {
-            graph.append(block, span, Op::Set(object, "y".into(), probe), false);
+            graph.append(
+                block,
+                span,
+                Op::Javascript(JsOp::Set(object, "y".into(), probe)),
+                false,
+            );
         }
-        let failed = graph.append_value(block, span, Op::IsUninitialized(probe));
+        let failed = graph.append_value(block, span, Op::Javascript(JsOp::IsUninitialized(probe)));
         graph.terminate(
             block,
             span,
             TerminatorKind::Branch(failed, Target::new(failure), Target::new(success)),
         );
         if mutation == Some(true) {
-            graph.append(success, span, Op::Set(object, "y".into(), probe), false);
+            graph.append(
+                success,
+                span,
+                Op::Javascript(JsOp::Set(object, "y".into(), probe)),
+                false,
+            );
         }
-        let (check, result) = graph.append(success, span, Op::IsShape(object, 34), true);
+        let (check, result) = graph.append(
+            success,
+            span,
+            Op::Javascript(JsOp::IsShape(object, 34)),
+            true,
+        );
         graph.terminate(success, span, TerminatorKind::Return(result.unwrap()));
-        let (miss_check, result) = graph.append(failure, span, Op::IsShape(object, 34), true);
+        let (miss_check, result) = graph.append(
+            failure,
+            span,
+            Op::Javascript(JsOp::IsShape(object, 34)),
+            true,
+        );
         graph.terminate(failure, span, TerminatorKind::Return(result.unwrap()));
         let mut function = FunctionState::from_graph(graph);
         reuse::reuse_loads(&mut function);
         assert_eq!(
             matches!(
                 function.graph.insts[check].op,
-                Op::Constant(Constant::Boolean(true))
+                Op::Javascript(JsOp::Constant(Constant::Boolean(true)))
             ),
             mutation.is_none()
         );
         assert!(matches!(
             function.graph.insts[miss_check].op,
-            Op::IsShape(..)
+            Op::Javascript(JsOp::IsShape(..))
         ));
         function.graph.verify().unwrap();
     }
@@ -4224,7 +4497,10 @@ fn property_reads_share_cache_search_and_holder_validation() {
             );
         }
         assert_eq!(
-            count(&operations, |op| matches!(op, Op::PropertyLoad(..))),
+            count(&operations, |op| matches!(
+                op,
+                Op::Javascript(JsOp::PropertyLoad(..))
+            )),
             1
         );
         assert_eq!(
@@ -4253,8 +4529,8 @@ fn property_access_lowering_preserves_boxed_loads_until_ownership_planning() {
         .graph;
         if shaped {
             for data in graph.insts.values_mut() {
-                if let Op::Get(object, ref name) = data.op {
-                    data.op = Op::ShapedGet(object, name.clone(), 0);
+                if let Op::Javascript(JsOp::Get(object, ref name)) = data.op {
+                    data.op = Op::Javascript(JsOp::ShapedGet(object, name.clone(), 0));
                 }
             }
         } else {
@@ -4266,17 +4542,24 @@ fn property_access_lowering_preserves_boxed_loads_until_ownership_planning() {
         properties::lower_accesses(&mut function).unwrap();
         assert!(!ops(&function.graph).iter().any(|op| matches!(
             op,
-            Op::ShapedGet(..)
-                | Op::CachedProperty(..)
-                | Op::IsPropertyCached(..)
-                | Op::FillPropertyCache(..)
+            Op::Javascript(
+                JsOp::ShapedGet(..)
+                    | JsOp::CachedProperty(..)
+                    | JsOp::IsPropertyCached(..)
+                    | JsOp::FillPropertyCache(..)
+            )
         )));
         function.ensure_facts();
         let loads: Vec<_> = Cfg::new(&function.graph)
             .rpo
             .into_iter()
             .flat_map(|block| function.graph.blocks[block].insts.clone())
-            .filter(|&inst| matches!(function.graph.insts[inst].op, Op::PropertyLoad(..)))
+            .filter(|&inst| {
+                matches!(
+                    function.graph.insts[inst].op,
+                    Op::Javascript(JsOp::PropertyLoad(..))
+                )
+            })
             .collect();
         assert!(!loads.is_empty());
         for &inst in &loads {
@@ -4301,7 +4584,7 @@ fn property_access_lowering_preserves_boxed_loads_until_ownership_planning() {
         assert!(
             !ops(&function.graph)
                 .iter()
-                .any(|op| matches!(op, Op::PropertyLoad(..)))
+                .any(|op| matches!(op, Op::Javascript(JsOp::PropertyLoad(..))))
         );
         for inst in loads {
             let Op::AsBoxed(word) = function.graph.insts[inst].op else {
@@ -4336,8 +4619,8 @@ fn optimize_with_shapes(
     let mut repository = calls::Repository::default();
     for data in canonical.graph.insts.values() {
         let (name, access) = match &data.op {
-            Op::Get(_, name) => (name, PropertyAccess::Get),
-            Op::Set(_, name, _) => (name, PropertyAccess::Set),
+            Op::Javascript(JsOp::Get(_, name)) => (name, PropertyAccess::Get),
+            Op::Javascript(JsOp::Set(_, name, _)) => (name, PropertyAccess::Set),
             _ => continue,
         };
         let site = Site {
@@ -4378,7 +4661,7 @@ fn related_storage_reads_use_explicit_layout_guards_and_probes() {
         );
         assert!(
             ops(&function.graph).iter().any(|op| matches!(op,
-            Op::LayoutGet(_, _, known) | Op::ProbeShapeProperty(_, _, known) if *known == layout)),
+            Op::Javascript(JsOp::LayoutGet(_, _, known) | JsOp::ProbeShapeProperty(_, _, known)) if *known == layout)),
             "{function}"
         );
         function.graph.verify().unwrap();
@@ -4412,13 +4695,13 @@ fn nested_read_probes_use_shape_feedback() {
     for (name, shape, index) in [("section", 10, 0), ("value", 20, 0), ("scale", 20, 1)] {
         assert!(
             ops(&function.graph).iter().any(|op| matches!(op,
-            Op::ProbeShapeProperty(_, property, layout)
+            Op::Javascript(JsOp::ProbeShapeProperty(_, property, layout))
                 if property == name && layout.shape == shape && layout.index == index)),
             "{function}"
         );
         assert!(
             !ops(&function.graph).iter().any(|op| matches!(op,
-            Op::ProbeProperty(_, property) if property == name)),
+            Op::Javascript(JsOp::ProbeProperty(_, property)) if property == name)),
             "{function}"
         );
     }
@@ -4447,12 +4730,14 @@ fn count(ops: &[&Op], predicate: impl Fn(&Op) -> bool) -> usize {
 fn generic_property_access(op: &Op) -> bool {
     matches!(
         op,
-        Op::Get(..)
-            | Op::Set(..)
-            | Op::IsPropertyCached(..)
-            | Op::CachedProperty(..)
-            | Op::FillPropertyCache(..)
-            | Op::PropertyAdd(..)
+        Op::Javascript(
+            JsOp::Get(..)
+                | JsOp::Set(..)
+                | JsOp::IsPropertyCached(..)
+                | JsOp::CachedProperty(..)
+                | JsOp::FillPropertyCache(..)
+                | JsOp::PropertyAdd(..)
+        )
     )
 }
 
@@ -4482,22 +4767,31 @@ fn shaped_overwrites_share_hoisted_guards_with_reads() {
         "{function}"
     );
     assert_eq!(
-        count(&body, |op| matches!(op, Op::IsShape(..))),
+        count(&body, |op| matches!(op, Op::Javascript(JsOp::IsShape(..)))),
         0,
         "{function}"
     );
     assert_eq!(
-        count(&body, |op| matches!(op, Op::ShapedGet(..))),
+        count(&body, |op| matches!(
+            op,
+            Op::Javascript(JsOp::ShapedGet(..))
+        )),
         1,
         "{function}"
     );
     assert_eq!(
-        count(&body, |op| matches!(op, Op::PropertyStore(..))),
+        count(&body, |op| matches!(
+            op,
+            Op::Javascript(JsOp::PropertyStore(..))
+        )),
         1,
         "{function}"
     );
     assert_eq!(
-        count(&ops(graph), |op| matches!(op, Op::IsShape(_, 10))),
+        count(&ops(graph), |op| matches!(
+            op,
+            Op::Javascript(JsOp::IsShape(_, 10))
+        )),
         1,
         "{function}"
     );
@@ -4541,7 +4835,7 @@ fn shaped_overwrites_keep_one_entry_guard_across_reads() {
     };
     assert!(matches!(
         graph.defining_op(*condition),
-        Some(Op::IsShape(_, 10))
+        Some(Op::Javascript(JsOp::IsShape(_, 10)))
     ));
     let mut pending = vec![guarded.block];
     let mut seen = FxHashSet::default();
@@ -4565,17 +4859,26 @@ fn shaped_overwrites_keep_one_entry_guard_across_reads() {
         "{function}"
     );
     assert_eq!(
-        count(&speculative, |op| matches!(op, Op::IsShape(..))),
+        count(&speculative, |op| matches!(
+            op,
+            Op::Javascript(JsOp::IsShape(..))
+        )),
         0,
         "{function}"
     );
     assert_eq!(
-        count(&speculative, |op| matches!(op, Op::ShapedGet(..))),
+        count(&speculative, |op| matches!(
+            op,
+            Op::Javascript(JsOp::ShapedGet(..))
+        )),
         2,
         "{function}"
     );
     assert_eq!(
-        count(&speculative, |op| matches!(op, Op::PropertyStore(..))),
+        count(&speculative, |op| matches!(
+            op,
+            Op::Javascript(JsOp::PropertyStore(..))
+        )),
         2,
         "{function}"
     );
@@ -4602,22 +4905,33 @@ fn property_additions_keep_shape_guards_inside_loops() {
     );
     let body = loop_ops(&function.graph);
     assert_eq!(
-        count(&body, |op| matches!(op, Op::IsShape(_, 10))),
+        count(&body, |op| matches!(
+            op,
+            Op::Javascript(JsOp::IsShape(_, 10))
+        )),
         1,
         "{function}"
     );
     assert_eq!(
-        count(&body, |op| matches!(op, Op::ShapedGet(..))),
+        count(&body, |op| matches!(
+            op,
+            Op::Javascript(JsOp::ShapedGet(..))
+        )),
         1,
         "{function}"
     );
     assert_eq!(
-        count(&body, |op| matches!(op, Op::PropertyAdd(..))),
+        count(&body, |op| matches!(
+            op,
+            Op::Javascript(JsOp::PropertyAdd(..))
+        )),
         1,
         "{function}"
     );
     assert!(
-        !body.iter().any(|op| matches!(op, Op::ShapedSet(..))),
+        !body
+            .iter()
+            .any(|op| matches!(op, Op::Javascript(JsOp::ShapedSet(..)))),
         "{function}"
     );
     function.graph.verify().unwrap();
@@ -4659,23 +4973,32 @@ fn shaped_accesses_on_two_receivers_hoist_both_guards() {
         "{function}"
     );
     assert_eq!(
-        count(&body, |op| matches!(op, Op::IsShape(..))),
+        count(&body, |op| matches!(op, Op::Javascript(JsOp::IsShape(..)))),
         0,
         "{function}"
     );
     assert_eq!(
-        count(&body, |op| matches!(op, Op::PropertyStore(..))),
+        count(&body, |op| matches!(
+            op,
+            Op::Javascript(JsOp::PropertyStore(..))
+        )),
         2,
         "{function}"
     );
     let all = ops(graph);
     assert_eq!(
-        count(&all, |op| matches!(op, Op::IsShape(_, 10))),
+        count(&all, |op| matches!(
+            op,
+            Op::Javascript(JsOp::IsShape(_, 10))
+        )),
         1,
         "{function}"
     );
     assert_eq!(
-        count(&all, |op| matches!(op, Op::IsShape(_, 20))),
+        count(&all, |op| matches!(
+            op,
+            Op::Javascript(JsOp::IsShape(_, 20))
+        )),
         1,
         "{function}"
     );
@@ -4866,7 +5189,7 @@ fn ownership_verifier_keeps_borrow_anchors_live() {
         .insts
         .iter()
         .find_map(|(inst, data)| {
-            if let Op::Get(owner, ref name) = data.op
+            if let Op::Javascript(JsOp::Get(owner, ref name)) = data.op
                 && name == "child"
             {
                 Some((inst, owner, data.result().unwrap()))
@@ -4899,7 +5222,7 @@ fn indexed_borrow_anchors_survive_helper_lowering() {
         .insts
         .values()
         .find_map(|data| match data.op {
-            Op::GetIndex(owner, _) => Some((owner, data.result().unwrap())),
+            Op::Javascript(JsOp::GetIndex(owner, _)) => Some((owner, data.result().unwrap())),
             _ => None,
         })
         .unwrap();
@@ -4945,7 +5268,7 @@ fn property_borrows_follow_owning_slots_across_writes() {
             .insts
             .values()
             .find_map(|data| {
-                matches!(&data.op, Op::Get(_, name) if name == "n")
+                matches!(&data.op, Op::Javascript(JsOp::Get(_, name)) if name == "n")
                     .then(|| data.op.operands_iter().next().unwrap())
             })
             .unwrap();
@@ -4971,7 +5294,7 @@ fn lowered_property_accesses_preserve_borrowed_slots() {
                         return;
                     }
                     borrowed = state.graph.insts.values().any(|data| {
-                        matches!(&data.op, Op::PropertyLoad(receiver, _, js::memory::Field::Named(name))
+                        matches!(&data.op, Op::Javascript(JsOp::PropertyLoad(receiver, _, js::memory::Field::Named(name)))
                         if name == "n" && state.graph.borrowed.contains(receiver))
                     });
                 })
@@ -4997,7 +5320,8 @@ fn megamorphic_helpers_preserve_borrow_anchors_and_field_conflicts() {
             .insts
             .values()
             .find_map(|data| {
-                matches!(&data.op, Op::Get(_, name) if name == "x").then(|| data.result().unwrap())
+                matches!(&data.op, Op::Javascript(JsOp::Get(_, name)) if name == "x")
+                    .then(|| data.result().unwrap())
             })
             .unwrap();
         let mut function = FunctionState::new(graph, Vec::new(), true);

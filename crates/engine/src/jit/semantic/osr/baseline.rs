@@ -1,5 +1,6 @@
 use crate::FxHashSet;
 use crate::jit::baseline_tiering::Inputs;
+use crate::jit::semantic::JsOp;
 use crate::jit::semantic::{Block, Cfg, Facts, Graph, Op, Result, Target, boundary};
 
 pub(in crate::jit) fn baseline_headers(graph: &Graph) -> FxHashSet<Block> {
@@ -30,16 +31,16 @@ pub(in crate::jit) fn baseline_resume(graph: &Graph, header: Block) -> Result<(G
                 graph.insts[inst].op,
                 Op::Argument(_)
                     | Op::Restored(_)
-                    | Op::Callee
-                    | Op::Arguments
-                    | Op::CallForward(..)
+                    | Op::Javascript(JsOp::Callee | JsOp::Arguments | JsOp::CallForward(..))
                     | Op::ArgumentCount
-                    | Op::Rest(_)
-                    | Op::EnterCaptures(..)
-                    | Op::Closure(..)
-                    | Op::ClosureCells(..)
-                    | Op::CellNew(_)
-                    | Op::ClosureThis(_)
+                    | Op::Javascript(
+                        JsOp::Rest(_)
+                            | JsOp::EnterCaptures(..)
+                            | JsOp::Closure(..)
+                            | JsOp::ClosureCells(..)
+                            | JsOp::CellNew(_)
+                            | JsOp::ClosureThis(_)
+                    )
                     | Op::OsrStart(..)
             ) {
                 return Err("baseline continuation requires independent frame state".into());

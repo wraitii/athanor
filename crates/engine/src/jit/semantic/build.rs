@@ -1,3 +1,4 @@
+use crate::jit::semantic::JsOp;
 use crate::{FxHashMap, FxHashSet};
 
 use oxc_ast::ast::{
@@ -197,7 +198,7 @@ impl<'a> Builder<'a> {
         if let Some(&(handler, depth)) = self.handlers.last()
             && !matches!(
                 self.graph.insts[inst].op,
-                Op::EnterScope(_) | Op::LeaveScope(_) | Op::Catch
+                Op::Javascript(JsOp::EnterScope(_) | JsOp::LeaveScope(_) | JsOp::Catch)
             )
         {
             let normal = self.block();
@@ -217,7 +218,7 @@ impl<'a> Builder<'a> {
                     span,
                     block,
                     results: Default::default(),
-                    op: Op::LeaveScope(scope),
+                    op: Op::Javascript(JsOp::LeaveScope(scope)),
                 });
                 self.graph.blocks[block].insts.push(inst);
             }
@@ -236,7 +237,7 @@ impl<'a> Builder<'a> {
     }
 
     fn constant(&mut self, span: Span, constant: Constant) -> Value {
-        self.emit(span, Op::Constant(constant))
+        self.emit(span, Op::Javascript(JsOp::Constant(constant)))
     }
 
     fn terminate(&mut self, span: Span, kind: TerminatorKind) {
@@ -293,7 +294,7 @@ impl<'a> Builder<'a> {
             self.graph.scopes[scope].bindings.push(binding);
             self.symbols.insert(symbol, binding);
         }
-        self.effect(span, Op::EnterScope(scope));
+        self.effect(span, Op::Javascript(JsOp::EnterScope(scope)));
         self.open.push(scope);
         Ok(Some(scope))
     }
@@ -304,13 +305,13 @@ impl<'a> Builder<'a> {
         };
         self.open.pop();
         if self.current.is_some() {
-            self.effect(span, Op::LeaveScope(scope));
+            self.effect(span, Op::Javascript(JsOp::LeaveScope(scope)));
         }
     }
 
     fn unwind(&mut self, span: Span, depth: usize) {
         for index in (depth..self.open.len()).rev() {
-            self.effect(span, Op::LeaveScope(self.open[index]));
+            self.effect(span, Op::Javascript(JsOp::LeaveScope(self.open[index])));
         }
     }
 
@@ -386,20 +387,20 @@ impl<'a> Builder<'a> {
 
     fn load(&mut self, span: Span, place: &Place) -> Value {
         let op = match place {
-            Place::Binding(binding) => Op::Read(*binding),
-            Place::Global(name) => Op::GlobalRead(name.clone()),
-            Place::Property(object, name) => Op::Get(*object, name.clone()),
-            Place::Index(object, key) => Op::GetIndex(*object, *key),
+            Place::Binding(binding) => Op::Javascript(JsOp::Read(*binding)),
+            Place::Global(name) => Op::Javascript(JsOp::GlobalRead(name.clone())),
+            Place::Property(object, name) => Op::Javascript(JsOp::Get(*object, name.clone())),
+            Place::Index(object, key) => Op::Javascript(JsOp::GetIndex(*object, *key)),
         };
         self.emit(span, op)
     }
 
     fn store(&mut self, span: Span, place: Place, value: Value) {
         let op = match place {
-            Place::Binding(binding) => Op::Write(binding, value),
-            Place::Global(name) => Op::GlobalWrite(name, value),
-            Place::Property(object, name) => Op::Set(object, name, value),
-            Place::Index(object, key) => Op::SetIndex(object, key, value),
+            Place::Binding(binding) => Op::Javascript(JsOp::Write(binding, value)),
+            Place::Global(name) => Op::Javascript(JsOp::GlobalWrite(name, value)),
+            Place::Property(object, name) => Op::Javascript(JsOp::Set(object, name, value)),
+            Place::Index(object, key) => Op::Javascript(JsOp::SetIndex(object, key, value)),
         };
         self.effect(span, op);
     }
@@ -419,7 +420,7 @@ impl<'a> Builder<'a> {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(Op::Closure(
+        Ok(Op::Javascript(JsOp::Closure(
             span,
             *code,
             arrow,
@@ -427,7 +428,7 @@ impl<'a> Builder<'a> {
             *lexical_this,
             captures,
             None,
-        ))
+        )))
     }
 
     fn expression(&mut self, expr: &Expression<'_>) -> Result<Value> {
@@ -451,26 +452,30 @@ impl<'a> Builder<'a> {
                     | (u8::from(flags.contains(RegExpFlags::G)) << 4);
                 regress::Regex::with_flags(pattern, crate::heap::regexp_flags(bits))
                     .map_err(|error| format!("invalid regular expression: {error}"))?;
-                Op::RegExp(pattern.to_owned(), bits)
+                Op::Javascript(JsOp::RegExp(pattern.to_owned(), bits))
             }
-            Expression::ThisExpression(_) => Op::This,
+            Expression::ThisExpression(_) => Op::Javascript(JsOp::This),
             Expression::FunctionExpression(function) => {
                 self.closure(function.span, false, function.generator)?
             }
             Expression::ArrowFunctionExpression(function) => {
                 self.closure(function.span, true, false)?
             }
-            Expression::NumericLiteral(x) => Op::Constant(Constant::Number(x.value)),
+            Expression::NumericLiteral(x) => {
+                Op::Javascript(JsOp::Constant(Constant::Number(x.value)))
+            }
             Expression::StringLiteral(x) => match x.value.as_str() {
-                Some(value) => Op::Constant(Constant::String(value.to_owned())),
+                Some(value) => Op::Javascript(JsOp::Constant(Constant::String(value.to_owned()))),
                 None => return unsupported("string literal", span),
             },
-            Expression::BooleanLiteral(x) => Op::Constant(Constant::Boolean(x.value)),
-            Expression::NullLiteral(_) => Op::Constant(Constant::Null),
+            Expression::BooleanLiteral(x) => {
+                Op::Javascript(JsOp::Constant(Constant::Boolean(x.value)))
+            }
+            Expression::NullLiteral(_) => Op::Javascript(JsOp::Constant(Constant::Null)),
             Expression::Identifier(x) => match self.resolve(&x.name, x.reference_id.get(), span)? {
-                Reference::Local(binding) => Op::Read(binding),
-                Reference::Global(name) => Op::GlobalRead(name),
-                Reference::Constant(constant) => Op::Constant(constant),
+                Reference::Local(binding) => Op::Javascript(JsOp::Read(binding)),
+                Reference::Global(name) => Op::Javascript(JsOp::GlobalRead(name)),
+                Reference::Constant(constant) => Op::Javascript(JsOp::Constant(constant)),
             },
             Expression::ParenthesizedExpression(x) => return self.expression(&x.expression),
             Expression::SequenceExpression(x) => {
@@ -482,12 +487,12 @@ impl<'a> Builder<'a> {
             }
             Expression::StaticMemberExpression(x) => {
                 let object = self.expression(&x.object)?;
-                Op::Get(object, x.property.name.to_string())
+                Op::Javascript(JsOp::Get(object, x.property.name.to_string()))
             }
             Expression::ComputedMemberExpression(x) => {
                 let object = self.expression(&x.object)?;
                 let key = self.expression(&x.expression)?;
-                Op::GetIndex(object, key)
+                Op::Javascript(JsOp::GetIndex(object, key))
             }
             Expression::ArrayExpression(x) => {
                 if x.elements
@@ -500,7 +505,7 @@ impl<'a> Builder<'a> {
                     {
                         return unsupported("array literal holes", span);
                     }
-                    let array = self.emit(span, Op::NewArray(Vec::new()));
+                    let array = self.emit(span, Op::Javascript(JsOp::NewArray(Vec::new())));
                     for element in &x.elements {
                         let (expression, spread) = match element {
                             ArrayExpressionElement::SpreadElement(spread) => {
@@ -510,11 +515,14 @@ impl<'a> Builder<'a> {
                         };
                         let value = self.expression(expression)?;
                         let value = if spread {
-                            self.emit(element.span(), Op::Spread(value))
+                            self.emit(element.span(), Op::Javascript(JsOp::Spread(value)))
                         } else {
                             value
                         };
-                        self.effect(element.span(), Op::ArrayAppend(array, value, spread));
+                        self.effect(
+                            element.span(),
+                            Op::Javascript(JsOp::ArrayAppend(array, value, spread)),
+                        );
                     }
                     return Ok(array);
                 }
@@ -525,7 +533,7 @@ impl<'a> Builder<'a> {
                     };
                     values.push(self.expression(element)?);
                 }
-                Op::NewArray(values)
+                Op::Javascript(JsOp::NewArray(values))
             }
             Expression::ObjectExpression(x) => return self.object(x),
             Expression::UnaryExpression(x) => {
@@ -539,9 +547,12 @@ impl<'a> Builder<'a> {
                             && let Reference::Global(_) =
                                 self.resolve(&id.name, id.reference_id.get(), id.span)?
                         {
-                            let value =
-                                self.emit(id.span, Op::GlobalReadOptional(id.name.to_string()));
-                            return Ok(self.emit(span, Op::Unary(UnaryOp::Typeof, value)));
+                            let value = self.emit(
+                                id.span,
+                                Op::Javascript(JsOp::GlobalReadOptional(id.name.to_string())),
+                            );
+                            return Ok(self
+                                .emit(span, Op::Javascript(JsOp::Unary(UnaryOp::Typeof, value))));
                         }
                         UnaryOp::Typeof
                     }
@@ -576,11 +587,11 @@ impl<'a> Builder<'a> {
                                 return Ok(self.constant(span, Constant::Boolean(true)));
                             }
                         };
-                        return Ok(self.emit(span, Op::Delete(object, key)));
+                        return Ok(self.emit(span, Op::Javascript(JsOp::Delete(object, key))));
                     }
                 };
                 let value = self.expression(&x.argument)?;
-                Op::Unary(operator, value)
+                Op::Javascript(JsOp::Unary(operator, value))
             }
             Expression::BinaryExpression(x) => {
                 if matches!(
@@ -596,16 +607,18 @@ impl<'a> Builder<'a> {
                     };
                     if let Some(other) = other {
                         let value = self.expression(other)?;
-                        let nullish = self.emit(span, Op::IsNullish(value));
+                        let nullish = self.emit(span, Op::Javascript(JsOp::IsNullish(value)));
                         if x.operator == BinaryOperator::Equality {
                             return Ok(nullish);
                         }
-                        return Ok(self.emit(span, Op::Unary(UnaryOp::Not, nullish)));
+                        return Ok(
+                            self.emit(span, Op::Javascript(JsOp::Unary(UnaryOp::Not, nullish)))
+                        );
                     }
                 }
                 let left = self.expression(&x.left)?;
                 let right = self.expression(&x.right)?;
-                Op::Binary(x.operator, left, right)
+                Op::Javascript(JsOp::Binary(x.operator, left, right))
             }
             Expression::LogicalExpression(x) => {
                 return self.logical(span, x.operator, &x.left, &x.right);
@@ -630,13 +643,13 @@ impl<'a> Builder<'a> {
             Expression::NewExpression(x) => {
                 let callee = self.expression(&x.callee)?;
                 if let Some(args) = self.spread_arguments(x.span, &x.arguments)? {
-                    Op::ConstructPack(callee, args)
+                    Op::Javascript(JsOp::ConstructPack(callee, args))
                 } else {
                     let mut args = Vec::new();
                     for arg in &x.arguments {
                         args.push(self.expression(arg.as_expression().unwrap())?);
                     }
-                    Op::Construct { callee, args }
+                    Op::Javascript(JsOp::Construct { callee, args })
                 }
             }
 
@@ -653,7 +666,7 @@ impl<'a> Builder<'a> {
     }
 
     fn object(&mut self, x: &ObjectExpression<'_>) -> Result<Value> {
-        let object = self.emit(x.span, Op::NewObject);
+        let object = self.emit(x.span, Op::Javascript(JsOp::NewObject));
         for property in &x.properties {
             let ObjectPropertyKind::ObjectProperty(property) = property else {
                 return unsupported("object spread", property.span());
@@ -666,9 +679,12 @@ impl<'a> Builder<'a> {
                     return unsupported("property key", property.span);
                 };
                 let key = self.expression(key)?;
-                let key = self.emit(property.span, Op::PropertyKey(key));
+                let key = self.emit(property.span, Op::Javascript(JsOp::PropertyKey(key)));
                 let value = self.expression(&property.value)?;
-                self.effect(property.span, Op::SetIndex(object, key, value));
+                self.effect(
+                    property.span,
+                    Op::Javascript(JsOp::SetIndex(object, key, value)),
+                );
                 continue;
             }
             let Some(name) = property
@@ -682,7 +698,10 @@ impl<'a> Builder<'a> {
                 return unsupported("prototype setter", property.span);
             }
             let value = self.expression(&property.value)?;
-            self.effect(property.span, Op::Define(object, name, value));
+            self.effect(
+                property.span,
+                Op::Javascript(JsOp::Define(object, name, value)),
+            );
         }
         Ok(object)
     }
@@ -706,7 +725,7 @@ impl<'a> Builder<'a> {
             LogicalOperator::Or => self.branch(span, left, done, Target::new(rest)),
             LogicalOperator::And => self.branch(span, left, Target::new(rest), done),
             LogicalOperator::Coalesce => {
-                let nullish = self.emit(span, Op::IsNullish(left));
+                let nullish = self.emit(span, Op::Javascript(JsOp::IsNullish(left)));
                 self.branch(span, nullish, Target::new(rest), done);
             }
         }
@@ -737,7 +756,7 @@ impl<'a> Builder<'a> {
     }
 
     fn chain_guard(&mut self, span: Span, value: Value, short: Block) {
-        let nullish = self.emit(span, Op::IsNullish(value));
+        let nullish = self.emit(span, Op::Javascript(JsOp::IsNullish(value)));
         let present = self.block();
         self.branch(span, nullish, Target::new(short), Target::new(present));
         self.switch(present);
@@ -761,14 +780,14 @@ impl<'a> Builder<'a> {
                 let receiver = self.expression(&member.object)?;
                 let value = self.emit(
                     member.span,
-                    Op::Get(receiver, member.property.name.to_string()),
+                    Op::Javascript(JsOp::Get(receiver, member.property.name.to_string())),
                 );
                 Ok((value, receiver))
             }
             Expression::ComputedMemberExpression(member) => {
                 let receiver = self.expression(&member.object)?;
                 let key = self.expression(&member.expression)?;
-                let value = self.emit(member.span, Op::GetIndex(receiver, key));
+                let value = self.emit(member.span, Op::Javascript(JsOp::GetIndex(receiver, key)));
                 Ok((value, receiver))
             }
             Expression::CallExpression(call) if short.is_some() => {
@@ -793,7 +812,7 @@ impl<'a> Builder<'a> {
         }
         let value = self.emit(
             member.span,
-            Op::Get(receiver, member.property.name.to_string()),
+            Op::Javascript(JsOp::Get(receiver, member.property.name.to_string())),
         );
         Ok((value, receiver))
     }
@@ -808,7 +827,7 @@ impl<'a> Builder<'a> {
             self.chain_guard(member.span, receiver, short);
         }
         let key = self.expression(&member.expression)?;
-        let value = self.emit(member.span, Op::GetIndex(receiver, key));
+        let value = self.emit(member.span, Op::Javascript(JsOp::GetIndex(receiver, key)));
         Ok((value, receiver))
     }
 
@@ -829,7 +848,7 @@ impl<'a> Builder<'a> {
     ) -> Result<Option<Value>> {
         if let [Argument::SpreadElement(spread)] = arguments {
             let value = self.expression(&spread.argument)?;
-            return Ok(Some(self.emit(span, Op::Spread(value))));
+            return Ok(Some(self.emit(span, Op::Javascript(JsOp::Spread(value)))));
         }
         if !arguments
             .iter()
@@ -837,7 +856,7 @@ impl<'a> Builder<'a> {
         {
             return Ok(None);
         }
-        let array = self.emit(span, Op::NewPack);
+        let array = self.emit(span, Op::Javascript(JsOp::NewPack));
         for argument in arguments {
             let (expression, spread) = match argument {
                 Argument::SpreadElement(spread) => (&spread.argument, true),
@@ -845,11 +864,14 @@ impl<'a> Builder<'a> {
             };
             let value = self.expression(expression)?;
             let value = if spread {
-                self.emit(argument.span(), Op::Spread(value))
+                self.emit(argument.span(), Op::Javascript(JsOp::Spread(value)))
             } else {
                 value
             };
-            self.effect(argument.span(), Op::PackAppend(array, value, spread));
+            self.effect(
+                argument.span(),
+                Op::Javascript(JsOp::PackAppend(array, value, spread)),
+            );
         }
         Ok(Some(array))
     }
@@ -861,7 +883,10 @@ impl<'a> Builder<'a> {
         receiver: Value,
     ) -> Result<Value> {
         if let Some(args) = self.spread_arguments(x.span, &x.arguments)? {
-            return Ok(self.emit(x.span, Op::CallPack(callee, receiver, args)));
+            return Ok(self.emit(
+                x.span,
+                Op::Javascript(JsOp::CallPack(callee, receiver, args)),
+            ));
         }
         let mut args = Vec::new();
         for arg in &x.arguments {
@@ -869,12 +894,12 @@ impl<'a> Builder<'a> {
         }
         Ok(self.emit(
             x.span,
-            Op::Call {
+            Op::Javascript(JsOp::Call {
                 callee,
                 receiver: Some(receiver),
                 args,
                 target: None,
-            },
+            }),
         ))
     }
 
@@ -902,7 +927,7 @@ impl<'a> Builder<'a> {
             Some(operator) => {
                 let old = self.load(x.span, &place);
                 let right = self.expression(&x.right)?;
-                self.emit(x.span, Op::Binary(operator, old, right))
+                self.emit(x.span, Op::Javascript(JsOp::Binary(operator, old, right)))
             }
             None => self.expression(&x.right)?,
         };
@@ -917,8 +942,8 @@ impl<'a> Builder<'a> {
         };
         let place = self.place(&x.argument)?;
         let old = self.load(x.span, &place);
-        let numeric = self.emit(x.span, Op::ToNumeric(old));
-        let value = self.emit(x.span, Op::Unary(operator, numeric));
+        let numeric = self.emit(x.span, Op::Javascript(JsOp::ToNumeric(old)));
+        let value = self.emit(x.span, Op::Javascript(JsOp::Unary(operator, numeric)));
         self.store(x.span, place, value);
         Ok(if x.prefix { value } else { numeric })
     }
@@ -931,17 +956,22 @@ impl<'a> Builder<'a> {
                     if self.scoping.symbol_scope_id(symbol) != self.scoping.root_scope_id() {
                         return unsupported("binding", id.span);
                     }
-                    self.effect(id.span, Op::GlobalWrite(id.name.to_string(), value));
+                    self.effect(
+                        id.span,
+                        Op::Javascript(JsOp::GlobalWrite(id.name.to_string(), value)),
+                    );
                     return Ok(());
                 };
-                self.effect(id.span, Op::Initialize(binding, value));
+                self.effect(id.span, Op::Javascript(JsOp::Initialize(binding, value)));
             }
             BindingPattern::ArrayPattern(pattern) => {
-                let iterator = self.emit(pattern.span, Op::IteratorNew(value));
+                let iterator = self.emit(pattern.span, Op::Javascript(JsOp::IteratorNew(value)));
                 for element in &pattern.elements {
-                    let next = self.emit(pattern.span, Op::IteratorNext(iterator));
+                    let next =
+                        self.emit(pattern.span, Op::Javascript(JsOp::IteratorNext(iterator)));
                     if let Some(element) = element {
-                        let missing = self.emit(element.span(), Op::IsUninitialized(next));
+                        let missing =
+                            self.emit(element.span(), Op::Javascript(JsOp::IsUninitialized(next)));
                         let absent = self.block();
                         let done = self.block();
                         let result = self.param(done);
@@ -974,7 +1004,7 @@ impl<'a> Builder<'a> {
                     if property.computed {
                         return unsupported("object binding key", property.span);
                     }
-                    let value = self.emit(property.span, Op::Get(value, name));
+                    let value = self.emit(property.span, Op::Javascript(JsOp::Get(value, name)));
                     self.bind_pattern(&property.value, value)?;
                 }
             }
@@ -1025,7 +1055,10 @@ impl<'a> Builder<'a> {
                 let binding = self.symbols[&symbol];
                 let closure = self.closure(function.span, false, function.generator)?;
                 let value = self.emit(function.span, closure);
-                self.effect(function.span, Op::Initialize(binding, value));
+                self.effect(
+                    function.span,
+                    Op::Javascript(JsOp::Initialize(binding, value)),
+                );
             }
         }
         for statement in statements {
@@ -1072,7 +1105,7 @@ impl<'a> Builder<'a> {
             }
             Statement::ThrowStatement(statement) => {
                 let value = self.expression(&statement.argument)?;
-                self.effect(statement.span, Op::Throw(value));
+                self.effect(statement.span, Op::Javascript(JsOp::Throw(value)));
                 let undefined = self.constant(statement.span, Constant::Undefined);
                 self.unwind(statement.span, 0);
                 self.terminate(statement.span, TerminatorKind::Return(undefined));
@@ -1205,7 +1238,7 @@ impl<'a> Builder<'a> {
         let body = self.block();
         let done = self.block();
         if let Some(scope) = scope {
-            self.effect(span, Op::NextIteration(scope));
+            self.effect(span, Op::Javascript(JsOp::NextIteration(scope)));
         }
         self.jump(span, head, Vec::new());
         self.switch(head);
@@ -1228,7 +1261,7 @@ impl<'a> Builder<'a> {
         if let Some(update) = update {
             self.switch(update);
             if let Some(scope) = scope {
-                self.effect(span, Op::NextIteration(scope));
+                self.effect(span, Op::Javascript(JsOp::NextIteration(scope)));
             }
             if let Some(expression) = &statement.update {
                 self.expression(expression)?;
@@ -1264,9 +1297,9 @@ impl<'a> Builder<'a> {
         let iterable = self.expression(&statement.right)?;
         // Arrays and typed arrays walk their elements by index; other iterables keep the
         // iterator protocol. Both paths share one copy of the body.
-        let indexed = self.emit(span, Op::IsIndexed(iterable));
+        let indexed = self.emit(span, Op::Javascript(JsOp::IsIndexed(iterable)));
         let zero = self.constant(span, Constant::Number(0.0));
-        self.effect(span, Op::Initialize(position, zero));
+        self.effect(span, Op::Javascript(JsOp::Initialize(position, zero)));
         let direct = self.block();
         let generic = self.block();
         let entry = self.block();
@@ -1277,7 +1310,7 @@ impl<'a> Builder<'a> {
         let undefined = self.constant(span, Constant::Undefined);
         self.jump(span, entry, vec![undefined]);
         self.switch(generic);
-        let created = self.emit(span, Op::IteratorNew(iterable));
+        let created = self.emit(span, Op::Javascript(JsOp::IteratorNew(iterable)));
         self.jump(span, entry, vec![created]);
         self.switch(entry);
         self.jump(span, head, Vec::new());
@@ -1291,19 +1324,25 @@ impl<'a> Builder<'a> {
         let item = self.param(body);
         self.branch(span, indexed, Target::new(direct), Target::new(generic));
         self.switch(direct);
-        let index = self.emit(span, Op::Read(position));
-        let length = self.emit(span, Op::IndexedLength(iterable));
-        let inside = self.emit(span, Op::Binary(BinaryOperator::LessThan, index, length));
+        let index = self.emit(span, Op::Javascript(JsOp::Read(position)));
+        let length = self.emit(span, Op::Javascript(JsOp::IndexedLength(iterable)));
+        let inside = self.emit(
+            span,
+            Op::Javascript(JsOp::Binary(BinaryOperator::LessThan, index, length)),
+        );
         self.branch(span, inside, Target::new(read), Target::new(done));
         self.switch(read);
-        let element = self.emit(span, Op::ArrayGet(iterable, index));
+        let element = self.emit(span, Op::Javascript(JsOp::ArrayGet(iterable, index)));
         let one = self.constant(span, Constant::Number(1.0));
-        let next = self.emit(span, Op::Binary(BinaryOperator::Addition, index, one));
-        self.effect(span, Op::Write(position, next));
+        let next = self.emit(
+            span,
+            Op::Javascript(JsOp::Binary(BinaryOperator::Addition, index, one)),
+        );
+        self.effect(span, Op::Javascript(JsOp::Write(position, next)));
         self.jump(span, body, vec![element]);
         self.switch(generic);
-        let next = self.emit(span, Op::IteratorNext(iterator));
-        let finished = self.emit(span, Op::IsUninitialized(next));
+        let next = self.emit(span, Op::Javascript(JsOp::IteratorNext(iterator)));
+        let finished = self.emit(span, Op::Javascript(JsOp::IsUninitialized(next)));
         self.branch(
             span,
             finished,
@@ -1315,7 +1354,7 @@ impl<'a> Builder<'a> {
         );
         self.switch(body);
         if let Some(scope) = scope {
-            self.effect(span, Op::FreshIteration(scope));
+            self.effect(span, Op::Javascript(JsOp::FreshIteration(scope)));
         }
         self.bind_pattern(&declarator.id, item)?;
         self.loop_body(
@@ -1347,7 +1386,7 @@ impl<'a> Builder<'a> {
             captured: false,
         });
         self.graph.scopes[scope].bindings.push(binding);
-        self.effect(span, Op::EnterScope(scope));
+        self.effect(span, Op::Javascript(JsOp::EnterScope(scope)));
         self.open.push(scope);
         (scope, binding)
     }
@@ -1376,12 +1415,22 @@ impl<'a> Builder<'a> {
             .unwrap_or(class.span);
         let closure = self.closure(constructor, false, false)?;
         let constructor = self.emit(class.span, closure);
-        self.effect(class.span, Op::Initialize(inner, constructor));
-        self.effect(class.span, Op::MarkClass(constructor));
-        let prototype = self.emit(class.span, Op::Get(constructor, "prototype".into()));
         self.effect(
             class.span,
-            Op::DefineHidden(prototype, "constructor".into(), constructor),
+            Op::Javascript(JsOp::Initialize(inner, constructor)),
+        );
+        self.effect(class.span, Op::Javascript(JsOp::MarkClass(constructor)));
+        let prototype = self.emit(
+            class.span,
+            Op::Javascript(JsOp::Get(constructor, "prototype".into())),
+        );
+        self.effect(
+            class.span,
+            Op::Javascript(JsOp::DefineHidden(
+                prototype,
+                "constructor".into(),
+                constructor,
+            )),
         );
         for element in &class.body.body {
             let ClassElement::MethodDefinition(method) = element else {
@@ -1395,21 +1444,31 @@ impl<'a> Builder<'a> {
             };
             let closure = self.closure(method.value.span, false, false)?;
             let function = self.emit(method.span, closure);
-            self.effect(method.span, Op::DisableConstructor(function));
             self.effect(
                 method.span,
-                Op::DefineHidden(prototype, key.name.to_string(), function),
+                Op::Javascript(JsOp::DisableConstructor(function)),
+            );
+            self.effect(
+                method.span,
+                Op::Javascript(JsOp::DefineHidden(
+                    prototype,
+                    key.name.to_string(),
+                    function,
+                )),
             );
         }
         self.close_scope(class.span, scope);
         if let Some(outer) = outer {
             self.symbols.insert(symbol, outer);
-            self.effect(class.span, Op::Initialize(outer, constructor));
+            self.effect(
+                class.span,
+                Op::Javascript(JsOp::Initialize(outer, constructor)),
+            );
         } else {
             self.symbols.remove(&symbol);
             self.effect(
                 class.span,
-                Op::GlobalWrite(id.name.to_string(), constructor),
+                Op::Javascript(JsOp::GlobalWrite(id.name.to_string(), constructor)),
             );
         }
         Ok(())
@@ -1441,7 +1500,7 @@ impl<'a> Builder<'a> {
                 self.terminate(span, TerminatorKind::Return(value));
             }
             Completion::Throw => {
-                self.effect(span, Op::Throw(value));
+                self.effect(span, Op::Javascript(JsOp::Throw(value)));
                 let undefined = self.constant(span, Constant::Undefined);
                 self.unwind(span, 0);
                 self.terminate(span, TerminatorKind::Return(undefined));
@@ -1491,7 +1550,7 @@ impl<'a> Builder<'a> {
             self.jump(span, entry, vec![normal, undefined]);
         }
         self.switch(exceptional);
-        let exception = self.emit(span, Op::Catch);
+        let exception = self.emit(span, Op::Javascript(JsOp::Catch));
         let thrown = self.constant(span, Constant::Number(1.0));
         self.jump(span, entry, vec![thrown, exception]);
         let frame = self.finalizers.pop().unwrap();
@@ -1508,8 +1567,10 @@ impl<'a> Builder<'a> {
                 let route = self.block();
                 let next = self.block();
                 let tag = self.constant(span, Constant::Number(index as f64));
-                let matches =
-                    self.emit(span, Op::Binary(BinaryOperator::StrictEquality, kind, tag));
+                let matches = self.emit(
+                    span,
+                    Op::Javascript(JsOp::Binary(BinaryOperator::StrictEquality, kind, tag)),
+                );
                 self.branch(span, matches, Target::new(route), Target::new(next));
                 self.switch(route);
                 self.complete(span, *completion, value);
@@ -1559,7 +1620,7 @@ impl<'a> Builder<'a> {
             self.jump(span, done, Vec::new());
         }
         self.switch(catch);
-        let exception = self.emit(handler.span, Op::Catch);
+        let exception = self.emit(handler.span, Op::Javascript(JsOp::Catch));
         let bindings = match &handler.param {
             Some(param) => pattern_bindings(&param.pattern)?
                 .into_iter()
@@ -1601,7 +1662,10 @@ impl<'a> Builder<'a> {
                     let binding = self.symbols[&symbol];
                     let closure = self.closure(function.span, false, function.generator)?;
                     let value = self.emit(function.span, closure);
-                    self.effect(function.span, Op::Initialize(binding, value));
+                    self.effect(
+                        function.span,
+                        Op::Javascript(JsOp::Initialize(binding, value)),
+                    );
                 }
             }
         }
@@ -1616,11 +1680,11 @@ impl<'a> Builder<'a> {
             let candidate = self.expression(test)?;
             let equal = self.emit(
                 case.span,
-                Op::Binary(
+                Op::Javascript(JsOp::Binary(
                     oxc_syntax::operator::BinaryOperator::StrictEquality,
                     discriminant,
                     candidate,
-                ),
+                )),
             );
             let next = self.block();
             self.branch(case.span, equal, Target::new(body), Target::new(next));
@@ -1698,18 +1762,18 @@ impl<'a> Builder<'a> {
             self.open_scope(span, ScopeKind::Loop, declaration_bindings(declaration)?)?
         };
         let iterable = self.expression(&statement.right)?;
-        let iterator = self.emit(span, Op::EnumerateNew(iterable));
+        let iterator = self.emit(span, Op::Javascript(JsOp::EnumerateNew(iterable)));
         let head = self.block();
         let body = self.block();
         let done = self.block();
         self.jump(span, head, Vec::new());
         self.switch(head);
-        let item = self.emit(span, Op::EnumerateNext(iterator));
-        let finished = self.emit(span, Op::IsUninitialized(item));
+        let item = self.emit(span, Op::Javascript(JsOp::EnumerateNext(iterator)));
+        let finished = self.emit(span, Op::Javascript(JsOp::IsUninitialized(item)));
         self.branch(span, finished, Target::new(done), Target::new(body));
         self.switch(body);
         if let Some(scope) = scope {
-            self.effect(span, Op::FreshIteration(scope));
+            self.effect(span, Op::Javascript(JsOp::FreshIteration(scope)));
         }
         self.bind_pattern(&declarator.id, item)?;
         self.loop_body(
@@ -1809,7 +1873,10 @@ pub(super) fn lower_global(
             let value = builder.constant(class.span, Constant::Uninitialized);
             builder.effect(
                 class.span,
-                Op::GlobalWrite(class.id.as_ref().unwrap().name.to_string(), value),
+                Op::Javascript(JsOp::GlobalWrite(
+                    class.id.as_ref().unwrap().name.to_string(),
+                    value,
+                )),
             );
         }
     }
@@ -1832,9 +1899,9 @@ pub(super) fn lower_global(
                         None => continue,
                     };
                     let op = if declaration.kind == VariableDeclarationKind::Var {
-                        Op::GlobalWrite(id.name.to_string(), value)
+                        Op::Javascript(JsOp::GlobalWrite(id.name.to_string(), value))
                     } else {
-                        Op::GlobalInitialize(id.name.to_string(), value)
+                        Op::Javascript(JsOp::GlobalInitialize(id.name.to_string(), value))
                     };
                     builder.effect(declarator.span, op);
                 }
@@ -1905,7 +1972,7 @@ pub(super) fn lower_parts(
             builder.graph.scopes[scope].bindings.push(binding);
             builder.symbols.insert(symbol, binding);
         }
-        builder.effect(span, Op::EnterScope(scope));
+        builder.effect(span, Op::Javascript(JsOp::EnterScope(scope)));
         builder.open.push(scope);
         Some(scope)
     };
@@ -1924,10 +1991,10 @@ pub(super) fn lower_parts(
         });
         builder.graph.scopes[scope].bindings.push(binding);
         builder.symbols.insert(symbol, binding);
-        builder.effect(span, Op::EnterScope(scope));
+        builder.effect(span, Op::Javascript(JsOp::EnterScope(scope)));
         builder.open.push(scope);
-        let value = builder.emit(span, Op::Arguments);
-        builder.effect(span, Op::Initialize(binding, value));
+        let value = builder.emit(span, Op::Javascript(JsOp::Arguments));
+        builder.effect(span, Op::Javascript(JsOp::Initialize(binding, value)));
         Some(scope)
     } else {
         None
@@ -1953,7 +2020,7 @@ pub(super) fn lower_parts(
         let argument = builder.emit(span, Op::Argument(index));
         let value = match &parameter.initializer {
             Some(default) => {
-                let missing = builder.emit(span, Op::IsUndefined(argument));
+                let missing = builder.emit(span, Op::Javascript(JsOp::IsUndefined(argument)));
                 let compute = builder.block();
                 let join = builder.block();
                 let value = builder.param(join);
@@ -1977,7 +2044,7 @@ pub(super) fn lower_parts(
         builder.bind_pattern(&parameter.pattern, value)?;
     }
     if let Some(rest) = &params.rest {
-        let value = builder.emit(rest.span, Op::Rest(params.items.len()));
+        let value = builder.emit(rest.span, Op::Javascript(JsOp::Rest(params.items.len())));
         builder.bind_pattern(&rest.rest.argument, value)?;
     }
     let mut var_symbols = Vec::new();
@@ -2004,11 +2071,11 @@ pub(super) fn lower_parts(
             builder.graph.scopes[scope].bindings.push(binding);
             builder.symbols.insert(symbol, binding);
         }
-        builder.effect(span, Op::EnterScope(scope));
+        builder.effect(span, Op::Javascript(JsOp::EnterScope(scope)));
         builder.open.push(scope);
         let undefined = builder.constant(span, Constant::Undefined);
         for binding in builder.graph.scopes[scope].bindings.clone() {
-            builder.effect(span, Op::Initialize(binding, undefined));
+            builder.effect(span, Op::Javascript(JsOp::Initialize(binding, undefined)));
         }
         Some(scope)
     };
@@ -2033,7 +2100,7 @@ pub(super) fn lower_parts(
         .graph
         .insts
         .values()
-        .any(|data| matches!(data.op, Op::Arguments | Op::Rest(_)));
+        .any(|data| matches!(data.op, Op::Javascript(JsOp::Arguments | JsOp::Rest(_))));
     if !generator && !dynamic {
         builder.graph.arity = u16::try_from(params.items.len()).ok();
     }

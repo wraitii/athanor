@@ -3,6 +3,7 @@ use super::super::{
     BlockData, Constant, FunctionState, Graph, Op, Repr, Target, Terminator, TerminatorKind,
     TypedRead, ValueType,
 };
+use crate::jit::semantic::JsOp;
 
 pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) -> super::super::Result<bool> {
     function.ensure_values();
@@ -16,14 +17,14 @@ pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) -> super::su
         .flat_map(|block| graph.blocks[block].insts.clone())
         .filter(|&inst| {
             matches!(graph.insts[inst].op,
-                Op::TypedIndex(_, key, TypedRead { element: Some(_), bounded: false })
+                Op::Javascript(JsOp::TypedIndex(_, key, TypedRead { element: Some(_), bounded: false }))
                 if facts.of(key).intersects(ValueType::NUMBER) && facts.of(key).within(ValueType::NUMBER))
         })
         .collect();
     let changed = !reads.is_empty();
     for inst in reads {
         let data = graph.insts[inst].clone();
-        let Op::TypedIndex(object, key, mut read) = data.op else {
+        let Op::Javascript(JsOp::TypedIndex(object, key, mut read)) = data.op else {
             unreachable!()
         };
         let (block, continuation, load) = super::super::dispatch::split(graph, inst);
@@ -36,11 +37,11 @@ pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) -> super::su
             }
         }
         let mut at = Cursor::at_end(graph, block, inst);
-        let position = at.add_unassigned(Op::ArrayPosition(key));
+        let position = at.add_unassigned(Op::Javascript(JsOp::ArrayPosition(key)));
         let exact = if facts.of(key).within(ValueType::INTEGER) {
-            at.add_unassigned(Op::Constant(Constant::Boolean(true)))
+            at.add_unassigned(Op::Javascript(JsOp::Constant(Constant::Boolean(true))))
         } else {
-            at.add_unassigned(Op::IsExactPosition(key, position))
+            at.add_unassigned(Op::Javascript(JsOp::IsExactPosition(key, position)))
         };
         graph.blocks[block].terminator = Some(Terminator {
             source_name: data.source_name,
@@ -49,8 +50,8 @@ pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) -> super::su
             kind: TerminatorKind::Branch(exact, Target::new(bounds), Target::new(failure)),
         });
         let mut at = Cursor::at_end(graph, bounds, inst);
-        let length = at.add_unassigned(Op::IndexedLength(object));
-        let inside = at.add_unassigned(Op::IsInBounds(position, length));
+        let length = at.add_unassigned(Op::Javascript(JsOp::IndexedLength(object)));
+        let inside = at.add_unassigned(Op::Javascript(JsOp::IsInBounds(position, length)));
         graph.blocks[bounds].terminator = Some(Terminator {
             source_name: data.source_name,
             emission_location: None,
@@ -58,9 +59,12 @@ pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) -> super::su
             kind: TerminatorKind::Branch(inside, Target::new(load), Target::new(failure)),
         });
         read.bounded = true;
-        graph.set_op(inst, Op::TypedIndex(object, position, read));
-        let undefined =
-            Cursor::at_end(graph, failure, inst).add_unassigned(Op::Constant(Constant::Undefined));
+        graph.set_op(
+            inst,
+            Op::Javascript(JsOp::TypedIndex(object, position, read)),
+        );
+        let undefined = Cursor::at_end(graph, failure, inst)
+            .add_unassigned(Op::Javascript(JsOp::Constant(Constant::Undefined)));
         graph.blocks[failure].terminator = Some(Terminator {
             source_name: data.source_name,
             emission_location: None,
@@ -93,14 +97,14 @@ pub(in crate::jit::semantic) fn lower_memory(function: &mut FunctionState) -> bo
             if data.block != block {
                 continue;
             }
-            let Op::TypedIndex(
+            let Op::Javascript(JsOp::TypedIndex(
                 object,
                 key,
                 TypedRead {
                     element: Some(element),
                     bounded: true,
                 },
-            ) = data.op
+            )) = data.op
             else {
                 continue;
             };
@@ -116,15 +120,16 @@ pub(in crate::jit::semantic) fn lower_memory(function: &mut FunctionState) -> bo
             };
             let existing_view = graph.views.remove(&inst);
             let mut at = Cursor::before(graph, inst);
-            let view = existing_view.unwrap_or_else(|| at.add_unassigned(Op::View(object)));
-            let base = at.add_unassigned(Op::TypedData(view));
-            let index = at.add_unassigned(Op::ArrayPosition(key));
+            let view = existing_view
+                .unwrap_or_else(|| at.add_unassigned(Op::Javascript(JsOp::View(object))));
+            let base = at.add_unassigned(Op::Javascript(JsOp::TypedData(view)));
+            let index = at.add_unassigned(Op::Javascript(JsOp::ArrayPosition(key)));
             let raw = at.add_unassigned(Op::Memory(MemoryOp::IndexedLoad {
                 base,
                 index,
                 format,
             }));
-            graph.set_op(inst, Op::MemoryNumber(raw, format));
+            graph.set_op(inst, Op::Javascript(JsOp::MemoryNumber(raw, format)));
             Cursor::after(graph, inst).add_effect(Op::KeepAlive(object));
             changed = true;
         }
@@ -144,7 +149,7 @@ pub(in crate::jit::semantic) fn lower_store(
     use cranelift_codegen::ir::{MemFlagsData, types};
     use oxc_syntax::operator::BinaryOperator as B;
     let data = graph.insts[inst].clone();
-    let Op::SetIndex(object, key, value) = data.op else {
+    let Op::Javascript(JsOp::SetIndex(object, key, value)) = data.op else {
         unreachable!()
     };
     let facts = super::super::Facts::compute(graph);
@@ -160,31 +165,32 @@ pub(in crate::jit::semantic) fn lower_store(
     let mut fast = if typed {
         block
     } else {
-        let check =
-            Cursor::at_end(graph, block, inst).add_unassigned(Op::IsTyped(object, Some(element)));
+        let check = Cursor::at_end(graph, block, inst)
+            .add_unassigned(Op::Javascript(JsOp::IsTyped(object, Some(element))));
         super::super::dispatch::branch(graph, inst, block, check, fallback)
     };
     for value in [key, value] {
         if !facts.of(value).within(ValueType::NUMBER) {
-            let number = Cursor::at_end(graph, fast, inst).add_unassigned(Op::IsNumber(value));
+            let number = Cursor::at_end(graph, fast, inst)
+                .add_unassigned(Op::Javascript(JsOp::IsNumber(value)));
             fast = super::super::dispatch::branch(graph, inst, fast, number, fallback);
         }
     }
     let key = Cursor::at_end(graph, fast, inst)
-        .place(Op::AsNumber(key), true)
+        .place(Op::Javascript(JsOp::AsNumber(key)), true)
         .1
         .unwrap();
     let value = Cursor::at_end(graph, fast, inst)
-        .place(Op::AsNumber(value), true)
+        .place(Op::Javascript(JsOp::AsNumber(value)), true)
         .1
         .unwrap();
     let mut at = Cursor::at_end(graph, fast, inst);
-    let position = at.add_unassigned(Op::ArrayPosition(key));
-    let exact = at.add_unassigned(Op::IsExactPosition(key, position));
+    let position = at.add_unassigned(Op::Javascript(JsOp::ArrayPosition(key)));
+    let exact = at.add_unassigned(Op::Javascript(JsOp::IsExactPosition(key, position)));
     fast = super::super::dispatch::branch(graph, inst, fast, exact, fallback);
     let mut at = Cursor::at_end(graph, fast, inst);
-    let length = at.add_unassigned(Op::IndexedLength(object));
-    let inside = at.add_unassigned(Op::IsInBounds(position, length));
+    let length = at.add_unassigned(Op::Javascript(JsOp::IndexedLength(object)));
+    let inside = at.add_unassigned(Op::Javascript(JsOp::IsInBounds(position, length)));
     fast = super::super::dispatch::branch(graph, inst, fast, inside, fallback);
     let float = matches!(
         element,
@@ -205,14 +211,19 @@ pub(in crate::jit::semantic) fn lower_store(
             number
         }
     } else {
-        let integer = Cursor::at_end(graph, fast, inst).add_unassigned(Op::ArrayPosition(value));
-        let exact =
-            Cursor::at_end(graph, fast, inst).add_unassigned(Op::IsExactPosition(value, integer));
+        let integer = Cursor::at_end(graph, fast, inst)
+            .add_unassigned(Op::Javascript(JsOp::ArrayPosition(value)));
+        let exact = Cursor::at_end(graph, fast, inst)
+            .add_unassigned(Op::Javascript(JsOp::IsExactPosition(value, integer)));
         fast = super::super::dispatch::branch(graph, inst, fast, exact, fallback);
-        let upper = Cursor::at_end(graph, fast, inst)
-            .add_unassigned(Op::Constant(Constant::Number(9223372036854775808.0)));
-        let below =
-            Cursor::at_end(graph, fast, inst).add_unassigned(Op::Binary(B::LessThan, value, upper));
+        let upper = Cursor::at_end(graph, fast, inst).add_unassigned(Op::Javascript(
+            JsOp::Constant(Constant::Number(9223372036854775808.0)),
+        ));
+        let below = Cursor::at_end(graph, fast, inst).add_unassigned(Op::Javascript(JsOp::Binary(
+            B::LessThan,
+            value,
+            upper,
+        )));
         fast = super::super::dispatch::branch(graph, inst, fast, below, fallback);
         let ty = match 1 << (element.element() & 3) {
             1 => types::I8,
@@ -222,7 +233,7 @@ pub(in crate::jit::semantic) fn lower_store(
         Cursor::at_end(graph, fast, inst).ins().ireduce(ty, integer)
     };
     let mut at = Cursor::at_end(graph, fast, inst);
-    let view = at.add_unassigned(Op::View(object));
+    let view = at.add_unassigned(Op::Javascript(JsOp::View(object)));
     let base = at.ins().load(
         types::I64,
         MemFlagsData::trusted(),

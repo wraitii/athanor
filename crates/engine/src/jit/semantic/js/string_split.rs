@@ -1,3 +1,4 @@
+use crate::jit::semantic::JsOp;
 use crate::{FxHashMap, FxHashSet};
 
 use super::super::{
@@ -13,12 +14,14 @@ pub(in crate::jit::semantic) fn result_facts(
     for &block in &cfg.rpo {
         for &inst in &graph.blocks[block].insts {
             let data = &graph.insts[inst];
-            let (Op::StringSplit(_, args) | Op::StringSplitParts(_, args)) = &data.op else {
+            let Op::Javascript(JsOp::StringSplit(_, args) | JsOp::StringSplitParts(_, args)) =
+                &data.op
+            else {
                 continue;
             };
             let nonempty = args.first().is_none_or(|separator| {
-                matches!(graph.defining_op(*separator), Some(Op::Constant(Constant::Undefined)))
-                    || matches!(graph.defining_op(*separator), Some(Op::Constant(Constant::String(text))) if !text.is_empty())
+                matches!(graph.defining_op(*separator), Some(Op::Javascript(JsOp::Constant(Constant::Undefined))))
+                    || matches!(graph.defining_op(*separator), Some(Op::Javascript(JsOp::Constant(Constant::String(text)))) if !text.is_empty())
             });
             arrays.insert(data.result().unwrap(), nonempty);
         }
@@ -38,7 +41,7 @@ pub(in crate::jit::semantic) fn result_facts(
     }
     for &block in &cfg.rpo {
         for &inst in &graph.blocks[block].insts {
-            if let Op::Spread(source) = graph.insts[inst].op {
+            if let Op::Javascript(JsOp::Spread(source)) = graph.insts[inst].op {
                 incoming.insert(graph.insts[inst].result().unwrap(), vec![source]);
             }
         }
@@ -71,28 +74,34 @@ pub(in crate::jit::semantic) fn result_facts(
             let data = &graph.insts[inst];
             for (index, value) in data.op.operands_iter().enumerate() {
                 let safe = match data.op {
-                    Op::Get(..)
-                    | Op::GetIndex(..)
-                    | Op::ArrayGet(..)
-                    | Op::ArrayLoad(..)
-                    | Op::PackTake(..)
-                    | Op::ProbeProperty(..)
-                    | Op::ProbeIndex(..) => index == 0,
-                    Op::Spread(_)
-                    | Op::IsIndexed(_)
-                    | Op::IndexedLength(_)
-                    | Op::IsUndefined(_)
-                    | Op::IsNullish(_)
-                    | Op::IsNumber(_)
-                    | Op::IsString(_)
-                    | Op::IsTypeof(..)
-                    | Op::IsUninitialized(_) => true,
-                    Op::CheckInitialized(_) => data.result().is_none(),
+                    Op::Javascript(
+                        JsOp::Get(..)
+                        | JsOp::GetIndex(..)
+                        | JsOp::ArrayGet(..)
+                        | JsOp::ArrayLoad(..)
+                        | JsOp::PackTake(..)
+                        | JsOp::ProbeProperty(..)
+                        | JsOp::ProbeIndex(..),
+                    ) => index == 0,
+                    Op::Javascript(
+                        JsOp::Spread(_)
+                        | JsOp::IsIndexed(_)
+                        | JsOp::IndexedLength(_)
+                        | JsOp::IsUndefined(_)
+                        | JsOp::IsNullish(_)
+                        | JsOp::IsNumber(_)
+                        | JsOp::IsString(_)
+                        | JsOp::IsTypeof(..)
+                        | JsOp::IsUninitialized(_),
+                    ) => true,
+                    Op::Javascript(JsOp::CheckInitialized(_)) => data.result().is_none(),
                     // Spread passes elements, not the backing array, under direct iteration.
-                    Op::ConstructPack(..) => index == 1,
-                    Op::ConstructPackResolved(..)
-                    | Op::ConstructorCallPack(..)
-                    | Op::CallPack(..) => index == 2,
+                    Op::Javascript(JsOp::ConstructPack(..)) => index == 1,
+                    Op::Javascript(
+                        JsOp::ConstructPackResolved(..)
+                        | JsOp::ConstructorCallPack(..)
+                        | JsOp::CallPack(..),
+                    ) => index == 2,
                     _ => false,
                 };
                 if !safe {
@@ -107,22 +116,28 @@ pub(in crate::jit::semantic) fn result_facts(
     for &block in &cfg.rpo {
         for &inst in &graph.blocks[block].insts {
             let (array, key) = match graph.insts[inst].op {
-                Op::GetIndex(array, key)
-                | Op::ArrayGet(array, key)
-                | Op::ArrayLoad(array, key, _)
-                | Op::PackTake(array, key) => (array, key),
+                Op::Javascript(
+                    JsOp::GetIndex(array, key)
+                    | JsOp::ArrayGet(array, key)
+                    | JsOp::ArrayLoad(array, key, _)
+                    | JsOp::PackTake(array, key),
+                ) => (array, key),
                 _ => continue,
             };
             let Some(&nonempty) = arrays.get(&array) else {
                 continue;
             };
-            let Some(Op::Constant(Constant::Number(index))) = graph.defining_op(key) else {
+            let Some(Op::Javascript(JsOp::Constant(Constant::Number(index)))) =
+                graph.defining_op(key)
+            else {
                 continue;
             };
             if !index.is_finite() || *index < 0.0 || index.fract() != 0.0 {
                 continue;
             }
-            if !(nonempty && *index == 0.0) && !matches!(graph.insts[inst].op, Op::PackTake(..)) {
+            if !(nonempty && *index == 0.0)
+                && !matches!(graph.insts[inst].op, Op::Javascript(JsOp::PackTake(..)))
+            {
                 continue;
             }
             let hazards = array_hazards.entry(array).or_insert_with(|| {
@@ -177,7 +192,10 @@ pub(in crate::jit::semantic) fn result_facts(
             }
             reads.insert(
                 inst,
-                if nonempty && *index == 0.0 && !matches!(graph.insts[inst].op, Op::PackTake(..)) {
+                if nonempty
+                    && *index == 0.0
+                    && !matches!(graph.insts[inst].op, Op::Javascript(JsOp::PackTake(..)))
+                {
                     ValueType::STRING
                 } else {
                     ValueType::STRING.union(ValueType::UNDEFINED)
@@ -197,32 +215,37 @@ pub(in crate::jit::semantic) fn expand(graph: &mut Graph, expanded: &mut FxHashS
             if expanded.contains(&inst) {
                 return false;
             }
-            let Op::Call {
+            let Op::Javascript(JsOp::Call {
                 callee,
                 receiver: Some(_),
                 ..
-            } = &graph.insts[inst].op
+            }) = &graph.insts[inst].op
             else {
                 return false;
             };
-            matches!(graph.defining_op(*callee), Some(Op::Get(_, name)) if name == "split")
+            matches!(graph.defining_op(*callee), Some(Op::Javascript(JsOp::Get(_, name))) if name == "split")
         })
         .collect();
     for inst in sites {
         expanded.insert(inst);
         let data = graph.insts[inst].clone();
-        let Op::Call {
+        let Op::Javascript(JsOp::Call {
             callee,
             receiver: Some(receiver),
             args,
             ..
-        } = data.op
+        }) = data.op
         else {
             unreachable!()
         };
         let (block, continuation, fallback) = super::super::dispatch::split(graph, inst);
         let fast = graph.blocks.push(BlockData::default());
-        let (guard, check) = graph.append(block, data.span, Op::IsStringSplit(callee), true);
+        let (guard, check) = graph.append(
+            block,
+            data.span,
+            Op::Javascript(JsOp::IsStringSplit(callee)),
+            true,
+        );
         graph.insts[guard].source_name = data.source_name;
         graph.insts[guard].inline_context = data.inline_context;
         graph.blocks[block].terminator = Some(Terminator {
@@ -231,7 +254,12 @@ pub(in crate::jit::semantic) fn expand(graph: &mut Graph, expanded: &mut FxHashS
             span: data.span,
             kind: TerminatorKind::Branch(check.unwrap(), Target::new(fast), Target::new(fallback)),
         });
-        let (call, result) = graph.append(fast, data.span, Op::StringSplit(receiver, args), true);
+        let (call, result) = graph.append(
+            fast,
+            data.span,
+            Op::Javascript(JsOp::StringSplit(receiver, args)),
+            true,
+        );
         graph.insts[call].source_name = data.source_name;
         graph.insts[call].inline_context = data.inline_context;
         graph.blocks[fast].terminator = Some(Terminator {
@@ -264,7 +292,7 @@ pub(in crate::jit::semantic) fn forward_packs(graph: &mut Graph) {
     let mut aliases = FxHashMap::default();
     for &block in &cfg.rpo {
         for inst in graph.blocks[block].insts.clone() {
-            let Op::Spread(array) = graph.insts[inst].op else {
+            let Op::Javascript(JsOp::Spread(array)) = graph.insts[inst].op else {
                 continue;
             };
             if uses.get(&array) != Some(&1) {
@@ -304,10 +332,15 @@ pub(in crate::jit::semantic) fn forward_packs(graph: &mut Graph) {
             let Some(producer) = producer else {
                 continue;
             };
-            let Op::StringSplit(receiver, args) = graph.insts[producer].op.clone() else {
+            let Op::Javascript(JsOp::StringSplit(receiver, args)) =
+                graph.insts[producer].op.clone()
+            else {
                 continue;
             };
-            graph.set_op(producer, Op::StringSplitParts(receiver, args));
+            graph.set_op(
+                producer,
+                Op::Javascript(JsOp::StringSplitParts(receiver, args)),
+            );
             aliases.insert(graph.insts[inst].result().unwrap(), array);
             graph.remove_inst(inst);
         }
@@ -342,15 +375,15 @@ mod tests {
             .graph;
         for block in Cfg::new(&graph).rpo {
             for inst in graph.blocks[block].insts.clone() {
-                if let Op::Call {
+                if let Op::Javascript(JsOp::Call {
                     callee,
                     receiver: Some(receiver),
                     args,
                     ..
-                } = graph.insts[inst].op.clone()
-                    && matches!(graph.defining_op(callee), Some(Op::Get(_, name)) if name == "split")
+                }) = graph.insts[inst].op.clone()
+                    && matches!(graph.defining_op(callee), Some(Op::Javascript(JsOp::Get(_, name))) if name == "split")
                 {
-                    graph.set_op(inst, Op::StringSplit(receiver, args));
+                    graph.set_op(inst, Op::Javascript(JsOp::StringSplit(receiver, args)));
                 }
             }
         }
@@ -371,12 +404,14 @@ mod tests {
             let read = graph
                 .insts
                 .iter()
-                .find_map(|(inst, data)| matches!(data.op, Op::GetIndex(..)).then_some(inst))
+                .find_map(|(inst, data)| {
+                    matches!(data.op, Op::Javascript(JsOp::GetIndex(..))).then_some(inst)
+                })
                 .unwrap();
-            let Op::GetIndex(array, index) = graph.insts[read].op else {
+            let Op::Javascript(JsOp::GetIndex(array, index)) = graph.insts[read].op else {
                 panic!()
             };
-            graph.set_op(read, Op::PackTake(array, index));
+            graph.set_op(read, Op::Javascript(JsOp::PackTake(array, index)));
             let facts = super::super::super::Facts::compute(&graph);
             assert!(facts.indexed(array));
             assert_eq!(facts.of(graph.insts[read].result().unwrap()), expected);

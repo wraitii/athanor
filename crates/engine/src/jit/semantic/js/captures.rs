@@ -1,5 +1,6 @@
 use super::super::transforms::loops::natural_loops;
 use super::super::{Block, FunctionState, Op, Value};
+use crate::jit::semantic::JsOp;
 use crate::{FxHashMap, FxHashSet};
 
 pub(in crate::jit::semantic) fn sink_closures(function: &mut FunctionState) {
@@ -18,7 +19,10 @@ pub(in crate::jit::semantic) fn sink_closures(function: &mut FunctionState) {
     for &block in &cfg.rpo {
         for &inst in &graph.blocks[block].insts {
             let data = &graph.insts[inst];
-            if matches!(&data.op, Op::Closure(_, _, _, false, _, _, _)) {
+            if matches!(
+                &data.op,
+                Op::Javascript(JsOp::Closure(_, _, _, false, _, _, _))
+            ) {
                 closures.push(inst);
             }
             for value in data.op.operands_iter() {
@@ -56,7 +60,7 @@ pub(in crate::jit::semantic) fn sink_closures(function: &mut FunctionState) {
         {
             continue;
         }
-        if matches!(&graph.insts[inst].op, Op::Closure(_, _, _, _, _, captures, _) if !captures.is_empty())
+        if matches!(&graph.insts[inst].op, Op::Javascript(JsOp::Closure(_, _, _, _, _, captures, _)) if !captures.is_empty())
         {
             let user = graph.blocks[target].insts.iter().copied().find(|&user| {
                 graph.insts[user]
@@ -116,11 +120,13 @@ pub(in crate::jit::semantic) fn forward_captured_parameters(function: &mut Funct
         for &block in &cfg.rpo {
             for &inst in &graph.blocks[block].insts {
                 match &graph.insts[inst].op {
-                    Op::Initialize(target, value) if *target == binding => {
+                    Op::Javascript(JsOp::Initialize(target, value)) if *target == binding => {
                         initializers.push((inst, *value))
                     }
-                    Op::Write(target, _) if *target == binding => writes = true,
-                    Op::Closure(_, _, _, _, _, captures, _) if captures.contains(&binding) => {
+                    Op::Javascript(JsOp::Write(target, _)) if *target == binding => writes = true,
+                    Op::Javascript(JsOp::Closure(_, _, _, _, _, captures, _))
+                        if captures.contains(&binding) =>
+                    {
                         pending.push(block)
                     }
                     _ => {}
@@ -147,7 +153,7 @@ pub(in crate::jit::semantic) fn forward_captured_parameters(function: &mut Funct
                     initialized = true;
                 }
                 if initialized
-                    && matches!(graph.insts[inst].op, Op::Read(target) if target == binding)
+                    && matches!(graph.insts[inst].op, Op::Javascript(JsOp::Read(target)) if target == binding)
                 {
                     aliases.insert(graph.insts[inst].result().unwrap(), value);
                     removed.push(inst);
@@ -183,10 +189,14 @@ pub(in crate::jit::semantic) fn lazy_captures(function: &mut FunctionState) -> b
     for &block in &facts.cfg.rpo {
         for &inst in &graph.blocks[block].insts {
             match &graph.insts[inst].op {
-                Op::Closure(_, _, _, false, _, captures, _) if graph.cold.contains(&block) => {
+                Op::Javascript(JsOp::Closure(_, _, _, false, _, captures, _))
+                    if graph.cold.contains(&block) =>
+                {
                     candidates.extend(captures.iter().copied());
                 }
-                Op::Closure(_, _, _, _, _, captures, _) => eager.extend(captures.iter().copied()),
+                Op::Javascript(JsOp::Closure(_, _, _, _, _, captures, _)) => {
+                    eager.extend(captures.iter().copied())
+                }
                 _ => {}
             }
         }

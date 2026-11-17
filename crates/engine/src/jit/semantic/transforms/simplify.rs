@@ -1,3 +1,4 @@
+use crate::jit::semantic::JsOp;
 use crate::{FxHashMap, FxHashSet};
 
 use cranelift_codegen::entity::SecondaryMap;
@@ -104,7 +105,7 @@ fn fold_constant_branches(graph: &mut Graph, cfg: &Cfg) -> bool {
             continue;
         };
         let taken = match graph.defining_op(*condition) {
-            Some(Op::Constant(Constant::Boolean(taken))) => *taken,
+            Some(Op::Javascript(JsOp::Constant(Constant::Boolean(taken)))) => *taken,
             Some(Op::EntryAssume(..)) => true,
             _ => continue,
         };
@@ -117,7 +118,7 @@ fn fold_constant_branches(graph: &mut Graph, cfg: &Cfg) -> bool {
 
 fn branch_condition(graph: &Graph, condition: Value) -> (Value, bool) {
     match graph.defining_op(condition) {
-        Some(Op::Unary(UnaryOp::Not, value)) => (*value, true),
+        Some(Op::Javascript(JsOp::Unary(UnaryOp::Not, value))) => (*value, true),
         _ => (condition, false),
     }
 }
@@ -185,7 +186,9 @@ fn thread_branches(graph: &mut Graph, cfg: &Cfg) -> bool {
         else {
             continue;
         };
-        let Some(Op::Unary(UnaryOp::Not, operand)) = graph.defining_op(*condition) else {
+        let Some(Op::Javascript(JsOp::Unary(UnaryOp::Not, operand))) =
+            graph.defining_op(*condition)
+        else {
             continue;
         };
         let kind = TerminatorKind::Branch(*operand, no.clone(), yes.clone());

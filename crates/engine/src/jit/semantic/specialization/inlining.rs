@@ -1,3 +1,4 @@
+use crate::jit::semantic::JsOp;
 use crate::{FxHashMap, FxHashSet};
 
 use super::super::{
@@ -17,8 +18,10 @@ fn scope_at(graph: &Graph, inst: Inst) -> Option<Scope> {
                 return scopes.last().copied();
             }
             match graph.insts[current].op {
-                Op::EnterScope(scope) | Op::EnterCaptures(scope, _) => scopes.push(scope),
-                Op::LeaveScope(_) => {
+                Op::Javascript(JsOp::EnterScope(scope) | JsOp::EnterCaptures(scope, _)) => {
+                    scopes.push(scope)
+                }
+                Op::Javascript(JsOp::LeaveScope(_)) => {
                     scopes.pop();
                 }
                 _ => {}
@@ -36,7 +39,9 @@ pub(in crate::jit::semantic) fn direct_captures(
     call: Inst,
     callee: super::super::Value,
 ) -> Option<Vec<super::super::Binding>> {
-    let Op::Closure(_, _, _, false, _, captures, _) = graph.defining_op(callee)? else {
+    let Op::Javascript(JsOp::Closure(_, _, _, false, _, captures, _)) =
+        graph.defining_op(callee)?
+    else {
         return None;
     };
     let origin = graph.def_block(callee);
@@ -64,8 +69,7 @@ pub(in crate::jit::semantic) fn direct_captures(
             }
             if after
                 && matches!(graph.insts[inst].op,
-                Op::EnterScope(scope) | Op::LeaveScope(scope) | Op::NextIteration(scope)
-                | Op::FreshIteration(scope) if scopes.contains(&scope))
+                Op::Javascript(JsOp::EnterScope(scope) | JsOp::LeaveScope(scope) | JsOp::NextIteration(scope) | JsOp::FreshIteration(scope)) if scopes.contains(&scope))
             {
                 return None;
             }
@@ -79,7 +83,7 @@ pub(in crate::jit::semantic) fn uses_this(body: &Graph) -> bool {
         body.blocks[block].insts.iter().any(|&inst| {
             matches!(
                 body.insts[inst].op,
-                Op::This | Op::Closure(_, _, true, _, true, _, None)
+                Op::Javascript(JsOp::This | JsOp::Closure(_, _, true, _, true, _, None))
             )
         })
     })
@@ -88,20 +92,21 @@ pub(in crate::jit::semantic) fn uses_this(body: &Graph) -> bool {
 pub(in crate::jit::semantic) fn apply(graph: &mut Graph, body: &Graph, plan: &Inline) {
     let call = graph.insts[plan.call].clone();
     let (callee, receiver, args, spread) = match &call.op {
-        Op::Call {
+        Op::Javascript(JsOp::Call {
             callee,
             receiver,
             args,
             ..
-        } => (callee, *receiver, args.as_slice(), None),
-        Op::ConstructorCall {
+        }) => (callee, *receiver, args.as_slice(), None),
+        Op::Javascript(JsOp::ConstructorCall {
             callee,
             receiver,
             args,
-        } => (callee, Some(*receiver), args.as_slice(), None),
-        Op::CallPack(callee, receiver, args) | Op::ConstructorCallPack(callee, receiver, args) => {
-            (callee, Some(*receiver), &[][..], Some(*args))
-        }
+        }) => (callee, Some(*receiver), args.as_slice(), None),
+        Op::Javascript(
+            JsOp::CallPack(callee, receiver, args)
+            | JsOp::ConstructorCallPack(callee, receiver, args),
+        ) => (callee, Some(*receiver), &[][..], Some(*args)),
         _ => unreachable!(),
     };
     let captures = (!plan.guard_code)
@@ -115,15 +120,23 @@ pub(in crate::jit::semantic) fn apply(graph: &mut Graph, body: &Graph, plan: &In
         emission_location: None,
         span: call.span,
         kind: if plan.guard_code {
-            let check = graph.append_value(block, call.span, Op::IsCode(*callee, plan.target));
+            let check = graph.append_value(
+                block,
+                call.span,
+                Op::Javascript(JsOp::IsCode(*callee, plan.target)),
+            );
             TerminatorKind::Branch(check, Target::new(current), Target::new(fallback))
         } else {
             TerminatorKind::Jump(Target::new(current))
         },
     });
-    let undefined = graph.append_value(current, call.span, Op::Constant(Constant::Undefined));
+    let undefined = graph.append_value(
+        current,
+        call.span,
+        Op::Javascript(JsOp::Constant(Constant::Undefined)),
+    );
     let receiver = if plan.arrow && uses_this(body) {
-        let op = Op::ClosureThis(*callee);
+        let op = Op::Javascript(JsOp::ClosureThis(*callee));
         graph.append_value(current, call.span, op)
     } else {
         receiver.unwrap_or(undefined)
@@ -191,9 +204,13 @@ pub(in crate::jit::semantic) fn apply(graph: &mut Graph, body: &Graph, plan: &In
                         let key = graph.append_value(
                             current,
                             call.span,
-                            Op::Constant(Constant::Number(index as f64)),
+                            Op::Javascript(JsOp::Constant(Constant::Number(index as f64))),
                         );
-                        graph.append_value(current, call.span, Op::PackTake(array, key))
+                        graph.append_value(
+                            current,
+                            call.span,
+                            Op::Javascript(JsOp::PackTake(array, key)),
+                        )
                     })
                 } else {
                     args.get(index).copied().unwrap_or(undefined)
@@ -201,13 +218,17 @@ pub(in crate::jit::semantic) fn apply(graph: &mut Graph, body: &Graph, plan: &In
                 values.insert(data.result().unwrap(), value);
                 continue;
             }
-            if matches!(data.op, Op::This) {
+            if matches!(data.op, Op::Javascript(JsOp::This)) {
                 values.insert(data.result().unwrap(), receiver);
                 continue;
             }
-            if matches!(data.op, Op::Arguments) {
-                let (copy, value) =
-                    graph.append(blocks[&block], data.span, Op::NewArray(args.to_vec()), true);
+            if matches!(data.op, Op::Javascript(JsOp::Arguments)) {
+                let (copy, value) = graph.append(
+                    blocks[&block],
+                    data.span,
+                    Op::Javascript(JsOp::NewArray(args.to_vec())),
+                    true,
+                );
                 graph.insts[copy].source_name = data.source_name.or(plan.source_name);
                 graph.insts[copy].inline_context = plan.context;
                 let value = value.unwrap();
@@ -218,7 +239,7 @@ pub(in crate::jit::semantic) fn apply(graph: &mut Graph, body: &Graph, plan: &In
                 let value = graph.append_value(
                     current,
                     call.span,
-                    Op::Constant(Constant::Number(args.len() as f64)),
+                    Op::Javascript(JsOp::Constant(Constant::Number(args.len() as f64))),
                 );
                 values.insert(data.result().unwrap(), value);
                 continue;
@@ -228,29 +249,35 @@ pub(in crate::jit::semantic) fn apply(graph: &mut Graph, body: &Graph, plan: &In
                 Op::LowLevel(super::super::low_level::Op::StackAddress { slot, .. }) => {
                     slot.0 += slot_base
                 }
-                Op::Closure(_, _, _, _, _, captures, _) => {
+                Op::Javascript(JsOp::Closure(_, _, _, _, _, captures, _)) => {
                     for binding in captures {
                         *binding = bindings[binding];
                     }
                 }
-                Op::Read(binding)
-                | Op::Write(binding, _)
-                | Op::Initialize(binding, _)
-                | Op::BindingLoad(binding)
-                | Op::BindingRestore(binding, _) => {
+                Op::Javascript(
+                    JsOp::Read(binding)
+                    | JsOp::Write(binding, _)
+                    | JsOp::Initialize(binding, _)
+                    | JsOp::BindingLoad(binding)
+                    | JsOp::BindingRestore(binding, _),
+                ) => {
                     *binding = bindings[binding];
                 }
-                Op::EnterScope(scope) if body.scopes[*scope].kind == ScopeKind::Captures => {
+                Op::Javascript(JsOp::EnterScope(scope))
+                    if body.scopes[*scope].kind == ScopeKind::Captures =>
+                {
                     op = if captures.is_some() {
-                        Op::EnterScope(scopes[scope])
+                        Op::Javascript(JsOp::EnterScope(scopes[scope]))
                     } else {
-                        Op::EnterCaptures(scopes[scope], *callee)
+                        Op::Javascript(JsOp::EnterCaptures(scopes[scope], *callee))
                     };
                 }
-                Op::EnterScope(scope)
-                | Op::LeaveScope(scope)
-                | Op::NextIteration(scope)
-                | Op::FreshIteration(scope) => {
+                Op::Javascript(
+                    JsOp::EnterScope(scope)
+                    | JsOp::LeaveScope(scope)
+                    | JsOp::NextIteration(scope)
+                    | JsOp::FreshIteration(scope),
+                ) => {
                     *scope = scopes[scope];
                 }
                 _ => {}
@@ -260,7 +287,10 @@ pub(in crate::jit::semantic) fn apply(graph: &mut Graph, body: &Graph, plan: &In
             graph.insts[copy].source_name = data.source_name.or(plan.source_name);
             graph.insts[copy].inline_context = plan.context;
             graph.insts[copy].emission_location = data.emission_location;
-            if matches!(data.op, Op::Closure(_, _, true, _, true, _, None)) {
+            if matches!(
+                data.op,
+                Op::Javascript(JsOp::Closure(_, _, true, _, true, _, None))
+            ) {
                 lexical_closures.push(copy);
             }
             for (&old, &new) in data.results.iter().zip(&results) {
@@ -271,29 +301,39 @@ pub(in crate::jit::semantic) fn apply(graph: &mut Graph, body: &Graph, plan: &In
         }
     }
     if let Some(pack) = spread {
-        graph.append(current, call.span, Op::PackRelease(pack), false);
+        graph.append(
+            current,
+            call.span,
+            Op::Javascript(JsOp::PackRelease(pack)),
+            false,
+        );
     }
     for inst in insts {
-        if matches!(graph.insts[inst].op, Op::EnterCaptures(..)) {
+        if matches!(
+            graph.insts[inst].op,
+            Op::Javascript(JsOp::EnterCaptures(..))
+        ) {
             continue;
         }
         for value in graph.insts[inst].op.operands_mut() {
             *value = values[value];
         }
-        if let Op::CallForward(callee, receiver) = graph.insts[inst].op {
+        if let Op::Javascript(JsOp::CallForward(callee, receiver)) = graph.insts[inst].op {
             graph.set_op(
                 inst,
-                Op::Call {
+                Op::Javascript(JsOp::Call {
                     callee,
                     receiver: Some(receiver),
                     args: args.to_vec(),
                     target: None,
-                },
+                }),
             );
         }
     }
     for inst in lexical_closures {
-        if let Op::Closure(_, _, _, _, _, _, lexical_receiver) = &mut graph.insts[inst].op {
+        if let Op::Javascript(JsOp::Closure(_, _, _, _, _, _, lexical_receiver)) =
+            &mut graph.insts[inst].op
+        {
             *lexical_receiver = Some(receiver);
         }
     }

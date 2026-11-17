@@ -1,5 +1,6 @@
 use crate::FxHashMap;
 use crate::jit::layout::ReadLayout;
+use crate::jit::semantic::JsOp;
 use cranelift_module::FuncId;
 
 use super::facts::ValueType;
@@ -56,17 +57,27 @@ pub(super) fn assumed(
 impl Fact {
     pub(super) fn test(self, value: Value) -> Option<Op> {
         Some(match self {
-            Self::Type(types) if types == ValueType::NUMBER => Op::IsNumber(value),
-            Self::Type(types) if types == ValueType::INTEGER => Op::IsInteger(value),
-            Self::Type(types) if types == ValueType::STRING => Op::IsString(value),
-            Self::Type(types) if types == ValueType::UNDEFINED => Op::IsUndefined(value),
-            Self::Code(code) => Op::IsCode(value, code),
-            Self::Cached(cache, builtins) => Op::IsPropertyCached(value, cache, builtins),
-            Self::Shape(shape) => Op::IsShape(value, shape),
-            Self::ReadLayout(layout) => Op::IsReadLayout(value, layout),
-            Self::Typed(element) => Op::IsTyped(value, element),
-            Self::Array => Op::IsOrdinaryArray(value),
-            Self::Native(native) => Op::IsNative(value, native),
+            Self::Type(types) if types == ValueType::NUMBER => {
+                Op::Javascript(JsOp::IsNumber(value))
+            }
+            Self::Type(types) if types == ValueType::INTEGER => {
+                Op::Javascript(JsOp::IsInteger(value))
+            }
+            Self::Type(types) if types == ValueType::STRING => {
+                Op::Javascript(JsOp::IsString(value))
+            }
+            Self::Type(types) if types == ValueType::UNDEFINED => {
+                Op::Javascript(JsOp::IsUndefined(value))
+            }
+            Self::Code(code) => Op::Javascript(JsOp::IsCode(value, code)),
+            Self::Cached(cache, builtins) => {
+                Op::Javascript(JsOp::IsPropertyCached(value, cache, builtins))
+            }
+            Self::Shape(shape) => Op::Javascript(JsOp::IsShape(value, shape)),
+            Self::ReadLayout(layout) => Op::Javascript(JsOp::IsReadLayout(value, layout)),
+            Self::Typed(element) => Op::Javascript(JsOp::IsTyped(value, element)),
+            Self::Array => Op::Javascript(JsOp::IsOrdinaryArray(value)),
+            Self::Native(native) => Op::Javascript(JsOp::IsNative(value, native)),
             _ => return None,
         })
     }
@@ -103,31 +114,35 @@ pub(super) struct Edge {
 
 pub(super) fn implies(op: &Op) -> Option<(Value, Fact)> {
     Some(match *op {
-        Op::IsUninitialized(value) => (value, Fact::Type(ValueType::UNINITIALIZED)),
-        Op::IsUndefined(value) => (value, Fact::Type(ValueType::UNDEFINED)),
-        Op::IsNullish(value) => (
+        Op::Javascript(JsOp::IsUninitialized(value)) => {
+            (value, Fact::Type(ValueType::UNINITIALIZED))
+        }
+        Op::Javascript(JsOp::IsUndefined(value)) => (value, Fact::Type(ValueType::UNDEFINED)),
+        Op::Javascript(JsOp::IsNullish(value)) => (
             value,
             Fact::Type(ValueType::UNDEFINED.union(ValueType::NULL)),
         ),
-        Op::IsString(value) => (value, Fact::Type(ValueType::STRING)),
-        Op::IsNumber(value) => (value, Fact::Type(ValueType::NUMBER)),
-        Op::IsInteger(value) | Op::IntegerCheck(value, ..) => {
+        Op::Javascript(JsOp::IsString(value)) => (value, Fact::Type(ValueType::STRING)),
+        Op::Javascript(JsOp::IsNumber(value)) => (value, Fact::Type(ValueType::NUMBER)),
+        Op::Javascript(JsOp::IsInteger(value) | JsOp::IntegerCheck(value, ..)) => {
             (value, Fact::Type(ValueType::INTEGER))
         }
-        Op::IsCode(value, code) => (value, Fact::Code(code)),
+        Op::Javascript(JsOp::IsCode(value, code)) => (value, Fact::Code(code)),
         Op::EntryAssume(value, fact) => (value, fact),
-        Op::IsShape(value, shape) => (value, Fact::Shape(shape)),
-        Op::IsReadLayout(value, layout) => (value, Fact::ReadLayout(layout)),
-        Op::IsTyped(value, element) => (value, Fact::Typed(element)),
-        Op::IsOrdinaryArray(value) => (value, Fact::Array),
-        Op::IsPropertyCached(value, cache, builtins) => (value, Fact::Cached(cache, builtins)),
+        Op::Javascript(JsOp::IsShape(value, shape)) => (value, Fact::Shape(shape)),
+        Op::Javascript(JsOp::IsReadLayout(value, layout)) => (value, Fact::ReadLayout(layout)),
+        Op::Javascript(JsOp::IsTyped(value, element)) => (value, Fact::Typed(element)),
+        Op::Javascript(JsOp::IsOrdinaryArray(value)) => (value, Fact::Array),
+        Op::Javascript(JsOp::IsPropertyCached(value, cache, builtins)) => {
+            (value, Fact::Cached(cache, builtins))
+        }
         _ => return None,
     })
 }
 
 pub(super) fn negated(graph: &Graph, value: Value) -> Option<Value> {
     match *graph.defining_op(value)? {
-        Op::Unary(UnaryOp::Not, value) => Some(value),
+        Op::Javascript(JsOp::Unary(UnaryOp::Not, value)) => Some(value),
         Op::LowLevel(low_level::Op::Binary {
             op: low_level::Binary::BooleanEqual,
             left,
@@ -136,7 +151,9 @@ pub(super) fn negated(graph: &Graph, value: Value) -> Option<Value> {
             let is_false = |value| {
                 matches!(
                     graph.defining_op(value),
-                    Some(Op::Constant(super::Constant::Boolean(false)))
+                    Some(Op::Javascript(JsOp::Constant(super::Constant::Boolean(
+                        false
+                    ))))
                 )
             };
             if is_false(right) {
@@ -169,7 +186,7 @@ pub(super) fn edge_of(graph: &Graph, kind: &TerminatorKind) -> Option<Edge> {
 pub(super) fn record_entry(graph: &mut Graph, value: Value, fact: Fact) {
     use crate::jit::variants::{Fact as InputFact, Input};
     let input = match graph.defining_op(value) {
-        Some(Op::This) => Input::This,
+        Some(Op::Javascript(JsOp::This)) => Input::This,
         Some(Op::Argument(index)) => Input::Argument(*index),
         _ => return,
     };
@@ -192,7 +209,7 @@ pub(super) fn holds(
     fact: Fact,
 ) -> bool {
     let original = |mut value| {
-        while let Some(Op::AsObject(source)) = graph.defining_op(value) {
+        while let Some(Op::Javascript(JsOp::AsObject(source))) = graph.defining_op(value) {
             value = *source;
         }
         value

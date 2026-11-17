@@ -1,4 +1,5 @@
 use crate::FxHashSet;
+use crate::jit::semantic::JsOp;
 
 use super::super::{Block, Cfg, Constant, Graph, Inst, Op, Value, ValueDef};
 
@@ -51,17 +52,20 @@ pub(in crate::jit::semantic) fn lower(graph: &mut Graph) -> bool {
         .rpo
         .iter()
         .flat_map(|&block| graph.blocks[block].insts.iter().copied())
-        .filter(|&inst| matches!(graph.insts[inst].op, Op::Spread(_)))
+        .filter(|&inst| matches!(graph.insts[inst].op, Op::Javascript(JsOp::Spread(_))))
         .collect();
     let mut changed = false;
     for spread in spreads {
-        let Op::Spread(array) = graph.insts[spread].op else {
+        let Op::Javascript(JsOp::Spread(array)) = graph.insts[spread].op else {
             continue;
         };
         let ValueDef::Result(allocation, _) = graph.values[array] else {
             continue;
         };
-        if !matches!(graph.insts[allocation].op, Op::Arguments | Op::NewArray(_)) {
+        if !matches!(
+            graph.insts[allocation].op,
+            Op::Javascript(JsOp::Arguments | JsOp::NewArray(_))
+        ) {
             continue;
         }
         let pack = graph.insts[spread].result().unwrap();
@@ -71,7 +75,8 @@ pub(in crate::jit::semantic) fn lower(graph: &mut Graph) -> bool {
         let [call] = pack_users.as_slice() else {
             continue;
         };
-        let Op::CallPack(callee, receiver, arguments) = graph.insts[*call].op else {
+        let Op::Javascript(JsOp::CallPack(callee, receiver, arguments)) = graph.insts[*call].op
+        else {
             continue;
         };
         if arguments != pack || callee == pack || receiver == pack {
@@ -81,7 +86,7 @@ pub(in crate::jit::semantic) fn lower(graph: &mut Graph) -> bool {
             continue;
         };
         let lengths: Vec<_> = array_users.iter().copied().filter(|&inst| {
-            matches!(&graph.insts[inst].op, Op::Get(value, name) if *value == array && name == "length")
+            matches!(&graph.insts[inst].op, Op::Javascript(JsOp::Get(value, name)) if *value == array && name == "length")
         }).collect();
         let remaining: Vec<_> = array_users
             .into_iter()
@@ -109,19 +114,21 @@ pub(in crate::jit::semantic) fn lower(graph: &mut Graph) -> bool {
             }
         }
         let op = match &graph.insts[allocation].op {
-            Op::Arguments => Op::CallForward(callee, receiver),
-            Op::NewArray(args) => Op::Call {
+            Op::Javascript(JsOp::Arguments) => Op::Javascript(JsOp::CallForward(callee, receiver)),
+            Op::Javascript(JsOp::NewArray(args)) => Op::Javascript(JsOp::Call {
                 callee,
                 receiver: Some(receiver),
                 args: args.clone(),
                 target: None,
-            },
+            }),
             _ => unreachable!(),
         };
         for length in lengths {
             let op = match &graph.insts[allocation].op {
-                Op::Arguments => Op::ArgumentCount,
-                Op::NewArray(args) => Op::Constant(Constant::Number(args.len() as f64)),
+                Op::Javascript(JsOp::Arguments) => Op::ArgumentCount,
+                Op::Javascript(JsOp::NewArray(args)) => {
+                    Op::Javascript(JsOp::Constant(Constant::Number(args.len() as f64)))
+                }
                 _ => unreachable!(),
             };
             graph.set_op(length, op);
@@ -172,8 +179,8 @@ mod tests {
             .unwrap()
             .graph;
         for data in graph.insts.values_mut() {
-            if matches!(&data.op, Op::NewArray(values) if values.is_empty()) {
-                data.op = Op::Arguments;
+            if matches!(&data.op, Op::Javascript(JsOp::NewArray(values)) if values.is_empty()) {
+                data.op = Op::Javascript(JsOp::Arguments);
             }
         }
         graph.arity = None;
@@ -200,10 +207,13 @@ mod tests {
         assert!(lower(&mut graph));
         graph.verify().unwrap();
         let ops = operations(&graph);
-        assert!(ops.iter().any(|op| matches!(op, Op::CallForward(..))));
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, Op::Javascript(JsOp::CallForward(..))))
+        );
         assert!(
             !ops.iter()
-                .any(|op| matches!(op, Op::Arguments | Op::Spread(_)))
+                .any(|op| matches!(op, Op::Javascript(JsOp::Arguments | JsOp::Spread(_))))
         );
     }
 
@@ -217,12 +227,12 @@ mod tests {
         let ops = operations(&graph);
         assert!(
             ops.iter()
-                .any(|op| matches!(op, Op::Call { args, .. } if args.len() == 2))
+                .any(|op| matches!(op, Op::Javascript(JsOp::Call { args, .. }) if args.len() == 2))
         );
-        assert!(
-            !ops.iter()
-                .any(|op| matches!(op, Op::NewArray(_) | Op::Spread(_) | Op::Get(_, _)))
-        );
+        assert!(!ops.iter().any(|op| matches!(
+            op,
+            Op::Javascript(JsOp::NewArray(_) | JsOp::Spread(_) | JsOp::Get(_, _))
+        )));
     }
 
     #[test]
@@ -235,12 +245,12 @@ mod tests {
             !graph.blocks[graph.entry]
                 .insts
                 .iter()
-                .any(|&inst| matches!(graph.insts[inst].op, Op::Arguments))
+                .any(|&inst| matches!(graph.insts[inst].op, Op::Javascript(JsOp::Arguments)))
         );
         assert!(
             operations(&graph)
                 .iter()
-                .any(|op| matches!(op, Op::Arguments))
+                .any(|op| matches!(op, Op::Javascript(JsOp::Arguments)))
         );
     }
 

@@ -1,3 +1,4 @@
+use crate::jit::semantic::JsOp;
 use crate::{FxHashMap, FxHashSet};
 use std::cell::RefCell;
 
@@ -230,7 +231,7 @@ impl FunctionCompiler<'_, '_> {
             .filter(|&inst| {
                 matches!(
                     self.b.graph.insts[inst].op,
-                    Op::NewPack | Op::Spread(_) | Op::StringSplitParts(..)
+                    Op::Javascript(JsOp::NewPack | JsOp::Spread(_) | JsOp::StringSplitParts(..))
                 )
             })
             .collect();
@@ -497,55 +498,59 @@ impl FunctionCompiler<'_, '_> {
                             }
                             Op::EntryAssume(..) => Some(self.constant(Value::boolean(true))),
                             Op::Assume(..) => None,
-                            Op::StringConcat(..)
+                            Op::Javascript(JsOp::StringConcat(..))
                             | Op::ReadHint(..)
                             | Op::KeepAlive(..)
-                            | Op::View(..)
+                            | Op::Javascript(JsOp::View(..))
                             | Op::BooleanAnd(..)
-                            | Op::IsInBounds(..)
-                            | Op::IsExactPosition(..)
-                            | Op::IntegerCheck(..)
-                            | Op::IsInteger(..)
-                            | Op::IsCode(..)
-                            | Op::IsShape(..)
-                            | Op::IsNumber(..)
-                            | Op::IsUninitialized(..)
-                            | Op::IsUndefined(..)
-                            | Op::IsNullish(..)
-                            | Op::IsTyped(..)
-                            | Op::IsString(..)
-                            | Op::IsIndexed(..)
-                            | Op::IsOrdinaryArray(..)
-                            | Op::CellNew(..)
-                            | Op::CellGet(..)
-                            | Op::CellSet(..)
-                            | Op::CaptureGet(..)
-                            | Op::Closure(..)
-                            | Op::Read(_)
-                            | Op::Write(..)
-                            | Op::Initialize(..)
-                            | Op::BindingLoad(_)
-                            | Op::BindingRestore(..) => {
+                            | Op::Javascript(
+                                JsOp::IsInBounds(..)
+                                | JsOp::IsExactPosition(..)
+                                | JsOp::IntegerCheck(..)
+                                | JsOp::IsInteger(..)
+                                | JsOp::IsCode(..)
+                                | JsOp::IsShape(..)
+                                | JsOp::IsNumber(..)
+                                | JsOp::IsUninitialized(..)
+                                | JsOp::IsUndefined(..)
+                                | JsOp::IsNullish(..)
+                                | JsOp::IsTyped(..)
+                                | JsOp::IsString(..)
+                                | JsOp::IsIndexed(..)
+                                | JsOp::IsOrdinaryArray(..)
+                                | JsOp::CellNew(..)
+                                | JsOp::CellGet(..)
+                                | JsOp::CellSet(..)
+                                | JsOp::CaptureGet(..)
+                                | JsOp::Closure(..)
+                                | JsOp::Read(_)
+                                | JsOp::Write(..)
+                                | JsOp::Initialize(..)
+                                | JsOp::BindingLoad(_)
+                                | JsOp::BindingRestore(..),
+                            ) => {
                                 unreachable!("{:?} must be lowered before emission", data.op)
                             }
-                            Op::Constant(
+                            Op::Javascript(JsOp::Constant(
                                 Constant::Undefined
                                 | Constant::Null
                                 | Constant::Boolean(_)
                                 | Constant::Number(_)
                                 | Constant::Uninitialized,
-                            )
+                            ))
                             | Op::Convert(..)
                             | Op::Box(_)
                             | Op::AsBoxed(_)
                             | Op::AsWord(_)
                             | Op::Unbox(..)
-                            | Op::NumericFloat(_)
-                            | Op::SaturatingInteger(_)
-                            | Op::AsInteger(_)
-                            | Op::ArrayPosition(_)
-                            | Op::ToInt32(_)
-                            | Op::AsNumber(_) => {
+                            | Op::Javascript(
+                                JsOp::NumericFloat(_)
+                                | JsOp::SaturatingInteger(_)
+                                | JsOp::AsInteger(_)
+                                | JsOp::ArrayPosition(_)
+                                | JsOp::ToInt32(_)
+                                | JsOp::AsNumber(_),
+                            ) => {
                                 unreachable!("{:?} is adopted", data.op)
                             }
                             Op::Retain(graph_value)
@@ -629,13 +634,13 @@ impl FunctionCompiler<'_, '_> {
                             Op::Argument(index) | Op::Restored(index) => {
                                 Some(self.load_arg(*index))
                             }
-                            Op::Arguments => {
+                            Op::Javascript(JsOp::Arguments) => {
                                 let (argv, argc) = self.argument_vector()?;
                                 let value = self.call_helper(Helper::ArrayNew, &[argv, argc]);
                                 self.check_error();
                                 Some(value)
                             }
-                            Op::CallForward(callee, receiver) => {
+                            Op::Javascript(JsOp::CallForward(callee, receiver)) => {
                                 let callee = get(self, *callee);
                                 let receiver = get(self, *receiver);
                                 let (argv, argc) = self.argument_vector()?;
@@ -648,80 +653,86 @@ impl FunctionCompiler<'_, '_> {
                                 let (_, argc) = self.argument_vector()?;
                                 Some(self.b.ins().fcvt_from_uint(types::F64, argc))
                             }
-                            Op::Rest(index) => {
+                            Op::Javascript(JsOp::Rest(index)) => {
                                 let index = self.b.ins().iconst(types::I64, *index as i64);
                                 let (argv, argc) = self.argument_vector()?;
                                 let value = self.call_helper(Helper::Rest, &[argv, argc, index]);
                                 self.check_error();
                                 Some(value)
                             }
-                            Op::This => Some(self.receiver),
-                            Op::Callee => Some(closure),
-                            Op::ClosureThis(..)
-                            | Op::IsArrayIteration(..)
-                            | Op::NewHoleyArray(..)
-                            | Op::MapElement(..)
-                            | Op::Throw(..)
-                            | Op::PropertyKey(..)
-                            | Op::IteratorNew(..)
-                            | Op::IteratorNext(..)
-                            | Op::EnumerateNew(..)
-                            | Op::EnumerateNext(..)
-                            | Op::NewObject
-                            | Op::MarkClass(..)
-                            | Op::DisableConstructor(..)
-                            | Op::CachedProperty(..)
-                            | Op::ShapedGet(..)
-                            | Op::FillPropertyCache(..)
-                            | Op::PrimePropertyCache(..)
-                            | Op::PropertyLoad(..)
-                            | Op::RelatedPropertyLoad(..)
+                            Op::Javascript(JsOp::This) => Some(self.receiver),
+                            Op::Javascript(JsOp::Callee) => Some(closure),
+                            Op::Javascript(
+                                JsOp::ClosureThis(..)
+                                | JsOp::IsArrayIteration(..)
+                                | JsOp::NewHoleyArray(..)
+                                | JsOp::MapElement(..)
+                                | JsOp::Throw(..)
+                                | JsOp::PropertyKey(..)
+                                | JsOp::IteratorNew(..)
+                                | JsOp::IteratorNext(..)
+                                | JsOp::EnumerateNew(..)
+                                | JsOp::EnumerateNext(..)
+                                | JsOp::NewObject
+                                | JsOp::MarkClass(..)
+                                | JsOp::DisableConstructor(..)
+                                | JsOp::CachedProperty(..)
+                                | JsOp::ShapedGet(..)
+                                | JsOp::FillPropertyCache(..)
+                                | JsOp::PrimePropertyCache(..)
+                                | JsOp::PropertyLoad(..)
+                                | JsOp::RelatedPropertyLoad(..),
+                            )
                             | Op::HelperCall { .. }
-                            | Op::ArrayStore(..)
-                            | Op::PropertyStore(..)
-                            | Op::PropertyAdd(..)
-                            | Op::CanOverwrite(..)
-                            | Op::FillPropertyStore(..)
-                            | Op::PackAppend(..)
-                            | Op::PackRelease(..)
-                            | Op::PackTake(..)
-                            | Op::TypedData(..)
+                            | Op::Javascript(
+                                JsOp::ArrayStore(..)
+                                | JsOp::PropertyStore(..)
+                                | JsOp::PropertyAdd(..)
+                                | JsOp::CanOverwrite(..)
+                                | JsOp::FillPropertyStore(..)
+                                | JsOp::PackAppend(..)
+                                | JsOp::PackRelease(..)
+                                | JsOp::PackTake(..)
+                                | JsOp::TypedData(..),
+                            )
                             | Op::Memory(..)
-                            | Op::MemoryNumber(..)
-                            | Op::IsTypeof(..)
-                            | Op::IsArrayIndex(..)
-                            | Op::IsArray(..)
-                            | Op::ArrayKind(..)
-                            | Op::ArrayLoad(..)
-                            | Op::GlobalCache(..)
-                            | Op::PropertyCache(..)
-                            | Op::IsPropertyCached(..)
-                            | Op::ArrayAppend(..)
-                            | Op::CallPack(..)
-                            | Op::ConstructPack(..)
-                            | Op::NewInstance(..)
-                            | Op::ConstructorResult(..)
-                            | Op::IndexedLength(..)
-                            | Op::NewArray(..)
-                            | Op::Construct { .. }
-                            | Op::ConstructResolved { .. }
-                            | Op::ConstructorCall { .. }
-                            | Op::StringSplit(..)
-                            | Op::ConstructorCallPack(..)
-                            | Op::ConstructorPrototype(..)
-                            | Op::ConstructPackResolved(..)
-                            | Op::ProbeIndex(..)
-                            | Op::IsStringSplit(..)
-                            | Op::IsNative(..)
-                            | Op::GetIndex(..)
-                            | Op::Delete(..)
-                            | Op::ArrayGet(..)
-                            | Op::SetIndex(..)
-                            | Op::Truthy(..)
-                            | Op::TypedIndex(..) => {
+                            | Op::Javascript(
+                                JsOp::MemoryNumber(..)
+                                | JsOp::IsTypeof(..)
+                                | JsOp::IsArrayIndex(..)
+                                | JsOp::IsArray(..)
+                                | JsOp::ArrayKind(..)
+                                | JsOp::ArrayLoad(..)
+                                | JsOp::GlobalCache(..)
+                                | JsOp::PropertyCache(..)
+                                | JsOp::IsPropertyCached(..)
+                                | JsOp::ArrayAppend(..)
+                                | JsOp::CallPack(..)
+                                | JsOp::ConstructPack(..)
+                                | JsOp::NewInstance(..)
+                                | JsOp::ConstructorResult(..)
+                                | JsOp::IndexedLength(..)
+                                | JsOp::NewArray(..)
+                                | JsOp::Construct { .. }
+                                | JsOp::ConstructResolved { .. }
+                                | JsOp::ConstructorCall { .. }
+                                | JsOp::StringSplit(..)
+                                | JsOp::ConstructorCallPack(..)
+                                | JsOp::ConstructorPrototype(..)
+                                | JsOp::ConstructPackResolved(..)
+                                | JsOp::ProbeIndex(..)
+                                | JsOp::IsStringSplit(..)
+                                | JsOp::IsNative(..)
+                                | JsOp::GetIndex(..)
+                                | JsOp::Delete(..)
+                                | JsOp::ArrayGet(..)
+                                | JsOp::SetIndex(..)
+                                | JsOp::Truthy(..)
+                                | JsOp::TypedIndex(..),
+                            ) => {
                                 break 'lowered self.typed_op(&cx, inst, data, target)?;
                             }
-                            Op::Catch => {
+                            Op::Javascript(JsOp::Catch) => {
                                 // A caught throw abandons argument evaluation in this frame.
                                 for &address in &pack_cleanup {
                                     self.call_helper(Helper::PackRelease, &[address]);
@@ -729,7 +740,7 @@ impl FunctionCompiler<'_, '_> {
                                 let dummy = self.constant(Value::UNDEFINED);
                                 Some(self.call_helper(Helper::Catch, &[dummy]))
                             }
-                            Op::ClosureCells(
+                            Op::Javascript(JsOp::ClosureCells(
                                 span,
                                 id,
                                 arrow,
@@ -737,7 +748,7 @@ impl FunctionCompiler<'_, '_> {
                                 lexical_this,
                                 cells,
                                 lexical_receiver,
-                            ) => {
+                            )) => {
                                 let cells: Vec<_> =
                                     cells.iter().map(|&cell| get(self, cell)).collect();
                                 let lexical_receiver =
@@ -750,13 +761,13 @@ impl FunctionCompiler<'_, '_> {
                                     lexical_receiver,
                                 )?)
                             }
-                            Op::Constant(Constant::String(value)) => {
+                            Op::Javascript(JsOp::Constant(Constant::String(value))) => {
                                 Some(self.string_constant(value))
                             }
-                            Op::GlobalRead(..) | Op::GlobalReadOptional(..) => {
+                            Op::Javascript(JsOp::GlobalRead(..) | JsOp::GlobalReadOptional(..)) => {
                                 unreachable!("global reads must be lowered before ownership")
                             }
-                            Op::RegExp(pattern, flags) => {
+                            Op::Javascript(JsOp::RegExp(pattern, flags)) => {
                                 let pattern: Box<str> = pattern.as_str().into();
                                 let ptr =
                                     self.b.ins().iconst(self.pointer, pattern.as_ptr() as i64);
@@ -768,48 +779,53 @@ impl FunctionCompiler<'_, '_> {
                                 self.check_error();
                                 Some(result)
                             }
-                            Op::GlobalInitialize(name, value) => {
+                            Op::Javascript(JsOp::GlobalInitialize(name, value)) => {
                                 let value = get(self, *value);
                                 self.global_initialize(name, value);
                                 None
                             }
-                            Op::GlobalWrite(name, value) => {
+                            Op::Javascript(JsOp::GlobalWrite(name, value)) => {
                                 let value = get(self, *value);
                                 self.global_set(name, value);
                                 None
                             }
-                            Op::CheckInitialized(value) => {
+                            Op::Javascript(JsOp::CheckInitialized(value)) => {
                                 let value = get(self, *value);
                                 let value = self.checked_temporary(value, data.result().is_some());
                                 Some(value)
                             }
-                            Op::GuardedCompare {
+                            Op::Javascript(JsOp::GuardedCompare {
                                 operator,
                                 left,
                                 right,
                                 ..
-                            } => {
+                            }) => {
                                 let left = get(self, *left);
                                 let right = get(self, *right);
                                 Some(self.binary(ops::binary_operator(*operator), left, right))
                             }
-                            Op::DefineHidden(object, name, value) => {
+                            Op::Javascript(JsOp::DefineHidden(object, name, value)) => {
                                 let object = get(self, *object);
                                 let value = get(self, *value);
                                 self.define_hidden_property(object, name, value);
                                 None
                             }
-                            Op::Set(..) | Op::Define(..) | Op::ShapedSet(..) | Op::Get(..) => {
+                            Op::Javascript(
+                                JsOp::Set(..)
+                                | JsOp::Define(..)
+                                | JsOp::ShapedSet(..)
+                                | JsOp::Get(..),
+                            ) => {
                                 unreachable!("property accesses must be lowered before ownership")
                             }
-                            Op::NewPack => {
+                            Op::Javascript(JsOp::NewPack) => {
                                 let destination = pack_slots[inst]
                                     .unwrap_or_else(|| self.constant(Value::UNDEFINED));
                                 let value = self.call_helper(Helper::NewPack, &[destination]);
                                 self.check_error();
                                 Some(value)
                             }
-                            Op::Spread(value) => {
+                            Op::Javascript(JsOp::Spread(value)) => {
                                 let value = get(self, *value);
                                 let destination = pack_slots[inst]
                                     .unwrap_or_else(|| self.constant(Value::UNDEFINED));
@@ -817,12 +833,14 @@ impl FunctionCompiler<'_, '_> {
                                 self.check_error();
                                 Some(pack)
                             }
-                            Op::AsObject(value) | Op::AsString(value) => Some(get(self, *value)),
-                            Op::ToNumeric(value) => {
+                            Op::Javascript(JsOp::AsObject(value) | JsOp::AsString(value)) => {
+                                Some(get(self, *value))
+                            }
+                            Op::Javascript(JsOp::ToNumeric(value)) => {
                                 let value = get(self, *value);
                                 Some(ops::to_number(self, value))
                             }
-                            Op::Unary(op, value) => {
+                            Op::Javascript(JsOp::Unary(op, value)) => {
                                 let value = get(self, *value);
                                 Some(match op {
                                     UnaryOp::Increment | UnaryOp::Decrement => {
@@ -850,17 +868,17 @@ impl FunctionCompiler<'_, '_> {
                                     ),
                                 })
                             }
-                            Op::Binary(op, left, right) => {
+                            Op::Javascript(JsOp::Binary(op, left, right)) => {
                                 let left = get(self, *left);
                                 let right = get(self, *right);
                                 Some(self.binary(ops::binary_operator(*op), left, right))
                             }
-                            Op::Call {
+                            Op::Javascript(JsOp::Call {
                                 callee,
                                 receiver,
                                 args,
                                 target,
-                            } => {
+                            }) => {
                                 let closure = self.b.graph.defining_op(*callee).cloned();
                                 let identity = cx.facts.identity_at(*callee, data.block);
                                 let callee = get(self, *callee);
@@ -872,9 +890,15 @@ impl FunctionCompiler<'_, '_> {
                                     Some(target) => {
                                         let receiver = match closure {
                                             _ if !target.lexical_this => receiver,
-                                            Some(Op::Closure(_, _, true, _, true, _, lexical)) => {
-                                                lexical.map_or(self.receiver, |v| get(self, v))
-                                            }
+                                            Some(Op::Javascript(JsOp::Closure(
+                                                _,
+                                                _,
+                                                true,
+                                                _,
+                                                true,
+                                                _,
+                                                lexical,
+                                            ))) => lexical.map_or(self.receiver, |v| get(self, v)),
                                             _ => self.call_helper(
                                                 Helper::LexicalReceiver,
                                                 &[callee, receiver],
@@ -900,15 +924,17 @@ impl FunctionCompiler<'_, '_> {
                                 };
                                 Some(value)
                             }
-                            Op::ProbeGlobal(..) | Op::ProbeProperty(..) => {
+                            Op::Javascript(JsOp::ProbeGlobal(..) | JsOp::ProbeProperty(..)) => {
                                 unreachable!("cache probes must be lowered before ownership")
                             }
-                            Op::ProbeShapeProperty(..)
-                            | Op::LayoutGet(..)
-                            | Op::IsReadLayout(..) => {
+                            Op::Javascript(
+                                JsOp::ProbeShapeProperty(..)
+                                | JsOp::LayoutGet(..)
+                                | JsOp::IsReadLayout(..),
+                            ) => {
                                 unreachable!("layout reads must be lowered before ownership")
                             }
-                            Op::StringSplitParts(receiver, args) => {
+                            Op::Javascript(JsOp::StringSplitParts(receiver, args)) => {
                                 let receiver = get(self, *receiver);
                                 let args: Vec<_> = args.iter().map(|&v| get(self, v)).collect();
                                 let argv = self.stack_values(&args, data.span)?;
@@ -924,7 +950,7 @@ impl FunctionCompiler<'_, '_> {
                                 self.check_error();
                                 Some(result)
                             }
-                            Op::GuardValid(guard) => {
+                            Op::Javascript(JsOp::GuardValid(guard)) => {
                                 let epoch = self.epoch();
                                 let cell = self.b.ins().iconst(self.pointer, cells[*guard]);
                                 let validated =
@@ -939,13 +965,13 @@ impl FunctionCompiler<'_, '_> {
                                 let word = self.b.ins().select(condition, yes, no);
                                 Some(self.b.as_boxed(word))
                             }
-                            Op::GuardCommit(guard) => {
+                            Op::Javascript(JsOp::GuardCommit(guard)) => {
                                 let epoch = self.epoch();
                                 let cell = self.b.ins().iconst(self.pointer, cells[*guard]);
                                 self.b.ins().store(MemFlagsData::trusted(), epoch, cell, 0);
                                 None
                             }
-                            Op::CallNative(native, args) => {
+                            Op::Javascript(JsOp::CallNative(native, args)) => {
                                 let args: Vec<_> = args.iter().map(|&v| get(self, v)).collect();
                                 let argv = self.stack_values(&args, data.span)?;
                                 let argc = self.b.ins().iconst(types::I64, args.len() as i64);
@@ -959,11 +985,13 @@ impl FunctionCompiler<'_, '_> {
                                 self.check_error();
                                 Some(value)
                             }
-                            Op::EnterScope(_)
-                            | Op::EnterCaptures(..)
-                            | Op::LeaveScope(_)
-                            | Op::NextIteration(_)
-                            | Op::FreshIteration(_) => None,
+                            Op::Javascript(
+                                JsOp::EnterScope(_)
+                                | JsOp::EnterCaptures(..)
+                                | JsOp::LeaveScope(_)
+                                | JsOp::NextIteration(_)
+                                | JsOp::FreshIteration(_),
+                            ) => None,
                         };
                         result.map(|value| Operand::new(value, Repr::Boxed))
                     }
@@ -1135,11 +1163,11 @@ impl FunctionCompiler<'_, '_> {
     ) -> Result<Option<Operand>, Error> {
         let boolean = |condition: LoweredValue| Some(Operand::new(condition, Repr::Boolean));
         let result = match &data.op {
-            Op::GlobalCache(name) => {
+            Op::Javascript(JsOp::GlobalCache(name)) => {
                 let address = self.function_data(crate::jit::helpers::GlobalCache::new(name));
                 Some(Operand::new(address, Repr::Word))
             }
-            Op::PropertyCache(site, name) => {
+            Op::Javascript(JsOp::PropertyCache(site, name)) => {
                 let observer = self.property_observer(data);
                 let address = self.property_cache(*site, name, observer);
                 Some(Operand::new(address, Repr::Word))
@@ -1153,7 +1181,9 @@ impl FunctionCompiler<'_, '_> {
             } => {
                 let builtins = if *helper == Helper::SemanticPropertyProbeCached {
                     match self.b.graph.defining_op(args[1]) {
-                        Some(Op::PropertyCache(_, name)) => crate::builtins::builtin_method(name),
+                        Some(Op::Javascript(JsOp::PropertyCache(_, name))) => {
+                            crate::builtins::builtin_method(name)
+                        }
                         _ => unreachable!("property probe requires a cache"),
                     }
                 } else {
@@ -1184,12 +1214,14 @@ impl FunctionCompiler<'_, '_> {
                 }
                 produces.map(|repr| Operand::new(value, repr))
             }
-            Op::Truthy(value) => {
+            Op::Javascript(JsOp::Truthy(value)) => {
                 let types = cx.facts.of(*value);
                 let value = self.operand(cx, *value).value;
                 boolean(self.truthy(value, types))
             }
-            Op::TypedData(..) => unreachable!("data pointer must be lowered before emission"),
+            Op::Javascript(JsOp::TypedData(..)) => {
+                unreachable!("data pointer must be lowered before emission")
+            }
             Op::Memory(MemoryOp::Address {
                 base,
                 index,
@@ -1221,7 +1253,7 @@ impl FunctionCompiler<'_, '_> {
                 let value = self.b.indexed_load(base, index, *format, repr.machine());
                 Some(Operand::new(value, repr))
             }
-            Op::MemoryNumber(value, format) => {
+            Op::Javascript(JsOp::MemoryNumber(value, format)) => {
                 let raw = self.operand(cx, *value).value;
                 let (value, repr) = match format {
                     MemoryFormat::U8 | MemoryFormat::U16 => {
@@ -1237,8 +1269,8 @@ impl FunctionCompiler<'_, '_> {
                 };
                 Some(Operand::new(value, repr))
             }
-            Op::IsArrayIndex(..) => unreachable!(),
-            Op::ArrayKind(..) | Op::IndexedLength(..) | Op::ArrayLoad(..) => {
+            Op::Javascript(JsOp::IsArrayIndex(..)) => unreachable!(),
+            Op::Javascript(JsOp::ArrayKind(..) | JsOp::IndexedLength(..) | JsOp::ArrayLoad(..)) => {
                 unreachable!("array storage must be lowered before emission")
             }
             Op::Regex(regex::Op::IsPattern(value, pattern)) => {
@@ -1281,11 +1313,10 @@ impl FunctionCompiler<'_, '_> {
                     shift,
                 );
                 let mask = self.b.ins().iconst(types::I64, u32::MAX as i64);
-                let end = self.b.ins().binary(
-                    crate::jit::semantic::low_level::Binary::And,
-                    found,
-                    mask,
-                );
+                let end =
+                    self.b
+                        .ins()
+                        .binary(crate::jit::semantic::low_level::Binary::And, found, mask);
                 let result =
                     self.call_helper(Helper::RegExpExecResult, &[regexp, subject, start, end]);
                 self.check_error();
@@ -1294,7 +1325,7 @@ impl FunctionCompiler<'_, '_> {
                 Some(Operand::new(self.b.block_params(done)[0], Repr::Boxed))
             }
             Op::Regex(regex::Op::Class(..)) => unreachable!(),
-            Op::IsArray(object, layout) => {
+            Op::Javascript(JsOp::IsArray(object, layout)) => {
                 let view = match self.b.graph.views.get(&inst).copied() {
                     Some(view) => self.operand(cx, view).value,
                     None => {
@@ -1306,14 +1337,14 @@ impl FunctionCompiler<'_, '_> {
                 let expected = layout.kind();
                 boolean(self.b.ins().icmp_imm_s(IntCC::Equal, kind, expected as i64))
             }
-            Op::TypedIndex(
+            Op::Javascript(JsOp::TypedIndex(
                 object,
                 key,
                 TypedRead {
                     element: Some(element),
                     bounded,
                 },
-            ) => {
+            )) => {
                 let view = match self.b.graph.views.get(&inst).copied() {
                     Some(view) => self.operand(cx, view).value,
                     None => {
@@ -1345,19 +1376,21 @@ impl FunctionCompiler<'_, '_> {
 
 fn deferred(op: &Op) -> bool {
     match op {
-        Op::Constant(constant) => !matches!(constant, Constant::String(_)),
+        Op::Javascript(JsOp::Constant(constant)) => !matches!(constant, Constant::String(_)),
         Op::LowLevel(_)
         | Op::Convert(..)
         | Op::Box(_)
         | Op::AsBoxed(_)
         | Op::AsWord(_)
         | Op::Unbox(..)
-        | Op::NumericFloat(_)
-        | Op::SaturatingInteger(_)
-        | Op::AsInteger(_)
-        | Op::ArrayPosition(_)
-        | Op::ToInt32(_)
-        | Op::AsNumber(_) => true,
+        | Op::Javascript(
+            JsOp::NumericFloat(_)
+            | JsOp::SaturatingInteger(_)
+            | JsOp::AsInteger(_)
+            | JsOp::ArrayPosition(_)
+            | JsOp::ToInt32(_)
+            | JsOp::AsNumber(_),
+        ) => true,
         _ => false,
     }
 }

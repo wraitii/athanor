@@ -1,6 +1,7 @@
 use super::super::super::guards::{Fact, Origin};
 use super::super::calls::ConditionalCall;
 use super::*;
+use crate::jit::semantic::JsOp;
 
 #[derive(Default)]
 pub(super) struct Candidates {
@@ -218,7 +219,7 @@ pub(super) fn plan_region(
     let written: FxHashSet<_> = body.difference(&fallbacks).copied().collect();
     let mut requirements = requirements(graph, &blocks);
     let native_of = |requirement: &Requirement| match graph.insts[requirement.call].op {
-        Op::Call { callee, .. } => (callee, Fact::Native(requirement.native)),
+        Op::Javascript(JsOp::Call { callee, .. }) => (callee, Fact::Native(requirement.native)),
         _ => unreachable!(),
     };
     let mut calls: Vec<_> = conditional
@@ -226,8 +227,8 @@ pub(super) fn plan_region(
         .filter(|call| {
             written.contains(&graph.insts[call.inst].block)
                 && body.contains(&graph.def_block(call.callee))
-                && matches!(graph.insts[call.inst].op, Op::Call { callee, .. } if callee == call.callee)
-                && matches!(graph.defining_op(call.callee), Some(Op::GlobalRead(name)) if name == &call.name)
+                && matches!(graph.insts[call.inst].op, Op::Javascript(JsOp::Call { callee, .. }) if callee == call.callee)
+                && matches!(graph.defining_op(call.callee), Some(Op::Javascript(JsOp::GlobalRead(name))) if name == &call.name)
         })
         .cloned()
         .collect();
@@ -243,12 +244,13 @@ pub(super) fn plan_region(
     let build = |requirements: &[Requirement], calls: &[ConditionalCall]| {
         let mut planning = graph.clone();
         for requirement in requirements {
-            let Op::Call { args, .. } = &planning.insts[requirement.call].op else {
+            let Op::Javascript(JsOp::Call { args, .. }) = &planning.insts[requirement.call].op
+            else {
                 unreachable!()
             };
             planning.set_op(
                 requirement.call,
-                Op::CallNative(requirement.native, args.clone()),
+                Op::Javascript(JsOp::CallNative(requirement.native, args.clone())),
             );
         }
         let assumed: FxHashMap<Value, cranelift_module::FuncId> = calls
@@ -319,7 +321,7 @@ pub(super) fn plan_region(
     let mut unused: Vec<_> = requirements
         .iter()
         .filter_map(|requirement| match graph.insts[requirement.call].op {
-            Op::Call { callee, .. } => Some(callee),
+            Op::Javascript(JsOp::Call { callee, .. }) => Some(callee),
             _ => None,
         })
         .collect();
@@ -331,11 +333,11 @@ pub(super) fn plan_region(
             continue;
         };
         match planning.insts[inst].op {
-            Op::Get(object, _) => {
+            Op::Javascript(JsOp::Get(object, _)) => {
                 uses[object] -= 1;
                 unused.push(object);
             }
-            Op::GlobalRead(_) => {}
+            Op::Javascript(JsOp::GlobalRead(_)) => {}
             _ => continue,
         }
         planning.remove_inst(inst);
@@ -413,17 +415,21 @@ pub(super) fn plan_region(
                 }
                 match fact {
                     Fact::Array => true,
-                    Fact::Shape(shape) => Access::read(graph, &Op::IsShape(value, shape), &shared)
-                        .is_some_and(|read| !writes.clobbers(&read)),
-                    Fact::ReadLayout(layout) => {
-                        Access::read(graph, &Op::IsReadLayout(value, layout), &shared)
+                    Fact::Shape(shape) => {
+                        Access::read(graph, &Op::Javascript(JsOp::IsShape(value, shape)), &shared)
                             .is_some_and(|read| !writes.clobbers(&read))
                     }
+                    Fact::ReadLayout(layout) => Access::read(
+                        graph,
+                        &Op::Javascript(JsOp::IsReadLayout(value, layout)),
+                        &shared,
+                    )
+                    .is_some_and(|read| !writes.clobbers(&read)),
                     Fact::Cached(cache, builtins) => {
                         (!body.contains(&planning.def_block(cache)) || available.contains(&cache))
                             && Access::read(
                                 graph,
-                                &Op::IsPropertyCached(value, cache, builtins),
+                                &Op::Javascript(JsOp::IsPropertyCached(value, cache, builtins)),
                                 &shared,
                             )
                             .is_some_and(|read| !writes.clobbers(&read))
@@ -442,7 +448,7 @@ pub(super) fn plan_region(
     let mut typed_reads = Vec::new();
     for &block in &blocks {
         for &inst in &planning.blocks[block].insts {
-            if let Op::GetIndex(object, key) | Op::TypedIndex(object, key, _) =
+            if let Op::Javascript(JsOp::GetIndex(object, key) | JsOp::TypedIndex(object, key, _)) =
                 planning.insts[inst].op
                 && let Some(&(_, element)) =
                     typed.iter().find(|(candidate, _)| *candidate == object)
@@ -450,7 +456,7 @@ pub(super) fn plan_region(
                 && !reads.contains(&inst)
             {
                 let previous = match planning.insts[inst].op {
-                    Op::TypedIndex(_, _, read) => Some(read),
+                    Op::Javascript(JsOp::TypedIndex(_, _, read)) => Some(read),
                     _ => None,
                 };
                 typed_reads.push((
@@ -519,7 +525,7 @@ pub(super) fn shaped_overwrites(
     assumes: &[(Value, Fact)],
 ) -> Vec<(Inst, (Value, Fact))> {
     let canonical = |mut value| {
-        while let Some(Op::AsObject(original)) = graph.defining_op(value) {
+        while let Some(Op::Javascript(JsOp::AsObject(original))) = graph.defining_op(value) {
             value = *original;
         }
         value
@@ -528,7 +534,7 @@ pub(super) fn shaped_overwrites(
         .iter()
         .flat_map(|&block| &graph.blocks[block].insts)
         .filter_map(|&inst| {
-            let Op::Set(object, ..) = graph.insts[inst].op else {
+            let Op::Javascript(JsOp::Set(object, ..)) = graph.insts[inst].op else {
                 return None;
             };
             let &[layout] = graph.property_accesses.get(&inst)?.shapes.as_slice() else {
@@ -567,10 +573,10 @@ pub(super) fn property_assumptions(graph: &mut Graph, notes: &mut Vec<String>) {
             };
             let (access, shapes) = accesses.get(&cache)?;
             let fact = match (&graph.insts[*access].op, shapes.as_slice()) {
-                (Op::Get(_, name), []) => {
+                (Op::Javascript(JsOp::Get(_, name)), []) => {
                     Some(Fact::Cached(cache, crate::builtins::builtin_method(&name)))
                 }
-                (Op::Get(..) | Op::Set(..), &[layout]) => {
+                (Op::Javascript(JsOp::Get(..) | JsOp::Set(..)), &[layout]) => {
                     (!solved.as_ref().is_some_and(|solved| {
                         let state = solved.before(graph, &facts, &facts.cfg, inst);
                         solved.holds(graph, &state, object, layout.requirement())

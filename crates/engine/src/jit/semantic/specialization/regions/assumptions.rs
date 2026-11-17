@@ -2,6 +2,7 @@ use super::super::super::guards::{Fact, Origin};
 use super::super::calls::ConditionalPlan;
 use super::*;
 use crate::jit::profile::ReadType;
+use crate::jit::semantic::JsOp;
 
 pub(super) struct Proposal {
     pub(super) inst: Inst,
@@ -41,9 +42,10 @@ pub(super) fn prepare(graph: &mut Graph, conditional: &ConditionalPlan) -> Vec<P
             unreachable!()
         };
         let global = match (fact, graph.defining_op(value)) {
-            (Fact::Code(_), Some(Op::ProbeGlobal(name) | Op::GlobalRead(name))) => {
-                Some(name.clone())
-            }
+            (
+                Fact::Code(_),
+                Some(Op::Javascript(JsOp::ProbeGlobal(name) | JsOp::GlobalRead(name))),
+            ) => Some(name.clone()),
             _ => None,
         };
         let local = match fact {

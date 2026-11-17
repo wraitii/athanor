@@ -1,3 +1,4 @@
+use crate::jit::semantic::JsOp;
 use cranelift_codegen::ir::{MemFlagsData, Type, condcodes::IntCC, types};
 use cranelift_codegen::isa::CallConv;
 
@@ -126,18 +127,20 @@ impl Lowering<'_, '_> {
 fn pure(op: &Op) -> bool {
     matches!(
         op,
-        Op::Constant(_)
+        Op::Javascript(JsOp::Constant(_))
             | Op::AsBoxed(_)
             | Op::AsWord(_)
             | Op::Box(_)
             | Op::Unbox(..)
             | Op::Convert(..)
-            | Op::NumericFloat(_)
-            | Op::SaturatingInteger(_)
-            | Op::AsInteger(_)
-            | Op::ArrayPosition(_)
-            | Op::ToInt32(_)
-            | Op::AsNumber(_)
+            | Op::Javascript(
+                JsOp::NumericFloat(_)
+                    | JsOp::SaturatingInteger(_)
+                    | JsOp::AsInteger(_)
+                    | JsOp::ArrayPosition(_)
+                    | JsOp::ToInt32(_)
+                    | JsOp::AsNumber(_)
+            )
             | Op::LowLevel(
                 low_level::Op::Integer { .. }
                     | low_level::Op::Float64(_)

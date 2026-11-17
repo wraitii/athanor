@@ -1,4 +1,5 @@
 use crate::FxHashMap;
+use crate::jit::semantic::JsOp;
 use oxc_span::Span;
 
 use super::contracts::{Use, repr_contract as contract};
@@ -22,11 +23,11 @@ pub(super) fn conditions(graph: &mut Graph, facts: &mut Facts) {
         let (span, source_name) = (terminator.span, terminator.source_name);
         let end = graph.blocks[block].insts.len();
         let op = if types.within(ValueType::OBJECT.union(ValueType::OTHER)) {
-            Op::Constant(Constant::Boolean(true))
+            Op::Javascript(JsOp::Constant(Constant::Boolean(true)))
         } else if types.within(ValueType::NULL.union(ValueType::UNDEFINED)) {
-            Op::Constant(Constant::Boolean(false))
+            Op::Javascript(JsOp::Constant(Constant::Boolean(false)))
         } else {
-            Op::Truthy(value)
+            Op::Javascript(JsOp::Truthy(value))
         };
         let (inst, truth) = graph.insert(block, end, span, op, true);
         graph.insts[inst].source_name = source_name;
@@ -58,8 +59,8 @@ impl Boxing<'_> {
         repr: Repr,
     ) -> (Inst, Value) {
         let op = match self.graph.defining_op(value) {
-            Some(Op::Constant(constant)) if super::repr::fits(constant, repr) => {
-                Op::Constant(constant.clone())
+            Some(Op::Javascript(JsOp::Constant(constant))) if super::repr::fits(constant, repr) => {
+                Op::Javascript(JsOp::Constant(constant.clone()))
             }
             _ if repr == Repr::Boxed => Op::Box(value),
             _ => Op::Unbox(value, repr),

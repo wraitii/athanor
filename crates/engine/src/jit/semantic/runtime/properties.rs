@@ -6,6 +6,7 @@ use super::super::{
 };
 use super::layout;
 use crate::jit::layout::ReadLayout;
+use crate::jit::semantic::JsOp;
 
 pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) -> super::super::Result<bool> {
     function.ensure_cfg();
@@ -22,7 +23,8 @@ pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) -> super::su
         .filter(|block| !graph.cold.contains(block))
         .flat_map(|&block| graph.blocks[block].insts.iter().copied())
         .filter(|&inst| {
-            matches!(graph.insts[inst].op, Op::Get(..)) && !shapes.megamorphic(graph, inst)
+            matches!(graph.insts[inst].op, Op::Javascript(JsOp::Get(..)))
+                && !shapes.megamorphic(graph, inst)
         })
         .collect();
     let mut changed = !reads.is_empty();
@@ -30,7 +32,7 @@ pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) -> super::su
     let mut cached = Vec::new();
     for inst in reads {
         let data = graph.insts[inst].clone();
-        let Op::Get(object, name) = &data.op else {
+        let Op::Javascript(JsOp::Get(object, name)) = &data.op else {
             unreachable!()
         };
         if name != "length" {
@@ -38,20 +40,25 @@ pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) -> super::su
             continue;
         }
         let object = *object;
-        let cache =
-            Cursor::before(graph, inst).add_unassigned(Op::PropertyCache(inst, name.clone()));
+        let cache = Cursor::before(graph, inst)
+            .add_unassigned(Op::Javascript(JsOp::PropertyCache(inst, name.clone())));
         let first = graph.blocks.len();
         let (block, continuation, fallback) = super::super::dispatch::split(graph, inst);
-        graph.set_op(inst, Op::FillPropertyCache(object, cache, name.clone()));
+        graph.set_op(
+            inst,
+            Op::Javascript(JsOp::FillPropertyCache(object, cache, name.clone())),
+        );
         let fast = graph.blocks.push(BlockData::default());
-        let check = Cursor::at_end(graph, block, inst).add_unassigned(Op::IsIndexed(object));
+        let check = Cursor::at_end(graph, block, inst)
+            .add_unassigned(Op::Javascript(JsOp::IsIndexed(object)));
         graph.blocks[block].terminator = Some(Terminator {
             source_name: data.source_name,
             emission_location: None,
             span: data.span,
             kind: TerminatorKind::Branch(check, Target::new(fast), Target::new(fallback)),
         });
-        let value = Cursor::at_end(graph, fast, inst).add_unassigned(Op::IndexedLength(object));
+        let value = Cursor::at_end(graph, fast, inst)
+            .add_unassigned(Op::Javascript(JsOp::IndexedLength(object)));
         graph.blocks[fast].terminator = Some(Terminator {
             source_name: data.source_name,
             emission_location: None,
@@ -70,12 +77,12 @@ pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) -> super::su
     }
     for inst in cached {
         let data = graph.insts[inst].clone();
-        let Op::Get(object, name) = &data.op else {
+        let Op::Javascript(JsOp::Get(object, name)) = &data.op else {
             unreachable!()
         };
         let object = *object;
-        let cache =
-            Cursor::before(graph, inst).add_unassigned(Op::PropertyCache(inst, name.clone()));
+        let cache = Cursor::before(graph, inst)
+            .add_unassigned(Op::Javascript(JsOp::PropertyCache(inst, name.clone())));
         super::super::specialization::properties::lower_cache(graph, inst, cache, object, name);
     }
     if changed {
@@ -98,36 +105,47 @@ fn lower_stores(graph: &mut Graph) -> bool {
         .filter(|&inst| {
             matches!(
                 graph.insts[inst].op,
-                Op::Set(..) | Op::Define(..) | Op::ShapedSet(..)
+                Op::Javascript(JsOp::Set(..) | JsOp::Define(..) | JsOp::ShapedSet(..))
             )
         })
         .collect();
     for &inst in &stores {
         let data = graph.insts[inst].clone();
-        let write = if matches!(data.op, Op::Define(..)) {
+        let write = if matches!(data.op, Op::Javascript(JsOp::Define(..))) {
             super::super::PropertyWrite::Define
         } else {
             super::super::PropertyWrite::Set
         };
         let (object, name, value, shaped) = match data.op {
-            Op::Set(object, name, value) | Op::Define(object, name, value) => {
+            Op::Javascript(JsOp::Set(object, name, value) | JsOp::Define(object, name, value)) => {
                 (object, name, value, None)
             }
-            Op::ShapedSet(object, name, index, value) => (object, name, value, Some(index)),
+            Op::Javascript(JsOp::ShapedSet(object, name, index, value)) => {
+                (object, name, value, Some(index))
+            }
             _ => unreachable!(),
         };
-        let cache =
-            Cursor::before(graph, inst).add_unassigned(Op::PropertyCache(inst, name.clone()));
+        let cache = Cursor::before(graph, inst)
+            .add_unassigned(Op::Javascript(JsOp::PropertyCache(inst, name.clone())));
         let first = graph.blocks.len();
         let (block, done, fallback) = super::super::dispatch::split(graph, inst);
         graph.set_op(
             inst,
-            Op::FillPropertyStore(object, cache, name.clone(), value, write),
+            Op::Javascript(JsOp::FillPropertyStore(
+                object,
+                cache,
+                name.clone(),
+                value,
+                write,
+            )),
         );
-        let view = Cursor::at_end(graph, block, inst).add_unassigned(Op::View(object));
+        let view =
+            Cursor::at_end(graph, block, inst).add_unassigned(Op::Javascript(JsOp::View(object)));
         let mut at = Cursor::at_end(graph, block, inst);
         let (overwrite, index) = if let Some(index) = shaped {
-            let index = at.add_unassigned(Op::Constant(Constant::Number(index as f64)));
+            let index = at.add_unassigned(Op::Javascript(JsOp::Constant(Constant::Number(
+                index as f64,
+            ))));
             (block, index)
         } else {
             let flags = MemFlagsData::trusted();
@@ -157,8 +175,9 @@ fn lower_stores(graph: &mut Graph) -> bool {
                 data.span,
                 TerminatorKind::Branch(addition, Target::new(add), Target::new(check)),
             );
-            let store = Cursor::at_end(graph, add, inst)
-                .add_effect(Op::PropertyAdd(object, cache, value, write));
+            let store = Cursor::at_end(graph, add, inst).add_effect(Op::Javascript(
+                JsOp::PropertyAdd(object, cache, value, write),
+            ));
             graph.views.insert(store, view);
             graph.terminate(add, data.span, TerminatorKind::Jump(Target::new(done)));
             let fast = super::super::dispatch::branch(graph, inst, check, overwrite, fallback);
@@ -168,17 +187,15 @@ fn lower_stores(graph: &mut Graph) -> bool {
             (fast, index)
         };
         let mut at = Cursor::at_end(graph, overwrite, inst);
-        let (check, writable) =
-            at.place(Op::CanOverwrite(object, index, Field::named(&name)), true);
+        let (check, writable) = at.place(
+            Op::Javascript(JsOp::CanOverwrite(object, index, Field::named(&name))),
+            true,
+        );
         graph.views.insert(check, view);
         let writable = writable.unwrap();
         let fast = super::super::dispatch::branch(graph, inst, overwrite, writable, fallback);
-        let store = Cursor::at_end(graph, fast, inst).add_effect(Op::PropertyStore(
-            object,
-            index,
-            value,
-            Field::named(&name),
-            write,
+        let store = Cursor::at_end(graph, fast, inst).add_effect(Op::Javascript(
+            JsOp::PropertyStore(object, index, value, Field::named(&name), write),
         ));
         graph.views.insert(store, view);
         graph.terminate(fast, data.span, TerminatorKind::Jump(Target::new(done)));
@@ -203,14 +220,16 @@ pub(in crate::jit::semantic) fn lower_accesses(
         .filter(|&inst| {
             matches!(
                 graph.insts[inst].op,
-                Op::ShapedGet(..)
-                    | Op::LayoutGet(..)
-                    | Op::ProbeShapeProperty(..)
-                    | Op::CachedProperty(..)
-                    | Op::IsPropertyCached(..)
-                    | Op::FillPropertyCache(..)
-                    | Op::PrimePropertyCache(..)
-                    | Op::FillPropertyStore(..)
+                Op::Javascript(
+                    JsOp::ShapedGet(..)
+                        | JsOp::LayoutGet(..)
+                        | JsOp::ProbeShapeProperty(..)
+                        | JsOp::CachedProperty(..)
+                        | JsOp::IsPropertyCached(..)
+                        | JsOp::FillPropertyCache(..)
+                        | JsOp::PrimePropertyCache(..)
+                        | JsOp::FillPropertyStore(..)
+                )
             )
         })
         .collect();
@@ -223,16 +242,19 @@ pub(in crate::jit::semantic) fn lower_accesses(
     for inst in accesses {
         let data = graph.insts[inst].clone();
         match data.op {
-            Op::ShapedGet(object, ref name, index) => {
+            Op::Javascript(JsOp::ShapedGet(object, ref name, index)) => {
                 lower_shaped(graph, inst, object, name, index)
             }
-            Op::LayoutGet(object, ref name, layout) => {
+            Op::Javascript(JsOp::LayoutGet(object, ref name, layout)) => {
                 lower_layout(graph, inst, object, name, layout)
             }
-            Op::ProbeShapeProperty(object, ref name, layout) => {
+            Op::Javascript(JsOp::ProbeShapeProperty(object, ref name, layout)) => {
                 let first = graph.blocks.len();
                 let (block, done, fallback) = super::super::dispatch::split(graph, inst);
-                graph.set_op(inst, Op::Constant(super::super::Constant::Uninitialized));
+                graph.set_op(
+                    inst,
+                    Op::Javascript(JsOp::Constant(super::super::Constant::Uninitialized)),
+                );
                 let check = super::super::dispatch::append(
                     graph,
                     &data,
@@ -243,7 +265,7 @@ pub(in crate::jit::semantic) fn lower_accesses(
                 let (load, value) = graph.append(
                     fast,
                     data.span,
-                    Op::LayoutGet(object, name.clone(), layout),
+                    Op::Javascript(JsOp::LayoutGet(object, name.clone(), layout)),
                     true,
                 );
                 graph.insts[load].source_name = data.source_name;
@@ -259,9 +281,11 @@ pub(in crate::jit::semantic) fn lower_accesses(
                 );
                 super::super::dispatch::extend_regions(graph, block, first);
             }
-            Op::CachedProperty(object, cache, builtins)
-            | Op::IsPropertyCached(object, cache, builtins) => {
-                let validate = matches!(data.op, Op::IsPropertyCached(..));
+            Op::Javascript(
+                JsOp::CachedProperty(object, cache, builtins)
+                | JsOp::IsPropertyCached(object, cache, builtins),
+            ) => {
+                let validate = matches!(data.op, Op::Javascript(JsOp::IsPropertyCached(..)));
                 let cached = if validate && graph.blocks[data.block].insts.last() == Some(&inst) {
                     match graph.blocks[data.block].terminator.as_ref().map(|term| &term.kind) {
                         Some(TerminatorKind::Branch(condition, yes, no))
@@ -270,7 +294,7 @@ pub(in crate::jit::semantic) fn lower_accesses(
                                 && function.facts.cfg.preds[yes.block].len() == 1 =>
                         {
                             graph.blocks[yes.block].insts.first().copied().filter(|&next| {
-                                matches!(graph.insts[next].op, Op::CachedProperty(receiver, site, native)
+                                matches!(graph.insts[next].op, Op::Javascript(JsOp::CachedProperty(receiver, site, native))
                                     if receiver == object && site == cache && native == builtins)
                             })
                         }
@@ -313,14 +337,16 @@ pub(in crate::jit::semantic) fn lower_accesses(
                     let (last, address) = lowering.slot(finish, view, entry, builtins);
                     let value = lowering
                         .at(last)
-                        .add_unassigned(Op::PropertyLoad(object, address, field));
+                        .add_unassigned(Op::Javascript(JsOp::PropertyLoad(object, address, field)));
                     (last, value)
                 };
                 lowering.jump(last, continuation, vec![value]);
                 super::super::dispatch::extend_regions(lowering.graph, block, first);
             }
-            Op::FillPropertyCache(object, cache, _) | Op::PrimePropertyCache(object, cache) => {
-                let fill = matches!(data.op, Op::FillPropertyCache(..));
+            Op::Javascript(
+                JsOp::FillPropertyCache(object, cache, _) | JsOp::PrimePropertyCache(object, cache),
+            ) => {
+                let fill = matches!(data.op, Op::Javascript(JsOp::FillPropertyCache(..)));
                 let contract = graph.contract(&data.op, &function.facts);
                 graph.set_op(
                     inst,
@@ -342,7 +368,7 @@ pub(in crate::jit::semantic) fn lower_accesses(
                     },
                 );
             }
-            Op::FillPropertyStore(object, cache, _, value, _) => {
+            Op::Javascript(JsOp::FillPropertyStore(object, cache, _, value, _)) => {
                 let contract = graph.contract(&data.op, &function.facts);
                 graph.set_op(
                     inst,
@@ -367,7 +393,7 @@ fn lower_shaped(graph: &mut Graph, inst: Inst, object: Value, name: &str, index:
     use cranelift_codegen::ir::{MemFlagsData, types};
 
     let mut at = Cursor::before(graph, inst);
-    let view = at.add_unassigned(Op::View(object));
+    let view = at.add_unassigned(Op::Javascript(JsOp::View(object)));
     let values = at.ins().load(
         types::I64,
         MemFlagsData::trusted(),
@@ -376,7 +402,10 @@ fn lower_shaped(graph: &mut Graph, inst: Inst, object: Value, name: &str, index:
     );
     let offset = at.ins().iconst(types::I64, i64::from(index) * 8);
     let address = at.ins().iadd(values, offset);
-    graph.set_op(inst, Op::PropertyLoad(object, address, Field::named(name)));
+    graph.set_op(
+        inst,
+        Op::Javascript(JsOp::PropertyLoad(object, address, Field::named(name))),
+    );
 }
 
 fn lower_layout(graph: &mut Graph, inst: Inst, object: Value, name: &str, layout: ReadLayout) {
@@ -397,7 +426,11 @@ fn lower_layout(graph: &mut Graph, inst: Inst, object: Value, name: &str, layout
     let address = at.ins().iadd(values, offset);
     graph.set_op(
         inst,
-        Op::RelatedPropertyLoad(object, address, Field::named(name)),
+        Op::Javascript(JsOp::RelatedPropertyLoad(
+            object,
+            address,
+            Field::named(name),
+        )),
     );
 }
 
@@ -698,8 +731,9 @@ pub(in crate::jit::semantic) fn lower_loads(function: &mut FunctionState) {
     let graph = &mut function.graph;
     for &block in &function.facts.cfg.rpo {
         for inst in graph.blocks[block].insts.clone() {
-            let (Op::PropertyLoad(_, address, _) | Op::RelatedPropertyLoad(_, address, _)) =
-                graph.insts[inst].op
+            let Op::Javascript(
+                JsOp::PropertyLoad(_, address, _) | JsOp::RelatedPropertyLoad(_, address, _),
+            ) = graph.insts[inst].op
             else {
                 continue;
             };

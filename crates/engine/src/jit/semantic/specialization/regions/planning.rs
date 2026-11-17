@@ -9,6 +9,7 @@ use super::versioning::{Bailouts, materialize};
 use super::*;
 #[cfg(test)]
 use crate::jit::layout::ReadLayout;
+use crate::jit::semantic::JsOp;
 use crate::{FxHashMap, FxHashSet};
 
 fn plan(
@@ -165,7 +166,7 @@ fn plan(
             .reads
             .iter()
             .filter_map(|&inst| {
-                let Op::Get(..) = candidate.insts[inst].op else {
+                let Op::Javascript(JsOp::Get(..)) = candidate.insts[inst].op else {
                     return None;
                 };
                 // The probe validates its own shape without a region-wide shape assumption.
@@ -417,17 +418,15 @@ mod tests {
         assert!(
             operations
                 .iter()
-                .any(|&inst| matches!(&candidate.insts[inst].op, Op::Get(_, name) if name == "x"))
+                .any(|&inst| matches!(&candidate.insts[inst].op, Op::Javascript(JsOp::Get(_, name)) if name == "x"))
         );
         assert!(!operations.iter().any(
-            |&inst| matches!(&candidate.insts[inst].op, Op::ProbeProperty(_, name) if name == "x")
+            |&inst| matches!(&candidate.insts[inst].op, Op::Javascript(JsOp::ProbeProperty(_, name)) if name == "x")
         ));
-        assert!(
-            operations
-                .iter()
-                .any(|&inst| matches!(candidate.insts[inst].op, Op::Call { .. })
-                    && facts.memory(inst).reenters())
-        );
+        assert!(operations.iter().any(|&inst| matches!(
+            candidate.insts[inst].op,
+            Op::Javascript(JsOp::Call { .. })
+        ) && facts.memory(inst).reenters()));
         candidate.verify().unwrap();
     }
 
@@ -455,8 +454,11 @@ mod tests {
         let bailouts = Bailouts::new(&original);
         let values = original.values.keys().map(|value| (value, value)).collect();
         let failure = bailouts.target(&mut candidate, Target::new(original.entry), &values);
-        let condition =
-            candidate.append_value(start, candidate.span, Op::Constant(Constant::Boolean(true)));
+        let condition = candidate.append_value(
+            start,
+            candidate.span,
+            Op::Javascript(JsOp::Constant(Constant::Boolean(true))),
+        );
         candidate.terminate(
             before,
             candidate.span,
@@ -571,7 +573,7 @@ mod tests {
                 .insts
                 .iter()
                 .filter_map(|(inst, data)| {
-                    matches!(data.op, Op::Get(..) | Op::Set(..)).then_some(inst)
+                    matches!(data.op, Op::Javascript(JsOp::Get(..) | JsOp::Set(..))).then_some(inst)
                 })
                 .collect();
             for inst in accesses {
@@ -613,7 +615,10 @@ mod tests {
                     .rpo
                     .iter()
                     .flat_map(|&block| &graph.blocks[block].insts)
-                    .filter(|&&inst| matches!(graph.insts[inst].op, Op::CallNative(..)))
+                    .filter(|&&inst| matches!(
+                        graph.insts[inst].op,
+                        Op::Javascript(JsOp::CallNative(..))
+                    ))
                     .count(),
                 2
             );
@@ -683,7 +688,7 @@ mod tests {
                 .insts
                 .values()
                 .find_map(|data| {
-                    matches!(data.op, Op::Get(_, ref name) if name == "x")
+                    matches!(data.op, Op::Javascript(JsOp::Get(_, ref name)) if name == "x")
                         .then(|| (data.span, data.result().unwrap()))
                 })
                 .unwrap();
@@ -710,7 +715,8 @@ mod tests {
             if expected {
                 let facts = Facts::assuming(&graph, &assumptions);
                 for data in graph.insts.values() {
-                    if let Op::Binary(BinaryOperator::Addition, left, _) = data.op {
+                    if let Op::Javascript(JsOp::Binary(BinaryOperator::Addition, left, _)) = data.op
+                    {
                         assert!(facts.of(left).within(ValueType::NUMBER), "{source}");
                     }
                 }
@@ -728,7 +734,7 @@ mod tests {
         );
         let mut repository = super::super::super::calls::Repository::default();
         for data in graph.insts.values() {
-            if matches!(data.op, Op::Get(..)) {
+            if matches!(data.op, Op::Javascript(JsOp::Get(..))) {
                 repository.read_feedback.insert(
                     (
                         Site {
@@ -748,9 +754,12 @@ mod tests {
             .insts
             .values()
             .find_map(|data| match data.op {
-                Op::Binary(BinaryOperator::Addition, left, right)
-                    if matches!(graph.defining_op(left), Some(Op::Get(..)))
-                        && matches!(graph.defining_op(right), Some(Op::Get(..))) =>
+                Op::Javascript(JsOp::Binary(BinaryOperator::Addition, left, right))
+                    if matches!(graph.defining_op(left), Some(Op::Javascript(JsOp::Get(..))))
+                        && matches!(
+                            graph.defining_op(right),
+                            Some(Op::Javascript(JsOp::Get(..)))
+                        ) =>
                 {
                     data.result()
                 }
@@ -787,7 +796,7 @@ mod tests {
                 .rpo
                 .iter()
                 .flat_map(|&block| &planned.graph.blocks[block].insts)
-                .filter(|&&inst| matches!(&planned.graph.insts[inst].op, Op::Get(_, name) if name == "strength"))
+                .filter(|&&inst| matches!(&planned.graph.insts[inst].op, Op::Javascript(JsOp::Get(_, name)) if name == "strength"))
                 .count();
             assert_eq!(reads, expected);
             planned.graph.verify().unwrap();
@@ -828,7 +837,7 @@ mod tests {
                 .rpo
                 .iter()
                 .flat_map(|&block| &graph.blocks[block].insts)
-                .filter(|&&inst| matches!(graph.insts[inst].op, Op::AsInteger(_)))
+                .filter(|&&inst| matches!(graph.insts[inst].op, Op::Javascript(JsOp::AsInteger(_))))
                 .map(|&inst| graph.insts[inst].result().unwrap())
                 .collect();
             assert_eq!(!integers.is_empty(), observed == ReadType::Integer);
@@ -849,7 +858,9 @@ mod tests {
         for data in graph.insts.values() {
             let observed = match data.op {
                 Op::Argument(0) => Some((ReadKind::Number, ReadType::Integer)),
-                Op::GetIndex(..) => Some((ReadKind::Receiver, ReadType::Typed(TypedKind::Int32))),
+                Op::Javascript(JsOp::GetIndex(..)) => {
+                    Some((ReadKind::Receiver, ReadType::Typed(TypedKind::Int32)))
+                }
                 _ => None,
             };
             if let Some((kind, observed)) = observed {
@@ -889,14 +900,14 @@ mod tests {
                 };
                 matches!(
                     graph.defining_op(right),
-                    Some(Op::TypedIndex(
+                    Some(Op::Javascript(JsOp::TypedIndex(
                         _,
                         _,
                         TypedRead {
                             element: Some(TypedKind::Int32),
                             bounded: true
                         }
-                    ))
+                    )))
                 ) && facts.of(data.result().unwrap()).within(ValueType::INTEGER)
             });
         assert!(integer_add);
@@ -914,7 +925,7 @@ mod tests {
         let data = graph
             .insts
             .values()
-            .find(|data| matches!(data.op, Op::GetIndex(..)))
+            .find(|data| matches!(data.op, Op::Javascript(JsOp::GetIndex(..))))
             .unwrap();
         let site = Site {
             inline_context: 0,
@@ -938,7 +949,7 @@ mod tests {
             .filter(|block| !graph.cold.contains(block))
             .flat_map(|&block| graph.blocks[block].insts.iter())
             .filter_map(|&inst| match graph.insts[inst].op {
-                Op::TypedIndex(_, _, read) => Some(read.element),
+                Op::Javascript(JsOp::TypedIndex(_, _, read)) => Some(read.element),
                 _ => None,
             })
             .collect();
@@ -967,10 +978,12 @@ mod tests {
         let cfg = Cfg::new(&candidate);
         assert_eq!(natural_loops(&candidate, &cfg).len(), 2);
         assert!(cfg.rpo.iter().any(|&block| {
-            candidate.blocks[block]
-                .insts
-                .iter()
-                .any(|&inst| matches!(candidate.insts[inst].op, Op::CallNative(..)))
+            candidate.blocks[block].insts.iter().any(|&inst| {
+                matches!(
+                    candidate.insts[inst].op,
+                    Op::Javascript(JsOp::CallNative(..))
+                )
+            })
         }));
         assert!(cfg.rpo.iter().any(|&block| matches!(
             candidate.blocks[block].terminator.as_ref().unwrap().kind,
@@ -985,7 +998,8 @@ mod tests {
                 else {
                     return None;
                 };
-                let Op::GuardValid(guard) = candidate.defining_op(*condition)? else {
+                let Op::Javascript(JsOp::GuardValid(guard)) = candidate.defining_op(*condition)?
+                else {
                     return None;
                 };
                 Some((*guard, no.block))
@@ -1001,7 +1015,7 @@ mod tests {
                     continue;
                 }
                 committed |= candidate.blocks[block].insts.iter().any(
-                    |&inst| matches!(candidate.insts[inst].op, Op::GuardCommit(id) if id == guard),
+                    |&inst| matches!(candidate.insts[inst].op, Op::Javascript(JsOp::GuardCommit(id)) if id == guard),
                 );
                 if let Some(term) = &candidate.blocks[block].terminator {
                     pending.extend(term.kind.targets().into_iter().map(|target| target.block));
@@ -1051,7 +1065,7 @@ mod tests {
             graph.blocks[block]
                 .insts
                 .iter()
-                .any(|&inst| matches!(graph.insts[inst].op, Op::Call { .. }))
+                .any(|&inst| matches!(graph.insts[inst].op, Op::Javascript(JsOp::Call { .. })))
         }));
         graph.verify().unwrap();
     }
@@ -1112,7 +1126,7 @@ mod tests {
         for data in graph
             .insts
             .values()
-            .filter(|data| matches!(data.op, Op::GetIndex(..)))
+            .filter(|data| matches!(data.op, Op::Javascript(JsOp::GetIndex(..))))
         {
             repository.read_feedback.insert(
                 (
@@ -1141,7 +1155,7 @@ mod tests {
             .filter(|&&inst| {
                 matches!(
                     graph.insts[inst].op,
-                    Op::IsTyped(_, Some(TypedKind::Uint16))
+                    Op::Javascript(JsOp::IsTyped(_, Some(TypedKind::Uint16)))
                 )
             })
             .count();
@@ -1158,7 +1172,7 @@ mod tests {
         );
         let mut repository = super::super::super::calls::Repository::default();
         for data in graph.insts.values() {
-            if !matches!(data.op, Op::GetIndex(..)) {
+            if !matches!(data.op, Op::Javascript(JsOp::GetIndex(..))) {
                 continue;
             }
             let site = Site {
@@ -1221,9 +1235,9 @@ mod tests {
         );
         let mut repository = super::super::super::calls::Repository::default();
         for data in graph.insts.values() {
-            if let Op::GetIndex(object, _) = data.op {
+            if let Op::Javascript(JsOp::GetIndex(object, _)) = data.op {
                 let element = match graph.defining_op(object) {
-                    Some(Op::GetIndex(..)) => TypedKind::Float64,
+                    Some(Op::Javascript(JsOp::GetIndex(..))) => TypedKind::Float64,
                     Some(Op::Argument(1)) => TypedKind::Int32,
                     Some(Op::Argument(2)) => TypedKind::Float64,
                     _ => continue,
@@ -1241,7 +1255,10 @@ mod tests {
                     ReadType::Typed(element),
                 );
             }
-            if matches!(data.op, Op::Binary(BinaryOperator::Addition, ..)) {
+            if matches!(
+                data.op,
+                Op::Javascript(JsOp::Binary(BinaryOperator::Addition, ..))
+            ) {
                 repository.read_feedback.insert(
                     (
                         Site {
@@ -1280,7 +1297,7 @@ mod tests {
             .insts
             .values()
             .find_map(|data| {
-                matches!(data.op, Op::Construct { .. })
+                matches!(data.op, Op::Javascript(JsOp::Construct { .. }))
                     .then_some(data.result())
                     .flatten()
             })
@@ -1299,7 +1316,7 @@ mod tests {
         let (_, outer_header) = plans[0].entry.unwrap();
         assert!(cfg.rpo.iter().any(|&block| {
             let Some(Terminator { kind: TerminatorKind::Branch(condition, good, _), .. }) = &candidate.blocks[block].terminator else { return false };
-            matches!(candidate.defining_op(*condition), Some(Op::IsTyped(object, _)) if *object == xs)
+            matches!(candidate.defining_op(*condition), Some(Op::Javascript(JsOp::IsTyped(object, _))) if *object == xs)
                 && cfg.dominates(good.block, outer_header)
         }));
         assert!(
@@ -1320,7 +1337,7 @@ mod tests {
             .rpo
             .iter()
             .flat_map(|&block| &graph.blocks[block].insts)
-            .filter(|&&inst| matches!(graph.insts[inst].op, Op::IsTyped(object, _) if object == xs))
+            .filter(|&&inst| matches!(graph.insts[inst].op, Op::Javascript(JsOp::IsTyped(object, _)) if object == xs))
             .count();
         assert_eq!(checks, 1);
         graph.verify().unwrap();
@@ -1346,13 +1363,13 @@ mod tests {
         assert!(root.entry.is_none());
         let cfg = Cfg::new(&candidate);
         let checks: Vec<_> = cfg.rpo.iter().copied().filter(|&block| candidate.blocks[block].insts.iter().any(|&inst| {
-            let (Op::IsNumber(value) | Op::IsInteger(value)) = candidate.insts[inst].op else { return false; };
-            matches!(candidate.defining_op(value), Some(Op::ProbeProperty(_, name)) if name == "width")
+            let Op::Javascript(JsOp::IsNumber(value) | JsOp::IsInteger(value)) = candidate.insts[inst].op else { return false; };
+            matches!(candidate.defining_op(value), Some(Op::Javascript(JsOp::ProbeProperty(_, name))) if name == "width")
         })).collect();
         assert!(!checks.is_empty());
         for block in checks {
             assert!(cfg.rpo.iter().any(|&write| cfg.dominates(write, block) && candidate.blocks[write].insts.iter()
-                .any(|&inst| matches!(&candidate.insts[inst].op, Op::Set(_, name, _) if name == "width"))));
+                .any(|&inst| matches!(&candidate.insts[inst].op, Op::Javascript(JsOp::Set(_, name, _)) if name == "width"))));
         }
         candidate.verify().unwrap();
     }
@@ -1371,17 +1388,14 @@ mod tests {
             .flat_map(|&block| graph.blocks[block].insts.iter())
             .copied()
             .collect();
-        assert!(
-            operations
-                .iter()
-                .any(|&inst| matches!(graph.insts[inst].op, Op::IsNumber(_) | Op::IsInteger(_)))
-        );
-        assert!(
-            operations
-                .iter()
-                .any(|&inst| matches!(graph.insts[inst].op, Op::Call { .. })
-                    && facts.memory(inst).reenters())
-        );
+        assert!(operations.iter().any(|&inst| matches!(
+            graph.insts[inst].op,
+            Op::Javascript(JsOp::IsNumber(_) | JsOp::IsInteger(_))
+        )));
+        assert!(operations.iter().any(|&inst| matches!(
+            graph.insts[inst].op,
+            Op::Javascript(JsOp::Call { .. })
+        ) && facts.memory(inst).reenters()));
         graph.verify().unwrap();
     }
 
@@ -1412,7 +1426,8 @@ pub(in crate::jit::semantic) fn materialize_properties(graph: &mut Graph) -> Res
         .copied()
         .flat_map(|block| graph.blocks[block].insts.iter().copied())
         .filter_map(|inst| {
-            let (Op::Get(object, _) | Op::Set(object, ..)) = graph.insts[inst].op else {
+            let Op::Javascript(JsOp::Get(object, _) | JsOp::Set(object, ..)) = graph.insts[inst].op
+            else {
                 return None;
             };
             let access = graph.property_accesses.get(&inst)?;
@@ -1433,7 +1448,7 @@ pub(in crate::jit::semantic) fn materialize_properties(graph: &mut Graph) -> Res
         .collect();
     for (inst, shapes) in accesses {
         let data = graph.insts[inst].clone();
-        let (Op::Get(object, _) | Op::Set(object, ..)) = data.op else {
+        let Op::Javascript(JsOp::Get(object, _) | JsOp::Set(object, ..)) = data.op else {
             unreachable!()
         };
         let alternatives = shapes

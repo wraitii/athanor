@@ -1,10 +1,11 @@
+use crate::jit::semantic::JsOp;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{MemFlagsData, Type, types};
 
 use super::low_level::{Builder, Op as LowOp, Unary};
 use super::{
-    Constant, Facts, Graph, Inst, MemoryFormat, MemoryOp, Op, TerminatorKind, TypedRead, Value,
-    ValueDef, ValueType, resolve,
+    Constant, Facts, Graph, Inst, MemoryFormat, MemoryOp, Op, TerminatorKind, Value, ValueDef,
+    ValueType, resolve,
 };
 use crate::value::Value as JsValue;
 use cranelift_codegen::entity::SecondaryMap;
@@ -213,6 +214,7 @@ pub(super) fn assign(graph: &mut Graph, facts: &Facts) {
 
 pub(in crate::jit) fn intrinsic(op: &Op) -> Option<Repr> {
     Some(match op {
+        Op::Javascript(op) => return super::js::repr::intrinsic(op),
         Op::LowLevel(
             LowOp::Load { ty, .. }
             | LowOp::AtomicLoad { ty, .. }
@@ -236,48 +238,15 @@ pub(in crate::jit) fn intrinsic(op: &Op) -> Option<Repr> {
         Op::LowLevel(LowOp::Binary { op, .. }) if op.is_float() => Repr::F64,
         Op::LowLevel(LowOp::Binary { op, .. }) if op.is_boolean() => Repr::Boolean,
         Op::LowLevel(LowOp::Binary { .. }) => Repr::I64,
-        Op::TypedData(_) | Op::Memory(MemoryOp::Address { .. }) => Repr::Word,
+        Op::Memory(MemoryOp::Address { .. }) => Repr::Word,
         Op::Memory(MemoryOp::IndexedLoad { format, .. } | MemoryOp::Load { format, .. }) => {
             format.repr()
         }
         Op::LowLevel(_) | Op::Aarch64(_) => return None,
-        Op::PropertyCache(..) | Op::GlobalCache(..) | Op::AsWord(_) => Repr::Word,
-        Op::MemoryNumber(_, format) => match format {
-            MemoryFormat::U32 | MemoryFormat::F32 | MemoryFormat::F64 => Repr::F64,
-            _ => Repr::I32,
-        },
+        Op::AsWord(_) => Repr::Word,
         Op::Convert(_, repr) | Op::Unbox(_, repr) => *repr,
-        Op::NumericFloat(_) => Repr::F64,
-        Op::AsNumber(_) => return None,
-        Op::SaturatingInteger(_) | Op::AsInteger(_) | Op::ArrayPosition(_) => Repr::I64,
-        Op::ToInt32(_) | Op::ArrayKind(_) => Repr::I32,
         Op::HelperCall { produces, .. } => produces.unwrap_or(Repr::Boxed),
-        Op::IntegerCheck(..)
-        | Op::IsInteger(_)
-        | Op::IsCode(..)
-        | Op::IsShape(..)
-        | Op::IsReadLayout(..)
-        | Op::IsTyped(..)
-        | Op::IsPropertyCached(..)
-        | Op::IsIndexed(_)
-        | Op::IsOrdinaryArray(_)
-        | Op::IsString(_)
-        | Op::Truthy(_)
-        | Op::IsNumber(_)
-        | Op::IsUninitialized(_)
-        | Op::IsUndefined(_)
-        | Op::IsNullish(_)
-        | Op::CanOverwrite(..)
-        | Op::IsArray(..)
-        | Op::Regex(super::regex::Op::IsPattern(..) | super::regex::Op::Test(..)) => Repr::Boolean,
-        Op::TypedIndex(
-            _,
-            _,
-            TypedRead {
-                element: Some(kind),
-                bounded: true,
-            },
-        ) => element(*kind),
+        Op::Regex(super::regex::Op::IsPattern(..) | super::regex::Op::Test(..)) => Repr::Boolean,
         _ => Repr::Boxed,
     })
 }
@@ -310,7 +279,7 @@ fn representation(graph: &Graph, facts: &Facts, value: super::Value) -> Repr {
     if let Some(repr) = op.and_then(intrinsic) {
         return repr;
     }
-    if let Some(&Op::AsNumber(input)) = op {
+    if let Some(&Op::Javascript(JsOp::AsNumber(input))) = op {
         return graph.reprs[input].unwrap_or_else(|| representation(graph, facts, input));
     }
     match Repr::of(facts.of(value)) {
@@ -388,7 +357,7 @@ fn rewrite(builder: &mut Builder<'_>, stage: Stage) -> Result<(), String> {
         let insts = std::mem::take(&mut builder.graph.blocks[block].insts);
         builder.switch_to_block(block);
         for inst in insts {
-            if let Op::Constant(constant) = &builder.graph.insts[inst].op {
+            if let Op::Javascript(JsOp::Constant(constant)) = &builder.graph.insts[inst].op {
                 let result = builder.graph.insts[inst].result().unwrap();
                 let repr = builder.graph.repr(result);
                 if stage != Stage::Runtime && (stage == Stage::Words) == (repr == Repr::Boxed) {
@@ -400,7 +369,7 @@ fn rewrite(builder: &mut Builder<'_>, stage: Stage) -> Result<(), String> {
                 builder.graph.blocks[block].insts.push(inst);
                 continue;
             }
-            if let Op::AsBoxed(word) | Op::AsWord(word) | Op::AsNumber(word) =
+            if let Op::AsBoxed(word) | Op::AsWord(word) | Op::Javascript(JsOp::AsNumber(word)) =
                 builder.graph.insts[inst].op
             {
                 let result = builder.graph.insts[inst].result().unwrap();
@@ -529,11 +498,13 @@ fn expansion(graph: &Graph, inst: Inst, stage: Stage) -> Option<(Value, Step)> {
         (Stage::Machine, &Op::Convert(input, to)) => Some((input, Step::Convert(to))),
         (
             Stage::Runtime,
-            &(Op::NumericFloat(input)
-            | Op::SaturatingInteger(input)
-            | Op::AsInteger(input)
-            | Op::ArrayPosition(input)
-            | Op::ToInt32(input)),
+            &Op::Javascript(
+                JsOp::NumericFloat(input)
+                | JsOp::SaturatingInteger(input)
+                | JsOp::AsInteger(input)
+                | JsOp::ArrayPosition(input)
+                | JsOp::ToInt32(input),
+            ),
         ) => Some((input, Step::Convert(graph.repr(data.result()?)))),
         _ => None,
     }
@@ -584,7 +555,7 @@ fn box_value(builder: &mut Builder<'_>, value: Value) -> Value {
                 let bits = JsValue::number(f64::from_bits(*bits)).bits();
                 builder.ins().iconst(types::I64, bits as i64)
             }
-            Some(Op::Constant(Constant::Number(number))) => {
+            Some(Op::Javascript(JsOp::Constant(Constant::Number(number)))) => {
                 let bits = JsValue::number(*number).bits();
                 builder.ins().iconst(types::I64, bits as i64)
             }
@@ -609,7 +580,7 @@ fn from_integer(graph: &Graph, value: Value) -> bool {
             op: Unary::FloatFromSigned | Unary::FloatFromUnsigned,
             ..
         })) => return true,
-        Some(Op::Convert(input, _) | Op::NumericFloat(input)) => *input,
+        Some(Op::Convert(input, _) | Op::Javascript(JsOp::NumericFloat(input))) => *input,
         _ => return false,
     };
     matches!(graph.repr(input), Repr::Integer(_) | Repr::Boolean)
