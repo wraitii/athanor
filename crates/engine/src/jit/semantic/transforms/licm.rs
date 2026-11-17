@@ -1,7 +1,7 @@
 use crate::FxHashSet;
 
 use super::super::specialization::regions::Writes;
-use super::super::{Block, Facts, Graph, Op};
+use super::super::{Block, Facts, Graph, Op, low_level};
 use super::loops::{natural_loops, preheader};
 
 pub(in crate::jit::semantic) fn hoist(
@@ -25,10 +25,16 @@ pub(in crate::jit::semantic) fn hoist(
             op.operands_iter()
                 .all(|value| !body.contains(&graph.def_block(value)))
         };
+        let constant = |op: &Op| {
+            matches!(
+                op,
+                Op::LowLevel(low_level::Op::Integer { .. } | low_level::Op::Float64(_))
+            )
+        };
         let mut moved = Vec::new();
         for inst in graph.blocks[header].insts.clone() {
             let data = &graph.insts[inst];
-            if matches!(data.op, Op::ReadHint(..)) {
+            if matches!(data.op, Op::ReadHint(..)) || constant(&data.op) {
                 continue;
             }
             let pure = facts.is_pure(inst);
@@ -49,6 +55,7 @@ pub(in crate::jit::semantic) fn hoist(
             for inst in graph.blocks[block].insts.clone() {
                 let data = &graph.insts[inst];
                 if !data.results.is_empty()
+                    && !constant(&data.op)
                     && (facts.is_pure(inst)
                         || (facts.removable(inst)
                             && writes
