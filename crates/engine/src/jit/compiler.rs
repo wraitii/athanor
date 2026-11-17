@@ -406,20 +406,64 @@ impl Compiler {
         }
     }
 
+    fn compile_baseline(
+        &mut self,
+        graph: &super::semantic::Graph,
+        source_name: (usize, usize),
+        osr: bool,
+        owner: Option<u64>,
+    ) -> Option<Arc<MachineCode>> {
+        if self.ssa_opt
+            || self.module.isa().name() != "aarch64"
+            || self.optimization != crate::OptimizationLevel::Baseline
+        {
+            return None;
+        }
+        let mut data = FunctionData::new();
+        let code = super::aarch64::compile_baseline(
+            graph,
+            source_name,
+            osr,
+            owner.map(|owner| (owner, self.baseline_warmup)),
+            self.dump_ir || self.inspection.is_some(),
+            &mut self.names,
+            &mut data,
+        )
+        .map_err(|reason| {
+            if let Some(stats) = &mut self.stats {
+                *stats.baseline_refusals.entry(reason.0).or_default() += 1;
+            }
+        })
+        .ok()?;
+        self.data.push(data);
+        Some(Arc::new(code))
+    }
+
     fn emit_body(
         &mut self,
         signature: Signature,
         source_name: (usize, usize),
+        baseline: Option<Arc<MachineCode>>,
+        listing: Option<jitdump::Listing>,
+        inspection: super::inspect::Inspection,
         build: impl FnOnce(finalize::Output<'_, '_>) -> Result<(), Error>,
-    ) -> Result<
-        (
-            cranelift_codegen::ir::Function,
-            Annotations,
-            Option<super::semantic::Graph>,
-            Option<(String, String)>,
-        ),
-        Error,
-    > {
+    ) -> Result<FunctionBody, Error> {
+        let mut annotations = Annotations {
+            semantic_locations: self.dump_ir || self.inspection.is_some(),
+            ..Annotations::default()
+        };
+        if baseline.is_some() {
+            let mut function = cranelift_codegen::ir::Function::new();
+            function.signature = signature;
+            return Ok(FunctionBody {
+                function,
+                lowered: None,
+                baseline,
+                annotations,
+                listing,
+                inspection,
+            });
+        }
         let pass = self
             .inspection
             .as_deref()
@@ -430,10 +474,6 @@ impl Compiler {
             if pass.as_deref() == Some(name) {
                 snapshot = Some((name.to_owned(), super::inspect::graph_text(graph)));
             }
-        };
-        let mut annotations = Annotations {
-            semantic_locations: self.dump_ir || self.inspection.is_some(),
-            ..Annotations::default()
         };
         self.context.clear();
         self.context.func.signature = signature;
@@ -489,7 +529,14 @@ impl Compiler {
             &mut self.context.func,
             cranelift_codegen::ir::Function::new(),
         );
-        Ok((function, annotations, lowered, snapshot))
+        Ok(FunctionBody {
+            function,
+            lowered,
+            baseline,
+            annotations,
+            listing,
+            inspection: inspection.lowered(snapshot),
+        })
     }
 
     fn machine_code(
@@ -1022,30 +1069,7 @@ impl Compiler {
                 (&label, line),
                 None,
             )?;
-            let mut baseline_data = super::function_data::FunctionData::new();
-            let baseline = if !self.ssa_opt
-                && self.module.isa().name() == "aarch64"
-                && self.optimization == crate::OptimizationLevel::Baseline
-            {
-                super::aarch64::compile_baseline(
-                    &graph.graph,
-                    self.source_name,
-                    false,
-                    None,
-                    self.dump_ir || self.inspection.is_some(),
-                    &mut self.names,
-                    &mut baseline_data,
-                )
-                .map_err(|reason| {
-                    if let Some(stats) = &mut self.stats {
-                        *stats.baseline_refusals.entry(reason.0).or_default() += 1;
-                    }
-                })
-                .ok()
-                .map(Arc::new)
-            } else {
-                None
-            };
+            let baseline = self.compile_baseline(&graph.graph, self.source_name, false, None);
             if baseline.is_none() {
                 passes
                     .lower_runtime(&mut graph, false)
@@ -1063,36 +1087,15 @@ impl Compiler {
             if let Some(listing) = &mut listing {
                 self.remap_listing(listing, &graph, self.source_name.0);
             }
-            let (function, annotations, lowered, snapshot) = if baseline.is_some() {
-                self.data.push(baseline_data);
-                let mut function = cranelift_codegen::ir::Function::new();
-                function.signature = self.signature.clone();
-                (
-                    function,
-                    Annotations {
-                        semantic_locations: self.dump_ir || self.inspection.is_some(),
-                        ..Annotations::default()
-                    },
-                    None,
-                    None,
-                )
-            } else {
-                self.emit_body(self.signature.clone(), self.source_name, |out| {
-                    finalize::build_global(out, graph.graph, &graph.facts, &continuations)
-                })?
-            };
-            let inspection = inspection.lowered(snapshot);
-            pending.push((
-                id,
-                FunctionBody {
-                    function,
-                    lowered,
-                    baseline,
-                    annotations,
-                    inspection,
-                    listing,
-                },
-            ));
+            let body = self.emit_body(
+                self.signature.clone(),
+                self.source_name,
+                baseline,
+                listing,
+                inspection,
+                |out| finalize::build_global(out, graph.graph, &graph.facts, &continuations),
+            )?;
+            pending.push((id, body));
             Some(id)
         };
 
@@ -1799,34 +1802,17 @@ impl Compiler {
         let feedback = ((self.ssa_opt || self.optimization == crate::OptimizationLevel::Baseline)
             && !self.canonical.is_region(code))
         .then_some(feedback);
-        let mut baseline_data = super::function_data::FunctionData::new();
-        let baseline = if initial
-            && !self.ssa_opt
-            && self.module.isa().name() == "aarch64"
-            && self.optimization == crate::OptimizationLevel::Baseline
-        {
-            super::aarch64::compile_baseline(
+        let baseline = if initial {
+            self.compile_baseline(
                 &graph.graph,
                 emission.source_name,
                 self.osr,
-                Some((u64::from(code.as_u32()), self.baseline_warmup)),
-                self.dump_ir || self.inspection.is_some(),
-                &mut self.names,
-                &mut baseline_data,
+                Some(u64::from(code.as_u32())),
             )
-            .map_err(|reason| {
-                if let Some(stats) = &mut self.stats {
-                    *stats.baseline_refusals.entry(reason.0).or_default() += 1;
-                }
-            })
-            .ok()
-            .map(Arc::new)
         } else {
             None
         };
-        if baseline.is_some() {
-            self.data.push(baseline_data);
-        } else {
+        if baseline.is_none() {
             passes
                 .lower_runtime(&mut graph, initial && tier == CompilationTier::Baseline)
                 .map_err(Error::Unsupported)?;
@@ -1842,20 +1828,13 @@ impl Compiler {
             inline_multiplier,
         )
         .after(passes.snapshot);
-        let (function, annotations, lowered, snapshot) = if baseline.is_some() {
-            let mut function = cranelift_codegen::ir::Function::new();
-            function.signature = signature;
-            (
-                function,
-                Annotations {
-                    semantic_locations: self.dump_ir || self.inspection.is_some(),
-                    ..Annotations::default()
-                },
-                None,
-                None,
-            )
-        } else {
-            self.emit_body(signature, emission.source_name, |out| {
+        let body = self.emit_body(
+            signature,
+            emission.source_name,
+            baseline,
+            listing,
+            inspection,
+            |out| {
                 finalize::build_function(
                     out,
                     emission.params,
@@ -1864,17 +1843,8 @@ impl Compiler {
                     &continuations,
                     feedback,
                 )
-            })?
-        };
-        let inspection = inspection.lowered(snapshot);
-        let body = FunctionBody {
-            function,
-            lowered,
-            baseline,
-            annotations,
-            listing,
-            inspection,
-        };
+            },
+        )?;
         let id = if declared {
             code
         } else {
@@ -2090,33 +2060,8 @@ impl Compiler {
         let mut listing = self
             .listing()
             .then(|| jitdump::Listing::new(state.listing_lines()));
-        let mut data = FunctionData::new();
-        let baseline = if !self.ssa_opt
-            && self.module.isa().name() == "aarch64"
-            && self.optimization == crate::OptimizationLevel::Baseline
-        {
-            super::aarch64::compile_baseline(
-                &state.graph,
-                source_name,
-                false,
-                None,
-                self.dump_ir || self.inspection.is_some(),
-                &mut self.names,
-                &mut data,
-            )
-            .map_err(|reason| {
-                if let Some(stats) = &mut self.stats {
-                    *stats.baseline_refusals.entry(reason.0).or_default() += 1;
-                }
-            })
-            .ok()
-            .map(Arc::new)
-        } else {
-            None
-        };
-        if baseline.is_some() {
-            self.data.push(data);
-        } else {
+        let baseline = self.compile_baseline(&state.graph, source_name, false, None);
+        if baseline.is_none() {
             passes
                 .lower_runtime(&mut state, recovery)
                 .map_err(Error::Unsupported)?;
@@ -2127,20 +2072,13 @@ impl Compiler {
         if let Some(listing) = &mut listing {
             self.remap_listing(listing, &state, source_name.0);
         }
-        let (function, annotations, lowered, snapshot) = if baseline.is_some() {
-            let mut function = cranelift_codegen::ir::Function::new();
-            function.signature = self.signature.clone();
-            (
-                function,
-                Annotations {
-                    semantic_locations: self.dump_ir || self.inspection.is_some(),
-                    ..Annotations::default()
-                },
-                None,
-                None,
-            )
-        } else {
-            self.emit_body(self.signature.clone(), source_name, |out| {
+        self.emit_body(
+            self.signature.clone(),
+            source_name,
+            baseline,
+            listing,
+            inspection,
+            |out| {
                 finalize::build_function(
                     out,
                     params,
@@ -2149,17 +2087,8 @@ impl Compiler {
                     continuations,
                     feedback,
                 )
-            })?
-        };
-        let inspection = inspection.lowered(snapshot);
-        Ok(FunctionBody {
-            function,
-            lowered,
-            annotations,
-            baseline,
-            inspection,
-            listing,
-        })
+            },
+        )
     }
 
     fn compile_callable(
@@ -2398,38 +2327,18 @@ impl Compiler {
                 },
             );
         }
-        let mut baseline_data = super::function_data::FunctionData::new();
-        let baseline = if self.optimization == crate::OptimizationLevel::Baseline
-            && self.module.isa().name() == "aarch64"
-            && !self.ssa_opt
-            && matches!(kind, finalize::FunctionKind::Ordinary)
-        {
-            graph
-                .as_ref()
-                .and_then(|graph| {
-                    super::aarch64::compile_baseline(
-                        &graph.graph,
-                        self.source_name,
-                        self.osr,
-                        feedback.map(|code| (u64::from(code.as_u32()), self.baseline_warmup)),
-                        self.dump_ir || self.inspection.is_some(),
-                        &mut self.names,
-                        &mut baseline_data,
-                    )
-                    .map_err(|reason| {
-                        if let Some(stats) = &mut self.stats {
-                            *stats.baseline_refusals.entry(reason.0).or_default() += 1;
-                        }
-                    })
-                    .ok()
-                })
-                .map(Arc::new)
+        let baseline = if matches!(kind, finalize::FunctionKind::Ordinary) {
+            graph.as_ref().and_then(|graph| {
+                self.compile_baseline(
+                    &graph.graph,
+                    self.source_name,
+                    self.osr,
+                    feedback.map(|code| u64::from(code.as_u32())),
+                )
+            })
         } else {
             None
         };
-        if baseline.is_some() {
-            self.data.push(baseline_data);
-        }
         let continuations = match &graph {
             Some(graph) => self.compile_continuations(
                 &graph.graph,
@@ -2470,20 +2379,13 @@ impl Compiler {
         if let Some(listing) = &mut listing {
             self.remap_listing(listing, graph.as_ref().unwrap(), self.source_name.0);
         }
-        let (function, annotations, lowered, snapshot) = if baseline.is_some() {
-            let mut function = cranelift_codegen::ir::Function::new();
-            function.signature = signature;
-            (
-                function,
-                Annotations {
-                    semantic_locations: self.dump_ir || self.inspection.is_some(),
-                    ..Annotations::default()
-                },
-                None,
-                None,
-            )
-        } else {
-            self.emit_body(signature, self.source_name, |out| match graph {
+        self.emit_body(
+            signature,
+            self.source_name,
+            baseline,
+            listing,
+            inspection,
+            |out| match graph {
                 Some(graph) => finalize::build_function(
                     out,
                     params.span,
@@ -2498,17 +2400,8 @@ impl Compiler {
                     }
                     _ => Ok(()),
                 },
-            })?
-        };
-        let inspection = inspection.lowered(snapshot);
-        Ok(FunctionBody {
-            function,
-            lowered,
-            baseline,
-            annotations,
-            inspection,
-            listing,
-        })
+            },
+        )
     }
 }
 
