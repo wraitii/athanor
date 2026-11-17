@@ -710,52 +710,7 @@ impl Op {
         let (fixed, rest): ([Option<Value>; 3], &[Value]) = match self {
             Op::Aarch64(op) => return op.operands(),
             Op::Regex(op) => return op.operands(),
-            Op::LowLevel(low_level::Op::Cleanup { values, .. }) => ([None; 3], values),
-            Op::LowLevel(low_level::Op::Call { target, args, .. }) => (
-                [
-                    match target {
-                        low_level::CallTarget::Indirect(value) => Some(*value),
-                        _ => None,
-                    },
-                    None,
-                    None,
-                ],
-                args,
-            ),
-            Op::LowLevel(
-                low_level::Op::Unary { value, .. }
-                | low_level::Op::Reference { value, .. }
-                | low_level::Op::ExtractBits { value, .. }
-                | low_level::Op::InRange { value, .. }
-                | low_level::Op::TestMask { value, .. }
-                | low_level::Op::Load { address: value, .. }
-                | low_level::Op::AtomicLoad { address: value, .. },
-            ) => ([Some(*value), None, None], &[]),
-            Op::LowLevel(
-                low_level::Op::FrameStore {
-                    ctx: left,
-                    value: right,
-                    ..
-                }
-                | low_level::Op::Binary { left, right, .. }
-                | low_level::Op::IntCompare { left, right, .. }
-                | low_level::Op::FloatCompare { left, right, .. }
-                | low_level::Op::Store {
-                    value: left,
-                    address: right,
-                    ..
-                },
-            ) => ([Some(*left), Some(*right), None], &[]),
-            Op::LowLevel(low_level::Op::Select { condition, yes, no }) => {
-                ([Some(*condition), Some(*yes), Some(*no)], &[])
-            }
-            Op::LowLevel(
-                low_level::Op::Integer { .. }
-                | low_level::Op::Float64(_)
-                | low_level::Op::StackAddress { .. }
-                | low_level::Op::StackPointer { .. },
-            ) => ([None; 3], &[]),
-            Op::LowLevel(low_level::Op::VariableRead) => ([None; 3], &[]),
+            Op::LowLevel(op) => return op.operands(),
             Op::OsrStart(_, _, values)
             | Op::Continuation(_, values)
             | Op::ContinuationStore(values) => ([None, None, None], values),
@@ -964,52 +919,7 @@ impl Op {
         let (fixed, rest): ([Option<&mut Value>; 3], &mut [Value]) = match self {
             Op::Aarch64(op) => return op.operands_mut(),
             Op::Regex(op) => return op.operands_mut(),
-            Op::LowLevel(low_level::Op::Cleanup { values, .. }) => ([None, None, None], values),
-            Op::LowLevel(low_level::Op::Call { target, args, .. }) => (
-                [
-                    match target {
-                        low_level::CallTarget::Indirect(value) => Some(value),
-                        _ => None,
-                    },
-                    None,
-                    None,
-                ],
-                args,
-            ),
-            Op::LowLevel(
-                low_level::Op::Unary { value, .. }
-                | low_level::Op::Reference { value, .. }
-                | low_level::Op::ExtractBits { value, .. }
-                | low_level::Op::InRange { value, .. }
-                | low_level::Op::TestMask { value, .. }
-                | low_level::Op::Load { address: value, .. }
-                | low_level::Op::AtomicLoad { address: value, .. },
-            ) => ([Some(value), None, None], &mut []),
-            Op::LowLevel(
-                low_level::Op::FrameStore {
-                    ctx: left,
-                    value: right,
-                    ..
-                }
-                | low_level::Op::Binary { left, right, .. }
-                | low_level::Op::IntCompare { left, right, .. }
-                | low_level::Op::FloatCompare { left, right, .. }
-                | low_level::Op::Store {
-                    value: left,
-                    address: right,
-                    ..
-                },
-            ) => ([Some(left), Some(right), None], &mut []),
-            Op::LowLevel(low_level::Op::Select { condition, yes, no }) => {
-                ([Some(condition), Some(yes), Some(no)], &mut [])
-            }
-            Op::LowLevel(
-                low_level::Op::Integer { .. }
-                | low_level::Op::Float64(_)
-                | low_level::Op::StackAddress { .. }
-                | low_level::Op::StackPointer { .. },
-            ) => ([None, None, None], &mut []),
-            Op::LowLevel(low_level::Op::VariableRead) => ([None, None, None], &mut []),
+            Op::LowLevel(op) => return op.operands_mut(),
             Op::OsrStart(_, _, values)
             | Op::Continuation(_, values)
             | Op::ContinuationStore(values) => ([None, None, None], values),

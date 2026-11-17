@@ -9,6 +9,98 @@ use super::cursor::Insert;
 use super::{Block, Constant, Graph, Inst, Op as GraphOp, Repr, Value};
 use crate::jit::helpers::Helper;
 
+impl Op {
+    pub(super) fn operands(&self) -> super::Operands<'_> {
+        let (fixed, rest): ([Option<Value>; 3], &[Value]) = match self {
+            Op::Cleanup { values, .. } => ([None; 3], values),
+            Op::Call { target, args, .. } => (
+                [
+                    match target {
+                        CallTarget::Indirect(value) => Some(*value),
+                        _ => None,
+                    },
+                    None,
+                    None,
+                ],
+                args,
+            ),
+            Op::Unary { value, .. }
+            | Op::Reference { value, .. }
+            | Op::ExtractBits { value, .. }
+            | Op::InRange { value, .. }
+            | Op::TestMask { value, .. }
+            | Op::Load { address: value, .. }
+            | Op::AtomicLoad { address: value, .. } => ([Some(*value), None, None], &[]),
+            Op::FrameStore {
+                ctx: left,
+                value: right,
+                ..
+            }
+            | Op::Binary { left, right, .. }
+            | Op::IntCompare { left, right, .. }
+            | Op::FloatCompare { left, right, .. }
+            | Op::Store {
+                value: left,
+                address: right,
+                ..
+            } => ([Some(*left), Some(*right), None], &[]),
+            Op::Select { condition, yes, no } => ([Some(*condition), Some(*yes), Some(*no)], &[]),
+            Op::Integer { .. }
+            | Op::Float64(_)
+            | Op::StackAddress { .. }
+            | Op::StackPointer { .. } => ([None; 3], &[]),
+            Op::VariableRead => ([None; 3], &[]),
+        };
+        let [a, b, c] = fixed;
+        super::Operands::new([a, b, c, None], rest)
+    }
+
+    pub(super) fn operands_mut(&mut self) -> super::OperandsMut<'_> {
+        let (fixed, rest): ([Option<&mut Value>; 3], &mut [Value]) = match self {
+            Op::Cleanup { values, .. } => ([None, None, None], values),
+            Op::Call { target, args, .. } => (
+                [
+                    match target {
+                        CallTarget::Indirect(value) => Some(value),
+                        _ => None,
+                    },
+                    None,
+                    None,
+                ],
+                args,
+            ),
+            Op::Unary { value, .. }
+            | Op::Reference { value, .. }
+            | Op::ExtractBits { value, .. }
+            | Op::InRange { value, .. }
+            | Op::TestMask { value, .. }
+            | Op::Load { address: value, .. }
+            | Op::AtomicLoad { address: value, .. } => ([Some(value), None, None], &mut []),
+            Op::FrameStore {
+                ctx: left,
+                value: right,
+                ..
+            }
+            | Op::Binary { left, right, .. }
+            | Op::IntCompare { left, right, .. }
+            | Op::FloatCompare { left, right, .. }
+            | Op::Store {
+                value: left,
+                address: right,
+                ..
+            } => ([Some(left), Some(right), None], &mut []),
+            Op::Select { condition, yes, no } => ([Some(condition), Some(yes), Some(no)], &mut []),
+            Op::Integer { .. }
+            | Op::Float64(_)
+            | Op::StackAddress { .. }
+            | Op::StackPointer { .. } => ([None, None, None], &mut []),
+            Op::VariableRead => ([None, None, None], &mut []),
+        };
+        let [a, b, c] = fixed;
+        super::OperandsMut::new([a, b, c, None], rest)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(in crate::jit) enum CallTarget {
     Direct(FuncId),
