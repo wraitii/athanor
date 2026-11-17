@@ -1093,6 +1093,10 @@ fn emit(
                     }
                 }
                 op => {
+                    let op: &dyn std::fmt::Debug = match op {
+                        Op::Javascript(op) => op,
+                        _ => op,
+                    };
                     return refuse(
                         reason,
                         format!(
