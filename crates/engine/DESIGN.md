@@ -212,6 +212,64 @@ unknown calls must remain conservative. The graph's facts describe what is
 proven on a path, whereas observations describe what has happened at runtime.
 An observation alone cannot justify an unchecked operation.
 
+## Dialects and regular expressions
+
+The graph infrastructure is meant to host more than one source language. Blocks,
+block parameters, terminators, values, representations, contracts and the passes
+that only consult them are the shared core. DCE and LICM already reason through
+`facts.is_pure`, and loop, parameter and trimming transforms do not inspect
+operations. Each language contributes a dialect: operations in the same `Op`
+enum, with their own contract, operand, representation and listing arms, their
+own passes, and a lowering towards `LowLevel`. A shared graph is not the goal by
+itself; sharing the infrastructure lets bodies from different frontends be
+combined, lets general passes apply across them, and lets a path occasionally
+skip phases that another path needs. The big enums (`Op`, `Value`, `Repr`) may
+grow dialect variants where that is cleaner than overloading JS meanings.
+
+Much of the core is still JS-shaped. JS operations are listed inline in central
+tables, facts use JS value types, `Locations` and `js::Access` model JS memory,
+and the inliner mixes body cloning with scopes, `this` and captures. These are
+seams to generalize as a second dialect needs them, not a refactor to do ahead.
+
+Regular expressions are the intended second dialect. They are the opposite of
+JS in most respects: no dynamic types, heap or exceptions, machine integers
+throughout and immutable inputs. This is design intent; RegExp objects currently
+wrap `regress`, a backtracking interpreter that remains the fallback.
+
+- The frontend parses with `oxc_regular_expression` into a small regex IR and
+  builds an automaton. Patterns outside the supported subset (backreferences,
+  lookaround, empty-matching quantified bodies, case-insensitive non-ASCII and
+  similar) report a reason and stay on `regress`. The automaton is frontend
+  analysis, like JS scoping, and can be tested against `regress` without the
+  graph.
+- The regex dialect expresses the matcher as graph code: automaton states are
+  blocks carrying the position as a parameter, with operations for byte loads,
+  class tests and assertions. Choosing between branches and table lookups for
+  a state is a regex pass, not part of the frontend output. Generic bounds-check
+  elimination, load combining and hoisting should then apply to regex code.
+- A body exposes an interface of agnostic inputs and an exit carrying its
+  results. Functionalizing binds inputs to ABI parameters and turns the exit into
+  a return, giving a standalone function for testing and uninlined calls.
+  Splicing binds inputs to host values and jumps from the exit to a
+  continuation. The JS inliner is splicing plus a JS adapter; the generic half
+  is meant to be extracted when regex needs it.
+- JS call sites with a known regex, either a literal or a profiled identity
+  behind a guard, are specialized in the `js` stage like `string_split.rs`. The
+  regex body is spliced there, before runtime lowering, so the combined graph
+  shares host passes: subject setup hoists out of loops, unused pure matches are
+  removed and loads can be shared. The JS path never builds the function
+  boundary that the standalone path needs. Each dialect lowers in its own
+  pipeline slot; regex lowers before `repr`, since its values are integers.
+- Matching reads immutable string bytes and constant data, so regex contracts
+  are pure apart from keeping the subject alive. Building `exec`, `match`,
+  `split` and `replace` results stays in helpers; captures may initially be
+  recomputed by `regress` over the matched span.
+
+Validation follows the layers: frontend against `regress`, the standalone
+regex graph against `regress`, and spliced against standalone code. The V8 v7
+RegExp benchmark (`bench/v8-v7/regexp.js`) is the main workload; all but two of
+its 237 executed patterns fit the automaton subset.
+
 ## Speculation, recovery and tiering
 
 Initial code can collect observations at sites such as calls, property accesses
