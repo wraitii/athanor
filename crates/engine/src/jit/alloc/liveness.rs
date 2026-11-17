@@ -1,7 +1,7 @@
 use crate::jit::semantic::{Block, Cfg, Graph, Value};
 use cranelift_codegen::entity::{EntityRef, SecondaryMap};
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Segment {
     pub start: u32,
     pub end: u32,
@@ -47,12 +47,40 @@ struct Use {
     at: u32,
 }
 
+struct Loop {
+    header: Block,
+    body: crate::FxHashSet<Block>,
+    predecessors: Vec<Block>,
+    segments: Vec<Segment>,
+    boundary: Vec<Block>,
+}
+
+fn append_segment(segments: &mut Vec<Segment>, segment: Segment) {
+    match segments.last_mut() {
+        Some(previous) if previous.end + 1 == segment.start && previous.cold == segment.cold => {
+            previous.end = segment.end;
+        }
+        _ => segments.push(segment),
+    }
+}
+
 pub(super) fn compute(
     graph: &Graph,
     order: &[Block],
     cfg: &Cfg,
     cold: &SecondaryMap<Block, bool>,
     input: &super::graph::Input,
+) -> Result<Liveness, String> {
+    compute_with_loops(graph, order, cfg, cold, input, true)
+}
+
+fn compute_with_loops(
+    graph: &Graph,
+    order: &[Block],
+    cfg: &Cfg,
+    cold: &SecondaryMap<Block, bool>,
+    input: &super::graph::Input,
+    skip_loops: bool,
 ) -> Result<Liveness, String> {
     let remat = &input.remat;
     let mut header = SecondaryMap::<Block, u32>::new();
@@ -128,6 +156,52 @@ pub(super) fn compute(
     }
     uses.sort_by_key(|u| u.value);
 
+    let mut loops = Vec::new();
+    let mut containing = SecondaryMap::<Block, Vec<usize>>::new();
+    if skip_loops {
+        for (loop_header, body) in crate::jit::semantic::natural_loops(graph, cfg)
+            .into_iter()
+            .rev()
+        {
+            let mut blocks: Vec<_> = body.iter().copied().collect();
+            blocks.sort_unstable_by_key(|&block| position[block]);
+            let mut predecessors = Vec::new();
+            let mut segments = Vec::new();
+            let mut boundary = Vec::new();
+            for block in blocks {
+                containing[block].push(loops.len());
+                predecessors.extend(
+                    cfg.preds[block]
+                        .iter()
+                        .copied()
+                        .filter(|pred| !body.contains(pred)),
+                );
+                append_segment(
+                    &mut segments,
+                    Segment {
+                        start: use_position(header[block]),
+                        end: def_position(last[block]),
+                        cold: cold[block],
+                    },
+                );
+                if crossing[block] {
+                    boundary.push(block);
+                }
+            }
+            predecessors.sort_unstable();
+            predecessors.dedup();
+            loops.push(Loop {
+                header: loop_header,
+                body,
+                predecessors,
+                segments,
+                boundary,
+            });
+        }
+    }
+    let mut loop_live = vec![0u32; loops.len()];
+    let mut active_loops = Vec::new();
+    let mut value_segments = Vec::new();
     let entry = graph.entry;
     let mut live_in = SecondaryMap::<Block, u32>::new();
     let mut live_out = SecondaryMap::<Block, u32>::new();
@@ -164,21 +238,41 @@ pub(super) fn compute(
             low = low.min(at);
             high = high.max(at);
         };
+        let loop_of = |block: Block| {
+            containing[block]
+                .iter()
+                .copied()
+                .find(|&index| !loops[index].body.contains(&def_block))
+        };
         touch(def_block);
         for u in value_uses {
             used_at[u.block] = (stamp, u.at);
             if u.block != def_block && live_in[u.block] != stamp {
                 live_in[u.block] = stamp;
-                touch(u.block);
                 worklist.push(u.block);
             }
         }
         while let Some(block) = worklist.pop() {
-            for &pred in &cfg.preds[block] {
+            // A use of an external value remains reachable on the next iteration
+            // from every block in a natural loop, so all its ranges are live.
+            let predecessors = if let Some(index) = loop_of(block) {
+                if loop_live[index] == stamp {
+                    continue;
+                }
+                if loops[index].header == entry {
+                    return Err(format!("{value} used before definition"));
+                }
+                loop_live[index] = stamp;
+                active_loops.push(index);
+                &loops[index].predecessors[..]
+            } else {
+                touch(block);
+                &cfg.preds[block]
+            };
+            for &pred in predecessors {
                 live_out[pred] = stamp;
                 if pred != def_block && live_in[pred] != stamp {
                     live_in[pred] = stamp;
-                    touch(pred);
                     worklist.push(pred);
                 }
             }
@@ -188,6 +282,11 @@ pub(super) fn compute(
         }
 
         let first_segment = segments.len();
+        let first_boundary = boundary.len();
+        for index in active_loops.drain(..) {
+            value_segments.extend_from_slice(&loops[index].segments);
+            boundary.extend(loops[index].boundary.iter().map(|&block| (value, block)));
+        }
         for word in low as usize / 64..=high as usize / 64 {
             let mut bits = std::mem::take(&mut touched[word]);
             while bits != 0 {
@@ -215,16 +314,18 @@ pub(super) fn compute(
                     end,
                     cold: cold[block],
                 };
-                match segments[first_segment..].last_mut() {
-                    Some(previous)
-                        if previous.end + 1 == start && previous.cold == segment.cold =>
-                    {
-                        previous.end = end;
-                    }
-                    _ => segments.push(segment),
-                }
+                value_segments.push(segment);
             }
         }
+        value_segments.sort_unstable_by_key(|segment| segment.start);
+        for segment in value_segments.drain(..) {
+            if segments.len() == first_segment {
+                segments.push(segment);
+            } else {
+                append_segment(&mut segments, segment);
+            }
+        }
+        boundary[first_boundary..].sort_unstable_by_key(|&(_, block)| position[block]);
         ranges[value] = (first_segment as u32, segments.len() as u32);
     }
     Ok(Liveness {
@@ -245,6 +346,79 @@ mod tests {
     use cranelift_codegen::ir::{AbiParam, Signature, types};
     use cranelift_codegen::isa::CallConv;
     use oxc_span::Span;
+
+    fn compare(graph: &Graph, order: &[Block], cfg: &Cfg, cold: &SecondaryMap<Block, bool>) {
+        let input = super::super::graph::Input::default();
+        let expected = compute_with_loops(graph, order, cfg, cold, &input, false).unwrap();
+        let actual = compute(graph, order, cfg, cold, &input).unwrap();
+        assert_eq!(actual.calls, expected.calls);
+        assert_eq!(actual.boundary, expected.boundary);
+        for value in graph.values.keys() {
+            assert_eq!(actual.of(value), expected.of(value), "{value}");
+        }
+    }
+
+    #[test]
+    fn loop_summaries_match_predecessor_walk() {
+        let span = Span::new(0, 0);
+        for seed in 0..256u32 {
+            let mut signature = Signature::new(CallConv::SystemV);
+            signature.params.push(AbiParam::new(types::I64));
+            let mut graph = Graph::new_low_level("loops".into(), span, signature);
+            let entry = graph.entry;
+            let mut builder = Builder::new(&mut graph);
+            builder.switch_to_block(entry);
+            builder.append_block_params_for_function_params(entry);
+            let input = builder.block_params(entry)[0];
+            let blocks: Vec<_> = (0..16).map(|_| builder.create_block()).collect();
+            builder.terminate(entry, span, TerminatorKind::Jump(Target::new(blocks[0])));
+            let mut state = seed + 1;
+            for (index, &block) in blocks.iter().enumerate() {
+                builder.switch_to_block(block);
+                let local = builder.ins().iadd(input, input);
+                if index + 1 == blocks.len() {
+                    builder.terminate(block, span, TerminatorKind::ReturnValues(vec![local]));
+                    continue;
+                }
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                let target = blocks[(state >> 16) as usize % blocks.len()];
+                builder.terminate(
+                    block,
+                    span,
+                    TerminatorKind::Branch(
+                        local,
+                        Target::new(blocks[index + 1]),
+                        Target::new(target),
+                    ),
+                );
+            }
+            drop(builder);
+            let cfg = Cfg::new(&graph);
+            let values: Vec<_> = graph
+                .values
+                .keys()
+                .map(|value| (value, graph.def_block(value)))
+                .collect();
+            let mut builder = Builder::new(&mut graph);
+            for &block in &blocks {
+                builder.switch_to_block(block);
+                for &(value, definition) in &values {
+                    if cfg.dominates(definition, block) {
+                        builder.ins().iadd(value, value);
+                    }
+                }
+            }
+            drop(builder);
+            let mut cold = SecondaryMap::new();
+            for (index, &block) in blocks.iter().enumerate() {
+                cold[block] = (index as u32 + seed) % 3 == 0;
+            }
+            compare(&graph, &cfg.rpo, &cfg, &cold);
+            let mut order = cfg.rpo.clone();
+            order.reverse();
+            compare(&graph, &order, &cfg, &cold);
+        }
+    }
 
     #[test]
     fn tracks_edge_arguments_loops_and_multiple_call_results() {
@@ -309,6 +483,7 @@ mod tests {
                 )
             );
         }
+        compare(&graph, &cfg.rpo, &cfg, &cold);
         let live = compute(&graph, &cfg.rpo, &cfg, &cold, &input).unwrap();
         let mut headers = SecondaryMap::<Block, u32>::new();
         let mut next = 0;

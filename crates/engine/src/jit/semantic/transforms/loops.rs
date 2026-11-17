@@ -42,10 +42,7 @@ pub(in crate::jit::semantic) fn natural_loop(cfg: &Cfg, header: Block) -> Option
     body
 }
 
-pub(in crate::jit::semantic) fn natural_loops(
-    graph: &Graph,
-    cfg: &Cfg,
-) -> Vec<(Block, FxHashSet<Block>)> {
+pub(in crate::jit) fn natural_loops(graph: &Graph, cfg: &Cfg) -> Vec<(Block, FxHashSet<Block>)> {
     let mut loops: FxHashMap<Block, FxHashSet<Block>> = FxHashMap::default();
     for &block in &cfg.rpo {
         for header in graph.successors(block) {

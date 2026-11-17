@@ -109,6 +109,37 @@ All three benchmarks completed successfully in every engine.
 call; string conversion, character/range methods and `parseInt` use Rust
 implementations.
 
+### Allocator loop liveness comparison
+
+Apple Silicon ARM64, 2026-11-17; release builds, baseline `5d919de` versus
+allocator loop summaries. Benchmark processes run sequentially, alternating
+before/after order. Compile times are medians of five process wall times using
+`js-runner --compile --no-ir PATH`, including startup and eager compilation of
+all functions. Scores use the standard harness and are medians of three runs,
+except Splay, which uses nine because the first three were noisy.
+
+| benchmark | compile before (ms) | compile after (ms) | time change | score before | score after | score change |
+|-----------|--------------------:|-------------------:|------------:|-------------:|------------:|-------------:|
+| richards | 81.4 | 81.2 | -0.3% | 4385 | 4367 | -0.4% |
+| navier-stokes | 89.7 | 91.7 | +2.2% | 24189 | 24338 | +0.6% |
+| splay | 76.0 | 75.9 | -0.1% | 3993 | 3903 | -2.3% |
+| raytrace | 224.7 | 223.3 | -0.6% | 5675 | 5698 | +0.4% |
+| crypto | 575.7 | 581.3 | +1.0% | 7233 | 7222 | -0.2% |
+| regexp | 1400.2 | 1036.0 | -26.0% | 5237 | 5237 | +0.0% |
+| gaussian-blur | 23.9 | 23.6 | -1.5% | 290 | 290 | +0.0% |
+
+RegExp compilation improves by 26.0%; a second five-run comparison on the
+final build gives 1418.2 → 1056.9 ms (25.5% faster). Other compile times and
+runtime scores show no clear general improvement. Splay's initial three-run
+score fell 9.1%, but the difference shrinks with six additional pairs of runs.
+
+A synthetic loop with 96 values loaded before the loop and 96 conditional uses
+inside it compiles in 101.9 → 97.3 ms (medians of five runs).
+
+Belgian Uplands generation remains 758 → 758 ms (medians of three runs).
+All six map runs produce `heightHash: dd1de906`,
+`tileIndexHash: 3688e6a0`, and `tilePriorityHash: 3688e6a0`.
+
 ### Published results
 
 Selected macos-arm64 results from
