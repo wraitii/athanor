@@ -7,17 +7,7 @@ impl Tiering {
             code,
             format_args!("baseline warmup calls={}", self.options.baseline_warmup),
         );
-        if code < jit::entries::DIRECT_ENTRIES as u64 {
-            self.direct.warm(code);
-        } else {
-            self.overflow_calls
-                .borrow_mut()
-                .insert(code, jit::entries::RECOMPILE_WARMUP);
-        }
-        self.request_compilation(code);
-        if self.options.background_compile {
-            self.submit_compilation(code);
-        }
+        self.request_hot_compilation(code);
     }
 
     pub(crate) fn baseline_osr_entered(&self, site: &jit::baseline_tiering::Site) {

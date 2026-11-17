@@ -185,6 +185,7 @@ impl Tiering {
         self.apply_feedback(
             cache,
             update,
+            false,
             format_args!("call feedback site={site} target={target}"),
         );
     }
@@ -193,12 +194,17 @@ impl Tiering {
         &self,
         cache: &mut jit::profile::ObservationCache,
         update: jit::profile::Update,
+        guard_failed: bool,
         event: std::fmt::Arguments<'_>,
     ) {
         cache.complete = u64::from(update.complete);
         if update.changed {
             self.log_recompilation(cache.owner, event);
-            self.request_compilation(cache.owner);
+            if guard_failed {
+                self.request_hot_compilation(cache.owner);
+            } else {
+                self.request_compilation(cache.owner);
+            }
         }
     }
 
@@ -218,6 +224,7 @@ impl Tiering {
                 changed,
                 complete: false,
             },
+            false,
             format_args!("native feedback site={site} target={target:?}"),
         );
     }
@@ -240,6 +247,7 @@ impl Tiering {
                 changed,
                 complete: true,
             },
+            false,
             format_args!("read feedback site={site} kind={kind:?} type={observed:?}"),
         );
     }
@@ -257,6 +265,7 @@ impl Tiering {
         self.apply_feedback(
             cache,
             update,
+            true,
             format_args!("number guard failure site={site} type={observed:?}"),
         );
     }
@@ -274,6 +283,7 @@ impl Tiering {
         self.apply_feedback(
             cache,
             update,
+            true,
             format_args!("primitive guard failure site={site} type={observed:?}"),
         );
     }
@@ -529,6 +539,21 @@ impl Tiering {
         self.submit_compilation(code);
     }
 
+    fn request_hot_compilation(&self, code: u64) {
+        self.request_compilation(code);
+        if !self.options.background_compile {
+            return;
+        }
+        if code < jit::entries::DIRECT_ENTRIES as u64 {
+            self.direct.warm(code);
+        } else {
+            self.overflow_calls
+                .borrow_mut()
+                .insert(code, jit::entries::RECOMPILE_WARMUP);
+        }
+        self.submit_compilation(code);
+    }
+
     fn submit_compilation(&self, code: u64) {
         let warmed = if code < jit::entries::DIRECT_ENTRIES as u64 {
             self.direct.warmed(code)
@@ -714,15 +739,7 @@ impl Tiering {
         if let Err(error) = self.enqueue_compilation(job, jit::recompile::Priority::Optimize) {
             eprintln!("js jit: OSR compilation failed: {error}");
         }
-        if site.owner < jit::entries::DIRECT_ENTRIES as u64 {
-            self.direct.warm(site.owner);
-        } else {
-            self.overflow_calls
-                .borrow_mut()
-                .insert(site.owner, jit::entries::RECOMPILE_WARMUP);
-        }
-        self.request_compilation(site.owner);
-        self.submit_compilation(site.owner);
+        self.request_hot_compilation(site.owner);
         0
     }
 

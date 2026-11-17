@@ -2141,12 +2141,10 @@ mod call_variant_tests {
             let variants = variants(&engine, "read");
             assert!(!variants.is_empty());
             engine.call("fraction", &[]).unwrap();
-            for _ in 0..jit::entries::RECOMPILE_WARMUP {
-                assert_eq!(
-                    engine.call("outer", &[Value::number(2.0)]).unwrap().value(),
-                    Value::number(2.5)
-                );
-            }
+            assert_eq!(
+                engine.call("outer", &[Value::number(2.0)]).unwrap().value(),
+                Value::number(2.5)
+            );
             finish_compilation(&engine);
             engine.tiering.entry(code(&engine, "read")).unwrap();
             finish_compilation(&engine);
