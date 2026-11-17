@@ -329,6 +329,9 @@ and may return values for dispatch back to the enclosing graph. Extraction has
 explicit eligibility checks: for example, generators, handlers, certain frame
 operations and heap views prevent it. Fallbacks and continuations are therefore
 choices made under graph constraints, not a universal deoptimization facility.
+Recovery continuations use the shared compiler's cheaper baseline runtime
+lowering, including the generic loop bodies and drivers shared by resume points.
+This policy is independent of the enclosing function's compilation tier.
 The relevant implementation is in `semantic/specialization/regions/`,
 `semantic/continuation.rs`, `semantic/boundary.rs`, and `semantic/guards.rs`.
 

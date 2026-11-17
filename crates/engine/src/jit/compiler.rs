@@ -2055,7 +2055,7 @@ impl Compiler {
                 ids,
             )?;
             let mut body =
-                self.compile_region(&target.graph, source_name, params, ids, feedback)?;
+                self.compile_region(&target.graph, source_name, params, ids, feedback, true)?;
             body.inspection = body
                 .inspection
                 .named(&format!("continuation of {}", name.0));
@@ -2071,9 +2071,14 @@ impl Compiler {
         params: oxc_span::Span,
         continuations: &FxHashMap<usize, FuncId>,
         feedback: Option<finalize::Feedback>,
+        recovery: bool,
     ) -> Result<FunctionBody, Error> {
         let mut passes = super::inspect::PassInspection::new(self.inspection.as_deref());
-        let mut state = super::semantic::FunctionState::from_graph(graph.clone());
+        let mut state = if recovery {
+            super::semantic::FunctionState::from_graph_unoptimized(graph.clone())
+        } else {
+            super::semantic::FunctionState::from_graph(graph.clone())
+        };
         let mut listing = self
             .listing()
             .then(|| jitdump::Listing::new(state.listing_lines()));
@@ -2105,7 +2110,7 @@ impl Compiler {
             self.data.push(data);
         } else {
             passes
-                .lower_runtime(&mut state, false)
+                .lower_runtime(&mut state, recovery)
                 .map_err(Error::Unsupported)?;
         }
         let inspection =
@@ -2256,6 +2261,7 @@ impl Compiler {
                 params.span,
                 &FxHashMap::default(),
                 None,
+                false,
             )?;
             self.continuations.push((id, body));
         }

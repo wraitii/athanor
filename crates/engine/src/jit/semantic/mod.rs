@@ -2575,6 +2575,10 @@ impl FunctionState {
         Self::new(graph, Vec::new(), true)
     }
 
+    pub(in crate::jit) fn from_graph_unoptimized(graph: Graph) -> Self {
+        Self::new(graph, Vec::new(), false)
+    }
+
     fn new(graph: Graph, notes: Vec<String>, optimize: bool) -> Self {
         let optimize = optimize && !graph.has_handlers && !graph.generator;
         Self {
