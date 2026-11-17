@@ -20,6 +20,97 @@ fn native_properties_retain_values_and_participate_in_cycle_analysis() {
 }
 
 #[test]
+fn array_buffers_wait_for_disposal_and_reset_holes() {
+    let heap = Heap::default();
+    let child = heap.string("owned element").unwrap();
+    let array = heap.array(&[child; 10]).unwrap();
+    let pointer = heap.0.borrow().slot(heap_id(array).unwrap()).data;
+    heap.release(child);
+    heap.release(array);
+    heap.drain(1);
+    assert!(heap.valid(child));
+    let buffer = heap.0.borrow_mut().array_buffers.take(10).unwrap();
+    assert_ne!(buffer.as_ptr().cast::<u8>(), pointer);
+    heap.drain(100);
+    assert!(!heap.valid(child));
+    let reused = heap.array_of_length(10).unwrap();
+    assert_eq!(heap.0.borrow().slot(heap_id(reused).unwrap()).data, pointer);
+    assert_eq!(heap.len(reused), Some(10));
+    for index in 0..10 {
+        assert!(!heap.present(reused, index));
+        assert_eq!(heap.get(reused, index), Some(Value::UNDEFINED));
+    }
+    heap.release(reused);
+    heap.drain(100);
+    let dense = heap.array(&[Value::TRUE; 10]).unwrap();
+    assert_eq!(heap.0.borrow().slot(heap_id(dense).unwrap()).data, pointer);
+    assert_eq!(
+        heap.0.borrow().slot(heap_id(dense).unwrap()).kind,
+        kind::ARRAY
+    );
+    assert!(heap.present(dense, 9));
+    assert_eq!(heap.get(dense, 9), Some(Value::TRUE));
+    heap.release(dense);
+}
+
+#[test]
+fn array_buffers_with_irregular_capacities_fit_reused_requests() {
+    let heap = Heap::default();
+    let elements = vec![Value::TRUE; 10];
+    let pointer = elements.as_ptr().cast::<u8>();
+    let array = heap.array_from_owned(elements).unwrap();
+    heap.release(array);
+    heap.drain(100);
+    let larger = heap.array(&[Value::FALSE; 11]).unwrap();
+    assert_ne!(heap.0.borrow().slot(heap_id(larger).unwrap()).data, pointer);
+    let smaller = heap.array(&[Value::TRUE; 8]).unwrap();
+    assert_eq!(
+        heap.0.borrow().slot(heap_id(smaller).unwrap()).data,
+        pointer
+    );
+    assert_eq!(heap.len(larger), Some(11));
+    assert_eq!(heap.get(larger, 10), Some(Value::FALSE));
+    assert_eq!(heap.len(smaller), Some(8));
+    heap.release(larger);
+    heap.release(smaller);
+}
+
+#[test]
+fn string_buffers_reset_contents_and_preserve_unicode() {
+    let heap = Heap::default();
+    let source = heap.string("étoile🌟").unwrap();
+    let pointer = heap
+        .0
+        .borrow()
+        .string(heap_id(source).unwrap())
+        .unwrap()
+        .as_ptr();
+    heap.release(source);
+    heap.drain(1);
+    let reused = heap.string("雪と海の月").unwrap();
+    assert_eq!(heap.text(reused).as_deref(), Some("雪と海の月"));
+    assert_eq!(
+        heap.0
+            .borrow()
+            .string(heap_id(reused).unwrap())
+            .unwrap()
+            .as_ptr(),
+        pointer
+    );
+    let suffix = heap.string("🌟").unwrap();
+    let joined = heap.concat_strings(reused, suffix).unwrap();
+    assert_eq!(heap.text(joined).as_deref(), Some("雪と海の月🌟"));
+    heap.release(joined);
+    heap.drain(100);
+    let parts = heap.concat_string_parts(&[suffix, reused, suffix]).unwrap();
+    assert_eq!(heap.text(parts).as_deref(), Some("🌟雪と海の月🌟"));
+    heap.release(parts);
+    heap.release(reused);
+    heap.release(suffix);
+    heap.drain(100);
+}
+
+#[test]
 fn cycle_stats_distinguish_rooted_and_unreachable_self_cycles() {
     let heap = Heap::default();
     let object = heap.object().unwrap();

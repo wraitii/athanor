@@ -18,19 +18,25 @@ impl Heap {
     pub(crate) fn string(&self, text: &str) -> Option<Value> {
         self.drain(64);
         let mut data = self.0.borrow_mut();
+        let mut buffer = String::from_utf8(data.string_buffers.take(text.len())?).unwrap();
+        buffer.push_str(text);
         let id = data.reserve()?;
-        data.store(id, Payload::String(text.into()));
+        data.store(id, Payload::String(buffer));
         Some(Value::from_bits(TAG_STRING | id))
     }
 
     pub(crate) fn concat_strings(&self, left: Value, right: Value) -> Option<Value> {
         self.drain(64);
         let mut data = self.0.borrow_mut();
-        let left = data.string(heap_id(left)?)?;
-        let right = data.string(heap_id(right)?)?;
-        let mut text = String::with_capacity(left.len().checked_add(right.len())?);
-        text.push_str(left);
-        text.push_str(right);
+        let left = heap_id(left)?;
+        let right = heap_id(right)?;
+        let length = data
+            .string(left)?
+            .len()
+            .checked_add(data.string(right)?.len())?;
+        let mut text = String::from_utf8(data.string_buffers.take(length)?).unwrap();
+        text.push_str(data.string(left)?);
+        text.push_str(data.string(right)?);
         let id = data.reserve()?;
         data.store(id, Payload::String(text));
         Some(Value::from_bits(TAG_STRING | id))
@@ -42,7 +48,7 @@ impl Heap {
         let length = values.iter().try_fold(0usize, |length, &value| {
             length.checked_add(data.string(heap_id(value)?)?.len())
         })?;
-        let mut text = String::with_capacity(length);
+        let mut text = String::from_utf8(data.string_buffers.take(length)?).unwrap();
         for &value in values {
             text.push_str(data.string(heap_id(value)?)?);
         }
@@ -94,8 +100,9 @@ impl Heap {
         let mut data = self.0.borrow_mut();
         values.reserve(ranges.len());
         for range in ranges {
+            let mut piece = String::from_utf8(data.string_buffers.take(range.len())?).unwrap();
+            piece.push_str(&data.string(id).unwrap()[range]);
             let piece_id = data.reserve()?;
-            let piece = data.string(id).unwrap()[range].to_owned();
             data.store(piece_id, Payload::String(piece));
             values.push(Value::from_bits(TAG_STRING | piece_id));
         }

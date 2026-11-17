@@ -62,6 +62,10 @@ therefore not a substitute for the embedding lifetime contract. See `value.rs`,
 
 The heap is reference counted. Heap slots carry metadata used by generated code;
 objects may store properties inline, and larger payloads use separate storage.
+Array and string construction reuse empty backing buffers in power-of-two size
+classes. Each heap caches up to 1 MiB per buffer kind, with at most 128 buffers
+per class and a 64 KiB maximum buffer size. Buffers become reusable only after
+disposal has released their contents; larger buffers are freed normally.
 Releasing the last reference queues destruction. Draining processes a bounded
 amount of work and releases outgoing edges incrementally; it is a work budget,
 not a real-time latency guarantee. `Engine::drain_disposals` exposes a drain to

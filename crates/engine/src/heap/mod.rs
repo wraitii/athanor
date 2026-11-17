@@ -9,6 +9,7 @@ use crate::value::{TAG_OBJECT, TAG_STRING, Value};
 
 mod arena;
 mod array;
+mod buffers;
 mod cycles;
 mod function;
 mod generator;
@@ -68,6 +69,8 @@ struct HeapData {
     interned: Vec<(&'static str, u64)>,
     regexp_cache: FxHashMap<(String, u8), Rc<crate::regex::Pattern>>,
     pending: VecDeque<u64>,
+    array_buffers: buffers::BufferPool<Value>,
+    string_buffers: buffers::BufferPool<u8>,
     epoch: u64,
     stats: Option<Box<stats::Stats>>,
 }
@@ -86,6 +89,8 @@ impl Default for HeapData {
             interned: Vec::new(),
             regexp_cache: FxHashMap::default(),
             pending: VecDeque::new(),
+            array_buffers: buffers::BufferPool::default(),
+            string_buffers: buffers::BufferPool::default(),
             epoch: 0,
             stats: stats::enabled().then(|| Box::new(stats::Stats::default())),
         }
@@ -286,6 +291,11 @@ impl Heap {
                 }
                 let payload = data.vacate(id);
                 match payload {
+                    Payload::Array(array) => data.array_buffers.put(array.elements),
+                    Payload::String(mut text) => {
+                        text.clear();
+                        data.string_buffers.put(text.into_bytes());
+                    }
                     Payload::Enumerator(state) => {
                         if let Some(value) = state.current {
                             data.release(value);

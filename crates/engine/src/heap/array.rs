@@ -132,6 +132,8 @@ impl Heap {
         if !elements.iter().all(|value| data.valid(*value)) {
             return None;
         }
+        let mut buffer = data.array_buffers.take(elements.len())?;
+        buffer.extend_from_slice(elements);
         let id = data.reserve()?;
         for value in elements {
             data.retain(*value);
@@ -139,7 +141,7 @@ impl Heap {
         data.store(
             id,
             Payload::Array(Array {
-                elements: elements.to_vec(),
+                elements: buffer,
                 holes: elements.iter().filter(|value| **value == HOLE).count(),
             }),
         );
@@ -152,8 +154,7 @@ impl Heap {
         }
         self.drain(64);
         let mut data = self.0.borrow_mut();
-        let mut elements = Vec::new();
-        elements.try_reserve_exact(length).ok()?;
+        let mut elements = data.array_buffers.take(length)?;
         elements.resize(length, HOLE);
         let id = data.reserve()?;
         data.store(
