@@ -39,9 +39,11 @@ fn params(graph: &mut Graph) {
                     let Some(open) = graph.reprs[param].filter(|repr| repr.is_open()) else {
                         continue;
                     };
-                    let width = graph.reprs[arg]
-                        .and_then(|repr| concrete(open, repr))
-                        .or_else(|| chosen.get(&arg).copied());
+                    let width = chosen
+                        .get(&arg)
+                        .copied()
+                        .or(graph.reprs[arg])
+                        .and_then(|repr| concrete(open, repr));
                     let Some(width) = width else {
                         continue;
                     };

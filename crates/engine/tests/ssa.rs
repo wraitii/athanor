@@ -35,6 +35,29 @@ fn engines() -> impl Iterator<Item = Engine> {
 }
 
 #[test]
+fn numeric_joins_preserve_fractional_values() {
+    let source = r#"
+        function blend(x, y) {
+            let value = (x | 0) + 1;
+            if (x < 0)
+                value = (y | 0) + 2;
+            if (y > 0)
+                value = y / 2;
+            return value;
+        }
+    "#;
+    for mut engine in engines() {
+        engine.compile(source, "numeric-joins.js").unwrap();
+        for (x, y, expected) in [(0.0, 1.0, 0.5), (2.0, 0.0, 3.0), (-1.0, 0.0, 2.0)] {
+            let result = engine
+                .call("blend", &[Value::number(x), Value::number(y)])
+                .unwrap();
+            assert_eq!(result.value(), Value::number(expected));
+        }
+    }
+}
+
+#[test]
 fn constant_integer_products_preserve_extremes_and_zero_signs() {
     for factor in [0.0, -1.0, 0.5, 3.0, 4_194_304.0, 4_194_305.0] {
         for expression in [format!("(x|0)*{factor}"), format!("{factor}*(x|0)")] {
