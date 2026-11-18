@@ -1472,7 +1472,7 @@ impl Graph {
                 match &stacks[target.block] {
                     Some(existing) if *existing != stack => {
                         return Err(format!(
-                            "{block} reaches {} with a different scope stack",
+                            "{block} reaches {} with a different scope stack: expected {existing:?}, got {stack:?}",
                             target.block
                         ));
                     }

@@ -229,12 +229,14 @@ impl Shape {
         block: Block,
         call: Value,
         definitions: &mut FxHashMap<Value, Vec<Value>>,
+        mut finish_case: impl FnMut(&mut Graph, Block, Option<Block>),
     ) {
         let count = self.count();
         let mut current = block;
         for index in 0..count {
             let case = result.blocks.push(BlockData::default());
-            let kind = match self.exits.get(index) {
+            let exit = self.exits.get(index);
+            let kind = match exit {
                 Some(exit) => {
                     for (offset, &(value, types)) in exit.outputs.iter().enumerate() {
                         let output = append(result, case, Op::ContinuationOutput(call, offset));
@@ -262,6 +264,7 @@ impl Shape {
                     TerminatorKind::Return(output)
                 }
             };
+            finish_case(result, case, exit.map(|exit| exit.block));
             terminate(result, case, kind);
             if index + 1 == count {
                 terminate(result, current, TerminatorKind::Jump(Target::new(case)));
@@ -514,7 +517,7 @@ impl Pieces {
             terminate(result, block, TerminatorKind::Return(call));
             return Ok((block, Vec::new()));
         }
-        shape.dispatch(result, block, call, definitions);
+        shape.dispatch(result, block, call, definitions, |_, _, _| {});
         Ok((block, shape.exits.iter().map(|exit| exit.block).collect()))
     }
 

@@ -222,6 +222,7 @@ impl Plan {
     }
 
     pub(in crate::jit) fn instrument(self: &Arc<Self>, graph: &mut Graph) -> super::Result<()> {
+        let scopes = super::boundary::scopes(graph);
         let mut definitions = FxHashMap::default();
         for (index, candidate) in self.loops.iter().enumerate() {
             let Ok(transfer) = &candidate.transfer else {
@@ -273,9 +274,23 @@ impl Plan {
                     Target::new(dispatch),
                 ),
             );
-            transfer
-                .shape
-                .dispatch(graph, dispatch, start, &mut definitions);
+            transfer.shape.dispatch(
+                graph,
+                dispatch,
+                start,
+                &mut definitions,
+                |graph, case, target| {
+                    let from = &scopes[header];
+                    let to = target.map_or(&[][..], |block| scopes[block].as_slice());
+                    let common = from.iter().zip(to).take_while(|(a, b)| a == b).count();
+                    for &scope in from[common..].iter().rev() {
+                        graph.append(case, span, Op::Javascript(JsOp::LeaveScope(scope)), false);
+                    }
+                    for &scope in &to[common..] {
+                        graph.append(case, span, Op::Javascript(JsOp::EnterScope(scope)), false);
+                    }
+                },
+            );
         }
         super::transforms::repair(graph, &definitions);
         graph.verify()
@@ -811,6 +826,36 @@ mod tests {
         plan.extract(0).unwrap().verify().unwrap();
         let mut instrumented = graph;
         plan.instrument(&mut instrumented).unwrap();
+    }
+
+    #[test]
+    fn dispatch_restores_exit_scopes() {
+        let mut graph = graph("function f(xs,n){while(n)n=xs[n];return n;}");
+        let header = Plan::discover(&graph, 0).unwrap().loops[0].header;
+        let scope = graph.scopes.push(super::super::ScopeData {
+            kind: super::super::ScopeKind::Block,
+            parent: None,
+            bindings: Vec::new(),
+        });
+        graph.append(
+            header,
+            graph.span,
+            Op::Javascript(JsOp::EnterScope(scope)),
+            false,
+        );
+        for successor in graph.successors(header) {
+            graph.insert(
+                successor,
+                0,
+                graph.span,
+                Op::Javascript(JsOp::LeaveScope(scope)),
+                false,
+            );
+        }
+        graph.verify().unwrap();
+        let plan = Arc::new(Plan::discover(&graph, 0).unwrap());
+        assert!(plan.loops[0].transfer.is_ok());
+        plan.instrument(&mut graph).unwrap();
     }
 
     #[test]
