@@ -28,16 +28,14 @@ impl Options {
                         .ok_or("--execute expects JavaScript source")?,
                 );
             }
-            "--clif" => self.dump.clif = true,
-            "--no-ir" | "--no-semantic-ir" => self.dump.semantic_ir = false,
-            "--ast" => self.dump.ast = true,
-            "--semantic-ir" => self.dump.semantic_ir = true,
-            "--planner" => self.dump.planner = true,
-            "--after" => {
-                self.dump.semantic_ir = true;
-                self.dump.after = Some(arguments.next().ok_or("--after expects a pass name")?)
-            }
-            "--asm" => self.dump.asm = true,
+            "--no-ir" => self.dump.semantic_ir = false,
+            "--after" => match arguments.next().ok_or("--after expects a pass name")? {
+                pass if pass == "planner" => self.dump.planner = true,
+                pass => {
+                    self.dump.semantic_ir = true;
+                    self.dump.after = Some(pass);
+                }
+            },
             "--filter" => {
                 self.dump.filter = Some(arguments.next().ok_or("--filter expects a function name")?)
             }
@@ -49,7 +47,7 @@ impl Options {
 
     pub fn validate(&self) -> Result<(), String> {
         if self.output && !self.enabled {
-            return Err("--clif, --no-ir, --no-semantic-ir, --ast, --semantic-ir, --after, --planner, --asm, --filter and --execute require --compile".into());
+            return Err("--no-ir, --after, --filter and --execute require --compile".into());
         }
         Ok(())
     }

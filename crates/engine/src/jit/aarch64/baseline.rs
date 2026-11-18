@@ -205,10 +205,8 @@ fn emit(
         crate::FxHashSet::default()
     };
     let osr_graph = (!headers.is_empty()).then(|| std::sync::Arc::new(graph.clone()));
-    let mut block_starts = Vec::new();
     let mut locations = Vec::new();
     for (block, data) in graph.blocks.iter() {
-        block_starts.push(asm.offset());
         asm.bind(labels[block]?);
         if headers.contains(&block) {
             let site = function_data.pin(crate::jit::baseline_tiering::Site::new(
@@ -1259,9 +1257,7 @@ fn emit(
         bytes,
         alignment: 4,
         relocs: Vec::new(),
-        traps: Vec::new(),
         locations,
-        block_starts,
     })
 }
 

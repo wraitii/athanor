@@ -9,6 +9,7 @@ version = "0.1.0"
 
 [profile.dev]
 opt-level = 1
+debug = "line-tables-only"
 
 [profile.release]
 debug = "line-tables-only"

@@ -284,7 +284,7 @@ impl FunctionCompiler<'_, '_> {
                 .terminator
                 .take()
                 .expect("reachable block has a terminator");
-            if self.annotations.semantic_locations {
+            if self.semantic_locations {
                 self.b
                     .set_srcloc(cranelift_codegen::ir::SourceLoc::default());
             }
@@ -309,7 +309,7 @@ impl FunctionCompiler<'_, '_> {
                 self.b.set_span(data.span);
                 self.source_name = data.source_name.unwrap_or(source_name);
                 self.b.set_source_name(Some(self.source_name));
-                let location = if self.annotations.semantic_locations {
+                let location = if self.semantic_locations {
                     cranelift_codegen::ir::SourceLoc::new(self.b.graph.inst_location(inst))
                 } else if self.source_name == source_name {
                     cranelift_codegen::ir::SourceLoc::new(data.span.start)
@@ -1022,7 +1022,7 @@ impl FunctionCompiler<'_, '_> {
             self.b.set_span(terminator.span);
             self.source_name = terminator.source_name.unwrap_or(source_name);
             self.b.set_source_name(Some(self.source_name));
-            let location = if self.annotations.semantic_locations {
+            let location = if self.semantic_locations {
                 cranelift_codegen::ir::SourceLoc::new(cx.terminator_location(block))
             } else if self.source_name == source_name {
                 cranelift_codegen::ir::SourceLoc::new(terminator.span.start)
@@ -1098,7 +1098,7 @@ impl FunctionCompiler<'_, '_> {
                 }
             }
         }
-        if self.annotations.semantic_locations {
+        if self.semantic_locations {
             self.b
                 .set_srcloc(cranelift_codegen::ir::SourceLoc::default());
         }

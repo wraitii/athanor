@@ -18,7 +18,6 @@ use cranelift_module::{FuncId, Module};
 use oxc_span::Span;
 
 use crate::error::Error;
-use crate::jit::clif::Annotations;
 use crate::jit::cranelift::stubs::Stubs;
 use crate::jit::function_data::{FUNCTION_DATA_BASE_OFFSET, FunctionData};
 use crate::jit::helpers::Helper;
@@ -53,7 +52,7 @@ pub(super) struct FunctionCompiler<'a, 'f> {
     error_sites: FxHashMap<(usize, u32, u32), i64>,
     error_dispatch: FxHashMap<Block, Block>,
     stubs: Stubs,
-    annotations: &'a mut Annotations,
+    semantic_locations: bool,
     pointer: Type,
     ctx: LoweredValue,
     receiver: LoweredValue,
@@ -106,7 +105,7 @@ pub(super) struct Output<'a, 'f> {
     pub(super) lowered: &'a mut Option<super::semantic::Graph>,
     pub(super) module: &'a mut JITModule,
     pub(super) stubs: Stubs,
-    pub(super) annotations: &'a mut Annotations,
+    pub(super) semantic_locations: bool,
     pub(super) names: &'a mut Vec<Box<str>>,
     pub(super) cells: &'a mut Vec<Box<u64>>,
     pub(super) data: &'a mut FunctionData,
@@ -185,7 +184,7 @@ fn build_callable(
         lowered: output_graph,
         module,
         stubs,
-        annotations,
+        semantic_locations,
         names,
         cells,
         data,
@@ -200,7 +199,7 @@ fn build_callable(
         clif_builder.func.signature.clone(),
         module,
         stubs,
-        annotations,
+        semantic_locations,
         names,
         cells,
         data,
@@ -215,7 +214,7 @@ fn build_callable(
         *output_graph = Some(lowered.clone());
     }
     super::cranelift::prepare(&mut lowered, after).map_err(Error::Compile)?;
-    super::cranelift::emit(clif_builder, module, &lowered, Some(annotations))?;
+    super::cranelift::emit(clif_builder, module, &lowered)?;
     Ok(())
 }
 
@@ -227,7 +226,7 @@ fn lower_callable(
     signature: cranelift_codegen::ir::Signature,
     module: &mut JITModule,
     stubs: Stubs,
-    annotations: &mut Annotations,
+    semantic_locations: bool,
     names: &mut Vec<Box<str>>,
     cells: &mut Vec<Box<u64>>,
     data: &mut FunctionData,
@@ -295,7 +294,7 @@ fn lower_callable(
         error_sites: FxHashMap::default(),
         error_dispatch: FxHashMap::default(),
         stubs,
-        annotations,
+        semantic_locations,
         pointer,
         ctx,
         receiver,

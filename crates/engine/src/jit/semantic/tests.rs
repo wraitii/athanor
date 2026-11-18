@@ -3433,7 +3433,7 @@ fn low_level_graph_emits_executable_cranelift() {
     context.func.signature = signature;
     let mut builder_context = FunctionBuilderContext::new();
     let mut builder = FunctionBuilder::new(&mut context.func, &mut builder_context);
-    crate::jit::cranelift::emit(&mut builder, &mut module, &graph, None).unwrap();
+    crate::jit::cranelift::emit(&mut builder, &mut module, &graph).unwrap();
     builder.seal_all_blocks();
     builder.finalize(module.target_config());
     module.define_function(id, &mut context).unwrap();

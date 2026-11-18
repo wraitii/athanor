@@ -82,14 +82,14 @@ From this folder:
 
 ```sh
 cargo test --workspace
-cargo run -p js-runner -- --compile --semantic-ir --eval 'function f(a,b){return a*b+1;}'
+cargo run -p js-runner -- --compile --eval 'function f(a,b){return a*b+1;}'
 cargo run --release -p js-runner -- --map \
   --data ../binaries/data/mods/public \
   ../binaries/data/mods/public/maps/random/belgian_uplands.js
 ```
 
-Use `JS_JIT_OPT=none` to compare semantic optimization, and `--planner`,
-`--clif`, `--asm` or `--after PASS` to inspect changes. Use release builds for
+Use `JS_JIT_OPT=none` to compare semantic optimization and `--after PASS`
+to inspect changes. Use release builds for
 performance comparisons. For compiler changes, run the Rust tests; for changes
 that affect the map workload, compare its output hash as well as timing.
 

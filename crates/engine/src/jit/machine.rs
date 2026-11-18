@@ -1,6 +1,5 @@
 use cranelift_codegen::Context;
 use cranelift_codegen::control::ControlPlane;
-use cranelift_codegen::ir::TrapCode;
 use cranelift_jit::JITModule;
 use cranelift_module::{FuncId, Module, ModuleReloc};
 
@@ -17,9 +16,7 @@ pub(super) struct MachineCode {
     pub bytes: Vec<u8>,
     pub alignment: u64,
     pub relocs: Vec<ModuleReloc>,
-    pub traps: Vec<(u32, TrapCode)>,
     pub locations: Vec<SourceRange>,
-    pub block_starts: Vec<u32>,
 }
 
 impl MachineCode {
@@ -47,12 +44,6 @@ impl MachineCode {
             })
             .collect();
         let alignment = u64::from(buffer.min_alignment);
-        let traps = buffer
-            .traps()
-            .iter()
-            .map(|trap| (trap.offset, trap.code))
-            .collect();
-        let block_starts = compiled.bb_starts.clone();
         let bytes = compiled.code_buffer().to_vec();
         let relocs = buffer
             .relocs()
@@ -63,9 +54,7 @@ impl MachineCode {
             bytes,
             alignment,
             relocs,
-            traps,
             locations,
-            block_starts,
         })
     }
 
@@ -73,16 +62,5 @@ impl MachineCode {
         module
             .define_function_bytes(id, self.alignment, &self.bytes, &self.relocs)
             .map_err(|error| Error::Compile(format!("{error:?}")))
-    }
-
-    pub(super) fn location_at(&self, offset: u32) -> Option<u32> {
-        let index = self
-            .locations
-            .partition_point(|range| range.start <= offset);
-        index
-            .checked_sub(1)
-            .and_then(|i| self.locations.get(i))
-            .filter(|range| offset < range.end)
-            .and_then(|range| range.location)
     }
 }

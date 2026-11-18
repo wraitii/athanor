@@ -54,7 +54,6 @@ fn emit_with(
         labels: SecondaryMap::new(),
         relocs: Vec::new(),
         locations: Vec::new(),
-        block_starts: Vec::new(),
     };
     for block in func.blocks.keys() {
         emitter.labels[block] = Some(emitter.asm.label());
@@ -74,7 +73,6 @@ fn emit_with(
         asm,
         relocs,
         locations,
-        block_starts,
         ..
     } = emitter;
     if asm.conditional_overflow() {
@@ -84,9 +82,7 @@ fn emit_with(
         bytes: asm.finish()?,
         alignment: 4,
         relocs,
-        traps: Vec::new(),
         locations,
-        block_starts,
     }))
 }
 
@@ -131,7 +127,6 @@ struct Emitter<'a> {
     labels: SecondaryMap<Block, Option<Label>>,
     relocs: Vec<ModuleReloc>,
     locations: Vec<SourceRange>,
-    block_starts: Vec<u32>,
 }
 
 impl Emitter<'_> {
@@ -288,7 +283,6 @@ impl Emitter<'_> {
 
     fn block(&mut self, block: Block, next: Option<Block>) -> Result<(), Unsupported> {
         self.block = block;
-        self.block_starts.push(self.asm.offset());
         let label = self.label(block);
         self.asm.bind(label);
         for &inst in &self.func.blocks[block].insts {

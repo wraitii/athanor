@@ -237,7 +237,7 @@ Pass order is significant. Facts, control-flow and effect analyses are cached in
 assumptions. Graph verification is performed at selected boundaries; additional
 ownership verification is enabled by `JS_JIT_VERIFY=1`. Optimizations are more
 restricted for generators and functions with exception handlers. Inspection
-with `--semantic-ir --after PASS` is useful when a fact, guard or operation
+with `--after PASS` is useful when a fact, guard or operation
 appears to disappear between stages.
 
 Effects are part of correctness, not just profitability. A reused load or a
@@ -495,13 +495,12 @@ same fallback.
 
 ## Inspection and validation
 
-The runner can display AST, graph, planner information, CLIF and assembly. For
-example:
+The runner displays semantic IR and can report optimization decisions.
 
 ```sh
-cargo run -p js-runner -- --compile --semantic-ir \
+cargo run -p js-runner -- --compile \
   --eval 'function f(a,b){return a*b+1;}'
-cargo run -p js-runner -- --compile --filter f --planner --clif --asm script.js
+cargo run -p js-runner -- --compile --filter f --after planner script.js
 ```
 
 Compile mode does not execute source unless `--execute` is supplied. Use

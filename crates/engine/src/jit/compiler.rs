@@ -23,7 +23,7 @@ use oxc_syntax::symbol::SymbolId;
 use crate::EngineOptions;
 use crate::error::{Error, compile_at, unsupported_at};
 
-use super::clif::{Annotations, FunctionBody};
+use super::clif::FunctionBody;
 use super::entries::{Entry, VariantId};
 use super::function_data::FunctionData;
 use super::machine::MachineCode;
@@ -448,10 +448,7 @@ impl Compiler {
         inspection: super::inspect::Inspection,
         build: impl FnOnce(finalize::Output<'_, '_>) -> Result<(), Error>,
     ) -> Result<FunctionBody, Error> {
-        let mut annotations = Annotations {
-            semantic_locations: self.dump_ir || self.inspection.is_some(),
-            ..Annotations::default()
-        };
+        let semantic_locations = self.dump_ir || self.inspection.is_some();
         if baseline.is_some() {
             let mut function = cranelift_codegen::ir::Function::new();
             function.signature = signature;
@@ -459,7 +456,7 @@ impl Compiler {
                 function,
                 lowered: None,
                 baseline,
-                annotations,
+                semantic_locations,
                 listing,
                 inspection,
             });
@@ -492,11 +489,10 @@ impl Compiler {
         }
         let clif = !native
             || self.inspection.as_ref().is_some_and(|options| {
-                options.clif
-                    || matches!(
-                        options.after.as_deref(),
-                        Some("legalize-convert" | "bits" | "cranelift-memory")
-                    )
+                matches!(
+                    options.after.as_deref(),
+                    Some("legalize-convert" | "bits" | "cranelift-memory")
+                )
             });
         build(finalize::Output {
             b: &mut builder,
@@ -505,7 +501,7 @@ impl Compiler {
             lowered: &mut lowered,
             module: &mut self.module,
             stubs: self.stubs,
-            annotations: &mut annotations,
+            semantic_locations,
             names: &mut self.names,
             cells: &mut self.cells,
             data: &mut data,
@@ -533,7 +529,7 @@ impl Compiler {
             function,
             lowered,
             baseline,
-            annotations,
+            semantic_locations,
             listing,
             inspection: inspection.lowered(snapshot),
         })
@@ -590,7 +586,7 @@ impl Compiler {
                 &mut self.context.func,
                 &mut self.builder_context,
             );
-            cranelift::emit(&mut builder, &mut self.module, &prepared, None)?;
+            cranelift::emit(&mut builder, &mut self.module, &prepared)?;
             builder.seal_all_blocks();
             builder.finalize(self.module.target_config());
         }
@@ -1082,8 +1078,7 @@ impl Compiler {
                 self.source_name.0,
                 1,
             )
-            .after(passes.snapshot)
-            .ast(self.inspection.as_deref(), &program);
+            .after(passes.snapshot);
             if let Some(listing) = &mut listing {
                 self.remap_listing(listing, &graph, self.source_name.0);
             }
@@ -1183,14 +1178,8 @@ impl Compiler {
                     }
                 }
             }
-            if let Some(options) = self.inspection.as_deref().filter(|o| o.matches(&name)) {
-                options.print_body(
-                    &name,
-                    &code.inspection,
-                    &self.context.func,
-                    &code.annotations,
-                    direct,
-                );
+            if self.inspection.as_ref().is_some_and(|o| o.matches(&name)) {
+                code.inspection.print(&name, direct);
             }
             if let Some(stats) = &mut self.stats {
                 stats.functions += 1;
@@ -1233,9 +1222,6 @@ impl Compiler {
             if let Some(stats) = &mut self.stats {
                 stats.bytes += machine.bytes.len();
             }
-            if let Some(options) = self.inspection.as_deref().filter(|o| o.matches(&name)) {
-                options.print_compiled(&name, &self.context, &machine, &self.module, direct)?;
-            }
             if self.dump.is_some() {
                 let size = machine.bytes.len();
                 let mut locations = BTreeMap::new();
@@ -1276,7 +1262,7 @@ impl Compiler {
                         let Some(offset) = range.location else {
                             continue;
                         };
-                        let offset = if code.annotations.semantic_locations {
+                        let offset = if code.semantic_locations {
                             let Some(offset) = source_locations.get(&offset) else {
                                 continue;
                             };
@@ -2122,10 +2108,7 @@ impl Compiler {
                 (label, line),
                 semantic_function,
             )?;
-            body.inspection = body.inspection.named(label).ast(
-                self.inspection.as_deref(),
-                &(params, statements, expression),
-            );
+            body.inspection = body.inspection.named(label);
             return Ok(body);
         }
         super::generator::validate(statements)?;
@@ -2202,7 +2185,7 @@ impl Compiler {
             )?;
             self.continuations.push((id, body));
         }
-        let mut factory = self.compile_function(
+        self.compile_function(
             params,
             &[],
             None,
@@ -2215,11 +2198,7 @@ impl Compiler {
             finalize::FunctionKind::Factory(layout),
             (label, line),
             None,
-        )?;
-        factory.inspection = factory
-            .inspection
-            .ast(self.inspection.as_deref(), &(params, statements));
-        Ok(factory)
+        )
     }
 
     fn compile_function(
@@ -2778,8 +2757,7 @@ mod native_tests {
                             &mut compiler.context.func,
                             &mut compiler.builder_context,
                         );
-                        cranelift::emit(&mut builder, &mut compiler.module, &prepared, None)
-                            .unwrap();
+                        cranelift::emit(&mut builder, &mut compiler.module, &prepared).unwrap();
                         builder.seal_all_blocks();
                         builder.finalize(compiler.module.target_config());
                     }

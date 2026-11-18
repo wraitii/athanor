@@ -43,8 +43,8 @@ to choose another entry point. Repeat `--load SCRIPT` to initialize libraries
 before the main source in the same engine. The REPL preserves global declarations
 between lines; use `exit`, `.exit`, or EOF to leave.
 
-Use `--release` for performance measurements. The dev profile uses `opt-level = 1`;
-release builds include line tables for profiling.
+Use `--release` for performance measurements. The dev profile uses `opt-level = 1`.
+Both profiles include line tables.
 
 ## Map generation
 
@@ -89,13 +89,13 @@ Their Makefiles accept `SCRIPT` and `DATA` overrides; `make run-test` runs
 ## Inspecting compilation
 
 ```sh
-cargo run -p js-runner -- --compile --semantic-ir \
+cargo run -p js-runner -- --compile \
   --eval 'function f(a,b){return a*b+1;}'
-cargo run -p js-runner -- --compile --filter paint --planner --clif --asm script.js
+cargo run -p js-runner -- --compile --filter paint --after ownership script.js
 ```
 
 Compile mode does not execute the source unless given `--execute 'JS'`.
-`--after PASS` inspects a lowering boundary; `--ast` shows the parsed source.
+`--after PASS` inspects a compiler pass. Use `--after planner` for optimization decisions.
 Use `JS_JIT_OPT=none` to compare against unoptimized semantic graphs.
 
 For a compile-time benchmark without inspection output or execution, use:

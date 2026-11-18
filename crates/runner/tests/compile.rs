@@ -61,7 +61,7 @@ fn after_views_span_specialization_and_lowering() {
 
 #[test]
 #[cfg(target_arch = "aarch64")]
-fn native_selection_view_preserves_clif_inspection() {
+fn native_selection_view_shows_selected_instructions() {
     let output = Command::new(env!("CARGO_BIN_EXE_js-runner"))
         .env("JS_JIT_BACKEND", "native-only")
         .env("JS_JIT_OPT", "full")
@@ -73,8 +73,6 @@ fn native_selection_view_preserves_clif_inspection() {
             "f",
             "--after",
             "aarch64-select",
-            "--clif",
-            "--asm",
             "--eval",
             "function f(a,b){return a*b+1;}",
         ])
@@ -88,21 +86,12 @@ fn native_selection_view_preserves_clif_inspection() {
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(text.contains("semantic IR f after aarch64-select"));
     assert!(text.contains("aarch64-branch"));
-    assert!(text.contains("Cranelift IR before optimization"));
-    assert!(text.contains("machine code ("));
 }
 
 #[test]
 fn filter_selects_all_views_without_removing_inline_candidates() {
     let output = compile(
-        &[
-            "--filter",
-            "selected",
-            "--ast",
-            "--clif",
-            "--planner",
-            "--asm",
-        ],
+        &["--filter", "selected", "--after", "planner"],
         "function helper(x){return x+1;} function selected(x){return helper(x);} function unrelated(){return 42;}",
     );
     assert!(
@@ -111,14 +100,7 @@ fn filter_selects_all_views_without_removing_inline_candidates() {
         String::from_utf8_lossy(&output.stderr)
     );
     let text = String::from_utf8(output.stdout).unwrap();
-    for heading in [
-        "analyzed AST selected",
-        "semantic IR selected",
-        "planner selected",
-        "Cranelift IR before optimization",
-        "Cranelift IR after optimization",
-        "machine code (",
-    ] {
+    for heading in ["semantic IR selected", "planner selected"] {
         assert!(text.contains(heading), "{heading}\n{text}");
     }
     assert!(!text.contains("[helper@"));
@@ -133,18 +115,6 @@ fn filter_selects_all_views_without_removing_inline_candidates() {
     assert!(!semantic.contains("note:"));
     assert!(text.contains("note: call inst"));
     assert!(text.contains("inline funcid"));
-    assert!(text.contains(" ; @"));
-    assert!(text.contains(" ; unattributed"));
-    let locations: Vec<_> = semantic
-        .lines()
-        .filter_map(|line| line.rsplit_once("  @").map(|(_, location)| location))
-        .collect();
-    let asm = text.split("machine code (").nth(1).unwrap();
-    for line in asm.lines() {
-        if let Some((_, location)) = line.split_once(" ; @") {
-            assert!(locations.contains(&location), "{line}");
-        }
-    }
 }
 
 #[test]
@@ -172,10 +142,8 @@ fn semantic_dump_includes_emitted_osr_instrumentation() {
             .args(arguments)
             .args([
                 "--compile",
-                "--no-ir",
                 "--filter",
                 "f",
-                "--semantic-ir",
                 "--eval",
                 "function f(rows,n){let total=0;for(let y=0;y<n;++y){let sum=0;for(let x=0;x<n;++x)sum+=rows[y][x]/1;total+=sum;}return total;}",
             ])
@@ -195,7 +163,7 @@ fn semantic_dump_includes_emitted_osr_instrumentation() {
 #[test]
 fn planner_can_be_printed_without_ir_or_execution() {
     let output = compile(
-        &["--no-ir", "--planner"],
+        &["--no-ir", "--after", "planner"],
         "function f(a){return a+1;} print('executed');",
     );
     assert!(
@@ -208,32 +176,26 @@ fn planner_can_be_printed_without_ir_or_execution() {
     assert!(text.contains("feedback: 0"));
     assert!(text.contains("inline budget:"));
     assert!(!text.contains("semantic IR"));
-    assert!(!text.contains("Cranelift IR"));
-    assert!(!text.contains("machine code"));
     assert!(!text.lines().any(|line| line == "executed"));
 }
 
 #[test]
-fn semantic_ir_is_default_and_clif_is_explicit() {
+fn semantic_ir_is_default_and_can_be_disabled() {
     let source = "function f(a){return a+1;}";
     let output = compile(&[], source);
     assert!(output.status.success());
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(text.contains("semantic IR f"));
-    assert!(!text.contains("Cranelift IR"));
     assert!(!text.contains("planner f"));
-    let output = compile(&["--no-semantic-ir", "--clif"], source);
+    let output = compile(&["--no-ir"], source);
     assert!(output.status.success());
-    let text = String::from_utf8(output.stdout).unwrap();
-    assert!(!text.contains("semantic IR"));
-    assert!(text.contains("Cranelift IR before optimization"));
-    assert!(text.contains("Cranelift IR after optimization"));
+    assert!(output.stdout.is_empty());
 }
 
 #[test]
 fn planner_reports_materialized_region_candidates() {
     let output = compile(
-        &["--planner"],
+        &["--after", "planner"],
         "function f(rows){let sum=0;for(let y=0;y<2;++y){const row=new Float64Array(2);for(let x=0;x<2;++x)sum+=row[x];}return sum;}",
     );
     assert!(
@@ -297,9 +259,8 @@ fn execution_collects_object_feedback_and_prints_guarded_variants() {
         &[
             "--filter",
             "selected",
-            "--planner",
-            "--clif",
-            "--asm",
+            "--after",
+            "planner",
             "--execute",
             "const object = {method: function(x){return x+1;}}; const runner = {call: selected}; for(let i=0;i<32;++i) runner.call(object); object.method = function(x){return x+2;}; print(runner.call(object));",
         ],
@@ -314,11 +275,7 @@ fn execution_collects_object_feedback_and_prints_guarded_variants() {
     assert!(text.contains("feedback: 0"), "{text}");
     assert!(text.contains(".feedback@"), "{text}");
     assert!(text.contains("guard_code=true"), "{text}");
-    assert!(
-        text.matches("Cranelift IR after optimization").count() >= 2,
-        "{text}"
-    );
-    assert!(text.matches("machine code (").count() >= 2, "{text}");
+    assert!(text.matches("semantic IR selected").count() >= 2, "{text}");
     assert!(text.lines().any(|line| line == "6"), "{text}");
 }
 
@@ -341,7 +298,8 @@ fn filter_append_allows_loop_guards_and_preserves_method_replacement() {
         &[
             "--filter",
             "selected",
-            "--planner",
+            "--after",
+            "planner",
             "--execute",
             "const values = [1,2,3]; const constraint = {allows: function(value){return true;}}; const runner = {call:selected}; for(let i=0;i<32;++i) runner.call(values,constraint); const before = runner.call(values,constraint).length; constraint.allows = function(value){return false;}; print(before === 3 && runner.call(values,constraint).length === 0);",
         ],
@@ -364,7 +322,8 @@ fn native_push_feedback_specializes_unknown_receivers_and_keeps_fallback() {
         &[
             "--filter",
             "selected",
-            "--planner",
+            "--after",
+            "planner",
             "--execute",
             "const runner={call:selected}; const a=[]; for(let i=0;i<32;++i) runner.call(a,i); const custom={push:function(x){return x+100;}}; print(a.length===32 && runner.call(custom,7)===107);",
         ],
@@ -390,7 +349,7 @@ fn native_push_feedback_specializes_unknown_receivers_and_keeps_fallback() {
 #[test]
 fn fresh_array_push_is_lowered_with_identity_guards() {
     let source = "function selected(x){const a=[]; const first=a.push(x,2); const second=a.push(); return first===2 && second===2 && a[0]===x && a[1]===2;}";
-    let output = compile(&["--filter", "selected", "--planner"], source);
+    let output = compile(&["--filter", "selected", "--after", "planner"], source);
     assert!(
         output.status.success(),
         "{}",
@@ -427,7 +386,6 @@ fn generator_regions_are_inspectable_and_published_for_execution() {
         &[
             "--filter",
             ".resume.",
-            "--clif",
             "--execute",
             "const g=gen(40);print(g.next().value+g.next().value);",
         ],
@@ -439,11 +397,7 @@ fn generator_regions_are_inspectable_and_published_for_execution() {
         String::from_utf8_lossy(&output.stderr)
     );
     let text = String::from_utf8(output.stdout).unwrap();
-    assert_eq!(
-        text.matches("Cranelift IR after optimization").count(),
-        2,
-        "{text}"
-    );
+    assert_eq!(text.matches("semantic IR ").count(), 2, "{text}");
     assert!(text.lines().any(|line| line == "82"), "{text}");
 }
 

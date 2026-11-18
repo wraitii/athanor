@@ -24,7 +24,6 @@ pub(in crate::jit) fn emit(
     builder: &mut FunctionBuilder<'_>,
     module: &mut JITModule,
     graph: &Graph,
-    mut annotations: Option<&mut crate::jit::clif::Annotations>,
 ) -> Result<(), Error> {
     let mut blocks = SecondaryMap::new();
     for block in graph.blocks.keys() {
@@ -200,7 +199,7 @@ pub(in crate::jit) fn emit(
                     target,
                     signature,
                     args,
-                    helper,
+                    ..
                 } => {
                     let args: Vec<_> = args.iter().map(|&arg| get(arg)).collect();
                     let call = match target {
@@ -219,10 +218,6 @@ pub(in crate::jit) fn emit(
                             builder.ins().call_indirect(signature, get(*value), &args)
                         }
                     };
-                    if let (Some(annotations), Some(helper)) = (annotations.as_deref_mut(), helper)
-                    {
-                        annotations.helpers.insert(call, *helper);
-                    }
                     builder.inst_results(call).to_vec()
                 }
                 Op::Cleanup { .. } | Op::Reference { .. } | Op::FrameStore { .. } => {

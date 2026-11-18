@@ -1,34 +1,22 @@
-use std::fmt::{Debug, Write};
+use std::fmt::Write;
 
-use cranelift_codegen::{Context, ir::Function};
-use cranelift_jit::JITModule;
-use cranelift_module::Module;
-
-use crate::error::Error;
-
-use super::{clif::Annotations, machine::MachineCode, semantic};
+use super::semantic;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompileOptions {
     pub filter: Option<String>,
-    pub clif: bool,
-    pub ast: bool,
     pub semantic_ir: bool,
     pub after: Option<String>,
     pub planner: bool,
-    pub asm: bool,
 }
 
 impl Default for CompileOptions {
     fn default() -> Self {
         Self {
             filter: None,
-            clif: false,
-            ast: false,
             semantic_ir: true,
             after: None,
             planner: false,
-            asm: false,
         }
     }
 }
@@ -36,7 +24,6 @@ impl Default for CompileOptions {
 #[derive(Clone, Default)]
 pub(super) struct Inspection {
     label: Option<String>,
-    ast: Option<String>,
     semantic: Option<String>,
     after: Option<(String, String)>,
     planner: Option<String>,
@@ -153,11 +140,21 @@ impl Inspection {
         self
     }
 
-    pub(super) fn ast(mut self, options: Option<&CompileOptions>, ast: &impl Debug) -> Self {
-        if options.is_some_and(|options| options.ast) {
-            self.ast = Some(format!("{ast:#?}"));
+    pub(super) fn print(&self, name: &str, direct: bool) {
+        let label = self.label.as_deref().unwrap_or(name);
+        if direct && (self.after.is_some() || self.semantic.is_some()) {
+            println!("[{name}] direct baseline code");
         }
-        self
+        match (&self.after, &self.semantic) {
+            (Some((pass, semantic)), _) => {
+                println!("[{name}] semantic IR {label} after {pass}\n{semantic}")
+            }
+            (None, Some(semantic)) => println!("[{name}] semantic IR {label}\n{semantic}"),
+            (None, None) => {}
+        }
+        if let Some(planner) = &self.planner {
+            println!("[{name}] planner {label}\n{planner}");
+        }
     }
 }
 
@@ -166,129 +163,5 @@ impl CompileOptions {
         self.filter
             .as_ref()
             .is_none_or(|filter| name.contains(filter))
-    }
-
-    pub(super) fn print_body(
-        &self,
-        name: &str,
-        body: &Inspection,
-        function: &Function,
-        annotations: &Annotations,
-        direct: bool,
-    ) {
-        let label = body.label.as_deref().unwrap_or(name);
-        if let Some(ast) = &body.ast {
-            println!("[{name}] analyzed AST {label}\n{ast}");
-        }
-        match (&body.after, &body.semantic) {
-            (Some((pass, semantic)), _) => {
-                println!("[{name}] semantic IR {label} after {pass}\n{semantic}")
-            }
-            (None, Some(semantic)) => println!("[{name}] semantic IR {label}\n{semantic}"),
-            (None, None) => {}
-        }
-        if let Some(planner) = &body.planner {
-            println!("[{name}] planner {label}\n{planner}");
-        }
-        if self.clif {
-            if direct {
-                println!("[{name}] Cranelift IR unavailable for direct baseline code");
-                return;
-            }
-            println!(
-                "[{name}] Cranelift IR before optimization\n{}",
-                function.display()
-            );
-            let mut helpers: Vec<_> = annotations.helpers.iter().collect();
-            helpers.sort_by_key(|(inst, _)| inst.as_u32());
-            for (inst, helper) in helpers {
-                println!("  helper {inst}: {helper:?}");
-            }
-        }
-    }
-
-    pub(super) fn print_compiled(
-        &self,
-        name: &str,
-        context: &Context,
-        machine: &MachineCode,
-        module: &JITModule,
-        direct: bool,
-    ) -> Result<(), Error> {
-        if self.clif && !direct {
-            println!(
-                "[{name}] Cranelift IR after optimization\n{}",
-                context.func.display()
-            );
-        }
-        if !self.asm {
-            return Ok(());
-        }
-        let cs = module
-            .isa()
-            .to_capstone()
-            .map_err(|error| Error::Compile(error.to_string()))?;
-        let code = &machine.bytes;
-        let mut starts = vec![0];
-        starts.extend(
-            machine
-                .block_starts
-                .iter()
-                .copied()
-                .filter(|&start| start != 0),
-        );
-        starts.push(code.len() as u32);
-        let mut out = String::new();
-        writeln!(out, "[{name}] machine code ({} bytes)", code.len()).unwrap();
-        for (block, bounds) in starts.windows(2).enumerate() {
-            let start = bounds[0] as usize;
-            let end = bounds[1] as usize;
-            writeln!(out, "block{block}:").unwrap();
-            let instructions = cs
-                .disasm_all(&code[start..end], start as u64)
-                .map_err(|error| Error::Compile(error.to_string()))?;
-            let mut decoded = start;
-            for inst in instructions.iter() {
-                let offset = inst.address() as u32;
-                let end = offset + inst.bytes().len() as u32;
-                write!(
-                    out,
-                    "  +{offset:06x}  {:8} {}",
-                    inst.mnemonic().unwrap_or(""),
-                    inst.op_str().unwrap_or("")
-                )
-                .unwrap();
-                match machine.location_at(offset) {
-                    Some(location) => write!(out, " ; @{location:04x}").unwrap(),
-                    None => out.push_str(" ; unattributed"),
-                }
-                for reloc in machine
-                    .relocs
-                    .iter()
-                    .filter(|reloc| offset <= reloc.offset && reloc.offset < end)
-                {
-                    write!(
-                        out,
-                        " ; reloc {} {} {:+}",
-                        reloc.kind, reloc.name, reloc.addend
-                    )
-                    .unwrap();
-                }
-                for (_, code) in machine
-                    .traps
-                    .iter()
-                    .filter(|(trap, _)| offset <= *trap && *trap < end)
-                {
-                    write!(out, " ; trap {code}").unwrap();
-                }
-                out.push('\n');
-                decoded = end as usize;
-            }
-            for (offset, byte) in code.iter().enumerate().take(end).skip(decoded) {
-                writeln!(out, "  +{offset:06x}  .byte 0x{byte:02x}").unwrap();
-            }
-        }
-        print!("{out}");
-        Ok(())
     }
 }
