@@ -74,34 +74,37 @@ cpp-quickjs/build/mapgen-runner --bootstrap bench/v8-v7/quickjs.js bench/gaussia
 
 Apple Silicon; node 23.9.0, bun 1.3.1, SpiderMonkey 128,
 QuickJS 2026-06-04, Ant 16.5.c41757b4.0. Higher is better.
-JIT, default Node and Bun results were measured on 2026-11-17, with Athanor
-at `56d6718`. Other results are retained from 2026-11-16.
+Navier–Stokes, Gaussian blur, DeltaBlue, Splay and Earley–Boyer JIT results
+were measured on 2026-11-18 at `8acd96f`. Other JIT, default Node and Bun
+results were measured on 2026-11-17, with Athanor at `56d6718`. Other engine
+results are retained from 2026-11-16.
 
 | benchmark | jit | node jitless | node ≤Sparkplug | node ≤Maglev | node | bun | Ant | SpiderMonkey 128 | QuickJS |
 |-----------|----:|-------------:|----------------:|-------------:|-----:|----:|----:|----------------:|--------:|
 | richards | 4204 | 1753 | 2835 | 33057 | 44947 | 51484 | 5454 | 15621 | 1139 |
-| navier-stokes | 23869 | 2370 | 3379 | 27788 | 40096 | 33700 | 20755 | 21390 | 1783 |
-| gaussian-blur | 289 | 12.9 | 19.9 | 229 | 645 | 1282 | 153 | 260 | 7.93 |
-| deltablue | 3253 | 1849 | 3124 | 47307 | 118384 | 77133 | — | 17515 | 1291 |
+| navier-stokes | 22722.5 | 2370 | 3379 | 27788 | 40096 | 33700 | 20755 | 21390 | 1783 |
+| gaussian-blur | 354.5 | 12.9 | 19.9 | 229 | 645 | 1282 | 153 | 260 | 7.93 |
+| deltablue | 3710.5 | 1849 | 3124 | 47307 | 118384 | 77133 | — | 17515 | 1291 |
 
-All scores are medians of three runs, with benchmark processes run sequentially.
+The five updated JIT scores are medians of four runs; the other scores are
+medians of three runs. Benchmark processes ran sequentially.
 The standard harness warms up each benchmark for one second before measurement.
 All engines produced a Gaussian blur output buffer sum of `2019780`.
 DeltaBlue was measured separately on 2026-11-17 with the `Function.prototype.call`
 change; Ant was unavailable for that run.
 
-Additional scores on the same machine, medians of three sequential runs per
-engine and benchmark, using the same dates and release JIT build as above.
+Additional scores on the same machine, using the same dates and builds as above.
 Node and Bun use their default configurations; QuickJS uses the C++ runner and
 the same benchmark harness:
 
 | benchmark | jit | node | bun | QuickJS |
 |-----------|----:|-----:|----:|--------:|
-| splay | 7774 | 20715 | 72421 | 5827 |
+| splay | 7464.5 | 20715 | 72421 | 5827 |
 | raytrace | 5119 | 105226 | 201055 | 2905 |
 | crypto | 8679 | 63546 | 76789 | 979 |
+| earley-boyer | 4399.5 | — | — | — |
 
-All three benchmarks completed successfully in every engine.
+Splay, RayTrace and Crypto completed successfully in every engine.
 
 `Function.prototype.apply` is implemented in JS with a compiler-visible target
 call; string conversion, character/range methods and `parseInt` use Rust
