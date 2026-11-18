@@ -5,7 +5,9 @@ use crate::jit::semantic::JsOp;
 use crate::{FxHashMap, FxHashSet};
 
 use super::super::super::available::LoadKey;
+use super::super::super::cursor::{Cursor, Insert};
 use super::super::super::guards::{Fact, edge_of, implies};
+use super::super::super::{ArrayLayout, low_level};
 use super::*;
 
 fn retarget(graph: &mut Graph, blocks: &FxHashSet<Block>, from: Value, to: Value) {
@@ -48,6 +50,7 @@ pub(in crate::jit::semantic) struct Speculation<'a> {
     pub(in crate::jit::semantic) exits: &'a [Block],
     pub(in crate::jit::semantic) exits_true: &'a [Block],
     pub(in crate::jit::semantic) typed_reads: &'a [(Inst, TypedRead)],
+    pub(in crate::jit::semantic) array_reads: &'a [(Inst, i64)],
     pub(in crate::jit::semantic) assumes: &'a [(Value, Fact)],
     pub(in crate::jit::semantic) code_guards: &'a [(String, cranelift_module::FuncId)],
 }
@@ -110,6 +113,7 @@ fn entry_checks(
     speculation: &Speculation<'_>,
     requirements: &[NativeCheck],
     hints: &FxHashMap<Value, crate::jit::profile::ReadType>,
+    array_bounds: &[(Value, i64)],
     head: Block,
     mut tested: FxHashSet<EntryGuard>,
     values: &mut FxHashMap<Value, Value>,
@@ -601,6 +605,26 @@ fn entry_checks(
     bounds.sort();
     bounds.dedup();
     current = typed_guards(graph, current, &original, &mapped_typed, &bounds);
+    for &(object, max) in array_bounds {
+        let object = values.get(&object).copied().unwrap_or(object);
+        let packed = graph.append_value(
+            current,
+            span,
+            Op::Javascript(JsOp::IsArray(object, ArrayLayout::Packed)),
+        );
+        let length = graph.append_value(current, span, Op::Javascript(JsOp::IndexedLength(object)));
+        let max = graph.append_value(
+            current,
+            span,
+            Op::LowLevel(low_level::Op::Integer {
+                ty: cranelift_codegen::ir::types::I64,
+                bits: max as u64,
+            }),
+        );
+        let fits = graph.append_value(current, span, Op::Javascript(JsOp::IsInBounds(max, length)));
+        let check = graph.append_value(current, span, Op::BooleanAnd(packed, fits));
+        current = continue_if(graph, current, check, &original);
+    }
     let good = Target { block: head, args };
     graph.terminate(current, span, TerminatorKind::Jump(good.clone()));
     match entry {
@@ -1037,6 +1061,26 @@ pub(super) fn materialize(
         .map(|value| (value, value))
         .collect();
     let scope = region.iter().copied().collect();
+    let mut array_bounds = FxHashMap::<Value, i64>::default();
+    for &(inst, max) in speculation.array_reads {
+        let data = &graph.insts[inst];
+        let Op::Javascript(JsOp::GetIndex(object, key) | JsOp::ArrayGet(object, key)) = data.op
+        else {
+            unreachable!();
+        };
+        let position =
+            Cursor::before(graph, inst).add_unassigned(Op::Javascript(JsOp::ArrayPosition(key)));
+        graph.set_op(
+            inst,
+            Op::Javascript(JsOp::ArrayLoad(object, position, ArrayLayout::Packed)),
+        );
+        array_bounds
+            .entry(object)
+            .and_modify(|old| *old = (*old).max(max))
+            .or_insert(max);
+    }
+    let mut array_bounds: Vec<_> = array_bounds.into_iter().collect();
+    array_bounds.sort_unstable();
     for &(inst, read) in speculation.typed_reads {
         if let Op::Javascript(JsOp::GetIndex(object, key) | JsOp::TypedIndex(object, key, _)) =
             graph.insts[inst].op
@@ -1063,6 +1107,7 @@ pub(super) fn materialize(
         speculation,
         &native,
         &hints,
+        &array_bounds,
         head,
         tested,
         &mut values,

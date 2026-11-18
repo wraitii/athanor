@@ -150,7 +150,10 @@ fn plan(
                 .filter(|block| !candidate.cold.contains(block))
                 .map(|&block| candidate.blocks[block].insts.len())
                 .sum(),
-            checks: parent.checks.len() + parent.identities.len() + parent.locals.len(),
+            checks: parent.checks.len()
+                + parent.identities.len()
+                + parent.locals.len()
+                + parent.array_reads.len(),
             reentry: parent.reentry.as_deref(),
             survivors: &parent.survivors,
         };
@@ -181,6 +184,7 @@ fn plan(
             guards: &parent.guards,
             exits: &parent.exits,
             typed_reads: &parent.typed_reads,
+            array_reads: &parent.array_reads,
             code_guards: &parent.identities,
             ..Default::default()
         };
@@ -965,6 +969,59 @@ mod tests {
             });
         assert!(integer_add);
         graph.verify().unwrap();
+    }
+
+    #[test]
+    fn packed_array_bounds_leave_read_only_loops() {
+        use crate::jit::profile::{ReadKind, ReadType, Site};
+
+        for (mutation, expected) in [("", true), ("other.length = 0;", false)] {
+            let graph = graph(&format!(
+                "function f(a,other){{let sum=0;for(let y=0;y<3;++y)for(let x=0;x<3;++x){{{mutation}sum+=a[y*3+x];}}return sum;}}"
+            ));
+            let data = graph
+                .insts
+                .values()
+                .find(|data| matches!(data.op, Op::Javascript(JsOp::GetIndex(..))))
+                .unwrap();
+            let site = Site {
+                inline_context: 0,
+                source: 7,
+                start: data.span.start,
+                end: data.span.end,
+            };
+            let mut repository = super::super::super::calls::Repository::default();
+            repository
+                .read_feedback
+                .insert((site, ReadKind::Receiver), ReadType::Array);
+            let canonical = FunctionState::from_graph(graph);
+            let planned = super::super::super::super::optimize_canonical(
+                canonical,
+                true,
+                Some((&repository, 7)),
+            )
+            .unwrap();
+            let graph = &planned.graph;
+            let cfg = Cfg::new(graph);
+            let mut guards = cfg.rpo.iter().copied().filter(|&block| {
+                graph.blocks[block].insts.iter().any(|&inst| {
+                    matches!(graph.insts[inst].op, Op::Javascript(JsOp::IsInBounds(position, _))
+                            if matches!(graph.defining_op(position),
+                                Some(Op::LowLevel(LowOp::Integer { bits: 8, .. }))))
+                })
+            });
+            let guard = guards.next();
+            assert_eq!(guard.is_some(), expected);
+            if let Some(guard) = guard {
+                assert!(guards.next().is_none());
+                assert!(
+                    natural_loops(graph, &cfg)
+                        .iter()
+                        .all(|(_, body)| !body.contains(&guard))
+                );
+            }
+            graph.verify().unwrap();
+        }
     }
 
     #[test]

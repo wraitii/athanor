@@ -24,6 +24,7 @@ pub(super) struct RegionPlan {
     pub(super) guards: Vec<Block>,
     pub(super) exits: Vec<Block>,
     pub(super) typed_reads: Vec<(Inst, TypedRead)>,
+    pub(super) array_reads: Vec<(Inst, i64)>,
     pub(super) survivors: Vec<(Fact, Origin)>,
     pub(super) reentry: Option<String>,
     pub(super) children: Vec<RegionPlan>,
@@ -163,6 +164,9 @@ impl RegionPlan {
             )
             .unwrap();
         }
+        for &(inst, max) in &self.array_reads {
+            writeln!(out, "{indent}  packed array read {inst}: max index {max}").unwrap();
+        }
         if children {
             for child in &self.children {
                 out.push_str(&child.report(graph, depth + 1, true));
@@ -177,6 +181,7 @@ impl RegionPlan {
             || !self.requirements.is_empty()
             || !self.checks.is_empty()
             || !self.guards.is_empty()
+            || !self.array_reads.is_empty()
     }
 }
 
@@ -387,6 +392,13 @@ pub(super) fn plan_region(
         known.cfg.clone(),
         &guards::assumed(&assumptions, &assumed),
     );
+    let array_reads = if let Some((preheader, _)) = entry {
+        bounded_array_reads(
+            &planning, &facts, &shared, &body, &blocks, preheader, &assumes,
+        )
+    } else {
+        Vec::new()
+    };
     let typed = typed_entry(&planning, &body, &available, &facts, &assumes);
     let objects: Vec<Value> = typed.iter().map(|&(object, _)| object).collect();
     let mut bounded = bounded_reads(&planning, &facts.cfg, &body, &objects, &available, &facts);
@@ -483,6 +495,7 @@ pub(super) fn plan_region(
         && requirements.is_empty()
         && checks.is_empty()
         && guards.is_empty()
+        && array_reads.is_empty()
         && closure_failure_with(&planning, &body, &guarded, &shared).is_some()
     {
         return Err(
@@ -519,12 +532,57 @@ pub(super) fn plan_region(
             guards,
             exits,
             typed_reads,
+            array_reads,
             survivors,
             reentry,
             children: Vec::new(),
         },
         planning,
     ))
+}
+
+fn bounded_array_reads(
+    graph: &Graph,
+    facts: &Facts,
+    effects: &Facts,
+    body: &FxHashSet<Block>,
+    blocks: &[Block],
+    preheader: Block,
+    assumes: &[(Value, Fact)],
+) -> Vec<(Inst, i64)> {
+    let mut ranges = super::super::super::ranges::Ranges::new(graph, facts, &[]);
+    let writes = Writes::with_facts(graph, body, effects);
+    blocks
+        .iter()
+        .filter(|block| !graph.cold.contains(block))
+        .flat_map(|&block| &graph.blocks[block].insts)
+        .filter_map(|&inst| {
+            let Op::Javascript(JsOp::GetIndex(object, key) | JsOp::ArrayGet(object, key)) =
+                graph.insts[inst].op
+            else {
+                return None;
+            };
+            let block = graph.insts[inst].block;
+            if !facts.cfg.dominates(graph.def_block(object), preheader)
+                || !body.contains(&graph.def_block(key))
+                || !assumes.contains(&(object, Fact::Array))
+                    && !guards::holds(graph, &facts.cfg, preheader, object, Fact::Array)
+            {
+                return None;
+            }
+            let range = ranges.integer_at(key, block)?;
+            if range.min < 0 || range.max >= i64::from(u32::MAX) {
+                return None;
+            }
+            for test in [JsOp::ArrayKind(object), JsOp::IndexedLength(object)] {
+                let read = Access::read(graph, &Op::Javascript(test), facts)?;
+                if writes.clobbers(&read) {
+                    return None;
+                }
+            }
+            Some((inst, range.max))
+        })
+        .collect()
 }
 
 pub(super) fn shaped_overwrites(
