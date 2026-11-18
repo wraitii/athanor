@@ -10,6 +10,7 @@ pub(in crate::jit) struct Plan {
     source: usize,
     accesses: Vec<(Site, PropertyAccess, ReadLayout)>,
     polymorphic: Vec<(Site, Vec<ReadLayout>)>,
+    shared_reads: FxHashMap<Site, Vec<ReadLayout>>,
     megamorphic: Vec<Site>,
 }
 
@@ -27,6 +28,12 @@ impl Plan {
         self.polymorphic
             .iter()
             .find_map(|(origin, entries)| (*origin == site).then_some(entries.as_slice()))
+    }
+
+    pub(super) fn shared_reads(&self, graph: &Graph, inst: Inst) -> &[ReadLayout] {
+        self.shared_reads
+            .get(&site(graph, inst, self.source))
+            .map_or(&[], Vec::as_slice)
     }
 
     pub(in crate::jit) fn megamorphic_sites(&self) -> &[Site] {
@@ -95,6 +102,7 @@ pub(in crate::jit::semantic) fn plan(
         .collect();
     let mut accesses = Vec::new();
     let mut polymorphic = Vec::new();
+    let mut shared_reads = FxHashMap::default();
     let mut megamorphic = Vec::new();
     for (inst, data) in graph.insts.iter() {
         if property_access(&data.op) != Some(PropertyAccess::Get) {
@@ -118,6 +126,21 @@ pub(in crate::jit::semantic) fn plan(
             };
             let site = site(graph, inst, source);
             let observed = bodies.shape_feedback(site, property);
+            if observed.is_none()
+                && site.inline_context != 0
+                && matches!(data.op, Op::Javascript(JsOp::Get(..)))
+                && let Some(ShapeAccess::PolymorphicRead { entries, len }) = bodies.shape_feedback(
+                    Site {
+                        inline_context: 0,
+                        ..site
+                    },
+                    property,
+                )
+            {
+                shared_reads
+                    .entry(site)
+                    .or_insert_with(|| entries[..usize::from(len)].to_vec());
+            }
             let callee = data.result().is_some_and(|value| callees.contains(&value));
             let object = match data.op {
                 Op::Javascript(
@@ -167,6 +190,7 @@ pub(in crate::jit::semantic) fn plan(
         source,
         accesses,
         polymorphic,
+        shared_reads,
         megamorphic,
     }
 }

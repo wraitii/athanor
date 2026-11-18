@@ -2463,6 +2463,70 @@ fn cell_read_reuse_stops_at_cell_writes_and_reentry() {
 }
 
 #[test]
+fn layout_guard_proves_shape_until_a_call() {
+    use crate::jit::layout::{LayoutGuard, RelatedStorage};
+
+    let mut graph = lower_source("function f(object, update){return object;}").unwrap();
+    let entry = graph.entry;
+    let span = graph.span;
+    let object = graph.append_value(entry, span, Op::Argument(0));
+    let update = graph.append_value(entry, span, Op::Argument(1));
+    let layout = LayoutGuard {
+        shape: 10,
+        storage: Some(RelatedStorage {
+            identity: 1,
+            shape: 20,
+            intermediate: None,
+        }),
+    };
+    let guard = graph.append_value(
+        entry,
+        span,
+        Op::Javascript(JsOp::IsReadLayout(object, layout)),
+    );
+    let fast = graph.blocks.push(BlockData::default());
+    let fallback = graph.blocks.push(BlockData::default());
+    graph.terminate(
+        entry,
+        span,
+        TerminatorKind::Branch(guard, Target::new(fast), Target::new(fallback)),
+    );
+    graph.terminate(fallback, span, TerminatorKind::Return(guard));
+    let before = graph.append_value(fast, span, Op::Javascript(JsOp::IsShape(object, 10)));
+    let other = graph.append_value(fast, span, Op::Javascript(JsOp::IsShape(object, 11)));
+    graph.append_value(
+        fast,
+        span,
+        Op::Javascript(JsOp::Call {
+            callee: update,
+            receiver: None,
+            args: vec![object],
+            target: None,
+        }),
+    );
+    let after = graph.append_value(fast, span, Op::Javascript(JsOp::IsShape(object, 10)));
+    let result = graph.append_value(
+        fast,
+        span,
+        Op::Javascript(JsOp::NewArray(vec![before, other, after])),
+    );
+    graph.terminate(fast, span, TerminatorKind::Return(result));
+    let mut function = FunctionState::new(graph, Vec::new(), true);
+    reuse::reuse_loads(&mut function);
+    function.graph.verify().unwrap();
+    for (value, expected) in [(before, true), (other, false)] {
+        assert!(matches!(
+            function.graph.defining_op(value),
+            Some(Op::Javascript(JsOp::Constant(Constant::Boolean(actual)))) if *actual == expected
+        ));
+    }
+    assert!(matches!(
+        function.graph.defining_op(after),
+        Some(Op::Javascript(JsOp::IsShape(_, 10)))
+    ));
+}
+
+#[test]
 fn array_kind_reuse_stops_at_calls_and_writes() {
     for call in [false, true] {
         let mut graph = lower_source("function f(a){return a;}").unwrap();

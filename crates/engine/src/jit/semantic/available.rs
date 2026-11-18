@@ -151,39 +151,52 @@ fn step(
     if cold {
         return None;
     }
-    if let Some((object, wanted)) = match data.op {
-        Op::Javascript(JsOp::IsShape(object, shape)) => Some((object, Fact::Shape(shape))),
-        Op::Javascript(JsOp::IsReadLayout(object, layout)) => {
-            Some((object, Fact::ReadLayout(layout)))
-        }
-        _ => None,
-    } && state.iter().any(|(key, entry)| {
-        matches!(key, LoadKey::ShapeProbe(receiver, _, layout)
-            if *receiver == resolve(aliases, object)
-                && (layout.requirement() == wanted || Fact::Shape(layout.shape) == wanted)
-                && entry.truth == Some(true))
-    }) {
-        return Some(Reuse::Boolean(true));
-    }
     let key = load_key(&data.op, probes, aliases)?;
     let [result] = data.results.as_slice() else {
         return None;
     };
+    let shape_truth = match (&data.op, &key) {
+        (
+            Op::Javascript(JsOp::IsShape(..) | JsOp::IsReadLayout(..)),
+            LoadKey::Check(object, wanted),
+        ) => {
+            let shape = |fact| match fact {
+                Fact::Shape(shape) => Some(shape),
+                Fact::ReadLayout(layout) => Some(layout.shape),
+                _ => None,
+            };
+            state.iter().find_map(|(key, entry)| {
+                if entry.truth != Some(true) {
+                    return None;
+                }
+                let (receiver, known) = match *key {
+                    LoadKey::Check(receiver, known) => (receiver, known),
+                    LoadKey::ShapeProbe(receiver, _, layout) => (receiver, layout.requirement()),
+                    _ => return None,
+                };
+                if receiver != *object {
+                    return None;
+                }
+                if known.implies(*wanted) {
+                    return Some(true);
+                }
+                shape(known)
+                    .zip(shape(*wanted))
+                    .filter(|(a, b)| a != b)
+                    .map(|_| false)
+            })
+        }
+        _ => None,
+    };
+    if shape_truth == Some(true) {
+        return Some(Reuse::Boolean(true));
+    }
     let result = *result;
     if let Some(entry) = state.get(&key)
         && (!matches!(key, LoadKey::Load(..)) || graph.repr(entry.value) == graph.repr(result))
     {
         return Some(Reuse::Value(entry.value));
     }
-    let excluded = match &key {
-        LoadKey::Check(object, Fact::Shape(shape)) => state.iter().any(|(known, entry)| {
-            let LoadKey::Check(other, Fact::Shape(known_shape)) = known else {
-                return false;
-            };
-            entry.truth == Some(true) && object == other && shape != known_shape
-        }),
-        _ => false,
-    };
     let read = read_access(graph, &data.op, facts).map(|mut read| {
         if let Some(js) = &mut read.js {
             js.base = js.base.map(|base| resolve(aliases, base));
@@ -195,16 +208,14 @@ fn step(
         Available {
             value: result,
             read,
-            truth: if excluded {
-                Some(false)
-            } else if matches!(data.op, Op::EntryAssume(..)) {
+            truth: if matches!(data.op, Op::EntryAssume(..)) {
                 Some(true)
             } else {
-                None
+                shape_truth
             },
         },
     );
-    excluded.then_some(Reuse::Boolean(false))
+    shape_truth.map(Reuse::Boolean)
 }
 
 fn entering(

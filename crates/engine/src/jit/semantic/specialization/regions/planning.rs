@@ -586,6 +586,7 @@ mod tests {
                     super::super::super::properties::Access {
                         cache: None,
                         shapes: vec![ReadLayout::own(10, 0), ReadLayout::own(20, 1)],
+                        shared_feedback: false,
                     },
                 );
             }
@@ -1545,7 +1546,7 @@ pub(in crate::jit::semantic) fn materialize_properties(graph: &mut Graph) -> Res
                 return None;
             };
             let access = graph.property_accesses.get(&inst)?;
-            if access.shapes.is_empty() {
+            if access.shared_feedback || access.shapes.is_empty() {
                 return None;
             }
             if solved.as_ref().is_some_and(|solved| {
@@ -1583,6 +1584,7 @@ pub(in crate::jit::semantic) fn materialize_properties(graph: &mut Graph) -> Res
                 Access {
                     cache: None,
                     shapes: vec![layout],
+                    shared_feedback: false,
                 },
             );
             value

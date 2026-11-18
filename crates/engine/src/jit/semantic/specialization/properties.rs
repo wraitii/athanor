@@ -9,6 +9,7 @@ use super::super::{Cfg, Facts, Graph, Inst, Op, Value, available, dispatch};
 pub(in crate::jit::semantic) struct Access {
     pub(in crate::jit::semantic) cache: Option<Value>,
     pub(in crate::jit::semantic) shapes: Vec<ReadLayout>,
+    pub(in crate::jit::semantic) shared_feedback: bool,
 }
 
 pub(in crate::jit::semantic) fn assume(graph: &mut Graph, shapes: &super::shapes::Plan) {
@@ -57,6 +58,7 @@ pub(in crate::jit::semantic) fn assume(graph: &mut Graph, shapes: &super::shapes
             ),
             _ => unreachable!(),
         };
+        let inherited = shapes.shared_reads(graph, inst);
         let origin = Origin {
             site: None,
             kind: Kind::Receiver,
@@ -92,7 +94,12 @@ pub(in crate::jit::semantic) fn assume(graph: &mut Graph, shapes: &super::shapes
             inst,
             Access {
                 cache: Some(cache),
-                shapes: alternatives,
+                shapes: if inherited.is_empty() {
+                    alternatives
+                } else {
+                    inherited.to_vec()
+                },
+                shared_feedback: !inherited.is_empty(),
             },
         );
     }
