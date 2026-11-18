@@ -1,6 +1,6 @@
 use super::hoisting::{AssumeCfg, Motion, RecoveryPoint};
 use super::*;
-use crate::jit::semantic::JsOp;
+use crate::jit::semantic::{ArrayLayout, JsOp};
 
 pub(super) struct JsMotion;
 
@@ -65,6 +65,8 @@ impl Motion for JsMotion {
             for &inst in &graph.blocks[block].insts {
                 let op = &graph.insts[inst].op;
                 let required = match *op {
+                    // The maximum is only proven to be reached within the chosen loop.
+                    Op::Javascript(JsOp::IsArray(_, ArrayLayout::Packed)) => return None,
                     Op::Javascript(JsOp::AsString(value)) => {
                         Some((value, guards::Fact::Type(ValueType::STRING)))
                     }

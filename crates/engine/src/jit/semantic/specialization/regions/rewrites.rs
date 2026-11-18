@@ -392,10 +392,8 @@ pub(super) fn plan_region(
         known.cfg.clone(),
         &guards::assumed(&assumptions, &assumed),
     );
-    let array_reads = if let Some((preheader, _)) = entry {
-        bounded_array_reads(
-            &planning, &facts, &shared, &body, &blocks, preheader, &assumes,
-        )
+    let array_reads = if let Some(entry) = entry {
+        bounded_array_reads(&planning, &facts, &shared, &body, &blocks, entry, &assumes)
     } else {
         Vec::new()
     };
@@ -547,10 +545,13 @@ fn bounded_array_reads(
     effects: &Facts,
     body: &FxHashSet<Block>,
     blocks: &[Block],
-    preheader: Block,
+    (preheader, header): (Block, Block),
     assumes: &[(Value, Fact)],
 ) -> Vec<(Inst, i64)> {
-    let mut ranges = super::super::super::ranges::Ranges::new(graph, facts, &[]);
+    use super::super::super::ranges::{LoopEndpoints, Ranges};
+
+    let mut ranges = Ranges::new(graph, facts, &[]);
+    let mut endpoints = None;
     let writes = Writes::with_facts(graph, body, effects);
     blocks
         .iter()
@@ -580,7 +581,12 @@ fn bounded_array_reads(
                     return None;
                 }
             }
-            Some((inst, range.max))
+            let endpoints = endpoints
+                .get_or_insert_with(|| LoopEndpoints::discover(graph, &facts.cfg, header))
+                .as_ref()?;
+            endpoints
+                .reaches(key, block, range.max)
+                .then_some((inst, range.max))
         })
         .collect()
 }

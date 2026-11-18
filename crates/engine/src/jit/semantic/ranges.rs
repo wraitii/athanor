@@ -9,6 +9,9 @@ use super::{
     ValueType,
 };
 
+mod endpoints;
+pub(super) use endpoints::LoopEndpoints;
+
 const QUERY_LIMIT: usize = 512;
 const DEPTH_LIMIT: usize = 24;
 pub(super) const MAX_SAFE_INTEGER: i64 = (1 << 53) - 1;
@@ -145,8 +148,8 @@ impl<'a> Ranges<'a> {
     }
 
     fn query(&mut self, value: Value, block: Block, depth: usize) -> Option<IntRange> {
-        if let Some(range) = self.literal(value) {
-            return Some(range);
+        if let Some(value) = integer_literal(self.graph, value) {
+            return Some(IntRange::point(value));
         }
         if let Some(range) = self.cache.get(&(value, block)) {
             return *range;
@@ -195,23 +198,6 @@ impl<'a> Ranges<'a> {
         Some(range)
     }
 
-    fn literal(&self, value: Value) -> Option<IntRange> {
-        match self.graph.defining_op(value) {
-            Some(Op::Javascript(JsOp::Constant(Constant::Number(n))))
-                if n.fract() == 0.0
-                    && n.abs() <= MAX_SAFE_INTEGER as f64
-                    && (*n != 0.0 || !n.is_sign_negative()) =>
-            {
-                Some(IntRange::point(*n as i64))
-            }
-            Some(Op::LowLevel(LowOp::Integer { ty, bits })) if ty.is_int() => {
-                let shift = 64 - ty.bits();
-                Some(IntRange::point(((*bits << shift) as i64) >> shift))
-            }
-            _ => None,
-        }
-    }
-
     fn definition(&mut self, value: Value, block: Block, depth: usize) -> Option<IntRange> {
         match self.graph.defining_op(value) {
             Some(Op::Javascript(JsOp::AsInteger(inner))) => {
@@ -237,7 +223,7 @@ impl<'a> Ranges<'a> {
                 }
             }
             Some(Op::LowLevel(LowOp::Binary { op, left, right })) if op.is_integer_arithmetic() => {
-                let width = self.repr_range(value)?;
+                let width = repr_range(self.graph, value)?;
                 let range = self
                     .query(*left, block, depth)?
                     .arithmetic(*op, self.query(*right, block, depth)?)?;
@@ -289,23 +275,7 @@ impl<'a> Ranges<'a> {
         }
         let mut range = initial?;
         for (pred, arg) in backedges {
-            let (operand, step) = match *self.graph.defining_op(arg)? {
-                Op::Javascript(JsOp::Unary(UnaryOp::Increment, operand)) => (operand, 1i64),
-                Op::Javascript(JsOp::Unary(UnaryOp::Decrement, operand)) => (operand, -1i64),
-                Op::Javascript(JsOp::Binary(BinaryOperator::Addition, operand, one))
-                | Op::LowLevel(LowOp::Binary {
-                    op: Binary::Add,
-                    left: operand,
-                    right: one,
-                }) if self.is_one(one) => (operand, 1i64),
-                Op::Javascript(JsOp::Binary(BinaryOperator::Subtraction, operand, one))
-                | Op::LowLevel(LowOp::Binary {
-                    op: Binary::Subtract,
-                    left: operand,
-                    right: one,
-                }) if self.is_one(one) => (operand, -1i64),
-                _ => return None,
-            };
+            let (operand, step) = induction_step(self.graph, arg)?;
             if operand != value {
                 return None;
             }
@@ -346,7 +316,7 @@ impl<'a> Ranges<'a> {
             };
             let width = match self.graph.defining_op(arg) {
                 Some(Op::LowLevel(_)) => {
-                    self.repr_range(arg)?.intersect(self.repr_range(value)?)?
+                    repr_range(self.graph, arg)?.intersect(repr_range(self.graph, value)?)?
                 }
                 _ => IntRange::I32,
             };
@@ -356,25 +326,6 @@ impl<'a> Ranges<'a> {
             range = bound;
         }
         Some(range)
-    }
-
-    fn repr_range(&self, value: Value) -> Option<IntRange> {
-        use super::Repr;
-        match self.graph.reprs[value] {
-            Some(Repr::I8) => Some(IntRange::new(i8::MIN.into(), i8::MAX.into())),
-            Some(Repr::I16) => Some(IntRange::new(i16::MIN.into(), i16::MAX.into())),
-            Some(Repr::I32) => Some(IntRange::I32),
-            None | Some(Repr::I64 | Repr::INTEGER) => Some(IntRange::I64),
-            _ => None,
-        }
-    }
-
-    fn is_one(&self, value: Value) -> bool {
-        matches!(self.graph.defining_op(value), Some(Op::Javascript(JsOp::Constant(Constant::Number(n)))) if *n == 1.0)
-            || matches!(
-                self.graph.defining_op(value),
-                Some(Op::LowLevel(LowOp::Integer { bits: 1, .. }))
-            )
     }
 
     fn source(&self, mut value: Value) -> Value {
@@ -456,4 +407,52 @@ impl<'a> Ranges<'a> {
         }
         constraints
     }
+}
+
+fn integer_literal(graph: &Graph, value: Value) -> Option<i64> {
+    match graph.defining_op(value)? {
+        Op::Javascript(JsOp::Constant(Constant::Number(n)))
+            if n.fract() == 0.0
+                && n.abs() <= MAX_SAFE_INTEGER as f64
+                && (*n != 0.0 || !n.is_sign_negative()) =>
+        {
+            Some(*n as i64)
+        }
+        Op::LowLevel(LowOp::Integer { ty, bits }) if ty.is_int() => {
+            let shift = 64 - ty.bits();
+            Some(((*bits << shift) as i64) >> shift)
+        }
+        _ => None,
+    }
+}
+
+fn repr_range(graph: &Graph, value: Value) -> Option<IntRange> {
+    use super::Repr;
+    match graph.reprs[value] {
+        Some(Repr::I8) => Some(IntRange::new(i8::MIN.into(), i8::MAX.into())),
+        Some(Repr::I16) => Some(IntRange::new(i16::MIN.into(), i16::MAX.into())),
+        Some(Repr::I32) => Some(IntRange::I32),
+        None | Some(Repr::I64 | Repr::INTEGER) => Some(IntRange::I64),
+        _ => None,
+    }
+}
+
+fn induction_step(graph: &Graph, value: Value) -> Option<(Value, i64)> {
+    Some(match *graph.defining_op(value)? {
+        Op::Javascript(JsOp::Unary(UnaryOp::Increment, operand)) => (operand, 1),
+        Op::Javascript(JsOp::Unary(UnaryOp::Decrement, operand)) => (operand, -1),
+        Op::Javascript(JsOp::Binary(BinaryOperator::Addition, operand, one))
+        | Op::LowLevel(LowOp::Binary {
+            op: Binary::Add,
+            left: operand,
+            right: one,
+        }) if integer_literal(graph, one) == Some(1) => (operand, 1),
+        Op::Javascript(JsOp::Binary(BinaryOperator::Subtraction, operand, one))
+        | Op::LowLevel(LowOp::Binary {
+            op: Binary::Subtract,
+            left: operand,
+            right: one,
+        }) if integer_literal(graph, one) == Some(1) => (operand, -1),
+        _ => return None,
+    })
 }

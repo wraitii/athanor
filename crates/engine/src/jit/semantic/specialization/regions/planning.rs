@@ -975,9 +975,15 @@ mod tests {
     fn packed_array_bounds_leave_read_only_loops() {
         use crate::jit::profile::{ReadKind, ReadType, Site};
 
-        for (mutation, expected) in [("", true), ("other.length = 0;", false)] {
+        for (outer, body, expected_depth) in [
+            ("", "", Some(0)),
+            ("for(let row=0;row<n;++row)", "", Some(1)),
+            ("", "other.length = 0;", None),
+            ("", "if(x === 2) continue;", None),
+            ("", "if(x === 2) break;", None),
+        ] {
             let graph = graph(&format!(
-                "function f(a,other){{let sum=0;for(let y=0;y<3;++y)for(let x=0;x<3;++x){{{mutation}sum+=a[y*3+x];}}return sum;}}"
+                "function f(a,other,n){{let sum=0;{outer}for(let y=0;y<3;++y)for(let x=0;x<3;++x){{{body}sum+=a[y*3+x];}}return sum;}}"
             ));
             let data = graph
                 .insts
@@ -1010,16 +1016,14 @@ mod tests {
                                 Some(Op::LowLevel(LowOp::Integer { bits: 8, .. }))))
                 })
             });
-            let guard = guards.next();
-            assert_eq!(guard.is_some(), expected);
-            if let Some(guard) = guard {
-                assert!(guards.next().is_none());
-                assert!(
-                    natural_loops(graph, &cfg)
-                        .iter()
-                        .all(|(_, body)| !body.contains(&guard))
-                );
-            }
+            let depth = guards.next().map(|guard| {
+                natural_loops(graph, &cfg)
+                    .iter()
+                    .filter(|(_, body)| body.contains(&guard))
+                    .count()
+            });
+            assert_eq!(depth, expected_depth, "{outer} {body}");
+            assert!(guards.next().is_none());
             graph.verify().unwrap();
         }
     }
