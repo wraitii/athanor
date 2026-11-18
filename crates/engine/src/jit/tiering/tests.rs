@@ -1159,6 +1159,7 @@ fn osr_request_queues_the_enclosing_function_before_return() {
         complete: 0,
         last_callee: 0,
         failures: 0,
+        last_shape: 0,
         owner: code,
         site: location,
     };
@@ -2150,6 +2151,7 @@ mod call_variant_tests {
             complete: 0,
             last_callee: 0,
             failures: 0,
+            last_shape: 0,
             owner: invoke,
             site,
         };

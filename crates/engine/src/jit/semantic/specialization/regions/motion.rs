@@ -99,6 +99,7 @@ impl Motion for JsMotion {
                                 | JsOp::GuardCommit(_)
                         )
                         | Op::Observe(..)
+                        | Op::ObserveMethod(..)
                         | Op::Javascript(
                             JsOp::AsNumber(_)
                                 | JsOp::AsInteger(_)

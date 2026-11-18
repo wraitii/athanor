@@ -169,15 +169,31 @@ pub(in crate::jit::semantic) fn apply(
             start: data.span.start,
             end: data.span.end,
         };
-        let mut targets = bodies.feedback.get(&site).cloned().unwrap_or_default();
-        if let Some(target) = target
-            && !targets.contains(&target.code)
-        {
-            targets.insert(0, target.code);
-        }
-        if graph.cold.contains(&data.block) && targets.len() < 2 {
-            continue;
-        }
+        let paired_shape = match graph.method_shapes.get(&inst) {
+            Some(None) => continue,
+            Some(Some(shape)) => Some(*shape),
+            None => None,
+        };
+        let targets = if paired_shape.is_some() {
+            let Some(target) = target else {
+                continue;
+            };
+            if !bodies.call_specialization {
+                continue;
+            }
+            vec![target.code]
+        } else {
+            let mut targets = bodies.feedback.get(&site).cloned().unwrap_or_default();
+            if let Some(target) = target
+                && !targets.contains(&target.code)
+            {
+                targets.insert(0, target.code);
+            }
+            if graph.cold.contains(&data.block) && targets.len() < 2 {
+                continue;
+            }
+            targets
+        };
         let mut alternatives = Vec::new();
         let offered: Requirements = receiver
             .map(|value| (Input::This, value))
@@ -188,9 +204,11 @@ pub(in crate::jit::semantic) fn apply(
                     .map(|(index, &value)| (Input::Argument(index), value)),
             )
             .filter_map(|(input, value)| {
-                hints
-                    .get(&value)
-                    .map(|&shape| (input, InputFact::Shape(shape)))
+                let shape = match input {
+                    Input::This => paired_shape.or_else(|| hints.get(&value).copied()),
+                    _ => hints.get(&value).copied(),
+                };
+                shape.map(|shape| (input, InputFact::Shape(shape)))
             })
             .take(4)
             .collect();
@@ -208,15 +226,16 @@ pub(in crate::jit::semantic) fn apply(
             if lexical_this || args.len() != usize::from(arity) {
                 continue;
             }
-            let mut target = DirectTarget {
+            let target = DirectTarget {
                 code,
                 variant: crate::jit::entries::VariantId::ordinary(code.as_u32() as u64),
                 arity,
                 lexical_this,
             };
+            let key = (code, offered.clone());
             let requirements = if !bodies.call_specialization {
                 Vec::new()
-            } else if let Some(requirements) = contracts.get(&(code, offered.clone())) {
+            } else if let Some(requirements) = contracts.get(&key) {
                 requirements.clone()
             } else {
                 let requirements = if offered.is_empty() {
@@ -224,7 +243,7 @@ pub(in crate::jit::semantic) fn apply(
                 } else {
                     contextual_requirements(body, bodies, callee_source, &offered)?
                 };
-                contracts.insert((code, offered.clone()), requirements.clone());
+                contracts.insert(key, requirements.clone());
                 requirements
             };
             let applicable = requirements.iter().all(|(input, _)| match input {
@@ -234,7 +253,19 @@ pub(in crate::jit::semantic) fn apply(
             if applicable
                 && let Some(variant) = bodies.variants.intern(code.as_u32() as u64, requirements)
             {
-                target.variant = variant.id();
+                let id = variant.id();
+                if let Some(shape) = paired_shape
+                    && variant.requirements == [(Input::This, InputFact::Shape(shape))]
+                {
+                    if let Op::Javascript(JsOp::Call { target, .. }) = &mut graph.insts[inst].op {
+                        *target = Some(DirectTarget {
+                            variant: id,
+                            ..target.unwrap()
+                        });
+                    }
+                    selected.push((site, id));
+                    continue;
+                }
                 let mut requirements = vec![(callee, Fact::Code(code))];
                 for &(input, fact) in &variant.requirements {
                     let value = match input {
@@ -248,13 +279,15 @@ pub(in crate::jit::semantic) fn apply(
                     };
                     requirements.push((value, fact));
                 }
-                selected.push((site, variant.id()));
+                selected.push((site, id));
                 alternatives.push(Alternative {
                     requirements,
-                    implementation: target,
+                    implementation: DirectTarget {
+                        variant: id,
+                        ..target
+                    },
                 });
             }
-            target.variant = crate::jit::entries::VariantId::ordinary(code.as_u32() as u64);
             selected.push((site, target.variant));
             alternatives.push(Alternative {
                 requirements: vec![(callee, Fact::Code(code))],

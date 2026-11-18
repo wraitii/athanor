@@ -126,6 +126,7 @@ pub(crate) struct ObservationCache {
     pub(crate) complete: u64,
     pub(crate) last_callee: u64,
     pub(crate) failures: u64,
+    pub(crate) last_shape: u64,
     pub(crate) owner: u64,
     pub(crate) site: Site,
 }
@@ -186,6 +187,8 @@ pub(crate) struct Profile {
     calls: FxHashMap<*const CallSite, (Site, CallProfile)>,
     targets: FxHashMap<Site, Vec<u64>>,
     call_versions: FxHashMap<(u64, Site), usize>,
+    method_pairs: FxHashMap<Site, Vec<(u64, u32)>>,
+    method_versions: FxHashMap<(u64, Site), usize>,
     natives: FxHashMap<Site, crate::heap::NativeFunction>,
     observed: FxHashSet<(u64, Site)>,
     reads: FxHashMap<(Site, ReadKind), ReadType>,
@@ -218,6 +221,36 @@ impl Profile {
             changed,
             complete: targets.len() == CALL_TARGET_LIMIT,
         }
+    }
+
+    pub(crate) fn observe_method(
+        &mut self,
+        owner: u64,
+        site: Site,
+        target: u64,
+        shape: u32,
+    ) -> Update {
+        let target_update = self.observe(owner, site, target);
+        let pairs = self.method_pairs.entry(site).or_default();
+        if pairs.len() < CALL_TARGET_LIMIT
+            && shape != crate::heap::NO_SHAPE
+            && shape != crate::heap::DICTIONARY
+            && !pairs.contains(&(target, shape))
+        {
+            pairs.push((target, shape));
+            self.revision += 1;
+        }
+        let changed = self.method_versions.insert((owner, site), pairs.len()) != Some(pairs.len());
+        Update {
+            changed: target_update.changed || changed,
+            complete: pairs.len() == CALL_TARGET_LIMIT,
+        }
+    }
+
+    pub(super) fn method_pairs(&self) -> impl Iterator<Item = (Site, &[(u64, u32)])> + '_ {
+        self.method_pairs
+            .iter()
+            .map(|(&site, pairs)| (site, pairs.as_slice()))
     }
 
     pub(crate) fn observe_native(
@@ -439,6 +472,21 @@ mod tests {
             let repeated = profile.observe_primitive_failure(1, site(), initial);
             assert!(!repeated.changed && repeated.complete);
         }
+    }
+
+    #[test]
+    fn method_feedback_keeps_observed_target_shape_pairs() {
+        let mut profile = Profile::default();
+        assert!(profile.observe_method(1, site(), 10, 100).changed);
+        assert!(!profile.observe_method(1, site(), 10, 100).changed);
+        assert!(profile.observe_method(1, site(), 10, 200).changed);
+        assert!(profile.observe_method(1, site(), 20, 100).changed);
+        assert_eq!(
+            profile.method_pairs().next(),
+            Some((site(), &[(10, 100), (10, 200), (20, 100)][..]))
+        );
+        assert!(profile.observe_method(1, site(), 20, 300).complete);
+        assert!(!profile.observe_method(1, site(), 20, 400).changed);
     }
 
     #[test]

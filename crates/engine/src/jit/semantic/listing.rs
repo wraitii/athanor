@@ -42,7 +42,9 @@ impl Graph {
                     ..site(inst)
                 });
                 match self.insts[inst].op {
-                    Op::Observe(_, _, origin) | Op::ReadHint(_, _, _, origin) => {
+                    Op::Observe(_, _, origin)
+                    | Op::ObserveMethod(_, _, origin)
+                    | Op::ReadHint(_, _, _, origin) => {
                         sites.insert(origin);
                     }
                     _ => {}
@@ -201,6 +203,9 @@ impl Graph {
             Op::LowLevel(op) => format!("low_level {op:?}"),
             Op::Observe(value, kind, site) => {
                 format!("observe {kind:?} {value} site={site}")
+            }
+            Op::ObserveMethod(callee, receiver, site) => {
+                format!("observe method {callee} this={receiver} site={site}")
             }
             Op::OsrStart(_, index, values) => format!("osr_start {index} [{}]", list(values)),
             Op::Continuation(body, values) => {

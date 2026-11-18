@@ -116,6 +116,7 @@ pub(super) struct Graph {
     pub(super) has_assumes: bool,
     // Input checks reported by the shared guard emitters for call specialization.
     pub(super) entry_guards: crate::jit::variants::Requirements,
+    pub(super) method_shapes: crate::FxHashMap<Inst, Option<u32>>,
     /// Parameter count of a function whose entry takes its arguments in registers; `None` when
     /// it reads `arguments` or a rest parameter, or is a generator.
     pub(in crate::jit) arity: Option<u16>,
@@ -264,6 +265,7 @@ pub(super) enum Op {
     Regex(regex::Op),
     Aarch64(crate::jit::aarch64::inst::Op),
     Observe(Value, super::profile::Observation, super::profile::Site),
+    ObserveMethod(Value, Value, super::profile::Site),
     ReadHint(
         Value,
         super::profile::ReadKind,
@@ -446,6 +448,7 @@ impl Op {
             | Op::Observe(value, ..)
             | Op::ReadHint(value, ..)
             | Op::EntryAssume(value, _) => ([Some(*value), None, None], &[]),
+            Op::ObserveMethod(callee, receiver, _) => ([Some(*callee), Some(*receiver), None], &[]),
             Op::Assume(
                 value,
                 guards::Fact::Cached(cache, _) | guards::Fact::Property(cache),
@@ -495,6 +498,9 @@ impl Op {
             | Op::Observe(value, ..)
             | Op::ReadHint(value, ..)
             | Op::EntryAssume(value, _) => ([Some(value), None, None], &mut []),
+            Op::ObserveMethod(callee, receiver, _) => {
+                ([Some(callee), Some(receiver), None], &mut [])
+            }
             Op::Assume(
                 value,
                 guards::Fact::Cached(cache, _) | guards::Fact::Property(cache),
@@ -853,6 +859,7 @@ impl Graph {
             generator,
             has_assumes: false,
             entry_guards: Vec::new(),
+            method_shapes: Default::default(),
             arity: None,
             regions: PrimaryMap::new(),
             blocks,
@@ -1296,9 +1303,10 @@ impl Graph {
                 result: Owned,
             },
             Op::ContinuationOutput(..) => closed(INTERNAL, Owned),
-            Op::ContinuationStore(..) | Op::Observe(..) | Op::ReadHint(..) => {
-                closed(INTERNAL, None)
-            }
+            Op::ContinuationStore(..)
+            | Op::Observe(..)
+            | Op::ObserveMethod(..)
+            | Op::ReadHint(..) => closed(INTERNAL, None),
             Op::Assume(..) => closed(0, None),
             Op::EntryAssume(..) => closed(0, Unowned),
             Op::ArgumentCount => closed(0, Unowned),

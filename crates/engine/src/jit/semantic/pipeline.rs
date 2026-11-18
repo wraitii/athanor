@@ -379,6 +379,11 @@ pub(super) fn inline_and_plan_inner(
     if let Some((bodies, source)) = specialization {
         function.invalidate_cfg();
         expansions.calls(&mut function.graph, bodies, source, &mut function.notes)?;
+        if select_call_variants
+            && (inline_multiplier != 0 || bodies.call_variants && bodies.call_specialization)
+        {
+            calls::dispatch_methods(&mut function.graph, bodies, source);
+        }
         let requests = calls::requests(&function.graph, bodies, source, &inline_budget);
         let plan = calls::plan_round(
             &function.graph,
@@ -403,6 +408,9 @@ pub(super) fn inline_and_plan_inner(
     expansions.constructors(&mut function.graph);
     if let Some((bodies, source)) = specialization {
         for _ in 0..calls::SPECIALIZATION_ROUNDS {
+            if select_call_variants && inline_multiplier != 0 {
+                calls::dispatch_methods(&mut function.graph, bodies, source);
+            }
             let requests = calls::requests(&function.graph, bodies, source, &inline_budget);
             let plan = calls::plan_round(
                 &function.graph,

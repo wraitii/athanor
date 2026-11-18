@@ -797,9 +797,11 @@ fn result_types(graph: &Graph, op: &Op, facts: &Facts) -> ValueType {
         Op::OsrStart(..) => ValueType::INT32,
         Op::Continuation(body, _) => body.result,
         Op::ContinuationOutput(..) | Op::Restored(_) => ValueType::ALL,
-        Op::ContinuationStore(..) | Op::Observe(..) | Op::ReadHint(..) | Op::Assume(..) => {
-            ValueType::default()
-        }
+        Op::ContinuationStore(..)
+        | Op::Observe(..)
+        | Op::ObserveMethod(..)
+        | Op::ReadHint(..)
+        | Op::Assume(..) => ValueType::default(),
         Op::ArgumentCount => ValueType::INTEGER,
         Op::EntryAssume(..) => ValueType::BOOLEAN,
         Op::HelperCall { result_type, .. } => *result_type,

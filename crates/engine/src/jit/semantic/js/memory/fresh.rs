@@ -7,7 +7,11 @@ use super::Access;
 
 fn contained_use(op: &Op, index: usize) -> bool {
     match op {
-        Op::Observe(..) | Op::ReadHint(..) | Op::Assume(..) | Op::EntryAssume(..) => true,
+        Op::Observe(..)
+        | Op::ObserveMethod(..)
+        | Op::ReadHint(..)
+        | Op::Assume(..)
+        | Op::EntryAssume(..) => true,
         Op::Javascript(
             JsOp::Get(..)
             | JsOp::ShapedGet(..)

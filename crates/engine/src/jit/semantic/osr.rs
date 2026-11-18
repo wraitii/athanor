@@ -69,6 +69,7 @@ pub(in crate::jit) struct Opportunity {
 enum Feedback {
     Call {
         targets: SmallVec<[FuncId; crate::jit::profile::CALL_TARGET_LIMIT]>,
+        pairs: SmallVec<[(u64, u32); crate::jit::profile::CALL_TARGET_LIMIT]>,
         native: Option<crate::heap::NativeFunction>,
     },
     Read(ReadKind, Option<ReadType>),
@@ -80,6 +81,12 @@ impl Feedback {
             Observation::Call => Self::Call {
                 targets: repository
                     .and_then(|repository| repository.feedback.get(&site))
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .collect(),
+                pairs: repository
+                    .and_then(|repository| repository.method_pairs.get(&site))
                     .into_iter()
                     .flatten()
                     .copied()
@@ -109,13 +116,22 @@ impl Feedback {
 
     fn changed(&self, repository: &Repository, site: Site) -> bool {
         match self {
-            Self::Call { targets, native } => {
+            Self::Call {
+                targets,
+                pairs,
+                native,
+            } => {
                 targets.as_slice()
                     != repository
                         .feedback
                         .get(&site)
                         .map_or(&[][..], Vec::as_slice)
                     || *native != repository.native_feedback.get(&site).copied()
+                    || pairs.as_slice()
+                        != repository
+                            .method_pairs
+                            .get(&site)
+                            .map_or(&[][..], Vec::as_slice)
             }
             Self::Read(kind, before) => *before != Self::read(Some(repository), site, *kind),
         }
@@ -143,8 +159,10 @@ impl Plan {
             .filter(|block| !graph.cold.contains(block))
             .flat_map(|&block| graph.blocks[block].insts.iter())
             .filter_map(|&inst| {
-                let Op::Observe(_, kind, mut site) = graph.insts[inst].op else {
-                    return None;
+                let (kind, mut site) = match graph.insts[inst].op {
+                    Op::Observe(_, kind, site) => (kind, site),
+                    Op::ObserveMethod(_, _, site) => (Observation::Call, site),
+                    _ => return None,
                 };
                 if site.source == 0 {
                     site.source = source;
@@ -173,14 +191,13 @@ impl Plan {
                     .iter()
                     .filter(|opportunity| {
                         let data = &graph.insts[opportunity.inst];
-                        let Op::Observe(value, ..) = data.op else {
-                            unreachable!()
-                        };
                         body.contains(&data.block)
                             || cfg.dominates(data.block, header)
-                                && transfer
-                                    .as_ref()
-                                    .is_ok_and(|transfer| transfer.inputs.contains(&value))
+                                && transfer.as_ref().is_ok_and(|transfer| {
+                                    data.op
+                                        .operands_iter()
+                                        .all(|value| transfer.inputs.contains(&value))
+                                })
                     })
                     .map(|opportunity| Opportunity {
                         inst: opportunity.inst,
@@ -353,15 +370,18 @@ impl Plan {
             .map(|(offset, &param)| argument(&mut graph, transfer.inputs.len() + offset, param))
             .collect();
         for opportunity in &candidate.opportunities {
-            let Op::Observe(value, kind, site) = self.graph.insts[opportunity.inst].op else {
-                unreachable!()
-            };
-            if !candidate
-                .body
-                .contains(&self.graph.insts[opportunity.inst].block)
-                && let Some(&argument) = aliases.get(&value)
+            let data = &self.graph.insts[opportunity.inst];
+            if !candidate.body.contains(&data.block)
+                && data
+                    .op
+                    .operands_iter()
+                    .all(|value| aliases.contains_key(&value))
             {
-                graph.append(entry, span, Op::Observe(argument, kind, site), false);
+                let mut op = data.op.clone();
+                for value in op.operands_mut() {
+                    *value = aliases[value];
+                }
+                graph.append(entry, span, op, false);
             }
         }
         for (_, block) in self.graph.blocks.iter() {

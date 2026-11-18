@@ -27,9 +27,12 @@ pub(in crate::jit::semantic) fn plan(
         }
     }
     for (_, block) in graph.blocks.iter_mut() {
-        block
-            .insts
-            .retain(|&inst| !matches!(graph.insts[inst].op, Op::Observe(..) | Op::ReadHint(..)));
+        block.insts.retain(|&inst| {
+            !matches!(
+                graph.insts[inst].op,
+                Op::Observe(..) | Op::ObserveMethod(..) | Op::ReadHint(..)
+            )
+        });
     }
     let cfg = Cfg::new(graph);
     let facts = Facts::compute(graph);
@@ -109,6 +112,22 @@ pub(in crate::jit::semantic) fn plan(
             let span = data.span;
             let source_name = data.source_name;
             let mut before = None;
+            let method = match data.op {
+                Op::Javascript(JsOp::Call {
+                    callee,
+                    receiver: Some(receiver),
+                    target,
+                    ..
+                }) if !graph.method_shapes.get(&inst).is_some_and(Option::is_some)
+                    && target.is_none_or(|target| {
+                        matches!(target.variant, crate::jit::entries::VariantId::Ordinary(_))
+                    })
+                    && super::calls::is_method(graph, callee, receiver) =>
+                {
+                    Some((callee, receiver))
+                }
+                _ => None,
+            };
             match data.op {
                 Op::Javascript(
                     JsOp::GetIndex(object, _)
@@ -210,6 +229,29 @@ pub(in crate::jit::semantic) fn plan(
                     && observed != ReadType::Unknown
                 {
                     numbers.push((origin, observed));
+                }
+            }
+            if let Some((callee, receiver)) = method {
+                before = None;
+                if !specialization.is_some_and(|(repository, _)| {
+                    repository
+                        .method_pairs
+                        .get(&site)
+                        .is_some_and(|pairs| pairs.len() == crate::jit::profile::CALL_TARGET_LIMIT)
+                }) {
+                    let position = graph.blocks[block]
+                        .insts
+                        .iter()
+                        .position(|&candidate| candidate == inst)
+                        .unwrap();
+                    let (observer, _) = graph.insert(
+                        block,
+                        position,
+                        span,
+                        Op::ObserveMethod(callee, receiver, site),
+                        false,
+                    );
+                    graph.insts[observer].source_name = source_name;
                 }
             }
             for (after, observation) in [

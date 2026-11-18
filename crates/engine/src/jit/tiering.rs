@@ -190,6 +190,25 @@ impl Tiering {
         );
     }
 
+    pub(crate) fn observe_method(
+        &self,
+        cache: &mut jit::profile::ObservationCache,
+        target: u64,
+        shape: u32,
+    ) {
+        let site = cache.site;
+        let update = self
+            .profile
+            .borrow_mut()
+            .observe_method(cache.owner, site, target, shape);
+        self.apply_feedback(
+            cache,
+            update,
+            false,
+            format_args!("method feedback site={site} target={target} shape={shape}"),
+        );
+    }
+
     fn apply_feedback(
         &self,
         cache: &mut jit::profile::ObservationCache,

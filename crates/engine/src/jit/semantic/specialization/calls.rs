@@ -31,6 +31,7 @@ pub(in crate::jit) struct Repository {
     regions: FxHashSet<FuncId>,
     pub(in crate::jit) number_first: FxHashSet<FuncId>,
     pub(in crate::jit) feedback: FxHashMap<crate::jit::profile::Site, Vec<FuncId>>,
+    pub(in crate::jit) method_pairs: FxHashMap<crate::jit::profile::Site, Vec<(u64, u32)>>,
     pub(in crate::jit) native_feedback:
         FxHashMap<crate::jit::profile::Site, crate::heap::NativeFunction>,
     pub(in crate::jit) read_feedback: FxHashMap<
@@ -61,6 +62,7 @@ impl Default for Repository {
             regions: Default::default(),
             number_first: Default::default(),
             feedback: Default::default(),
+            method_pairs: Default::default(),
             native_feedback: Default::default(),
             read_feedback: Default::default(),
             shape_feedback: Default::default(),
@@ -911,6 +913,105 @@ fn eligible(graph: &Graph, body_limit: usize, spread: bool) -> bool {
     true
 }
 
+pub(super) fn is_method(
+    graph: &Graph,
+    callee: super::super::Value,
+    receiver: super::super::Value,
+) -> bool {
+    matches!(graph.defining_op(callee), Some(Op::Javascript(JsOp::Get(object, _))) if *object == receiver)
+}
+
+pub(in crate::jit::semantic) fn dispatch_methods(
+    graph: &mut Graph,
+    bodies: &Repository,
+    source: usize,
+) {
+    use super::super::dispatch::{self, Alternative};
+    use super::super::guards::Fact;
+    if bodies.method_pairs.is_empty() {
+        return;
+    }
+    let calls: Vec<_> = Cfg::new(graph)
+        .rpo
+        .into_iter()
+        .filter(|block| !graph.cold.contains(block))
+        .flat_map(|block| graph.blocks[block].insts.iter().copied())
+        .collect();
+    for inst in calls {
+        let data = graph.insts[inst].clone();
+        let Op::Javascript(JsOp::Call {
+            callee,
+            receiver: Some(receiver),
+            ref args,
+            target: None,
+        }) = data.op
+        else {
+            continue;
+        };
+        if !is_method(graph, callee, receiver) {
+            continue;
+        }
+        let site = crate::jit::profile::Site {
+            inline_context: 0,
+            source: data.source_name.map_or(source, |name| name.0),
+            start: data.span.start,
+            end: data.span.end,
+        };
+        let Some(pairs) = bodies
+            .method_pairs
+            .get(&site)
+            .filter(|pairs| pairs.len() > 1)
+        else {
+            continue;
+        };
+        let alternatives: Vec<_> = pairs
+            .iter()
+            .filter_map(|&(code, shape)| {
+                let code = FuncId::from_u32(u32::try_from(code).ok()?);
+                let body = bodies.body(code)?;
+                let arity = body.arity?;
+                let lexical_this = bodies.lexical_this(code);
+                let target = DirectTarget {
+                    code,
+                    variant: crate::jit::entries::VariantId::ordinary(u64::from(code.as_u32())),
+                    arity,
+                    lexical_this,
+                };
+                Some(Alternative {
+                    requirements: vec![(callee, Fact::Code(code)), (receiver, Fact::Shape(shape))],
+                    implementation: (target, shape),
+                })
+            })
+            .collect();
+        if alternatives.is_empty() {
+            continue;
+        }
+        graph.method_shapes.insert(inst, None);
+        dispatch::apply(
+            graph,
+            inst,
+            alternatives,
+            |graph, block, (target, shape)| {
+                let (call, result) = graph.append(
+                    block,
+                    data.span,
+                    Op::Javascript(JsOp::Call {
+                        callee,
+                        receiver: Some(receiver),
+                        args: args.clone(),
+                        target: Some(target),
+                    }),
+                    true,
+                );
+                graph.insts[call].source_name = data.source_name;
+                graph.insts[call].inline_context = data.inline_context;
+                graph.method_shapes.insert(call, Some(shape));
+                result
+            },
+        );
+    }
+}
+
 fn call_target(
     graph: &Graph,
     bodies: &Repository,
@@ -919,6 +1020,14 @@ fn call_target(
     callee: super::super::Value,
 ) -> Option<FuncId> {
     let data = &graph.insts[call];
+    if graph.method_shapes.get(&call).is_some_and(Option::is_some)
+        && let Op::Javascript(JsOp::Call {
+            target: Some(target),
+            ..
+        }) = data.op
+    {
+        return Some(target.code);
+    }
     let site = crate::jit::profile::Site {
         inline_context: 0,
         source: data.source_name.map_or(source, |name| name.0),
@@ -992,6 +1101,9 @@ pub(in crate::jit::semantic) fn requests(
     let mut requests = Vec::new();
     for block in Cfg::new(graph).rpo {
         for &call in &graph.blocks[block].insts {
+            if graph.method_shapes.get(&call) == Some(&None) {
+                continue;
+            }
             let callee = match &graph.insts[call].op {
                 Op::Javascript(
                     JsOp::Call { callee, .. }
@@ -1091,13 +1203,16 @@ pub(in crate::jit::semantic) fn plan_round(
             request.target,
         )
             .hash(&mut context);
+        if let Some(Some(shape)) = graph.method_shapes.get(&request.call) {
+            shape.hash(&mut context);
+        }
         inlines.push(Inline {
             context: context.finish().max(1),
             call: request.call,
             target: request.target,
             source_name,
             arrow: bodies.bodies[&request.target].arrow,
-            guard_code: !matches!(graph.defining_op(*callee), Some(Op::Javascript(JsOp::Closure(_, code, _, false, _, _, _)))
+            guard_code: !graph.method_shapes.get(&request.call).is_some_and(Option::is_some) && !matches!(graph.defining_op(*callee), Some(Op::Javascript(JsOp::Closure(_, code, _, false, _, _, _)))
                 if *code == request.target
                 && !graph.insts.values().any(|data| matches!(data.op, Op::Javascript(JsOp::MarkClass(value)) if value == *callee))),
         });
@@ -1913,6 +2028,90 @@ mod tests {
             }
             graph.verify().unwrap();
         }
+    }
+
+    #[test]
+    fn polymorphic_method_receivers_offer_shapes_to_callees() {
+        use crate::jit::layout::ReadLayout;
+        use crate::jit::profile::{PropertyAccess, ShapeAccess, Site};
+        use crate::jit::variants::{Fact as InputFact, Input};
+
+        let (canonical, mut bodies) = fixture(
+            "function read(){return this.x;} function constant(){return 1;} function main(o){return o.method();}",
+        );
+        let mut graph = canonical.graph;
+        let site = |data: &super::super::super::InstData| Site {
+            inline_context: 0,
+            source: 0,
+            start: data.span.start,
+            end: data.span.end,
+        };
+        let read = FuncId::from_u32(0);
+        let constant = FuncId::from_u32(1);
+        let callee_site = bodies
+            .body(read)
+            .unwrap()
+            .insts
+            .values()
+            .find(|data| matches!(data.op, Op::Javascript(JsOp::Get(..))))
+            .map(site)
+            .unwrap();
+        let layouts = |first, second| ShapeAccess::PolymorphicRead {
+            entries: [
+                ReadLayout::own(first, 0),
+                ReadLayout::own(second, 1),
+                ReadLayout::default(),
+                ReadLayout::default(),
+            ],
+            len: 2,
+        };
+        bodies
+            .shape_feedback
+            .insert((callee_site, PropertyAccess::Get), layouts(10, 30));
+        for data in graph.insts.values() {
+            match data.op {
+                Op::Javascript(JsOp::Get(..)) => {
+                    bodies
+                        .shape_feedback
+                        .insert((site(data), PropertyAccess::Get), layouts(10, 20));
+                }
+                Op::Javascript(JsOp::Call { .. }) => {
+                    bodies.feedback.insert(site(data), vec![read, constant]);
+                    bodies
+                        .method_pairs
+                        .insert(site(data), vec![(0, 10), (1, 20)]);
+                }
+                _ => {}
+            }
+        }
+        dispatch_methods(&mut graph, &bodies, 0);
+        let mut inlined = graph.clone();
+        let requests = requests(&inlined, &bodies, 0, &Budget::default());
+        let plan = plan(&inlined, &bodies, 0, &requests);
+        assert_eq!(plan.inlines.len(), 2);
+        assert!(plan.inlines.iter().all(|inline| !inline.guard_code));
+        apply(&mut inlined, &bodies, 0, plan, &mut Vec::new()).unwrap();
+        assert!(
+            operations(&inlined)
+                .iter()
+                .any(|op| matches!(op, Op::Javascript(JsOp::Call { target: None, .. })))
+        );
+        let selected = super::super::call_variants::apply(&mut graph, &bodies, 0).unwrap();
+        let variants: Vec<_> = selected
+            .into_iter()
+            .filter_map(|(_, id)| bodies.variants.get(id))
+            .collect();
+        assert_eq!(variants.len(), 1);
+        assert_eq!(variants[0].function, 0);
+        assert_eq!(
+            variants[0].requirements,
+            [(Input::This, InputFact::Shape(10))]
+        );
+        assert!(
+            operations(&graph)
+                .iter()
+                .any(|op| matches!(op, Op::Javascript(JsOp::IsShape(_, 10))))
+        );
     }
 
     #[test]

@@ -119,6 +119,7 @@ impl FunctionCompiler<'_, '_> {
             complete: 0,
             last_callee: 0,
             failures: 0,
+            last_shape: 0,
             owner: feedback.owner,
             site,
         });
@@ -165,6 +166,88 @@ impl FunctionCompiler<'_, '_> {
                 end: data.span.end,
             },
         ))
+    }
+
+    fn observe_method(
+        &mut self,
+        callee: LoweredValue,
+        receiver: LoweredValue,
+        mut site: crate::jit::profile::Site,
+    ) {
+        let Some(feedback) = self.feedback.filter(|feedback| feedback.observations) else {
+            return;
+        };
+        use crate::jit::profile::ObservationCache;
+        if site.source == 0 {
+            site.source = self.source_name.0;
+        }
+        let address = self.function_data(ObservationCache {
+            complete: 0,
+            last_callee: 0,
+            failures: 0,
+            last_shape: 0,
+            owner: feedback.owner,
+            site,
+        });
+        let flags = MemFlagsData::trusted();
+        let complete = self.b.ins().load(types::I64, flags, address, 0);
+        let inspect = self.b.create_block();
+        let done = self.b.create_block();
+        self.b.ins().brif(complete, done, &[], inspect, &[]);
+        self.b.switch_to_block(inspect);
+        let receiver = self.b.as_word(receiver);
+        let object = layout::is_object(self.b, receiver);
+        let object_path = self.b.create_block();
+        let check = self.b.create_block();
+        self.b.append_block_param(check, types::I64);
+        let no_shape = self
+            .b
+            .ins()
+            .iconst(types::I64, i64::from(crate::heap::NO_SHAPE));
+        self.b.ins().brif(
+            object,
+            object_path,
+            &[],
+            check,
+            &[BlockArg::Value(no_shape)],
+        );
+        self.b.switch_to_block(object_path);
+        let view = layout::heap_view(self.b, receiver);
+        let view = if self.pointer == types::I64 {
+            view
+        } else {
+            self.b.ins().ireduce(self.pointer, view)
+        };
+        let shape = self
+            .b
+            .ins()
+            .load(types::I32, flags, view, crate::heap::SHAPE_OFFSET);
+        let shape = self.b.ins().uextend(types::I64, shape);
+        self.b.ins().jump(check, &[BlockArg::Value(shape)]);
+        self.b.switch_to_block(check);
+        let shape = self.b.block_params(check)[0];
+        let last_shape = self.b.ins().load(
+            types::I64,
+            flags,
+            address,
+            std::mem::offset_of!(ObservationCache, last_shape) as i32,
+        );
+        let last_callee = self.b.ins().load(
+            types::I64,
+            flags,
+            address,
+            std::mem::offset_of!(ObservationCache, last_callee) as i32,
+        );
+        let word = self.b.as_word(callee);
+        let same_callee = self.b.ins().icmp(IntCC::Equal, word, last_callee);
+        let same_shape = self.b.ins().icmp(IntCC::Equal, shape, last_shape);
+        let same = self.b.ins().boolean_and(same_callee, same_shape);
+        let observe = self.b.create_block();
+        self.b.ins().brif(same, done, &[], observe, &[]);
+        self.b.switch_to_block(observe);
+        self.call_helper(Helper::ObserveMethod, &[callee, shape, address]);
+        self.b.ins().jump(done, &[]);
+        self.b.switch_to_block(done);
     }
 
     fn epoch(&mut self) -> LoweredValue {
@@ -600,6 +683,12 @@ impl FunctionCompiler<'_, '_> {
                             Op::Observe(value, kind, site) => {
                                 let value = get(self, *value);
                                 self.observe(value, *site, *kind);
+                                None
+                            }
+                            Op::ObserveMethod(callee, receiver, site) => {
+                                let callee = get(self, *callee);
+                                let receiver = get(self, *receiver);
+                                self.observe_method(callee, receiver, *site);
                                 None
                             }
                             Op::ContinuationOutput(call, index) => {

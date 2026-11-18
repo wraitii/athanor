@@ -127,6 +127,7 @@ define_helpers! {
     ArrayExtend => js_array_extend(Value, Value) -> Value;
     Call => js_call(Value, Value, *const Value, u64) -> Value, owned;
     ObserveCall => js_observe_call(Value, u64) -> Value;
+    ObserveMethod => js_observe_method(Value, u64, u64) -> Value;
     ObserveGet => js_observe_get(Value, u64) -> Value;
     ObserveIndex => js_observe_index(Value, u64) -> Value;
     ObservePattern => js_observe_pattern(Value, u64) -> Value;
@@ -781,6 +782,22 @@ extern "C" fn js_observe_call(ctx: *mut JitCtx, callee: Value, cache: u64) -> Va
         } else if let Some(native) = context.global.heap().native(callee) {
             context.engine.tiering.observe_native(cache, native);
         }
+    }
+    Value::UNDEFINED
+}
+
+extern "C" fn js_observe_method(ctx: *mut JitCtx, callee: Value, shape: u64, cache: u64) -> Value {
+    let context = unsafe { &*ctx };
+    let cache = unsafe { &mut *(cache as *mut super::profile::ObservationCache) };
+    cache.last_callee = callee.bits();
+    cache.last_shape = shape;
+    if let Some(code) = context.global.heap().closure_code(callee) {
+        context
+            .engine
+            .tiering
+            .observe_method(cache, code.0, shape as u32);
+    } else if let Some(native) = context.global.heap().native(callee) {
+        context.engine.tiering.observe_native(cache, native);
     }
     Value::UNDEFINED
 }

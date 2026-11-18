@@ -1318,6 +1318,11 @@ impl Compiler {
                     .map(|target| u64::from(target.as_u32()))
                     .eq(target.iter().copied())
             })
+        }) && profile.method_pairs().all(|(site, pairs)| {
+            self.canonical
+                .method_pairs
+                .get(&site)
+                .is_some_and(|known| known == pairs)
         }) && profile
             .natives()
             .all(|(site, target)| self.canonical.native_feedback.get(&site) == Some(&target))
@@ -1348,6 +1353,9 @@ impl Compiler {
         }
         for (site, target) in profile.natives() {
             canonical.native_feedback.insert(site, target);
+        }
+        for (site, pairs) in profile.method_pairs() {
+            canonical.method_pairs.insert(site, pairs.to_vec());
         }
         if self.get_refinement {
             for code in profile.number_first() {
