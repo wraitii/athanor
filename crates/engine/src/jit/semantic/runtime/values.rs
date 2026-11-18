@@ -121,6 +121,20 @@ fn predicate(graph: &mut Graph, facts: &Facts, inst: Inst) -> Option<Value> {
             let exact = at.ins().fcvt_from_sint(types::F64, integer);
             integer_check(&mut at, value, float, exact)
         }
+        Op::Javascript(JsOp::IsIntegerInRange(value, min, max)) => {
+            let mut at = Cursor::before(graph, inst);
+            let bits = at.as_word(value);
+            let float = at.ins().bitcast(types::F64, MemFlagsData::new(), bits);
+            let integer = at.ins().fcvt_to_sint_sat(types::I64, float);
+            let exact = at.ins().fcvt_from_sint(types::F64, integer);
+            let valid = integer_check(&mut at, value, float, exact);
+            let min = at.ins().iconst(types::I64, i64::from(min));
+            let max = at.ins().iconst(types::I64, i64::from(max));
+            let lower = at.ins().icmp(IntCC::SignedGreaterThanOrEqual, integer, min);
+            let upper = at.ins().icmp(IntCC::SignedLessThanOrEqual, integer, max);
+            let inside = at.ins().boolean_and(lower, upper);
+            at.ins().boolean_and(valid, inside)
+        }
         Op::Javascript(JsOp::IsNumber(value)) if boxed(graph, value) => {
             let mut at = Cursor::before(graph, inst);
             let word = at.as_word(value);

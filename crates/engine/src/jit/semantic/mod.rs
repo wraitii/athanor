@@ -19,6 +19,7 @@ mod memory;
 pub(super) mod osr;
 pub(in crate::jit) mod ownership;
 mod pipeline;
+mod ranges;
 pub(in crate::jit) mod regex;
 pub(in crate::jit) mod repr;
 pub(in crate::jit) mod runtime;

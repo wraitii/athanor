@@ -217,6 +217,7 @@ pub(in crate::jit::semantic) fn contract(graph: &Graph, op: &Op, facts: &Facts) 
         Op::TypedIndex(..) => closed(HEAP_READ, Unowned),
         Op::IsNumber(_)
         | Op::IsInteger(_)
+        | Op::IsIntegerInRange(..)
         | Op::AsInteger(_)
         | Op::NumericFloat(_)
         | Op::SaturatingInteger(_)
@@ -310,7 +311,7 @@ fn specific(graph: &Graph, inst: Inst, op: &Op) -> Option<Representations> {
             uses: smallvec![Use::Exact(Repr::Boxed), Use::Any, Use::Any],
             produces: Some(Repr::Boolean),
         },
-        Op::IsInteger(_) => exact(&[Repr::Boxed], Repr::Boolean),
+        Op::IsInteger(_) | Op::IsIntegerInRange(..) => exact(&[Repr::Boxed], Repr::Boolean),
         Op::ToInt32(_) => exact(&[Repr::I32], Repr::I32),
         Op::AsNumber(_) => any(1, target),
         Op::IsCode(..) | Op::IsShape(..) | Op::IsReadLayout(..) | Op::IsTyped(..) => {

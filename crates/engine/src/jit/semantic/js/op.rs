@@ -271,6 +271,7 @@ pub(in crate::jit) enum Op {
     MemoryNumber(Value, MemoryFormat),
     IsNumber(Value),
     IsInteger(Value),
+    IsIntegerInRange(Value, i32, i32),
     AsInteger(Value),
     NumericFloat(Value),
     SaturatingInteger(Value),
@@ -372,6 +373,7 @@ impl Op {
             | Op::IsTyped(value, _)
             | Op::IsNumber(value)
             | Op::IsInteger(value)
+            | Op::IsIntegerInRange(value, ..)
             | Op::AsInteger(value)
             | Op::NumericFloat(value)
             | Op::SaturatingInteger(value)
@@ -538,6 +540,7 @@ impl Op {
             | Op::IsTyped(value, _)
             | Op::IsNumber(value)
             | Op::IsInteger(value)
+            | Op::IsIntegerInRange(value, ..)
             | Op::AsInteger(value)
             | Op::NumericFloat(value)
             | Op::SaturatingInteger(value)

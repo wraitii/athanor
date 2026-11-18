@@ -849,6 +849,59 @@ mod tests {
     }
 
     #[test]
+    fn nested_index_ranges_use_observed_integer_inputs() {
+        use crate::jit::profile::{ReadKind, ReadType, Site};
+
+        for (read_type, expected) in [(ReadType::Integer, true), (ReadType::Number, false)] {
+            let graph = graph(
+                "function f(image,w,h){let sum=0;for(let y=0;y<h;++y)for(let x=0;x<w;++x)sum+=image[y*w+x];return sum;}",
+            );
+            let mut repository = super::super::super::calls::Repository::default();
+            for data in graph.insts.values() {
+                let observed = match data.op {
+                    Op::Argument(1 | 2) => (ReadKind::Number, read_type),
+                    Op::Javascript(JsOp::GetIndex(..)) => (ReadKind::Receiver, ReadType::Array),
+                    _ => continue,
+                };
+                repository.read_feedback.insert(
+                    (
+                        Site {
+                            inline_context: 0,
+                            source: 7,
+                            start: data.span.start,
+                            end: data.span.end,
+                        },
+                        observed.0,
+                    ),
+                    observed.1,
+                );
+            }
+            let mut function = FunctionState::from_graph(graph);
+            super::super::super::observations::plan(&mut function.graph, Some((&repository, 7)));
+            version(
+                &mut function.graph,
+                &Default::default(),
+                None,
+                &mut Vec::new(),
+            )
+            .unwrap();
+            let guards = Cfg::new(&function.graph)
+                .rpo
+                .iter()
+                .flat_map(|&block| &function.graph.blocks[block].insts)
+                .filter(|&&inst| {
+                    matches!(
+                        function.graph.insts[inst].op,
+                        Op::Javascript(JsOp::IsIntegerInRange(..))
+                    )
+                })
+                .count();
+            assert_eq!(guards, if expected { 2 } else { 0 });
+            function.graph.verify().unwrap();
+        }
+    }
+
+    #[test]
     fn observed_storage_and_numbers_combine_for_bounded_integer_reads() {
         use crate::jit::profile::{ReadKind, ReadType, Site};
         let graph = graph(

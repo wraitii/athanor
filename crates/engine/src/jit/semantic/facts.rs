@@ -560,7 +560,7 @@ impl Facts {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Relation {
+pub(super) enum Relation {
     Less,
     LessEqual,
     Greater,
@@ -568,7 +568,7 @@ enum Relation {
 }
 
 impl Relation {
-    fn comparison(op: &Op) -> Option<(Self, Value, Value)> {
+    pub(super) fn comparison(op: &Op) -> Option<(Self, Value, Value)> {
         let (relation, left, right) = match *op {
             Op::Javascript(
                 JsOp::Binary(operator, left, right)
@@ -622,7 +622,7 @@ impl Relation {
         })
     }
 
-    fn negate(self) -> Self {
+    pub(super) fn negate(self) -> Self {
         match self {
             Self::Less => Self::GreaterEqual,
             Self::LessEqual => Self::Greater,
@@ -631,7 +631,7 @@ impl Relation {
         }
     }
 
-    fn swap(self) -> Self {
+    pub(super) fn swap(self) -> Self {
         match self {
             Self::Less => Self::Greater,
             Self::LessEqual => Self::GreaterEqual,

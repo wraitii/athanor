@@ -110,6 +110,10 @@ impl RegionPlan {
                     writeln!(out, "{indent}  cache-hit assumption {value}: {cache}").unwrap();
                     continue;
                 }
+                Fact::IntegerRange(min, max) => {
+                    writeln!(out, "{indent}  integer range {value}: {min}..={max}").unwrap();
+                    continue;
+                }
                 Fact::Type(types) => types,
                 _ => continue,
             };
@@ -390,7 +394,11 @@ pub(super) fn plan_region(
     let mut bounds: Vec<_> = bounded.values().copied().collect();
     bounds.sort();
     bounds.dedup();
+    let ranges = entry.map_or_else(Vec::new, |(preheader, header)| {
+        super::propose::integer_ranges(&planning, &facts, preheader, header, &body, &numbers)
+    });
     let mut checks = numbers;
+    checks.extend(ranges);
     checks.extend(
         typed
             .iter()

@@ -508,6 +508,7 @@ impl FunctionCompiler<'_, '_> {
                                 | JsOp::IsExactPosition(..)
                                 | JsOp::IntegerCheck(..)
                                 | JsOp::IsInteger(..)
+                                | JsOp::IsIntegerInRange(..)
                                 | JsOp::IsCode(..)
                                 | JsOp::IsShape(..)
                                 | JsOp::IsNumber(..)

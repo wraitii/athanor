@@ -16,6 +16,7 @@ pub(in crate::jit) fn intrinsic(op: &Op) -> Option<Repr> {
         Op::ToInt32(_) | Op::ArrayKind(_) => Repr::I32,
         Op::IntegerCheck(..)
         | Op::IsInteger(_)
+        | Op::IsIntegerInRange(..)
         | Op::IsCode(..)
         | Op::IsShape(..)
         | Op::IsReadLayout(..)

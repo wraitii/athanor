@@ -225,3 +225,124 @@ pub(super) fn identities(graph: &mut Graph, conditional: &ConditionalPlan) -> Ve
     }
     added
 }
+
+pub(super) fn integer_ranges(
+    graph: &Graph,
+    facts: &Facts,
+    preheader: Block,
+    header: Block,
+    body: &FxHashSet<Block>,
+    numbers: &[(Value, Fact)],
+) -> Vec<(Value, Fact)> {
+    use super::super::super::ranges::{IntRange, Ranges};
+
+    const LIMIT: i32 = 1 << 15;
+    const GUARD_RANGE: IntRange = IntRange::new(0, LIMIT as i64);
+    if !numbers
+        .iter()
+        .any(|&(_, fact)| fact == Fact::Type(ValueType::INTEGER))
+    {
+        return Vec::new();
+    }
+    let hints = super::super::observations::type_hints(graph);
+    let mut inputs: Vec<_> = numbers
+        .iter()
+        .filter_map(|&(value, fact)| {
+            (fact == Fact::Type(ValueType::INTEGER)
+                && hints.get(&value) == Some(&ReadType::Integer)
+                && !body.contains(&graph.def_block(value))
+                && facts.cfg.dominates(graph.def_block(value), preheader))
+            .then_some((value, GUARD_RANGE))
+        })
+        .collect();
+    if inputs.is_empty() || inputs.len() > 3 {
+        return Vec::new();
+    }
+
+    let size: usize = body
+        .iter()
+        .map(|&block| graph.blocks[block].insts.len())
+        .sum();
+    if size > SPECIALIZATION_REGION_LIMIT {
+        return Vec::new();
+    }
+    let loops = natural_loops(graph, &facts.cfg);
+    let nested: FxHashSet<_> = loops
+        .into_iter()
+        .filter(|(inner, blocks)| *inner != header && blocks.is_subset(body))
+        .flat_map(|(_, blocks)| blocks)
+        .collect();
+    if nested.is_empty() {
+        return Vec::new();
+    }
+
+    let receivers: FxHashSet<_> = graph
+        .insts
+        .values()
+        .filter_map(|data| match data.op {
+            Op::ReadHint(value, ReadKind::Receiver, ReadType::Array | ReadType::Typed(_), _) => {
+                Some(value)
+            }
+            _ => None,
+        })
+        .collect();
+    let mut known = Ranges::new(graph, facts, &[]);
+    let mut assumed = Ranges::new(graph, facts, &inputs);
+    for &block in &facts.cfg.rpo {
+        if !nested.contains(&block) || graph.cold.contains(&block) {
+            continue;
+        }
+        for &inst in &graph.blocks[block].insts {
+            let index = match graph.insts[inst].op {
+                Op::Javascript(JsOp::GetIndex(receiver, index))
+                    if receivers.contains(&receiver) =>
+                {
+                    index
+                }
+                Op::Javascript(JsOp::ArrayGet(_, index) | JsOp::TypedIndex(_, index, _)) => index,
+                _ => continue,
+            };
+            if facts.of(index).within(ValueType::INTEGER)
+                || !benefits_from_ranges(graph, &mut assumed, index)
+                || known.prove_arithmetic(index, &mut FxHashSet::default())
+            {
+                continue;
+            }
+            for i in (0..inputs.len()).rev() {
+                let mut fewer = inputs.clone();
+                fewer.remove(i);
+                if benefits_from_ranges(graph, &mut Ranges::new(graph, facts, &fewer), index) {
+                    inputs = fewer;
+                }
+            }
+            if inputs.len() > 2 {
+                return Vec::new();
+            }
+            return inputs
+                .into_iter()
+                .map(|(value, _)| (value, Fact::IntegerRange(0, LIMIT)))
+                .collect();
+        }
+    }
+    Vec::new()
+}
+
+fn benefits_from_ranges(
+    graph: &Graph,
+    ranges: &mut super::super::super::ranges::Ranges<'_>,
+    index: Value,
+) -> bool {
+    use super::super::super::ranges::IntRange;
+
+    let mut proved = FxHashSet::default();
+    ranges.prove_arithmetic(index, &mut proved)
+        && proved.iter().any(|&inst| {
+            matches!(
+                graph.insts[inst].op,
+                Op::Javascript(JsOp::Binary(BinaryOperator::Multiplication, ..))
+            )
+        })
+        && ranges
+            .integer_at(index, graph.def_block(index))
+            .is_some_and(|range| range.within(IntRange::I32))
+}

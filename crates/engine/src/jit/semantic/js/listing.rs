@@ -244,6 +244,9 @@ pub(in crate::jit::semantic) fn op_text(graph: &Graph, op: &Op) -> String {
             format!("get_typed {object}[{key}]{element}{bounded}")
         }
         Op::IsInteger(value) => format!("is_integer {value}"),
+        Op::IsIntegerInRange(value, min, max) => {
+            format!("is_integer_in_range {value}, {min}, {max}")
+        }
         Op::AsInteger(value) => format!("as_integer {value}"),
         Op::NumericFloat(value) => format!("numeric_float {value}"),
         Op::SaturatingInteger(value) => format!("saturating_integer {value}"),

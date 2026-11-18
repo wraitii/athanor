@@ -12,6 +12,7 @@ use crate::jit::profile::Site;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(in crate::jit) enum Fact {
     Type(ValueType),
+    IntegerRange(i32, i32),
     Code(FuncId),
     Shape(u32),
     ReadLayout(crate::jit::layout::LayoutGuard),
@@ -63,6 +64,7 @@ impl Fact {
             Self::Type(types) if types == ValueType::INTEGER => {
                 Op::Javascript(JsOp::IsInteger(value))
             }
+            Self::IntegerRange(min, max) => Op::Javascript(JsOp::IsIntegerInRange(value, min, max)),
             Self::Type(types) if types == ValueType::STRING => {
                 Op::Javascript(JsOp::IsString(value))
             }
@@ -92,6 +94,8 @@ impl Fact {
     pub(super) fn implies(self, other: Self) -> bool {
         match (self, other) {
             (Self::Type(known), Self::Type(wanted)) => known.within(wanted),
+            (Self::IntegerRange(..), Self::Type(wanted)) => ValueType::INT32.within(wanted),
+            (Self::IntegerRange(a, b), Self::IntegerRange(c, d)) => c <= a && b <= d,
             (Self::Typed(Some(_)), Self::Typed(None)) => true,
             (Self::ReadLayout(layout), Self::Shape(shape)) => layout.shape == shape,
             _ => self == other,
@@ -126,6 +130,9 @@ pub(super) fn implies(op: &Op) -> Option<(Value, Fact)> {
         Op::Javascript(JsOp::IsNumber(value)) => (value, Fact::Type(ValueType::NUMBER)),
         Op::Javascript(JsOp::IsInteger(value) | JsOp::IntegerCheck(value, ..)) => {
             (value, Fact::Type(ValueType::INTEGER))
+        }
+        Op::Javascript(JsOp::IsIntegerInRange(value, min, max)) => {
+            (value, Fact::IntegerRange(min, max))
         }
         Op::Javascript(JsOp::IsCode(value, code)) => (value, Fact::Code(code)),
         Op::EntryAssume(value, fact) => (value, fact),

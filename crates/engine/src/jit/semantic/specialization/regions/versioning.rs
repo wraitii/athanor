@@ -18,6 +18,7 @@ fn retarget(graph: &mut Graph, blocks: &FxHashSet<Block>, from: Value, to: Value
                     JsOp::IsNumber(_)
                         | JsOp::AsNumber(_)
                         | JsOp::IsInteger(_)
+                        | JsOp::IsIntegerInRange(..)
                         | JsOp::AsInteger(_)
                         | JsOp::AsString(_)
                         | JsOp::IsString(_)
@@ -516,6 +517,18 @@ fn entry_checks(
             span,
         );
         current = continue_if(graph, current, check, &failure);
+    }
+    for &(value, fact) in assumes {
+        if !matches!(fact, Fact::IntegerRange(..)) {
+            continue;
+        }
+        let checked = values.get(&value).copied().unwrap_or(value);
+        let guard = EntryGuard::Fact(checked, fact);
+        if !guard.tested_by(&tested) {
+            tested.insert(guard);
+            let check = graph.append_value(current, span, fact.test(checked).unwrap());
+            current = continue_if(graph, current, check, &original);
+        }
     }
     let mut numbers = FxHashMap::default();
     for (value, fact) in numeric() {

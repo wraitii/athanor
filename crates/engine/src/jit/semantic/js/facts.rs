@@ -66,6 +66,7 @@ pub(in crate::jit::semantic) fn result_types(graph: &Graph, op: &Op, facts: &Fac
         Op::ArrayKind(_) => ValueType::INT32,
         Op::IsNumber(_)
         | Op::IsInteger(_)
+        | Op::IsIntegerInRange(..)
         | Op::IntegerCheck(..)
         | Op::IsString(_)
         | Op::Truthy(_)
@@ -165,4 +166,36 @@ fn integer_product(graph: &Graph, facts: &Facts, left: Value, right: Value) -> b
                 if *n > 0.0 && n.fract() == 0.0 && *n <= 4_194_304.0)
     };
     scaled(left, right) || scaled(right, left)
+}
+
+pub(in crate::jit::semantic) fn integer_arithmetic(
+    operator: BinaryOperator,
+) -> Option<super::super::low_level::Binary> {
+    use super::super::low_level::Binary;
+    match operator {
+        BinaryOperator::Addition => Some(Binary::Add),
+        BinaryOperator::Subtraction => Some(Binary::Subtract),
+        BinaryOperator::Multiplication => Some(Binary::Multiply),
+        _ => None,
+    }
+}
+
+pub(in crate::jit::semantic) fn exact_integer_arithmetic(
+    op: super::super::low_level::Binary,
+    left: super::super::ranges::IntRange,
+    right: super::super::ranges::IntRange,
+) -> Option<super::super::ranges::IntRange> {
+    use super::super::low_level::Binary;
+    use super::super::ranges::IntRange;
+    if !left.within(IntRange::SAFE) || !right.within(IntRange::SAFE) {
+        return None;
+    }
+    if op == Binary::Multiply
+        && ((left.min <= 0 && left.max >= 0 && right.min < 0)
+            || (right.min <= 0 && right.max >= 0 && left.min < 0))
+    {
+        return None;
+    }
+    let result = left.arithmetic(op, right)?;
+    result.within(IntRange::SAFE).then_some(result)
 }

@@ -9,12 +9,13 @@ use oxc_syntax::operator::BinaryOperator;
 
 use super::super::cursor::{Cursor, Insert};
 use super::super::low_level::{Binary, Op as LowLevel, Unary};
+use super::super::ranges::Ranges;
 use super::super::{Constant, FunctionState, Op, Repr, UnaryOp, Value, ValueType};
-use crate::FxHashMap;
+use crate::{FxHashMap, FxHashSet};
 
 pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) -> bool {
-    let checks = lower_checks(function);
-    arithmetic(function) || checks
+    let arithmetic = arithmetic(function);
+    lower_checks(function) || arithmetic
 }
 
 pub(in crate::jit::semantic) fn relax_checks(function: &mut FunctionState) -> bool {
@@ -94,18 +95,47 @@ fn lower_checks(function: &mut FunctionState) -> bool {
 
 pub(in crate::jit::semantic) fn arithmetic(function: &mut FunctionState) -> bool {
     function.ensure_values();
+    let proved = if function.optimize {
+        exact_index_arithmetic(&function.graph, &function.facts)
+    } else {
+        FxHashSet::default()
+    };
     let mut changed = false;
     let mut insts = Vec::new();
     for &block in &function.facts.cfg.rpo {
         insts.clone_from(&function.graph.blocks[block].insts);
         for &inst in &insts {
-            changed |= arithmetic_inst(&mut function.graph, &function.facts, inst);
+            changed |= arithmetic_inst(
+                &mut function.graph,
+                &function.facts,
+                inst,
+                proved.contains(&inst),
+            );
         }
     }
     if changed {
         function.invalidate_values();
     }
     changed
+}
+
+fn exact_index_arithmetic(graph: &Graph, facts: &Facts) -> FxHashSet<Inst> {
+    let mut ranges = Ranges::new(graph, facts, &[]);
+    let mut proved = FxHashSet::default();
+    for &block in &facts.cfg.rpo {
+        if graph.cold.contains(&block) {
+            continue;
+        }
+        for &inst in &graph.blocks[block].insts {
+            let Op::Javascript(JsOp::ArrayPosition(index)) = graph.insts[inst].op else {
+                continue;
+            };
+            if !facts.of(index).within(ValueType::INTEGER) {
+                ranges.prove_arithmetic(index, &mut proved);
+            }
+        }
+    }
+    proved
 }
 
 pub(in crate::jit::semantic) fn operations(function: &mut FunctionState) -> bool {
@@ -119,7 +149,7 @@ pub(in crate::jit::semantic) fn operations(function: &mut FunctionState) -> bool
         for &inst in &insts {
             let graph = &mut function.graph;
             let facts = &function.facts;
-            changed |= arithmetic_inst(graph, facts, inst)
+            changed |= arithmetic_inst(graph, facts, inst, false)
                 || integer_operations_inst(graph, facts, inst)
                 || natives_inst(graph, facts, inst)
                 || comparisons_and_unary_inst(graph, facts, inst, &mut aliases, &mut removed);
@@ -135,7 +165,7 @@ pub(in crate::jit::semantic) fn operations(function: &mut FunctionState) -> bool
     changed
 }
 
-fn arithmetic_inst(graph: &mut Graph, facts: &Facts, inst: Inst) -> bool {
+fn arithmetic_inst(graph: &mut Graph, facts: &Facts, inst: Inst, proved_integer: bool) -> bool {
     let numeric = ValueType::NUMBER.union(ValueType::UNDEFINED);
     let data = &graph.insts[inst];
     let Op::Javascript(JsOp::Binary(operator, mut left, mut right)) = data.op else {
@@ -155,9 +185,10 @@ fn arithmetic_inst(graph: &mut Graph, facts: &Facts, inst: Inst) -> bool {
         return false;
     }
     let integer = operator != BinaryOperator::Division
-        && data
-            .result()
-            .is_some_and(|result| facts.of(result).within(ValueType::INTEGER));
+        && (proved_integer
+            || data
+                .result()
+                .is_some_and(|result| facts.of(result).within(ValueType::INTEGER)));
     let op = match (operator, integer) {
         (BinaryOperator::Addition, true) => Binary::Add,
         (BinaryOperator::Subtraction, true) => Binary::Subtract,
