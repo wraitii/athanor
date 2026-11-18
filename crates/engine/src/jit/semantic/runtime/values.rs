@@ -193,18 +193,13 @@ fn predicate(graph: &mut Graph, facts: &Facts, inst: Inst) -> Option<Value> {
             match layout.storage {
                 None => hit,
                 Some(storage) => {
-                    // A failed receiver check may leave the recorded storage dead or reused.
-                    let holder = at.ins().iconst(types::I64, storage.identity as i64);
-                    let empty = at
-                        .ins()
-                        .iconst(types::I64, crate::heap::NO_ELEMENTS.as_ptr() as i64);
-                    let holder = at.ins().select(hit, holder, empty);
-                    let shape =
-                        at.ins()
-                            .load(types::I32, MemFlagsData::trusted(), holder, SHAPE_OFFSET);
-                    let expected = at.ins().iconst(types::I32, i64::from(storage.shape));
-                    let valid = at.ins().icmp(IntCC::Equal, shape, expected);
-                    at.ins().boolean_and(hit, valid)
+                    let hit = match storage.intermediate {
+                        Some(parent) => {
+                            related_shape_is(&mut at, hit, parent.identity, parent.shape)
+                        }
+                        None => hit,
+                    };
+                    related_shape_is(&mut at, hit, storage.identity, storage.shape)
                 }
             }
         }
@@ -230,4 +225,18 @@ fn predicate(graph: &mut Graph, facts: &Facts, inst: Inst) -> Option<Value> {
         ),
         _ => return None,
     })
+}
+
+fn related_shape_is(at: &mut Cursor<'_>, hit: Value, identity: u64, shape: u32) -> Value {
+    // The preceding checks establish that this prototype is reachable from the receiver.
+    let holder = at.ins().iconst(types::I64, identity as i64);
+    let empty = at
+        .ins()
+        .iconst(types::I64, crate::heap::NO_ELEMENTS.as_ptr() as i64);
+    let holder = at.ins().select(hit, holder, empty);
+    let current = at
+        .ins()
+        .load(types::I32, MemFlagsData::trusted(), holder, SHAPE_OFFSET);
+    let valid = at.ins().icmp_imm_s(IntCC::Equal, current, i64::from(shape));
+    at.ins().boolean_and(hit, valid)
 }

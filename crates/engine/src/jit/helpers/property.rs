@@ -1,5 +1,5 @@
 use super::*;
-use crate::jit::layout::ReadLayout;
+use crate::jit::layout::{ReadLayout, RelatedStorage, StorageGuard};
 use crate::jit::profile::{PropertyAccess, ShapeAccess};
 
 #[repr(C)]
@@ -361,23 +361,28 @@ impl PropertyCache {
             self.observe(engine, PropertyAccess::Get, ShapeAccess::Varying);
             return Some(value);
         }
-        if let Some(found) = heap.cached_property(receiver, &self.name) {
-            self.insert(PropertyCacheEntry {
-                shape: found.shape,
-                index: found.index,
-                holder: found.holder,
-                holder_shape: found.holder_shape,
-                ..PropertyCacheEntry::EMPTY
-            });
+        if let Some(found) = heap.cached_property(receiver, &self.name, self.observer.is_some()) {
+            if found.intermediate.is_none() {
+                self.insert(PropertyCacheEntry {
+                    shape: found.shape,
+                    index: found.index,
+                    holder: found.holder,
+                    holder_shape: found.holder_shape,
+                    ..PropertyCacheEntry::EMPTY
+                });
+            }
             self.observe(
                 engine,
                 PropertyAccess::Get,
                 ShapeAccess::Read(ReadLayout {
                     shape: found.shape,
                     index: found.index,
-                    storage: (found.holder != 0).then_some(crate::jit::layout::RelatedStorage {
+                    storage: (found.holder != 0).then_some(RelatedStorage {
                         identity: found.holder,
                         shape: found.holder_shape,
+                        intermediate: found
+                            .intermediate
+                            .map(|(identity, shape)| StorageGuard { identity, shape }),
                     }),
                 }),
             );

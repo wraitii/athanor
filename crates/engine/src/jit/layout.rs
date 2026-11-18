@@ -11,6 +11,13 @@ pub(crate) struct RelatedStorage {
     // never permits dereferencing it; the receiver check must succeed first.
     pub(crate) identity: u64,
     pub(crate) shape: u32,
+    pub(crate) intermediate: Option<StorageGuard>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct StorageGuard {
+    pub(crate) identity: u64,
+    pub(crate) shape: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

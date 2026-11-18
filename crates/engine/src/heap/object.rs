@@ -96,8 +96,13 @@ impl Heap {
         Some(Value::from_bits(TAG_OBJECT | id))
     }
 
-    /// Where a site cache may find a property, together with its borrowed current value.
-    pub(crate) fn cached_property(&self, receiver: Value, name: &str) -> Option<CachedProperty> {
+    /// Where a site cache or the optimizer may find a property, with its borrowed current value.
+    pub(crate) fn cached_property(
+        &self,
+        receiver: Value,
+        name: &str,
+        observe_deep: bool,
+    ) -> Option<CachedProperty> {
         let data = self.0.borrow();
         let id = heap_id(receiver)?;
         let shape = data.cacheable_shape(id)?;
@@ -107,30 +112,42 @@ impl Heap {
             return None;
         }
         let atom = data.atoms.find(name)?;
-        let (holder, holder_shape, index) = if let Some(index) = data.shapes.get(shape).slot(atom) {
-            (0, shape, index)
-        } else {
-            let prototype = if matches!(
-                data.live(id)?.payload,
-                Payload::Closure(_) | Payload::Native(_)
-            ) {
-                // Closures share shapes even when only some have a lazy own prototype.
-                if name == "prototype" {
-                    return None;
-                }
-                let prototype = data.function_prototype?;
-                if !data.shapes.get(shape).has_prototype(prototype) {
-                    return None;
-                }
-                prototype
+        let (holder, holder_shape, index, intermediate) =
+            if let Some(index) = data.shapes.get(shape).slot(atom) {
+                (0, shape, index, None)
             } else {
-                data.property_prototype(id)?
+                let prototype = if matches!(
+                    data.live(id)?.payload,
+                    Payload::Closure(_) | Payload::Native(_)
+                ) {
+                    // Closures share shapes even when only some have a lazy own prototype.
+                    if name == "prototype" {
+                        return None;
+                    }
+                    let prototype = data.function_prototype?;
+                    if !data.shapes.get(shape).has_prototype(prototype) {
+                        return None;
+                    }
+                    prototype
+                } else {
+                    data.property_prototype(id)?
+                };
+                let holder = heap_id(prototype)?;
+                let holder_shape = data.cacheable_shape(holder)?;
+                if let Some(index) = data.shapes.get(holder_shape).slot(atom) {
+                    (holder, holder_shape, index, None)
+                } else {
+                    if !observe_deep {
+                        return None;
+                    }
+                    data.object(id)?;
+                    let target = heap_id(data.object(holder)?.prototype?)?;
+                    data.object(target)?;
+                    let target_shape = data.cacheable_shape(target)?;
+                    let index = data.shapes.get(target_shape).slot(atom)?;
+                    (target, target_shape, index, Some((holder, holder_shape)))
+                }
             };
-            let holder = heap_id(prototype)?;
-            let holder_shape = data.cacheable_shape(holder)?;
-            let index = data.shapes.get(holder_shape).slot(atom)?;
-            (holder, holder_shape, index)
-        };
         let owner = if holder == 0 { id } else { holder };
         let PropertyView::Shaped { values, .. } = data.properties(owner)? else {
             return None;
@@ -140,6 +157,7 @@ impl Heap {
             holder,
             holder_shape,
             index: index as u32,
+            intermediate,
             value: *values.get(index)?,
         })
     }
@@ -854,14 +872,14 @@ impl Heap {
     }
 }
 
-/// A receiver's shape fixes its prototype's address, so a matching receiver and holder shape
-/// fix where the value lives. `holder` is 0 for an own property.
+/// Each shape along the path fixes the identity of its prototype. `holder` is 0 for an own property.
 pub(crate) struct CachedProperty {
     pub(crate) value: Value,
     pub(crate) shape: u32,
     pub(crate) holder: u64,
     pub(crate) holder_shape: u32,
     pub(crate) index: u32,
+    pub(crate) intermediate: Option<(u64, u32)>,
 }
 
 impl Slot {

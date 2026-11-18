@@ -4649,6 +4649,7 @@ fn related_storage_reads_use_explicit_layout_guards_and_probes() {
         storage: Some(RelatedStorage {
             identity: 128,
             shape: 20,
+            intermediate: None,
         }),
     };
     for source in [

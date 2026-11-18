@@ -490,6 +490,7 @@ mod tests {
             storage: Some(RelatedStorage {
                 identity: 128,
                 shape: 20,
+                intermediate: None,
             }),
         };
         let mut profile = Profile::default();
@@ -511,6 +512,7 @@ mod tests {
             storage: Some(RelatedStorage {
                 identity: 128,
                 shape: 21,
+                intermediate: None,
             }),
             ..inherited
         };

@@ -503,6 +503,54 @@ fn inherited_read_feedback_replaces_the_entry_and_checks_holder_layouts() {
 }
 
 #[test]
+fn deep_inherited_method_reads_follow_prototype_changes() {
+    for backend in [crate::Backend::NativeOnly, crate::Backend::Cranelift] {
+        let mut engine = Engine::with_options(EngineOptions {
+            backend,
+            background_compile: false,
+            generic_first: false,
+            ..Default::default()
+        })
+        .unwrap();
+        engine
+            .compile(
+                r#"
+                function Base() {}
+                Base.prototype.method = function () { return 1; };
+                function Derived() {}
+                Derived.prototype = new Base();
+                var receiver = new Derived();
+                function run() { return receiver.method(); }
+                function replace() { Base.prototype.method = function () { return 2; }; }
+                function shadow() { Derived.prototype.method = function () { return 3; }; }
+                function unshadow() { delete Derived.prototype.method; }
+                "#,
+                "deep-inherited-feedback.js",
+            )
+            .unwrap();
+        let run = code(&engine, "run");
+        let initial = entry(&engine, run);
+        for _ in 0..16 {
+            assert_eq!(engine.call("run", &[]).unwrap().value(), Value::number(1.0));
+        }
+        assert_ne!(entry(&engine, run), initial);
+        assert!(engine.tiering.profile.borrow().shapes().any(|(_, access)| {
+            access
+                .read(None)
+                .and_then(|layout| layout.storage)
+                .is_some_and(|storage| storage.intermediate.is_some())
+        }));
+        for (change, value) in [("replace", 2.0), ("shadow", 3.0), ("unshadow", 2.0)] {
+            engine.call(change, &[]).unwrap();
+            assert_eq!(
+                engine.call("run", &[]).unwrap().value(),
+                Value::number(value)
+            );
+        }
+    }
+}
+
+#[test]
 fn entry_guards_specialize_nested_reads_and_guard_replacements() {
     let mut engine = new_engine().unwrap();
     engine.compile(
