@@ -1,0 +1,14 @@
+[package]
+name = "js-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+js-engine = { path = "../engine", default-features = false, features = ["wgsl"] }
+wasm-bindgen = "=0.2.130"
+serde_json = { version = "=1.0.154", features = ["preserve_order"] }
+console_error_panic_hook = "=0.1.7"

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/engine", "crates/runner"]
+members = ["crates/engine", "crates/runner", "crates/web"]
 
 [workspace.package]
 edition = "2024"
@@ -13,3 +13,12 @@ debug = "line-tables-only"
 
 [profile.release]
 debug = "line-tables-only"
+
+[profile.web]
+inherits = "release"
+opt-level = "s"
+debug = false
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"
