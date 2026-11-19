@@ -134,8 +134,23 @@ cargo run -p js-runner -- --compile --filter paint --after ownership script.js
 ```
 
 Compile mode does not execute the source unless given `--execute 'JS'`.
-`--after PASS` inspects a compiler pass. Use `--after planner` for optimization decisions.
+`--after PASS` inspects a compiler pass, and `--after all` prints every pass.
+Use `--after planner` for optimization decisions.
 Use `JS_JIT_OPT=none` to compare against unoptimized semantic graphs.
+
+`web/` is a browser inspector that runs the compiler as WebAssembly and steps
+through each pass with diffs and source mapping. It needs `wasm-pack` 0.15 and
+`bun`:
+
+```sh
+cd web
+bun install
+bun run wasm
+bun run dev
+```
+
+Without the `native` feature, the compiler targets AArch64 but never maps or
+runs code, and only generic compilations are shown since nothing is observed.
 
 For a compile-time benchmark without inspection output or execution, use:
 
