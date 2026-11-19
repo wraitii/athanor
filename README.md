@@ -29,11 +29,11 @@ JS source ─▶ Oxc ─▶ SSA Graph (JS / Regex / LowLevel / AArch64)
 - **No interpreter or bytecode**: cold functions go through a fast direct
   AArch64 baseline (or unoptimized lowering) and tier up via call thresholds or
   loop OSR.
-- **One progressively-lowered graph**: high-level language ops, mid-level
-  runtime/memory ops, and machine ops coexist in the same CFG. The AArch64
-  backend can consume mid-level ops directly instead of lowering them to scalar
-  primitives only to pattern-match them back, while Cranelift runs extra
-  lowering passes.
+- **One progressively-lowered graph**: high-level language ops (JS and a
+  spliced regular-expression dialect), mid-level runtime/memory ops, and
+  machine ops coexist in the same CFG. The AArch64 backend can consume
+  mid-level ops directly instead of lowering them to scalar primitives only to
+  pattern-match them back, while Cranelift runs extra lowering passes.
 - **Region versioning instead of interpreter deopt**: speculative optimizations
   version regions on the graph, hoist guards outward, and fall back to generic
   regions or extracted continuations compiled with cheaper baseline lowering.
@@ -44,15 +44,21 @@ JS source ─▶ Oxc ─▶ SSA Graph (JS / Regex / LowLevel / AArch64)
 
 ## Where it stands
 
-- Runs real 0 A.D. random-map scripts (such as `belgian_uplands.js`) with
-  deterministic output.
+- Runs all eight V8 v7 benchmarks and real 0 A.D. random-map scripts (such as
+  `belgian_uplands.js`) with deterministic output.
 - Native AArch64 codegen is the default on ARM64; Cranelift is available as a
   backend and fallback on other targets.
-- Numeric and loop-heavy code optimizes reasonably well; property-heavy
-  workloads and compile times are still well behind V8 and JavaScriptCore.
-- Longer-term directions include a second dialect (regular expressions spliced
-  directly into the JS graph), more component-based pass/analysis invalidation,
-  and reusing the core compiler for AoT compilation or other frontends.
+- On Apple Silicon (see [bench/README.md](bench/README.md) for full tables):
+  - Numeric/array-heavy workloads (`navier-stokes`, `gaussian-blur`) are
+    competitive with SpiderMonkey 128 and V8 Maglev.
+  - Property- and allocation-heavy workloads (`richards`, `deltablue`,
+    `raytrace`) beat V8 Sparkplug and QuickJS, but remain 10–30× behind V8
+    TurboFan and JavaScriptCore; `belgian_uplands` runs ~9× faster than QuickJS
+    and ~2.5× behind SpiderMonkey 128.
+  - Compile times are still a weak point compared to mainstream engines.
+- Longer-term directions include more component-based pass/analysis
+  invalidation and reusing the core compiler for AoT compilation or other
+  frontends.
 
 ## Getting started
 

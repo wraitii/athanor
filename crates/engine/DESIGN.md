@@ -277,39 +277,32 @@ runtime operations such as shape checks and cached property accesses; these can
 coexist with other dialects at different lowering stages. The remaining shared
 JS assumptions are seams to generalize as another dialect needs them.
 
-Regular expressions are the intended second dialect. They are the opposite of
-JS in most respects: no dynamic types, heap or exceptions, machine integers
-throughout and immutable inputs. This is design intent; RegExp objects currently
-wrap `regress`, a backtracking interpreter that remains the fallback.
+Regular expressions are the second dialect. They are the opposite of JS in most
+respects: no dynamic types, heap or exceptions, machine integers throughout and
+immutable inputs. Supported patterns compile through the `Regex` dialect
+(`semantic/regex.rs`, `semantic/js/regexps.rs`), while unsupported patterns and
+capture extraction fall back to `regress`, a backtracking interpreter.
 
 - The frontend parses with `oxc_regular_expression` into a small regex IR and
-  builds an automaton. Patterns outside the supported subset (backreferences,
+  builds a DFA automaton. Patterns outside the supported subset (backreferences,
   lookaround, empty-matching quantified bodies, case-insensitive non-ASCII and
   similar) report a reason and stay on `regress`. The automaton is frontend
-  analysis, like JS scoping, and can be tested against `regress` without the
-  graph.
+  analysis, like JS scoping, and is tested against `regress` without the graph.
 - The regex dialect expresses the matcher as graph code: automaton states are
-  blocks carrying the position as a parameter, with operations for byte loads,
-  class tests and assertions. Choosing between branches and table lookups for
-  a state is a regex pass, not part of the frontend output. Generic bounds-check
-  elimination, load combining and hoisting should then apply to regex code.
-- A body exposes an interface of agnostic inputs and an exit carrying its
-  results. Functionalizing binds inputs to ABI parameters and turns the exit into
-  a return, giving a standalone function for testing and uninlined calls.
-  Splicing binds inputs to host values and jumps from the exit to a
-  continuation. The JS inliner is splicing plus a JS adapter; the generic half
-  is meant to be extracted when regex needs it.
-- JS call sites with a known regex, either a literal or a profiled identity
-  behind a guard, are specialized in the `js` stage like `string_split.rs`. The
-  regex body is spliced there, before runtime lowering, so the combined graph
-  shares host passes: subject setup hoists out of loops, unused pure matches are
-  removed and loads can be shared. The JS path never builds the function
-  boundary that the standalone path needs. Each dialect lowers in its own
-  pipeline slot; regex lowers before `repr`, since its values are integers.
-- Matching reads immutable string bytes and constant data, so regex contracts
-  are pure apart from keeping the subject alive. Building `exec`, `match`,
-  `split` and `replace` results stays in helpers; captures may initially be
-  recomputed by `regress` over the matched span.
+  blocks carrying the position as a parameter, with `Regex` ops (`Class`,
+  `IsPattern`, `Test`, `Exec`) lowered to `LowLevel` range/byte checks in
+  `lower_low_level`. Standalone matchers (`regex::matcher`) bind inputs to ABI
+  parameters and return the match result; inline matchers (`regex::emit`) emit
+  directly into a host builder.
+- JS `.test` and `.exec` call sites with a profiled non-global regex are
+  expanded in `semantic/js/regexps.rs` behind an `IsPattern` guard, allowing
+  unused pure matches to be dropped and matched spans to avoid generic dispatch.
+  Building `exec`, `match`, `split` and `replace` results stays in helpers,
+  with captures recomputed by `regress` over the matched span.
+- Remaining design intent includes extracting a generic body-splicing primitive
+  shared with the JS inliner, choosing between branches and table lookups as a
+  regex pass, and lowering regex earlier so generic host passes (bounds-check
+  elimination, load combining, hoisting) apply across spliced matchers.
 
 Validation follows the layers: frontend against `regress`, the standalone
 regex graph against `regress`, and spliced against standalone code. The V8 v7
