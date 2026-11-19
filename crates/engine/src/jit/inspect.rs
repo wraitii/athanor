@@ -1,6 +1,9 @@
-use std::fmt::Write;
+use std::fmt::{self, Write};
+use std::sync::{Arc, Mutex};
 
 use super::semantic;
+
+const ALL_PASSES: &str = "all";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompileOptions {
@@ -8,6 +11,7 @@ pub struct CompileOptions {
     pub semantic_ir: bool,
     pub after: Option<String>,
     pub planner: bool,
+    pub reports: Option<ReportSink>,
 }
 
 impl Default for CompileOptions {
@@ -17,15 +21,53 @@ impl Default for CompileOptions {
             semantic_ir: true,
             after: None,
             planner: false,
+            reports: None,
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct Report {
+    pub name: String,
+    pub label: String,
+    pub direct: bool,
+    pub semantic: Option<String>,
+    pub passes: Vec<(String, String)>,
+    pub planner: Option<String>,
+}
+
+#[derive(Clone, Default)]
+pub struct ReportSink(Arc<Mutex<Vec<Report>>>);
+
+impl ReportSink {
+    pub fn take(&self) -> Vec<Report> {
+        std::mem::take(&mut self.0.lock().unwrap())
+    }
+}
+
+impl PartialEq for ReportSink {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ReportSink {}
+
+impl fmt::Debug for ReportSink {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ReportSink")
+    }
+}
+
+pub(super) fn selects(pass: Option<&str>, name: &str) -> bool {
+    pass.is_some_and(|pass| pass == ALL_PASSES || pass == name)
 }
 
 #[derive(Clone, Default)]
 pub(super) struct Inspection {
     label: Option<String>,
     semantic: Option<String>,
-    after: Option<(String, String)>,
+    after: Vec<(String, String)>,
     planner: Option<String>,
 }
 
@@ -47,7 +89,7 @@ fn semantic_text(lines: Vec<semantic::ListingLine>) -> String {
 
 pub(super) struct PassInspection {
     pass: Option<String>,
-    pub(super) snapshot: Option<(String, String)>,
+    pub(super) snapshots: Vec<(String, String)>,
 }
 
 impl PassInspection {
@@ -56,22 +98,21 @@ impl PassInspection {
             pass: options
                 .filter(|options| options.semantic_ir)
                 .and_then(|options| options.after.clone()),
-            snapshot: None,
+            snapshots: Vec::new(),
         }
     }
 
     pub(super) fn observe(&mut self, name: &str, state: &semantic::FunctionState) {
+        if selects(self.pass.as_deref(), name) {
+            self.snapshots.push((name.to_owned(), semantic_text(state.listing_lines())));
+        }
         #[cfg(feature = "wgsl")]
-        if self.pass.as_deref() == Some("wgsl") && name == "inline" {
+        if name == "inline" && selects(self.pass.as_deref(), "wgsl") {
             let text = match super::naga::compile_wgsl(&state.graph) {
                 Ok(wgsl) => wgsl,
                 Err(error) => format!("// wgsl unsupported: {error}\n"),
             };
-            self.snapshot = Some(("wgsl".to_owned(), text));
-            return;
-        }
-        if self.pass.as_deref() == Some(name) {
-            self.snapshot = Some((name.to_owned(), semantic_text(state.listing_lines())));
+            self.snapshots.push(("wgsl".to_owned(), text));
         }
     }
 
@@ -84,7 +125,7 @@ impl PassInspection {
         let Some(pass) = self.pass.as_deref() else {
             return Ok(());
         };
-        if cfg!(feature = "wgsl") && pass == "wgsl" {
+        if pass == ALL_PASSES || (cfg!(feature = "wgsl") && pass == "wgsl") {
             return Ok(());
         }
         let passes = semantic::SPECIALIZATION_PASSES
@@ -140,29 +181,37 @@ impl Inspection {
         self
     }
 
-    pub(super) fn after(mut self, snapshot: Option<(String, String)>) -> Self {
-        self.after = snapshot;
+    pub(super) fn after(mut self, snapshots: Vec<(String, String)>) -> Self {
+        self.after = snapshots;
         self
     }
 
-    pub(super) fn lowered(mut self, snapshot: Option<(String, String)>) -> Self {
-        if snapshot.is_some() {
-            self.after = snapshot;
-        }
+    pub(super) fn lowered(mut self, snapshots: Vec<(String, String)>) -> Self {
+        self.after.extend(snapshots);
         self
     }
 
-    pub(super) fn print(&self, name: &str, direct: bool) {
+    pub(super) fn print(&self, name: &str, direct: bool, options: &CompileOptions) {
         let label = self.label.as_deref().unwrap_or(name);
-        if direct && (self.after.is_some() || self.semantic.is_some()) {
+        if let Some(reports) = &options.reports {
+            reports.0.lock().unwrap().push(Report {
+                name: name.to_owned(),
+                label: label.to_owned(),
+                direct,
+                semantic: self.semantic.clone(),
+                passes: self.after.clone(),
+                planner: self.planner.clone(),
+            });
+            return;
+        }
+        if direct && (!self.after.is_empty() || self.semantic.is_some()) {
             println!("[{name}] direct baseline code");
         }
-        match (&self.after, &self.semantic) {
-            (Some((pass, semantic)), _) => {
-                println!("[{name}] semantic IR {label} after {pass}\n{semantic}")
-            }
-            (None, Some(semantic)) => println!("[{name}] semantic IR {label}\n{semantic}"),
-            (None, None) => {}
+        for (pass, semantic) in &self.after {
+            println!("[{name}] semantic IR {label} after {pass}\n{semantic}");
+        }
+        if let (true, Some(semantic)) = (self.after.is_empty(), &self.semantic) {
+            println!("[{name}] semantic IR {label}\n{semantic}");
         }
         if let Some(planner) = &self.planner {
             println!("[{name}] planner {label}\n{planner}");

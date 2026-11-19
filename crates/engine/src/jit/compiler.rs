@@ -464,10 +464,10 @@ impl Compiler {
             .as_deref()
             .filter(|options| options.semantic_ir)
             .and_then(|options| options.after.clone());
-        let mut snapshot = None;
+        let mut snapshots = Vec::new();
         let mut after = |name: &str, graph: &super::semantic::Graph| {
-            if pass.as_deref() == Some(name) {
-                snapshot = Some((name.to_owned(), super::inspect::graph_text(graph)));
+            if super::inspect::selects(pass.as_deref(), name) {
+                snapshots.push((name.to_owned(), super::inspect::graph_text(graph)));
             }
         };
         self.context.clear();
@@ -508,11 +508,11 @@ impl Compiler {
         })?;
         builder.seal_all_blocks();
         builder.finalize(self.module.target_config());
-        if pass.as_deref() == Some("aarch64-select") {
+        if native && super::inspect::selects(pass.as_deref(), "aarch64-select") {
             let mut selected = lowered.as_ref().unwrap().clone();
             super::aarch64::select_graph(&mut selected)
                 .map_err(|reason| Error::Compile(reason.0))?;
-            snapshot = Some((
+            snapshots.push((
                 "aarch64-select".into(),
                 super::inspect::graph_text(&selected),
             ));
@@ -529,7 +529,7 @@ impl Compiler {
             baseline,
             semantic_locations,
             listing,
-            inspection: inspection.lowered(snapshot),
+            inspection: inspection.lowered(snapshots),
         })
     }
 
@@ -1076,7 +1076,7 @@ impl Compiler {
                 self.source_name.0,
                 1,
             )
-            .after(passes.snapshot);
+            .after(passes.snapshots);
             if let Some(listing) = &mut listing {
                 self.remap_listing(listing, &graph, self.source_name.0);
             }
@@ -1176,8 +1176,8 @@ impl Compiler {
                     }
                 }
             }
-            if self.inspection.as_ref().is_some_and(|o| o.matches(&name)) {
-                code.inspection.print(&name, direct);
+            if let Some(options) = self.inspection.as_deref().filter(|o| o.matches(&name)) {
+                code.inspection.print(&name, direct, options);
             }
             if let Some(stats) = &mut self.stats {
                 stats.functions += 1;
@@ -1819,7 +1819,7 @@ impl Compiler {
             source,
             inline_multiplier,
         )
-        .after(passes.snapshot);
+        .after(passes.snapshots);
         let body = self.emit_body(
             signature,
             emission.source_name,
@@ -2060,7 +2060,7 @@ impl Compiler {
         }
         let inspection =
             super::inspect::Inspection::from_graph(self.inspection.as_deref(), &state.graph)
-                .after(passes.snapshot);
+                .after(passes.snapshots);
         if let Some(listing) = &mut listing {
             self.remap_listing(listing, &state, source_name.0);
         }
@@ -2359,7 +2359,7 @@ impl Compiler {
                 self.source_name.0,
                 usize::from(self.inlining),
             )
-            .after(passes.snapshot)
+            .after(passes.snapshots)
         });
         if let Some(listing) = &mut listing {
             self.remap_listing(listing, graph.as_ref().unwrap(), self.source_name.0);

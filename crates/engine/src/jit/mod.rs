@@ -34,7 +34,7 @@ mod variants;
 
 pub(crate) use compiler::{CompilationTier, CompiledFunction, Compiler, RecompileJob};
 pub(crate) use entries::DirectEntries;
-pub use inspect::CompileOptions;
+pub use inspect::{CompileOptions, Report, ReportSink};
 pub(crate) use profile::{Profile, Recompiles};
 pub(crate) use semantic::specialization::calls::DEFAULT_RECOMPILE_INLINE_MULTIPLIER;
 pub(crate) use session::{LocalSlots, call};
