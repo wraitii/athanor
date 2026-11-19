@@ -1,6 +1,6 @@
 use cranelift_codegen::Context;
 use cranelift_codegen::control::ControlPlane;
-use cranelift_jit::JITModule;
+use crate::jit::module::CodeModule;
 use cranelift_module::{FuncId, Module, ModuleReloc};
 
 use crate::error::Error;
@@ -22,7 +22,7 @@ pub(super) struct MachineCode {
 impl MachineCode {
     pub(super) fn from_cranelift(
         context: &mut Context,
-        module: &JITModule,
+        module: &CodeModule,
         id: FuncId,
     ) -> Result<Self, Error> {
         context
@@ -58,7 +58,7 @@ impl MachineCode {
         })
     }
 
-    pub(super) fn define(&self, module: &mut JITModule, id: FuncId) -> Result<(), Error> {
+    pub(super) fn define(&self, module: &mut CodeModule, id: FuncId) -> Result<(), Error> {
         module
             .define_function_bytes(id, self.alignment, &self.bytes, &self.relocs)
             .map_err(|error| Error::Compile(format!("{error:?}")))

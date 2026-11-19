@@ -168,7 +168,9 @@ impl Engine {
             locals: jit::LocalSlots::new(),
             host: None,
         };
-        engine.compile_source(include_str!("builtins/setup.js"), "<builtins>", true)?;
+        if cfg!(feature = "native") {
+            engine.compile_source(include_str!("builtins/setup.js"), "<builtins>", true)?;
+        }
         Ok(engine)
     }
 

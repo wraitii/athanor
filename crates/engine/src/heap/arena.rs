@@ -5,7 +5,7 @@ use super::{Payload, SmallObject};
 pub(crate) const SLOT_SIZE: usize = 128;
 const FIRST_CHUNK: usize = 256;
 const LARGEST_CHUNK: usize = 1 << 18;
-const ADDRESS_LIMIT: usize = 1 << 48;
+const ADDRESS_LIMIT: u64 = 1 << 48;
 
 #[repr(C, align(128))]
 pub(super) struct Slot {
@@ -99,7 +99,7 @@ impl Arena {
         let slots: Box<[Slot]> = (0..capacity).map(|_| Slot::vacant()).collect();
         let start = NonNull::new(Box::into_raw(slots).cast::<Slot>()).unwrap();
         let chunk = Chunk { start, capacity };
-        if chunk.address() + capacity * SLOT_SIZE > ADDRESS_LIMIT {
+        if (chunk.address() + capacity * SLOT_SIZE) as u64 > ADDRESS_LIMIT {
             unsafe { drop_chunk(&chunk) };
             return None;
         }

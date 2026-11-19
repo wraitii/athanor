@@ -13,7 +13,7 @@ use super::semantic::{Block, Inst, Value as LoweredValue};
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{MemFlagsData, Type, types};
 use cranelift_frontend::FunctionBuilder;
-use cranelift_jit::JITModule;
+use crate::jit::module::CodeModule;
 use cranelift_module::{FuncId, Module};
 use oxc_span::Span;
 
@@ -46,7 +46,7 @@ pub(super) struct FunctionCompiler<'a, 'f> {
     source_name: (usize, usize),
     source_span: Span,
     b: &'a mut GraphBuilder<'f>,
-    module: &'a mut JITModule,
+    module: &'a mut CodeModule,
     helper_signatures: FxHashMap<Helper, SigRef>,
     source_names: FxHashMap<usize, i64>,
     error_sites: FxHashMap<(usize, u32, u32), i64>,
@@ -103,7 +103,7 @@ pub(super) struct Output<'a, 'f> {
     pub(super) clif: bool,
     pub(super) native: bool,
     pub(super) lowered: &'a mut Option<super::semantic::Graph>,
-    pub(super) module: &'a mut JITModule,
+    pub(super) module: &'a mut CodeModule,
     pub(super) stubs: Stubs,
     pub(super) semantic_locations: bool,
     pub(super) names: &'a mut Vec<Box<str>>,
@@ -224,7 +224,7 @@ fn lower_callable(
     continuations: &FxHashMap<usize, FuncId>,
     feedback: Option<Feedback>,
     signature: cranelift_codegen::ir::Signature,
-    module: &mut JITModule,
+    module: &mut CodeModule,
     stubs: Stubs,
     semantic_locations: bool,
     names: &mut Vec<Box<str>>,

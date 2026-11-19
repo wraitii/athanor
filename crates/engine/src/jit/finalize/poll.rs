@@ -1,5 +1,5 @@
 use cranelift_codegen::ir::{MemFlagsData, types};
-use cranelift_jit::JITModule;
+use crate::jit::module::CodeModule;
 use cranelift_module::Module;
 
 use crate::jit::helpers::{self, Helper};
@@ -8,7 +8,7 @@ use crate::jit::session::HELPERS_OFFSET;
 
 pub(super) fn emit(
     b: &mut Builder<'_>,
-    module: &JITModule,
+    module: &CodeModule,
     state: usize,
     ctx: Value,
     owner: Option<Value>,

@@ -9,8 +9,8 @@ use cranelift_codegen::Context;
 use cranelift_codegen::ir::{AbiParam, Signature, types};
 use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::FunctionBuilderContext;
-use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{FuncId, Linkage, Module, default_libcall_names};
+use crate::jit::module::{CodeModule, new_module};
+use cranelift_module::{FuncId, Linkage, Module};
 use oxc_ast::AstKind;
 use oxc_ast::ast::{
     AssignmentTarget, BindingPattern, Expression, FormalParameters, Function, Program, PropertyKey,
@@ -192,7 +192,7 @@ pub(crate) struct Compiler {
     data: Vec<Box<FunctionData>>,
     source_name: (usize, usize),
     canonical: Arc<super::semantic::specialization::calls::Repository>,
-    module: JITModule,
+    module: CodeModule,
     signature: Signature,
     fixed: FxHashMap<FuncId, u16>,
     adapters: FxHashMap<u16, usize>,
@@ -281,9 +281,7 @@ impl Compiler {
         compilation_state: usize,
         log: super::recompile::Log,
     ) -> Result<Self, Error> {
-        let builder = JITBuilder::with_flags(&[], default_libcall_names())
-            .map_err(|error| Error::Compile(error.to_string()))?;
-        let mut module = JITModule::new(builder);
+        let mut module = new_module().map_err(Error::Compile)?;
         let target = module.target_config();
         let pointer = target.pointer_type();
         let call_conv = target.default_call_conv;

@@ -10,7 +10,7 @@ use cranelift_codegen::ir::{
     BlockArg, InstBuilder, StackSlotData, StackSlotKind, Value as ClifValue, types,
 };
 use cranelift_frontend::FunctionBuilder;
-use cranelift_jit::JITModule;
+use crate::jit::module::CodeModule;
 use cranelift_module::Module;
 
 use crate::error::Error;
@@ -22,7 +22,7 @@ use crate::jit::semantic::{
 
 pub(in crate::jit) fn emit(
     builder: &mut FunctionBuilder<'_>,
-    module: &mut JITModule,
+    module: &mut CodeModule,
     graph: &Graph,
 ) -> Result<(), Error> {
     let mut blocks = SecondaryMap::new();

@@ -4,7 +4,7 @@ use cranelift_codegen::ir::{
 };
 use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-use cranelift_jit::JITModule;
+use crate::jit::module::CodeModule;
 use cranelift_module::{FuncId, Module};
 
 use crate::error::Error;
@@ -45,7 +45,7 @@ pub(in crate::jit) struct Stubs {
 
 impl Stubs {
     pub(in crate::jit) fn new(
-        module: &mut JITModule,
+        module: &mut CodeModule,
         generic: &Signature,
         direct_entries: *const usize,
         compilation_state: usize,
@@ -105,7 +105,7 @@ pub(in crate::jit) fn fixed_signature(pointer: Type, arity: u16) -> Signature {
 
 pub(super) fn poll(
     b: &mut FunctionBuilder<'_>,
-    module: &JITModule,
+    module: &CodeModule,
     state: usize,
     ctx: cranelift_codegen::ir::Value,
     owner: Option<cranelift_codegen::ir::Value>,
@@ -150,7 +150,7 @@ pub(in crate::jit) struct Stub {
 impl Stub {
     pub(in crate::jit) fn finalize(
         self,
-        module: &JITModule,
+        module: &CodeModule,
         dump: Option<&mut Writer>,
         name: &str,
     ) -> usize {
@@ -164,9 +164,9 @@ impl Stub {
 }
 
 fn define(
-    module: &mut JITModule,
+    module: &mut CodeModule,
     signature: Signature,
-    body: impl FnOnce(&mut FunctionBuilder<'_>, &mut JITModule),
+    body: impl FnOnce(&mut FunctionBuilder<'_>, &mut CodeModule),
 ) -> Result<Stub, Error> {
     let id = module
         .declare_anonymous_function(&signature)
@@ -194,7 +194,7 @@ fn define(
 /// Tail calls published code of this arity, and otherwise dispatches through published
 /// adapters before trying the runtime. Returns an owned result, like fixed-arity code.
 fn build_miss(
-    module: &mut JITModule,
+    module: &mut CodeModule,
     generic: &Signature,
     direct_entries: *const usize,
     compilation_state: usize,
@@ -350,7 +350,7 @@ fn record_call(
 
 /// Lets generic callers enter fixed-arity code, passed as the last argument.
 pub(in crate::jit) fn build_adapter(
-    module: &mut JITModule,
+    module: &mut CodeModule,
     generic: &Signature,
     arity: u16,
 ) -> Result<Stub, Error> {
