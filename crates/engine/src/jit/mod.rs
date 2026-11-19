@@ -19,6 +19,8 @@ mod jitdump;
 pub(crate) mod layout;
 mod machine;
 mod math;
+#[cfg(feature = "wgsl")]
+mod naga;
 pub(crate) mod osr;
 pub(crate) mod pack;
 pub(crate) mod profile;

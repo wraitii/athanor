@@ -29,6 +29,14 @@ impl Heap {
         self.0.borrow().indexed_prototypes
     }
 
+    #[cfg(feature = "gpu")]
+    pub(crate) fn array_elements_copy(&self, value: Value) -> Option<Vec<Value>> {
+        let id = heap_id(value)?;
+        let data = self.0.borrow();
+        let array = data.array(id)?;
+        Some(array.elements.clone())
+    }
+
     // Consumes the element references on both success and failure.
     pub(crate) fn array_from_owned(&self, elements: Vec<Value>) -> Option<Value> {
         self.drain(64);

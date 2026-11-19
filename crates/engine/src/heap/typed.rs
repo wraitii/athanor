@@ -213,4 +213,33 @@ impl Heap {
         array.storage.fill(start, end, number);
         true
     }
+
+    #[cfg(feature = "gpu")]
+    pub(crate) fn float32_copy(&self, value: Value) -> Option<Vec<f32>> {
+        let id = heap_id(value)?;
+        let data = self.0.borrow();
+        let array = data.typed_array(id)?;
+        match &array.storage {
+            TypedStorage::Float32(values) => Some(values.clone()),
+            _ => None,
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    pub(crate) fn float32_write(&self, value: Value, src: &[f32]) -> bool {
+        let Some(id) = heap_id(value) else {
+            return false;
+        };
+        let mut data = self.0.borrow_mut();
+        let Some(array) = data.typed_array_mut(id) else {
+            return false;
+        };
+        match &mut array.storage {
+            TypedStorage::Float32(values) if values.len() == src.len() => {
+                values.copy_from_slice(src);
+                true
+            }
+            _ => false,
+        }
+    }
 }

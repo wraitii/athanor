@@ -61,6 +61,15 @@ impl PassInspection {
     }
 
     pub(super) fn observe(&mut self, name: &str, state: &semantic::FunctionState) {
+        #[cfg(feature = "wgsl")]
+        if self.pass.as_deref() == Some("wgsl") && name == "inline" {
+            let text = match super::naga::compile_wgsl(&state.graph) {
+                Ok(wgsl) => wgsl,
+                Err(error) => format!("// wgsl unsupported: {error}\n"),
+            };
+            self.snapshot = Some(("wgsl".to_owned(), text));
+            return;
+        }
         if self.pass.as_deref() == Some(name) {
             self.snapshot = Some((name.to_owned(), semantic_text(state.listing_lines())));
         }
@@ -75,6 +84,9 @@ impl PassInspection {
         let Some(pass) = self.pass.as_deref() else {
             return Ok(());
         };
+        if cfg!(feature = "wgsl") && pass == "wgsl" {
+            return Ok(());
+        }
         let passes = semantic::SPECIALIZATION_PASSES
             .iter()
             .chain(semantic::RUNTIME_PASSES)

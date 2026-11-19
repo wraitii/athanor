@@ -534,6 +534,10 @@ pub(in crate::jit) fn specialize_observed(
         Versioning::Speculate { .. } => osr_feedback,
     };
     after("inline", &function);
+    #[cfg(feature = "gpu")]
+    if crate::jit::naga::try_inject_gpu(&mut function.graph) {
+        function.invalidate_cfg();
+    }
     if !function.optimize {
         function.ensure_facts();
         after("captures", &function);

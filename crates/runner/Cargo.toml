@@ -8,6 +8,10 @@ license.workspace = true
 name = "js-runner"
 path = "src/main.rs"
 
+[features]
+wgsl = ["js-engine/wgsl"]
+gpu = ["js-engine/gpu"]
+
 [dependencies]
 js-engine = { path = "../engine" }
 tracing-samply = "0.1.5"

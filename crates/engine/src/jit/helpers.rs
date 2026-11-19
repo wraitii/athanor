@@ -18,6 +18,8 @@ use cranelift_frontend::FunctionBuilder;
 use crate::heap::{IndexRead, PropertyRead};
 use crate::value::Value;
 
+#[cfg(feature = "gpu")]
+use super::naga::runtime::js_gpu_dispatch;
 use super::osr::Site;
 use super::session::{HELPERS_OFFSET, JitCtx};
 use super::variants::Variant;
@@ -69,15 +71,15 @@ macro_rules! define_helpers {
     (@ownership) => { super::semantic::Ownership::Unowned };
     (@ownership owned) => { super::semantic::Ownership::Owned };
     (@ownership borrowed) => { super::semantic::Ownership::Borrowed };
-    ($($variant:ident => $function:ident($($param:ty),*) -> $result:ty $(, $ownership:ident)?;)*) => {
+    ($($(#[$meta:meta])* $variant:ident => $function:ident($($param:ty),*) -> $result:ty $(, $ownership:ident)?;)*) => {
         #[repr(usize)]
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
         pub(crate) enum Helper {
-            $($variant),*
+            $($(#[$meta])* $variant),*
         }
 
         pub(crate) const HELPERS: &[HelperSpec] = &[
-            $(HelperSpec {
+            $($(#[$meta])* HelperSpec {
                 params: &[$(<$param as HelperType>::KIND),*],
                 returns: <$result as HelperType>::KIND,
                 pointer: {
@@ -100,6 +102,8 @@ define_helpers! {
     PackTake => js_pack_take(Value, Value) -> Value, owned;
     CompilePoll => js_compile_poll() -> Value;
     VariantEntry => js_variant_entry(*const Variant) -> u64;
+    #[cfg(feature = "gpu")]
+    GpuDispatch => js_gpu_dispatch(usize, Value) -> u64;
     OsrPoll => js_osr_poll(Value, *mut Value, *const Site) -> Value;
     CompileLeave => js_compile_leave(u64) -> Value;
     BaselineWarm => js_baseline_warm(u64) -> Value;

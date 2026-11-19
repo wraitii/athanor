@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+wgsl = ["dep:naga"]
+gpu = ["wgsl", "dep:wgpu", "dep:pollster"]
+
 [dependencies]
 # Cranelift is pinned to a wasmtime main commit (newer than the 0.137.1 release)
 # for an upstream fix to machine-code source locations, which jitdump profiling
@@ -29,3 +33,15 @@ num-bigint = "=0.5.1"
 rustc-hash = "=2.1.3"
 smallvec = "=1.16.4"
 tracing = "0.1"
+naga = { version = "=30.0.2", optional = true, default-features = false, features = ["wgsl-out"] }
+wgpu = { version = "=30.0.2", optional = true, default-features = false, features = ["std", "naga-ir"] }
+pollster = { version = "=1.0.3", optional = true }
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+wgpu = { version = "=30.0.2", optional = true, default-features = false, features = ["metal"] }
+
+[target.'cfg(not(target_vendor = "apple"))'.dependencies]
+wgpu = { version = "=30.0.2", optional = true, default-features = false, features = ["vulkan"] }
+
+[target.'cfg(windows)'.dependencies]
+wgpu = { version = "=30.0.2", optional = true, default-features = false, features = ["dx12"] }
