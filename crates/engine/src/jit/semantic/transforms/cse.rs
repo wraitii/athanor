@@ -23,6 +23,10 @@ enum Expression {
     NumericFloat(Value),
     IntCompare(IntCC, Value, Value),
     FloatCompare(FloatCC, Value, Value),
+    Select(Value, Value, Value),
+    ExtractBits(Value, u8, u8),
+    InRange(Value, u64, u64, bool),
+    TestMask(Value, u64),
     SaturatingInteger(Value),
     Position(Value),
     ExactPosition(Value, Value),
@@ -83,6 +87,23 @@ fn expression(
             left,
             right,
         }) if pure => Expression::FloatCompare(*condition, at(left), at(right)),
+        Op::LowLevel(low_level::Op::Select { condition, yes, no }) if pure => {
+            Expression::Select(at(condition), at(yes), at(no))
+        }
+        Op::LowLevel(low_level::Op::ExtractBits {
+            value,
+            shift,
+            width,
+        }) if pure => Expression::ExtractBits(at(value), *shift, *width),
+        Op::LowLevel(low_level::Op::InRange {
+            value,
+            low,
+            high,
+            inside,
+        }) if pure => Expression::InRange(at(value), *low, *high, *inside),
+        Op::LowLevel(low_level::Op::TestMask { value, mask }) if pure => {
+            Expression::TestMask(at(value), *mask)
+        }
         // The dominating conversion has already succeeded, including its internal error check.
         Op::Javascript(JsOp::ArrayPosition(value)) => Expression::Position(at(value)),
         Op::Javascript(JsOp::IsExactPosition(key, position)) => {
