@@ -5,7 +5,13 @@ use serde_json::{Value, json};
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
-pub fn compile(source: &str, filter: Option<String>) -> Result<String, String> {
+pub fn compile(
+    source: &str,
+    filter: Option<String>,
+    inlining: bool,
+    versioning: bool,
+    continuations: bool,
+) -> Result<String, String> {
     console_error_panic_hook::set_once();
     let reports = ReportSink::default();
     let engine = Engine::with_options(EngineOptions {
@@ -16,6 +22,9 @@ pub fn compile(source: &str, filter: Option<String>) -> Result<String, String> {
             ..Default::default()
         })),
         background_compile: false,
+        inlining,
+        versioning,
+        continuations,
         ..Default::default()
     })
     .map_err(|error| error.to_string())?;

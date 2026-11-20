@@ -205,6 +205,7 @@ pub(crate) struct Compiler {
     ssa_opt: bool,
     optimization: crate::OptimizationLevel,
     inlining: bool,
+    versioning: bool,
     recompile_inline_multiplier: usize,
     osr: bool,
     baseline_warmup: u64,
@@ -343,6 +344,7 @@ impl Compiler {
                 ),
             optimization: options.optimization,
             inlining: options.inlining,
+            versioning: options.versioning,
             recompile_inline_multiplier: options.recompile_inline_multiplier,
             get_refinement: options.get_refinement,
             specialization_log: options.specialization_log,
@@ -1048,7 +1050,7 @@ impl Compiler {
                 &analysis.arguments_references,
                 self.ssa_opt,
                 self.speculative_continuations,
-                self.optimization == crate::OptimizationLevel::Initial,
+                self.optimization == crate::OptimizationLevel::Initial || !self.versioning,
                 self.report_regions(),
                 &mut |name, state| passes.observe(name, state),
             )
@@ -1725,18 +1727,20 @@ impl Compiler {
             );
             return Ok(None);
         }
-        let versioning =
-            if matches!(request, RecompileRequest::Observing(_)) || initial && self.generic_first {
-                super::semantic::Versioning::Generic
-            } else {
-                super::semantic::Versioning::Speculate {
-                    fallback: match &request {
-                        RecompileRequest::Replacement { previous } => Some(previous.code),
-                        _ => None,
-                    },
-                    continuations: self.speculative_continuations,
-                }
-            };
+        let versioning = if matches!(request, RecompileRequest::Observing(_))
+            || initial && self.generic_first
+            || !self.versioning
+        {
+            super::semantic::Versioning::Generic
+        } else {
+            super::semantic::Versioning::Speculate {
+                fallback: match &request {
+                    RecompileRequest::Replacement { previous } => Some(previous.code),
+                    _ => None,
+                },
+                continuations: self.speculative_continuations,
+            }
+        };
         self.log_specialization(
             code,
             &label,
@@ -2257,7 +2261,7 @@ impl Compiler {
                 );
                 super::semantic::specialize_observed(
                     planned,
-                    if self.optimization == crate::OptimizationLevel::Initial {
+                    if self.optimization == crate::OptimizationLevel::Initial || !self.versioning {
                         super::semantic::Versioning::Generic
                     } else {
                         super::semantic::Versioning::Speculate {

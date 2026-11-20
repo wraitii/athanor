@@ -34,10 +34,17 @@ export interface Report {
   gpu: GpuReport | null;
 }
 
+export interface CompileOptions {
+  inlining: boolean;
+  versioning: boolean;
+  continuations: boolean;
+}
+
 export interface CompileRequest {
   id: number;
   source: string;
   filter: string;
+  options: CompileOptions;
 }
 
 export type CompileResponse =

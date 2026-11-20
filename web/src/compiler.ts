@@ -1,4 +1,4 @@
-import type { CompileResponse } from './types';
+import type { CompileOptions, CompileResponse } from './types';
 
 type Pending = (response: CompileResponse) => void;
 
@@ -28,11 +28,11 @@ export class Compiler {
     };
   }
 
-  compile(source: string, filter: string): Promise<CompileResponse> {
+  compile(source: string, filter: string, options: CompileOptions): Promise<CompileResponse> {
     const id = this.next++;
     return new Promise((resolve) => {
       this.pending.set(id, resolve);
-      this.worker.postMessage({ id, source, filter });
+      this.worker.postMessage({ id, source, filter, options });
     });
   }
 }

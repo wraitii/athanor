@@ -41,6 +41,7 @@ pub struct EngineOptions {
     pub prefetch_compile: bool,
     pub compiler_threads: usize,
     pub inlining: bool,
+    pub versioning: bool,
     pub call_variants: bool,
     pub call_specialization: bool,
     pub recompile_inline_multiplier: usize,
@@ -80,6 +81,7 @@ impl Default for EngineOptions {
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(jit::recompile::DEFAULT_COMPILER_THREADS),
             inlining: std::env::var("JS_JIT_INLINE").as_deref() != Ok("0"),
+            versioning: std::env::var("JS_JIT_VERSIONING").as_deref() != Ok("0"),
             call_variants: std::env::var("JS_JIT_CALL_VARIANTS").as_deref() != Ok("0"),
             call_specialization: std::env::var("JS_JIT_CALL_SPECIALIZATION").as_deref() != Ok("0"),
             recompile_inline_multiplier: std::env::var("JS_JIT_RECOMPILE_INLINE_MULTIPLIER")

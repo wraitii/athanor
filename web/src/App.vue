@@ -8,7 +8,7 @@ import type { CallStats, LogLevel, RunKernel } from './run/protocol';
 import { Compiler } from './compiler';
 import { examples } from './examples';
 import { byteOffsets, diffListing, sourceLines, type Span } from './listing';
-import type { Pass, Report } from './types';
+import type { CompileOptions, Pass, Report } from './types';
 import type { DiffRequest, DiffResponse } from './diff-worker';
 
 const STORAGE_KEY = 'athanor-inspector-source';
@@ -24,6 +24,7 @@ function loadSource(): string {
 const compiler = new Compiler();
 const source = ref(loadSource());
 const filter = ref('');
+const options = ref<CompileOptions>({ inlining: true, versioning: true, continuations: true });
 const reports = ref<Report[]>([]);
 const compiledSource = ref('');
 const reportIndex = ref(0);
@@ -125,7 +126,7 @@ async function run() {
   const id = ++latest;
   const text = source.value;
   compiling.value = true;
-  const response = await compiler.compile(text, filter.value.trim());
+  const response = await compiler.compile(text, filter.value.trim(), { ...options.value });
   if (id !== latest) return;
   compiling.value = false;
   if (!response.ok) {
@@ -154,7 +155,7 @@ async function execute() {
   runLogs.value = [];
   runStats.value = [];
   runStatus.value = 'Compiling…';
-  const response = await compiler.compile(text, '');
+  const response = await compiler.compile(text, '', { ...options.value });
   if (id !== latestRun) return;
   if (!response.ok) {
     running.value = false;
@@ -202,13 +203,13 @@ function stop() {
 }
 
 let timer: number | undefined;
-watch([source, filter], () => {
+watch([source, filter, options], () => {
   try {
     localStorage.setItem(STORAGE_KEY, source.value);
   } catch {}
   clearTimeout(timer);
   timer = window.setTimeout(run, 500);
-});
+}, { deep: true });
 
 watch(reportIndex, () => {
   passIndex.value = Math.min(passIndex.value, Math.max(passes.value.length - 1, 0));
@@ -242,6 +243,13 @@ onMounted(run);
         <option v-for="name in Object.keys(examples)" :key="name" :value="name">{{ name }}</option>
       </select>
       <input v-model="filter" class="filter" placeholder="Filter functions" aria-label="Function filter" />
+      <div class="toggles">
+        <label class="toggle"><input v-model="options.inlining" type="checkbox" /> inlining</label>
+        <label class="toggle"><input v-model="options.versioning" type="checkbox" /> versioning</label>
+        <label class="toggle">
+          <input v-model="options.continuations" type="checkbox" :disabled="!options.versioning" /> continuations
+        </label>
+      </div>
       <button class="compile" :disabled="compiling" @click="run">Compile <kbd>⌘↵</kbd></button>
       <span class="status" :class="{ failed: error }">{{ compiling ? 'Compiling…' : status }}</span>
     </header>
