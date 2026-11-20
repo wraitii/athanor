@@ -62,8 +62,7 @@ pub(super) struct FunctionCompiler<'a, 'f> {
     error_origin: Option<Block>,
     handlers: Vec<Block>,
     terminated: bool,
-    frame_size: Option<Inst>,
-    frame: Option<CallerFrame>,
+    frame: Option<Frame>,
     fixed_signatures: FxHashMap<u16, SigRef>,
     property_caches: FxHashMap<super::semantic::Inst, i64>,
     slots: FxHashMap<LoweredValue, u32>,
@@ -80,10 +79,13 @@ enum Arguments {
     Fixed(Vec<LoweredValue>),
 }
 
-#[derive(Clone, Copy)]
-struct CallerFrame {
-    start: LoweredValue,
-    base: LoweredValue,
+/// The temp-stack push and pops are emitted once the slot count is known, so frames
+/// without slots leave the stack untouched.
+struct Frame {
+    push: Block,
+    body: Block,
+    overflow: Block,
+    pops: Vec<(Block, Block)>,
 }
 
 const INLINE_FRAME_RELEASES: u32 = 4;
@@ -304,7 +306,6 @@ fn lower_callable(
         error_origin: None,
         handlers: Vec::new(),
         terminated: false,
-        frame_size: None,
         frame: None,
         fixed_signatures: FxHashMap::default(),
         property_caches: FxHashMap::default(),
@@ -334,8 +335,8 @@ fn lower_callable(
         compiler.return_value(result);
     } else if let Body::Graph(context) = body {
         compiler.finalize_runtime_lowering(context, closure, continuations)?;
-        compiler.patch_frame_size();
     }
+    compiler.finish_frame();
     compiler
         .references
         .finish(compiler.b.graph)
@@ -505,7 +506,6 @@ impl FunctionCompiler<'_, '_> {
     }
 
     fn exit_frame(&mut self, value: LoweredValue) {
-        let caller = self.frame.unwrap();
         self.increment(value);
         if self.slot_count > 0 {
             if self.slot_count <= INLINE_FRAME_RELEASES {
@@ -517,10 +517,15 @@ impl FunctionCompiler<'_, '_> {
             }
         }
         self.release_owned();
-        let start = self.load_ctx(crate::jit::session::LOCALS_START_OFFSET);
-        self.store_ctx(start, crate::jit::session::LOCALS_LEN_OFFSET);
-        self.store_ctx(caller.start, crate::jit::session::LOCALS_START_OFFSET);
-        self.store_ctx(caller.base, crate::jit::session::LOCALS_OFFSET);
+        let pop = self.b.create_block();
+        let after = self.b.create_block();
+        self.jump(pop, &[]);
+        self.switch(after);
+        self.frame
+            .as_mut()
+            .expect("frame entered before exit")
+            .pops
+            .push((pop, after));
     }
 
     fn release_slot(&mut self, slot: u32) {
@@ -535,34 +540,19 @@ impl FunctionCompiler<'_, '_> {
         self.switch(done);
     }
 
-    /// Slots above the stack's length are always empty, so nothing needs initializing.
     fn enter_frame(&mut self) {
-        use crate::jit::session::{
-            LOCALS_LEN_OFFSET, LOCALS_LIMIT_OFFSET, LOCALS_OFFSET, LOCALS_START_OFFSET,
-            STACK_LIMIT_OFFSET,
-        };
-        let caller = CallerFrame {
-            start: self.load_ctx(LOCALS_START_OFFSET),
-            base: self.load_ctx(LOCALS_OFFSET),
-        };
-        let start = self.load_ctx(LOCALS_LEN_OFFSET);
-        let size = self.b.ins().iconst(types::I64, 0);
-        self.frame_size = Some(self.b.defining_inst(size));
-        let len = self.b.ins().iadd(start, size);
-        let limit = self.load_ctx(LOCALS_LIMIT_OFFSET);
-        let full = self.b.ins().icmp(IntCC::UnsignedGreaterThan, len, limit);
         let stack_pointer = self.b.ins().get_stack_pointer(self.pointer);
-        let stack_limit = self.load_ctx(STACK_LIMIT_OFFSET);
+        let stack_limit = self.load_ctx(crate::jit::session::STACK_LIMIT_OFFSET);
         let deep = self
             .b
             .ins()
             .icmp(IntCC::UnsignedLessThan, stack_pointer, stack_limit);
-        let overflow = self.b.ins().boolean_or(full, deep);
-        let fail = self.b.create_block();
-        let enter = self.b.create_block();
-        self.b.set_cold_block(fail);
-        self.brif(overflow, fail, &[], enter, &[]);
-        self.switch(fail);
+        let overflow = self.b.create_block();
+        let push = self.b.create_block();
+        let body = self.b.create_block();
+        self.b.set_cold_block(overflow);
+        self.brif(deep, overflow, &[], push, &[]);
+        self.switch(overflow);
         self.call_helper(Helper::FrameOverflow, &[]);
         let undefined = self.constant(Value::UNDEFINED);
         let mut results = vec![undefined];
@@ -570,14 +560,53 @@ impl FunctionCompiler<'_, '_> {
             results.push(self.b.ins().iconst(types::I8, 1));
         }
         self.b.ins().return_(&results);
+        self.switch(body);
+        self.frame = Some(Frame {
+            push,
+            body,
+            overflow,
+            pops: Vec::new(),
+        });
+    }
+
+    /// Slots above the stack's length are always empty, so nothing needs initializing.
+    fn finish_frame(&mut self) {
+        use crate::jit::session::{
+            LOCALS_LEN_OFFSET, LOCALS_LIMIT_OFFSET, LOCALS_OFFSET, LOCALS_START_OFFSET,
+        };
+        let frame = self.frame.take().expect("frame entered");
+        self.switch(frame.push);
+        if self.slot_count == 0 {
+            self.jump(frame.body, &[]);
+            for (pop, after) in frame.pops {
+                self.switch(pop);
+                self.jump(after, &[]);
+            }
+            return;
+        }
+        let caller_start = self.load_ctx(LOCALS_START_OFFSET);
+        let caller_base = self.load_ctx(LOCALS_OFFSET);
+        let start = self.load_ctx(LOCALS_LEN_OFFSET);
+        let len = self.b.ins().iadd_imm_u(start, i64::from(self.slot_count));
+        let limit = self.load_ctx(LOCALS_LIMIT_OFFSET);
+        let full = self.b.ins().icmp(IntCC::UnsignedGreaterThan, len, limit);
+        let enter = self.b.create_block();
+        self.brif(full, frame.overflow, &[], enter, &[]);
         self.switch(enter);
-        let caller_slots = self.b.ins().isub(start, caller.start);
+        let caller_slots = self.b.ins().isub(start, caller_start);
         let offset = self.b.ins().ishl_imm_s(caller_slots, 3);
-        let base = self.b.ins().iadd(caller.base, offset);
+        let base = self.b.ins().iadd(caller_base, offset);
         self.store_ctx(base, LOCALS_OFFSET);
         self.store_ctx(start, LOCALS_START_OFFSET);
         self.store_ctx(len, LOCALS_LEN_OFFSET);
-        self.frame = Some(caller);
+        self.jump(frame.body, &[]);
+        for (pop, after) in frame.pops {
+            self.switch(pop);
+            self.store_ctx(start, LOCALS_LEN_OFFSET);
+            self.store_ctx(caller_start, LOCALS_START_OFFSET);
+            self.store_ctx(caller_base, LOCALS_OFFSET);
+            self.jump(after, &[]);
+        }
     }
 
     fn store_ctx(&mut self, value: LoweredValue, offset: i32) -> Inst {
@@ -586,12 +615,6 @@ impl FunctionCompiler<'_, '_> {
             .ins()
             .store(MemFlagsData::trusted(), value, self.ctx, offset);
         store
-    }
-
-    fn patch_frame_size(&mut self) {
-        if let Some(inst) = self.frame_size {
-            self.b.patch_integer(inst, self.slot_count as u64);
-        }
     }
 
     pub(super) fn argument_vector(&self) -> Result<(LoweredValue, LoweredValue), Error> {

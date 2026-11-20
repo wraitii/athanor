@@ -371,19 +371,12 @@ impl<'a> Builder<'a> {
         self.graph.blocks.len()
     }
 
+    #[cfg(test)]
     pub(in crate::jit) fn defining_inst(&self, value: Value) -> Inst {
         match self.graph.values[value] {
             super::ValueDef::Result(inst, _) => inst,
             _ => panic!("not an instruction result"),
         }
-    }
-
-    pub(in crate::jit) fn patch_integer(&mut self, inst: Inst, bits: u64) {
-        let GraphOp::LowLevel(Op::Integer { bits: value, .. }) = &mut self.graph.insts[inst].op
-        else {
-            panic!("not an integer constant")
-        };
-        *value = bits;
     }
 
     pub(in crate::jit) fn mark_helper(&mut self, inst: Inst, identity: Helper) {
