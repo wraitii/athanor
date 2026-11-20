@@ -80,16 +80,26 @@ enum Access {
 }
 
 pub(in crate::jit::semantic) fn promote(graph: &mut Graph, notes: &mut Vec<String>) {
-    let promoted: FxHashSet<Binding> = graph
-        .bindings
+    let cfg = Cfg::new(graph);
+    let promoted: FxHashSet<Binding> = cfg
+        .rpo
         .iter()
-        .filter(|(_, data)| !data.captured)
-        .map(|(binding, _)| binding)
+        .flat_map(|&block| &graph.blocks[block].insts)
+        .filter_map(|&inst| match graph.insts[inst].op {
+            Op::Javascript(
+                JsOp::Read(binding)
+                | JsOp::BindingLoad(binding)
+                | JsOp::Write(binding, _)
+                | JsOp::Initialize(binding, _)
+                | JsOp::BindingRestore(binding, _),
+            ) => Some(binding),
+            _ => None,
+        })
+        .filter(|&binding| !graph.bindings[binding].captured)
         .collect();
     if promoted.is_empty() {
         return;
     }
-    let cfg = Cfg::new(graph);
     let entry = graph.entry;
     let span = graph.span;
     let (_, uninitialized) = graph.insert(
