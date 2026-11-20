@@ -1,43 +1,48 @@
 use std::fmt;
 
-pub(super) enum BoundSpec {
+#[derive(Clone, Debug)]
+pub enum BoundSpec {
     Const(i32),
     Arg(usize),
     ArgAdd(usize, i32),
 }
 
-pub(super) struct AxisSpec {
-    pub(super) start: BoundSpec,
-    pub(super) end: BoundSpec,
+#[derive(Clone, Debug)]
+pub struct AxisSpec {
+    pub start: BoundSpec,
+    pub end: BoundSpec,
 }
 
-pub(super) struct KernelBuffer {
-    pub(super) arg_index: usize,
-    pub(super) writable: bool,
+#[derive(Clone, Debug)]
+pub struct KernelBuffer {
+    pub arg_index: usize,
+    pub writable: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum Scale {
+pub enum Scale {
     Const(i64),
     Arg(usize, i64),
 }
 
-pub(super) struct StrideCheck {
-    pub(super) stride: Scale,
-    pub(super) inner: u64,
-    pub(super) inner_axis: usize,
+#[derive(Clone, Debug)]
+pub struct StrideCheck {
+    pub stride: Scale,
+    pub inner: u64,
+    pub inner_axis: usize,
 }
 
-pub(super) struct GpuKernel {
-    pub(super) wgsl: String,
+#[derive(Clone, Debug)]
+pub struct GpuKernel {
+    pub wgsl: String,
     #[cfg(feature = "gpu")]
-    pub(super) module: naga::Module,
-    pub(super) buffers: Vec<KernelBuffer>,
-    pub(super) uniforms: Vec<usize>,
-    pub(super) axis_x: AxisSpec,
-    pub(super) axis_y: Option<AxisSpec>,
-    pub(super) strides: Vec<StrideCheck>,
-    pub(super) workgroup_size: [u32; 3],
+    pub module: naga::Module,
+    pub buffers: Vec<KernelBuffer>,
+    pub uniforms: Vec<usize>,
+    pub axis_x: AxisSpec,
+    pub axis_y: Option<AxisSpec>,
+    pub strides: Vec<StrideCheck>,
+    pub workgroup_size: [u32; 3],
 }
 
 impl fmt::Display for BoundSpec {

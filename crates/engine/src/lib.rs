@@ -16,6 +16,8 @@ pub use error::Error;
 pub use heap::OwnedValue;
 pub use host::Host;
 pub use jit::{CompileOptions, Report, ReportSink};
+#[cfg(feature = "wgsl")]
+pub use jit::{AxisSpec, BoundSpec, GpuKernel, KernelBuffer, Scale, StrideCheck};
 pub use value::Value;
 
 pub(crate) use rustc_hash::{FxHashMap, FxHashSet};

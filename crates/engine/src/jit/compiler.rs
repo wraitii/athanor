@@ -1076,7 +1076,7 @@ impl Compiler {
                 self.source_name.0,
                 1,
             )
-            .after(passes.snapshots);
+            .after(passes);
             if let Some(listing) = &mut listing {
                 self.remap_listing(listing, &graph, self.source_name.0);
             }
@@ -1819,7 +1819,7 @@ impl Compiler {
             source,
             inline_multiplier,
         )
-        .after(passes.snapshots);
+        .after(passes);
         let body = self.emit_body(
             signature,
             emission.source_name,
@@ -2060,7 +2060,7 @@ impl Compiler {
         }
         let inspection =
             super::inspect::Inspection::from_graph(self.inspection.as_deref(), &state.graph)
-                .after(passes.snapshots);
+                .after(passes);
         if let Some(listing) = &mut listing {
             self.remap_listing(listing, &state, source_name.0);
         }
@@ -2359,7 +2359,7 @@ impl Compiler {
                 self.source_name.0,
                 usize::from(self.inlining),
             )
-            .after(passes.snapshots)
+            .after(passes)
         });
         if let Some(listing) = &mut listing {
             self.remap_listing(listing, graph.as_ref().unwrap(), self.source_name.0);

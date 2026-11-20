@@ -34,6 +34,8 @@ pub struct Report {
     pub semantic: Option<String>,
     pub passes: Vec<(String, String)>,
     pub planner: Option<String>,
+    #[cfg(feature = "wgsl")]
+    pub gpu: Option<Result<super::naga::GpuKernel, String>>,
 }
 
 #[derive(Clone, Default)]
@@ -69,6 +71,8 @@ pub(super) struct Inspection {
     semantic: Option<String>,
     after: Vec<(String, String)>,
     planner: Option<String>,
+    #[cfg(feature = "wgsl")]
+    gpu: Option<Result<super::naga::GpuKernel, String>>,
 }
 
 pub(super) fn graph_text(graph: &semantic::Graph) -> String {
@@ -89,7 +93,9 @@ fn semantic_text(lines: Vec<semantic::ListingLine>) -> String {
 
 pub(super) struct PassInspection {
     pass: Option<String>,
-    pub(super) snapshots: Vec<(String, String)>,
+    snapshots: Vec<(String, String)>,
+    #[cfg(feature = "wgsl")]
+    gpu: Option<Result<super::naga::GpuKernel, String>>,
 }
 
 impl PassInspection {
@@ -99,6 +105,8 @@ impl PassInspection {
                 .filter(|options| options.semantic_ir)
                 .and_then(|options| options.after.clone()),
             snapshots: Vec::new(),
+            #[cfg(feature = "wgsl")]
+            gpu: None,
         }
     }
 
@@ -108,11 +116,13 @@ impl PassInspection {
         }
         #[cfg(feature = "wgsl")]
         if name == "inline" && selects(self.pass.as_deref(), "wgsl") {
-            let text = match super::naga::compile_wgsl(&state.graph) {
-                Ok(wgsl) => wgsl,
+            let kernel = super::naga::compile_kernel(&state.graph);
+            let text = match &kernel {
+                Ok(kernel) => kernel.to_string(),
                 Err(error) => format!("// wgsl unsupported: {error}\n"),
             };
             self.snapshots.push(("wgsl".to_owned(), text));
+            self.gpu = Some(kernel);
         }
     }
 
@@ -181,8 +191,12 @@ impl Inspection {
         self
     }
 
-    pub(super) fn after(mut self, snapshots: Vec<(String, String)>) -> Self {
-        self.after = snapshots;
+    pub(super) fn after(mut self, passes: PassInspection) -> Self {
+        self.after = passes.snapshots;
+        #[cfg(feature = "wgsl")]
+        {
+            self.gpu = passes.gpu;
+        }
         self
     }
 
@@ -201,6 +215,8 @@ impl Inspection {
                 semantic: self.semantic.clone(),
                 passes: self.after.clone(),
                 planner: self.planner.clone(),
+                #[cfg(feature = "wgsl")]
+                gpu: self.gpu.clone(),
             });
             return;
         }

@@ -21,7 +21,7 @@ use super::semantic::{
     Block, Cfg, Constant, Graph, JsOp, Op, Target, TerminatorKind, UnaryOp, Value, natural_loops,
 };
 use affine::Affine;
-use kernel::{AxisSpec, BoundSpec, GpuKernel, KernelBuffer, StrideCheck};
+pub use kernel::{AxisSpec, BoundSpec, GpuKernel, KernelBuffer, Scale, StrideCheck};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ScalarTy {
@@ -47,10 +47,6 @@ struct BufferInfo {
     arg: Value,
     arg_index: usize,
     writable: bool,
-}
-
-pub(super) fn compile_wgsl(graph: &Graph) -> Result<String, String> {
-    compile_kernel(graph).map(|kernel| kernel.to_string())
 }
 
 #[cfg(feature = "gpu")]
@@ -180,7 +176,7 @@ fn extract_bound(graph: &Graph, value: Value) -> Option<BoundSpec> {
     }
 }
 
-fn compile_kernel(graph: &Graph) -> Result<GpuKernel, String> {
+pub(super) fn compile_kernel(graph: &Graph) -> Result<GpuKernel, String> {
     if graph.generator {
         return Err("generators are not supported".into());
     }
