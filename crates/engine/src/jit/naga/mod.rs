@@ -17,6 +17,7 @@ use oxc_syntax::operator::BinaryOperator;
 use crate::{FxHashMap, FxHashSet};
 
 use super::semantic::low_level;
+use super::semantic::offload::Offload;
 use super::semantic::{
     Block, Cfg, Constant, Graph, JsOp, Op, Target, TerminatorKind, UnaryOp, Value, natural_loops,
 };
@@ -49,99 +50,110 @@ struct BufferInfo {
     writable: bool,
 }
 
-#[cfg(feature = "gpu")]
-pub(in crate::jit) fn try_inject_gpu(graph: &mut Graph) -> bool {
-    use super::effects::{Effects, HEAP_READ, HEAP_WRITE, INTERNAL};
-    use super::helpers::Helper;
-    use super::semantic::{BlockData, Repr, ValueType};
+pub(in crate::jit) fn enabled() -> bool {
+    std::env::var("JS_JIT_GPU").as_deref() == Ok("1")
+}
 
-    if std::env::var("JS_JIT_GPU").as_deref() != Ok("1") {
-        return false;
+pub(in crate::jit) struct Gpu;
+
+impl Offload for Gpu {
+    fn compile(&mut self, kernel: &Graph) -> Option<usize> {
+        let compiled = compile_kernel(kernel);
+        let log = std::env::var("JS_JIT_GPU_LOG");
+        if matches!(log.as_deref(), Ok("1" | "2")) {
+            match &compiled {
+                Ok(_) => eprintln!("[js jit gpu] outlined {}", kernel.name),
+                Err(error) => eprintln!("[js jit gpu] declined {}: {error}", kernel.name),
+            }
+        }
+        if log.as_deref() == Ok("2") {
+            eprintln!("{}", super::inspect::graph_text(kernel, false));
+        }
+        #[cfg(feature = "gpu")]
+        return compiled.ok().map(runtime::register_kernel);
+        #[cfg(not(feature = "gpu"))]
+        None
     }
-    let Ok(kernel) = compile_kernel(graph) else {
-        return false;
-    };
-    let arity = kernel
-        .buffers
-        .iter()
-        .map(|buffer| buffer.arg_index)
-        .chain(kernel.uniforms.iter().copied())
-        .max()
-        .map_or(0, |max| max + 1);
-    let kernel_id = runtime::register_kernel(kernel);
-    let old_entry = graph.entry;
-    let span = graph.span;
-    let gpu_entry = graph.blocks.push(BlockData::default());
-    let gpu_done = graph.blocks.push(BlockData::default());
-    let mut arg_values = Vec::with_capacity(arity);
-    for i in 0..arity {
-        arg_values.push(graph.append_value(gpu_entry, span, Op::Argument(i)));
+
+    #[cfg(feature = "gpu")]
+    fn launch(
+        &mut self,
+        graph: &mut Graph,
+        block: Block,
+        kernel: usize,
+        inputs: &[Value],
+    ) -> Value {
+        use super::effects::{Effects, HEAP_READ, HEAP_WRITE, INTERNAL};
+        use super::helpers::Helper;
+        use super::semantic::{Repr, ValueType};
+        use cranelift_codegen::ir::{condcodes::IntCC, types::I64};
+
+        let span = graph.span;
+        let arguments =
+            graph.append_value(block, span, Op::Javascript(JsOp::NewArray(inputs.to_vec())));
+        let id = graph.append_value(
+            block,
+            span,
+            Op::LowLevel(low_level::Op::Integer {
+                ty: I64,
+                bits: kernel as u64,
+            }),
+        );
+        let dispatched = graph.append_value(
+            block,
+            span,
+            Op::HelperCall {
+                helper: Helper::GpuDispatch,
+                args: vec![id, arguments],
+                uses: vec![Repr::I64, Repr::Boxed],
+                produces: Some(Repr::I64),
+                result_type: ValueType::INTEGER,
+                effects: Effects::of(HEAP_READ | HEAP_WRITE | INTERNAL),
+            },
+        );
+        let zero = graph.append_value(
+            block,
+            span,
+            Op::LowLevel(low_level::Op::Integer { ty: I64, bits: 0 }),
+        );
+        graph.append_value(
+            block,
+            span,
+            Op::LowLevel(low_level::Op::IntCompare {
+                condition: IntCC::NotEqual,
+                left: dispatched,
+                right: zero,
+            }),
+        )
     }
-    let args_array =
-        graph.append_value(gpu_entry, span, Op::Javascript(JsOp::NewArray(arg_values)));
-    let id_val = graph.append_value(
-        gpu_entry,
-        span,
-        Op::LowLevel(low_level::Op::Integer {
-            ty: cranelift_codegen::ir::types::I64,
-            bits: kernel_id as u64,
-        }),
-    );
-    let dispatched = graph.append_value(
-        gpu_entry,
-        span,
-        Op::HelperCall {
-            helper: Helper::GpuDispatch,
-            args: vec![id_val, args_array],
-            uses: vec![Repr::I64, Repr::Boxed],
-            produces: Some(Repr::I64),
-            result_type: ValueType::INTEGER,
-            effects: Effects::of(HEAP_READ | HEAP_WRITE | INTERNAL),
-        },
-    );
-    let zero = graph.append_value(
-        gpu_entry,
-        span,
-        Op::LowLevel(low_level::Op::Integer {
-            ty: cranelift_codegen::ir::types::I64,
-            bits: 0,
-        }),
-    );
-    let ok = graph.append_value(
-        gpu_entry,
-        span,
-        Op::LowLevel(low_level::Op::IntCompare {
-            condition: cranelift_codegen::ir::condcodes::IntCC::NotEqual,
-            left: dispatched,
-            right: zero,
-        }),
-    );
-    graph.terminate(
-        gpu_entry,
-        span,
-        TerminatorKind::Branch(ok, Target::new(gpu_done), Target::new(old_entry)),
-    );
-    let undef = graph.append_value(
-        gpu_done,
-        span,
-        Op::Javascript(JsOp::Constant(Constant::Undefined)),
-    );
-    graph.terminate(gpu_done, span, TerminatorKind::Return(undef));
-    graph.entry = gpu_entry;
-    true
+
+    #[cfg(not(feature = "gpu"))]
+    fn launch(&mut self, _: &mut Graph, _: Block, _: usize, _: &[Value]) -> Value {
+        unreachable!("kernels are only compiled with the gpu runtime")
+    }
+}
+
+fn unwrapped(graph: &Graph, value: Value) -> Value {
+    match graph.defining_op(value) {
+        Some(Op::Javascript(JsOp::AsInteger(inner) | JsOp::AsNumber(inner))) => {
+            unwrapped(graph, *inner)
+        }
+        _ => value,
+    }
 }
 
 fn extract_bound(graph: &Graph, value: Value) -> Option<BoundSpec> {
-    match graph.defining_op(value)? {
+    let defining = |value: Value| graph.defining_op(unwrapped(graph, value));
+    match defining(value)? {
         Op::Javascript(JsOp::Constant(Constant::Number(n))) if n.fract() == 0.0 => {
             Some(BoundSpec::Const(*n as i32))
         }
         Op::Argument(i) => Some(BoundSpec::Arg(*i)),
         Op::Javascript(JsOp::Binary(BinaryOperator::Subtraction, l, r)) => {
-            let Op::Argument(i) = graph.defining_op(*l)? else {
+            let Op::Argument(i) = defining(*l)? else {
                 return None;
             };
-            let Op::Javascript(JsOp::Constant(Constant::Number(n))) = graph.defining_op(*r)? else {
+            let Op::Javascript(JsOp::Constant(Constant::Number(n))) = defining(*r)? else {
                 return None;
             };
             Some(BoundSpec::ArgAdd(*i, -(*n as i32)))
@@ -150,14 +162,14 @@ fn extract_bound(graph: &Graph, value: Value) -> Option<BoundSpec> {
             if let (
                 Some(Op::Argument(i)),
                 Some(Op::Javascript(JsOp::Constant(Constant::Number(n)))),
-            ) = (graph.defining_op(*l), graph.defining_op(*r))
+            ) = (defining(*l), defining(*r))
             {
                 return Some(BoundSpec::ArgAdd(*i, *n as i32));
             }
             if let (
                 Some(Op::Javascript(JsOp::Constant(Constant::Number(n)))),
                 Some(Op::Argument(i)),
-            ) = (graph.defining_op(*l), graph.defining_op(*r))
+            ) = (defining(*l), defining(*r))
             {
                 return Some(BoundSpec::ArgAdd(*i, *n as i32));
             }
@@ -168,11 +180,10 @@ fn extract_bound(graph: &Graph, value: Value) -> Option<BoundSpec> {
             left,
             right,
         }) => {
-            let Op::Argument(i) = graph.defining_op(*left)? else {
+            let Op::Argument(i) = defining(*left)? else {
                 return None;
             };
-            let Op::Javascript(JsOp::Constant(Constant::Number(n))) = graph.defining_op(*right)?
-            else {
+            let Op::Javascript(JsOp::Constant(Constant::Number(n))) = defining(*right)? else {
                 return None;
             };
             Some(BoundSpec::ArgAdd(*i, -(*n as i32)))
@@ -430,14 +441,17 @@ fn check_isolated(
         }
         for &inst in &graph.blocks[block].insts {
             let data = &graph.insts[inst];
-            let pure = matches!(
-                data.op,
+            let pure = match &data.op {
                 Op::Argument(_)
-                    | Op::Javascript(JsOp::Constant(_))
-                    | Op::Observe(..)
-                    | Op::ObserveMethod(..)
-                    | Op::ReadHint(..)
-            );
+                | Op::Javascript(JsOp::Constant(_))
+                | Op::Observe(..)
+                | Op::ObserveMethod(..)
+                | Op::ReadHint(..) => true,
+                Op::Javascript(JsOp::AsInteger(value) | JsOp::AsNumber(value)) => {
+                    matches!(graph.defining_op(*value), Some(Op::Argument(_)))
+                }
+                _ => false,
+            };
             if !pure && !data.result().is_some_and(|value| allowed.contains(&value)) {
                 return Err(format!("code outside the loop nest in {block}"));
             }
@@ -592,7 +606,10 @@ fn infer_types(
                     UnaryOp::Increment | UnaryOp::Decrement | UnaryOp::Negate | UnaryOp::Plus,
                     v,
                 )) => Some(types.get(v).copied().unwrap_or(ScalarTy::I32)),
-                Op::Javascript(JsOp::AsInteger(_)) => Some(ScalarTy::I32),
+                Op::Javascript(JsOp::AsInteger(v)) => match types.get(v) {
+                    Some(ScalarTy::F32) => Some(ScalarTy::F32),
+                    _ => Some(ScalarTy::I32),
+                },
                 Op::Javascript(JsOp::AsNumber(_)) => Some(ScalarTy::F32),
                 _ => None,
             };
@@ -1081,6 +1098,9 @@ impl<'a> Emitter<'a> {
             }
             Op::Javascript(JsOp::AsInteger(v)) => {
                 let pair = self.get_or_emit_value(block, *v)?;
+                if pair.1 == ScalarTy::F32 {
+                    return Ok(pair);
+                }
                 let expr = self.coerce(block, pair, ScalarTy::I32);
                 Ok((expr, ScalarTy::I32))
             }
@@ -1177,10 +1197,11 @@ impl<'a> Emitter<'a> {
                     );
                 }
                 op => {
-                    if let Some(result) = data.result() {
-                        let pair = self.emit_op(block, result, op)?;
-                        self.values.insert(result, pair);
-                    }
+                    let Some(result) = data.result() else {
+                        return Err(format!("unsupported effect {op:?}"));
+                    };
+                    let pair = self.emit_op(block, result, op)?;
+                    self.values.insert(result, pair);
                 }
             }
         }

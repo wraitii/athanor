@@ -128,7 +128,7 @@ impl PassInspection {
                 .push((name.to_owned(), graph_text(graph, self.verbose)));
         }
         #[cfg(feature = "wgsl")]
-        if name == "inline" && selects(self.pass.as_deref(), "wgsl") {
+        if name == "versioning/offload" && selects(self.pass.as_deref(), "wgsl") {
             let kernel = super::naga::compile_kernel(graph);
             let text = match &kernel {
                 Ok(kernel) => kernel.to_string(),

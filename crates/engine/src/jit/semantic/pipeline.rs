@@ -549,10 +549,6 @@ pub(in crate::jit) fn specialize_observed(
         Versioning::Speculate { .. } => osr_feedback,
     };
     after("inline", &function.graph);
-    #[cfg(feature = "gpu")]
-    if crate::jit::naga::try_inject_gpu(&mut function.graph) {
-        function.invalidate_cfg();
-    }
     if !function.optimize {
         function.ensure_facts();
         after("assume", &function.graph);
@@ -649,6 +645,13 @@ pub(in crate::jit) fn specialize_observed(
     function.graph.strip_assumes();
     function.specialized_regions = Some(regions);
     after("versioning", &function.graph);
+    #[cfg(feature = "wgsl")]
+    if !baseline
+        && matches!(versioning, Versioning::Speculate { .. })
+        && crate::jit::naga::enabled()
+    {
+        super::offload::outline(&mut function, &mut crate::jit::naga::Gpu, after);
+    }
     if let Some(source) = osr_source {
         function.instrument_osr(source, osr_feedback)?;
     }

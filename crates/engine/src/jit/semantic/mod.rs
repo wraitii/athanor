@@ -16,6 +16,7 @@ mod listing;
 mod liveness;
 pub(in crate::jit) mod low_level;
 mod memory;
+pub(in crate::jit) mod offload;
 pub(super) mod osr;
 pub(in crate::jit) mod ownership;
 mod pipeline;
