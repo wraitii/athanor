@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 use super::kernel::{AxisSpec, BoundSpec, GpuKernel, Scale};
@@ -31,11 +32,27 @@ impl Scale {
     }
 }
 
-static KERNELS: LazyLock<Mutex<Vec<Arc<GpuKernel>>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+const DECLINE_LIMIT: u32 = 4;
+
+struct Registered {
+    kernel: GpuKernel,
+    key: String,
+    declines: AtomicU32,
+}
+
+static KERNELS: LazyLock<Mutex<Vec<Arc<Registered>>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
 pub(super) fn register_kernel(kernel: GpuKernel) -> usize {
+    let key = kernel.to_string();
     let mut kernels = KERNELS.lock().unwrap();
-    kernels.push(Arc::new(kernel));
+    if let Some(id) = kernels.iter().position(|registered| registered.key == key) {
+        return id;
+    }
+    kernels.push(Arc::new(Registered {
+        kernel,
+        key,
+        declines: AtomicU32::new(0),
+    }));
     kernels.len() - 1
 }
 
@@ -263,6 +280,9 @@ impl GpuRuntime {
         if let Some(flag) = flag {
             let bytes = self.read(&flag)?;
             if bytes.iter().any(|&byte| byte != 0) {
+                if gpu_log_enabled() {
+                    eprintln!("[js jit gpu] kernel={kernel_id} bailed");
+                }
                 return Ok(false);
             }
         }
@@ -324,9 +344,12 @@ pub(crate) extern "C" fn js_gpu_dispatch(
         }
         return 0;
     };
-    let Some(kernel) = KERNELS.lock().unwrap().get(kernel_id).cloned() else {
+    let Some(registered) = KERNELS.lock().unwrap().get(kernel_id).cloned() else {
         return 0;
     };
+    if registered.declines.load(Ordering::Relaxed) >= DECLINE_LIMIT {
+        return 0;
+    }
     let runtime = match GpuRuntime::get() {
         Ok(runtime) => runtime,
         Err(error) => {
@@ -336,24 +359,23 @@ pub(crate) extern "C" fn js_gpu_dispatch(
             return 0;
         }
     };
-    match runtime.dispatch(kernel_id, &kernel, &args, ctx) {
-        Ok(true) => {
-            if log {
-                eprintln!("[js jit gpu] kernel={kernel_id} dispatched on GPU");
-            }
-            1
+    let outcome = runtime.dispatch(kernel_id, &registered.kernel, &args, ctx);
+    if let Ok(true) = outcome {
+        registered.declines.store(0, Ordering::Relaxed);
+        if log {
+            eprintln!("[js jit gpu] kernel={kernel_id} dispatched on GPU");
         }
-        Ok(false) => {
-            if log {
-                eprintln!("[js jit gpu] kernel={kernel_id} fallback: guard declined");
-            }
-            0
-        }
-        Err(error) => {
-            if log {
-                eprintln!("[js jit gpu] kernel={kernel_id} fallback: {error}");
-            }
-            0
+        return 1;
+    }
+    if log {
+        match outcome {
+            Err(error) => eprintln!("[js jit gpu] kernel={kernel_id} fallback: {error}"),
+            _ => eprintln!("[js jit gpu] kernel={kernel_id} fallback: declined"),
         }
     }
+    let declines = registered.declines.fetch_add(1, Ordering::Relaxed) + 1;
+    if declines == DECLINE_LIMIT && log {
+        eprintln!("[js jit gpu] kernel={kernel_id} disabled after {declines} declines");
+    }
+    0
 }
