@@ -499,13 +499,19 @@ management or code without a native graph. Consult `jit/compiler.rs` for the
 exact selection and failure behavior rather than assuming all modes provide the
 same fallback.
 
-An experimental WGSL/WebGPU loop backend (`jit/naga/`) recognizes counted 1D/2D
-loop nests over `Float32Array` arguments with no other side effects, compiles
-them to WGSL compute kernels through Naga, and dispatches via `wgpu` ahead of
-the function body with automatic CPU fallback when dispatch declines. It sits
-behind the `wgsl` (kernel compilation and `--after wgsl`) and `gpu` (native
-`wgpu` runtime, enabled by `JS_JIT_GPU=1`) Cargo features, and intentionally
-computes in `f32`/`i32` rather than `f64`.
+An experimental WGSL/WebGPU loop backend (`jit/naga/`) offloads counted 1D/2D
+loop nests over `Float32Array`s. After versioning, `semantic/offload.rs`
+outlines a qualifying loop (single preheader and latch, no loop values live
+after it) into a standalone kernel graph whose inputs are unboxed using the
+host's facts; the host loop is kept behind a launch block that skips it when
+the target accepts the call. The outliner is target-agnostic behind the
+`Offload` trait. The Naga target lowers speculation side exits and unproven
+read bounds to a bail flag: a bailed dispatch discards its results and the CPU
+loop runs instead, and a kernel that declines four times in a row stops being
+dispatched. It sits behind the `wgsl` (kernel compilation and `--after wgsl`)
+and `gpu` (native `wgpu` runtime) Cargo features, only runs with
+`JS_JIT_GPU=1` (`JS_JIT_GPU_LOG=1` or `2` for decisions and kernel graphs), and
+intentionally computes in `f32`/`i32` rather than `f64`.
 
 ## Inspection and validation
 
