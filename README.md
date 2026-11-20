@@ -131,9 +131,13 @@ Their Makefiles accept `SCRIPT` and `DATA` overrides; `make run-test` runs
 cargo run -p js-runner -- --compile \
   --eval 'function f(a,b){return a*b+1;}'
 cargo run -p js-runner -- --compile --filter paint --after ownership script.js
+cargo run -p js-runner -- --compile --filter paint --after ownership \
+  --execute 'main()' script.js
 ```
 
-Compile mode does not execute the source unless given `--execute 'JS'`.
+Compile mode does not execute the source unless given `--execute 'JS'`, which
+runs that code after the script loads and also prints the feedback and OSR
+recompilations it triggers.
 `--after PASS` inspects a compiler pass, and `--after all` prints every pass.
 A stage name such as `inline` or `versioning` also selects its `stage/...`
 steps. `--diff` prints the first selected pass in full and then only what each

@@ -463,6 +463,16 @@ edges in a borrowed receiver chain. Stored values may alias even when the owning
 slots are distinct; writes to a potentially aliasing slot still invalidate the
 borrow. Unknown calls and unclassified writes remain conservative.
 
+Load reuse forwards an object literal's defines to later reads of the same
+property while the literal has not escaped. An own data property shadows the
+prototype chain, so only writes into that object can change it; this relies on
+the subset having no accessors. Reads of properties the literal does not define
+still observe prototype writes. Afterwards, `semantic/js/allocations.rs` removes
+literals whose only remaining uses are their own defines, including literals
+nested only inside such literals. Literals merged through block parameters,
+class instances, and objects that reach guard exits are still allocated;
+removing those needs materialization on exits.
+
 Representation selection is separate from semantic type facts and ownership.
 Values may be boxed or held in scalar integer, floating-point, boolean or word
 representations; operation contracts determine required representations and
@@ -505,12 +515,16 @@ The runner displays semantic IR and can report optimization decisions.
 cargo run -p js-runner -- --compile \
   --eval 'function f(a,b){return a*b+1;}'
 cargo run -p js-runner -- --compile --filter f --after planner script.js
+cargo run -p js-runner -- --compile --filter f --after load-reuse \
+  --execute 'main()' script.js
 ```
 
-Compile mode does not execute source unless `--execute` is supplied. With
-`--execute`, feedback recompilations are printed as `NAME.feedback` and OSR
-regions as `NAME.loopblockN.feedback`. `--filter NAME` also selects
-compilations that inlined a function matching `NAME`, since hot code often
+Compile mode does not execute source unless `--execute JS` is supplied; its
+argument is the code to run after the script loads, so `--execute` must be
+followed by that code rather than by another flag. While it runs, feedback
+recompilations are printed as `NAME.feedback` and OSR regions as
+`NAME.loopblockN.feedback`. `--filter NAME` matches by substring and also
+selects compilations that inlined a matching function, since hot code often
 ends up inlined into a caller such as the `--execute` wrapper. Use
 `--after PASS` to inspect a named pipeline boundary (including `--after wgsl`
 with the `wgsl` feature), `--diff` to print only per-pass changes, and
