@@ -157,10 +157,14 @@ impl Boxing<'_> {
             if let Op::Convert(value, repr) = self.graph.insts[inst].op
                 && boundary(self.graph.repr(value), repr)
             {
-                self.graph.insts[inst].op = if repr == Repr::Boxed {
-                    Op::Box(value)
-                } else {
-                    Op::Unbox(value, repr)
+                self.graph.insts[inst].op = match self.graph.defining_op(value) {
+                    Some(Op::Javascript(JsOp::Constant(constant)))
+                        if super::repr::fits(constant, repr) =>
+                    {
+                        Op::Javascript(JsOp::Constant(constant.clone()))
+                    }
+                    _ if repr == Repr::Boxed => Op::Box(value),
+                    _ => Op::Unbox(value, repr),
                 };
             }
             let uses = contract(self.graph, inst).uses;
