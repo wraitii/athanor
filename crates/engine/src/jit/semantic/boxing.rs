@@ -51,15 +51,8 @@ struct Boxing<'a> {
 }
 
 impl Boxing<'_> {
-    fn convert(
-        &mut self,
-        block: Block,
-        span: Span,
-        source_name: Option<(usize, usize)>,
-        value: Value,
-        repr: Repr,
-    ) -> (Inst, Value) {
-        let op = match self.graph.defining_op(value) {
+    fn boundary_op(&mut self, value: Value, repr: Repr) -> Op {
+        match self.graph.defining_op(value) {
             Some(Op::Javascript(JsOp::Constant(constant))) if super::repr::fits(constant, repr) => {
                 Op::Javascript(JsOp::Constant(constant.clone()))
             }
@@ -70,7 +63,18 @@ impl Boxing<'_> {
                 Op::Box(value)
             }
             _ => Op::Unbox(value, repr),
-        };
+        }
+    }
+
+    fn convert(
+        &mut self,
+        block: Block,
+        span: Span,
+        source_name: Option<(usize, usize)>,
+        value: Value,
+        repr: Repr,
+    ) -> (Inst, Value) {
+        let op = self.boundary_op(value, repr);
         let inst = self.graph.insts.next_key();
         let result = self.graph.values.push(ValueDef::Result(inst, 0));
         self.graph.insts.push(InstData {
@@ -157,15 +161,7 @@ impl Boxing<'_> {
             if let Op::Convert(value, repr) = self.graph.insts[inst].op
                 && boundary(self.graph.repr(value), repr)
             {
-                self.graph.insts[inst].op = match self.graph.defining_op(value) {
-                    Some(Op::Javascript(JsOp::Constant(constant)))
-                        if super::repr::fits(constant, repr) =>
-                    {
-                        Op::Javascript(JsOp::Constant(constant.clone()))
-                    }
-                    _ if repr == Repr::Boxed => Op::Box(value),
-                    _ => Op::Unbox(value, repr),
-                };
+                self.graph.insts[inst].op = self.boundary_op(value, repr);
             }
             let uses = contract(self.graph, inst).uses;
             let operands: smallvec::SmallVec<[Value; 4]> =
@@ -317,7 +313,9 @@ fn canonical(graph: &Graph, facts: &Facts, value: Value, depth: usize) -> bool {
     }
     let operand = |value: Value| canonical(graph, facts, value, depth + 1);
     match graph.defining_op(value) {
-        Some(Op::Javascript(JsOp::Constant(Constant::Number(_)))) => true,
+        Some(Op::Javascript(JsOp::Constant(Constant::Number(number)))) => {
+            crate::value::Value::number(*number).bits() == number.to_bits()
+        }
         Some(Op::LowLevel(LowOp::Float64(bits))) => {
             crate::value::Value::number(f64::from_bits(*bits)).bits() == *bits
         }
