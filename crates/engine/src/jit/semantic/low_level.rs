@@ -654,6 +654,36 @@ impl Insert for Builder<'_> {
     }
 }
 
+/// The operand an integer operation with a zero operand reduces to, when it already has the
+/// representation the operation would produce.
+fn identity(graph: &Graph, op: Binary, left: Value, right: Value) -> Option<Value> {
+    let zero = |value: Value| {
+        matches!(
+            graph.defining_op(value),
+            Some(GraphOp::LowLevel(Op::Integer { bits: 0, .. }))
+        )
+    };
+    let kept = match op {
+        Binary::Add | Binary::Or | Binary::Xor if zero(left) => right,
+        Binary::Add
+        | Binary::Or
+        | Binary::Xor
+        | Binary::Subtract
+        | Binary::ShiftLeft
+        | Binary::ShiftRightSigned
+        | Binary::ShiftRightUnsigned
+            if zero(right) =>
+        {
+            left
+        }
+        _ => return None,
+    };
+    let other = if kept == left { right } else { left };
+    let repr = graph.reprs[kept]?;
+    (repr != Repr::Boxed && graph.reprs[other].is_some_and(|other| other.machine() == repr.machine()))
+        .then_some(kept)
+}
+
 pub(in crate::jit) struct Instructions<'b, I: Insert + ?Sized> {
     pub(super) inserter: &'b mut I,
 }
@@ -742,6 +772,9 @@ impl<I: Insert + ?Sized> Instructions<'_, I> {
                 .all(|&value| graph.reprs[value] != Some(Repr::Boolean)),
             "boolean operand to {op:?}"
         );
+        if let Some(identity) = identity(graph, op, left, right) {
+            return identity;
+        }
         self.derived(binary, left, right)
     }
 
