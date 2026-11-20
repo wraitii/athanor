@@ -119,8 +119,9 @@ is required even without optimizations, and the names are not runtime globals.
 Packed calls expose their targets to profiling and guarded inlining. A facility
 for registering handwritten IR bodies is not implemented.
 
-`Function.prototype.call` and `Function.prototype.apply` are JS wrappers.
-The latter uses an argument-list helper; its ordinary
+`Function.prototype.call`, `Function.prototype.apply` and
+`Function.prototype.bind` are JS wrappers.
+`apply` uses an argument-list helper; its ordinary
 array path avoids an intermediate JS array. Argument lowering forwards fresh,
 unmodified argument arrays directly and sinks materialization to an exclusive
 fallback when needed. Fixed-argument calls can inline functions using `arguments`,
@@ -319,8 +320,10 @@ region versions. A guard is a runtime condition; only the success path may use
 its associated facts. When it fails, generated code must continue with correct
 generic semantics, preserving already performed effects rather than restarting
 an effectful computation indiscriminately.
-Inlining selects a target only for monomorphic call feedback; polymorphic sites
-retain guarded call dispatch.
+Inlining selects a target for monomorphic call feedback; polymorphic method
+calls track callee and receiver shape together so dispatch can inline observed
+targets and select receiver-specific call variants while keeping a generic
+fallback for unobserved pairs.
 
 Region versioning prepares speculative proposals and explicit recovery boundaries
 before preserving a generic graph snapshot. It visits loops from inner to outer,
@@ -486,6 +489,14 @@ management or code without a native graph. Consult `jit/compiler.rs` for the
 exact selection and failure behavior rather than assuming all modes provide the
 same fallback.
 
+An experimental WGSL/WebGPU loop backend (`jit/naga/`) recognizes counted 1D/2D
+loop nests over `Float32Array` arguments with no other side effects, compiles
+them to WGSL compute kernels through Naga, and dispatches via `wgpu` ahead of
+the function body with automatic CPU fallback when dispatch declines. It sits
+behind the `wgsl` (kernel compilation and `--after wgsl`) and `gpu` (native
+`wgpu` runtime, enabled by `JS_JIT_GPU=1`) Cargo features, and intentionally
+computes in `f32`/`i32` rather than `f64`.
+
 ## Inspection and validation
 
 The runner displays semantic IR and can report optimization decisions.
@@ -497,13 +508,15 @@ cargo run -p js-runner -- --compile --filter f --after planner script.js
 ```
 
 Compile mode does not execute source unless `--execute` is supplied. Use
-`--after PASS` to inspect a named pipeline boundary; pass names are listed in
+`--after PASS` to inspect a named pipeline boundary (including `--after wgsl`
+with the `wgsl` feature), `--diff` to print only per-pass changes, and
+`--verbose-ir` for assumption origins; pass names are listed in
 `semantic/pipeline.rs`. `JS_JIT_OPT=none`, `baseline`, or `initial` selects an
 optimization level; the default is `full`. Useful switches include
 `JS_JIT_BACKEND=cranelift|native|native-only`, `JS_JIT_BACKGROUND=0`,
-`JS_JIT_PREFETCH=0`, `JS_JIT_INLINE=0`, `JS_JIT_OSR=0`, `JS_JIT_VERIFY=1`,
-`JS_JIT_RECOMPILE_LOG=1`, and `JS_JIT_JITDUMP=1` (or `2` with IR). Defaults
-and further controls live in `EngineOptions`.
+`JS_JIT_PREFETCH=0`, `JS_JIT_INLINE=0`, `JS_JIT_OSR=0`, `JS_JIT_GPU=1`,
+`JS_JIT_VERIFY=1`, `JS_JIT_RECOMPILE_LOG=1`, and `JS_JIT_JITDUMP=1` (or `2`
+with IR). Defaults and further controls live in `EngineOptions`.
 
 `JS_JIT_PREFETCH=0` (`EngineOptions::prefetch_compile = false`) disables
 both eager background unlazification and callee precompilation. Functions are

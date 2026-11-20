@@ -165,6 +165,39 @@ bootstrap and explicit biome, before adding the circle placement setting;
 Latium, Unknown and Caledonian Meadows used the original bootstrap and defaults.
 The diagnostic bootstrap and modified benchmark copies are not checked in.
 
+### Map compatibility update, 2026-11-20
+
+After adding array/object destructuring assignments and `Array.prototype.shift`,
+`splice`, `reduce`, and `Function.prototype.bind` (`6c93404`), re-probing the
+same 14 maps on release build `275d7f1` with the temporary `Engine.FileExists`
+bootstrap (`Size: 128`, `Seed: 0`, two players `athen`/`brit`, and
+`Biome: "generic/temperate"`, `PlayerPlacement: "circle"` for biome maps) shows
+10 maps completing and matching SpiderMonkey 128 on all three hashes and entity
+counts. Timings below are single smoke runs, not performance medians:
+
+| map | Athanor (ms) | SpiderMonkey (ms) | entities | heightHash | status |
+|-----|-------------:|------------------:|---------:|------------|--------|
+| belgian_uplands | 852 | 333 | 1137 | `dd1de906` | match |
+| mainland | 697 | 77 | 1185 | `f8a3935b` | match |
+| islands | 994 | 115 | 253 | `bcb20d95` | match |
+| rivers | 889 | 108 | 1029 | `9371a3a4` | match |
+| ardennes_forest | 981 | 106 | 2020 | `b31bda19` | match |
+| lake | 799 | 107 | 1095 | `f5fa7e99` | match |
+| cantabrian_highlands | 785 | 78 | 1370 | `9deae8ac` | match |
+| oasis | 883 | 84 | 537 | `91feaab0` | match |
+| northern_lights | 569 | 67 | 123 | `5c874b42` | match |
+| unknown | 1259 | 140 | 795 | `62806cae` | match |
+
+Remaining failures in this probe:
+
+- `alpine_lakes`: passes biome-library loading and now hits the same undefined
+  terrain error as SpiderMonkey under these settings.
+- `latium`: object-to-primitive conversion is unsupported (`t == tGrass`).
+- `caledonian_meadows`: destructured function parameter pattern is unsupported
+  (SpiderMonkey fails earlier on missing `clone`).
+- `alpine_valley`: nested `yield` statements are unsupported (SpiderMonkey fails
+  on undefined terrain under these settings).
+
 ### Object root and constructor check, 2026-11-17
 
 The object root and native Object constructor now let unmodified DeltaBlue
