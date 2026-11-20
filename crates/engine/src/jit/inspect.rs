@@ -76,6 +76,7 @@ pub(super) fn selects(pass: Option<&str>, name: &str) -> bool {
 #[derive(Clone, Default)]
 pub(super) struct Inspection {
     label: Option<String>,
+    inlined: Vec<String>,
     semantic: Option<String>,
     after: Vec<(String, String)>,
     planner: Option<String>,
@@ -179,6 +180,11 @@ impl Inspection {
             return Self::default();
         };
         Self {
+            inlined: graph
+                .plan
+                .inlined_names(repository)
+                .map(str::to_owned)
+                .collect(),
             semantic: options
                 .semantic_ir
                 .then(|| graph_text(&graph.graph, options.verbose)),
@@ -201,6 +207,11 @@ impl Inspection {
         }
     }
 
+    pub(super) fn inlining<'a>(mut self, names: impl Iterator<Item = &'a str>) -> Self {
+        self.inlined.extend(names.map(str::to_owned));
+        self
+    }
+
     pub(super) fn named(mut self, label: &str) -> Self {
         self.label = Some(label.to_owned());
         self
@@ -218,6 +229,10 @@ impl Inspection {
     pub(super) fn lowered(mut self, snapshots: Vec<(String, String)>) -> Self {
         self.after.extend(snapshots);
         self
+    }
+
+    pub(super) fn matches(&self, name: &str, options: &CompileOptions) -> bool {
+        options.matches(name) || self.inlined.iter().any(|inlined| options.matches(inlined))
     }
 
     pub(super) fn print(&self, name: &str, direct: bool, options: &CompileOptions) {

@@ -1182,7 +1182,11 @@ impl Compiler {
                     }
                 }
             }
-            if let Some(options) = self.inspection.as_deref().filter(|o| o.matches(&name)) {
+            if let Some(options) = self
+                .inspection
+                .as_deref()
+                .filter(|options| code.inspection.matches(&name, options))
+            {
                 code.inspection.print(&name, direct, options);
             }
             if let Some(stats) = &mut self.stats {
@@ -1827,6 +1831,12 @@ impl Compiler {
             &self.canonical,
             source,
             inline_multiplier,
+        )
+        .inlining(
+            matches!(request, RecompileRequest::Loop(_))
+                .then(|| emission.plan.inlined_names(&self.canonical))
+                .into_iter()
+                .flatten(),
         )
         .after(passes);
         let body = self.emit_body(

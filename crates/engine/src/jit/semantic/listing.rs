@@ -478,6 +478,17 @@ impl fmt::Display for FunctionState {
     }
 }
 
+impl super::SpecializationPlan {
+    pub(in crate::jit) fn inlined_names<'a>(
+        &self,
+        repository: &'a super::specialization::calls::Repository,
+    ) -> impl Iterator<Item = &'a str> {
+        self.inlines
+            .iter()
+            .filter_map(|inline| repository.name(inline.target))
+    }
+}
+
 impl FunctionState {
     pub(in crate::jit) fn plan_report(
         &self,

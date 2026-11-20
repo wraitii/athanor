@@ -507,7 +507,11 @@ cargo run -p js-runner -- --compile \
 cargo run -p js-runner -- --compile --filter f --after planner script.js
 ```
 
-Compile mode does not execute source unless `--execute` is supplied. Use
+Compile mode does not execute source unless `--execute` is supplied. With
+`--execute`, feedback recompilations are printed as `NAME.feedback` and OSR
+regions as `NAME.loopblockN.feedback`. `--filter NAME` also selects
+compilations that inlined a function matching `NAME`, since hot code often
+ends up inlined into a caller such as the `--execute` wrapper. Use
 `--after PASS` to inspect a named pipeline boundary (including `--after wgsl`
 with the `wgsl` feature), `--diff` to print only per-pass changes, and
 `--verbose-ir` for assumption origins; pass names are listed in
