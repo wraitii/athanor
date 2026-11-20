@@ -328,6 +328,7 @@ fn lower_callable(
         compiler.release_tracked(&[arguments])?;
         compiler.check_error();
         let args = compiler.return_args(generator, false);
+        compiler.increment(generator);
         compiler.jump(return_block, &args);
         compiler.finish_failed_exit();
         compiler.switch(return_block);
@@ -496,7 +497,7 @@ impl FunctionCompiler<'_, '_> {
             self.b.ins().jump(done, &[]);
             self.b.switch_to_block(done);
         }
-        self.exit_frame(value);
+        self.exit_frame();
         let mut results = vec![value];
         if matches!(self.arguments, Arguments::Fixed(_)) {
             results.push(self.b.block_params(self.return_block)[1]);
@@ -505,8 +506,7 @@ impl FunctionCompiler<'_, '_> {
         self.terminated = true;
     }
 
-    fn exit_frame(&mut self, value: LoweredValue) {
-        self.increment(value);
+    fn exit_frame(&mut self) {
         if self.slot_count > 0 {
             if self.slot_count <= INLINE_FRAME_RELEASES {
                 for slot in 0..self.slot_count {

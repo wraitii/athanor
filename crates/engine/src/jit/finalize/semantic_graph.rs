@@ -25,6 +25,12 @@ use crate::jit::semantic::contracts::ResultReference;
 use crate::jit::semantic::ownership::{Holder, Plan};
 use crate::jit::semantic::regex;
 use crate::jit::semantic::runtime::layout;
+use crate::jit::semantic::ValueType;
+
+const UNMANAGED: ValueType = ValueType::NUMBER
+    .union(ValueType::BOOLEAN)
+    .union(ValueType::UNDEFINED)
+    .union(ValueType::NULL);
 
 pub(super) struct Context<'a> {
     entry: Block,
@@ -1157,8 +1163,7 @@ impl FunctionCompiler<'_, '_> {
                         super::Arguments::Fixed(values) => args.extend(values),
                         super::Arguments::Vector { argv, argc } => args.extend([*argv, *argc]),
                     }
-                    let undefined = self.constant(Value::UNDEFINED);
-                    self.exit_frame(undefined);
+                    self.exit_frame();
                     let signature = self.b.import_signature(
                         self.b.graph.low_level_signature.as_ref().unwrap().clone(),
                     );
@@ -1175,6 +1180,9 @@ impl FunctionCompiler<'_, '_> {
                 TerminatorKind::Return(value) => {
                     let operand = self.operand(&cx, *value);
                     debug_assert_eq!(operand.repr, Repr::Boxed, "{block} returns unboxed {value}");
+                    if !cx.facts.of(*value).within(UNMANAGED) {
+                        self.increment(operand.value);
+                    }
                     let args = self.return_args(operand.value, false);
                     self.jump(self.return_block, &args);
                 }
