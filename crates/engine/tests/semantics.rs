@@ -22,6 +22,17 @@ fn numeric_fast_path_checks_tags() {
 }
 
 #[test]
+fn generated_nans_stay_canonical() {
+    let source = "function main(a, b){ return Math.sqrt(a * b - 1) + 1; }";
+    for (a, b) in [(0.0, f64::INFINITY), (f64::NAN, 1.0), (0.0, 0.0)] {
+        assert_eq!(
+            eval(source, &[Value::number(a), Value::number(b)]),
+            Value::number(f64::NAN)
+        );
+    }
+}
+
+#[test]
 fn hoisted_vars_start_undefined() {
     check("function main(){ return x; var x = 1; }", Value::UNDEFINED);
 }

@@ -114,6 +114,8 @@ pub(super) struct Graph {
     pub(super) lazy_captures: FxHashSet<Binding>,
     pub(super) generator: bool,
     pub(super) has_assumes: bool,
+    /// Floats whose NaNs cannot carry a boxed tag, so boxing them needs no canonicalisation.
+    pub(in crate::jit) canonical_floats: FxHashSet<Value>,
     // Input checks reported by the shared guard emitters for call specialization.
     pub(super) entry_guards: crate::jit::variants::Requirements,
     pub(super) method_shapes: crate::FxHashMap<Inst, Option<u32>>,
@@ -858,6 +860,7 @@ impl Graph {
             lazy_captures: FxHashSet::default(),
             generator,
             has_assumes: false,
+            canonical_floats: FxHashSet::default(),
             entry_guards: Vec::new(),
             method_shapes: Default::default(),
             arity: None,

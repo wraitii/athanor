@@ -3,6 +3,7 @@ use crate::jit::semantic::JsOp;
 use oxc_span::Span;
 
 use super::contracts::{Use, repr_contract as contract};
+use super::low_level::{Binary, Op as LowOp, Unary};
 use super::{
     Block, BlockData, Cfg, Constant, Facts, Graph, Inst, InstData, Op, Repr, Target, Terminator,
     TerminatorKind, Value, ValueDef, ValueType,
@@ -62,7 +63,12 @@ impl Boxing<'_> {
             Some(Op::Javascript(JsOp::Constant(constant))) if super::repr::fits(constant, repr) => {
                 Op::Javascript(JsOp::Constant(constant.clone()))
             }
-            _ if repr == Repr::Boxed => Op::Box(value),
+            _ if repr == Repr::Boxed => {
+                if canonical(self.graph, self.facts, value, 0) {
+                    self.graph.canonical_floats.insert(value);
+                }
+                Op::Box(value)
+            }
             _ => Op::Unbox(value, repr),
         };
         let inst = self.graph.insts.next_key();
@@ -294,6 +300,54 @@ impl Boxing<'_> {
             block: edge,
             args: Vec::new(),
         }
+    }
+}
+
+/// Whether a float can only be NaN as the canonical NaN. AArch64 generates the canonical NaN as
+/// its default NaN and float operations propagate a NaN operand's payload, so this holds through
+/// arithmetic on values that already hold it. Unboxed non-numbers do not: the numeric fast paths
+/// read tagged values such as `undefined` as NaNs.
+fn canonical(graph: &Graph, facts: &Facts, value: Value, depth: usize) -> bool {
+    if !cfg!(target_arch = "aarch64") || depth > 8 {
+        return false;
+    }
+    let operand = |value: Value| canonical(graph, facts, value, depth + 1);
+    match graph.defining_op(value) {
+        Some(Op::Javascript(JsOp::Constant(Constant::Number(_)))) => true,
+        Some(Op::LowLevel(LowOp::Float64(bits))) => {
+            crate::value::Value::number(f64::from_bits(*bits)).bits() == *bits
+        }
+        Some(Op::LowLevel(LowOp::Unary {
+            op: Unary::FloatFromSigned | Unary::FloatFromUnsigned,
+            ..
+        })) => true,
+        Some(Op::LowLevel(LowOp::Unary {
+            op: Unary::Sqrt | Unary::Ceil | Unary::Floor | Unary::Trunc,
+            value,
+            ..
+        })) => operand(*value),
+        Some(Op::LowLevel(LowOp::Binary {
+            op:
+                Binary::FloatAdd
+                | Binary::FloatSubtract
+                | Binary::FloatMultiply
+                | Binary::FloatDivide
+                | Binary::FloatMin
+                | Binary::FloatMax,
+            left,
+            right,
+        })) => operand(*left) && operand(*right),
+        Some(
+            Op::Unbox(input, _)
+            | Op::Convert(input, _)
+            | Op::Javascript(JsOp::NumericFloat(input)),
+        ) => match graph.repr(*input) {
+            Repr::Integer(_) | Repr::Boolean => true,
+            Repr::Boxed => facts.of(*input).within(ValueType::NUMBER),
+            Repr::Float(_) => operand(*input),
+            _ => false,
+        },
+        _ => false,
     }
 }
 

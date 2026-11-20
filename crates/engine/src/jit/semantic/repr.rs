@@ -559,7 +559,7 @@ fn box_value(builder: &mut Builder<'_>, value: Value) -> Value {
                 let bits = JsValue::number(*number).bits();
                 builder.ins().iconst(types::I64, bits as i64)
             }
-            _ if from_integer(builder.graph, value) => {
+            _ if from_integer(builder.graph, value) || builder.graph.canonical_floats.contains(&value) => {
                 builder.ins().bitcast(types::I64, flags, value)
             }
             _ => {
