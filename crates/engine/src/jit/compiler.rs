@@ -1052,7 +1052,7 @@ impl Compiler {
                 self.speculative_continuations,
                 self.optimization == crate::OptimizationLevel::Initial || !self.versioning,
                 self.report_regions(),
-                &mut |name, state| passes.observe(name, state),
+                &mut |name, graph| passes.observe(name, graph),
             )
             .map_err(Error::Unsupported)?;
             let mut listing = self
@@ -1682,7 +1682,7 @@ impl Compiler {
             self.ssa_opt,
             Some((&self.canonical, source)),
             inline_multiplier,
-            &mut |name, state| passes.observe(name, state),
+            &mut |name, graph| passes.observe(name, graph),
         )
         .map_err(Error::Unsupported)?;
         emission.callees = self.canonical.graph_callees(&planned.graph, source);
@@ -1775,7 +1775,7 @@ impl Compiler {
             osr_source,
             Some(&self.canonical),
             initial && tier == CompilationTier::Baseline,
-            &mut |name, state| passes.observe(name, state),
+            &mut |name, graph| passes.observe(name, graph),
         )
         .map_err(Error::Unsupported)?;
         let mut listing = self
@@ -2253,7 +2253,7 @@ impl Compiler {
                     self.ssa_opt,
                     Some((&self.canonical, self.source_name.0)),
                     usize::from(self.inlining),
-                    &mut |name, state| passes.observe(name, state),
+                    &mut |name, graph| passes.observe(name, graph),
                 )?;
                 specialization = self.specialization_entries(
                     name.0,
@@ -2275,7 +2275,7 @@ impl Compiler {
                     (self.osr && self.ssa_opt).then_some(self.source_name.0),
                     Some(&self.canonical),
                     false,
-                    &mut |name, state| passes.observe(name, state),
+                    &mut |name, graph| passes.observe(name, graph),
                 )
             })
             .transpose()

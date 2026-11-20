@@ -114,13 +114,13 @@ impl PassInspection {
         }
     }
 
-    pub(super) fn observe(&mut self, name: &str, state: &semantic::FunctionState) {
+    pub(super) fn observe(&mut self, name: &str, graph: &semantic::Graph) {
         if selects(self.pass.as_deref(), name) {
-            self.snapshots.push((name.to_owned(), graph_text(&state.graph)));
+            self.snapshots.push((name.to_owned(), graph_text(graph)));
         }
         #[cfg(feature = "wgsl")]
         if name == "inline" && selects(self.pass.as_deref(), "wgsl") {
-            let kernel = super::naga::compile_kernel(&state.graph);
+            let kernel = super::naga::compile_kernel(graph);
             let text = match &kernel {
                 Ok(kernel) => kernel.to_string(),
                 Err(error) => format!("// wgsl unsupported: {error}\n"),
@@ -135,7 +135,7 @@ impl PassInspection {
         state: &mut semantic::FunctionState,
         baseline: bool,
     ) -> Result<(), String> {
-        state.lower_runtime_observed(baseline, &mut |name, state| self.observe(name, state))?;
+        state.lower_runtime_observed(baseline, &mut |name, graph| self.observe(name, graph))?;
         let Some(pass) = self.pass.as_deref() else {
             return Ok(());
         };

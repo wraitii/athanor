@@ -18,6 +18,7 @@ fn plan(
     assumptions: &[Proposal],
     notes: &mut Vec<String>,
     shapes: &super::super::shapes::Plan,
+    after: &mut dyn FnMut(&str, &Graph),
 ) -> Result<(Graph, Vec<RegionPlan>)> {
     let known = Facts::values(graph);
     let cfg = &known.cfg;
@@ -245,6 +246,7 @@ fn plan(
         working = candidate;
         values = candidate_values;
         groups.extend(added_groups);
+        after(&format!("versioning/{label}"), &working);
         super::hoisting::hoist(
             &mut working,
             &mut groups,
@@ -255,6 +257,7 @@ fn plan(
             notes,
         );
         working.verify()?;
+        after(&format!("versioning/{label} hoisting"), &working);
     }
     Ok((working, plans))
 }
@@ -275,6 +278,7 @@ pub(in crate::jit::semantic) fn version(
         notes,
         false,
         &Default::default(),
+        &mut |_, _| {},
     )
 }
 
@@ -286,11 +290,14 @@ pub(in crate::jit::semantic) fn version_regions(
     notes: &mut Vec<String>,
     report_regions: bool,
     shapes: &super::super::shapes::Plan,
+    after: &mut dyn FnMut(&str, &Graph),
 ) -> Result<Vec<RegionId>> {
     property_assumptions(graph, notes);
+    after("versioning/properties", graph);
     let reached = super::assumptions::prepare(graph, conditional);
+    after("versioning/proposals", graph);
     let original = graph.clone();
-    let (mut candidate, plans) = plan(&original, conditional, &reached, notes, shapes)?;
+    let (mut candidate, plans) = plan(&original, conditional, &reached, notes, shapes, after)?;
     if report_regions {
         let mut report = String::from("region candidates after specialization:\n");
         for plan in &plans {
@@ -316,6 +323,7 @@ pub(in crate::jit::semantic) fn version_regions(
         &regions,
         notes,
     )?;
+    after("versioning/recovery", &candidate);
     *graph = candidate;
     materialize_properties(graph)?;
     graph.strip_assumes();
@@ -368,6 +376,7 @@ mod tests {
             &proposals,
             &mut notes,
             &Default::default(),
+            &mut |_, _| {},
         )
         .unwrap();
         assert!(
@@ -405,6 +414,7 @@ mod tests {
             &proposals,
             &mut notes,
             &Default::default(),
+            &mut |_, _| {},
         )
         .unwrap();
         assert!(
@@ -1084,6 +1094,7 @@ mod tests {
             &reached,
             &mut Vec::new(),
             &Default::default(),
+            &mut |_, _| {},
         )
         .unwrap();
         assert_eq!(plans.len(), 1);
@@ -1221,6 +1232,7 @@ mod tests {
             &reached,
             &mut Vec::new(),
             &Default::default(),
+            &mut |_, _| {},
         )
         .unwrap();
         assert_eq!(plans.len(), 1);
@@ -1425,6 +1437,7 @@ mod tests {
             &reached,
             &mut Vec::new(),
             &Default::default(),
+            &mut |_, _| {},
         )
         .unwrap();
         let cfg = Cfg::new(&candidate);
@@ -1471,6 +1484,7 @@ mod tests {
             &reached,
             &mut Vec::new(),
             &Default::default(),
+            &mut |_, _| {},
         )
         .unwrap();
         assert_eq!(plans.len(), 1);

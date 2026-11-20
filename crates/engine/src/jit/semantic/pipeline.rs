@@ -38,70 +38,70 @@ impl FunctionState {
     pub(in crate::jit) fn lower_runtime_observed(
         &mut self,
         baseline: bool,
-        after: &mut dyn FnMut(&str, &FunctionState),
+        after: &mut dyn FnMut(&str, &Graph),
     ) -> Result<()> {
-        after("input", self);
+        after("input", &self.graph);
         array_checks::generic_cold(self);
         self.lower_js_observed(baseline, after)?;
         array_checks::generic_cold(self);
         if self.optimize {
             self.lower_typed_storage()?;
         }
-        after("typed-storage", self);
+        after("typed-storage", &self.graph);
         self.graph.strip_hints();
         cells::lower(self);
-        after("cells", self);
+        after("cells", &self.graph);
         self.invalidate_cfg();
         transforms::promote(&mut self.graph, &mut self.notes);
         self.graph.verify()?;
-        after("bindings", self);
+        after("bindings", &self.graph);
         if !baseline {
             properties::lower(self)?;
         }
-        after("properties", self);
+        after("properties", &self.graph);
         properties::lower_accesses(self)?;
-        after("property-accesses", self);
+        after("property-accesses", &self.graph);
         cells::lower_accesses(self);
-        after("cell-accesses", self);
+        after("cell-accesses", &self.graph);
         self.lower_typed_storage()?;
-        after("memory", self);
+        after("memory", &self.graph);
         numeric::operations(self);
         let dispatched = numeric::dispatch(self);
         if dispatched {
             numeric::operations(self);
         }
-        after("numeric", self);
+        after("numeric", &self.graph);
         array_checks::lower_checks(self);
-        after("array-checks", self);
+        after("array-checks", &self.graph);
         self.ensure_facts();
         // Helper lowering erases the receivers needed to prove borrows.
         let borrows = borrow::borrows(&mut self.graph, &self.facts, &mut self.notes);
         helpers::lower(self);
-        after("helpers", self);
+        after("helpers", &self.graph);
         let plan = ownership::plan(&mut self.graph, &mut self.facts, borrows);
         if super::verification_enabled() {
             ownership::verify(&self.graph, &self.facts, &plan)?;
         }
         self.graph.ownership = Some(plan);
-        after("ownership", self);
+        after("ownership", &self.graph);
         properties::lower_loads(self);
-        after("property-loads", self);
+        after("property-loads", &self.graph);
         storage::lower_array_loads(self);
-        after("array-loads", self);
+        after("array-loads", &self.graph);
         storage::lower_stores(self);
-        after("stores", self);
+        after("stores", &self.graph);
         values::lower(self);
-        after("values", self);
+        after("values", &self.graph);
         self.ensure_facts();
         boxing::conditions(&mut self.graph, &mut self.facts);
-        after("conditions", self);
+        after("conditions", &self.graph);
         repr::assign(&mut self.graph, &self.facts);
-        after("repr", self);
+        after("repr", &self.graph);
         boxing::insert(&mut self.graph, &mut self.facts);
-        after("boxing", self);
+        after("boxing", &self.graph);
         conversions::simplify(&mut self.graph, &self.facts);
         conversions::hoist(&mut self.graph, &self.facts);
-        after("conversions", self);
+        after("conversions", &self.graph);
         self.graph.verify()?;
         Ok(())
     }
@@ -204,7 +204,7 @@ pub(in crate::jit) fn lower_global(
     continuations: bool,
     initial_only: bool,
     report_regions: bool,
-    after: &mut dyn FnMut(&str, &FunctionState),
+    after: &mut dyn FnMut(&str, &Graph),
 ) -> Result<FunctionState> {
     let graph = build::lower_global(
         statements,
@@ -359,7 +359,7 @@ pub(in crate::jit) fn inline_and_plan_specialization(
     ssa_opt: bool,
     specialization: Option<(&calls::Repository, usize)>,
     inline_multiplier: usize,
-    after: &mut dyn FnMut(&str, &FunctionState),
+    after: &mut dyn FnMut(&str, &Graph),
 ) -> Result<FunctionState> {
     inline_and_plan_inner(
         function,
@@ -377,7 +377,7 @@ pub(super) fn inline_and_plan_inner(
     specialization: Option<(&calls::Repository, usize)>,
     inline_multiplier: usize,
     select_call_variants: bool,
-    after: &mut dyn FnMut(&str, &FunctionState),
+    after: &mut dyn FnMut(&str, &Graph),
 ) -> Result<FunctionState> {
     function.optimize = ssa_opt && !function.graph.has_handlers && !function.graph.generator;
     if !function.optimize {
@@ -388,7 +388,7 @@ pub(super) fn inline_and_plan_inner(
     if let Some((bodies, source)) = specialization {
         function.invalidate_cfg();
         expansions.calls(&mut function.graph, bodies, source, &mut function.notes)?;
-        after("inline/expand", &function);
+        after("inline/expand", &function.graph);
         if select_call_variants
             && (inline_multiplier != 0 || bodies.call_variants && bodies.call_specialization)
         {
@@ -413,11 +413,11 @@ pub(super) fn inline_and_plan_inner(
         function.invalidate_cfg();
         expansions.calls(&mut function.graph, bodies, source, &mut function.notes)?;
         function.graph.verify()?;
-        after("inline/round 1", &function);
+        after("inline/round 1", &function.graph);
     }
     function.invalidate_cfg();
     expansions.constructors(&mut function.graph);
-    after("inline/constructors", &function);
+    after("inline/constructors", &function.graph);
     if let Some((bodies, source)) = specialization {
         for round in 0..calls::SPECIALIZATION_ROUNDS {
             if select_call_variants && inline_multiplier != 0 {
@@ -447,7 +447,7 @@ pub(super) fn inline_and_plan_inner(
             expansions.calls(&mut function.graph, bodies, source, &mut function.notes)?;
             expansions.constructors(&mut function.graph);
             function.graph.verify()?;
-            after(&format!("inline/round {}", round + 2), &function);
+            after(&format!("inline/round {}", round + 2), &function.graph);
         }
     }
     function.invalidate_effects();
@@ -462,10 +462,10 @@ pub(super) fn inline_and_plan_inner(
             call_variants = call_variants::apply(&mut function.graph, bodies, source)?;
         }
     }
-    after("inline/calls", &function);
+    after("inline/calls", &function.graph);
     function.invalidate_cfg();
     reuse::reuse_loads(&mut function);
-    after("inline/load-reuse", &function);
+    after("inline/load-reuse", &function.graph);
     let numbers = observations::plan(&mut function.graph, specialization);
     let reads = specialization.map_or_else(Vec::new, |(bodies, source)| {
         reads::plan(&function.graph, bodies, source)
@@ -542,26 +542,26 @@ pub(in crate::jit) fn specialize_observed(
     osr_source: Option<usize>,
     osr_feedback: Option<&calls::Repository>,
     baseline: bool,
-    after: &mut dyn FnMut(&str, &FunctionState),
+    after: &mut dyn FnMut(&str, &Graph),
 ) -> Result<FunctionState> {
     let osr_feedback = match versioning {
         Versioning::Generic => None,
         Versioning::Speculate { .. } => osr_feedback,
     };
-    after("inline", &function);
+    after("inline", &function.graph);
     #[cfg(feature = "gpu")]
     if crate::jit::naga::try_inject_gpu(&mut function.graph) {
         function.invalidate_cfg();
     }
     if !function.optimize {
         function.ensure_facts();
-        after("assume", &function);
-        after("captures", &function);
-        after("versioning", &function);
+        after("assume", &function.graph);
+        after("captures", &function.graph);
+        after("versioning", &function.graph);
         if let Some(source) = osr_source {
             function.instrument_osr(source, osr_feedback)?;
         }
-        after("osr", &function);
+        after("osr", &function.graph);
         return Ok(function);
     }
     function.graph.entry_guards.clear();
@@ -580,7 +580,7 @@ pub(in crate::jit) fn specialize_observed(
         reads::assume(&mut function.graph, &function.plan.reads);
         reads::assume(&mut function.graph, &function.plan.stores);
     }
-    after("assume", &function);
+    after("assume", &function.graph);
     captures::sink_closures(&mut function);
     if captures::lazy_captures(&mut function) {
         function.invalidate_cfg();
@@ -594,7 +594,7 @@ pub(in crate::jit) fn specialize_observed(
     }
     function.graph.verify()?;
     function.invalidate_cfg();
-    after("captures", &function);
+    after("captures", &function.graph);
     let regions = match versioning {
         Versioning::Generic => {
             regions::materialize_properties(&mut function.graph)?;
@@ -612,6 +612,7 @@ pub(in crate::jit) fn specialize_observed(
                 &mut function.notes,
                 report_regions,
                 &function.plan.shapes,
+                after,
             )?;
             function.graph.verify()?;
             if regions.is_empty() {
@@ -647,11 +648,11 @@ pub(in crate::jit) fn specialize_observed(
     }
     function.graph.strip_assumes();
     function.specialized_regions = Some(regions);
-    after("versioning", &function);
+    after("versioning", &function.graph);
     if let Some(source) = osr_source {
         function.instrument_osr(source, osr_feedback)?;
     }
-    after("osr", &function);
+    after("osr", &function.graph);
     Ok(function)
 }
 
@@ -671,7 +672,7 @@ impl FunctionState {
     fn lower_js_observed(
         &mut self,
         baseline: bool,
-        after: &mut dyn FnMut(&str, &FunctionState),
+        after: &mut dyn FnMut(&str, &Graph),
     ) -> Result<()> {
         let Some(regions) = self.specialized_regions.take().filter(|_| self.optimize) else {
             self.ensure_facts();
@@ -680,23 +681,23 @@ impl FunctionState {
                 .skip(1)
                 .take_while(|&&pass| pass != "typed-storage")
             {
-                after(pass, self);
+                after(pass, &self.graph);
             }
             return Ok(());
         };
         if !baseline {
             property_accesses::rewrite(&mut self.graph)?;
         }
-        after("property-specialization", self);
+        after("property-specialization", &self.graph);
         if !baseline {
             reads::lower(&mut self.graph, &self.plan.reads, &mut self.notes)?;
             writes::lower(&mut self.graph, &self.plan.stores)?;
         }
-        after("indexed-accesses", self);
+        after("indexed-accesses", &self.graph);
         self.invalidate_cfg();
         js::simplify(self);
         self.graph.verify()?;
-        after("normalise", self);
+        after("normalise", &self.graph);
         js::coercions(self);
         js::bit_tests(self);
         self.graph.verify()?;
@@ -706,7 +707,7 @@ impl FunctionState {
             regions::hoist(self, *region);
             self.graph.verify()?;
         }
-        after("load-reuse", self);
+        after("load-reuse", &self.graph);
         let bits_changed = numeric::bitwise(self);
         let arrays_changed = array_checks::lower_arrays(self);
         let typed_changed = typed::lower(self)?;
@@ -714,14 +715,14 @@ impl FunctionState {
         if indexed_changed {
             js::simplify(self);
         }
-        after("indexed-checks", self);
+        after("indexed-checks", &self.graph);
         self.invalidate_cfg();
         let properties_changed = !baseline && properties::lower(self)?;
         let kinds_changed = array_checks::lower_array_kinds(self);
         if indexed_changed || properties_changed || kinds_changed {
             reuse::reuse_loads(self);
         }
-        after("property-caches", self);
+        after("property-caches", &self.graph);
         views::views(self);
         comparisons::expose(self);
         self.graph.verify()?;
@@ -735,10 +736,10 @@ impl FunctionState {
         transforms::trim(&mut self.graph);
         transforms::remove_trivial_params(&mut self.graph);
         self.graph.verify()?;
-        after("js-cleanup", self);
+        after("js-cleanup", &self.graph);
         js::strings::concatenate(self);
         self.graph.verify()?;
-        after("string-concat", self);
+        after("string-concat", &self.graph);
         if numeric::lower(self) {
             reuse::reuse_loads(self);
             js::simplify(self);
@@ -750,9 +751,9 @@ impl FunctionState {
             regions::hoist(self, *region);
             self.graph.verify()?;
         }
-        after("numeric-specialization", self);
+        after("numeric-specialization", &self.graph);
         self.ensure_facts();
-        after("js", self);
+        after("js", &self.graph);
         Ok(())
     }
 }

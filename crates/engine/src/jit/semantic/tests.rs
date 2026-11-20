@@ -121,14 +121,14 @@ fn baseline_keeps_generic_property_accesses() {
     let mut checked = false;
     let mut checked_helpers = false;
     function
-        .lower_runtime_observed(true, &mut |stage, function| {
+        .lower_runtime_observed(true, &mut |stage, graph| {
             if stage == "helpers" {
                 assert!(
-                    !ops(&function.graph)
+                    !ops(graph)
                         .iter()
                         .any(|op| matches!(op, Op::Javascript(JsOp::Get(..))))
                 );
-                let helper = ops(&function.graph)
+                let helper = ops(graph)
                     .into_iter()
                     .find(|op| {
                         matches!(
@@ -141,18 +141,18 @@ fn baseline_keeps_generic_property_accesses() {
                     })
                     .unwrap();
                 assert_eq!(
-                    function.graph.contract(helper, &function.facts).result,
+                    graph.contract(helper, &Facts::compute(graph)).result,
                     Ownership::Borrowed
                 );
                 for helper in [
                     crate::jit::helpers::Helper::PropertySetCached,
                     crate::jit::helpers::Helper::GlobalGetBorrowed,
                 ] {
-                    assert!(ops(&function.graph).iter().any(|op| matches!(
+                    assert!(ops(graph).iter().any(|op| matches!(
                         op, Op::HelperCall { helper: selected, .. } if *selected == helper
                     )));
                 }
-                assert!(!ops(&function.graph).iter().any(|op| matches!(
+                assert!(!ops(graph).iter().any(|op| matches!(
                     op,
                     Op::Javascript(JsOp::Set(..) | JsOp::ShapedSet(..) | JsOp::GlobalRead(..))
                 )));
@@ -161,7 +161,7 @@ fn baseline_keeps_generic_property_accesses() {
             if stage != "property-accesses" {
                 return;
             }
-            let operations = ops(&function.graph);
+            let operations = ops(graph);
             assert!(
                 operations
                     .iter()
@@ -5354,13 +5354,13 @@ fn lowered_property_accesses_preserve_borrowed_slots() {
             let mut function = FunctionState::new(graph, Vec::new(), true);
             let mut borrowed = false;
             function
-                .lower_runtime_observed(false, &mut |pass, state| {
+                .lower_runtime_observed(false, &mut |pass, graph| {
                     if pass != "ownership" {
                         return;
                     }
-                    borrowed = state.graph.insts.values().any(|data| {
+                    borrowed = graph.insts.values().any(|data| {
                         matches!(&data.op, Op::Javascript(JsOp::PropertyLoad(receiver, _, js::memory::Field::Named(name)))
-                        if name == "n" && state.graph.borrowed.contains(receiver))
+                        if name == "n" && graph.borrowed.contains(receiver))
                     });
                 })
                 .unwrap();
