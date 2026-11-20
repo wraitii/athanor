@@ -135,6 +135,10 @@ cargo run -p js-runner -- --compile --filter paint --after ownership script.js
 
 Compile mode does not execute the source unless given `--execute 'JS'`.
 `--after PASS` inspects a compiler pass, and `--after all` prints every pass.
+A stage name such as `inline` or `versioning` also selects its `stage/...`
+steps. `--diff` prints the first selected pass in full and then only what each
+later pass changed (all passes unless `--after` narrows them), and
+`--verbose-ir` adds assumption origins to listings.
 Use `--after planner` for optimization decisions.
 Use `JS_JIT_OPT=none` to compare against unoptimized semantic graphs.
 

@@ -38,6 +38,7 @@ tracing = "0.1"
 naga = { version = "=30.0.2", optional = true, default-features = false, features = ["wgsl-out"] }
 wgpu = { version = "=30.0.2", optional = true, default-features = false, features = ["std", "naga-ir"] }
 pollster = { version = "=1.0.3", optional = true }
+similar = { version = "2", default-features = false, features = ["text"] }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 wgpu = { version = "=30.0.2", optional = true, default-features = false, features = ["metal"] }

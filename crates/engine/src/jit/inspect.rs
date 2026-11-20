@@ -11,6 +11,7 @@ pub struct CompileOptions {
     pub semantic_ir: bool,
     pub verbose: bool,
     pub after: Option<String>,
+    pub diff: bool,
     pub planner: bool,
     pub reports: Option<ReportSink>,
 }
@@ -22,6 +23,7 @@ impl Default for CompileOptions {
             semantic_ir: true,
             verbose: false,
             after: None,
+            diff: false,
             planner: false,
             reports: None,
         }
@@ -235,8 +237,12 @@ impl Inspection {
         if direct && (!self.after.is_empty() || self.semantic.is_some()) {
             println!("[{name}] direct baseline code");
         }
-        for (pass, semantic) in &self.after {
-            println!("[{name}] semantic IR {label} after {pass}\n{semantic}");
+        if options.diff {
+            self.print_diffs(name, label);
+        } else {
+            for (pass, semantic) in &self.after {
+                println!("[{name}] semantic IR {label} after {pass}\n{semantic}");
+            }
         }
         if let (true, Some(semantic)) = (self.after.is_empty(), &self.semantic) {
             println!("[{name}] semantic IR {label}\n{semantic}");
@@ -245,6 +251,89 @@ impl Inspection {
             println!("[{name}] planner {label}\n{planner}");
         }
     }
+}
+
+impl Inspection {
+    fn print_diffs(&self, name: &str, label: &str) {
+        let mut previous: Option<String> = None;
+        let mut unchanged = Vec::new();
+        let flush = |unchanged: &mut Vec<&str>| {
+            if !unchanged.is_empty() {
+                println!("[{name}] unchanged {label}: {}\n", unchanged.join(", "));
+                unchanged.clear();
+            }
+        };
+        for (pass, text) in &self.after {
+            if pass == "wgsl" {
+                flush(&mut unchanged);
+                println!("[{name}] semantic IR {label} after {pass}\n{text}");
+                continue;
+            }
+            let text = strip_locations(text);
+            let Some(before) = previous.replace(text.clone()) else {
+                println!("[{name}] semantic IR {label} after {pass}\n{text}");
+                continue;
+            };
+            let diff = listing_diff(&before, &text);
+            if diff.is_empty() {
+                unchanged.push(pass.as_str());
+                continue;
+            }
+            flush(&mut unchanged);
+            println!("[{name}] diff {label} after {pass}\n{diff}");
+        }
+        flush(&mut unchanged);
+    }
+}
+
+fn strip_locations(text: &str) -> String {
+    let mut stripped = String::with_capacity(text.len());
+    for line in text.lines() {
+        let line = match line.rsplit_once("  @") {
+            Some((code, id)) if id.chars().all(|c| c.is_ascii_hexdigit()) => code.trim_end(),
+            _ => line,
+        };
+        stripped.push_str(line);
+        stripped.push('\n');
+    }
+    stripped
+}
+
+fn listing_diff(before: &str, after: &str) -> String {
+    use similar::{ChangeTag, TextDiff};
+    let diff = TextDiff::from_lines(before, after);
+    let lines: Vec<&str> = after.lines().collect();
+    let mut text = String::new();
+    for group in diff.grouped_ops(2) {
+        let start = group
+            .iter()
+            .find(|op| op.tag() != similar::DiffTag::Equal)
+            .map_or(0, |op| op.new_range().start);
+        writeln!(text, "@@ {} @@", enclosing_block(&lines, start)).unwrap();
+        for op in &group {
+            for change in diff.iter_changes(op) {
+                let sign = match change.tag() {
+                    ChangeTag::Equal => ' ',
+                    ChangeTag::Delete => '-',
+                    ChangeTag::Insert => '+',
+                };
+                write!(text, "{sign}{}", change.value()).unwrap();
+                if change.missing_newline() {
+                    text.push('\n');
+                }
+            }
+        }
+    }
+    text
+}
+
+fn enclosing_block<'a>(lines: &[&'a str], index: usize) -> &'a str {
+    lines[..(index + 1).min(lines.len())]
+        .iter()
+        .rev()
+        .find(|line| line.starts_with("block"))
+        .and_then(|line| line.split(['(', ':']).next())
+        .unwrap_or("function")
 }
 
 impl CompileOptions {

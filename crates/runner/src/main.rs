@@ -246,7 +246,7 @@ fn display(error: Error) -> String {
 
 fn usage() {
     eprintln!(
-        "usage: js-runner [--load SCRIPT]... [--function NAME] [--arg VALUE]... <script>\n       js-runner [--function NAME] [--arg VALUE]... --eval SOURCE\n       js-runner --map [--data ROOT] [--settings JSON] [--bootstrap SCRIPT] [SCRIPT]\n       js-runner --compile [--filter NAME] [--no-ir] [--verbose-ir] [--after PASS] [--after planner] [--execute JS] (--eval SOURCE | SCRIPT)
+        "usage: js-runner [--load SCRIPT]... [--function NAME] [--arg VALUE]... <script>\n       js-runner [--function NAME] [--arg VALUE]... --eval SOURCE\n       js-runner --map [--data ROOT] [--settings JSON] [--bootstrap SCRIPT] [SCRIPT]\n       js-runner --compile [--filter NAME] [--no-ir] [--verbose-ir] [--diff] [--after PASS] [--after planner] [--execute JS] (--eval SOURCE | SCRIPT)
        js-runner --repl"
     );
 }
