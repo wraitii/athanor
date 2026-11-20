@@ -626,6 +626,8 @@ fn entry_checks(
                 Op::Javascript(JsOp::IsInBounds(max, length))
             }
             IndexBound::Below(bound) => {
+                // `loop_counters` guarantees `bound` is a number, so `<=` cannot coerce or throw;
+                // negative bounds pass here and skip the loop.
                 let bound = values.get(&bound).copied().unwrap_or(bound);
                 Op::Javascript(JsOp::Binary(BinaryOperator::LessEqualThan, bound, length))
             }
