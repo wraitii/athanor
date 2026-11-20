@@ -1121,8 +1121,34 @@ impl<'a> Emitter<'a> {
                     let val_pair = self.get_or_emit_value(block, *val)?;
                     let value = self.coerce(block, val_pair, ScalarTy::F32);
                     let base = self.emit_pre(Expression::GlobalVariable(global));
-                    let pointer = self.emit(block, Expression::Access { base, index });
-                    block.push(Statement::Store { pointer, value }, NagaSpan::UNDEFINED);
+                    let unsigned = self.emit(
+                        block,
+                        Expression::As {
+                            expr: index,
+                            kind: ScalarKind::Uint,
+                            convert: Some(4),
+                        },
+                    );
+                    let length = self.emit(block, Expression::ArrayLength(base));
+                    let condition = self.emit(
+                        block,
+                        Expression::Binary {
+                            op: NagaBinOp::Less,
+                            left: unsigned,
+                            right: length,
+                        },
+                    );
+                    let mut accept = NagaBlock::new();
+                    let pointer = self.emit(&mut accept, Expression::Access { base, index });
+                    accept.push(Statement::Store { pointer, value }, NagaSpan::UNDEFINED);
+                    block.push(
+                        Statement::If {
+                            condition,
+                            accept,
+                            reject: NagaBlock::new(),
+                        },
+                        NagaSpan::UNDEFINED,
+                    );
                 }
                 op => {
                     if let Some(result) = data.result() {
