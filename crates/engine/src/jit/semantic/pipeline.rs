@@ -707,6 +707,10 @@ impl FunctionState {
             regions::hoist(self, *region);
             self.graph.verify()?;
         }
+        if js::dead_allocations(&mut self.graph) {
+            self.invalidate_values();
+            self.graph.verify()?;
+        }
         after("load-reuse", &self.graph);
         let bits_changed = numeric::bitwise(self);
         let arrays_changed = array_checks::lower_arrays(self);

@@ -2,6 +2,7 @@ mod op;
 pub(in crate::jit) use op::{
     ArrayLayout, ArrayMethod, Constant, DirectTarget, Native, Op, PropertyWrite, TypedRead, UnaryOp,
 };
+mod allocations;
 pub(in crate::jit::semantic) mod arguments;
 pub(in crate::jit::semantic) mod arrays;
 mod bit_tests;
@@ -24,6 +25,7 @@ mod typeof_comparisons;
 
 use super::ValueType;
 
+pub(super) use allocations::dead_allocations;
 pub(super) use bit_tests::bit_tests;
 pub(super) use coercions::coercions;
 pub(super) use folding::simplify;
