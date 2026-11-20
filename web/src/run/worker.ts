@@ -95,6 +95,7 @@ function plan(kernel: GpuKernel, args: unknown[]): Plan {
   for (const { arg } of kernel.buffers) {
     const buffer = args[arg];
     if (!(buffer instanceof Float32Array)) return fallback(`argument ${arg} is not a Float32Array`);
+    if (buffer.byteLength === 0) return fallback('empty buffer');
     buffers.push(buffer);
   }
   for (const [index, { writable }] of kernel.buffers.entries()) {
@@ -111,7 +112,7 @@ function plan(kernel: GpuKernel, args: unknown[]): Plan {
 
 function dispatch(index: number, kernel: GpuKernel, plan: Extract<Plan, { kind: 'dispatch' }>): boolean {
   const shared = plan.buffers.map((buffer) => {
-    const copy = new Float32Array(new SharedArrayBuffer(Math.max(buffer.byteLength, 4)));
+    const copy = new Float32Array(new SharedArrayBuffer(buffer.byteLength));
     copy.set(buffer);
     return copy;
   });
