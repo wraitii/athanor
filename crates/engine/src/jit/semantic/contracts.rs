@@ -142,6 +142,7 @@ fn generic(graph: &Graph, inst: Inst) -> Representations {
         | Op::ReadHint(..)
         | Op::Assume(..)
         | Op::ContinuationOutput(..)
+        | Op::OsrStart(..)
         | Op::LowLevel(_) => smallvec![Use::Any; count],
         _ => smallvec![Use::Exact(Repr::Boxed); count],
     };

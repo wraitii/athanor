@@ -554,8 +554,10 @@ impl FunctionCompiler<'_, '_> {
                                     self.brif(poll, slow, &[], done, &[declined.into()]);
                                     self.switch(slow);
                                     for (index, &input) in inputs.iter().enumerate() {
-                                        let value = get(self, input);
-                                        if cx.plan.holder(input) == Holder::Borrowed {
+                                        let operand = self.operand(&cx, input);
+                                        let boxed = operand.repr == Repr::Boxed;
+                                        let value = self.convert(operand, Repr::Boxed);
+                                        if boxed && cx.plan.holder(input) == Holder::Borrowed {
                                             let heap = self.is_heap(value);
                                             let retain = self.b.create_block();
                                             let stored = self.b.create_block();
