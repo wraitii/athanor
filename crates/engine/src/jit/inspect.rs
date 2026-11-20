@@ -9,6 +9,7 @@ const ALL_PASSES: &str = "all";
 pub struct CompileOptions {
     pub filter: Option<String>,
     pub semantic_ir: bool,
+    pub verbose: bool,
     pub after: Option<String>,
     pub planner: bool,
     pub reports: Option<ReportSink>,
@@ -19,6 +20,7 @@ impl Default for CompileOptions {
         Self {
             filter: None,
             semantic_ir: true,
+            verbose: false,
             after: None,
             planner: false,
             reports: None,
@@ -79,8 +81,9 @@ pub(super) struct Inspection {
     gpu: Option<Result<super::naga::GpuKernel, String>>,
 }
 
-pub(super) fn graph_text(graph: &semantic::Graph) -> String {
-    semantic_text(graph.listing(&semantic::Facts::compute(graph)).lines())
+pub(super) fn graph_text(graph: &semantic::Graph, verbose: bool) -> String {
+    let facts = semantic::Facts::compute(graph);
+    semantic_text(graph.listing(&facts).verbose(verbose).lines())
 }
 
 fn semantic_text(lines: Vec<semantic::ListingLine>) -> String {
@@ -97,6 +100,7 @@ fn semantic_text(lines: Vec<semantic::ListingLine>) -> String {
 
 pub(super) struct PassInspection {
     pass: Option<String>,
+    verbose: bool,
     snapshots: Vec<(String, String)>,
     #[cfg(feature = "wgsl")]
     gpu: Option<Result<super::naga::GpuKernel, String>>,
@@ -108,6 +112,7 @@ impl PassInspection {
             pass: options
                 .filter(|options| options.semantic_ir)
                 .and_then(|options| options.after.clone()),
+            verbose: options.is_some_and(|options| options.verbose),
             snapshots: Vec::new(),
             #[cfg(feature = "wgsl")]
             gpu: None,
@@ -116,7 +121,7 @@ impl PassInspection {
 
     pub(super) fn observe(&mut self, name: &str, graph: &semantic::Graph) {
         if selects(self.pass.as_deref(), name) {
-            self.snapshots.push((name.to_owned(), graph_text(graph)));
+            self.snapshots.push((name.to_owned(), graph_text(graph, self.verbose)));
         }
         #[cfg(feature = "wgsl")]
         if name == "inline" && selects(self.pass.as_deref(), "wgsl") {
@@ -173,7 +178,7 @@ impl Inspection {
         Self {
             semantic: options
                 .semantic_ir
-                .then(|| semantic_text(graph.listing_lines())),
+                .then(|| graph_text(&graph.graph, options.verbose)),
             planner: options
                 .planner
                 .then(|| graph.plan_report(repository, source, inline_multiplier)),
@@ -186,7 +191,9 @@ impl Inspection {
             return Self::default();
         };
         Self {
-            semantic: options.semantic_ir.then(|| graph_text(graph)),
+            semantic: options
+                .semantic_ir
+                .then(|| graph_text(graph, options.verbose)),
             ..Self::default()
         }
     }

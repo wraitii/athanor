@@ -466,10 +466,14 @@ impl Compiler {
             .as_deref()
             .filter(|options| options.semantic_ir)
             .and_then(|options| options.after.clone());
+        let verbose = self
+            .inspection
+            .as_deref()
+            .is_some_and(|options| options.verbose);
         let mut snapshots = Vec::new();
         let mut after = |name: &str, graph: &super::semantic::Graph| {
             if super::inspect::selects(pass.as_deref(), name) {
-                snapshots.push((name.to_owned(), super::inspect::graph_text(graph)));
+                snapshots.push((name.to_owned(), super::inspect::graph_text(graph, verbose)));
             }
         };
         self.context.clear();
@@ -516,7 +520,7 @@ impl Compiler {
                 .map_err(|reason| Error::Compile(reason.0))?;
             snapshots.push((
                 "aarch64-select".into(),
-                super::inspect::graph_text(&selected),
+                super::inspect::graph_text(&selected, verbose),
             ));
         }
         data.seal();

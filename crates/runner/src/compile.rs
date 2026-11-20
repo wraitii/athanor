@@ -29,6 +29,7 @@ impl Options {
                 );
             }
             "--no-ir" => self.dump.semantic_ir = false,
+            "--verbose-ir" => self.dump.verbose = true,
             "--after" => match arguments.next().ok_or("--after expects a pass name")? {
                 pass if pass == "planner" => self.dump.planner = true,
                 pass => {
@@ -47,7 +48,7 @@ impl Options {
 
     pub fn validate(&self) -> Result<(), String> {
         if self.output && !self.enabled {
-            return Err("--no-ir, --after, --filter and --execute require --compile".into());
+            return Err("--no-ir, --verbose-ir, --after, --filter and --execute require --compile".into());
         }
         Ok(())
     }

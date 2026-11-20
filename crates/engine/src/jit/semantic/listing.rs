@@ -228,16 +228,8 @@ impl Graph {
             ),
             Op::Memory(op) => format!("memory {op:?}"),
             Op::KeepAlive(value) => format!("keep_alive {value}"),
-            Op::EntryAssume(value, fact) => format!("entry-assume {value} {fact:?}"),
-            Op::Assume(value, fact, origin) => {
-                let site = origin
-                    .site
-                    .map_or(String::new(), |site| format!(" site={site}"));
-                format!(
-                    "assume {value} {fact:?} {:?} gain={}{site}",
-                    origin.kind, origin.gain
-                )
-            }
+            Op::EntryAssume(value, fact) => format!("entry-assume {value}: {fact}"),
+            Op::Assume(value, fact, _) => format!("assume {value}: {fact}"),
             Op::ReadHint(value, kind, observed, site) => {
                 format!("read_hint {kind:?} {value} {observed:?} site={site}")
             }
@@ -255,13 +247,25 @@ impl Graph {
     }
 
     pub(in crate::jit) fn listing<'a>(&'a self, facts: &'a Facts) -> Listing<'a> {
-        Listing { graph: self, facts }
+        Listing {
+            graph: self,
+            facts,
+            verbose: false,
+        }
     }
 }
 
 pub(in crate::jit) struct Listing<'a> {
     graph: &'a Graph,
     facts: &'a Facts,
+    verbose: bool,
+}
+
+impl Listing<'_> {
+    pub(in crate::jit) fn verbose(mut self, verbose: bool) -> Self {
+        self.verbose = verbose;
+        self
+    }
 }
 
 impl Listing<'_> {
@@ -326,6 +330,15 @@ impl Listing<'_> {
             for &inst in &data.insts {
                 let inst_data = &graph.insts[inst];
                 let mut text = graph.op_text(&inst_data.op);
+                if self.verbose
+                    && let Op::Assume(_, _, origin) = &inst_data.op
+                {
+                    text += &format!(" [{:?} gain={}", origin.kind, origin.gain);
+                    if let Some(site) = origin.site {
+                        text += &format!(" site={site}");
+                    }
+                    text += "]";
+                }
                 if !inst_data.results.is_empty() {
                     let results = inst_data
                         .results
@@ -381,7 +394,7 @@ impl Listing<'_> {
                             .join(", ")
                     ),
                     TerminatorKind::Bailout { target, inputs } => format!(
-                        "bailout {} ({})",
+                        "bailout generic:{} ({})",
                         target.block,
                         inputs
                             .iter()

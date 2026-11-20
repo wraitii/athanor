@@ -25,6 +25,26 @@ pub(in crate::jit) enum Fact {
     Bound(Value),
 }
 
+impl std::fmt::Display for Fact {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Type(types) => write!(f, "{types}"),
+            Self::IntegerRange(min, max) => write!(f, "int32 in {min}..={max}"),
+            Self::Code(code) => write!(f, "code {code}"),
+            Self::Shape(shape) => write!(f, "shape {shape}"),
+            Self::ReadLayout(layout) => write!(f, "layout {layout:?}"),
+            Self::Typed(Some(kind)) => write!(f, "typed array {kind:?}"),
+            Self::Typed(None) => write!(f, "typed array"),
+            Self::Array => write!(f, "array"),
+            Self::Property(cache) => write!(f, "property {cache}"),
+            Self::Cached(cache, true) => write!(f, "cached {cache} (builtin)"),
+            Self::Cached(cache, false) => write!(f, "cached {cache}"),
+            Self::Native(native) => write!(f, "native {native:?}"),
+            Self::Bound(bound) => write!(f, "length >= {bound}"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(in crate::jit) enum Kind {
     Number,
