@@ -8,9 +8,9 @@ use naga::valid::{Capabilities, ValidationFlags, Validator};
 use naga::{
     AddressSpace, ArraySize, BinaryOperator as NagaBinOp, Binding as NagaBinding,
     Block as NagaBlock, BuiltIn, EntryPoint, Expression, Function, FunctionArgument,
-    GlobalVariable, Handle, Literal, LocalVariable, Module, ResourceBinding, Scalar, ScalarKind,
-    ShaderStage, Span as NagaSpan, Statement, StorageAccess, StructMember, Type, TypeInner,
-    UnaryOperator as NagaUnaryOp, VectorSize,
+    GlobalVariable, Handle, Literal, LocalVariable, MathFunction, Module, ResourceBinding, Scalar,
+    ScalarKind, ShaderStage, Span as NagaSpan, Statement, StorageAccess, StructMember, Type,
+    TypeInner, UnaryOperator as NagaUnaryOp, VectorSize,
 };
 use oxc_syntax::operator::BinaryOperator;
 
@@ -60,17 +60,22 @@ impl Offload for Gpu {
     fn compile(&mut self, kernel: &Graph) -> Option<usize> {
         let compiled = compile_kernel(kernel);
         let log = std::env::var("JS_JIT_GPU_LOG");
-        if matches!(log.as_deref(), Ok("1" | "2")) {
-            match &compiled {
-                Ok(_) => eprintln!("[js jit gpu] outlined {}", kernel.name),
-                Err(error) => eprintln!("[js jit gpu] declined {}: {error}", kernel.name),
-            }
+        if let Err(error) = &compiled
+            && matches!(log.as_deref(), Ok("1" | "2"))
+        {
+            eprintln!("[js jit gpu] declined {}: {error}", kernel.name);
         }
         if log.as_deref() == Ok("2") {
             eprintln!("{}", super::inspect::graph_text(kernel, false));
         }
         #[cfg(feature = "gpu")]
-        return compiled.ok().map(runtime::register_kernel);
+        return compiled.ok().map(|compiled| {
+            let id = runtime::register_kernel(compiled);
+            if matches!(log.as_deref(), Ok("1" | "2")) {
+                eprintln!("[js jit gpu] outlined {} as kernel={id}", kernel.name);
+            }
+            id
+        });
         #[cfg(not(feature = "gpu"))]
         None
     }
@@ -258,6 +263,7 @@ pub(super) fn compile_kernel(graph: &Graph) -> Result<GpuKernel, String> {
     let mut emitter = Emitter::new(graph, &cfg, &types, kernel_blocks, &inner_loops);
     emitter.declare_inputs(&buffers, &uniforms);
     emitter.emit_entry_point(&outer_y, outer_x.as_ref(), kernel_entry, kernel_latch)?;
+    let flag = emitter.flag;
     let module = emitter.finish();
     let info = Validator::new(ValidationFlags::all(), Capabilities::empty())
         .validate(&module)
@@ -280,6 +286,7 @@ pub(super) fn compile_kernel(graph: &Graph) -> Result<GpuKernel, String> {
         axis_y,
         strides,
         workgroup_size,
+        flag: flag.map(|(_, binding)| binding),
     })
 }
 
@@ -457,7 +464,7 @@ fn check_isolated(
             }
         }
         match graph.blocks[block].terminator.as_ref().map(|t| &t.kind) {
-            Some(TerminatorKind::Jump(_)) => {}
+            Some(TerminatorKind::Jump(_) | TerminatorKind::Bailout { .. }) => {}
             Some(TerminatorKind::Branch(..)) if grid.iter().any(|l| l.header == block) => {}
             Some(TerminatorKind::Return(value))
                 if matches!(
@@ -549,7 +556,9 @@ fn infer_types(
                 }
             }
             Op::Javascript(JsOp::Constant(Constant::Boolean(_))) => Some(ScalarTy::Bool),
-            Op::Javascript(JsOp::Unary(UnaryOp::Not, _)) => Some(ScalarTy::Bool),
+            Op::Javascript(
+                JsOp::Unary(UnaryOp::Not, _) | JsOp::IsInteger(_) | JsOp::IsNumber(_),
+            ) => Some(ScalarTy::Bool),
             Op::Javascript(JsOp::Binary(
                 BinaryOperator::LessThan
                 | BinaryOperator::LessEqualThan
@@ -737,6 +746,8 @@ struct Emitter<'a> {
     uniform_global: Option<Handle<GlobalVariable>>,
     uniform_fields: FxHashMap<Value, (u32, ScalarTy)>,
     param_locals: FxHashMap<(Block, usize), (Handle<LocalVariable>, ScalarTy)>,
+    next_binding: u32,
+    flag: Option<(Handle<GlobalVariable>, u32)>,
 }
 
 impl<'a> Emitter<'a> {
@@ -808,6 +819,8 @@ impl<'a> Emitter<'a> {
             uniform_global: None,
             uniform_fields: FxHashMap::default(),
             param_locals: FxHashMap::default(),
+            next_binding: 0,
+            flag: None,
         }
     }
 
@@ -873,7 +886,109 @@ impl<'a> Emitter<'a> {
                 NagaSpan::UNDEFINED,
             );
             self.uniform_global = Some(global);
+            binding += 1;
         }
+        self.next_binding = binding;
+    }
+
+    fn bail(&mut self, block: &mut NagaBlock) {
+        let global = match self.flag {
+            Some((global, _)) => global,
+            None => self.declare_flag(),
+        };
+        let base = self.emit_pre(Expression::GlobalVariable(global));
+        let pointer = self.emit(block, Expression::AccessIndex { base, index: 0 });
+        let value = self.emit_pre(Expression::Literal(Literal::U32(1)));
+        block.push(Statement::Store { pointer, value }, NagaSpan::UNDEFINED);
+        block.push(Statement::Return { value: None }, NagaSpan::UNDEFINED);
+    }
+
+    fn declare_flag(&mut self) -> Handle<GlobalVariable> {
+        let u32 = self.module.types.insert(
+            Type {
+                name: None,
+                inner: TypeInner::Scalar(Scalar::U32),
+            },
+            NagaSpan::UNDEFINED,
+        );
+        let ty = self.module.types.insert(
+            Type {
+                name: None,
+                inner: TypeInner::Array {
+                    base: u32,
+                    size: ArraySize::Dynamic,
+                    stride: 4,
+                },
+            },
+            NagaSpan::UNDEFINED,
+        );
+        let global = self.module.global_variables.append(
+            GlobalVariable {
+                name: Some("bailed".into()),
+                space: AddressSpace::Storage {
+                    access: StorageAccess::LOAD | StorageAccess::STORE,
+                },
+                binding: Some(ResourceBinding {
+                    group: 0,
+                    binding: self.next_binding,
+                }),
+                ty,
+                init: None,
+                memory_decorations: naga::MemoryDecorations::empty(),
+            },
+            NagaSpan::UNDEFINED,
+        );
+        self.flag = Some((global, self.next_binding));
+        global
+    }
+
+    fn bails(&self, block: Block) -> bool {
+        matches!(
+            self.graph.blocks[block]
+                .terminator
+                .as_ref()
+                .map(|t| &t.kind),
+            Some(TerminatorKind::Bailout { .. })
+        )
+    }
+
+    fn bail_unless(&mut self, block: &mut NagaBlock, condition: Handle<Expression>) {
+        let mut reject = NagaBlock::new();
+        self.bail(&mut reject);
+        block.push(
+            Statement::If {
+                condition,
+                accept: NagaBlock::new(),
+                reject,
+            },
+            NagaSpan::UNDEFINED,
+        );
+    }
+
+    fn in_bounds(
+        &mut self,
+        block: &mut NagaBlock,
+        global: Handle<GlobalVariable>,
+        index: Handle<Expression>,
+    ) -> Handle<Expression> {
+        let base = self.emit_pre(Expression::GlobalVariable(global));
+        let unsigned = self.emit(
+            block,
+            Expression::As {
+                expr: index,
+                kind: ScalarKind::Uint,
+                convert: Some(4),
+            },
+        );
+        let length = self.emit(block, Expression::ArrayLength(base));
+        self.emit(
+            block,
+            Expression::Binary {
+                op: NagaBinOp::Less,
+                left: unsigned,
+                right: length,
+            },
+        )
     }
 
     fn emit_pre(&mut self, expr: Expression) -> Handle<Expression> {
@@ -1086,6 +1201,12 @@ impl<'a> Emitter<'a> {
                     .ok_or_else(|| format!("non-buffer receiver {recv}"))?;
                 let idx_pair = self.get_or_emit_value(block, *idx)?;
                 let index = self.coerce(block, idx_pair, ScalarTy::I32);
+                let bounded =
+                    matches!(op, Op::Javascript(JsOp::TypedIndex(_, _, read)) if read.bounded);
+                if !bounded {
+                    let inside = self.in_bounds(block, global, index);
+                    self.bail_unless(block, inside);
+                }
                 let base = self.emit_pre(Expression::GlobalVariable(global));
                 let ptr = self.emit(block, Expression::Access { base, index });
                 let loaded = self.emit(block, Expression::Load { pointer: ptr });
@@ -1095,6 +1216,68 @@ impl<'a> Emitter<'a> {
                 let pair = self.get_or_emit_value(block, *v)?;
                 let expr = self.coerce(block, pair, ScalarTy::F32);
                 Ok((expr, ScalarTy::F32))
+            }
+            Op::Javascript(JsOp::IsNumber(v)) => {
+                self.get_or_emit_value(block, *v)?;
+                Ok((
+                    self.emit_pre(Expression::Literal(Literal::Bool(true))),
+                    ScalarTy::Bool,
+                ))
+            }
+            Op::Javascript(JsOp::IsInteger(v)) => {
+                let (expr, ty) = self.get_or_emit_value(block, *v)?;
+                if ty != ScalarTy::F32 {
+                    return Ok((
+                        self.emit_pre(Expression::Literal(Literal::Bool(true))),
+                        ScalarTy::Bool,
+                    ));
+                }
+                let truncated = self.emit(
+                    block,
+                    Expression::Math {
+                        fun: MathFunction::Trunc,
+                        arg: expr,
+                        arg1: None,
+                        arg2: None,
+                        arg3: None,
+                    },
+                );
+                let integral = self.emit(
+                    block,
+                    Expression::Binary {
+                        op: NagaBinOp::Equal,
+                        left: expr,
+                        right: truncated,
+                    },
+                );
+                let magnitude = self.emit(
+                    block,
+                    Expression::Math {
+                        fun: MathFunction::Abs,
+                        arg: expr,
+                        arg1: None,
+                        arg2: None,
+                        arg3: None,
+                    },
+                );
+                let limit = self.emit_pre(Expression::Literal(Literal::F32(2147483648.0)));
+                let small = self.emit(
+                    block,
+                    Expression::Binary {
+                        op: NagaBinOp::Less,
+                        left: magnitude,
+                        right: limit,
+                    },
+                );
+                let result = self.emit(
+                    block,
+                    Expression::Binary {
+                        op: NagaBinOp::LogicalAnd,
+                        left: integral,
+                        right: small,
+                    },
+                );
+                Ok((result, ScalarTy::Bool))
             }
             Op::Javascript(JsOp::AsInteger(v)) => {
                 let pair = self.get_or_emit_value(block, *v)?;
@@ -1166,24 +1349,8 @@ impl<'a> Emitter<'a> {
                     let index = self.coerce(block, idx_pair, ScalarTy::I32);
                     let val_pair = self.get_or_emit_value(block, *val)?;
                     let value = self.coerce(block, val_pair, ScalarTy::F32);
+                    let condition = self.in_bounds(block, global, index);
                     let base = self.emit_pre(Expression::GlobalVariable(global));
-                    let unsigned = self.emit(
-                        block,
-                        Expression::As {
-                            expr: index,
-                            kind: ScalarKind::Uint,
-                            convert: Some(4),
-                        },
-                    );
-                    let length = self.emit(block, Expression::ArrayLength(base));
-                    let condition = self.emit(
-                        block,
-                        Expression::Binary {
-                            op: NagaBinOp::Less,
-                            left: unsigned,
-                            right: length,
-                        },
-                    );
                     let mut accept = NagaBlock::new();
                     let pointer = self.emit(&mut accept, Expression::Access { base, index });
                     accept.push(Statement::Store { pointer, value }, NagaSpan::UNDEFINED);
@@ -1217,6 +1384,10 @@ impl<'a> Emitter<'a> {
     ) -> Result<(), String> {
         let mut cur = start;
         while cur != stop {
+            if self.bails(cur) {
+                self.bail(stmts);
+                return Ok(());
+            }
             if !self.kernel_blocks.contains(&cur) {
                 return Err(format!("control flow leaves the kernel at {cur}"));
             }
@@ -1298,6 +1469,35 @@ impl<'a> Emitter<'a> {
                 .clone();
             match term {
                 TerminatorKind::Jump(target) => {
+                    self.store_target_args(stmts, &target)?;
+                    if target.block == stop {
+                        break;
+                    }
+                    if !self.graph.blocks[target.block].params.is_empty()
+                        && !self.inner_loops.contains_key(&target.block)
+                    {
+                        self.load_block_params(stmts, target.block);
+                    }
+                    cur = target.block;
+                }
+                TerminatorKind::Branch(cond, then_t, else_t)
+                    if self.bails(then_t.block) || self.bails(else_t.block) =>
+                {
+                    let cond_pair = self.get_or_emit_value(stmts, cond)?;
+                    let mut cond_expr = self.coerce(stmts, cond_pair, ScalarTy::Bool);
+                    let target = if self.bails(then_t.block) {
+                        cond_expr = self.emit(
+                            stmts,
+                            Expression::Unary {
+                                op: NagaUnaryOp::LogicalNot,
+                                expr: cond_expr,
+                            },
+                        );
+                        else_t
+                    } else {
+                        then_t
+                    };
+                    self.bail_unless(stmts, cond_expr);
                     self.store_target_args(stmts, &target)?;
                     if target.block == stop {
                         break;

@@ -187,8 +187,21 @@ impl GpuRuntime {
             self.queue.write_buffer(&buffer, 0, &uniform_bytes);
             buffer
         });
-        let mut entries =
-            Vec::with_capacity(gpu_buffers.len() + usize::from(uniform_buffer.is_some()));
+        let flag = kernel.flag.map(|binding| {
+            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: 4,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.queue.write_buffer(&buffer, 0, &[0; 4]);
+            (binding, buffer)
+        });
+        let mut entries = Vec::with_capacity(
+            gpu_buffers.len() + usize::from(uniform_buffer.is_some()) + usize::from(flag.is_some()),
+        );
         for (i, buffer) in gpu_buffers.iter().enumerate() {
             entries.push(wgpu::BindGroupEntry {
                 binding: i as u32,
@@ -199,6 +212,12 @@ impl GpuRuntime {
             entries.push(wgpu::BindGroupEntry {
                 binding: gpu_buffers.len() as u32,
                 resource: ubuf.as_entire_binding(),
+            });
+        }
+        if let Some((binding, buffer)) = &flag {
+            entries.push(wgpu::BindGroupEntry {
+                binding: *binding,
+                resource: buffer.as_entire_binding(),
             });
         }
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -217,45 +236,70 @@ impl GpuRuntime {
             let gy = (dim_y as u32).div_ceil(kernel.workgroup_size[1]);
             pass.dispatch_workgroups(gx, gy, 1);
         }
+        let staging = |size: u64| {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        let flag = flag.map(|(_, buffer)| {
+            let copy = staging(4);
+            encoder.copy_buffer_to_buffer(&buffer, 0, &copy, 0, 4);
+            copy
+        });
         let mut readbacks = Vec::new();
         for (i, (val, data, writable)) in host_buffers.iter().enumerate() {
             if !writable || data.is_empty() {
                 continue;
             }
             let size = (data.len() * 4) as u64;
-            let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: None,
-                size,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            encoder.copy_buffer_to_buffer(&gpu_buffers[i], 0, &staging, 0, size);
-            readbacks.push((*val, data.len(), staging));
+            let copy = staging(size);
+            encoder.copy_buffer_to_buffer(&gpu_buffers[i], 0, &copy, 0, size);
+            readbacks.push((*val, data.len(), copy));
         }
         self.queue.submit(Some(encoder.finish()));
-        for (val, len, staging) in readbacks {
-            let slice = staging.slice(..);
-            let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let flag = done.clone();
-            slice.map_async(wgpu::MapMode::Read, move |res| {
-                if res.is_ok() {
-                    flag.store(true, std::sync::atomic::Ordering::Release);
-                }
-            });
-            let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
-            if !done.load(std::sync::atomic::Ordering::Acquire) {
+        if let Some(flag) = flag {
+            let bytes = self.read(&flag)?;
+            if bytes.iter().any(|&byte| byte != 0) {
                 return Ok(false);
             }
-            let view = slice.get_mapped_range().map_err(|e| format!("{e}"))?;
+        }
+        let mut results = Vec::with_capacity(readbacks.len());
+        for (val, len, copy) in readbacks {
+            let bytes = self.read(&copy)?;
             let mut out = vec![0.0f32; len];
-            for (slot, chunk) in out.iter_mut().zip(view.as_chunks::<4>().0) {
+            for (slot, chunk) in out.iter_mut().zip(bytes.as_chunks::<4>().0) {
                 *slot = f32::from_le_bytes(*chunk);
             }
-            drop(view);
-            staging.unmap();
+            results.push((val, out));
+        }
+        for (val, out) in results {
             heap.float32_write(val, &out);
         }
         Ok(true)
+    }
+
+    fn read(&self, buffer: &wgpu::Buffer) -> Result<Vec<u8>, String> {
+        let slice = buffer.slice(..);
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = done.clone();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            if res.is_ok() {
+                flag.store(true, std::sync::atomic::Ordering::Release);
+            }
+        });
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        if !done.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("readback failed".into());
+        }
+        let bytes = slice
+            .get_mapped_range()
+            .map_err(|e| format!("{e}"))?
+            .to_vec();
+        buffer.unmap();
+        Ok(bytes)
     }
 }
 

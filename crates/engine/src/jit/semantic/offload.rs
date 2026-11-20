@@ -120,15 +120,38 @@ fn extract(graph: &Graph, facts: &Facts, candidate: &Loop) -> Option<(Graph, Vec
     );
     kernel.terminate(done, span, TerminatorKind::Return(undefined));
     for &block in &candidate.body {
-        let terminator = kernel.blocks[block].terminator.as_mut()?;
-        for target in terminator.kind.targets_mut() {
-            if candidate.body.contains(&target.block) {
+        let exits: Vec<Target> = kernel.blocks[block]
+            .terminator
+            .as_ref()?
+            .kind
+            .targets()
+            .filter(|target| !candidate.body.contains(&target.block))
+            .cloned()
+            .collect();
+        let mut replacements = Vec::with_capacity(exits.len());
+        for exit in exits {
+            if block == candidate.header && exit.block == candidate.exit {
+                replacements.push(done);
                 continue;
             }
-            if block != candidate.header || target.block != candidate.exit {
-                return None;
-            }
-            *target = Target::new(done);
+            let bail = kernel.blocks.push(BlockData::default());
+            kernel.terminate(
+                bail,
+                span,
+                TerminatorKind::Bailout {
+                    target: exit,
+                    inputs: Vec::new(),
+                },
+            );
+            replacements.push(bail);
+        }
+        let terminator = kernel.blocks[block].terminator.as_mut()?;
+        let outside = terminator
+            .kind
+            .targets_mut()
+            .filter(|target| !candidate.body.contains(&target.block));
+        for (target, replacement) in outside.zip(replacements) {
+            *target = Target::new(replacement);
         }
     }
     let TerminatorKind::Jump(entry) = &graph.blocks[candidate.preheader].terminator.as_ref()?.kind

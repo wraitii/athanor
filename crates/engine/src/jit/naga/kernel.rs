@@ -43,6 +43,7 @@ pub struct GpuKernel {
     pub axis_y: Option<AxisSpec>,
     pub strides: Vec<StrideCheck>,
     pub workgroup_size: [u32; 3],
+    pub flag: Option<u32>,
 }
 
 impl fmt::Display for BoundSpec {
@@ -90,6 +91,9 @@ impl fmt::Display for GpuKernel {
         }
         for index in &self.uniforms {
             writeln!(f, "// uniform arg{index}: int32")?;
+        }
+        if let Some(binding) = self.flag {
+            writeln!(f, "// bails to the CPU through binding {binding}")?;
         }
         for check in &self.strides {
             let axis = ["x", "y"][check.inner_axis];
