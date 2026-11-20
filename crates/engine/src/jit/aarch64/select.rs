@@ -419,8 +419,11 @@ pub(in crate::jit) fn run(graph: &mut Graph) -> Result<(), Unsupported> {
     let mut replacements = Vec::new();
     let mut branches = Vec::new();
     for &block in &order {
+        let mut position = 0;
         for inst in graph.blocks[block].insts.clone() {
-            replacements.push((inst, instruction(graph, inst, &patterns)?));
+            let len = graph.blocks[block].insts.len();
+            replacements.push((inst, instruction(graph, inst, position, &patterns)?));
+            position += graph.blocks[block].insts.len() - len + 1;
         }
         let Some(term) = graph.blocks[block].terminator.clone() else {
             continue;
@@ -463,17 +466,17 @@ pub(in crate::jit) fn run(graph: &mut Graph) -> Result<(), Unsupported> {
     graph.verify_machine().map_err(Unsupported)
 }
 
-fn instruction(graph: &mut Graph, inst: Inst, patterns: &Patterns) -> Result<a::Op, Unsupported> {
+fn instruction(
+    graph: &mut Graph,
+    inst: Inst,
+    position: usize,
+    patterns: &Patterns,
+) -> Result<a::Op, Unsupported> {
     let data = graph.insts[inst].clone();
     let result = data.results.first().copied();
     let ty = result.map(|value| graph.repr(value).machine());
     let selected_binary = binary(graph, inst);
     let indexed = indexed_load(graph, inst);
-    let position = graph.blocks[data.block]
-        .insts
-        .iter()
-        .position(|&i| i == inst)
-        .unwrap();
     let mut b = Builder::new(graph);
     b.insert_at(data.block, position);
     b.set_span(data.span);
