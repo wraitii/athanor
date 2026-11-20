@@ -1040,6 +1040,55 @@ mod tests {
     }
 
     #[test]
+    fn packed_array_reads_below_loop_bounds_skip_bounds_checks() {
+        use crate::jit::profile::{ReadKind, ReadType, Site};
+
+        let graph = graph("function f(a,n){let sum=0;for(let i=0;i<n;++i)sum+=a[i];return sum;}");
+        let data = graph
+            .insts
+            .values()
+            .find(|data| matches!(data.op, Op::Javascript(JsOp::GetIndex(..))))
+            .unwrap();
+        let site = Site {
+            inline_context: 0,
+            source: 7,
+            start: data.span.start,
+            end: data.span.end,
+        };
+        let mut repository = super::super::super::calls::Repository::default();
+        repository
+            .read_feedback
+            .insert((site, ReadKind::Receiver), ReadType::Array);
+        let canonical = FunctionState::from_graph(graph);
+        let planned =
+            super::super::super::super::optimize_canonical(canonical, true, Some((&repository, 7)))
+                .unwrap();
+        let graph = &planned.graph;
+        let cfg = Cfg::new(graph);
+        let in_loop: FxHashSet<Block> = natural_loops(graph, &cfg)
+            .into_iter()
+            .flat_map(|(_, body)| body)
+            .collect();
+        let loop_ops = || {
+            in_loop
+                .iter()
+                .filter(|block| !graph.cold.contains(block))
+                .flat_map(|&block| &graph.blocks[block].insts)
+                .map(|&inst| &graph.insts[inst].op)
+        };
+        assert!(loop_ops().any(|op| matches!(
+            op,
+            Op::Javascript(JsOp::ArrayLoad(
+                _,
+                _,
+                crate::jit::semantic::ArrayLayout::Packed
+            ))
+        )));
+        assert!(!loop_ops().any(|op| matches!(op, Op::Javascript(JsOp::IsInBounds(..)))));
+        graph.verify().unwrap();
+    }
+
+    #[test]
     fn versioning_keeps_feedback_specialized_typed_reads() {
         use crate::heap::TypedKind;
         use crate::jit::profile::{ReadKind, ReadType, Site};

@@ -50,7 +50,7 @@ pub(in crate::jit::semantic) struct Speculation<'a> {
     pub(in crate::jit::semantic) exits: &'a [Block],
     pub(in crate::jit::semantic) exits_true: &'a [Block],
     pub(in crate::jit::semantic) typed_reads: &'a [(Inst, TypedRead)],
-    pub(in crate::jit::semantic) array_reads: &'a [(Inst, i64)],
+    pub(in crate::jit::semantic) array_reads: &'a [(Inst, IndexBound)],
     pub(in crate::jit::semantic) assumes: &'a [(Value, Fact)],
     pub(in crate::jit::semantic) code_guards: &'a [(String, cranelift_module::FuncId)],
 }
@@ -113,7 +113,7 @@ fn entry_checks(
     speculation: &Speculation<'_>,
     requirements: &[NativeCheck],
     hints: &FxHashMap<Value, crate::jit::profile::ReadType>,
-    array_bounds: &[(Value, i64)],
+    array_bounds: &[(Value, IndexBound)],
     head: Block,
     mut tested: FxHashSet<EntryGuard>,
     values: &mut FxHashMap<Value, Value>,
@@ -605,7 +605,7 @@ fn entry_checks(
     bounds.sort();
     bounds.dedup();
     current = typed_guards(graph, current, &original, &mapped_typed, &bounds);
-    for &(object, max) in array_bounds {
+    for &(object, bound) in array_bounds {
         let object = values.get(&object).copied().unwrap_or(object);
         let packed = graph.append_value(
             current,
@@ -613,15 +613,24 @@ fn entry_checks(
             Op::Javascript(JsOp::IsArray(object, ArrayLayout::Packed)),
         );
         let length = graph.append_value(current, span, Op::Javascript(JsOp::IndexedLength(object)));
-        let max = graph.append_value(
-            current,
-            span,
-            Op::LowLevel(low_level::Op::Integer {
-                ty: cranelift_codegen::ir::types::I64,
-                bits: max as u64,
-            }),
-        );
-        let fits = graph.append_value(current, span, Op::Javascript(JsOp::IsInBounds(max, length)));
+        let fits = match bound {
+            IndexBound::Max(max) => {
+                let max = graph.append_value(
+                    current,
+                    span,
+                    Op::LowLevel(low_level::Op::Integer {
+                        ty: cranelift_codegen::ir::types::I64,
+                        bits: max as u64,
+                    }),
+                );
+                Op::Javascript(JsOp::IsInBounds(max, length))
+            }
+            IndexBound::Below(bound) => {
+                let bound = values.get(&bound).copied().unwrap_or(bound);
+                Op::Javascript(JsOp::Binary(BinaryOperator::LessEqualThan, bound, length))
+            }
+        };
+        let fits = graph.append_value(current, span, fits);
         let check = graph.append_value(current, span, Op::BooleanAnd(packed, fits));
         current = continue_if(graph, current, check, &original);
     }
@@ -1062,7 +1071,8 @@ pub(super) fn materialize(
         .collect();
     let scope = region.iter().copied().collect();
     let mut array_bounds = FxHashMap::<Value, i64>::default();
-    for &(inst, max) in speculation.array_reads {
+    let mut below = Vec::new();
+    for &(inst, bound) in speculation.array_reads {
         let data = &graph.insts[inst];
         let Op::Javascript(JsOp::GetIndex(object, key) | JsOp::ArrayGet(object, key)) = data.op
         else {
@@ -1074,13 +1084,23 @@ pub(super) fn materialize(
             inst,
             Op::Javascript(JsOp::ArrayLoad(object, position, ArrayLayout::Packed)),
         );
-        array_bounds
-            .entry(object)
-            .and_modify(|old| *old = (*old).max(max))
-            .or_insert(max);
+        match bound {
+            IndexBound::Max(max) => {
+                array_bounds
+                    .entry(object)
+                    .and_modify(|old| *old = (*old).max(max))
+                    .or_insert(max);
+            }
+            IndexBound::Below(bound) => below.push((object, IndexBound::Below(bound))),
+        }
     }
-    let mut array_bounds: Vec<_> = array_bounds.into_iter().collect();
+    let mut array_bounds: Vec<_> = array_bounds
+        .into_iter()
+        .map(|(object, max)| (object, IndexBound::Max(max)))
+        .chain(below)
+        .collect();
     array_bounds.sort_unstable();
+    array_bounds.dedup();
     for &(inst, read) in speculation.typed_reads {
         if let Op::Javascript(JsOp::GetIndex(object, key) | JsOp::TypedIndex(object, key, _)) =
             graph.insts[inst].op

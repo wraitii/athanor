@@ -24,7 +24,7 @@ pub(super) struct RegionPlan {
     pub(super) guards: Vec<Block>,
     pub(super) exits: Vec<Block>,
     pub(super) typed_reads: Vec<(Inst, TypedRead)>,
-    pub(super) array_reads: Vec<(Inst, i64)>,
+    pub(super) array_reads: Vec<(Inst, IndexBound)>,
     pub(super) survivors: Vec<(Fact, Origin)>,
     pub(super) reentry: Option<String>,
     pub(super) children: Vec<RegionPlan>,
@@ -164,8 +164,17 @@ impl RegionPlan {
             )
             .unwrap();
         }
-        for &(inst, max) in &self.array_reads {
-            writeln!(out, "{indent}  packed array read {inst}: max index {max}").unwrap();
+        for &(inst, bound) in &self.array_reads {
+            match bound {
+                IndexBound::Max(max) => {
+                    writeln!(out, "{indent}  packed array read {inst}: max index {max}").unwrap()
+                }
+                IndexBound::Below(bound) => writeln!(
+                    out,
+                    "{indent}  packed array read {inst}: index below {bound}"
+                )
+                .unwrap(),
+            }
         }
         if children {
             for child in &self.children {
@@ -393,7 +402,9 @@ pub(super) fn plan_region(
         &guards::assumed(&assumptions, &assumed),
     );
     let array_reads = if let Some(entry) = entry {
-        bounded_array_reads(&planning, &facts, &shared, &body, &blocks, entry, &assumes)
+        bounded_array_reads(
+            &planning, &facts, &shared, &body, &blocks, entry, &assumes, &available,
+        )
     } else {
         Vec::new()
     };
@@ -539,6 +550,7 @@ pub(super) fn plan_region(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bounded_array_reads(
     graph: &Graph,
     facts: &Facts,
@@ -547,11 +559,13 @@ fn bounded_array_reads(
     blocks: &[Block],
     (preheader, header): (Block, Block),
     assumes: &[(Value, Fact)],
-) -> Vec<(Inst, i64)> {
+    available: &FxHashSet<Value>,
+) -> Vec<(Inst, IndexBound)> {
     use super::super::super::ranges::{LoopEndpoints, Ranges};
 
     let mut ranges = Ranges::new(graph, facts, &[]);
     let mut endpoints = None;
+    let mut counters = None;
     let writes = Writes::with_facts(graph, body, effects);
     blocks
         .iter()
@@ -571,22 +585,29 @@ fn bounded_array_reads(
             {
                 return None;
             }
-            let range = ranges.integer_at(key, block)?;
-            if range.min < 0 || range.max >= i64::from(u32::MAX) {
-                return None;
-            }
             for test in [JsOp::ArrayKind(object), JsOp::IndexedLength(object)] {
                 let read = Access::read(graph, &Op::Javascript(test), facts)?;
                 if writes.clobbers(&read) {
                     return None;
                 }
             }
-            let endpoints = endpoints
-                .get_or_insert_with(|| LoopEndpoints::discover(graph, &facts.cfg, header))
-                .as_ref()?;
-            endpoints
-                .reaches(key, block, range.max)
-                .then_some((inst, range.max))
+            if let Some(range) = ranges.integer_at(key, block)
+                && range.min >= 0
+                && range.max < i64::from(u32::MAX)
+                && endpoints
+                    .get_or_insert_with(|| LoopEndpoints::discover(graph, &facts.cfg, header))
+                    .as_ref()
+                    .is_some_and(|endpoints| endpoints.reaches(key, block, range.max))
+            {
+                return Some((inst, IndexBound::Max(range.max)));
+            }
+            let &(inside, bound) = counters
+                .get_or_insert_with(|| loop_counters(graph, &facts.cfg, body, available, facts))
+                .get(&key)?;
+            facts
+                .cfg
+                .dominates(inside, block)
+                .then_some((inst, IndexBound::Below(bound)))
         })
         .collect()
 }

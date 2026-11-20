@@ -362,6 +362,14 @@ fn element_guess_at(graph: &Graph, object: Value, depth: usize) -> Option<TypedK
     })
 }
 
+/// The largest index a packed array read can reach: a constant, or anything below a loop bound
+/// defined before the region.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(in crate::jit::semantic) enum IndexBound {
+    Max(i64),
+    Below(Value),
+}
+
 /// Index reads on `objects` inside `region` whose key is a loop counter starting at a
 /// non-negative integer, stepping by one and tested against a bound defined before the region,
 /// mapped to their receiver and that bound.
@@ -373,6 +381,32 @@ fn bounded_reads(
     available: &FxHashSet<Value>,
     facts: &Facts,
 ) -> FxHashMap<Inst, (Value, Value)> {
+    let counters = loop_counters(graph, cfg, region, available, facts);
+    let mut reads = FxHashMap::default();
+    for &block in region {
+        for &inst in &graph.blocks[block].insts {
+            if let Op::Javascript(JsOp::GetIndex(object, key) | JsOp::TypedIndex(object, key, _)) =
+                graph.insts[inst].op
+                && objects.contains(&object)
+                && let Some(&(inside, bound)) = counters.get(&key)
+                && cfg.dominates(inside, block)
+            {
+                reads.insert(inst, (object, bound));
+            }
+        }
+    }
+    reads
+}
+
+/// Loop counters in `region` starting at a non-negative integer and stepping by one, mapped to
+/// the block entered while they are below their bound, and that bound.
+fn loop_counters(
+    graph: &Graph,
+    cfg: &Cfg,
+    region: &FxHashSet<Block>,
+    available: &FxHashSet<Value>,
+    facts: &Facts,
+) -> FxHashMap<Value, (Block, Value)> {
     let mut counters = FxHashMap::default();
     for (header, body) in natural_loops(graph, cfg) {
         if !region.contains(&header) {
@@ -422,20 +456,7 @@ fn bounded_reads(
         }
         counters.insert(counter, (inside.block, bound));
     }
-    let mut reads = FxHashMap::default();
-    for &block in region {
-        for &inst in &graph.blocks[block].insts {
-            if let Op::Javascript(JsOp::GetIndex(object, key) | JsOp::TypedIndex(object, key, _)) =
-                graph.insts[inst].op
-                && objects.contains(&object)
-                && let Some(&(inside, bound)) = counters.get(&key)
-                && cfg.dominates(inside, block)
-            {
-                reads.insert(inst, (object, bound));
-            }
-        }
-    }
-    reads
+    counters
 }
 
 fn counts_up(
