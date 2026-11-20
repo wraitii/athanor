@@ -17,6 +17,7 @@ fn after_views_span_specialization_and_lowering() {
     let source = "function helper(x){return x*2;} function selected(a,n){let sum=0;for(let i=0;i<n;++i)sum+=helper(a[i]);return sum;}";
     for pass in [
         "inline",
+        "assume",
         "captures",
         "versioning",
         "osr",
@@ -52,7 +53,7 @@ fn after_views_span_specialization_and_lowering() {
     let error = String::from_utf8_lossy(&output.stderr);
     assert!(
         error.contains(
-            "unknown pass unknown; available passes: inline, captures, versioning, osr, input"
+            "unknown pass unknown; available passes: inline, assume, captures, versioning, osr, input"
         ),
         "{error}"
     );

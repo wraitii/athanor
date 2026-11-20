@@ -2300,6 +2300,7 @@ mod tests {
             true,
             Some((&bodies, 0)),
             2,
+            &mut |_, _| {},
         )
         .unwrap();
         assert!(initial.plan.inlines.is_empty());

@@ -107,7 +107,7 @@ fn baseline_keeps_generic_property_accesses() {
     let graph =
         lower_source("function f(a, k, v) { a.x = v; return a.y + a[k] + shared; }").unwrap();
     let function = canonicalize_graph(graph, true).unwrap();
-    let planned = inline_and_plan_specialization(function, true, None, 1).unwrap();
+    let planned = inline_and_plan_specialization(function, true, None, 1, &mut |_, _| {}).unwrap();
     let mut function = specialize_observed(
         planned,
         Versioning::Generic,

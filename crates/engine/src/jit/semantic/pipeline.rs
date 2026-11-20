@@ -122,7 +122,7 @@ impl FunctionState {
 }
 
 pub(in crate::jit) const SPECIALIZATION_PASSES: &[&str] =
-    &["inline", "captures", "versioning", "osr"];
+    &["inline", "assume", "captures", "versioning", "osr"];
 
 pub(in crate::jit) const RUNTIME_PASSES: &[&str] = &[
     "input",
@@ -216,7 +216,7 @@ pub(in crate::jit) fn lower_global(
     )?;
     let mut function = FunctionState::new(graph, Vec::new(), ssa_opt);
     canonicalize(&mut function)?;
-    let planned = inline_and_plan_specialization(function, ssa_opt, None, 1)?;
+    let planned = inline_and_plan_specialization(function, ssa_opt, None, 1, after)?;
     let versioning = if initial_only {
         Versioning::Generic
     } else {
@@ -351,7 +351,7 @@ pub(in crate::jit) fn plan_specialization(
     ssa_opt: bool,
     specialization: Option<(&calls::Repository, usize)>,
 ) -> Result<FunctionState> {
-    inline_and_plan_specialization(function, ssa_opt, specialization, 1)
+    inline_and_plan_specialization(function, ssa_opt, specialization, 1, &mut |_, _| {})
 }
 
 pub(in crate::jit) fn inline_and_plan_specialization(
@@ -359,8 +359,16 @@ pub(in crate::jit) fn inline_and_plan_specialization(
     ssa_opt: bool,
     specialization: Option<(&calls::Repository, usize)>,
     inline_multiplier: usize,
+    after: &mut dyn FnMut(&str, &FunctionState),
 ) -> Result<FunctionState> {
-    inline_and_plan_inner(function, ssa_opt, specialization, inline_multiplier, true)
+    inline_and_plan_inner(
+        function,
+        ssa_opt,
+        specialization,
+        inline_multiplier,
+        true,
+        after,
+    )
 }
 
 pub(super) fn inline_and_plan_inner(
@@ -369,6 +377,7 @@ pub(super) fn inline_and_plan_inner(
     specialization: Option<(&calls::Repository, usize)>,
     inline_multiplier: usize,
     select_call_variants: bool,
+    after: &mut dyn FnMut(&str, &FunctionState),
 ) -> Result<FunctionState> {
     function.optimize = ssa_opt && !function.graph.has_handlers && !function.graph.generator;
     if !function.optimize {
@@ -379,6 +388,7 @@ pub(super) fn inline_and_plan_inner(
     if let Some((bodies, source)) = specialization {
         function.invalidate_cfg();
         expansions.calls(&mut function.graph, bodies, source, &mut function.notes)?;
+        after("inline/expand", &function);
         if select_call_variants
             && (inline_multiplier != 0 || bodies.call_variants && bodies.call_specialization)
         {
@@ -403,11 +413,13 @@ pub(super) fn inline_and_plan_inner(
         function.invalidate_cfg();
         expansions.calls(&mut function.graph, bodies, source, &mut function.notes)?;
         function.graph.verify()?;
+        after("inline/round 1", &function);
     }
     function.invalidate_cfg();
     expansions.constructors(&mut function.graph);
+    after("inline/constructors", &function);
     if let Some((bodies, source)) = specialization {
-        for _ in 0..calls::SPECIALIZATION_ROUNDS {
+        for round in 0..calls::SPECIALIZATION_ROUNDS {
             if select_call_variants && inline_multiplier != 0 {
                 calls::dispatch_methods(&mut function.graph, bodies, source);
             }
@@ -435,6 +447,7 @@ pub(super) fn inline_and_plan_inner(
             expansions.calls(&mut function.graph, bodies, source, &mut function.notes)?;
             expansions.constructors(&mut function.graph);
             function.graph.verify()?;
+            after(&format!("inline/round {}", round + 2), &function);
         }
     }
     function.invalidate_effects();
@@ -449,8 +462,10 @@ pub(super) fn inline_and_plan_inner(
             call_variants = call_variants::apply(&mut function.graph, bodies, source)?;
         }
     }
+    after("inline/calls", &function);
     function.invalidate_cfg();
     reuse::reuse_loads(&mut function);
+    after("inline/load-reuse", &function);
     let numbers = observations::plan(&mut function.graph, specialization);
     let reads = specialization.map_or_else(Vec::new, |(bodies, source)| {
         reads::plan(&function.graph, bodies, source)
@@ -540,6 +555,7 @@ pub(in crate::jit) fn specialize_observed(
     }
     if !function.optimize {
         function.ensure_facts();
+        after("assume", &function);
         after("captures", &function);
         after("versioning", &function);
         if let Some(source) = osr_source {
@@ -564,6 +580,7 @@ pub(in crate::jit) fn specialize_observed(
         reads::assume(&mut function.graph, &function.plan.reads);
         reads::assume(&mut function.graph, &function.plan.stores);
     }
+    after("assume", &function);
     captures::sink_closures(&mut function);
     if captures::lazy_captures(&mut function) {
         function.invalidate_cfg();

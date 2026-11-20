@@ -1676,11 +1676,13 @@ impl Compiler {
         } else {
             self.recompile_inline_multiplier
         };
+        let mut passes = super::inspect::PassInspection::new(self.inspection.as_deref());
         let planned = super::semantic::inline_and_plan_specialization(
             canonical,
             self.ssa_opt,
             Some((&self.canonical, source)),
             inline_multiplier,
+            &mut |name, state| passes.observe(name, state),
         )
         .map_err(Error::Unsupported)?;
         emission.callees = self.canonical.graph_callees(&planned.graph, source);
@@ -1761,7 +1763,6 @@ impl Compiler {
         };
         emission.specialized =
             self.ssa_opt && matches!(versioning, super::semantic::Versioning::Speculate { .. });
-        let mut passes = super::inspect::PassInspection::new(self.inspection.as_deref());
         let osr_source = (self.osr
             && self.ssa_opt
             && !matches!(request, RecompileRequest::Loop(_))
@@ -2252,6 +2253,7 @@ impl Compiler {
                     self.ssa_opt,
                     Some((&self.canonical, self.source_name.0)),
                     usize::from(self.inlining),
+                    &mut |name, state| passes.observe(name, state),
                 )?;
                 specialization = self.specialization_entries(
                     name.0,

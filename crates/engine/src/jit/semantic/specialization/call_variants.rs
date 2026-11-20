@@ -38,6 +38,7 @@ pub(in crate::jit::semantic) fn contextual_requirements(
         Some((bodies, source)),
         0,
         false,
+        &mut |_, _| {},
     )?;
     let mut optimized = super::super::specialize(
         planned,

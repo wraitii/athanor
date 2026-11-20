@@ -62,7 +62,11 @@ impl fmt::Debug for ReportSink {
 }
 
 pub(super) fn selects(pass: Option<&str>, name: &str) -> bool {
-    pass.is_some_and(|pass| pass == ALL_PASSES || pass == name)
+    pass.is_some_and(|pass| {
+        pass == ALL_PASSES
+            || pass == name
+            || name.split_once('/').is_some_and(|(stage, _)| stage == pass)
+    })
 }
 
 #[derive(Clone, Default)]
@@ -112,7 +116,7 @@ impl PassInspection {
 
     pub(super) fn observe(&mut self, name: &str, state: &semantic::FunctionState) {
         if selects(self.pass.as_deref(), name) {
-            self.snapshots.push((name.to_owned(), semantic_text(state.listing_lines())));
+            self.snapshots.push((name.to_owned(), graph_text(&state.graph)));
         }
         #[cfg(feature = "wgsl")]
         if name == "inline" && selects(self.pass.as_deref(), "wgsl") {
@@ -144,7 +148,8 @@ impl PassInspection {
             .chain(semantic::LOW_LEVEL_PASSES)
             .copied()
             .collect::<Vec<_>>();
-        if !passes.contains(&pass) {
+        let stage = pass.split_once('/').map_or(pass, |(stage, _)| stage);
+        if !passes.contains(&stage) {
             return Err(format!(
                 "unknown pass {pass}; available passes: {}",
                 passes.join(", ")
