@@ -69,6 +69,16 @@ impl Analysis {
         self.js
             .may_clobber(inst, write.js.as_ref(), read.js.as_ref())
     }
+
+    pub(super) fn may_clobber_own(&self, inst: Inst, write: &Access, read: &Access) -> bool {
+        if !write.overlaps(read) {
+            return false;
+        }
+        match &read.js {
+            Some(js) => self.js.may_clobber_own(inst, write.js.as_ref(), js),
+            None => true,
+        }
+    }
 }
 
 #[cfg(test)]

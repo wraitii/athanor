@@ -1,5 +1,7 @@
+use crate::jit::effects::Locations;
 use crate::jit::layout::ReadLayout;
 use crate::jit::semantic::JsOp;
+use crate::jit::semantic::js::memory::Field;
 use crate::{FxHashMap, FxHashSet};
 use cranelift_codegen::entity::SecondaryMap;
 use smallvec::SmallVec;
@@ -40,6 +42,26 @@ pub(super) struct Available {
     pub(super) value: Value,
     read: Option<Access>,
     truth: Option<bool>,
+    own: bool,
+}
+
+impl Available {
+    fn killed(
+        &self,
+        graph: &Graph,
+        facts: &Facts,
+        inst: Inst,
+        write: &Access,
+        reenters: bool,
+    ) -> bool {
+        let Some(read) = &self.read else {
+            return false;
+        };
+        if self.own {
+            return facts.kills_own(graph, inst, write, read);
+        }
+        reenters || facts.kills(graph, inst, write, read)
+    }
 }
 
 pub(super) type AvailableLoads = FxHashMap<LoadKey, Available>;
@@ -118,6 +140,32 @@ fn read_access(graph: &Graph, op: &Op, facts: &Facts) -> Option<Access> {
     }
 }
 
+fn define(
+    graph: &Graph,
+    facts: &Facts,
+    inst: Inst,
+    aliases: &FxHashMap<Value, Value>,
+    state: &mut Rc<AvailableLoads>,
+) {
+    let Op::Javascript(JsOp::Define(object, name, value)) = &graph.insts[inst].op else {
+        return;
+    };
+    let object = resolve(aliases, *object);
+    let get = Op::Javascript(JsOp::Get(object, name.clone()));
+    let Some(read) = read_access(graph, &get, facts) else {
+        return;
+    };
+    Rc::make_mut(state).insert(
+        LoadKey::Property(object, name.clone()),
+        Available {
+            value: resolve(aliases, *value),
+            read: Some(read),
+            truth: None,
+            own: true,
+        },
+    );
+}
+
 fn step(
     graph: &Graph,
     facts: &Facts,
@@ -130,22 +178,24 @@ fn step(
     let data = &graph.insts[inst];
     let memory = facts.memory(inst);
     if memory.reenters() {
-        if state.values().any(|entry| entry.read.is_some()) {
-            Rc::make_mut(state).retain(|_, entry| entry.read.is_none());
+        let external = Access::js(Locations::ALL, None, Field::Any);
+        if state
+            .values()
+            .any(|entry| entry.killed(graph, facts, inst, &external, true))
+        {
+            Rc::make_mut(state)
+                .retain(|_, entry| !entry.killed(graph, facts, inst, &external, true));
         }
         return None;
     }
     if memory.writes_state() {
-        if state.is_empty() {
-            return None;
+        if !state.is_empty() {
+            let write = Access::written(graph, &data.op, facts, memory.writes);
+            Rc::make_mut(state).retain(|_, entry| !entry.killed(graph, facts, inst, &write, false));
         }
-        let write = Access::written(graph, &data.op, facts, memory.writes);
-        Rc::make_mut(state).retain(|_, entry| {
-            entry
-                .read
-                .as_ref()
-                .is_none_or(|read| !facts.kills(graph, inst, &write, read))
-        });
+        if !cold {
+            define(graph, facts, inst, aliases, state);
+        }
         return None;
     }
     if cold {
@@ -213,6 +263,7 @@ fn step(
             } else {
                 shape_truth
             },
+            own: false,
         },
     );
     shape_truth.map(Reuse::Boolean)

@@ -259,4 +259,26 @@ impl Fresh {
         let read = read.unwrap_or(&Access::UNKNOWN);
         self.may_alias(inst, write, read) && write.field.conflicts(&read.field)
     }
+
+    // An own data property of an unescaped allocation shadows its prototype chain,
+    // so only writes into that allocation can change it.
+    pub(in crate::jit::semantic) fn may_clobber_own(
+        &self,
+        inst: super::super::Inst,
+        write: Option<&Access>,
+        read: &Access,
+    ) -> bool {
+        let write = write.unwrap_or(&Access::UNKNOWN);
+        if !write.field.conflicts(&read.field) {
+            return false;
+        }
+        let Some(base) = read.base.value().filter(|&base| self.unescaped(base, inst)) else {
+            return true;
+        };
+        match write.base {
+            Base::Unknown => true,
+            Base::External => false,
+            Base::Known(target) => self.same_class(target, base),
+        }
+    }
 }

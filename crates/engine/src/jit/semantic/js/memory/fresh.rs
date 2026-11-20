@@ -356,6 +356,15 @@ impl Fresh {
         }
     }
 
+    pub(super) fn unescaped(&self, value: Value, inst: Inst) -> bool {
+        self.at(value, inst).is_some()
+    }
+
+    pub(super) fn same_class(&self, left: Value, right: Value) -> bool {
+        self.class(left)
+            .is_some_and(|class| Some(class) == self.class(right))
+    }
+
     fn at(&self, value: Value, inst: Inst) -> Option<u32> {
         let class = self.class(value)?;
         let (block, index) = self.positions[inst]?;

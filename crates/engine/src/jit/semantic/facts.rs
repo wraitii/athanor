@@ -213,6 +213,17 @@ impl Facts {
         self.memory_analysis(graph).may_clobber(inst, write, read)
     }
 
+    pub(super) fn kills_own(
+        &self,
+        graph: &Graph,
+        inst: Inst,
+        write: &Access,
+        read: &Access,
+    ) -> bool {
+        self.memory_analysis(graph)
+            .may_clobber_own(inst, write, read)
+    }
+
     fn unavailable_probes(&self, graph: &Graph) -> Vec<Inst> {
         let mut pending = Vec::new();
         for &block in &self.cfg.rpo {
