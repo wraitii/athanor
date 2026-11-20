@@ -7,8 +7,8 @@ import { Compartment, EditorState, Prec, StateEffect, StateField } from '@codemi
 import { Decoration, type DecorationSet, keymap } from '@codemirror/view';
 import type { Span } from '../listing';
 
-const props = defineProps<{ source: string; highlight: Span | null }>();
-const emit = defineEmits<{ 'update:source': [string]; cursor: [number]; run: [] }>();
+const props = defineProps<{ source: string; highlight: Span | null; lines: number[] }>();
+const emit = defineEmits<{ 'update:source': [string]; cursor: [number]; run: []; execute: [] }>();
 
 const host = ref<HTMLElement>();
 let view: EditorView | undefined;
@@ -30,6 +30,24 @@ const highlightField = StateField.define<DecorationSet>({
   provide: (field) => EditorView.decorations.from(field),
 });
 
+const setLines = StateEffect.define<number[]>();
+const lineDecorations = Array.from({ length: 8 }, (_, index) => Decoration.line({ class: `cm-sourced src-${index}` }));
+const linesField = StateField.define<DecorationSet>({
+  create: () => Decoration.none,
+  update(set, transaction) {
+    for (const effect of transaction.effects) {
+      if (!effect.is(setLines)) continue;
+      const doc = transaction.state.doc;
+      const ranges = effect.value
+        .filter((line) => line < doc.lines)
+        .map((line) => lineDecorations[line % 8].range(doc.line(line + 1).from));
+      return Decoration.set(ranges);
+    }
+    return set.map(transaction.changes);
+  },
+  provide: (field) => EditorView.decorations.from(field),
+});
+
 const theme = new Compartment();
 const dark = window.matchMedia('(prefers-color-scheme: dark)');
 const applyTheme = () => view?.dispatch({ effects: theme.reconfigure(dark.matches ? oneDark : []) });
@@ -40,10 +58,16 @@ onMounted(() => {
     state: EditorState.create({
       doc: props.source,
       extensions: [
-        Prec.highest(keymap.of([{ key: 'Mod-Enter', run: () => (emit('run'), true) }])),
+        Prec.highest(
+          keymap.of([
+            { key: 'Mod-Enter', run: () => (emit('run'), true) },
+            { key: 'Shift-Mod-Enter', run: () => (emit('execute'), true) },
+          ]),
+        ),
         basicSetup,
         javascript(),
         highlightField,
+        linesField,
         theme.of(dark.matches ? oneDark : []),
         EditorView.updateListener.of((update) => {
           if (update.docChanged) emit('update:source', update.state.doc.toString());
@@ -52,6 +76,7 @@ onMounted(() => {
       ],
     }),
   });
+  view.dispatch({ effects: setLines.of(props.lines) });
   dark.addEventListener('change', applyTheme);
 });
 
@@ -66,6 +91,11 @@ watch(
     if (!view || source === view.state.doc.toString()) return;
     view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: source } });
   },
+);
+
+watch(
+  () => props.lines,
+  (lines) => view?.dispatch({ effects: setLines.of(lines) }),
 );
 
 watch(
@@ -93,6 +123,10 @@ watch(
 .source-editor :deep(.cm-scroller) {
   font-family: var(--mono);
   font-size: 13px;
+}
+.source-editor :deep(.cm-sourced) {
+  background: color-mix(in srgb, var(--src) var(--src-tint), transparent);
+  box-shadow: inset 3px 0 0 var(--src);
 }
 .source-editor :deep(.cm-ir-span) {
   background: var(--span-highlight);

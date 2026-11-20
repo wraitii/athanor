@@ -15,6 +15,15 @@
   --hover: #f0f0ec;
   --cursor-line: #fff4ec;
   --span-highlight: #fcd9c2;
+  --src-tint: 15%;
+  --src-0: #e8a33d;
+  --src-1: #3d8fe8;
+  --src-2: #d9487a;
+  --src-3: #2fb37a;
+  --src-4: #8a5be0;
+  --src-5: #9fb52e;
+  --src-6: #22aebf;
+  --src-7: #e0663a;
   color-scheme: light;
 }
 
@@ -34,6 +43,7 @@
     --hover: #2a2a30;
     --cursor-line: #33251b;
     --span-highlight: #6b3a1c;
+    --src-tint: 22%;
     color-scheme: dark;
   }
 }
@@ -53,6 +63,7 @@
   --hover: #2a2a30;
   --cursor-line: #33251b;
   --span-highlight: #6b3a1c;
+  --src-tint: 22%;
   color-scheme: dark;
 }
 
@@ -80,3 +91,12 @@ input {
   font: inherit;
   color: inherit;
 }
+
+.src-0 { --src: var(--src-0); }
+.src-1 { --src: var(--src-1); }
+.src-2 { --src: var(--src-2); }
+.src-3 { --src: var(--src-3); }
+.src-4 { --src: var(--src-4); }
+.src-5 { --src: var(--src-5); }
+.src-6 { --src: var(--src-6); }
+.src-7 { --src: var(--src-7); }

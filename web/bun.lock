@@ -14,6 +14,7 @@
       },
       "devDependencies": {
         "@vitejs/plugin-vue": "6.0.11",
+        "@webgpu/types": "0.1.74",
         "typescript": "6.0.3",
         "vite": "8.3.8",
         "vue-tsc": "3.3.14",
@@ -136,6 +137,8 @@
     "@vue/server-renderer": ["@vue/server-renderer@3.5.45", "", { "dependencies": { "@vue/compiler-ssr": "3.5.45", "@vue/runtime-dom": "3.5.45", "@vue/shared": "3.5.45" } }, "sha512-1fNXUHhhsWf4EVL4XixbGBU5mKdiIXJAB82feHRTyPPo6ZUEYWIJuEeUl3mVV6QDBp50HJOX4obLhxYXlrjrzA=="],
 
     "@vue/shared": ["@vue/shared@3.5.45", "", {}, "sha512-ue9fgHmVNPlP7iW3+cxoBX/Cnlw53dHlVSw0JKGY6z1lObg8pHoj928M2nzG4/yVsMZ3NaRZ2s2z61uC16NDwQ=="],
+
+    "@webgpu/types": ["@webgpu/types@0.1.74", "", {}, "sha512-lgiI4hbuLcI9unnm2cL/tvCaQU45dp0xcLWJh5uB/9MBGvIA4F8XIk7nSiBeg+K4xWGYwgZKn80LmERI5CxoTA=="],
 
     "alien-signals": ["alien-signals@3.2.1", "", {}, "sha512-I8FjmltrfnDFoZedi5CG8DghVYNhzb/Ijluz7tCSJH0xpd0484Kowhbb1XDYOxfJpU1p5wnM2X54dA+IfGyD1g=="],
 

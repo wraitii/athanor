@@ -1,14 +1,31 @@
 <script setup lang="ts">
-import { nextTick, ref, watch } from 'vue';
+import { computed, nextTick, ref, watch } from 'vue';
 import type { Line, Span } from '../listing';
 
-const props = defineProps<{ lines: Line[]; diff: boolean; cursor: number | null }>();
+const props = defineProps<{ lines: Line[]; diff: boolean; colour: boolean; cursor: number | null }>();
 const emit = defineEmits<{ hover: [Span | null] }>();
 
 const host = ref<HTMLElement>();
 
-function atCursor(line: Line): boolean {
+function sourceClass(line: Line): string | undefined {
+  if (!props.colour || line.source === null) return undefined;
+  return `sourced src-${line.source % 8}`;
+}
+
+function contains(line: Line): boolean {
   return props.cursor !== null && line.span !== null && line.span[0] <= props.cursor && props.cursor < line.span[1];
+}
+
+const narrowest = computed(() => {
+  let width = Infinity;
+  for (const line of props.lines) {
+    if (contains(line)) width = Math.min(width, line.span![1] - line.span![0]);
+  }
+  return width;
+});
+
+function atCursor(line: Line): boolean {
+  return contains(line) && line.span![1] - line.span![0] === narrowest.value;
 }
 
 watch(
@@ -26,7 +43,7 @@ watch(
       <div
         v-if="diff || line.kind !== 'removed'"
         class="line"
-        :class="[diff ? line.kind : 'same', { 'at-cursor': atCursor(line), spanned: line.span }]"
+        :class="[diff ? line.kind : 'same', sourceClass(line), { 'at-cursor': atCursor(line), spanned: line.span }]"
         @mouseenter="emit('hover', line.span)"
       ><span class="gutter">{{ diff && line.kind === 'added' ? '+' : diff && line.kind === 'removed' ? '−' : ' ' }}</span>{{ line.text }}</div>
     </template>
@@ -52,6 +69,12 @@ watch(
   width: 1.5ch;
   color: var(--muted);
   user-select: none;
+}
+.line.sourced {
+  box-shadow: inset 3px 0 0 var(--src);
+}
+.line.same.sourced {
+  background: color-mix(in srgb, var(--src) var(--src-tint), transparent);
 }
 .line.added {
   background: var(--added);
