@@ -53,7 +53,10 @@ impl Options {
 
     pub fn validate(&self) -> Result<(), String> {
         if self.output && !self.enabled {
-            return Err("--no-ir, --verbose-ir, --diff, --after, --filter and --execute require --compile".into());
+            return Err(
+                "--no-ir, --verbose-ir, --diff, --after, --filter and --execute require --compile"
+                    .into(),
+            );
         }
         Ok(())
     }

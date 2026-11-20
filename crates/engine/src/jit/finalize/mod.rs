@@ -10,10 +10,10 @@ use crate::FxHashMap;
 
 use super::semantic::low_level::{BlockArg, Builder as GraphBuilder, SignatureRef as SigRef};
 use super::semantic::{Block, Inst, Value as LoweredValue};
+use crate::jit::module::CodeModule;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{MemFlagsData, Type, types};
 use cranelift_frontend::FunctionBuilder;
-use crate::jit::module::CodeModule;
 use cranelift_module::{FuncId, Module};
 use oxc_span::Span;
 

@@ -123,7 +123,8 @@ impl PassInspection {
 
     pub(super) fn observe(&mut self, name: &str, graph: &semantic::Graph) {
         if selects(self.pass.as_deref(), name) {
-            self.snapshots.push((name.to_owned(), graph_text(graph, self.verbose)));
+            self.snapshots
+                .push((name.to_owned(), graph_text(graph, self.verbose)));
         }
         #[cfg(feature = "wgsl")]
         if name == "inline" && selects(self.pass.as_deref(), "wgsl") {

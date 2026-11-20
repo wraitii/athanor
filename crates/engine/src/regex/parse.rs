@@ -141,9 +141,10 @@ impl Lowering {
                     greedy: quantifier.greedy,
                 })
             }
-            Term::Character(character) => {
-                self.atom(Set::range(character.value, character.value), character.value)
-            }
+            Term::Character(character) => self.atom(
+                Set::range(character.value, character.value),
+                character.value,
+            ),
             Term::Dot(_) => {
                 let any = Set::range(0, set::MAX);
                 if self.flags.dot_all {

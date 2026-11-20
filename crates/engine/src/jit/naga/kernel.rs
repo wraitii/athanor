@@ -67,21 +67,37 @@ impl fmt::Display for Scale {
 
 impl fmt::Display for GpuKernel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "// grid: x in [{}, {})", self.axis_x.start, self.axis_x.end)?;
+        write!(
+            f,
+            "// grid: x in [{}, {})",
+            self.axis_x.start, self.axis_x.end
+        )?;
         if let Some(axis_y) = &self.axis_y {
             write!(f, ", y in [{}, {})", axis_y.start, axis_y.end)?;
         }
         writeln!(f, ", workgroup {:?}", self.workgroup_size)?;
         for buffer in &self.buffers {
-            let access = if buffer.writable { "read_write" } else { "read" };
-            writeln!(f, "// buffer arg{}: Float32Array, {access}", buffer.arg_index)?;
+            let access = if buffer.writable {
+                "read_write"
+            } else {
+                "read"
+            };
+            writeln!(
+                f,
+                "// buffer arg{}: Float32Array, {access}",
+                buffer.arg_index
+            )?;
         }
         for index in &self.uniforms {
             writeln!(f, "// uniform arg{index}: int32")?;
         }
         for check in &self.strides {
             let axis = ["x", "y"][check.inner_axis];
-            writeln!(f, "// guard |{}| >= {} * extent.{axis}", check.stride, check.inner)?;
+            writeln!(
+                f,
+                "// guard |{}| >= {} * extent.{axis}",
+                check.stride, check.inner
+            )?;
         }
         f.write_str(&self.wgsl)
     }

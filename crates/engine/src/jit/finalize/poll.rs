@@ -1,5 +1,5 @@
-use cranelift_codegen::ir::{MemFlagsData, types};
 use crate::jit::module::CodeModule;
+use cranelift_codegen::ir::{MemFlagsData, types};
 use cranelift_module::Module;
 
 use crate::jit::helpers::{self, Helper};

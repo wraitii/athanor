@@ -6,11 +6,11 @@ pub(super) mod runtime;
 use naga::back::wgsl::{self, WriterFlags};
 use naga::valid::{Capabilities, ValidationFlags, Validator};
 use naga::{
-    AddressSpace, ArraySize, BinaryOperator as NagaBinOp, Binding as NagaBinding, Block as NagaBlock,
-    BuiltIn, EntryPoint, Expression, Function, FunctionArgument, GlobalVariable, Handle, Literal,
-    LocalVariable, Module, ResourceBinding, Scalar, ScalarKind, ShaderStage, Span as NagaSpan,
-    Statement, StorageAccess, StructMember, Type, TypeInner, UnaryOperator as NagaUnaryOp,
-    VectorSize,
+    AddressSpace, ArraySize, BinaryOperator as NagaBinOp, Binding as NagaBinding,
+    Block as NagaBlock, BuiltIn, EntryPoint, Expression, Function, FunctionArgument,
+    GlobalVariable, Handle, Literal, LocalVariable, Module, ResourceBinding, Scalar, ScalarKind,
+    ShaderStage, Span as NagaSpan, Statement, StorageAccess, StructMember, Type, TypeInner,
+    UnaryOperator as NagaUnaryOp, VectorSize,
 };
 use oxc_syntax::operator::BinaryOperator;
 
@@ -77,7 +77,8 @@ pub(in crate::jit) fn try_inject_gpu(graph: &mut Graph) -> bool {
     for i in 0..arity {
         arg_values.push(graph.append_value(gpu_entry, span, Op::Argument(i)));
     }
-    let args_array = graph.append_value(gpu_entry, span, Op::Javascript(JsOp::NewArray(arg_values)));
+    let args_array =
+        graph.append_value(gpu_entry, span, Op::Javascript(JsOp::NewArray(arg_values)));
     let id_val = graph.append_value(
         gpu_entry,
         span,
@@ -146,13 +147,17 @@ fn extract_bound(graph: &Graph, value: Value) -> Option<BoundSpec> {
             Some(BoundSpec::ArgAdd(*i, -(*n as i32)))
         }
         Op::Javascript(JsOp::Binary(BinaryOperator::Addition, l, r)) => {
-            if let (Some(Op::Argument(i)), Some(Op::Javascript(JsOp::Constant(Constant::Number(n))))) =
-                (graph.defining_op(*l), graph.defining_op(*r))
+            if let (
+                Some(Op::Argument(i)),
+                Some(Op::Javascript(JsOp::Constant(Constant::Number(n)))),
+            ) = (graph.defining_op(*l), graph.defining_op(*r))
             {
                 return Some(BoundSpec::ArgAdd(*i, *n as i32));
             }
-            if let (Some(Op::Javascript(JsOp::Constant(Constant::Number(n)))), Some(Op::Argument(i))) =
-                (graph.defining_op(*l), graph.defining_op(*r))
+            if let (
+                Some(Op::Javascript(JsOp::Constant(Constant::Number(n)))),
+                Some(Op::Argument(i)),
+            ) = (graph.defining_op(*l), graph.defining_op(*r))
             {
                 return Some(BoundSpec::ArgAdd(*i, *n as i32));
             }
@@ -188,7 +193,12 @@ pub(super) fn compile_kernel(graph: &Graph) -> Result<GpuKernel, String> {
     let (outer_y, outer_x) = find_grid_loops(graph, &cfg, &loops)?;
     let (kernel_header, kernel_entry, kernel_latch, kernel_blocks) = match &outer_x {
         Some(inner) => (inner.header, inner.body_entry, inner.latch, &inner.body),
-        None => (outer_y.header, outer_y.body_entry, outer_y.latch, &outer_y.body),
+        None => (
+            outer_y.header,
+            outer_y.body_entry,
+            outer_y.latch,
+            &outer_y.body,
+        ),
     };
     let grid: Vec<&CountedLoop> = std::iter::once(&outer_y).chain(outer_x.as_ref()).collect();
     check_isolated(graph, &grid, kernel_blocks, kernel_header)?;
@@ -218,22 +228,19 @@ pub(super) fn compile_kernel(graph: &Graph) -> Result<GpuKernel, String> {
         let ax = AxisSpec {
             start: extract_bound(graph, x_loop.start)
                 .ok_or_else(|| "non-affine x start".to_string())?,
-            end: extract_bound(graph, x_loop.end)
-                .ok_or_else(|| "non-affine x end".to_string())?,
+            end: extract_bound(graph, x_loop.end).ok_or_else(|| "non-affine x end".to_string())?,
         };
         let ay = AxisSpec {
             start: extract_bound(graph, outer_y.start)
                 .ok_or_else(|| "non-affine y start".to_string())?,
-            end: extract_bound(graph, outer_y.end)
-                .ok_or_else(|| "non-affine y end".to_string())?,
+            end: extract_bound(graph, outer_y.end).ok_or_else(|| "non-affine y end".to_string())?,
         };
         (ax, Some(ay), [16, 16, 1])
     } else {
         let ax = AxisSpec {
             start: extract_bound(graph, outer_y.start)
                 .ok_or_else(|| "non-affine start".to_string())?,
-            end: extract_bound(graph, outer_y.end)
-                .ok_or_else(|| "non-affine end".to_string())?,
+            end: extract_bound(graph, outer_y.end).ok_or_else(|| "non-affine end".to_string())?,
         };
         (ax, None, [64, 1, 1])
     };
@@ -389,7 +396,10 @@ fn is_unit_increment(graph: &Graph, next: Value, iv: Value) -> bool {
             op: low_level::Binary::Add,
             left,
             right,
-        })) => (*left == iv && is_const_one(graph, *right)) || (*right == iv && is_const_one(graph, *left)),
+        })) => {
+            (*left == iv && is_const_one(graph, *right))
+                || (*right == iv && is_const_one(graph, *left))
+        }
         _ => false,
     }
 }
@@ -440,7 +450,11 @@ fn check_isolated(
                     graph.defining_op(*value),
                     Some(Op::Javascript(JsOp::Constant(Constant::Undefined)))
                 ) => {}
-            _ => return Err(format!("unsupported control flow outside the loop nest in {block}")),
+            _ => {
+                return Err(format!(
+                    "unsupported control flow outside the loop nest in {block}"
+                ));
+            }
         }
     }
     Ok(())
@@ -482,7 +496,10 @@ fn check_independent(
         }
     }
     for (recv, index) in reads {
-        let stored = stores.iter().find(|(buffer, _)| *buffer == recv).map(|(_, index)| index);
+        let stored = stores
+            .iter()
+            .find(|(buffer, _)| *buffer == recv)
+            .map(|(_, index)| index);
         if Affine::of(graph, index, axes).as_ref() != stored {
             return Err("written buffer is read at another iteration's index".into());
         }
@@ -873,7 +890,14 @@ impl<'a> Emitter<'a> {
         } else {
             Some(4)
         };
-        self.emit(block, Expression::As { expr, kind, convert })
+        self.emit(
+            block,
+            Expression::As {
+                expr,
+                kind,
+                convert,
+            },
+        )
     }
 
     fn get_or_emit_value(
@@ -916,9 +940,10 @@ impl<'a> Emitter<'a> {
                 };
                 Ok((self.emit_pre(Expression::Literal(lit)), ty))
             }
-            Op::Javascript(JsOp::Constant(Constant::Boolean(b))) => {
-                Ok((self.emit_pre(Expression::Literal(Literal::Bool(*b))), ScalarTy::Bool))
-            }
+            Op::Javascript(JsOp::Constant(Constant::Boolean(b))) => Ok((
+                self.emit_pre(Expression::Literal(Literal::Bool(*b))),
+                ScalarTy::Bool,
+            )),
             Op::Javascript(JsOp::Unary(UnaryOp::Increment, v)) => {
                 let (expr, ty) = self.get_or_emit_value(block, *v)?;
                 let one = match ty {
@@ -1063,7 +1088,12 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    fn param_local(&mut self, block: Block, index: usize, value: Value) -> (Handle<LocalVariable>, ScalarTy) {
+    fn param_local(
+        &mut self,
+        block: Block,
+        index: usize,
+        value: Value,
+    ) -> (Handle<LocalVariable>, ScalarTy) {
         if let Some(&pair) = self.param_locals.get(&(block, index)) {
             return pair;
         }
@@ -1186,15 +1216,16 @@ impl<'a> Emitter<'a> {
                 };
                 let cond_pair = self.get_or_emit_value(&mut loop_stmts, cond)?;
                 let cond_expr = self.coerce(&mut loop_stmts, cond_pair, ScalarTy::Bool);
-                let (inside_target, exit_target, break_on_true) =
-                    if loop_body.contains(&then_t.block) && !loop_body.contains(&else_t.block) {
-                        (then_t, else_t, false)
-                    } else if loop_body.contains(&else_t.block) && !loop_body.contains(&then_t.block)
-                    {
-                        (else_t, then_t, true)
-                    } else {
-                        return Err(format!("unsupported inner loop exit shape at {cur}"));
-                    };
+                let (inside_target, exit_target, break_on_true) = if loop_body
+                    .contains(&then_t.block)
+                    && !loop_body.contains(&else_t.block)
+                {
+                    (then_t, else_t, false)
+                } else if loop_body.contains(&else_t.block) && !loop_body.contains(&then_t.block) {
+                    (else_t, then_t, true)
+                } else {
+                    return Err(format!("unsupported inner loop exit shape at {cur}"));
+                };
                 let break_cond = if break_on_true {
                     cond_expr
                 } else {
@@ -1314,8 +1345,20 @@ impl<'a> Emitter<'a> {
         }
         let gid = self.emit_pre(Expression::FunctionArgument(0));
         let (workgroup_size, guard_cond) = if let Some(x_loop) = outer_x {
-            let gid_x = self.emit(&mut body, Expression::AccessIndex { base: gid, index: 0 });
-            let gid_y = self.emit(&mut body, Expression::AccessIndex { base: gid, index: 1 });
+            let gid_x = self.emit(
+                &mut body,
+                Expression::AccessIndex {
+                    base: gid,
+                    index: 0,
+                },
+            );
+            let gid_y = self.emit(
+                &mut body,
+                Expression::AccessIndex {
+                    base: gid,
+                    index: 1,
+                },
+            );
             let gid_x_i32 = self.emit(
                 &mut body,
                 Expression::As {
@@ -1384,7 +1427,13 @@ impl<'a> Emitter<'a> {
             );
             ([16, 16, 1], oob)
         } else {
-            let gid_x = self.emit(&mut body, Expression::AccessIndex { base: gid, index: 0 });
+            let gid_x = self.emit(
+                &mut body,
+                Expression::AccessIndex {
+                    base: gid,
+                    index: 0,
+                },
+            );
             let gid_x_i32 = self.emit(
                 &mut body,
                 Expression::As {
@@ -1449,13 +1498,7 @@ impl<'a> Emitter<'a> {
     }
 }
 
-fn find_merge(
-    graph: &Graph,
-    cfg: &Cfg,
-    a: Block,
-    b: Block,
-    stop: Block,
-) -> Option<Block> {
+fn find_merge(graph: &Graph, cfg: &Cfg, a: Block, b: Block, stop: Block) -> Option<Block> {
     let mut reach_a = FxHashSet::default();
     let mut stack = vec![a];
     while let Some(bb) = stack.pop() {

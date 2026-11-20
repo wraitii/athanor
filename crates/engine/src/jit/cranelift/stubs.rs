@@ -1,10 +1,10 @@
+use crate::jit::module::CodeModule;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
     AbiParam, InstBuilder, MemFlagsData, Signature, StackSlotData, StackSlotKind, Type, types,
 };
 use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-use crate::jit::module::CodeModule;
 use cranelift_module::{FuncId, Module};
 
 use crate::error::Error;

@@ -1,6 +1,6 @@
+use crate::jit::module::CodeModule;
 use cranelift_codegen::Context;
 use cranelift_codegen::control::ControlPlane;
-use crate::jit::module::CodeModule;
 use cranelift_module::{FuncId, Module, ModuleReloc};
 
 use crate::error::Error;

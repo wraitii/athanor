@@ -111,7 +111,9 @@ impl Definition {
     fn intern(source: &str, flags: u8) -> &'static Self {
         static DEFINITIONS: LazyLock<Mutex<FxHashMap<(String, u8), &'static Definition>>> =
             LazyLock::new(Default::default);
-        let mut definitions = DEFINITIONS.lock().unwrap_or_else(|error| error.into_inner());
+        let mut definitions = DEFINITIONS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         definitions
             .entry((source.to_owned(), flags))
             .or_insert_with(|| {

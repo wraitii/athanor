@@ -5,12 +5,12 @@ pub(in crate::jit) use legalize::prepare;
 #[cfg(test)]
 pub(in crate::jit) use legalize::split_indexed_loads;
 
+use crate::jit::module::CodeModule;
 use cranelift_codegen::entity::SecondaryMap;
 use cranelift_codegen::ir::{
     BlockArg, InstBuilder, StackSlotData, StackSlotKind, Value as ClifValue, types,
 };
 use cranelift_frontend::FunctionBuilder;
-use crate::jit::module::CodeModule;
 use cranelift_module::Module;
 
 use crate::error::Error;

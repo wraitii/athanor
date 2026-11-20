@@ -8,13 +8,26 @@ pub(super) type StateId = u32;
 
 #[derive(Clone, Debug)]
 pub(super) enum State {
-    Bytes { start: u8, end: u8, next: StateId },
+    Bytes {
+        start: u8,
+        end: u8,
+        next: StateId,
+    },
     Split(Vec<StateId>),
     Start(StateId),
     End(StateId),
-    WordBoundary { negated: bool, next: StateId },
-    Save { slot: usize, next: StateId },
-    Reset { slots: std::ops::Range<usize>, next: StateId },
+    WordBoundary {
+        negated: bool,
+        next: StateId,
+    },
+    Save {
+        slot: usize,
+        next: StateId,
+    },
+    Reset {
+        slots: std::ops::Range<usize>,
+        next: StateId,
+    },
     Match,
 }
 
@@ -158,7 +171,12 @@ impl Builder {
 fn utf8_sequences(set: &Set) -> Vec<Vec<(u8, u8)>> {
     let mut sequences = Vec::new();
     for &(start, end) in set.ranges() {
-        for (low, high) in [(0, 0x7f), (0x80, 0x7ff), (0x800, 0xffff), (0x10000, 0x10ffff)] {
+        for (low, high) in [
+            (0, 0x7f),
+            (0x80, 0x7ff),
+            (0x800, 0xffff),
+            (0x10000, 0x10ffff),
+        ] {
             let (start, end) = (start.max(low), end.min(high));
             if start <= end {
                 split_sequence(start, end, &mut sequences);

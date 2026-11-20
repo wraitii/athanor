@@ -680,8 +680,9 @@ fn identity(graph: &Graph, op: Binary, left: Value, right: Value) -> Option<Valu
     };
     let other = if kept == left { right } else { left };
     let repr = graph.reprs[kept]?;
-    (repr != Repr::Boxed && graph.reprs[other].is_some_and(|other| other.machine() == repr.machine()))
-        .then_some(kept)
+    (repr != Repr::Boxed
+        && graph.reprs[other].is_some_and(|other| other.machine() == repr.machine()))
+    .then_some(kept)
 }
 
 pub(in crate::jit) struct Instructions<'b, I: Insert + ?Sized> {

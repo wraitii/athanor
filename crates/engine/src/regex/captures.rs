@@ -95,7 +95,9 @@ pub(super) fn captures(
                 }
                 State::Reset { slots, next } => {
                     for slot in slots.clone() {
-                        scratch.stack.push(Frame::Restore(slot, scratch.slots[slot]));
+                        scratch
+                            .stack
+                            .push(Frame::Restore(slot, scratch.slots[slot]));
                         scratch.slots[slot] = UNSET;
                     }
                     id = *next;

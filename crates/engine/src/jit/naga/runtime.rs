@@ -51,10 +51,12 @@ impl GpuRuntime {
     fn get() -> Result<&'static Self, String> {
         RUNTIME
             .get_or_init(|| {
-                let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-                let adapter =
-                    pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
-                        .map_err(|e| format!("wgpu adapter failed: {e}"))?;
+                let instance =
+                    wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+                let adapter = pollster::block_on(
+                    instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
+                )
+                .map_err(|e| format!("wgpu adapter failed: {e}"))?;
                 let (device, queue) =
                     pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
                         .map_err(|e| format!("wgpu device failed: {e}"))?;
@@ -68,7 +70,13 @@ impl GpuRuntime {
             .map_err(Clone::clone)
     }
 
-    fn dispatch(&self, kernel_id: usize, kernel: &GpuKernel, args: &[Value], ctx: &JitCtx) -> Result<bool, String> {
+    fn dispatch(
+        &self,
+        kernel_id: usize,
+        kernel: &GpuKernel,
+        args: &[Value],
+        ctx: &JitCtx,
+    ) -> Result<bool, String> {
         let mut uniform_bytes = Vec::with_capacity(kernel.uniforms.len().div_ceil(4) * 16);
         for &index in &kernel.uniforms {
             let Some(value) = int_arg(args, index) else {
@@ -77,7 +85,9 @@ impl GpuRuntime {
             uniform_bytes.extend_from_slice(&value.to_le_bytes());
         }
         uniform_bytes.resize(uniform_bytes.len().div_ceil(16) * 16, 0);
-        let extent = |axis: &AxisSpec| Some(i64::from(axis.end.eval(args)?) - i64::from(axis.start.eval(args)?));
+        let extent = |axis: &AxisSpec| {
+            Some(i64::from(axis.end.eval(args)?) - i64::from(axis.start.eval(args)?))
+        };
         let Some(dim_x) = extent(&kernel.axis_x) else {
             return Ok(false);
         };
@@ -103,7 +113,8 @@ impl GpuRuntime {
             }
         }
         let heap = ctx.global.heap();
-        let mut host_buffers: Vec<(Value, Vec<f32>, bool)> = Vec::with_capacity(kernel.buffers.len());
+        let mut host_buffers: Vec<(Value, Vec<f32>, bool)> =
+            Vec::with_capacity(kernel.buffers.len());
         for buf in &kernel.buffers {
             let Some(&val) = args.get(buf.arg_index) else {
                 return Ok(false);
@@ -127,10 +138,12 @@ impl GpuRuntime {
             let mut map = self.pipelines.lock().unwrap();
             map.entry(kernel_id)
                 .or_insert_with(|| {
-                    let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                        label: None,
-                        source: wgpu::ShaderSource::Naga(Cow::Owned(kernel.module.clone())),
-                    });
+                    let shader = self
+                        .device
+                        .create_shader_module(wgpu::ShaderModuleDescriptor {
+                            label: None,
+                            source: wgpu::ShaderSource::Naga(Cow::Owned(kernel.module.clone())),
+                        });
                     self.device
                         .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                             label: None,
@@ -174,7 +187,8 @@ impl GpuRuntime {
             self.queue.write_buffer(&buffer, 0, &uniform_bytes);
             buffer
         });
-        let mut entries = Vec::with_capacity(gpu_buffers.len() + usize::from(uniform_buffer.is_some()));
+        let mut entries =
+            Vec::with_capacity(gpu_buffers.len() + usize::from(uniform_buffer.is_some()));
         for (i, buffer) in gpu_buffers.iter().enumerate() {
             entries.push(wgpu::BindGroupEntry {
                 binding: i as u32,

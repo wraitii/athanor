@@ -73,12 +73,19 @@ fn boundaries(text: &str) -> Vec<usize> {
 }
 
 fn inputs(pattern: &str, pool: &[String], rng: &mut Rng) -> Vec<String> {
-    let mut alphabet: Vec<char> = pattern.chars().filter(|c| !"\\[]()|*+?{}^$".contains(*c)).collect();
-    alphabet.extend(['a', 'B', '0', '_', ' ', '\t', '\n', '=', ';', '/', 'é', '€', '😀', '\u{a0}', '\u{2028}']);
+    let mut alphabet: Vec<char> = pattern
+        .chars()
+        .filter(|c| !"\\[]()|*+?{}^$".contains(*c))
+        .collect();
+    alphabet.extend([
+        'a', 'B', '0', '_', ' ', '\t', '\n', '=', ';', '/', 'é', '€', '😀', '\u{a0}', '\u{2028}',
+    ]);
     let mut inputs: Vec<String> = (0..64)
         .map(|_| {
             let length = rng.below(24);
-            (0..length).map(|_| alphabet[rng.below(alphabet.len())]).collect()
+            (0..length)
+                .map(|_| alphabet[rng.below(alphabet.len())])
+                .collect()
         })
         .collect();
     inputs.push(String::new());

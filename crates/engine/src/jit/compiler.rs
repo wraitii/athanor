@@ -5,11 +5,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::jit::module::{CodeModule, new_module};
 use cranelift_codegen::Context;
 use cranelift_codegen::ir::{AbiParam, Signature, types};
 use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::FunctionBuilderContext;
-use crate::jit::module::{CodeModule, new_module};
 use cranelift_module::{FuncId, Linkage, Module};
 use oxc_ast::AstKind;
 use oxc_ast::ast::{

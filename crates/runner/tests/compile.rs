@@ -64,14 +64,21 @@ fn after_views_span_specialization_and_lowering() {
 fn diff_prints_one_listing_then_changes_between_passes() {
     let source = "function helper(x){return x*2;} function selected(a,n){let sum=0;for(let i=0;i<n;++i)sum+=helper(a[i]);return sum;}";
     let output = compile(&["--filter", "selected", "--diff"], source);
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let text = String::from_utf8(output.stdout).unwrap();
     let listings = text
         .lines()
         .filter(|line| line.contains("semantic IR selected after") && !line.ends_with("after wgsl"))
         .count();
     assert_eq!(listings, 1, "{text}");
-    assert!(text.contains("diff selected after inline/round 1\n@@ "), "{text}");
+    assert!(
+        text.contains("diff selected after inline/round 1\n@@ "),
+        "{text}"
+    );
     assert!(text.contains("unchanged selected: "), "{text}");
     assert!(!text.contains("  @0"), "{text}");
 }

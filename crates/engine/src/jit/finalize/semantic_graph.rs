@@ -21,11 +21,11 @@ use super::FunctionCompiler;
 use super::ops::{self, BinaryOp, UnaryOp as EmitUnaryOp};
 use super::repr::Operand;
 use crate::jit::semantic::Repr;
+use crate::jit::semantic::ValueType;
 use crate::jit::semantic::contracts::ResultReference;
 use crate::jit::semantic::ownership::{Holder, Plan};
 use crate::jit::semantic::regex;
 use crate::jit::semantic::runtime::layout;
-use crate::jit::semantic::ValueType;
 
 const UNMANAGED: ValueType = ValueType::NUMBER
     .union(ValueType::BOOLEAN)

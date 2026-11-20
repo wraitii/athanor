@@ -31,7 +31,9 @@ impl Dfa {
     pub(crate) fn matching(&self, state: u32) -> Option<bool> {
         let row = state as usize * self.class_count;
         let row = &self.matching_before[row..row + self.class_count];
-        row.iter().all(|&matching| matching == row[0]).then_some(row[0])
+        row.iter()
+            .all(|&matching| matching == row[0])
+            .then_some(row[0])
     }
 
     pub(crate) fn may_match(&self, state: u32) -> bool {
@@ -188,7 +190,11 @@ impl Builder<'_> {
             Some(word) => Lookahead::Byte(word),
             None => Lookahead::End,
         };
-        self.closure_with(list, context.beginning, Some((context.after_word, lookahead)))
+        self.closure_with(
+            list,
+            context.beginning,
+            Some((context.after_word, lookahead)),
+        )
     }
 
     fn closure(&self, seeds: &[StateId], beginning: bool) -> Vec<StateId> {

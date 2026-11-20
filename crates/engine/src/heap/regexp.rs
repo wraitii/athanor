@@ -16,7 +16,10 @@ pub(crate) fn regexp_flags(bits: u8) -> regress::Flags {
     }
 }
 
-fn split_ranges(pattern: &crate::regex::Pattern, text: &str) -> Vec<Option<std::ops::Range<usize>>> {
+fn split_ranges(
+    pattern: &crate::regex::Pattern,
+    text: &str,
+) -> Vec<Option<std::ops::Range<usize>>> {
     if text.is_empty() {
         return match pattern.find(text, 0) {
             Some(_) => Vec::new(),

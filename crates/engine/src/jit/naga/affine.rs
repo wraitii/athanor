@@ -72,7 +72,12 @@ impl Affine {
 
     fn add(mut self, other: &Self, sign: i64) -> Option<Self> {
         for (&atom, &factor) in &other.0 {
-            let sum = self.0.get(&atom).copied().unwrap_or(0).checked_add(factor.checked_mul(sign)?)?;
+            let sum = self
+                .0
+                .get(&atom)
+                .copied()
+                .unwrap_or(0)
+                .checked_add(factor.checked_mul(sign)?)?;
             if sum == 0 {
                 self.0.remove(&atom);
             } else {
@@ -123,7 +128,9 @@ impl Affine {
             };
         }
         let (inner_axis, inner, stride) = match (self.scale(0)?, self.scale(1)?) {
-            (Scale::Const(x), Scale::Const(y)) if y.unsigned_abs() < x.unsigned_abs() => (1, y, Scale::Const(x)),
+            (Scale::Const(x), Scale::Const(y)) if y.unsigned_abs() < x.unsigned_abs() => {
+                (1, y, Scale::Const(x))
+            }
             (Scale::Const(x), stride) => (0, x, stride),
             (stride, Scale::Const(y)) => (1, y, stride),
             _ => return Err("store index has no unit axis".into()),

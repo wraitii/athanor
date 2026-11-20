@@ -342,9 +342,7 @@ fn canonical(graph: &Graph, facts: &Facts, value: Value, depth: usize) -> bool {
             right,
         })) => operand(*left) && operand(*right),
         Some(
-            Op::Unbox(input, _)
-            | Op::Convert(input, _)
-            | Op::Javascript(JsOp::NumericFloat(input)),
+            Op::Unbox(input, _) | Op::Convert(input, _) | Op::Javascript(JsOp::NumericFloat(input)),
         ) => match graph.repr(*input) {
             Repr::Integer(_) | Repr::Boolean => true,
             Repr::Boxed => facts.of(*input).within(ValueType::NUMBER),
