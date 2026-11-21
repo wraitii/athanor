@@ -3,6 +3,8 @@ use super::super::{
     BlockData, Constant, FunctionState, Graph, Op, Repr, Target, Terminator, TerminatorKind,
     TypedRead, ValueType,
 };
+use super::super::{MemoryFormat, MemoryOp};
+use crate::heap::TypedKind;
 use crate::jit::semantic::JsOp;
 
 pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) -> super::super::Result<bool> {
@@ -84,8 +86,6 @@ pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) -> super::su
 
 pub(in crate::jit::semantic) fn lower_memory(function: &mut FunctionState) -> bool {
     function.ensure_cfg();
-    use super::super::{MemoryFormat, MemoryOp};
-    use crate::heap::TypedKind;
 
     let graph = &mut function.graph;
     let mut changed = false;
@@ -108,16 +108,7 @@ pub(in crate::jit::semantic) fn lower_memory(function: &mut FunctionState) -> bo
             else {
                 continue;
             };
-            let format = match element {
-                TypedKind::Uint8 => MemoryFormat::U8,
-                TypedKind::Uint16 => MemoryFormat::U16,
-                TypedKind::Uint32 => MemoryFormat::U32,
-                TypedKind::Int8 => MemoryFormat::I8,
-                TypedKind::Int16 => MemoryFormat::I16,
-                TypedKind::Int32 => MemoryFormat::I32,
-                TypedKind::Float32 => MemoryFormat::F32,
-                TypedKind::Float64 => MemoryFormat::F64,
-            };
+            let format = memory_format(element);
             let existing_view = graph.views.remove(&inst);
             let mut at = Cursor::before(graph, inst);
             let view = existing_view
@@ -138,6 +129,19 @@ pub(in crate::jit::semantic) fn lower_memory(function: &mut FunctionState) -> bo
         function.invalidate_values();
     }
     changed
+}
+
+fn memory_format(element: TypedKind) -> MemoryFormat {
+    match element {
+        TypedKind::Uint8 => MemoryFormat::U8,
+        TypedKind::Uint16 => MemoryFormat::U16,
+        TypedKind::Uint32 => MemoryFormat::U32,
+        TypedKind::Int8 => MemoryFormat::I8,
+        TypedKind::Int16 => MemoryFormat::I16,
+        TypedKind::Int32 => MemoryFormat::I32,
+        TypedKind::Float32 => MemoryFormat::F32,
+        TypedKind::Float64 => MemoryFormat::F64,
+    }
 }
 
 pub(in crate::jit::semantic) fn lower_store(
@@ -245,14 +249,12 @@ pub(in crate::jit::semantic) fn lower_store(
         view,
         crate::heap::DATA_OFFSET,
     );
-    let bytes = at
-        .ins()
-        .iconst(types::I64, (1 << (element.element() & 3)) as i64);
-    let offset = at
-        .ins()
-        .binary(low_level::Binary::Multiply, position, bytes);
-    let address = at.ins().iadd(base, offset);
-    at.ins().store(MemFlagsData::trusted(), stored, address, 0);
+    at.add_effect(Op::Memory(MemoryOp::IndexedStore {
+        base,
+        index: position,
+        value: stored,
+        format: memory_format(element),
+    }));
     at.add_effect(Op::KeepAlive(object));
     graph.terminate(fast, data.span, TerminatorKind::Jump(Target::new(done)));
     super::super::dispatch::extend_regions(graph, block, first);

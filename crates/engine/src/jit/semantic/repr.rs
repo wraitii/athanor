@@ -242,6 +242,7 @@ pub(in crate::jit) fn intrinsic(op: &Op) -> Option<Repr> {
         Op::Memory(MemoryOp::IndexedLoad { format, .. } | MemoryOp::Load { format, .. }) => {
             format.repr()
         }
+        Op::Memory(MemoryOp::IndexedStore { .. }) => return None,
         Op::LowLevel(_) | Op::Aarch64(_) => return None,
         Op::AsWord(_) => Repr::Word,
         Op::Convert(_, repr) | Op::Unbox(_, repr) => *repr,

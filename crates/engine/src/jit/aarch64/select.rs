@@ -144,20 +144,19 @@ fn comparison(graph: &Graph, cond: IntCC, x: Value, y: Value) -> Condition {
 }
 
 fn indexed_load(graph: &Graph, inst: Inst) -> Option<(Address, Mem)> {
-    let Op::Memory(MemoryOp::IndexedLoad {
-        base,
-        index,
-        format,
-    }) = graph.insts[inst].op
-    else {
-        return None;
-    };
-    let mem = match format {
-        MemoryFormat::U8 | MemoryFormat::I8 => Mem::Ldrb,
-        MemoryFormat::U16 | MemoryFormat::I16 => Mem::Ldrh,
-        MemoryFormat::U32 | MemoryFormat::I32 => Mem::LdrW,
-        MemoryFormat::F32 => Mem::LdrS,
-        MemoryFormat::F64 => Mem::LdrD,
+    let (base, index, format, mem) = match graph.insts[inst].op {
+        Op::Memory(MemoryOp::IndexedLoad {
+            base,
+            index,
+            format,
+        }) => (base, index, format, format_mem(format)),
+        Op::Memory(MemoryOp::IndexedStore {
+            base,
+            index,
+            format,
+            ..
+        }) => (base, index, format, format_store(format)),
+        _ => return None,
     };
     let kind = match graph.reprs[index].map(Repr::machine)? {
         types::I64 => Index::Lsl,
@@ -520,6 +519,14 @@ fn instruction(
                 a::Op::Load {
                     op,
                     address: select.address(op, address),
+                }
+            }
+            MemoryOp::IndexedStore { value, .. } => {
+                let (address, op) = indexed.ok_or_else(|| Unsupported("indexed store".into()))?;
+                a::Op::Store {
+                    op,
+                    address: select.address(op, address),
+                    value: Some(value),
                 }
             }
             MemoryOp::Load { address, format } => {
@@ -1066,6 +1073,16 @@ impl Selector<'_> {
                 }
             }
         }
+    }
+}
+
+fn format_store(format: MemoryFormat) -> Mem {
+    match format {
+        MemoryFormat::U8 | MemoryFormat::I8 => Mem::Strb,
+        MemoryFormat::U16 | MemoryFormat::I16 => Mem::Strh,
+        MemoryFormat::U32 | MemoryFormat::I32 => Mem::StrW,
+        MemoryFormat::F32 => Mem::StrS,
+        MemoryFormat::F64 => Mem::StrD,
     }
 }
 

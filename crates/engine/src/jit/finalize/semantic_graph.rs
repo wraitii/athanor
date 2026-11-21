@@ -1354,6 +1354,18 @@ impl FunctionCompiler<'_, '_> {
                 let value = self.b.indexed_load(base, index, *format, repr.machine());
                 Some(Operand::new(value, repr))
             }
+            Op::Memory(MemoryOp::IndexedStore {
+                base,
+                index,
+                value,
+                format,
+            }) => {
+                let base = self.operand(cx, *base).value;
+                let index = self.operand(cx, *index).value;
+                let value = self.operand(cx, *value).value;
+                self.b.indexed_store(base, index, value, *format);
+                None
+            }
             Op::Javascript(JsOp::MemoryNumber(value, format)) => {
                 let raw = self.operand(cx, *value).value;
                 let (value, repr) = match format {

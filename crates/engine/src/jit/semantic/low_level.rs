@@ -427,6 +427,29 @@ impl<'a> Builder<'a> {
         result
     }
 
+    pub(in crate::jit) fn indexed_store(
+        &mut self,
+        base: Value,
+        index: Value,
+        value: Value,
+        format: super::MemoryFormat,
+    ) {
+        let block = self.current.expect("no current block");
+        let (inst, _) = self.graph.append(
+            block,
+            self.span,
+            GraphOp::Memory(super::MemoryOp::IndexedStore {
+                base,
+                index,
+                value,
+                format,
+            }),
+            false,
+        );
+        self.graph.insts[inst].emission_location = self.location;
+        self.graph.insts[inst].source_name = self.source_name;
+    }
+
     pub(in crate::jit) fn adopt(&mut self, inst: Inst) {
         let block = self.current.expect("no current block");
         self.graph.blocks[block].insts.push(inst);

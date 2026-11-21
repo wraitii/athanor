@@ -103,6 +103,7 @@ fn specific(graph: &Graph, inst: Inst) -> Option<Representations> {
         Op::Memory(MemoryOp::Address { .. }) => any(2, Some(Repr::Word)),
         Op::Memory(MemoryOp::Load { format, .. }) => any(1, Some(format.repr())),
         Op::Memory(MemoryOp::IndexedLoad { format, .. }) => any(2, Some(format.repr())),
+        Op::Memory(MemoryOp::IndexedStore { .. }) => any(3, None),
         Op::KeepAlive(_) => any(1, None),
         Op::LowLevel(super::low_level::Op::Store { .. }) => any(2, None),
         Op::LowLevel(super::low_level::Op::ExtractBits { value, .. }) => {

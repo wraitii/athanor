@@ -4127,11 +4127,10 @@ fn write_lowering_keeps_generic_keys_and_materializes_selected_stores() {
                 .iter()
                 .any(|op| matches!(op, Op::Javascript(JsOp::ArrayStore(..))))
         );
-        assert!(
-            ops(&function.graph)
-                .iter()
-                .any(|op| matches!(op, Op::LowLevel(low_level::Op::Store { .. })))
-        );
+        assert!(ops(&function.graph).iter().any(|op| match element {
+            Some(_) => matches!(op, Op::Memory(MemoryOp::IndexedStore { .. })),
+            None => matches!(op, Op::LowLevel(low_level::Op::Store { .. })),
+        }));
         if element.is_none() {
             let old_reads = ops(&function.graph).iter().filter(|op| matches!(op,
                 Op::LowLevel(low_level::Op::Load { ty, offset: 0, .. }) if *ty == cranelift_codegen::ir::types::I64)).count();

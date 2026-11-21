@@ -20,11 +20,17 @@ pub(in crate::jit) fn split_indexed_loads(graph: &mut Graph) {
             if data.block != block {
                 continue;
             }
-            let Op::Memory(MemoryOp::IndexedLoad {
+            let (Op::Memory(MemoryOp::IndexedLoad {
                 base,
                 index,
                 format,
-            }) = data.op
+            })
+            | Op::Memory(MemoryOp::IndexedStore {
+                base,
+                index,
+                format,
+                ..
+            })) = data.op
             else {
                 continue;
             };
@@ -47,10 +53,20 @@ pub(in crate::jit) fn split_indexed_loads(graph: &mut Graph) {
             graph.insts[address_inst].source_name = data.source_name;
             graph.insts[address_inst].emission_location = data.emission_location;
             graph.reprs[address.unwrap()] = graph.reprs[base];
-            graph.insts[inst].op = Op::Memory(MemoryOp::Load {
-                address: address.unwrap(),
-                format,
-            });
+            graph.insts[inst].op = match data.op {
+                Op::Memory(MemoryOp::IndexedStore { value, .. }) => {
+                    Op::LowLevel(crate::jit::semantic::low_level::Op::Store {
+                        value,
+                        address: address.unwrap(),
+                        offset: 0,
+                        flags: cranelift_codegen::ir::MemFlagsData::trusted(),
+                    })
+                }
+                _ => Op::Memory(MemoryOp::Load {
+                    address: address.unwrap(),
+                    format,
+                }),
+            };
         }
     }
 }

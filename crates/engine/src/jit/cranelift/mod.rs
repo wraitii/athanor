@@ -87,9 +87,9 @@ pub(in crate::jit) fn emit(
                             0,
                         )
                     }
-                    MemoryOp::IndexedLoad { .. } => {
+                    MemoryOp::IndexedLoad { .. } | MemoryOp::IndexedStore { .. } => {
                         return Err(Error::Compile(
-                            "indexed load reached Cranelift emission".into(),
+                            "indexed access reached Cranelift emission".into(),
                         ));
                     }
                 };

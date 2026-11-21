@@ -250,6 +250,12 @@ pub(in crate::jit) enum MemoryOp {
         index: Value,
         format: MemoryFormat,
     },
+    IndexedStore {
+        base: Value,
+        index: Value,
+        value: Value,
+        format: MemoryFormat,
+    },
     Address {
         base: Value,
         index: Value,
@@ -482,6 +488,9 @@ impl Op {
                 ..
             })
             | Op::BooleanAnd(object, key) => ([Some(*object), Some(*key), None], &[]),
+            Op::Memory(MemoryOp::IndexedStore {
+                base, index, value, ..
+            }) => ([Some(*base), Some(*index), Some(*value)], &[]),
             Op::HelperCall { args: values, .. } => ([None; 3], values),
         };
         let [a, b, c] = fixed;
@@ -534,6 +543,9 @@ impl Op {
                 ..
             })
             | Op::BooleanAnd(object, key) => ([Some(object), Some(key), None], &mut []),
+            Op::Memory(MemoryOp::IndexedStore {
+                base, index, value, ..
+            }) => ([Some(base), Some(index), Some(value)], &mut []),
             Op::HelperCall { args: values, .. } => ([None, None, None], values),
         };
         let [a, b, c] = fixed;
@@ -1332,6 +1344,7 @@ impl Graph {
                 closed(HEAP_READ, Unowned)
             }
             Op::Memory(MemoryOp::Address { .. }) => closed(0, Unowned),
+            Op::Memory(MemoryOp::IndexedStore { .. }) => closed(HEAP_WRITE, None),
             Op::KeepAlive(_) => closed(INTERNAL, None),
             Op::BooleanAnd(..) => closed(0, Unowned),
             Op::Convert(..) | Op::Box(_) | Op::AsBoxed(_) | Op::AsWord(_) | Op::Unbox(..) => {
@@ -1603,13 +1616,16 @@ impl Graph {
                     let valid = match (&self.insts[inst].op, def) {
                         (
                             Op::Memory(
-                                MemoryOp::IndexedLoad { base, .. } | MemoryOp::Address { base, .. },
+                                MemoryOp::IndexedLoad { base, .. }
+                                | MemoryOp::IndexedStore { base, .. }
+                                | MemoryOp::Address { base, .. },
                             ),
                             Op::Javascript(JsOp::TypedData(_))
                             | Op::Memory(MemoryOp::Address { .. }),
                         ) => *base == value,
                         (
-                            Op::Memory(MemoryOp::Load { address, .. }),
+                            Op::Memory(MemoryOp::Load { address, .. })
+                            | Op::LowLevel(low_level::Op::Store { address, .. }),
                             Op::Memory(MemoryOp::Address { .. }),
                         ) => *address == value,
                         (
