@@ -181,6 +181,7 @@ fn stores(op: &Op) -> bool {
                 | JsOp::PropertyAdd(..)
                 | JsOp::FillPropertyStore(..)
                 | JsOp::SetIndex(..)
+                | JsOp::TypedSet(..)
                 | JsOp::Define(..)
                 | JsOp::ArrayAppend(..)
                 | JsOp::Initialize(..)

@@ -337,6 +337,7 @@ fn assumptions(op: &Op, facts: &Facts) -> &'static [Assumption] {
             | JsOp::FillPropertyCache(..)
             | JsOp::Set(..)
             | JsOp::SetIndex(..)
+            | JsOp::TypedSet(..)
             | JsOp::Define(..),
         ) => PROPERTY,
         Op::Javascript(JsOp::Spread(_) | JsOp::IteratorNext(_) | JsOp::EnumerateNext(_)) => {
@@ -463,7 +464,9 @@ impl Repository {
                     ) => {
                         effects.properties_read.insert("*".into());
                     }
-                    Op::Javascript(JsOp::SetIndex(..) | JsOp::ArrayAppend(..)) => {
+                    Op::Javascript(
+                        JsOp::SetIndex(..) | JsOp::TypedSet(..) | JsOp::ArrayAppend(..),
+                    ) => {
                         effects.properties_written.insert("*".into());
                         effects.memory.writes = effects.memory.writes.union(Locations::HEAP);
                     }

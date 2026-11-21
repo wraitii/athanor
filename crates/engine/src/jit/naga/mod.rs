@@ -496,7 +496,9 @@ fn check_independent(
         }
         for &inst in &graph.blocks[block].insts {
             match &graph.insts[inst].op {
-                Op::Javascript(JsOp::SetIndex(recv, index, _)) => {
+                Op::Javascript(
+                    JsOp::SetIndex(recv, index, _) | JsOp::TypedSet(recv, index, ..),
+                ) => {
                     let index = Affine::of(graph, *index, axes)
                         .ok_or("store index is not affine in the grid")?;
                     match stores.iter().find(|(buffer, _)| buffer == recv) {
@@ -681,7 +683,7 @@ fn collect_inputs(
                         buf_map.entry(*recv).or_insert((*index, false));
                     }
                 }
-                Op::Javascript(JsOp::SetIndex(recv, _, _)) => {
+                Op::Javascript(JsOp::SetIndex(recv, ..) | JsOp::TypedSet(recv, ..)) => {
                     if let Some(Op::Argument(index)) = graph.defining_op(*recv) {
                         let entry = buf_map.entry(*recv).or_insert((*index, true));
                         entry.1 = true;
@@ -1340,7 +1342,9 @@ impl<'a> Emitter<'a> {
             let data = &self.graph.insts[inst];
             match &data.op {
                 Op::Observe(_, _, _) | Op::ObserveMethod(_, _, _) | Op::ReadHint(_, _, _, _) => {}
-                Op::Javascript(JsOp::SetIndex(recv, idx, val)) => {
+                Op::Javascript(
+                    JsOp::SetIndex(recv, idx, val) | JsOp::TypedSet(recv, idx, val, _),
+                ) => {
                     let &global = self
                         .buffers
                         .get(recv)

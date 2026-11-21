@@ -607,6 +607,7 @@ impl FunctionCompiler<'_, '_> {
                                 | JsOp::IsUndefined(..)
                                 | JsOp::IsNullish(..)
                                 | JsOp::IsTyped(..)
+                                | JsOp::TypedSet(..)
                                 | JsOp::IsString(..)
                                 | JsOp::IsIndexed(..)
                                 | JsOp::IsOrdinaryArray(..)

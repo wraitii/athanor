@@ -7,6 +7,19 @@ pub(in crate::jit::semantic) fn lower(
     planned: &[super::reads::Read],
 ) -> super::super::Result<()> {
     if graph.has_handlers || graph.generator {
+        let typed: Vec<_> = graph
+            .insts
+            .iter()
+            .filter_map(|(inst, data)| match data.op {
+                Op::Javascript(JsOp::TypedSet(object, key, value, _)) => {
+                    Some((inst, JsOp::SetIndex(object, key, value)))
+                }
+                _ => None,
+            })
+            .collect();
+        for (inst, op) in typed {
+            graph.set_op(inst, Op::Javascript(op));
+        }
         return Ok(());
     }
     let stores: Vec<_> = Cfg::new(graph)
@@ -16,23 +29,22 @@ pub(in crate::jit::semantic) fn lower(
         .flat_map(|block| graph.blocks[block].insts.clone())
         .filter_map(|inst| {
             let data = &graph.insts[inst];
-            if !matches!(data.op, Op::Javascript(JsOp::SetIndex(..))) {
-                return None;
+            match data.op {
+                Op::Javascript(JsOp::TypedSet(.., element)) => return Some((inst, Some(element))),
+                Op::Javascript(JsOp::SetIndex(..)) => {}
+                _ => return None,
             }
-            planned
-                .iter()
-                .find(|access| {
-                    let original = &graph.insts[access.inst];
-                    original.span == data.span && original.source_name == data.source_name
-                })
-                .map(|access| (inst, access.clone()))
+            let access = planned.iter().find(|access| {
+                let original = &graph.insts[access.inst];
+                original.span == data.span && original.source_name == data.source_name
+            })?;
+            Some((inst, access.typed.then(|| access.element.unwrap())))
         })
         .collect();
-    for (inst, access) in stores {
-        if access.typed {
-            super::super::runtime::typed::lower_store(graph, inst, access.element.unwrap());
-        } else {
-            lower_array(graph, inst);
+    for (inst, element) in stores {
+        match element {
+            Some(element) => super::super::runtime::typed::lower_store(graph, inst, element),
+            None => lower_array(graph, inst),
         }
     }
     graph.verify()

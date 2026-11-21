@@ -25,6 +25,7 @@ pub(super) struct RegionPlan {
     pub(super) guards: Vec<Block>,
     pub(super) exits: Vec<Block>,
     pub(super) typed_reads: Vec<(Inst, TypedRead)>,
+    pub(super) typed_stores: Vec<(Inst, TypedKind)>,
     pub(super) array_reads: Vec<(Inst, IndexBound)>,
     pub(super) ranges: Vec<(Value, Interval)>,
     pub(super) survivors: Vec<(Fact, Origin)>,
@@ -165,6 +166,9 @@ impl RegionPlan {
                 read.element, read.bounded
             )
             .unwrap();
+        }
+        for (inst, element) in &self.typed_stores {
+            writeln!(out, "{indent}  typed store {inst}: element={element:?}").unwrap();
         }
         for &(inst, bound) in &self.array_reads {
             match bound {
@@ -432,7 +436,7 @@ pub(super) fn plan_region(
             _ => None,
         })
         .collect();
-    let (ranged, index_ranges) = ranged_reads(
+    let (ranged, index_ranges) = ranged_accesses(
         &planning, &facts, &body, &blocks, &objects, &bounded, &available, &inputs,
     );
     let mut bounds: Vec<_> = bounded.values().copied().collect();
@@ -520,6 +524,17 @@ pub(super) fn plan_region(
             }
         }
     }
+    let typed_stores: Vec<_> = blocks
+        .iter()
+        .flat_map(|&block| &planning.blocks[block].insts)
+        .filter_map(|&inst| {
+            let Op::Javascript(JsOp::SetIndex(object, ..)) = planning.insts[inst].op else {
+                return None;
+            };
+            let &(_, element) = typed.iter().find(|(candidate, _)| *candidate == object)?;
+            ranged.contains(&inst).then_some((inst, element?))
+        })
+        .collect();
     if locals.is_empty()
         && identities.is_empty()
         && requirements.is_empty()
@@ -562,6 +577,7 @@ pub(super) fn plan_region(
             guards,
             exits,
             typed_reads,
+            typed_stores,
             array_reads,
             ranges: index_ranges,
             survivors,
@@ -572,10 +588,10 @@ pub(super) fn plan_region(
     ))
 }
 
-/// Typed reads on `objects` whose key stays within an interval computable at region entry,
-/// and those intervals.
+/// Typed reads and stores on `objects` whose key stays within an interval computable at region
+/// entry, and those intervals.
 #[allow(clippy::too_many_arguments)]
-fn ranged_reads(
+fn ranged_accesses(
     graph: &Graph,
     facts: &Facts,
     body: &FxHashSet<Block>,
@@ -591,8 +607,11 @@ fn ranged_reads(
     let mut intervals = Vec::new();
     for &block in blocks.iter().filter(|block| !graph.cold.contains(block)) {
         for &inst in &graph.blocks[block].insts {
-            let Op::Javascript(JsOp::GetIndex(object, key) | JsOp::TypedIndex(object, key, _)) =
-                graph.insts[inst].op
+            let Op::Javascript(
+                JsOp::GetIndex(object, key)
+                | JsOp::TypedIndex(object, key, _)
+                | JsOp::SetIndex(object, key, _),
+            ) = graph.insts[inst].op
             else {
                 continue;
             };

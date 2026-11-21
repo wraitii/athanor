@@ -337,7 +337,8 @@ fn numeric_uses(graph: &Graph, cfg: &Cfg) -> FxHashSet<Value> {
                         | JsOp::Define(..)
                         | JsOp::GetIndex(..)
                         | JsOp::SetIndex(..)
-                        | JsOp::TypedIndex(..),
+                        | JsOp::TypedIndex(..)
+                        | JsOp::TypedSet(..),
                     ) => index == 0,
                     _ => false,
                 };

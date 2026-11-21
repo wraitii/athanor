@@ -178,6 +178,9 @@ pub(in crate::jit::semantic) fn op_text(graph: &Graph, op: &Op) -> String {
             format!("fill_property_store {object}.{name}, {value} {cache}")
         }
         Op::SetIndex(object, key, value) => format!("set {object}[{key}], {value}"),
+        Op::TypedSet(object, key, value, element) => {
+            format!("typed_set {object}[{key}], {value} {element:?}")
+        }
         Op::ToNumeric(value) => format!("to_numeric {value}"),
         Op::ToInt32(value) => format!("to_int32 {value}"),
         Op::Unary(operator, value) => format!("{operator:?} {value}").to_lowercase(),

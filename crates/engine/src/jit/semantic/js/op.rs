@@ -267,6 +267,8 @@ pub(in crate::jit) enum Op {
     View(Value),
     IsTyped(Value, Option<TypedKind>),
     TypedIndex(Value, Value, TypedRead),
+    // Typed-array store whose key is an exact position within the length.
+    TypedSet(Value, Value, Value, TypedKind),
     TypedData(Value),
     MemoryNumber(Value, MemoryFormat),
     IsNumber(Value),
@@ -441,7 +443,10 @@ impl Op {
             | Op::PropertyStore(object, key, value, _, _)
             | Op::PropertyAdd(object, key, value, _)
             | Op::FillPropertyStore(object, key, _, value, _)
-            | Op::SetIndex(object, key, value) => ([Some(*object), Some(*key), Some(*value)], &[]),
+            | Op::SetIndex(object, key, value)
+            | Op::TypedSet(object, key, value, _) => {
+                ([Some(*object), Some(*key), Some(*value)], &[])
+            }
             Op::StringConcat(values) | Op::NewArray(values) | Op::CallNative(_, values) => {
                 ([None; 3], values)
             }
@@ -608,7 +613,10 @@ impl Op {
             | Op::PropertyStore(object, key, value, _, _)
             | Op::PropertyAdd(object, key, value, _)
             | Op::FillPropertyStore(object, key, _, value, _)
-            | Op::SetIndex(object, key, value) => ([Some(object), Some(key), Some(value)], &mut []),
+            | Op::SetIndex(object, key, value)
+            | Op::TypedSet(object, key, value, _) => {
+                ([Some(object), Some(key), Some(value)], &mut [])
+            }
             Op::StringConcat(values) | Op::NewArray(values) | Op::CallNative(_, values) => {
                 ([None, None, None], values)
             }

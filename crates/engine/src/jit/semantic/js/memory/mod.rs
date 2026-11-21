@@ -85,7 +85,8 @@ impl Field {
                 | JsOp::ArrayGet(_, key)
                 | JsOp::ArrayLoad(_, key, _)
                 | JsOp::ArrayStore(_, key, _)
-                | JsOp::SetIndex(_, key, _),
+                | JsOp::SetIndex(_, key, _)
+                | JsOp::TypedSet(_, key, ..),
             ) if facts.of(*key).within(ValueType::NUMBER) => Self::Elements,
             Op::Javascript(JsOp::IndexedLength(_)) => Self::Length,
             Op::Javascript(JsOp::ArrayAppend(..) | JsOp::MapElement(..)) => Self::Elements,
@@ -239,6 +240,7 @@ fn write_target(op: &Op) -> Option<Value> {
             | JsOp::PropertyAdd(object, ..)
             | JsOp::FillPropertyStore(object, ..)
             | JsOp::SetIndex(object, ..)
+            | JsOp::TypedSet(object, ..)
             | JsOp::ArrayAppend(object, ..)
             | JsOp::IteratorNext(object)
             | JsOp::EnumerateNext(object),

@@ -149,8 +149,10 @@ pub(in crate::jit::semantic) fn lower_store(
     use cranelift_codegen::ir::{MemFlagsData, types};
     use oxc_syntax::operator::BinaryOperator as B;
     let data = graph.insts[inst].clone();
-    let Op::Javascript(JsOp::SetIndex(object, key, value)) = data.op else {
-        unreachable!()
+    let (object, key, value, bounded) = match data.op {
+        Op::Javascript(JsOp::SetIndex(object, key, value)) => (object, key, value, false),
+        Op::Javascript(JsOp::TypedSet(object, key, value, _)) => (object, key, value, true),
+        _ => unreachable!(),
     };
     let facts = super::super::Facts::compute(graph);
     let typed = super::super::guards::holds(
@@ -162,6 +164,7 @@ pub(in crate::jit::semantic) fn lower_store(
     );
     let first = graph.blocks.len();
     let (block, done, fallback) = super::super::dispatch::split(graph, inst);
+    graph.set_op(inst, Op::Javascript(JsOp::SetIndex(object, key, value)));
     let mut fast = if typed {
         block
     } else {
@@ -186,12 +189,14 @@ pub(in crate::jit::semantic) fn lower_store(
         .unwrap();
     let mut at = Cursor::at_end(graph, fast, inst);
     let position = at.add_unassigned(Op::Javascript(JsOp::ArrayPosition(key)));
-    let exact = at.add_unassigned(Op::Javascript(JsOp::IsExactPosition(key, position)));
-    fast = super::super::dispatch::branch(graph, inst, fast, exact, fallback);
-    let mut at = Cursor::at_end(graph, fast, inst);
-    let length = at.add_unassigned(Op::Javascript(JsOp::IndexedLength(object)));
-    let inside = at.add_unassigned(Op::Javascript(JsOp::IsInBounds(position, length)));
-    fast = super::super::dispatch::branch(graph, inst, fast, inside, fallback);
+    if !bounded {
+        let exact = at.add_unassigned(Op::Javascript(JsOp::IsExactPosition(key, position)));
+        fast = super::super::dispatch::branch(graph, inst, fast, exact, fallback);
+        let mut at = Cursor::at_end(graph, fast, inst);
+        let length = at.add_unassigned(Op::Javascript(JsOp::IndexedLength(object)));
+        let inside = at.add_unassigned(Op::Javascript(JsOp::IsInBounds(position, length)));
+        fast = super::super::dispatch::branch(graph, inst, fast, inside, fallback);
+    }
     let float = matches!(
         element,
         crate::heap::TypedKind::Float32 | crate::heap::TypedKind::Float64

@@ -131,7 +131,7 @@ pub(in crate::jit::semantic) fn contract(graph: &Graph, op: &Op, facts: &Facts) 
             HEAP_READ | HEAP_WRITE | CODE_WRITE | ALLOCATION | INTERNAL | ERROR,
             Unowned,
         ),
-        Op::Set(..) | Op::SetIndex(..) | Op::FillPropertyStore(..) => closed(
+        Op::Set(..) | Op::SetIndex(..) | Op::TypedSet(..) | Op::FillPropertyStore(..) => closed(
             HEAP_READ | HEAP_WRITE | CODE_WRITE | ALLOCATION | INTERNAL | ERROR,
             None,
         ),

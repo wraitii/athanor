@@ -50,6 +50,7 @@ pub(in crate::jit::semantic) struct Speculation<'a> {
     pub(in crate::jit::semantic) exits: &'a [Block],
     pub(in crate::jit::semantic) exits_true: &'a [Block],
     pub(in crate::jit::semantic) typed_reads: &'a [(Inst, TypedRead)],
+    pub(in crate::jit::semantic) typed_stores: &'a [(Inst, TypedKind)],
     pub(in crate::jit::semantic) array_reads: &'a [(Inst, IndexBound)],
     pub(in crate::jit::semantic) ranges: &'a [(Value, Interval)],
     pub(in crate::jit::semantic) assumes: &'a [(Value, Fact)],
@@ -1115,6 +1116,14 @@ pub(super) fn materialize(
             graph.insts[inst].op
         {
             graph.set_op(inst, Op::Javascript(JsOp::TypedIndex(object, key, read)));
+        }
+    }
+    for &(inst, element) in speculation.typed_stores {
+        if let Op::Javascript(JsOp::SetIndex(object, key, value)) = graph.insts[inst].op {
+            graph.set_op(
+                inst,
+                Op::Javascript(JsOp::TypedSet(object, key, value, element)),
+            );
         }
     }
     let native: Vec<_> = requirements

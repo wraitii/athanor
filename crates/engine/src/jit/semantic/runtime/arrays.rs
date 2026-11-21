@@ -16,9 +16,10 @@ pub(in crate::jit::semantic) fn generic_cold(function: &mut FunctionState) {
                 Op::Javascript(
                     JsOp::ArrayLoad(object, index, _) | JsOp::TypedIndex(object, index, _),
                 ) => Op::Javascript(JsOp::GetIndex(object, index)),
-                Op::Javascript(JsOp::ArrayStore(object, index, value)) => {
-                    Op::Javascript(JsOp::SetIndex(object, index, value))
-                }
+                Op::Javascript(
+                    JsOp::ArrayStore(object, index, value)
+                    | JsOp::TypedSet(object, index, value, _),
+                ) => Op::Javascript(JsOp::SetIndex(object, index, value)),
                 _ => continue,
             };
             graph.set_op(inst, op);

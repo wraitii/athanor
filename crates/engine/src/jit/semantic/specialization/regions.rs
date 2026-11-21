@@ -286,8 +286,11 @@ fn typed_entry(
     let mut typed = FxHashMap::default();
     for &block in body {
         for &inst in &graph.blocks[block].insts {
-            if let Op::Javascript(JsOp::GetIndex(object, key) | JsOp::TypedIndex(object, key, _)) =
-                graph.insts[inst].op
+            if let Op::Javascript(
+                JsOp::GetIndex(object, key)
+                | JsOp::TypedIndex(object, key, _)
+                | JsOp::SetIndex(object, key, _),
+            ) = graph.insts[inst].op
                 && (!body.contains(&graph.def_block(object)) || available.contains(&object))
                 && facts.of(key).within(NUMERIC)
                 && let Some(element) = candidates.iter().find_map(|&(value, fact)| match fact {
@@ -561,7 +564,8 @@ fn numeric_use(op: &Op, index: usize) -> bool {
             | JsOp::TypedIndex(..)
             | JsOp::ArrayGet(..)
             | JsOp::ArrayLoad(..)
-            | JsOp::SetIndex(..),
+            | JsOp::SetIndex(..)
+            | JsOp::TypedSet(..),
         ) => index == 1,
         _ => false,
     }

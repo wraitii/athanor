@@ -419,7 +419,8 @@ skips a typed read's bounds check when its key is built from `+`, `-` and consta
 invariant `*` over constants, invariants and counting loop counters: the entry evaluates
 the key's interval, checks the low end is non-negative and the high end below the length,
 and checks an endpoint is an int32 integer only where integer ranges cannot already prove
-it (`specialization/regions/intervals.rs`). Integer range proofs also keep typed read keys
+it (`specialization/regions/intervals.rs`). Typed stores with such keys become `TypedSet`, which
+lowers without exactness and bounds checks. Integer range proofs also keep typed read keys
 in integer arithmetic, as for array positions. Heap views
 and lowered offsets expose storage to optimized code only while their validity
 conditions hold. The slow helpers implement generic behavior when those

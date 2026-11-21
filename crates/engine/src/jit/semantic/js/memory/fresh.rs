@@ -22,6 +22,7 @@ fn contained_use(op: &Op, index: usize) -> bool {
             | JsOp::ArrayLoad(..)
             | JsOp::Set(..)
             | JsOp::SetIndex(..)
+            | JsOp::TypedSet(..)
             | JsOp::Define(..)
             | JsOp::ArrayAppend(..),
         ) => index == 0,

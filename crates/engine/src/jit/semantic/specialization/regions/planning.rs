@@ -186,6 +186,7 @@ fn plan(
             guards: &parent.guards,
             exits: &parent.exits,
             typed_reads: &parent.typed_reads,
+            typed_stores: &parent.typed_stores,
             array_reads: &parent.array_reads,
             ranges: &parent.ranges,
             code_guards: &parent.identities,
