@@ -77,6 +77,11 @@ substituting the file name. Its reference value is also arbitrary, and set
 high enough that scores stay above 100, since `FormatScore` otherwise needs
 `Number.prototype.toPrecision`.
 
+`gaussian-blur-int.js` is the integer counterpart: a `Uint8Array` image and
+output with an `Int16Array` kernel, normalized with `sum >> 8`. Every
+intermediate is an exact integer well inside int32, so the reduction can be
+reordered and computed in integer lanes without changing results.
+
 ### Results
 
 Apple Silicon; Node 23.9.0, Bun 1.3.1, SpiderMonkey 128,
