@@ -127,7 +127,9 @@ fn exact_index_arithmetic(graph: &Graph, facts: &Facts) -> FxHashSet<Inst> {
             continue;
         }
         for &inst in &graph.blocks[block].insts {
-            let Op::Javascript(JsOp::ArrayPosition(index)) = graph.insts[inst].op else {
+            let (Op::Javascript(JsOp::ArrayPosition(index))
+            | Op::Javascript(JsOp::TypedIndex(_, index, _))) = graph.insts[inst].op
+            else {
                 continue;
             };
             if !facts.of(index).within(ValueType::INTEGER) {
