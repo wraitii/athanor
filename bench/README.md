@@ -87,16 +87,24 @@ reordered and computed in integer lanes without changing results.
 Apple Silicon; Node 23.9.0, Bun 1.3.1, SpiderMonkey 128,
 QuickJS 2026-06-04, Ant 16.5.c41757b4.0. Higher is better.
 
+The jit column is the median of three release runs at `ec7efd5`
+(2026-11-21). Node and Bun gaussian-blur-typed and gaussian-blur-int
+scores are medians of three runs; the other new Node and Bun entries
+are single runs. The remaining columns are kept from earlier runs.
+
 | benchmark | jit | node jitless | node ≤Sparkplug | node ≤Maglev | node | bun | Ant | SpiderMonkey 128 | QuickJS |
 |-----------|----:|-------------:|----------------:|-------------:|-----:|----:|----:|----------------:|--------:|
-| richards | 4204 | 1753 | 2835 | 33057 | 44947 | 51484 | 5454 | 15621 | 1139 |
-| navier-stokes | 22722.5 | 2370 | 3379 | 27788 | 40096 | 33700 | 20755 | 21390 | 1783 |
-| gaussian-blur | 354.5 | 12.9 | 19.9 | 229 | 645 | 1282 | 153 | 260 | 7.93 |
-| deltablue | 3710.5 | 1849 | 3124 | 47307 | 118384 | 77133 | — | 17515 | 1291 |
-| splay | 7464.5 | — | — | — | 20715 | 72421 | — | — | 5827 |
-| raytrace | 5119 | — | — | — | 105226 | 201055 | — | — | 2905 |
-| crypto | 8679 | — | — | — | 63546 | 76789 | — | — | 979 |
-| earley-boyer | 4399.5 | — | — | — | — | — | — | — | — |
+| richards | 6383 | 1753 | 2835 | 33057 | 44947 | 51484 | 5454 | 15621 | 1139 |
+| navier-stokes | 22592 | 2370 | 3379 | 27788 | 40096 | 33700 | 20755 | 21390 | 1783 |
+| gaussian-blur | 356 | 12.9 | 19.9 | 229 | 645 | 1282 | 153 | 260 | 7.93 |
+| deltablue | 4723 | 1849 | 3124 | 47307 | 118384 | 77133 | — | 17515 | 1291 |
+| splay | 7302 | — | — | — | 20715 | 72421 | — | — | 5827 |
+| raytrace | 5091 | — | — | — | 105226 | 201055 | — | — | 2905 |
+| crypto | 8752 | — | — | — | 63546 | 76789 | — | — | 979 |
+| earley-boyer | 4229 | — | — | — | 95962 | 111476 | — | — | — |
+| regexp | 4875 | — | — | — | 12237 | 31702 | — | — | — |
+| gaussian-blur-typed | 1510 | — | — | — | 469 | 1041 | — | — | — |
+| gaussian-blur-int | 7586 | — | — | — | 470 | 920 | — | — | — |
 
 ### Compatibility audit, 2026-11-17
 
