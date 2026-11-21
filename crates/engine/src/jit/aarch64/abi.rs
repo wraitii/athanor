@@ -36,7 +36,7 @@ pub(super) fn assign(conv: CallConv, params: &[AbiParam]) -> Result<Assignment, 
                 RegClass::of(ty).ok_or_else(|| Unsupported(format!("argument type {ty}")))?;
             let next = match class {
                 RegClass::Int => &mut next_int,
-                RegClass::Float => &mut next_float,
+                RegClass::Float | RegClass::Vector => &mut next_float,
             };
             if *next < 8 {
                 *next += 1;

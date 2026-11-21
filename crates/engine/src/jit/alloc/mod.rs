@@ -8,6 +8,7 @@ use cranelift_codegen::ir::{Type, types};
 pub(crate) enum RegClass {
     Int,
     Float,
+    Vector,
 }
 
 impl RegClass {
@@ -28,6 +29,7 @@ pub(crate) struct Registers {
 pub(crate) struct Target {
     pub int: Registers,
     pub float: Registers,
+    pub vector: Registers,
 }
 
 impl Target {
@@ -35,6 +37,7 @@ impl Target {
         match class {
             RegClass::Int => &self.int,
             RegClass::Float => &self.float,
+            RegClass::Vector => &self.vector,
         }
     }
 }

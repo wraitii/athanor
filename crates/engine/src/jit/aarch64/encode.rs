@@ -362,6 +362,8 @@ pub(in crate::jit) enum Mem {
     StrS,
     LdrD,
     StrD,
+    LdrQ,
+    StrQ,
 }
 
 impl Mem {
@@ -371,6 +373,7 @@ impl Mem {
             Self::Ldrh | Self::Strh => 2,
             Self::LdrW | Self::StrW | Self::LdrS | Self::StrS => 4,
             Self::LdrX | Self::StrX | Self::LdrD | Self::StrD => 8,
+            Self::LdrQ | Self::StrQ => 16,
         }
     }
 
@@ -388,6 +391,8 @@ impl Mem {
             Self::StrS => 0xBD00_0000,
             Self::LdrD => 0xFD40_0000,
             Self::StrD => 0xFD00_0000,
+            Self::LdrQ => 0x3DC0_0000,
+            Self::StrQ => 0x3D80_0000,
         }
     }
 }
@@ -592,4 +597,52 @@ pub(super) fn float_imm8(bits: u64) -> Option<u32> {
 
 pub(super) fn fmov_imm(rd: u8, imm8: u32) -> u32 {
     0x1E60_1000 | (imm8 << 13) | u32::from(rd)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(in crate::jit) enum VectorOp {
+    Add,
+    Sub,
+    Mul,
+    And,
+    Orr,
+    Eor,
+}
+
+pub(super) fn vector_binary(op: VectorOp, rd: u8, rn: u8, rm: u8) -> u32 {
+    let base = match op {
+        VectorOp::Add => 0x4EA0_8400,
+        VectorOp::Sub => 0x6EA0_8400,
+        VectorOp::Mul => 0x4EA0_9C00,
+        VectorOp::And => 0x4E20_1C00,
+        VectorOp::Orr => 0x4EA0_1C00,
+        VectorOp::Eor => 0x6E20_1C00,
+    };
+    base | rd_rn_rm(rd, rn, rm)
+}
+
+pub(super) fn vector_mov(rd: u8, rn: u8) -> u32 {
+    vector_binary(VectorOp::Orr, rd, rn, rn)
+}
+
+pub(super) fn vector_shift(op: Shift, rd: u8, rn: u8, amount: u32) -> u32 {
+    match op {
+        Shift::Lsl => 0x4F00_5400 | ((32 + amount) << 16) | rd_rn(rd, rn),
+        Shift::Asr => 0x4F00_0400 | ((64 - amount) << 16) | rd_rn(rd, rn),
+        Shift::Lsr => 0x6F00_0400 | ((64 - amount) << 16) | rd_rn(rd, rn),
+    }
+}
+
+pub(super) fn vector_dup(rd: u8, rn: u8) -> u32 {
+    0x4E04_0C00 | rd_rn(rd, rn)
+}
+
+pub(super) fn vector_widen(signed: bool, bits: u32, rd: u8, rn: u8) -> u32 {
+    let base = if signed { 0x0F00_A400 } else { 0x2F00_A400 };
+    base | (bits << 16) | rd_rn(rd, rn)
+}
+
+pub(super) fn vector_narrow(bits: u32, rd: u8, rn: u8) -> u32 {
+    let size = if bits == 32 { 1 << 22 } else { 0 };
+    0x0E21_2800 | size | rd_rn(rd, rn)
 }

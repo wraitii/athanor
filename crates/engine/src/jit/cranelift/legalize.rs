@@ -8,8 +8,6 @@ pub(in crate::jit) fn prepare(
     after("legalize-convert", graph);
     crate::jit::semantic::bits::expand(graph);
     after("bits", graph);
-    crate::jit::semantic::vectorize(graph);
-    after("vectorize", graph);
     split_indexed_loads(graph);
     after("cranelift-memory", graph);
     graph.verify_machine()

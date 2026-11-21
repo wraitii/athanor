@@ -1,7 +1,7 @@
 use cranelift_codegen::ir::Signature;
 
 use super::encode::{
-    Alu, Cond, Extend, Float, FloatOp, FloatUnary, Index, Logical, Mem, Shift, Width,
+    Alu, Cond, Extend, Float, FloatOp, FloatUnary, Index, Logical, Mem, Shift, VectorOp, Width,
 };
 use crate::jit::alloc::RegClass;
 use crate::jit::effects::{Effects, HEAP_READ};
@@ -153,6 +153,65 @@ pub(in crate::jit) enum SelectType {
     Float(Float),
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(in crate::jit) enum Vector {
+    Load {
+        address: Address,
+        bytes: u32,
+        signed: bool,
+    },
+    Store {
+        address: Address,
+        bytes: u32,
+        value: Value,
+    },
+    Splat {
+        value: Value,
+    },
+    Binary {
+        op: VectorOp,
+        left: Value,
+        right: Value,
+    },
+    Shift {
+        op: Shift,
+        value: Value,
+        amount: u32,
+    },
+}
+
+impl Vector {
+    fn values(&self) -> [Option<Value>; 4] {
+        match *self {
+            Self::Load { address, .. } => {
+                let [a, b] = address.values();
+                [a, b, None, None]
+            }
+            Self::Store { address, value, .. } => {
+                let [a, b] = address.values();
+                [Some(value), a, b, None]
+            }
+            Self::Splat { value } | Self::Shift { value, .. } => [Some(value), None, None, None],
+            Self::Binary { left, right, .. } => [Some(left), Some(right), None, None],
+        }
+    }
+
+    fn values_mut(&mut self) -> [Option<&mut Value>; 4] {
+        match self {
+            Self::Load { address, .. } => {
+                let [a, b] = address.values_mut();
+                [a, b, None, None]
+            }
+            Self::Store { address, value, .. } => {
+                let [a, b] = address.values_mut();
+                [Some(value), a, b, None]
+            }
+            Self::Splat { value } | Self::Shift { value, .. } => [Some(value), None, None, None],
+            Self::Binary { left, right, .. } => [Some(left), Some(right), None, None],
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(in crate::jit) enum Op {
     Constant {
@@ -269,18 +328,25 @@ pub(in crate::jit) enum Op {
         signature: Signature,
         args: Vec<Value>,
     },
+    Vector(Vector),
 }
 
 impl Op {
     pub(in crate::jit) fn contract(&self) -> Contract {
         let effects = match self {
-            Self::Load { .. } => Effects::of(HEAP_READ),
-            Self::Store { .. } | Self::Call { .. } | Self::LoadAcquire { .. } => Effects::UNKNOWN,
+            Self::Load { .. } | Self::Vector(Vector::Load { .. }) => Effects::of(HEAP_READ),
+            Self::Store { .. }
+            | Self::Vector(Vector::Store { .. })
+            | Self::Call { .. }
+            | Self::LoadAcquire { .. } => Effects::UNKNOWN,
             _ => Effects::of(0),
         };
         Contract {
             effects,
-            result: if matches!(self, Self::Store { .. }) {
+            result: if matches!(
+                self,
+                Self::Store { .. } | Self::Vector(Vector::Store { .. })
+            ) {
                 Ownership::None
             } else {
                 Ownership::Unowned
@@ -291,7 +357,11 @@ impl Op {
     pub(in crate::jit) fn pure(&self) -> bool {
         !matches!(
             self,
-            Self::Call { .. } | Self::Load { .. } | Self::LoadAcquire { .. } | Self::Store { .. }
+            Self::Call { .. }
+                | Self::Load { .. }
+                | Self::LoadAcquire { .. }
+                | Self::Store { .. }
+                | Self::Vector(Vector::Load { .. } | Vector::Store { .. })
         )
     }
 
@@ -347,6 +417,7 @@ impl Op {
                 let [a, b] = address.values();
                 ([*value, a, b, None], &[])
             }
+            Self::Vector(vector) => (vector.values(), &[]),
             Self::Call { target, args, .. } => (
                 [
                     match target {
@@ -417,6 +488,7 @@ impl Op {
                 let [a, b] = address.values_mut();
                 ([value.as_mut(), a, b, None], &mut [])
             }
+            Self::Vector(vector) => (vector.values_mut(), &mut []),
             Self::Call { target, args, .. } => (
                 [
                     match target {

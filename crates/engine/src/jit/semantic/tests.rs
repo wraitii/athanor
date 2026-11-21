@@ -3033,7 +3033,7 @@ fn runtime_conversions_leave_backend_neutral_operations() {
         },
     )
     .unwrap();
-    assert_eq!(passes.last().unwrap(), "scalar-cleanup");
+    assert_eq!(passes.last().unwrap(), "vectorize");
     assert!(!ops(&graph).iter().any(|op| matches!(op,
         Op::Convert(value, Repr::I32 | Repr::Boolean) if *value == number
     )));

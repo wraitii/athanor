@@ -56,7 +56,7 @@ const REGISTERS: usize = 32;
 fn occupancy_index(class: RegClass, reg: u8) -> usize {
     match class {
         RegClass::Int => usize::from(reg),
-        RegClass::Float => REGISTERS + usize::from(reg),
+        RegClass::Float | RegClass::Vector => REGISTERS + usize::from(reg),
     }
 }
 
@@ -495,7 +495,21 @@ pub(crate) fn allocate(
             slot_bundles.push((segments[0].start, segments.last().unwrap().end, index));
         }
     }
-    let (bundle_slots, slot_count) = assign_slots(slot_bundles, bundles.len());
+    let (vector_bundles, slot_bundles): (Vec<_>, Vec<_>) = slot_bundles
+        .into_iter()
+        .partition(|&(_, _, index)| bundles[index].class == RegClass::Vector);
+    let (mut bundle_slots, mut slot_count) = assign_slots(slot_bundles, bundles.len());
+    let (vector_slots, vector_count) = assign_slots(vector_bundles, bundles.len());
+    if vector_count > 0 {
+        // Vector slots take two words each, placed after the word slots.
+        let base = slot_count.next_multiple_of(2);
+        for (slot, vector) in bundle_slots.iter_mut().zip(vector_slots) {
+            if let Some(vector) = vector {
+                *slot = Some(base + 2 * vector);
+            }
+        }
+        slot_count = base + 2 * vector_count;
+    }
     for (index, (bundle, &reg)) in bundles.iter().zip(&assigned).enumerate() {
         if bundle.size == 0 {
             continue;

@@ -512,6 +512,10 @@ mod tests {
                 caller_saved: &[],
                 callee_saved: &[],
             },
+            vector: crate::jit::alloc::Registers {
+                caller_saved: &[],
+                callee_saved: &[],
+            },
         };
         let allocation =
             super::super::graph::allocate(&graph, &cfg, &cfg.rpo, &target, &input).unwrap();

@@ -124,6 +124,7 @@ impl Assembler {
                     self.emit(e::move_to_float(Width::X, rd, ADDRESS));
                 }
             },
+            RegClass::Vector => unreachable!("vectors are never constants"),
         }
     }
     pub(super) fn memory(&mut self, op: Mem, rt: u8, base: u8, offset: i64) {
@@ -148,6 +149,8 @@ impl Assembler {
             (RegClass::Int, false) => Mem::StrX,
             (RegClass::Float, true) => Mem::LdrD,
             (RegClass::Float, false) => Mem::StrD,
+            (RegClass::Vector, true) => Mem::LdrQ,
+            (RegClass::Vector, false) => Mem::StrQ,
         }
     }
     pub(super) fn emit_move(&mut self, m: Move) {
@@ -156,6 +159,7 @@ impl Assembler {
                 let word = match m.class {
                     RegClass::Int => e::mov(Width::X, to, from),
                     RegClass::Float => e::float_unary(FloatUnary::Mov, Float::D, to, from),
+                    RegClass::Vector => e::vector_mov(to, from),
                 };
                 self.emit(word);
             }
@@ -179,7 +183,7 @@ impl Assembler {
             (Loc::Slot(from), Loc::Slot(to)) => {
                 let temporary = match m.class {
                     RegClass::Int => T0,
-                    RegClass::Float => F0,
+                    RegClass::Float | RegClass::Vector => F0,
                 };
                 self.memory(
                     Self::spill_op(m.class, true),
@@ -199,7 +203,7 @@ impl Assembler {
     pub(super) fn parallel(&mut self, pending: Vec<Move>) {
         let ordered = moves::sequence(pending, |class| match class {
             RegClass::Int => Loc::Reg(class, T1),
-            RegClass::Float => Loc::Reg(class, F1),
+            RegClass::Float | RegClass::Vector => Loc::Reg(class, F1),
         });
         for m in ordered {
             self.emit_move(m);

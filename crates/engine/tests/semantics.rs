@@ -1961,9 +1961,10 @@ fn typed_element_loops_match_scalar_results() {
             ..Default::default()
         })
         .unwrap();
-        engine
-            .compile(
-                r#"
+        let taps: String = (0..25)
+            .map(|i| format!(" + a[x + {i}] * {}", 3 + 2 * i))
+            .collect();
+        let source = r#"
 function blend(a, b, c, n, k) {
   for (var x = 0; x < n; ++x) { b[x] = ((a[x] ^ k) - a[x + 1]) >> 1; c[x + 1] = a[x] * 5 + k; }
 }
@@ -1987,11 +1988,21 @@ for (var r = 0; r < 300; r++) {
   blend(a, b, shared ? b : c, n, k);
   ok = matches(a, b, c, n, k, shared) && ok;
 }
+function wide(a, b, n) {
+  for (var x = 0; x < n; ++x) b[x] = (0 TAPS) >> 3;
+}
+var w = new Int16Array(64), v = new Int32Array(40);
+for (var i = 0; i < 64; i++) w[i] = (i * 7919) % 6000 - 3000;
+for (var r = 0; r < 300; r++) wide(w, v, 39 - r % 7);
+for (var x = 0; x < 33; ++x) {
+  var s = 0;
+  for (var i = 0; i < 25; i++) s += w[x + i] * (3 + 2 * i);
+  ok = (s >> 3) === v[x] && ok;
+}
 function main() { return ok; }
-"#,
-                "semantics.js",
-            )
-            .unwrap();
+"#
+        .replace("TAPS", &taps);
+        engine.compile(&source, "semantics.js").unwrap();
         assert_eq!(
             engine.call("main", &[]).unwrap().value(),
             Value::boolean(true),

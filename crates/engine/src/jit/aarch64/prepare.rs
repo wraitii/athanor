@@ -107,6 +107,11 @@ pub(super) fn run(graph: &Graph) -> Result<Prepared, Unsupported> {
                 return Err(Unsupported("unselected operation".into()));
             };
             match op {
+                inst::Op::Vector(_) => {
+                    for &value in &data.results {
+                        prepared.input.classes[value] = Some(RegClass::Vector);
+                    }
+                }
                 inst::Op::Constant { bits, class } => {
                     let value = data.results[0];
                     prepared.constants[value] = Some(*bits);

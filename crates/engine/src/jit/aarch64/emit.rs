@@ -266,7 +266,7 @@ impl Emitter<'_> {
             };
             let scratch = match self.class(param) {
                 RegClass::Int => T0,
-                RegClass::Float => F0,
+                RegClass::Float | RegClass::Vector => F0,
             };
             let reg = self.def_reg(param, scratch);
             self.asm.memory(load, reg, e::FP, area + i64::from(offset));
@@ -493,7 +493,7 @@ impl Emitter<'_> {
                 } => {
                     let scratch = match self.class(arg) {
                         RegClass::Int => T0,
-                        RegClass::Float => F0,
+                        RegClass::Float | RegClass::Vector => F0,
                     };
                     let reg = self.use_reg(arg, scratch);
                     self.asm.memory(op, reg, base, area + i64::from(offset));
@@ -906,7 +906,75 @@ impl Emitter<'_> {
                     }
                 }
             }
+            A::Vector(vector) => self.vector(vector, result),
         }
         Ok(())
+    }
+
+    fn vector(&mut self, vector: a::Vector, result: Option<Value>) {
+        match vector {
+            a::Vector::Load {
+                address,
+                bytes,
+                signed,
+            } => {
+                let result = result.unwrap();
+                let d = self.def_reg(result, F0);
+                self.access(vector_memory(bytes, true), address, d);
+                let mut bits = bytes * 8;
+                while bits < 32 {
+                    self.asm.emit(e::vector_widen(signed, bits, d, d));
+                    bits *= 2;
+                }
+                self.commit(result, d);
+            }
+            a::Vector::Store {
+                address,
+                bytes,
+                value,
+            } => {
+                let mut reg = self.use_reg(value, F0);
+                let mut bits = 32;
+                while bits > bytes * 8 {
+                    self.asm.emit(e::vector_narrow(bits, F0, reg));
+                    reg = F0;
+                    bits /= 2;
+                }
+                self.access(vector_memory(bytes, false), address, reg);
+            }
+            a::Vector::Splat { value } => {
+                let a = self.use_reg(value, T0);
+                let result = result.unwrap();
+                let d = self.def_reg(result, F0);
+                self.asm.emit(e::vector_dup(d, a));
+                self.commit(result, d);
+            }
+            a::Vector::Binary { op, left, right } => {
+                let a = self.use_reg(left, F0);
+                let b = self.use_reg(right, F1);
+                let result = result.unwrap();
+                let d = self.def_reg(result, F0);
+                self.asm.emit(e::vector_binary(op, d, a, b));
+                self.commit(result, d);
+            }
+            a::Vector::Shift { op, value, amount } => {
+                let a = self.use_reg(value, F0);
+                let result = result.unwrap();
+                let d = self.def_reg(result, F0);
+                self.asm.emit(e::vector_shift(op, d, a, amount));
+                self.commit(result, d);
+            }
+        }
+    }
+}
+
+fn vector_memory(bytes: u32, load: bool) -> Mem {
+    match (bytes, load) {
+        (1, true) => Mem::LdrS,
+        (1, false) => Mem::StrS,
+        (2, true) => Mem::LdrD,
+        (2, false) => Mem::StrD,
+        (_, true) => Mem::LdrQ,
+        (_, false) => Mem::StrQ,
     }
 }

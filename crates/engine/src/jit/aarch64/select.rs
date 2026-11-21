@@ -5,7 +5,8 @@ use cranelift_codegen::ir::{ArgumentExtension, Type, types};
 
 use super::Unsupported;
 use super::encode::{
-    self as e, Alu, Cond, Extend, Float, FloatOp, FloatUnary, Index, Logical, Mem, Shift, Width,
+    self as e, Alu, Cond, Extend, Float, FloatOp, FloatUnary, Index, Logical, Mem, Shift, VectorOp,
+    Width,
 };
 use super::inst::{self as a, CompareOperand, Condition, Mask, ShiftAmount};
 use crate::jit::alloc::RegClass;
@@ -473,7 +474,9 @@ fn instruction(
 ) -> Result<a::Op, Unsupported> {
     let data = graph.insts[inst].clone();
     let result = data.results.first().copied();
-    let ty = result.map(|value| graph.repr(value).machine());
+    let ty = result
+        .and_then(|value| graph.reprs[value])
+        .map(Repr::machine);
     let selected_binary = binary(graph, inst);
     let indexed = indexed_load(graph, inst);
     let mut b = Builder::new(graph);
@@ -824,6 +827,7 @@ fn instruction(
             shift,
             bits,
         },
+        L::Vector(vector) => a::Op::Vector(select.vector(vector)?),
         _ => return Err(Unsupported("unlowered operation".into())),
     })
 }
@@ -1040,6 +1044,90 @@ impl Selector<'_> {
         })
     }
 
+    fn vector(&mut self, vector: low_level::Vector) -> Result<a::Vector, Unsupported> {
+        use low_level::{Binary as B, Vector as V};
+        Ok(match vector {
+            V::Load {
+                base,
+                index,
+                format,
+                ..
+            } => a::Vector::Load {
+                address: self.lanes(base, index, format),
+                bytes: format.bytes(),
+                signed: matches!(format, MemoryFormat::I8 | MemoryFormat::I16),
+            },
+            V::Store {
+                base,
+                index,
+                value,
+                format,
+            } => a::Vector::Store {
+                address: self.lanes(base, index, format),
+                bytes: format.bytes(),
+                value,
+            },
+            V::Splat { value, .. } => a::Vector::Splat { value },
+            V::Binary {
+                op: op @ (B::ShiftLeft | B::ShiftRightSigned | B::ShiftRightUnsigned),
+                left,
+                right,
+            } => {
+                let amount = constant(self.b.graph, right)
+                    .ok_or_else(|| Unsupported("vector shift amount".into()))?
+                    as u32
+                    & 31;
+                a::Vector::Shift {
+                    op: match op {
+                        _ if amount == 0 => Shift::Lsl,
+                        B::ShiftLeft => Shift::Lsl,
+                        B::ShiftRightSigned => Shift::Asr,
+                        _ => Shift::Lsr,
+                    },
+                    value: left,
+                    amount,
+                }
+            }
+            V::Binary { op, left, right } => a::Vector::Binary {
+                op: match op {
+                    B::Add => VectorOp::Add,
+                    B::Subtract => VectorOp::Sub,
+                    B::Multiply => VectorOp::Mul,
+                    B::And => VectorOp::And,
+                    B::Or => VectorOp::Orr,
+                    B::Xor => VectorOp::Eor,
+                    _ => return Err(Unsupported(format!("vector {op:?}"))),
+                },
+                left,
+                right,
+            },
+        })
+    }
+
+    fn lanes(&mut self, base: Value, index: Value, format: MemoryFormat) -> a::Address {
+        let shift = format.bytes().trailing_zeros();
+        if shift == 0 {
+            return a::Address::Indexed {
+                base,
+                index,
+                kind: Index::Lsl,
+                scaled: false,
+            };
+        }
+        let base = self.b.semantic(
+            Op::Aarch64(a::Op::AddShifted {
+                sub: false,
+                width: Width::X,
+                left: base,
+                right: index,
+                kind: Index::Lsl,
+                shift,
+            }),
+            Repr::I64,
+        );
+        a::Address::Scaled { base, offset: 0 }
+    }
+
     fn address(&mut self, op: Mem, address: Address) -> a::Address {
         match address {
             Address::Indexed {
@@ -1160,6 +1248,9 @@ fn check_function(graph: &Graph, order: &[Block]) -> Result<(), Unsupported> {
             }
         }
         for &inst in &graph.blocks[block].insts {
+            if matches!(graph.insts[inst].op, Op::LowLevel(low_level::Op::Vector(_))) {
+                continue;
+            }
             for &value in &graph.insts[inst].results {
                 let ty = graph.reprs[value]
                     .map(Repr::machine)

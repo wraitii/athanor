@@ -39,7 +39,7 @@ struct Plan {
 /// Runs four iterations at once of innermost counted loops over typed elements. A prologue checks
 /// that four iterations remain, the loop's invariant guards hold and its stores cannot overlap its
 /// loads; otherwise, and for the remaining iterations, the scalar loop runs unchanged.
-pub(in crate::jit) fn vectorize(graph: &mut Graph) -> bool {
+pub(in crate::jit::semantic) fn vectorize(graph: &mut Graph) -> bool {
     let cfg = Cfg::new(graph);
     let loops = natural_loops(graph, &cfg);
     let plans: Vec<Plan> = loops
@@ -162,8 +162,14 @@ fn plan(graph: &Graph, cfg: &Cfg, header: Block, body: &FxHashSet<Block>) -> Opt
                     | LowOp::Binary { .. }
                     | LowOp::IntCompare { .. }
                     | LowOp::FloatCompare { .. }
-                    | LowOp::Select { .. },
-                ) if !operands.contains(&Kind::Vector) => {
+                    | LowOp::Select { .. }
+                    | LowOp::ExtractBits { .. }
+                    | LowOp::InRange { .. }
+                    | LowOp::TestMask { .. },
+                )
+                | Op::Convert(..)
+                    if !operands.contains(&Kind::Vector) =>
+                {
                     if operands.contains(&Kind::Scalar) {
                         Kind::Scalar
                     } else {
@@ -171,6 +177,9 @@ fn plan(graph: &Graph, cfg: &Cfg, header: Block, body: &FxHashSet<Block>) -> Opt
                     }
                 }
                 Op::LowLevel(op) if lanewise(graph, &kinds, op, &operands) => Kind::Vector,
+                Op::Convert(value, Repr::I32 | Repr::I64) if exact(graph, &kinds, *value) => {
+                    Kind::Vector
+                }
                 _ => return None,
             };
             kinds.insert(data.result()?, result);
@@ -285,14 +294,27 @@ fn lanewise(graph: &Graph, kinds: &FxHashMap<Value, Kind>, op: &LowOp, operands:
         LowOp::Binary {
             op: Binary::ShiftLeft | Binary::ShiftRightSigned | Binary::ShiftRightUnsigned,
             left,
-            ..
+            right,
         } => {
             operands[0] == Kind::Vector
-                && operands[1] == Kind::Invariant
+                && super::super::ranges::integer_literal(graph, right).is_some()
                 && width(graph, left) == Some(types::I32)
         }
         _ => false,
     }
+}
+
+/// Lanes of full-width integers and of loaded elements hold their exact values' low bits, which a
+/// representation change keeps.
+fn exact(graph: &Graph, kinds: &FxHashMap<Value, Kind>, value: Value) -> bool {
+    if kinds.get(&value) != Some(&Kind::Vector) {
+        return false;
+    }
+    matches!(width(graph, value), Some(types::I32 | types::I64))
+        || matches!(
+            graph.defining_op(value),
+            Some(Op::Memory(MemoryOp::IndexedLoad { .. }))
+        )
 }
 
 fn signed(format: MemoryFormat) -> bool {
@@ -312,7 +334,7 @@ fn width(graph: &Graph, value: Value) -> Option<Type> {
         ) => Some(ty),
         Op::LowLevel(LowOp::Binary { op, left, .. }) if !op.is_boolean() => width(graph, left),
         Op::Memory(MemoryOp::IndexedLoad { format, .. }) => Some(format.repr().machine()),
-        _ => None,
+        _ => graph.reprs[value].map(Repr::machine),
     }
 }
 
@@ -465,7 +487,7 @@ fn apply(graph: &mut Graph, plan: Plan) {
                 index: resolve(&values, offset),
                 format,
             },
-            Op::LowLevel(LowOp::Unary { value, .. }) => {
+            Op::LowLevel(LowOp::Unary { value, .. }) | Op::Convert(value, _) => {
                 let result = graph.insts[inst].result().unwrap();
                 values.insert(result, values[&value]);
                 continue;
