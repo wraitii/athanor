@@ -1917,3 +1917,34 @@ function main() {
         Value::number(9411156.0)
     );
 }
+
+#[test]
+fn narrow_products_keep_negative_zero_outside_integer_sums() {
+    let mut engine = Engine::with_options(js_engine::EngineOptions {
+        background_compile: false,
+        ..Default::default()
+    })
+    .unwrap();
+    engine
+        .compile(
+            r#"
+function sum(a, k, n) { var s = 0; for (var i = 0; i < n; i++) s += a[i] * k[i]; return 1 / s; }
+function last(a, k, n) { var s = 0, p = 0; for (var i = 0; i < n; i++) { p = a[i] * k[i]; s += p; } return 1 / p; }
+function start(a, k) { var s = -0; s += a[0] * k[0]; return 1 / s; }
+function main() {
+  var a = new Uint8Array(3), k = new Int16Array(3);
+  k[0] = -1; k[1] = -2; k[2] = -3;
+  var ok = true;
+  for (var r = 0; r < 300; r++)
+    ok = ok && sum(a, k, 3) === Infinity && last(a, k, 3) === -Infinity && start(a, k) === -Infinity;
+  return ok;
+}
+"#,
+            "semantics.js",
+        )
+        .unwrap();
+    assert_eq!(
+        engine.call("main", &[]).unwrap().value(),
+        Value::boolean(true)
+    );
+}

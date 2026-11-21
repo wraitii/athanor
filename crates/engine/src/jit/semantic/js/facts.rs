@@ -110,6 +110,14 @@ pub(in crate::jit::semantic) fn result_types(graph: &Graph, op: &Op, facts: &Fac
         {
             ValueType::INT64
         }
+        Op::Binary(BinaryOperator::Addition, left, right)
+            if facts.of(*left).within(ValueType::INTEGER)
+                && signed_zero_product(graph, facts, *right)
+                || facts.of(*right).within(ValueType::INTEGER)
+                    && signed_zero_product(graph, facts, *left) =>
+        {
+            ValueType::INT64
+        }
         Op::Binary(operator, left, right) => match operator {
             BinaryOperator::Addition => {
                 let (left, right) = (facts.of(*left), facts.of(*right));
@@ -155,6 +163,39 @@ fn number(value: f64) -> ValueType {
         ValueType::INT32
     } else {
         ValueType::DOUBLE
+    }
+}
+
+/// An int32 times a narrow integer is exact but may be negative zero, which adding it to an
+/// integer absorbs.
+pub(in crate::jit::semantic) fn signed_zero_product(
+    graph: &Graph,
+    facts: &Facts,
+    value: Value,
+) -> bool {
+    let Some(GraphOp::Javascript(Op::Binary(BinaryOperator::Multiplication, left, right))) =
+        graph.defining_op(value)
+    else {
+        return false;
+    };
+    let int32 = |value| facts.of(value).within(ValueType::INT32);
+    int32(*left) && int32(*right) && (narrow(graph, *left) || narrow(graph, *right))
+}
+
+fn narrow(graph: &Graph, value: Value) -> bool {
+    match graph.defining_op(value) {
+        Some(GraphOp::Javascript(Op::MemoryNumber(_, format))) => matches!(
+            format,
+            MemoryFormat::U8 | MemoryFormat::I8 | MemoryFormat::U16 | MemoryFormat::I16
+        ),
+        Some(GraphOp::Javascript(Op::TypedIndex(.., read))) => {
+            read.bounded
+                && matches!(
+                    read.element,
+                    Some(TypedKind::Uint8 | TypedKind::Int8 | TypedKind::Uint16 | TypedKind::Int16)
+                )
+        }
+        _ => false,
     }
 }
 

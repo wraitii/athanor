@@ -95,11 +95,12 @@ fn lower_checks(function: &mut FunctionState) -> bool {
 
 pub(in crate::jit::semantic) fn arithmetic(function: &mut FunctionState) -> bool {
     function.ensure_values();
-    let proved = if function.optimize {
+    let mut proved = if function.optimize {
         exact_index_arithmetic(&function.graph, &function.facts)
     } else {
         FxHashSet::default()
     };
+    proved.extend(absorbed_products(&function.graph, &function.facts));
     let mut changed = false;
     let mut insts = Vec::new();
     for &block in &function.facts.cfg.rpo {
@@ -138,6 +139,50 @@ fn exact_index_arithmetic(graph: &Graph, facts: &Facts) -> FxHashSet<Inst> {
         }
     }
     proved
+}
+
+/// Integer products whose every use is an integer addition, which absorbs their negative zero.
+fn absorbed_products(graph: &Graph, facts: &Facts) -> FxHashSet<Inst> {
+    let mut products: FxHashMap<Value, (Inst, bool)> = FxHashMap::default();
+    for &block in &facts.cfg.rpo {
+        for &inst in &graph.blocks[block].insts {
+            if let Some(result) = graph.insts[inst].result()
+                && super::super::js::facts::signed_zero_product(graph, facts, result)
+            {
+                products.insert(result, (inst, true));
+            }
+        }
+    }
+    if products.is_empty() {
+        return FxHashSet::default();
+    }
+    for &block in &facts.cfg.rpo {
+        for &inst in &graph.blocks[block].insts {
+            let data = &graph.insts[inst];
+            let absorbs = matches!(
+                data.op,
+                Op::Javascript(JsOp::Binary(BinaryOperator::Addition, ..))
+            ) && data
+                .result()
+                .is_some_and(|result| facts.of(result).within(ValueType::INTEGER));
+            for value in data.op.operands_iter() {
+                if let Some((_, absorbed)) = products.get_mut(&value) {
+                    *absorbed &= absorbs;
+                }
+            }
+        }
+        if let Some(terminator) = &graph.blocks[block].terminator {
+            for value in terminator.kind.operands_iter() {
+                if let Some((_, absorbed)) = products.get_mut(&value) {
+                    *absorbed = false;
+                }
+            }
+        }
+    }
+    products
+        .into_values()
+        .filter_map(|(inst, absorbed)| absorbed.then_some(inst))
+        .collect()
 }
 
 pub(in crate::jit::semantic) fn operations(function: &mut FunctionState) -> bool {
