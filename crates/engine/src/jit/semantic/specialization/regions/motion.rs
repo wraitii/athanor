@@ -106,7 +106,8 @@ impl Motion for JsMotion {
                                 | JsOp::AsString(_)
                                 | JsOp::AsObject(_)
                         )
-                ) && !writes.preserves(graph, inst)
+                ) && !fixed_length(graph, facts, insertion, op)
+                    && !writes.preserves(graph, inst)
                 {
                     return None;
                 }
@@ -144,6 +145,21 @@ impl Motion for JsMotion {
         }
         Some(dependencies)
     }
+}
+
+/// Typed arrays never change length, so once one is known typed its length read cannot be
+/// clobbered.
+fn fixed_length(graph: &Graph, facts: &Facts, insertion: Block, op: &Op) -> bool {
+    let &Op::Javascript(JsOp::IndexedLength(object)) = op else {
+        return false;
+    };
+    guards::holds(
+        graph,
+        &facts.cfg,
+        insertion,
+        object,
+        guards::Fact::Typed(None),
+    )
 }
 
 fn collect(
