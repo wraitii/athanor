@@ -176,6 +176,15 @@ pub(in crate::jit::semantic) fn hoist_data(function: &mut FunctionState) -> bool
     changed
 }
 
+fn element_type(element: TypedKind) -> cranelift_codegen::ir::Type {
+    use cranelift_codegen::ir::types;
+    match 1 << (element.element() & 3) {
+        1 => types::I8,
+        2 => types::I16,
+        _ => types::I32,
+    }
+}
+
 fn memory_format(element: TypedKind) -> MemoryFormat {
     match element {
         TypedKind::Uint8 => MemoryFormat::U8,
@@ -221,6 +230,7 @@ pub(in crate::jit::semantic) fn lower_store(
             .add_unassigned(Op::Javascript(JsOp::IsTyped(object, Some(element))));
         super::super::dispatch::branch(graph, inst, block, check, fallback)
     };
+    let integral = facts.of(value).within(ValueType::INTEGER);
     for value in [key, value] {
         if !facts.of(value).within(ValueType::NUMBER) {
             let number = Cursor::at_end(graph, fast, inst)
@@ -264,6 +274,12 @@ pub(in crate::jit::semantic) fn lower_store(
         } else {
             number
         }
+    } else if integral {
+        let integer = Cursor::at_end(graph, fast, inst)
+            .add_unassigned(Op::Javascript(JsOp::ArrayPosition(value)));
+        Cursor::at_end(graph, fast, inst)
+            .ins()
+            .ireduce(element_type(element), integer)
     } else {
         let integer = Cursor::at_end(graph, fast, inst)
             .add_unassigned(Op::Javascript(JsOp::ArrayPosition(value)));
@@ -279,12 +295,9 @@ pub(in crate::jit::semantic) fn lower_store(
             upper,
         )));
         fast = super::super::dispatch::branch(graph, inst, fast, below, fallback);
-        let ty = match 1 << (element.element() & 3) {
-            1 => types::I8,
-            2 => types::I16,
-            _ => types::I32,
-        };
-        Cursor::at_end(graph, fast, inst).ins().ireduce(ty, integer)
+        Cursor::at_end(graph, fast, inst)
+            .ins()
+            .ireduce(element_type(element), integer)
     };
     let mut at = Cursor::at_end(graph, fast, inst);
     let view = at.add_unassigned(Op::Javascript(JsOp::View(object)));
