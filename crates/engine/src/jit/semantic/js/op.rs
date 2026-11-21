@@ -161,8 +161,9 @@ pub(in crate::jit) enum Op {
     // Borrows the current frame's original arguments, which inlining substitutes.
     CallForward(Value, Value),
     ConstructPack(Value, Value),
-    // UNINITIALIZED leaves native constructors and lazy prototypes to generic construction.
-    ConstructorPrototype(Value),
+    // Yields the callee's `prototype` read when it is a constructable closure with an ordinary
+    // object prototype; UNINITIALIZED leaves everything else to generic construction.
+    ConstructorPrototype(Value, Value),
     ConstructPackResolved(Value, Value, Value),
     ConstructResolved {
         callee: Value,
@@ -366,7 +367,6 @@ impl Op {
             | Op::ProbeShapeProperty(value, _, _)
             | Op::IsNative(value, _)
             | Op::NewInstance(value)
-            | Op::ConstructorPrototype(value)
             | Op::IsCode(value, _)
             | Op::View(value)
             | Op::TypedData(value)
@@ -412,6 +412,7 @@ impl Op {
             | Op::PackAppend(object, key, _)
             | Op::ArrayAppend(object, key, _)
             | Op::ConstructorResult(object, key)
+            | Op::ConstructorPrototype(object, key)
             | Op::ConstructPack(object, key) => ([Some(*object), Some(*key), None], &[]),
             Op::CallForward(callee, receiver) => ([Some(*callee), Some(*receiver), None], &[]),
             Op::IntegerCheck(object, key, position)
@@ -536,7 +537,6 @@ impl Op {
             | Op::ProbeShapeProperty(value, _, _)
             | Op::IsNative(value, _)
             | Op::NewInstance(value)
-            | Op::ConstructorPrototype(value)
             | Op::IsCode(value, _)
             | Op::View(value)
             | Op::TypedData(value)
@@ -582,6 +582,7 @@ impl Op {
             | Op::PackAppend(object, key, _)
             | Op::ArrayAppend(object, key, _)
             | Op::ConstructorResult(object, key)
+            | Op::ConstructorPrototype(object, key)
             | Op::ConstructPack(object, key) => ([Some(object), Some(key), None], &mut []),
             Op::CallForward(callee, receiver) => ([Some(callee), Some(receiver), None], &mut []),
             Op::IntegerCheck(object, key, position)

@@ -780,23 +780,6 @@ impl Heap {
         false
     }
 
-    pub(crate) fn constructor_prototype(&self, constructor: Value) -> Option<Value> {
-        let data = self.0.borrow();
-        let id = heap_id(constructor)?;
-        if !data.closure(id)?.constructable {
-            return None;
-        }
-        // Reading an absent prototype must not trigger its lazy allocation.
-        let prototype = data.properties(id)?.get("prototype")?;
-        if prototype.is_object()
-            && heap_id(prototype)
-                .is_none_or(|id| data.object(id).is_none() && data.array(id).is_none())
-        {
-            return None;
-        }
-        Some(prototype)
-    }
-
     pub(crate) fn object_with_prototype(&self, prototype: Value) -> Option<Value> {
         self.allocate_object(Some(prototype))
     }

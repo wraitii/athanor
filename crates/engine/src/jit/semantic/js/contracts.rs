@@ -192,7 +192,7 @@ pub(in crate::jit::semantic) fn contract(graph: &Graph, op: &Op, facts: &Facts) 
         }
         Op::CallNative(..) => coercing(Unowned),
         Op::IsUndefined(_) | Op::IsNullish(_) | Op::IsNative(..) => closed(0, Unowned),
-        Op::ConstructorPrototype(_) => closed(HEAP_READ, Borrowed),
+        Op::ConstructorPrototype(..) => closed(HEAP_READ, Borrowed),
         Op::IsCode(..) => closed(HEAP_READ, Unowned),
         Op::ProbeGlobal(_) => closed(GLOBAL_READ, Borrowed),
         Op::ProbeProperty(..) | Op::ProbeIndex(..) => closed(HEAP_READ, Borrowed),

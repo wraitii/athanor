@@ -488,7 +488,7 @@ fn construction_exposes_prototype_resolution() {
             String::from_utf8_lossy(&output.stderr)
         );
         let dump = String::from_utf8(output.stdout).unwrap();
-        assert_eq!(dump.contains("helper_call ConstructorPrototype("), enabled);
+        assert_eq!(dump.contains("helper_call PropertyGetCached("), enabled);
         assert_eq!(dump.contains("helper_call ConstructResolved("), enabled);
         assert_eq!(dump.contains("helper_call ConstructPackResolved("), enabled);
         assert_eq!(dump.contains("helper_call NewInstance"), enabled);
@@ -497,7 +497,7 @@ fn construction_exposes_prototype_resolution() {
         if enabled {
             assert!(
                 dump.find("helper_call PropertySetCached").unwrap()
-                    < dump.find("helper_call ConstructorPrototype(").unwrap()
+                    < dump.find("helper_call PropertyGetCached(").unwrap()
             );
         }
     }

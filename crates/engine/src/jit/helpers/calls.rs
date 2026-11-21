@@ -140,14 +140,6 @@ pub(super) extern "C" fn js_constructor_call_pack(
     invoke(ctx, constructor, instance, argv, argc as u64)
 }
 
-pub(super) extern "C" fn js_constructor_prototype(ctx: *mut JitCtx, constructor: Value) -> Value {
-    unsafe { &*ctx }
-        .global
-        .heap()
-        .constructor_prototype(constructor)
-        .unwrap_or(Value::UNINITIALIZED)
-}
-
 pub(super) extern "C" fn js_construct_resolved(
     ctx: *mut JitCtx,
     constructor: Value,

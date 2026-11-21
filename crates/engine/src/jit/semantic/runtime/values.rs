@@ -32,16 +32,29 @@ pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) {
                 removed.push(inst);
                 continue;
             }
-            let Op::Javascript(JsOp::ConstructorResult(result, instance)) = graph.insts[inst].op
-            else {
-                continue;
-            };
-            let mut at = Cursor::before(graph, inst);
-            let result = at.as_word(result);
-            let instance = at.as_word(instance);
-            let condition = layout::is_object(&mut at, result);
-            let select = at.ins().select(condition, result, instance);
-            graph.set_op(inst, Op::AsBoxed(select));
+            match graph.insts[inst].op {
+                Op::Javascript(JsOp::ConstructorResult(result, instance)) => {
+                    let mut at = Cursor::before(graph, inst);
+                    let result = at.as_word(result);
+                    let instance = at.as_word(instance);
+                    let condition = layout::is_object(&mut at, result);
+                    let select = at.ins().select(condition, result, instance);
+                    graph.set_op(inst, Op::AsBoxed(select));
+                }
+                Op::Javascript(JsOp::ConstructorPrototype(callee, prototype)) => {
+                    let mut at = Cursor::before(graph, inst);
+                    let constructor = has_kind(&mut at, callee, kind::CONSTRUCTOR);
+                    let ordinary = has_kind(&mut at, prototype, kind::OBJECT | kind::ARRAY);
+                    let valid = at.ins().boolean_and(constructor, ordinary);
+                    let prototype = at.as_word(prototype);
+                    let unresolved = at
+                        .ins()
+                        .iconst(types::I64, JsValue::UNINITIALIZED.bits() as i64);
+                    let select = at.ins().select(valid, prototype, unresolved);
+                    graph.set_op(inst, Op::AsBoxed(select));
+                }
+                _ => {}
+            }
         }
     }
     graph.replace_uses(&aliases);

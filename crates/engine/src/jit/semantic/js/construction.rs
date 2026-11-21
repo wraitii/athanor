@@ -18,15 +18,18 @@ pub(in crate::jit::semantic) fn resolve(graph: &mut Graph) {
                 .position(|&current| current == inst)
                 .unwrap();
             let span = graph.insts[inst].span;
-            let (probe, prototype) = graph.insert(
+            let read = graph.insert_value(
                 block,
                 position,
                 span,
-                Op::Javascript(JsOp::ConstructorPrototype(callee)),
-                true,
+                Op::Javascript(JsOp::Get(callee, "prototype".into())),
             );
-            graph.insts[probe].source_name = graph.insts[inst].source_name;
-            let prototype = prototype.unwrap();
+            let prototype = graph.insert_value(
+                block,
+                position + 1,
+                span,
+                Op::Javascript(JsOp::ConstructorPrototype(callee, read)),
+            );
             graph.set_op(
                 inst,
                 match graph.insts[inst].op.clone() {

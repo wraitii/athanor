@@ -344,8 +344,7 @@ fn assumptions(op: &Op, facts: &Facts) -> &'static [Assumption] {
             &[Assumption::DirectIteration]
         }
         Op::Javascript(
-            JsOp::ConstructorPrototype(_)
-            | JsOp::ProbeGlobal(_)
+            JsOp::ProbeGlobal(_)
             | JsOp::ProbeProperty(..)
             | JsOp::ProbeShapeProperty(..)
             | JsOp::ProbeIndex(..),

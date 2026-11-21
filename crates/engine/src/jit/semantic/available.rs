@@ -24,7 +24,6 @@ pub(super) enum LoadKey {
     Length(Value),
     ArrayKind(Value),
     Array(Value, super::ArrayLayout),
-    Constructor(Value),
     Cell(Value),
     Property(Value, String),
     Index(Value, Value),
@@ -94,7 +93,6 @@ fn load_key(op: &Op, probes: bool, aliases: &FxHashMap<Value, Value>) -> Option<
             | JsOp::ArrayGet(object, key)
             | JsOp::ArrayLoad(object, key, _),
         ) => LoadKey::Index(at(object), at(key)),
-        Op::Javascript(JsOp::ConstructorPrototype(callee)) => LoadKey::Constructor(at(callee)),
         Op::Javascript(JsOp::CellGet(cell)) => LoadKey::Cell(at(cell)),
         Op::Javascript(JsOp::GlobalRead(name)) => LoadKey::Global(name.clone()),
         Op::Javascript(JsOp::ProbeGlobal(name)) if probes => LoadKey::Probe(name.clone()),

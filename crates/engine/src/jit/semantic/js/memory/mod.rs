@@ -175,7 +175,7 @@ impl Access {
                 | JsOp::IndexedLength(object)
                 | JsOp::ArrayKind(object)
                 | JsOp::IsArray(object, _)
-                | JsOp::ConstructorPrototype(object),
+                | JsOp::ConstructorPrototype(object, _),
             ) => (Locations::HEAP, Base::Known(*object)),
             Op::Javascript(JsOp::ProbeShapeProperty(object, ..)) => {
                 (Locations::HEAP.union(Locations::CODE), Base::Known(*object))

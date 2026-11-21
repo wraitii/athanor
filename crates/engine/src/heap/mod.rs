@@ -140,6 +140,7 @@ impl Payload {
             Self::Array(_) => kind::ARRAY | kind::HOLEY,
             Self::TypedArray(array) => kind::TYPED | array.kind.element(),
             Self::Cell(_) => kind::CELL,
+            Self::Closure(closure) if closure.constructable => kind::CLOSURE | kind::CONSTRUCTOR,
             Self::Closure(_) => kind::CLOSURE,
         }
     }

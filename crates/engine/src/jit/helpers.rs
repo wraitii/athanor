@@ -119,7 +119,6 @@ define_helpers! {
     MarkClass => js_mark_class(Value) -> Value;
     ClosureNew => js_closure_new(u64, *const Value, u64) -> Value, owned;
     Construct => js_construct(Value, *const Value, u64) -> Value, owned;
-    ConstructorPrototype => js_constructor_prototype(Value) -> Value, borrowed;
     NewInstance => js_new_instance(Value) -> Value, owned;
     ConstructorCall => js_constructor_call(Value, Value, *const Value, u64) -> Value, owned;
     ConstructorCallPack => js_constructor_call_pack(Value, Value, Value) -> Value, owned;

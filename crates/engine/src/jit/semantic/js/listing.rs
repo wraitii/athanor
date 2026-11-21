@@ -82,7 +82,9 @@ pub(in crate::jit::semantic) fn op_text(graph: &Graph, op: &Op) -> String {
         Op::ConstructorCallPack(callee, receiver, args) => {
             format!("constructor_call_pack {callee}, {receiver}, {args}")
         }
-        Op::ConstructorPrototype(callee) => format!("constructor_prototype {callee}"),
+        Op::ConstructorPrototype(callee, prototype) => {
+            format!("constructor_prototype {callee}, {prototype}")
+        }
         Op::ConstructResolved {
             callee,
             prototype,

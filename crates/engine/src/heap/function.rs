@@ -78,6 +78,7 @@ impl Heap {
         let closure = data.closure_mut(id).unwrap();
         closure.constructable = false;
         let old = closure.lexical_this.replace(receiver);
+        data.sync(id);
         if let Some(old) = old {
             data.release(old);
         }
@@ -85,11 +86,10 @@ impl Heap {
     }
 
     pub(crate) fn disable_constructor(&self, closure: Value) {
-        self.0
-            .borrow_mut()
-            .closure_mut(heap_id(closure).unwrap())
-            .unwrap()
-            .constructable = false;
+        let id = heap_id(closure).unwrap();
+        let mut data = self.0.borrow_mut();
+        data.closure_mut(id).unwrap().constructable = false;
+        data.sync(id);
     }
 
     pub(crate) fn mark_class(&self, closure: Value) {

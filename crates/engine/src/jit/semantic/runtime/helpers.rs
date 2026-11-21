@@ -136,9 +136,6 @@ fn select(inst: super::super::Inst, op: &Op, facts: &Facts) -> Option<Call> {
         JsOp::ProbeIndex(object, key) => {
             call(Helper::SemanticIndexProbe, boxed(&[*object, *key]), true)
         }
-        JsOp::ConstructorPrototype(callee) => {
-            call(Helper::ConstructorPrototype, boxed(&[*callee]), true)
-        }
         JsOp::IteratorNew(value) => call(Helper::IterateNew, boxed(&[*value]), true),
         JsOp::IteratorNext(value) => call(Helper::IterateNext, boxed(&[*value]), true),
         JsOp::EnumerateNew(value) => call(Helper::EnumerateNew, boxed(&[*value]), true),

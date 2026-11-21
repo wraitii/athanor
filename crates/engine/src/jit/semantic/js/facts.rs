@@ -35,7 +35,7 @@ pub(in crate::jit::semantic) fn result_types(graph: &Graph, op: &Op, facts: &Fac
         | Op::ProbeProperty(..)
         | Op::ProbeShapeProperty(..)
         | Op::ProbeIndex(..)
-        | Op::ConstructorPrototype(_)
+        | Op::ConstructorPrototype(..)
         | Op::CachedProperty(..)
         | Op::ShapedGet(..)
         | Op::LayoutGet(..)
