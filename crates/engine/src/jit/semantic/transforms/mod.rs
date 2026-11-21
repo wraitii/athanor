@@ -10,6 +10,7 @@ mod repair;
 pub(in crate::jit::semantic) mod reuse;
 mod simplify;
 mod trim;
+pub(in crate::jit::semantic) mod unroll;
 
 pub(super) use promote::{promote, remove_trivial_params};
 pub(super) use repair::repair;

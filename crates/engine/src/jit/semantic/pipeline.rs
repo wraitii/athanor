@@ -13,7 +13,7 @@ use oxc_ast::ast::{Expression, FormalParameters, Statement};
 use oxc_semantic::Scoping;
 use oxc_span::Span;
 use oxc_syntax::symbol::SymbolId;
-use transforms::{conversions, reuse};
+use transforms::{conversions, reuse, unroll};
 
 use super::{
     FunctionState, Graph, Inst, RegionFallback, Result, SpecializationPlan, Value, borrow, boxing,
@@ -164,6 +164,7 @@ pub(in crate::jit) const LOW_LEVEL_PASSES: &[&str] = &[
     "ownership-lower",
     "unbox",
     "scalar-semantics",
+    "unroll",
     "scalar-cleanup",
     "aarch64-select",
     "legalize-convert",
@@ -189,6 +190,10 @@ pub(in crate::jit) fn lower_low_level(
     legalize::prepare(graph);
     repr::lower_conversions(&mut low_level::Builder::new(graph))?;
     after("scalar-semantics", graph);
+    if unroll::unroll(graph) {
+        graph.verify()?;
+    }
+    after("unroll", graph);
     reuse::lowered(graph);
     after("scalar-cleanup", graph);
     graph.verify()
