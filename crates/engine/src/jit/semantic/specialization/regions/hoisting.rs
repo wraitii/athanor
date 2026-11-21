@@ -138,6 +138,8 @@ pub(super) fn hoist(
                 for other in groups.iter_mut() {
                     if other.before == Some(exit) && other.start == good.block {
                         other.before = Some(source);
+                    } else if other.before == point.before && other.start == destination.block {
+                        other.before = Some(exit);
                     }
                 }
                 facts = None;
