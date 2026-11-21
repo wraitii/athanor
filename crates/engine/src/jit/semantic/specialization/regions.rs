@@ -30,6 +30,8 @@ mod propose;
 mod rewrites;
 mod versioning;
 
+use super::super::facts::Relation;
+use super::super::ranges::{induction_step, integer_literal};
 use super::super::transforms::repair;
 use analysis::{Requirement, closure_failure, closure_failure_with, conflicts, guarded_accesses};
 pub(in crate::jit::semantic) use analysis::{Writes, requirements};
@@ -413,6 +415,9 @@ fn loop_counters(
         .into_iter()
         .filter(|counted| {
             region.contains(&counted.header)
+                && !counted.inclusive
+                && integer_literal(graph, counted.start)
+                    .is_some_and(|start| (0..=i64::from(i32::MAX)).contains(&start))
                 && (!region.contains(&graph.def_block(counted.bound))
                     || available.contains(&counted.bound))
                 && facts.of(counted.bound).within(ValueType::NUMBER)
@@ -421,14 +426,15 @@ fn loop_counters(
         .collect()
 }
 
-/// A loop whose `counter` starts at `start` or above, steps by one and stays below `bound`
-/// while in `inside`.
+/// A loop whose `counter` starts at `start` or above, steps by one and stays below `bound`, or
+/// at most `bound` when `inclusive`, while in `inside`.
 pub(super) struct CountedLoop {
     pub(super) header: Block,
     pub(super) counter: Value,
     pub(super) inside: Block,
     pub(super) bound: Value,
-    pub(super) start: i32,
+    pub(super) inclusive: bool,
+    pub(super) start: Value,
 }
 
 pub(super) fn counted_loops(graph: &Graph, cfg: &Cfg) -> Vec<CountedLoop> {
@@ -456,49 +462,59 @@ pub(super) fn counted_loops(graph: &Graph, cfg: &Cfg) -> Vec<CountedLoop> {
         else {
             continue;
         };
-        let Some(&Op::Javascript(
-            JsOp::Binary(BinaryOperator::LessThan, counter, bound)
-            | JsOp::GuardedCompare {
-                operator: BinaryOperator::LessThan,
-                left: counter,
-                right: bound,
-                ..
-            },
-        )) = graph.defining_op(*condition)
+        let (mut condition, mut inside, mut outside) = (*condition, inside.block, outside.block);
+        if let Some(positive) = guards::negated(graph, condition) {
+            condition = positive;
+            std::mem::swap(&mut inside, &mut outside);
+        }
+        let Some((relation, left, right)) =
+            graph.defining_op(condition).and_then(Relation::comparison)
         else {
             continue;
         };
-        if !body.contains(&inside.block) || body.contains(&outside.block) {
-            continue;
-        }
+        let (relation, counter, bound) = match (body.contains(&inside), body.contains(&outside)) {
+            (true, false) => (relation, left, right),
+            (false, true) => {
+                std::mem::swap(&mut inside, &mut outside);
+                (relation.negate(), left, right)
+            }
+            _ => continue,
+        };
+        let (inclusive, counter, bound) = match relation {
+            Relation::Less => (false, counter, bound),
+            Relation::LessEqual => (true, counter, bound),
+            Relation::Greater => (false, bound, counter),
+            Relation::GreaterEqual => (true, bound, counter),
+        };
         let Some(start) = counts_up(graph, cfg, header, &body, counter) else {
             continue;
         };
         counted.push(CountedLoop {
             header,
             counter,
-            inside: inside.block,
+            inside,
             bound,
+            inclusive,
             start,
         });
     }
     counted
 }
 
-/// The smallest initial value of a counter that starts at non-negative integers and only
-/// steps by one.
+/// The initial value of a counter that only steps by one, or the smallest one when it starts
+/// at several integers.
 fn counts_up(
     graph: &Graph,
     cfg: &Cfg,
     header: Block,
     body: &FxHashSet<Block>,
     counter: Value,
-) -> Option<i32> {
+) -> Option<Value> {
     let index = graph.blocks[header]
         .params
         .iter()
         .position(|&param| param == counter)?;
-    let mut start = None::<i32>;
+    let mut start = None::<Value>;
     for &pred in &cfg.preds[header] {
         let terminator = graph.blocks[pred].terminator.as_ref().unwrap();
         for target in terminator
@@ -507,26 +523,18 @@ fn counts_up(
             .filter(|target| target.block == header)
         {
             let arg = target.args[index];
-            match graph.defining_op(arg) {
-                Some(Op::Javascript(JsOp::Constant(Constant::Number(initial))))
-                    if !body.contains(&pred)
-                        && *initial >= 0.0
-                        && initial.fract() == 0.0
-                        && *initial <= f64::from(i32::MAX) =>
-                {
-                    let initial = *initial as i32;
-                    start = Some(start.map_or(initial, |start| start.min(initial)));
+            if body.contains(&pred) {
+                if induction_step(graph, arg) != Some((counter, 1)) {
+                    return None;
                 }
-                Some(&Op::Javascript(JsOp::Unary(UnaryOp::Increment, operand)))
-                    if operand == counter => {}
-                Some(&Op::Javascript(JsOp::Binary(BinaryOperator::Addition, operand, step)))
-                    if operand == counter
-                        && matches!(
-                            graph.defining_op(step),
-                            Some(Op::Javascript(JsOp::Constant(Constant::Number(step)))) if *step == 1.0
-                        ) => {}
-                _ => return None,
+                continue;
             }
+            start = Some(match start {
+                None => arg,
+                Some(other) if other == arg => arg,
+                Some(other) if integer_literal(graph, arg)? < integer_literal(graph, other)? => arg,
+                Some(other) => other,
+            });
         }
     }
     start

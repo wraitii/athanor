@@ -599,9 +599,6 @@ fn ranged_reads(
             if !objects.contains(&object)
                 || bounded.contains_key(&inst)
                 || !facts.of(key).within(NUMERIC)
-                // A failed entry check sends the whole region to generic code, so leave keys that
-                // can go negative, such as `a[i - 1]` behind `i > 0`, to their per-read checks.
-                || ranges.integer_at(key, block).is_some_and(|range| range.min < 0)
             {
                 continue;
             }
@@ -615,6 +612,11 @@ fn ranged_reads(
             else {
                 continue;
             };
+            // A failed entry check sends the whole region to generic code, so leave keys that
+            // always go negative, such as `a[i - 1]` behind `i > 0`, to their per-read checks.
+            if interval.low().max < 0 {
+                continue;
+            }
             ranged.insert(inst);
             let range = (object, interval);
             if !intervals.contains(&range) {

@@ -409,7 +409,7 @@ impl<'a> Ranges<'a> {
     }
 }
 
-fn integer_literal(graph: &Graph, value: Value) -> Option<i64> {
+pub(super) fn integer_literal(graph: &Graph, value: Value) -> Option<i64> {
     match graph.defining_op(value)? {
         Op::Javascript(JsOp::Constant(Constant::Number(n)))
             if n.fract() == 0.0
@@ -437,7 +437,7 @@ fn repr_range(graph: &Graph, value: Value) -> Option<IntRange> {
     }
 }
 
-fn induction_step(graph: &Graph, value: Value) -> Option<(Value, i64)> {
+pub(super) fn induction_step(graph: &Graph, value: Value) -> Option<(Value, i64)> {
     Some(match *graph.defining_op(value)? {
         Op::Javascript(JsOp::Unary(UnaryOp::Increment, operand)) => (operand, 1),
         Op::Javascript(JsOp::Unary(UnaryOp::Decrement, operand)) => (operand, -1),

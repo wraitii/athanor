@@ -2,6 +2,7 @@ use super::super::super::low_level::Binary;
 use super::super::super::ranges::IntRange;
 use super::*;
 use crate::jit::semantic::JsOp;
+use cranelift_codegen::entity::packed_option::ReservedValue;
 
 const DEPTH: usize = 12;
 
@@ -9,25 +10,24 @@ const DEPTH: usize = 12;
 pub(in crate::jit::semantic) enum Interval {
     Constant(i32),
     Invariant(Value, Option<IntRange>),
-    Counter { start: i32, bound: Box<Interval> },
+    Counter {
+        start: Box<Interval>,
+        bound: Box<Interval>,
+        inclusive: bool,
+    },
     Add(Box<Interval>, Box<Interval>),
     Subtract(Box<Interval>, Box<Interval>),
     Scale(Box<Interval>, Box<Interval>),
 }
 
-pub(super) struct Counters(FxHashMap<Value, (Block, i32, Value)>);
+pub(super) struct Counters(FxHashMap<Value, CountedLoop>);
 
 impl Counters {
     pub(super) fn discover(graph: &Graph, cfg: &Cfg) -> Self {
         Self(
             counted_loops(graph, cfg)
                 .into_iter()
-                .map(|counted| {
-                    (
-                        counted.counter,
-                        (counted.inside, counted.start, counted.bound),
-                    )
-                })
+                .map(|counted| (counted.counter, counted))
                 .collect(),
         )
     }
@@ -58,11 +58,14 @@ impl Interval {
             return None;
         }
         let mut of = |value| Self::at(graph, cfg, counters, block, value, invariant, depth + 1);
-        if let Some(&(inside, start, bound)) = counters.0.get(&value)
-            && cfg.dominates(inside, block)
+        if let Some(counted) = counters.0.get(&value)
+            && cfg.dominates(counted.inside, block)
         {
-            let bound = Box::new(of(bound)?);
-            return Some(Self::Counter { start, bound });
+            return Some(Self::Counter {
+                start: Box::new(of(counted.start)?),
+                bound: Box::new(of(counted.bound)?),
+                inclusive: counted.inclusive,
+            });
         }
         match graph.defining_op(value) {
             Some(Op::Javascript(JsOp::Constant(Constant::Number(number))))
@@ -107,6 +110,17 @@ impl Interval {
         }
     }
 
+    /// The range of the smallest value, as far as it is known without evaluating the expression.
+    pub(super) fn low(&self) -> IntRange {
+        let values = FxHashMap::default();
+        let mut emitter = Emitter {
+            target: None,
+            values: &values,
+            checks: Vec::new(),
+        };
+        emitter.emit(self).0.1
+    }
+
     /// Appends a check to `block` that every value the expression takes is an int32 integer
     /// and the smallest one is non-negative, branching to `fallback` otherwise, and returns the
     /// continuation block and one more than the largest value.
@@ -118,8 +132,7 @@ impl Interval {
         fallback: &Target,
     ) -> (Block, Value) {
         let mut emitter = Emitter {
-            graph,
-            block,
+            target: Some((graph, block)),
             values,
             checks: Vec::new(),
         };
@@ -130,11 +143,13 @@ impl Interval {
         let one = emitter.constant(1);
         let (limit, _) = emitter.binary(Binary::Add, high, one);
         let Emitter {
-            graph,
-            block,
+            target: Some((graph, block)),
             checks,
             ..
-        } = emitter;
+        } = emitter
+        else {
+            unreachable!()
+        };
         let span = graph.span;
         let Some(all) = checks
             .into_iter()
@@ -152,17 +167,18 @@ impl Interval {
 type Bound = (Value, IntRange);
 
 struct Emitter<'a> {
-    graph: &'a mut Graph,
-    block: Block,
+    target: Option<(&'a mut Graph, Block)>,
     values: &'a FxHashMap<Value, Value>,
     checks: Vec<Value>,
 }
 
 impl Emitter<'_> {
     fn append(&mut self, op: JsOp) -> Value {
-        let span = self.graph.span;
-        self.graph
-            .append_value(self.block, span, Op::Javascript(op))
+        let Some((graph, block)) = &mut self.target else {
+            return Value::reserved_value();
+        };
+        let span = graph.span;
+        graph.append_value(*block, span, Op::Javascript(op))
     }
 
     fn constant(&mut self, value: i32) -> Bound {
@@ -214,9 +230,16 @@ impl Emitter<'_> {
                 let value = self.within_int32(value, range);
                 (value, value)
             }
-            Interval::Counter { start, bound } => {
-                let low = self.constant(*start);
+            Interval::Counter {
+                start,
+                bound,
+                inclusive,
+            } => {
+                let (low, _) = self.emit(start);
                 let (_, bound) = self.emit(bound);
+                if *inclusive {
+                    return (low, bound);
+                }
                 let one = self.constant(1);
                 let high = self.binary(Binary::Subtract, bound, one);
                 (low, high)
