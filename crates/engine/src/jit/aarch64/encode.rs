@@ -648,6 +648,11 @@ pub(super) fn vector_shift(op: Shift, rd: u8, rn: u8, amount: u32) -> u32 {
     }
 }
 
+pub(super) fn vector_shift_by(signed: bool, rd: u8, rn: u8, rm: u8) -> u32 {
+    let base = if signed { 0x4EA0_4400 } else { 0x6EA0_4400 };
+    base | rd_rn_rm(rd, rn, rm)
+}
+
 pub(super) fn vector_dup(rd: u8, rn: u8) -> u32 {
     0x4E04_0C00 | rd_rn(rd, rn)
 }

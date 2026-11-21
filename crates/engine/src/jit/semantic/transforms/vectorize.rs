@@ -297,12 +297,8 @@ fn lanewise(graph: &Graph, kinds: &FxHashMap<Value, Kind>, op: &LowOp, operands:
         LowOp::Binary {
             op: Binary::ShiftLeft | Binary::ShiftRightSigned | Binary::ShiftRightUnsigned,
             left,
-            right,
-        } => {
-            operands[0] == Kind::Vector
-                && super::super::ranges::integer_literal(graph, right).is_some()
-                && width(graph, left) == Some(types::I32)
-        }
+            ..
+        } => operands == [Kind::Vector, Kind::Invariant] && width(graph, left) == Some(types::I32),
         _ => false,
     }
 }

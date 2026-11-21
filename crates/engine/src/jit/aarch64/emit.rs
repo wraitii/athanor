@@ -5,7 +5,7 @@ use cranelift_module::{ModuleReloc, ModuleRelocTarget};
 use super::Unsupported;
 use super::abi::{CALLEE, F0, F1, Location, T0, T1, T2};
 use super::asm::{Assembler, Label};
-use super::encode::{self as e, Alu, Cond, Index, Mem, VectorOp, Width};
+use super::encode::{self as e, Alu, Cond, Index, Mem, Shift, VectorOp, Width};
 use super::inst::{self as a, Address, CompareOperand, Condition, Mask};
 use super::prepare::{Call, Prepared};
 use crate::jit::alloc::moves::{Loc, Move};
@@ -955,6 +955,22 @@ impl Emitter<'_> {
                 let result = result.unwrap();
                 let d = self.def_reg(result, F0);
                 self.asm.emit(e::vector_binary(op, d, a, b));
+                self.commit(result, d);
+            }
+            a::Vector::ShiftBy { op, value, amount } => {
+                let a = self.use_reg(value, F0);
+                let t = self.use_reg(amount, T0);
+                // Register shifts do not wrap their amount and shift right by negative amounts.
+                self.asm
+                    .emit(e::logical_imm(e::Logical::And, Width::W, T0, t, 31).unwrap());
+                if op != Shift::Lsl {
+                    self.asm.emit(e::alu(Alu::Sub, Width::W, T0, e::ZR, T0));
+                }
+                self.asm.emit(e::vector_dup(F1, T0));
+                let result = result.unwrap();
+                let d = self.def_reg(result, F0);
+                self.asm
+                    .emit(e::vector_shift_by(op == Shift::Asr, d, a, F1));
                 self.commit(result, d);
             }
             a::Vector::MultiplyAdd {

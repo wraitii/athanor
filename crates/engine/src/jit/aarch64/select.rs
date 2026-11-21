@@ -1112,17 +1112,21 @@ impl Selector<'_> {
                 left,
                 right,
             } => {
-                let amount = constant(self.b.graph, right)
-                    .ok_or_else(|| Unsupported("vector shift amount".into()))?
-                    as u32
-                    & 31;
+                let shift = match op {
+                    B::ShiftLeft => Shift::Lsl,
+                    B::ShiftRightSigned => Shift::Asr,
+                    _ => Shift::Lsr,
+                };
+                let Some(amount) = constant(self.b.graph, right) else {
+                    return Ok(a::Vector::ShiftBy {
+                        op: shift,
+                        value: left,
+                        amount: right,
+                    });
+                };
+                let amount = amount as u32 & 31;
                 a::Vector::Shift {
-                    op: match op {
-                        _ if amount == 0 => Shift::Lsl,
-                        B::ShiftLeft => Shift::Lsl,
-                        B::ShiftRightSigned => Shift::Asr,
-                        _ => Shift::Lsr,
-                    },
+                    op: if amount == 0 { Shift::Lsl } else { shift },
                     value: left,
                     amount,
                 }
