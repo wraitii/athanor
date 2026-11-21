@@ -70,6 +70,13 @@ node bench/v8-v7/shell.cjs ../gaussian-blur
 cpp-quickjs/build/mapgen-runner --bootstrap bench/v8-v7/quickjs.js bench/gaussian-blur.js
 ```
 
+`gaussian-blur-typed.js` is the typed-array variant used by the web
+frontend's example: a 5×5 kernel over a 256×256 `Float32Array`, with the
+kernel and output also stored in `Float32Array`s. Run it the same way,
+substituting the file name. Its reference value is also arbitrary, and set
+high enough that scores stay above 100, since `FormatScore` otherwise needs
+`Number.prototype.toPrecision`.
+
 ### Results
 
 Apple Silicon; Node 23.9.0, Bun 1.3.1, SpiderMonkey 128,
