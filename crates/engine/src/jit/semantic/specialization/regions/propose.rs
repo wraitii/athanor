@@ -267,13 +267,13 @@ pub(super) fn integer_ranges(
         return Vec::new();
     }
     let loops = natural_loops(graph, &facts.cfg);
-    let nested: FxHashSet<_> = loops
+    let mut nested: FxHashSet<_> = loops
         .into_iter()
         .filter(|(inner, blocks)| *inner != header && blocks.is_subset(body))
         .flat_map(|(_, blocks)| blocks)
         .collect();
     if nested.is_empty() {
-        return Vec::new();
+        nested.clone_from(body);
     }
 
     let receivers: FxHashSet<_> = graph
@@ -314,9 +314,6 @@ pub(super) fn integer_ranges(
                 if benefits_from_ranges(graph, &mut Ranges::new(graph, facts, &fewer), index) {
                     inputs = fewer;
                 }
-            }
-            if inputs.len() > 2 {
-                return Vec::new();
             }
             return inputs
                 .into_iter()

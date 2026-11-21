@@ -1883,10 +1883,11 @@ function incl(a, n) { var s = 0; for (var i = 0; i <= n; i++) s += a[i] === unde
 function swapped(a, n) { var s = 0; for (var i = 1; n > i; i++) s += a[i + 1] === undefined ? 1000 : a[i + 1]; return s; }
 function from(a, lo, hi) { var s = 0; for (var i = lo; i < hi; i++) s += a[i] === undefined ? 1000 : a[i]; return s; }
 function tail(a, n) { var s = 0; for (var i = 0; i < n; i++) for (var j = i; j < n; j++) { var v = a[i * n + j]; s += v === undefined ? 1000 : v; } return s; }
+function strided(a, n, w, c) { var s = 0; for (var i = 0; i < n; i++) { var v = a[i * w + c]; s += v === undefined ? 1000 : v; } return s; }
 function main() {
   var a = new Float64Array(64);
   for (var i = 0; i < 64; i++) a[i] = i * 0.5 + 1;
-  var t = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+  var t = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
   for (var r = 0; r < 300; r++) {
     t[0] += neg(a, 10) === neg(a, 10) ? 1 : 2;
     t[1] += past(a, 64);
@@ -1900,6 +1901,7 @@ function main() {
     t[9] += swapped(a, r % 13 == 0 ? 64 : 63);
     t[10] += from(a, r % 3 == 0 ? -1 : r % 3 == 1 ? 2 : 1.5, 60);
     t[11] += tail(a, r % 17 == 0 ? 9 : 8);
+    t[12] += strided(a, r % 19 == 0 ? 3 : 8, r % 23 == 0 ? 40000 : 7, r % 8);
   }
   return t.reduce(function (s, v) { return s + v; }, 0);
 }
@@ -1909,6 +1911,6 @@ function main() {
         .unwrap();
     assert_eq!(
         engine.call("main", &[]).unwrap().value(),
-        Value::number(9230049.0)
+        Value::number(9355834.0)
     );
 }
