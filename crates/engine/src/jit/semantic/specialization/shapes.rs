@@ -64,7 +64,7 @@ impl Plan {
     }
 }
 
-fn property_access(op: &Op) -> Option<PropertyAccess> {
+pub(in crate::jit::semantic) fn property_access(op: &Op) -> Option<PropertyAccess> {
     match op {
         Op::Javascript(JsOp::Get(_, name) | JsOp::ProbeProperty(_, name)) if name != "length" => {
             Some(PropertyAccess::Get)
@@ -74,7 +74,7 @@ fn property_access(op: &Op) -> Option<PropertyAccess> {
     }
 }
 
-fn site(graph: &Graph, inst: Inst, source: usize) -> Site {
+pub(in crate::jit::semantic) fn site(graph: &Graph, inst: Inst, source: usize) -> Site {
     let data = &graph.insts[inst];
     Site {
         inline_context: data.inline_context,

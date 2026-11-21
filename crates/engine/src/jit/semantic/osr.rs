@@ -12,7 +12,7 @@ use oxc_syntax::operator::BinaryOperator;
 use smallvec::SmallVec;
 
 use super::specialization::calls::Repository;
-use crate::jit::profile::{Observation, ReadKind, ReadType, Site};
+use crate::jit::profile::{Observation, PropertyAccess, ReadKind, ReadType, Site};
 
 use super::continuation::{Shape, liveness, unbox};
 use super::{
@@ -39,6 +39,7 @@ pub(in crate::jit) struct Loop {
     pub(in crate::jit) header: Block,
     pub(in crate::jit) body: FxHashSet<Block>,
     pub(in crate::jit) opportunities: Vec<Opportunity>,
+    shapes: Vec<ShapeSite>,
     pub(in crate::jit) transfer: Result<Transfer, String>,
 }
 
@@ -63,6 +64,13 @@ pub(in crate::jit) struct Opportunity {
     pub(in crate::jit) site: Site,
     pub(in crate::jit) kind: Observation,
     feedback: Feedback,
+}
+
+#[derive(Clone, Copy)]
+struct ShapeSite {
+    block: Block,
+    site: Site,
+    property: PropertyAccess,
 }
 
 #[derive(Clone)]
@@ -175,7 +183,31 @@ impl Plan {
                 })
             })
             .collect();
-        if opportunities.is_empty() {
+        let shapes: Vec<_> = cfg
+            .rpo
+            .iter()
+            .filter(|block| !graph.cold.contains(block))
+            .flat_map(|&block| {
+                graph.blocks[block]
+                    .insts
+                    .iter()
+                    .map(move |&inst| (block, inst))
+            })
+            .filter_map(|(block, inst)| {
+                let property =
+                    super::specialization::shapes::property_access(&graph.insts[inst].op)?;
+                let site = super::specialization::shapes::site(graph, inst, source);
+                feedback
+                    .and_then(|repository| repository.shape_feedback(site, property))
+                    .is_none()
+                    .then_some(ShapeSite {
+                        block,
+                        site,
+                        property,
+                    })
+            })
+            .collect();
+        if opportunities.is_empty() && shapes.is_empty() {
             return None;
         }
         let facts = Facts::compute(graph);
@@ -206,13 +238,19 @@ impl Plan {
                         feedback: opportunity.feedback.clone(),
                     })
                     .collect();
-                if opportunities.is_empty() {
+                let shapes: Vec<_> = shapes
+                    .iter()
+                    .filter(|shape| body.contains(&shape.block))
+                    .copied()
+                    .collect();
+                if opportunities.is_empty() && shapes.is_empty() {
                     return None;
                 }
                 Some(Loop {
                     header,
                     body,
                     opportunities,
+                    shapes,
                     transfer,
                 })
             })
@@ -236,6 +274,11 @@ impl Plan {
                 .opportunities
                 .iter()
                 .any(|opportunity| opportunity.feedback.changed(repository, opportunity.site))
+            || self.loops[candidate].shapes.iter().any(|shape| {
+                repository
+                    .shape_feedback(shape.site, shape.property)
+                    .is_some()
+            })
     }
 
     pub(in crate::jit) fn instrument(self: &Arc<Self>, graph: &mut Graph) -> super::Result<()> {
