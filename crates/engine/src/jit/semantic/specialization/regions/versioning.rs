@@ -51,6 +51,7 @@ pub(in crate::jit::semantic) struct Speculation<'a> {
     pub(in crate::jit::semantic) exits_true: &'a [Block],
     pub(in crate::jit::semantic) typed_reads: &'a [(Inst, TypedRead)],
     pub(in crate::jit::semantic) array_reads: &'a [(Inst, IndexBound)],
+    pub(in crate::jit::semantic) ranges: &'a [(Value, Interval)],
     pub(in crate::jit::semantic) assumes: &'a [(Value, Fact)],
     pub(in crate::jit::semantic) code_guards: &'a [(String, cranelift_module::FuncId)],
 }
@@ -602,6 +603,12 @@ fn entry_checks(
             ))
         })
         .collect();
+    for (object, interval) in speculation.ranges {
+        let object = values.get(object).copied().unwrap_or(*object);
+        let limit;
+        (current, limit) = interval.guard(graph, current, values, &original);
+        bounds.push((object, limit));
+    }
     bounds.sort();
     bounds.dedup();
     current = typed_guards(graph, current, &original, &mapped_typed, &bounds);

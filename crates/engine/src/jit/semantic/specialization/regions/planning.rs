@@ -154,7 +154,8 @@ fn plan(
             checks: parent.checks.len()
                 + parent.identities.len()
                 + parent.locals.len()
-                + parent.array_reads.len(),
+                + parent.array_reads.len()
+                + parent.ranges.len(),
             reentry: parent.reentry.as_deref(),
             survivors: &parent.survivors,
         };
@@ -186,6 +187,7 @@ fn plan(
             exits: &parent.exits,
             typed_reads: &parent.typed_reads,
             array_reads: &parent.array_reads,
+            ranges: &parent.ranges,
             code_guards: &parent.identities,
             ..Default::default()
         };

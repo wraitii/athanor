@@ -1862,3 +1862,45 @@ fn language_errors_are_catchable() {
         Value::boolean(true),
     );
 }
+
+#[test]
+fn typed_reads_with_loop_index_ranges_fall_back_outside_them() {
+    let mut engine = Engine::with_options(js_engine::EngineOptions {
+        background_compile: false,
+        ..Default::default()
+    })
+    .unwrap();
+    engine
+        .compile(
+            r#"
+function neg(a, n) { var s = 0; for (var i = 0; i < n; i++) s += a[i - 1]; return s; }
+function past(a, n) { var s = 0; for (var i = 0; i < n; i++) s += a[i + 1] === undefined ? 1000 : a[i + 1]; return s; }
+function frac(a, n, w) { var s = 0; for (var i = 0; i < n; i++) { var v = a[i * w]; s += v === undefined ? 7 : v; } return s; }
+function grid(a, w, h) { var s = 0; for (var y = 1; y < h - 1; y++) for (var x = 1; x < w - 1; x++) s += a[(y - 1) * w + x + 1] * 2 + a[y * w + x - 1]; return s; }
+function tri(a, n) { var s = 0; for (var i = 0; i < n; i++) for (var j = 0; j < i; j++) s += a[i * n + j]; return s; }
+function guarded(a, n) { var s = 0; for (var i = 0; i < n; i++) if (i > 0) s += a[i - 1]; return s; }
+function main() {
+  var a = new Float64Array(64);
+  for (var i = 0; i < 64; i++) a[i] = i * 0.5 + 1;
+  var t = [0, 0, 0, 0, 0, 0, 0, 0];
+  for (var r = 0; r < 300; r++) {
+    t[0] += neg(a, 10) === neg(a, 10) ? 1 : 2;
+    t[1] += past(a, 64);
+    t[2] += frac(a, 20, r % 3 == 0 ? 2.5 : 3);
+    t[3] += grid(a, 8, 8);
+    t[4] += grid(a, 8, r % 5 == 0 ? 9 : 8);
+    t[5] += tri(a, 8);
+    t[6] += guarded(a, 64);
+    t[7] += neg(a, r % 7 == 0 ? 3.5 : 3) === neg(a, 2) ? 1 : 3;
+  }
+  return t[0] + t[1] + t[2] + t[3] + t[4] + t[5] + t[6] + t[7];
+}
+"#,
+            "semantics.js",
+        )
+        .unwrap();
+    assert_eq!(
+        engine.call("main", &[]).unwrap().value(),
+        Value::number(2153610.0)
+    );
+}

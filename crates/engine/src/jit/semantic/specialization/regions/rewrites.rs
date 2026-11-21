@@ -25,6 +25,7 @@ pub(super) struct RegionPlan {
     pub(super) exits: Vec<Block>,
     pub(super) typed_reads: Vec<(Inst, TypedRead)>,
     pub(super) array_reads: Vec<(Inst, IndexBound)>,
+    pub(super) ranges: Vec<(Value, Interval)>,
     pub(super) survivors: Vec<(Fact, Origin)>,
     pub(super) reentry: Option<String>,
     pub(super) children: Vec<RegionPlan>,
@@ -176,6 +177,13 @@ impl RegionPlan {
                 .unwrap(),
             }
         }
+        for (object, interval) in &self.ranges {
+            writeln!(
+                out,
+                "{indent}  index range {interval:?} within length({object})"
+            )
+            .unwrap();
+        }
         if children {
             for child in &self.children {
                 out.push_str(&child.report(graph, depth + 1, true));
@@ -191,6 +199,7 @@ impl RegionPlan {
             || !self.checks.is_empty()
             || !self.guards.is_empty()
             || !self.array_reads.is_empty()
+            || !self.ranges.is_empty()
     }
 }
 
@@ -412,6 +421,9 @@ pub(super) fn plan_region(
     let objects: Vec<Value> = typed.iter().map(|&(object, _)| object).collect();
     let mut bounded = bounded_reads(&planning, &facts.cfg, &body, &objects, &available, &facts);
     bounded.retain(|_, &mut (object, bound)| assumes.contains(&(object, Fact::Bound(bound))));
+    let (ranged, index_ranges) = ranged_reads(
+        &planning, &facts, &body, &blocks, &objects, &bounded, &available,
+    );
     let mut bounds: Vec<_> = bounded.values().copied().collect();
     bounds.sort();
     bounds.dedup();
@@ -493,7 +505,8 @@ pub(super) fn plan_region(
                     TypedRead {
                         element: previous.and_then(|read| read.element).or(element),
                         bounded: previous.is_some_and(|read| read.bounded)
-                            || bounded.contains_key(&inst),
+                            || bounded.contains_key(&inst)
+                            || ranged.contains(&inst),
                     },
                 ));
             }
@@ -542,12 +555,64 @@ pub(super) fn plan_region(
             exits,
             typed_reads,
             array_reads,
+            ranges: index_ranges,
             survivors,
             reentry,
             children: Vec::new(),
         },
         planning,
     ))
+}
+
+/// Typed reads on `objects` whose key stays within an interval computable at region entry,
+/// and those intervals.
+fn ranged_reads(
+    graph: &Graph,
+    facts: &Facts,
+    body: &FxHashSet<Block>,
+    blocks: &[Block],
+    objects: &[Value],
+    bounded: &FxHashMap<Inst, (Value, Value)>,
+    available: &FxHashSet<Value>,
+) -> (FxHashSet<Inst>, Vec<(Value, Interval)>) {
+    use super::super::super::ranges::Ranges;
+
+    let counters = Counters::discover(graph, &facts.cfg);
+    let invariant = |value: Value| {
+        (!body.contains(&graph.def_block(value)) || available.contains(&value))
+            && facts.of(value).within(ValueType::NUMBER)
+    };
+    let mut ranges = Ranges::new(graph, facts, &[]);
+    let mut ranged = FxHashSet::default();
+    let mut intervals = Vec::new();
+    for &block in blocks.iter().filter(|block| !graph.cold.contains(block)) {
+        for &inst in &graph.blocks[block].insts {
+            let Op::Javascript(JsOp::GetIndex(object, key) | JsOp::TypedIndex(object, key, _)) =
+                graph.insts[inst].op
+            else {
+                continue;
+            };
+            if !objects.contains(&object)
+                || bounded.contains_key(&inst)
+                || !facts.of(key).within(NUMERIC)
+                // A failed entry check sends the whole region to generic code, so leave keys that
+                // can go negative, such as `a[i - 1]` behind `i > 0`, to their per-read checks.
+                || ranges.integer_at(key, block).is_some_and(|range| range.min < 0)
+            {
+                continue;
+            }
+            let Some(interval) = Interval::of(graph, &facts.cfg, &counters, block, key, &invariant)
+            else {
+                continue;
+            };
+            ranged.insert(inst);
+            let range = (object, interval);
+            if !intervals.contains(&range) {
+                intervals.push(range);
+            }
+        }
+    }
+    (ranged, intervals)
 }
 
 #[allow(clippy::too_many_arguments)]

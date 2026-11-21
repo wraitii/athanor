@@ -414,7 +414,11 @@ inherited elements without traversing prototypes on normal dense accesses.
 `Array.prototype` itself always uses generic indexed access so writes cannot
 bypass this invalidation.
 
-Typed arrays carry an element kind and require appropriate kind and bounds checks. Heap views
+Typed arrays carry an element kind and require appropriate kind and bounds checks. A region
+skips a typed read's bounds check when its key is built from `+`, `-` and constant or
+invariant `*` over constants, invariants and counting loop counters: the entry evaluates
+the key's interval, checks every endpoint is an int32 integer, the low end is non-negative
+and the high end below the length (`specialization/regions/intervals.rs`). Heap views
 and lowered offsets expose storage to optimized code only while their validity
 conditions hold. The slow helpers implement generic behavior when those
 conditions are not established. `heap/shape.rs`, `heap/properties.rs`,
