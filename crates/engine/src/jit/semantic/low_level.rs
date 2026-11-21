@@ -46,6 +46,14 @@ impl Op {
                 ..
             } => ([Some(*left), Some(*right), None], &[]),
             Op::Select { condition, yes, no } => ([Some(*condition), Some(*yes), Some(*no)], &[]),
+            Op::Vector(vector) => match vector {
+                Vector::Load { base, index, .. } => ([Some(*base), Some(*index), None], &[]),
+                Vector::Store {
+                    base, index, value, ..
+                } => ([Some(*base), Some(*index), Some(*value)], &[]),
+                Vector::Splat { value, .. } => ([Some(*value), None, None], &[]),
+                Vector::Binary { left, right, .. } => ([Some(*left), Some(*right), None], &[]),
+            },
             Op::Integer { .. }
             | Op::Float64(_)
             | Op::StackAddress { .. }
@@ -91,6 +99,14 @@ impl Op {
                 ..
             } => ([Some(left), Some(right), None], &mut []),
             Op::Select { condition, yes, no } => ([Some(condition), Some(yes), Some(no)], &mut []),
+            Op::Vector(vector) => match vector {
+                Vector::Load { base, index, .. } => ([Some(base), Some(index), None], &mut []),
+                Vector::Store {
+                    base, index, value, ..
+                } => ([Some(base), Some(index), Some(value)], &mut []),
+                Vector::Splat { value, .. } => ([Some(value), None, None], &mut []),
+                Vector::Binary { left, right, .. } => ([Some(left), Some(right), None], &mut []),
+            },
             Op::Integer { .. }
             | Op::Float64(_)
             | Op::StackAddress { .. }
@@ -283,6 +299,32 @@ pub(in crate::jit) enum Op {
         helper: Option<Helper>,
     },
     VariableRead,
+    Vector(Vector),
+}
+
+#[derive(Clone, Debug)]
+pub(in crate::jit) enum Vector {
+    Load {
+        ty: Type,
+        base: Value,
+        index: Value,
+        format: super::MemoryFormat,
+    },
+    Store {
+        base: Value,
+        index: Value,
+        value: Value,
+        format: super::MemoryFormat,
+    },
+    Splat {
+        ty: Type,
+        value: Value,
+    },
+    Binary {
+        op: Binary,
+        left: Value,
+        right: Value,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]

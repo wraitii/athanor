@@ -274,7 +274,12 @@ fn expand(graph: &mut Graph, counted: Counted) {
     super::super::dispatch::extend_regions(graph, header, first);
 }
 
-fn clone_inst(graph: &mut Graph, inst: Inst, block: Block, values: &mut FxHashMap<Value, Value>) {
+pub(super) fn clone_inst(
+    graph: &mut Graph,
+    inst: Inst,
+    block: Block,
+    values: &mut FxHashMap<Value, Value>,
+) {
     let mut data: InstData = graph.insts[inst].clone();
     for value in data.op.operands_mut() {
         *value = values.get(value).copied().unwrap_or(*value);

@@ -1948,3 +1948,54 @@ function main() {
         Value::boolean(true)
     );
 }
+
+#[test]
+fn typed_element_loops_match_scalar_results() {
+    for backend in [
+        js_engine::Backend::NativeOnly,
+        js_engine::Backend::Cranelift,
+    ] {
+        let mut engine = Engine::with_options(js_engine::EngineOptions {
+            background_compile: false,
+            backend,
+            ..Default::default()
+        })
+        .unwrap();
+        engine
+            .compile(
+                r#"
+function blend(a, b, c, n, k) {
+  for (var x = 0; x < n; ++x) { b[x] = ((a[x] ^ k) - a[x + 1]) >> 1; c[x + 1] = a[x] * 5 + k; }
+}
+function matches(a, b, c, n, k, shared) {
+  var e = [], f = [];
+  for (var i = 0; i < n + 2; i++) { e.push(0); f.push(0); }
+  for (var x = 0; x < n; ++x) {
+    e[x] = (((a[x] ^ k) - a[x + 1]) >> 1) & 255;
+    (shared ? e : f)[x + 1] = (a[x] * 5 + k) & 255;
+  }
+  for (var i = 0; i < n + 2; i++)
+    if (b[i] !== e[i] || !shared && c[i] !== f[i]) return false;
+  return true;
+}
+var ok = true;
+for (var r = 0; r < 300; r++) {
+  var n = r % 13, k = r * 40503 - 6000000;
+  var a = new Int16Array(n + 2), b = new Uint8Array(n + 2), c = new Uint8Array(n + 2);
+  for (var i = 0; i < n + 2; i++) a[i] = i * 2531 - r * 77;
+  var shared = r % 4 == 0;
+  blend(a, b, shared ? b : c, n, k);
+  ok = matches(a, b, c, n, k, shared) && ok;
+}
+function main() { return ok; }
+"#,
+                "semantics.js",
+            )
+            .unwrap();
+        assert_eq!(
+            engine.call("main", &[]).unwrap().value(),
+            Value::boolean(true),
+            "{backend:?}"
+        );
+    }
+}

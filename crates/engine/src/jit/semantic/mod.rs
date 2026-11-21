@@ -28,6 +28,7 @@ pub(in crate::jit) mod specialization;
 pub(in crate::jit) mod suspension;
 mod transforms;
 pub(super) use transforms::loops::natural_loops;
+pub(in crate::jit) use transforms::vectorize::vectorize;
 pub(in crate::jit) mod variables;
 pub(in crate::jit) mod widths;
 

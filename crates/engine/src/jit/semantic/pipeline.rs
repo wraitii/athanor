@@ -169,6 +169,7 @@ pub(in crate::jit) const LOW_LEVEL_PASSES: &[&str] = &[
     "aarch64-select",
     "legalize-convert",
     "bits",
+    "vectorize",
     "cranelift-memory",
 ];
 

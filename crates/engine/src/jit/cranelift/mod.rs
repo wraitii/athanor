@@ -1,5 +1,6 @@
 mod legalize;
 pub(super) mod stubs;
+mod vector;
 
 pub(in crate::jit) use legalize::prepare;
 #[cfg(test)]
@@ -226,6 +227,7 @@ pub(in crate::jit) fn emit(
                 Op::VariableRead => {
                     return Err(Error::Compile("unresolved low-level variable".into()));
                 }
+                Op::Vector(vector) => vector::emit(builder, vector, get),
                 Op::ExtractBits { .. } | Op::InRange { .. } | Op::TestMask { .. } => {
                     return Err(Error::Compile("unexpanded bit operation".into()));
                 }
