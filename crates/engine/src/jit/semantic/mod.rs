@@ -1630,7 +1630,13 @@ impl Graph {
                         ) => *base == value,
                         (
                             Op::Memory(MemoryOp::Load { address, .. })
-                            | Op::LowLevel(low_level::Op::Store { address, .. }),
+                            | Op::LowLevel(
+                                low_level::Op::Store { address, .. }
+                                | low_level::Op::Vector(
+                                    low_level::Vector::Load { address, .. }
+                                    | low_level::Vector::Store { address, .. },
+                                ),
+                            ),
                             Op::Memory(MemoryOp::Address { .. }),
                         ) => *address == value,
                         (
