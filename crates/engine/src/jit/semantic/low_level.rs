@@ -47,10 +47,8 @@ impl Op {
             } => ([Some(*left), Some(*right), None], &[]),
             Op::Select { condition, yes, no } => ([Some(*condition), Some(*yes), Some(*no)], &[]),
             Op::Vector(vector) => match vector {
-                Vector::Load { base, index, .. } => ([Some(*base), Some(*index), None], &[]),
-                Vector::Store {
-                    base, index, value, ..
-                } => ([Some(*base), Some(*index), Some(*value)], &[]),
+                Vector::Load { address, .. } => ([Some(*address), None, None], &[]),
+                Vector::Store { address, value, .. } => ([Some(*address), Some(*value), None], &[]),
                 Vector::Splat { value, .. } => ([Some(*value), None, None], &[]),
                 Vector::Binary { left, right, .. } => ([Some(*left), Some(*right), None], &[]),
             },
@@ -100,10 +98,10 @@ impl Op {
             } => ([Some(left), Some(right), None], &mut []),
             Op::Select { condition, yes, no } => ([Some(condition), Some(yes), Some(no)], &mut []),
             Op::Vector(vector) => match vector {
-                Vector::Load { base, index, .. } => ([Some(base), Some(index), None], &mut []),
-                Vector::Store {
-                    base, index, value, ..
-                } => ([Some(base), Some(index), Some(value)], &mut []),
+                Vector::Load { address, .. } => ([Some(address), None, None], &mut []),
+                Vector::Store { address, value, .. } => {
+                    ([Some(address), Some(value), None], &mut [])
+                }
                 Vector::Splat { value, .. } => ([Some(value), None, None], &mut []),
                 Vector::Binary { left, right, .. } => ([Some(left), Some(right), None], &mut []),
             },
@@ -306,13 +304,13 @@ pub(in crate::jit) enum Op {
 pub(in crate::jit) enum Vector {
     Load {
         ty: Type,
-        base: Value,
-        index: Value,
+        address: Value,
+        offset: i32,
         format: super::MemoryFormat,
     },
     Store {
-        base: Value,
-        index: Value,
+        address: Value,
+        offset: i32,
         value: Value,
         format: super::MemoryFormat,
     },

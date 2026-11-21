@@ -16,32 +16,32 @@ pub(super) fn emit(
     match *vector {
         Vector::Load {
             ty,
-            base,
-            index,
+            address,
+            offset,
             format,
         } => {
-            let address = address(builder, get(base), get(index), format);
+            let address = get(address);
             let loaded = match format {
                 MemoryFormat::U8 | MemoryFormat::I8 => {
-                    let word = builder.ins().load(types::I32, trusted, address, 0);
+                    let word = builder.ins().load(types::I32, trusted, address, offset);
                     let bytes = builder.ins().scalar_to_vector(types::I32X4, word);
                     let bytes = builder.ins().bitcast(types::I8X16, lanes, bytes);
                     let halves = widen(builder, format, bytes);
                     widen(builder, format, halves)
                 }
-                MemoryFormat::I16 => builder.ins().sload16x4(trusted, address, 0),
-                MemoryFormat::U16 => builder.ins().uload16x4(trusted, address, 0),
-                _ => builder.ins().load(ty, trusted, address, 0),
+                MemoryFormat::I16 => builder.ins().sload16x4(trusted, address, offset),
+                MemoryFormat::U16 => builder.ins().uload16x4(trusted, address, offset),
+                _ => builder.ins().load(ty, trusted, address, offset),
             };
             vec![loaded]
         }
         Vector::Store {
-            base,
-            index,
+            address,
+            offset,
             value,
             format,
         } => {
-            let address = address(builder, get(base), get(index), format);
+            let address = get(address);
             let value = get(value);
             let stored = match format.bytes() {
                 1 => {
@@ -57,7 +57,7 @@ pub(super) fn emit(
                 }
                 _ => value,
             };
-            builder.ins().store(trusted, stored, address, 0);
+            builder.ins().store(trusted, stored, address, offset);
             Vec::new()
         }
         Vector::Splat { ty, value } => vec![builder.ins().splat(ty, get(value))],
@@ -77,16 +77,6 @@ pub(super) fn emit(
             }]
         }
     }
-}
-
-fn address(
-    builder: &mut FunctionBuilder<'_>,
-    base: ClifValue,
-    index: ClifValue,
-    format: MemoryFormat,
-) -> ClifValue {
-    let offset = builder.ins().imul_imm_s(index, format.bytes() as i64);
-    builder.ins().iadd(base, offset)
 }
 
 fn widen(builder: &mut FunctionBuilder<'_>, format: MemoryFormat, value: ClifValue) -> ClifValue {

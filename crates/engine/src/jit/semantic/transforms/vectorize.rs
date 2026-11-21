@@ -1,7 +1,7 @@
 use super::super::low_level::{Binary, Op as LowOp, Unary, Vector};
 use super::super::{
-    Block, BlockData, Cfg, Graph, Inst, MemoryFormat, MemoryOp, Op, Repr, Target, TerminatorKind,
-    Value, ValueDef,
+    Block, BlockData, Cfg, Facts, Graph, Inst, MemoryFormat, MemoryOp, Op, Repr, Target,
+    TerminatorKind, Value, ValueDef,
 };
 use super::loops::{natural_loops, preheader};
 use crate::{FxHashMap, FxHashSet};
@@ -51,11 +51,14 @@ pub(in crate::jit::semantic) fn vectorize(graph: &mut Graph) -> bool {
         })
         .filter_map(|(header, body)| plan(graph, &cfg, *header, body))
         .collect();
-    let changed = !plans.is_empty();
+    if plans.is_empty() {
+        return false;
+    }
     for plan in plans {
         apply(graph, plan);
     }
-    changed
+    super::dce::eliminate(graph, &Facts::effects(graph));
+    true
 }
 
 fn plan(graph: &Graph, cfg: &Cfg, header: Block, body: &FxHashSet<Block>) -> Option<Plan> {
@@ -439,6 +442,7 @@ fn apply(graph: &mut Graph, plan: Plan) {
     );
     values.insert(index, lanes);
     let mut splats: FxHashMap<Value, Value> = FxHashMap::default();
+    let mut addresses: FxHashMap<(Value, Value, u32), Value> = FxHashMap::default();
     for step in &steps {
         let Step::Inst(inst) = *step else {
             continue;
@@ -468,9 +472,11 @@ fn apply(graph: &mut Graph, plan: Plan) {
                 format,
             }) => {
                 let value = lane(graph, value);
+                let (address, offset) =
+                    address(graph, body, &values, &mut addresses, base, offset, format);
                 let store = Vector::Store {
-                    base: resolve(&values, base),
-                    index: resolve(&values, offset),
+                    address,
+                    offset,
                     value,
                     format,
                 };
@@ -481,12 +487,16 @@ fn apply(graph: &mut Graph, plan: Plan) {
                 base,
                 index: offset,
                 format,
-            }) => Vector::Load {
-                ty: VECTOR,
-                base: resolve(&values, base),
-                index: resolve(&values, offset),
-                format,
-            },
+            }) => {
+                let (address, offset) =
+                    address(graph, body, &values, &mut addresses, base, offset, format);
+                Vector::Load {
+                    ty: VECTOR,
+                    address,
+                    offset,
+                    format,
+                }
+            }
             Op::LowLevel(LowOp::Unary { value, .. }) | Op::Convert(value, _) => {
                 let result = graph.insts[inst].result().unwrap();
                 values.insert(result, values[&value]);
@@ -542,6 +552,76 @@ fn apply(graph: &mut Graph, plan: Plan) {
         }),
     );
     super::super::dispatch::extend_regions(graph, header, first);
+}
+
+fn address(
+    graph: &mut Graph,
+    block: Block,
+    values: &FxHashMap<Value, Value>,
+    addresses: &mut FxHashMap<(Value, Value, u32), Value>,
+    base: Value,
+    index: Value,
+    format: MemoryFormat,
+) -> (Value, i32) {
+    let bytes = format.bytes();
+    let (variable, offset) = split(graph, index);
+    let (index, offset) = match offset
+        .checked_mul(bytes.into())
+        .and_then(|offset| i32::try_from(offset).ok())
+    {
+        Some(offset) => (variable, offset),
+        None => (index, 0),
+    };
+    let (base, index) = (resolve(values, base), resolve(values, index));
+    let address = *addresses.entry((base, index, bytes)).or_insert_with(|| {
+        let address = graph.append_value(
+            block,
+            graph.span,
+            Op::Memory(MemoryOp::Address {
+                base,
+                index,
+                format,
+            }),
+        );
+        graph.reprs[address] = graph.reprs[base];
+        address
+    });
+    (address, offset)
+}
+
+fn split(graph: &Graph, value: Value) -> (Value, i64) {
+    let Some(Op::LowLevel(LowOp::Binary { op, left, right })) = graph.defining_op(value) else {
+        return (value, 0);
+    };
+    if width(graph, value) != Some(types::I64) {
+        return (value, 0);
+    }
+    let (variable, offset) = match (op, constant(graph, *left), constant(graph, *right)) {
+        (Binary::Add, _, Some(offset)) => (*left, offset),
+        (Binary::Add, Some(offset), _) => (*right, offset),
+        (Binary::Subtract, _, Some(offset)) => (*left, -offset),
+        _ => return (value, 0),
+    };
+    let (variable, inner) = split(graph, variable);
+    match inner.checked_add(offset) {
+        Some(offset) => (variable, offset),
+        None => (value, 0),
+    }
+}
+
+fn constant(graph: &Graph, value: Value) -> Option<i64> {
+    if let Some(literal) = super::super::ranges::integer_literal(graph, value) {
+        return Some(literal);
+    }
+    let Some(Op::LowLevel(LowOp::Binary { op, left, right })) = graph.defining_op(value) else {
+        return None;
+    };
+    let (left, right) = (constant(graph, *left)?, constant(graph, *right)?);
+    match op {
+        Binary::Add => left.checked_add(right),
+        Binary::Subtract => left.checked_sub(right),
+        _ => None,
+    }
 }
 
 fn resolve(values: &FxHashMap<Value, Value>, value: Value) -> Value {

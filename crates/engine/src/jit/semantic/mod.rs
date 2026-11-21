@@ -1300,12 +1300,17 @@ impl Graph {
                 effects: Effects::UNKNOWN,
                 result: Unowned,
             },
-            Op::LowLevel(low_level::Op::Load { .. }) => closed(HEAP_READ, Unowned),
+            Op::LowLevel(
+                low_level::Op::Load { .. } | low_level::Op::Vector(low_level::Vector::Load { .. }),
+            ) => closed(HEAP_READ, Unowned),
             Op::LowLevel(low_level::Op::AtomicLoad { .. }) => Contract {
                 effects: Effects::UNKNOWN,
                 result: Unowned,
             },
-            Op::LowLevel(low_level::Op::Store { .. }) => Contract {
+            Op::LowLevel(
+                low_level::Op::Store { .. }
+                | low_level::Op::Vector(low_level::Vector::Store { .. }),
+            ) => Contract {
                 effects: Effects::UNKNOWN,
                 result: None,
             },

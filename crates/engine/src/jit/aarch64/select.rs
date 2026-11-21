@@ -1048,22 +1048,22 @@ impl Selector<'_> {
         use low_level::{Binary as B, Vector as V};
         Ok(match vector {
             V::Load {
-                base,
-                index,
+                address,
+                offset,
                 format,
                 ..
             } => a::Vector::Load {
-                address: self.lanes(base, index, format),
+                address: self.lanes(address, offset, format, true),
                 bytes: format.bytes(),
                 signed: matches!(format, MemoryFormat::I8 | MemoryFormat::I16),
             },
             V::Store {
-                base,
-                index,
+                address,
+                offset,
                 value,
                 format,
             } => a::Vector::Store {
-                address: self.lanes(base, index, format),
+                address: self.lanes(address, offset, format, false),
                 bytes: format.bytes(),
                 value,
             },
@@ -1104,28 +1104,15 @@ impl Selector<'_> {
         })
     }
 
-    fn lanes(&mut self, base: Value, index: Value, format: MemoryFormat) -> a::Address {
-        let shift = format.bytes().trailing_zeros();
-        if shift == 0 {
-            return a::Address::Indexed {
+    fn lanes(&mut self, base: Value, offset: i32, format: MemoryFormat, load: bool) -> a::Address {
+        let op = e::vector_memory(format.bytes(), load);
+        self.address(
+            op,
+            Address::Offset {
                 base,
-                index,
-                kind: Index::Lsl,
-                scaled: false,
-            };
-        }
-        let base = self.b.semantic(
-            Op::Aarch64(a::Op::AddShifted {
-                sub: false,
-                width: Width::X,
-                left: base,
-                right: index,
-                kind: Index::Lsl,
-                shift,
-            }),
-            Repr::I64,
-        );
-        a::Address::Scaled { base, offset: 0 }
+                offset: offset.into(),
+            },
+        )
     }
 
     fn address(&mut self, op: Mem, address: Address) -> a::Address {

@@ -413,6 +413,17 @@ pub(super) fn mem_unscaled(op: Mem, rt: u8, rn: u8, offset: i32) -> Option<u32> 
     Some(base | (((offset as u32) & 0x1FF) << 12) | rd_rn(rt, rn))
 }
 
+pub(super) fn vector_memory(bytes: u32, load: bool) -> Mem {
+    match (bytes, load) {
+        (1, true) => Mem::LdrS,
+        (1, false) => Mem::StrS,
+        (2, true) => Mem::LdrD,
+        (2, false) => Mem::StrD,
+        (_, true) => Mem::LdrQ,
+        (_, false) => Mem::StrQ,
+    }
+}
+
 pub(super) fn mem_register(op: Mem, rt: u8, rn: u8, rm: u8) -> u32 {
     mem_indexed(op, rt, rn, rm, Index::Lsl, false)
 }
