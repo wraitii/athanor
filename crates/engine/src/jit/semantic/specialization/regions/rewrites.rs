@@ -1,4 +1,5 @@
 use super::super::super::guards::{Fact, Origin};
+use super::super::super::ranges::{IntRange, Ranges};
 use super::super::calls::ConditionalCall;
 use super::*;
 use crate::jit::semantic::JsOp;
@@ -421,15 +422,22 @@ pub(super) fn plan_region(
     let objects: Vec<Value> = typed.iter().map(|&(object, _)| object).collect();
     let mut bounded = bounded_reads(&planning, &facts.cfg, &body, &objects, &available, &facts);
     bounded.retain(|_, &mut (object, bound)| assumes.contains(&(object, Fact::Bound(bound))));
+    let ranges = entry.map_or_else(Vec::new, |(preheader, header)| {
+        super::propose::integer_ranges(&planning, &facts, preheader, header, &body, &numbers)
+    });
+    let inputs: Vec<_> = ranges
+        .iter()
+        .filter_map(|&(value, fact)| match fact {
+            Fact::IntegerRange(min, max) => Some((value, IntRange::new(min.into(), max.into()))),
+            _ => None,
+        })
+        .collect();
     let (ranged, index_ranges) = ranged_reads(
-        &planning, &facts, &body, &blocks, &objects, &bounded, &available,
+        &planning, &facts, &body, &blocks, &objects, &bounded, &available, &inputs,
     );
     let mut bounds: Vec<_> = bounded.values().copied().collect();
     bounds.sort();
     bounds.dedup();
-    let ranges = entry.map_or_else(Vec::new, |(preheader, header)| {
-        super::propose::integer_ranges(&planning, &facts, preheader, header, &body, &numbers)
-    });
     let mut checks = numbers;
     checks.extend(ranges);
     checks.extend(
@@ -566,6 +574,7 @@ pub(super) fn plan_region(
 
 /// Typed reads on `objects` whose key stays within an interval computable at region entry,
 /// and those intervals.
+#[allow(clippy::too_many_arguments)]
 fn ranged_reads(
     graph: &Graph,
     facts: &Facts,
@@ -574,15 +583,10 @@ fn ranged_reads(
     objects: &[Value],
     bounded: &FxHashMap<Inst, (Value, Value)>,
     available: &FxHashSet<Value>,
+    assumed: &[(Value, IntRange)],
 ) -> (FxHashSet<Inst>, Vec<(Value, Interval)>) {
-    use super::super::super::ranges::Ranges;
-
     let counters = Counters::discover(graph, &facts.cfg);
-    let invariant = |value: Value| {
-        (!body.contains(&graph.def_block(value)) || available.contains(&value))
-            && facts.of(value).within(ValueType::NUMBER)
-    };
-    let mut ranges = Ranges::new(graph, facts, &[]);
+    let mut ranges = Ranges::new(graph, facts, assumed);
     let mut ranged = FxHashSet::default();
     let mut intervals = Vec::new();
     for &block in blocks.iter().filter(|block| !graph.cold.contains(block)) {
@@ -601,7 +605,13 @@ fn ranged_reads(
             {
                 continue;
             }
-            let Some(interval) = Interval::of(graph, &facts.cfg, &counters, block, key, &invariant)
+            let mut invariant = |value: Value| {
+                ((!body.contains(&graph.def_block(value)) || available.contains(&value))
+                    && facts.of(value).within(ValueType::NUMBER))
+                .then(|| ranges.integer_at(value, graph.def_block(value)))
+            };
+            let Some(interval) =
+                Interval::of(graph, &facts.cfg, &counters, block, key, &mut invariant)
             else {
                 continue;
             };

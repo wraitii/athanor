@@ -1,3 +1,5 @@
+use super::super::super::low_level::Binary;
+use super::super::super::ranges::IntRange;
 use super::*;
 use crate::jit::semantic::JsOp;
 
@@ -6,7 +8,7 @@ const DEPTH: usize = 12;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(in crate::jit::semantic) enum Interval {
     Constant(i32),
-    Invariant(Value),
+    Invariant(Value, Option<IntRange>),
     Counter { start: i32, bound: Box<Interval> },
     Add(Box<Interval>, Box<Interval>),
     Subtract(Box<Interval>, Box<Interval>),
@@ -38,7 +40,7 @@ impl Interval {
         counters: &Counters,
         block: Block,
         value: Value,
-        invariant: &dyn Fn(Value) -> bool,
+        invariant: &mut dyn FnMut(Value) -> Option<Option<IntRange>>,
     ) -> Option<Self> {
         Self::at(graph, cfg, counters, block, value, invariant, 0)
     }
@@ -49,13 +51,13 @@ impl Interval {
         counters: &Counters,
         block: Block,
         value: Value,
-        invariant: &dyn Fn(Value) -> bool,
+        invariant: &mut dyn FnMut(Value) -> Option<Option<IntRange>>,
         depth: usize,
     ) -> Option<Self> {
         if depth > DEPTH {
             return None;
         }
-        let of = |value| Self::at(graph, cfg, counters, block, value, invariant, depth + 1);
+        let mut of = |value| Self::at(graph, cfg, counters, block, value, invariant, depth + 1);
         if let Some(&(inside, start, bound)) = counters.0.get(&value)
             && cfg.dominates(inside, block)
         {
@@ -92,12 +94,12 @@ impl Interval {
             }
             _ => {}
         }
-        invariant(value).then_some(Self::Invariant(value))
+        invariant(value).map(|range| Self::Invariant(value, range))
     }
 
     fn is_point(&self) -> bool {
         match self {
-            Self::Constant(_) | Self::Invariant(_) => true,
+            Self::Constant(_) | Self::Invariant(..) => true,
             Self::Counter { .. } => false,
             Self::Add(left, right) | Self::Subtract(left, right) | Self::Scale(left, right) => {
                 left.is_point() && right.is_point()
@@ -122,9 +124,11 @@ impl Interval {
             checks: Vec::new(),
         };
         let (low, high) = emitter.emit(self);
-        emitter.check(low, 0);
+        if low.1.min < 0 {
+            emitter.check(low.0, 0);
+        }
         let one = emitter.constant(1);
-        let limit = emitter.binary(BinaryOperator::Addition, high, one);
+        let (limit, _) = emitter.binary(Binary::Add, high, one);
         let Emitter {
             graph,
             block,
@@ -132,16 +136,20 @@ impl Interval {
             ..
         } = emitter;
         let span = graph.span;
-        let all = checks
+        let Some(all) = checks
             .into_iter()
             .reduce(|all, check| graph.append_value(block, span, Op::BooleanAnd(all, check)))
-            .unwrap();
+        else {
+            return (block, limit);
+        };
         let next = graph.blocks.push(BlockData::default());
         let kind = TerminatorKind::Branch(all, Target::new(next), fallback.clone());
         graph.terminate(block, span, kind);
         (next, limit)
     }
 }
+
+type Bound = (Value, IntRange);
 
 struct Emitter<'a> {
     graph: &'a mut Graph,
@@ -157,8 +165,9 @@ impl Emitter<'_> {
             .append_value(self.block, span, Op::Javascript(op))
     }
 
-    fn constant(&mut self, value: i32) -> Value {
-        self.append(JsOp::Constant(Constant::Number(f64::from(value))))
+    fn constant(&mut self, value: i32) -> Bound {
+        let constant = self.append(JsOp::Constant(Constant::Number(f64::from(value))));
+        (constant, IntRange::new(value.into(), value.into()))
     }
 
     fn check(&mut self, value: Value, min: i32) {
@@ -166,61 +175,77 @@ impl Emitter<'_> {
         self.checks.push(check);
     }
 
-    // Checking every endpoint keeps all values the loop computes within int32, so its f64
-    // arithmetic on them is exact and the endpoints bound it.
-    fn binary(&mut self, operator: BinaryOperator, left: Value, right: Value) -> Value {
-        let value = self.append(JsOp::Binary(operator, left, right));
+    // Keeping every endpoint within int32 keeps all values the loop computes there too, so
+    // its f64 arithmetic on them is exact and the endpoints bound it.
+    fn within_int32(&mut self, value: Value, range: Option<IntRange>) -> Bound {
+        if let Some(range) = range
+            && range.within(IntRange::I32)
+        {
+            return (value, range);
+        }
         self.check(value, i32::MIN);
-        value
+        (value, IntRange::I32)
     }
 
-    fn emit(&mut self, interval: &Interval) -> (Value, Value) {
+    fn binary(
+        &mut self,
+        op: Binary,
+        (left, left_range): Bound,
+        (right, right_range): Bound,
+    ) -> Bound {
+        let operator = match op {
+            Binary::Add => BinaryOperator::Addition,
+            Binary::Subtract => BinaryOperator::Subtraction,
+            _ => BinaryOperator::Multiplication,
+        };
+        let value = self.append(JsOp::Binary(operator, left, right));
+        self.within_int32(value, left_range.arithmetic(op, right_range))
+    }
+
+    fn emit(&mut self, interval: &Interval) -> (Bound, Bound) {
         match interval {
             &Interval::Constant(value) => {
                 let value = self.constant(value);
                 (value, value)
             }
-            &Interval::Invariant(value) => {
+            &Interval::Invariant(value, range) => {
                 let value = self.values.get(&value).copied().unwrap_or(value);
                 let value = self.append(JsOp::AsNumber(value));
-                self.check(value, i32::MIN);
+                let value = self.within_int32(value, range);
                 (value, value)
             }
             Interval::Counter { start, bound } => {
                 let low = self.constant(*start);
                 let (_, bound) = self.emit(bound);
                 let one = self.constant(1);
-                let high = self.binary(BinaryOperator::Subtraction, bound, one);
+                let high = self.binary(Binary::Subtract, bound, one);
                 (low, high)
             }
             Interval::Add(left, right) => {
                 let (left_low, left_high) = self.emit(left);
                 let (right_low, right_high) = self.emit(right);
                 (
-                    self.binary(BinaryOperator::Addition, left_low, right_low),
-                    self.binary(BinaryOperator::Addition, left_high, right_high),
+                    self.binary(Binary::Add, left_low, right_low),
+                    self.binary(Binary::Add, left_high, right_high),
                 )
             }
             Interval::Subtract(left, right) => {
                 let (left_low, left_high) = self.emit(left);
                 let (right_low, right_high) = self.emit(right);
                 (
-                    self.binary(BinaryOperator::Subtraction, left_low, right_high),
-                    self.binary(BinaryOperator::Subtraction, left_high, right_low),
+                    self.binary(Binary::Subtract, left_low, right_high),
+                    self.binary(Binary::Subtract, left_high, right_low),
                 )
             }
             Interval::Scale(varying, point) => {
                 let (low, high) = self.emit(varying);
                 let (factor, _) = self.emit(point);
-                let negative = match **point {
-                    Interval::Constant(factor) => factor < 0,
-                    _ => {
-                        self.check(factor, 0);
-                        false
-                    }
-                };
-                let low = self.binary(BinaryOperator::Multiplication, low, factor);
-                let high = self.binary(BinaryOperator::Multiplication, high, factor);
+                let negative = factor.1.max < 0;
+                if !negative && factor.1.min < 0 {
+                    self.check(factor.0, 0);
+                }
+                let low = self.binary(Binary::Multiply, low, factor);
+                let high = self.binary(Binary::Multiply, high, factor);
                 if negative { (high, low) } else { (low, high) }
             }
         }

@@ -417,8 +417,10 @@ bypass this invalidation.
 Typed arrays carry an element kind and require appropriate kind and bounds checks. A region
 skips a typed read's bounds check when its key is built from `+`, `-` and constant or
 invariant `*` over constants, invariants and counting loop counters: the entry evaluates
-the key's interval, checks every endpoint is an int32 integer, the low end is non-negative
-and the high end below the length (`specialization/regions/intervals.rs`). Heap views
+the key's interval, checks the low end is non-negative and the high end below the length,
+and checks an endpoint is an int32 integer only where integer ranges cannot already prove
+it (`specialization/regions/intervals.rs`). Integer range proofs also keep typed read keys
+in integer arithmetic, as for array positions. Heap views
 and lowered offsets expose storage to optimized code only while their validity
 conditions hold. The slow helpers implement generic behavior when those
 conditions are not established. `heap/shape.rs`, `heap/properties.rs`,
