@@ -413,6 +413,7 @@ pub(super) fn inline_and_plan_inner(
             &requests,
             &mut inline_budget,
         );
+        let before = calls::cost(&function.graph);
         calls::apply(
             &mut function.graph,
             bodies,
@@ -423,6 +424,7 @@ pub(super) fn inline_and_plan_inner(
         js::simplify(&mut function);
         function.invalidate_cfg();
         expansions.calls(&mut function.graph, bodies, source, &mut function.notes)?;
+        inline_budget.settle(calls::cost(&function.graph).saturating_sub(before));
         function.graph.verify()?;
         after("inline/round 1", &function.graph);
     }
@@ -446,6 +448,7 @@ pub(super) fn inline_and_plan_inner(
                 break;
             }
             function.invalidate_cfg();
+            let before = calls::cost(&function.graph);
             calls::apply(
                 &mut function.graph,
                 bodies,
@@ -456,6 +459,7 @@ pub(super) fn inline_and_plan_inner(
             js::simplify(&mut function);
             function.invalidate_cfg();
             expansions.calls(&mut function.graph, bodies, source, &mut function.notes)?;
+            inline_budget.settle(calls::cost(&function.graph).saturating_sub(before));
             expansions.constructors(&mut function.graph);
             function.graph.verify()?;
             after(&format!("inline/round {}", round + 2), &function.graph);

@@ -843,6 +843,7 @@ pub(in crate::jit::semantic) struct Plan {
 
 pub(in crate::jit::semantic) struct Budget {
     remaining: usize,
+    charged: usize,
     body_limit: usize,
     sites: FxHashSet<Inst>,
     pub(in crate::jit::semantic) inlines: Vec<Inline>,
@@ -858,11 +859,54 @@ impl Budget {
     pub(in crate::jit::semantic) fn new(multiplier: usize) -> Self {
         Self {
             remaining: SPECIALIZATION_BUDGET.saturating_mul(multiplier),
+            charged: 0,
             body_limit: SPECIALIZATION_BODY_INSTS.saturating_mul(multiplier),
             sites: FxHashSet::default(),
             inlines: Vec::new(),
         }
     }
+
+    /// Refunds estimated costs that simplification folded away once inlined bodies met their
+    /// call sites.
+    pub(in crate::jit::semantic) fn settle(&mut self, growth: usize) {
+        self.remaining += self.charged.saturating_sub(growth);
+        self.charged = 0;
+    }
+}
+
+/// Instructions on paths that can return normally; throwing paths do not count.
+pub(in crate::jit::semantic) fn cost(graph: &Graph) -> usize {
+    let cfg = Cfg::new(graph);
+    let throws = |block: super::super::Block| {
+        graph.blocks[block]
+            .insts
+            .iter()
+            .any(|&inst| matches!(graph.insts[inst].op, Op::Javascript(JsOp::Throw(_))))
+    };
+    let mut pending: Vec<_> = cfg
+        .rpo
+        .iter()
+        .copied()
+        .filter(|&block| {
+            matches!(
+                graph.blocks[block].terminator.as_ref().map(|t| &t.kind),
+                Some(TerminatorKind::Return(_) | TerminatorKind::ReturnValues(_))
+            ) && !throws(block)
+        })
+        .collect();
+    let mut hot = FxHashSet::default();
+    while let Some(block) = pending.pop() {
+        if !hot.insert(block) {
+            continue;
+        }
+        pending.extend(
+            cfg.preds[block]
+                .iter()
+                .copied()
+                .filter(|&pred| !throws(pred)),
+        );
+    }
+    hot.iter().map(|&block| graph.blocks[block].insts.len()).sum()
 }
 
 impl Plan {
@@ -1175,16 +1219,13 @@ pub(in crate::jit::semantic) fn plan_round(
             ) => callee,
             _ => continue,
         };
-        let cost: usize = Cfg::new(body)
-            .rpo
-            .iter()
-            .map(|&block| body.blocks[block].insts.len())
-            .sum();
+        let cost = cost(body);
         if cost > budget.remaining || budget.sites.contains(&request.call) {
             continue;
         }
         budget.sites.insert(request.call);
         budget.remaining -= cost;
+        budget.charged += cost;
         let body_source = bodies.bodies[&request.target].source;
         let source_name = if body_source == source {
             None
