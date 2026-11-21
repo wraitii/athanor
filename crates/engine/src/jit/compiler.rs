@@ -990,7 +990,10 @@ impl Compiler {
         }
 
         for callable in &callables {
-            if !intrinsics && !callable.generator && self.inspection.is_none() {
+            if !intrinsics
+                && !callable.generator
+                && self.inspection.as_ref().is_none_or(|options| options.tiered)
+            {
                 self.lazy.insert(
                     callable.id,
                     (
@@ -1106,6 +1109,7 @@ impl Compiler {
             .collect();
 
         if let Some(options) = self.inspection.as_deref()
+            && !options.tiered
             && let Some(filter) = &options.filter
             && !pending.iter().chain(&self.continuations).any(|(id, _)| {
                 self.function_names

@@ -13,6 +13,7 @@ pub struct CompileOptions {
     pub after: Option<String>,
     pub diff: bool,
     pub planner: bool,
+    pub tiered: bool,
     pub reports: Option<ReportSink>,
 }
 
@@ -25,6 +26,7 @@ impl Default for CompileOptions {
             after: None,
             diff: false,
             planner: false,
+            tiered: false,
             reports: None,
         }
     }

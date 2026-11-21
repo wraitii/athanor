@@ -538,7 +538,10 @@ followed by that code rather than by another flag. While it runs, feedback
 recompilations are printed as `NAME.feedback` and OSR regions as
 `NAME.loopblockN.feedback`. `--filter NAME` matches by substring and also
 selects compilations that inlined a matching function, since hot code often
-ends up inlined into a caller such as the `--execute` wrapper. Use
+ends up inlined into a caller such as the `--execute` wrapper. Compile mode
+normally compiles every function eagerly, without the baseline tier or OSR;
+add `--tiered` to compile lazily through the normal tiering path instead, so
+that the dumps show initial, OSR and feedback compilations as they run. Use
 `--after PASS` to inspect a named pipeline boundary (including `--after wgsl`
 with the `wgsl` feature), `--diff` to print only per-pass changes, and
 `--verbose-ir` for assumption origins; pass names are listed in

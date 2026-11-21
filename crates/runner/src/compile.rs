@@ -28,6 +28,7 @@ impl Options {
                         .ok_or("--execute expects JavaScript source")?,
                 );
             }
+            "--tiered" => self.dump.tiered = true,
             "--no-ir" => self.dump.semantic_ir = false,
             "--verbose-ir" => self.dump.verbose = true,
             "--diff" => {
@@ -54,7 +55,7 @@ impl Options {
     pub fn validate(&self) -> Result<(), String> {
         if self.output && !self.enabled {
             return Err(
-                "--no-ir, --verbose-ir, --diff, --after, --filter and --execute require --compile"
+                "--no-ir, --verbose-ir, --diff, --after, --filter, --tiered and --execute require --compile"
                     .into(),
             );
         }
