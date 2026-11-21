@@ -349,6 +349,7 @@ impl Patterns {
         memory_address(graph, address, offset, size)
     }
 
+    /// Only integer lanes fuse, as their products are exact; float operations each round.
     fn multiply_add(&self, graph: &Graph, inst: Inst) -> Option<a::Vector> {
         use low_level::{Binary as B, Op as L, Vector as V};
         let Op::LowLevel(L::Vector(V::Binary {

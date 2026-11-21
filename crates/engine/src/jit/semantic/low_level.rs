@@ -142,6 +142,8 @@ pub(in crate::jit) enum Unary {
     SignedSaturatingFromFloat,
 }
 
+/// Float operations round every result, so backends must not contract them, for instance into
+/// fused multiply-adds; a fused operation would be an operation of its own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(in crate::jit) enum Binary {
     Add,
