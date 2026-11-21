@@ -441,8 +441,9 @@ pub(crate) fn allocate(
         let available = target.registers(class);
         let allocatable =
             |reg: &u8| available.caller_saved.contains(reg) || available.callee_saved.contains(reg);
+        // Calls preserve at most the low halves of vector registers.
         let usable = |reg: u8| {
-            !(crosses_call && available.caller_saved.contains(&reg))
+            !(crosses_call && (class == RegClass::Vector || available.caller_saved.contains(&reg)))
                 && free(&occupied[occupancy_index(class, reg)], &occupy)
         };
         let choice = preferences
@@ -473,8 +474,12 @@ pub(crate) fn allocate(
             map.insert(segment.start, segment.end);
         }
         assigned[index] = Some(reg);
-        if available.callee_saved.contains(&reg) && !callee_saved.contains(&(class, reg)) {
-            callee_saved.push((class, reg));
+        let saved = match class {
+            RegClass::Vector => RegClass::Float,
+            class => class,
+        };
+        if available.callee_saved.contains(&reg) && !callee_saved.contains(&(saved, reg)) {
+            callee_saved.push((saved, reg));
         }
     }
     callee_saved.sort_by_key(|&(class, reg)| occupancy_index(class, reg));
