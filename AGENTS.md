@@ -1,7 +1,22 @@
 # Athanor contributor guide
 
-This folder is the Athanor Cargo workspace, an experimental JS JIT engine for
-fun and a possible “Beating* V8 in two weeks” blog post, with a substantial asterisk.
+This folder is the Athanor Cargo workspace, an experimental compiler & JS JIT engine.
+It started as an idea for a “Beating* V8 in two weeks” blog post, with a substantial asterisk.
+It's kind of became its own real thing now though, per the readme:
+```
+It started from the idea that Cranelift makes it easy to write a JIT without an
+interpreter. That turned out to be true, but getting decent performance meant
+building a dedicated mid-level IR for JS semantics, specialization, and
+ownership anyway—at which point lowering into Cranelift meant paying for two
+optimizing compilers back-to-back. Athanor evolved around a different model: a
+single SSA graph whose operations live at different abstraction levels and are
+progressively lowered only as far as the target backend needs.
+
+This is a compiler playground with deliberate JS subset restrictions and
+semantic deviations, not a bid for full ECMAScript compatibility. See
+[the design guide](crates/engine/DESIGN.md) for details.
+```
+
 The user is wraitii, a long-term 0 A.D. maintainer. Work from this folder by default.
 It lives at `athanor/` inside a 0 A.D. checkout, as a separate Git checkout
 of `https://github.com/wraitii/athanor`. Commit and push engine changes from this
