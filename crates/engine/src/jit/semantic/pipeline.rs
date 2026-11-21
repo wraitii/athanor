@@ -23,8 +23,9 @@ use super::{
 impl FunctionState {
     pub(super) fn lower_typed_storage(&mut self) -> Result<()> {
         let typed = typed::lower_memory(self);
+        let hoisted = typed::hoist_data(self);
         let metadata = storage::lower_metadata(self);
-        if typed || metadata {
+        if typed || hoisted || metadata {
             self.graph.verify()?;
         }
         Ok(())

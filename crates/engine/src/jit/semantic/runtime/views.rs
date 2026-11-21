@@ -15,9 +15,11 @@ pub(in crate::jit::semantic) fn views(function: &mut FunctionState) {
     let mut loops = natural_loops(graph, cfg);
     loops.reverse();
     let mut placed: FxHashMap<(Block, Value), Value> = FxHashMap::default();
+    let mut aliases: FxHashMap<Value, Value> = FxHashMap::default();
     for &block in &cfg.rpo {
         for inst in graph.blocks[block].insts.clone() {
             let object = match graph.insts[inst].op {
+                Op::Javascript(JsOp::View(object)) => object,
                 Op::Javascript(
                     JsOp::TypedIndex(
                         object,
@@ -59,9 +61,17 @@ pub(in crate::jit::semantic) fn views(function: &mut FunctionState) {
                     view
                 }
             };
-            graph.views.insert(inst, view);
+            match graph.insts[inst].op {
+                Op::Javascript(JsOp::View(_)) => {
+                    aliases.insert(graph.insts[inst].result().unwrap(), view);
+                }
+                _ => {
+                    graph.views.insert(inst, view);
+                }
+            }
         }
     }
+    graph.replace_uses(&aliases);
     if !placed.is_empty() {
         function.invalidate_values();
     }

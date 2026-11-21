@@ -3,7 +3,8 @@ use super::super::{
     BlockData, Constant, FunctionState, Graph, Op, Repr, Target, Terminator, TerminatorKind,
     TypedRead, ValueType,
 };
-use super::super::{MemoryFormat, MemoryOp};
+use super::super::{MemoryFormat, MemoryOp, Value, guards};
+use crate::FxHashMap;
 use crate::heap::TypedKind;
 use crate::jit::semantic::JsOp;
 
@@ -131,6 +132,50 @@ pub(in crate::jit::semantic) fn lower_memory(function: &mut FunctionState) -> bo
     changed
 }
 
+/// Typed storage never moves, so once the receiver is known typed where its view is defined,
+/// the data pointer can be loaded there once and shared by every access through that view.
+pub(in crate::jit::semantic) fn hoist_data(function: &mut FunctionState) -> bool {
+    function.ensure_cfg();
+    let graph = &mut function.graph;
+    let cfg = &function.facts.cfg;
+    let mut bases: FxHashMap<Value, Value> = FxHashMap::default();
+    let mut aliases: FxHashMap<Value, Value> = FxHashMap::default();
+    let mut duplicates = Vec::new();
+    let mut moved = false;
+    for &block in &cfg.rpo {
+        for inst in graph.blocks[block].insts.clone() {
+            let Op::Javascript(JsOp::TypedData(view)) = graph.insts[inst].op else {
+                continue;
+            };
+            let Some(&Op::Javascript(JsOp::View(object))) = graph.defining_op(view) else {
+                continue;
+            };
+            let home = graph.def_block(view);
+            if !guards::holds(graph, cfg, home, object, guards::Fact::Typed(None)) {
+                continue;
+            }
+            let base = graph.insts[inst].result().unwrap();
+            if let Some(&existing) = bases.get(&view) {
+                aliases.insert(base, existing);
+                duplicates.push(inst);
+                continue;
+            }
+            if block != home {
+                graph.move_inst(inst, home);
+                moved = true;
+            }
+            bases.insert(view, base);
+        }
+    }
+    let changed = moved || !duplicates.is_empty();
+    graph.replace_uses(&aliases);
+    graph.remove_insts(duplicates);
+    if changed {
+        function.invalidate_values();
+    }
+    changed
+}
+
 fn memory_format(element: TypedKind) -> MemoryFormat {
     match element {
         TypedKind::Uint8 => MemoryFormat::U8,
@@ -150,7 +195,7 @@ pub(in crate::jit::semantic) fn lower_store(
     element: crate::heap::TypedKind,
 ) {
     use super::super::low_level;
-    use cranelift_codegen::ir::{MemFlagsData, types};
+    use cranelift_codegen::ir::types;
     use oxc_syntax::operator::BinaryOperator as B;
     let data = graph.insts[inst].clone();
     let (object, key, value, bounded) = match data.op {
@@ -243,12 +288,7 @@ pub(in crate::jit::semantic) fn lower_store(
     };
     let mut at = Cursor::at_end(graph, fast, inst);
     let view = at.add_unassigned(Op::Javascript(JsOp::View(object)));
-    let base = at.ins().load(
-        types::I64,
-        MemFlagsData::trusted(),
-        view,
-        crate::heap::DATA_OFFSET,
-    );
+    let base = at.add_unassigned(Op::Javascript(JsOp::TypedData(view)));
     at.add_effect(Op::Memory(MemoryOp::IndexedStore {
         base,
         index: position,
