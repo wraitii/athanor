@@ -5,7 +5,7 @@ use cranelift_module::{ModuleReloc, ModuleRelocTarget};
 use super::Unsupported;
 use super::abi::{CALLEE, F0, F1, Location, T0, T1, T2};
 use super::asm::{Assembler, Label};
-use super::encode::{self as e, Alu, Cond, Index, Mem, Width};
+use super::encode::{self as e, Alu, Cond, Index, Mem, VectorOp, Width};
 use super::inst::{self as a, Address, CompareOperand, Condition, Mask};
 use super::prepare::{Call, Prepared};
 use crate::jit::alloc::moves::{Loc, Move};
@@ -955,6 +955,30 @@ impl Emitter<'_> {
                 let result = result.unwrap();
                 let d = self.def_reg(result, F0);
                 self.asm.emit(e::vector_binary(op, d, a, b));
+                self.commit(result, d);
+            }
+            a::Vector::MultiplyAdd {
+                accumulator,
+                left,
+                right,
+            } => {
+                let a = self.use_reg(left, F0);
+                let b = self.use_reg(right, F1);
+                let result = result.unwrap();
+                let d = self.def_reg(result, F0);
+                match self.loc(accumulator) {
+                    Loc::Reg(_, c) if d == c || d != a && d != b => {
+                        if d != c {
+                            self.asm.emit(e::vector_mov(d, c));
+                        }
+                        self.asm.emit(e::vector_multiply_add(d, a, b));
+                    }
+                    _ => {
+                        self.asm.emit(e::vector_binary(VectorOp::Mul, F0, a, b));
+                        let c = self.use_reg(accumulator, F1);
+                        self.asm.emit(e::vector_binary(VectorOp::Add, d, c, F0));
+                    }
+                }
                 self.commit(result, d);
             }
             a::Vector::Shift { op, value, amount } => {

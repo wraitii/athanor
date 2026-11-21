@@ -632,6 +632,10 @@ pub(super) fn vector_binary(op: VectorOp, rd: u8, rn: u8, rm: u8) -> u32 {
     base | rd_rn_rm(rd, rn, rm)
 }
 
+pub(super) fn vector_multiply_add(rd: u8, rn: u8, rm: u8) -> u32 {
+    0x4EA0_9400 | rd_rn_rm(rd, rn, rm)
+}
+
 pub(super) fn vector_mov(rd: u8, rn: u8) -> u32 {
     vector_binary(VectorOp::Orr, rd, rn, rn)
 }

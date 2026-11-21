@@ -107,9 +107,15 @@ pub(super) fn run(graph: &Graph) -> Result<Prepared, Unsupported> {
                 return Err(Unsupported("unselected operation".into()));
             };
             match op {
-                inst::Op::Vector(_) => {
+                inst::Op::Vector(vector) => {
                     for &value in &data.results {
                         prepared.input.classes[value] = Some(RegClass::Vector);
+                    }
+                    if let inst::Vector::MultiplyAdd { accumulator, .. } = vector {
+                        prepared
+                            .input
+                            .copies
+                            .push((*accumulator, data.results[0], block));
                     }
                 }
                 inst::Op::Constant { bits, class } => {

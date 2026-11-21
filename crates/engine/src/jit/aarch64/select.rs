@@ -349,6 +349,41 @@ impl Patterns {
         memory_address(graph, address, offset, size)
     }
 
+    fn multiply_add(&self, graph: &Graph, inst: Inst) -> Option<a::Vector> {
+        use low_level::{Binary as B, Op as L, Vector as V};
+        let Op::LowLevel(L::Vector(V::Binary {
+            op: B::Add,
+            left,
+            right,
+        })) = graph.insts[inst].op
+        else {
+            return None;
+        };
+        let product = |value: Value| {
+            if self.uses[value] != 1 {
+                return None;
+            }
+            match graph.defining_op(value)? {
+                Op::LowLevel(L::Vector(V::Binary {
+                    op: B::Multiply,
+                    left,
+                    right,
+                })) => Some((*left, *right)),
+                _ => None,
+            }
+        };
+        let (accumulator, (left, right)) = match (product(right), product(left)) {
+            (Some(product), _) => (left, product),
+            (None, Some(product)) => (right, product),
+            (None, None) => return None,
+        };
+        Some(a::Vector::MultiplyAdd {
+            accumulator,
+            left,
+            right,
+        })
+    }
+
     fn operand(&self, graph: &Graph, inst: Inst) -> Option<Operand> {
         let Op::LowLevel(low_level::Op::Binary { op, left, right }) = graph.insts[inst].op else {
             return None;
@@ -478,6 +513,7 @@ fn instruction(
         .and_then(|value| graph.reprs[value])
         .map(Repr::machine);
     let selected_binary = binary(graph, inst);
+    let multiply_add = patterns.multiply_add(graph, inst);
     let indexed = indexed_load(graph, inst);
     let mut b = Builder::new(graph);
     b.insert_at(data.block, position);
@@ -827,7 +863,10 @@ fn instruction(
             shift,
             bits,
         },
-        L::Vector(vector) => a::Op::Vector(select.vector(vector)?),
+        L::Vector(vector) => a::Op::Vector(match multiply_add {
+            Some(fused) => fused,
+            None => select.vector(vector)?,
+        }),
         _ => return Err(Unsupported("unlowered operation".into())),
     })
 }

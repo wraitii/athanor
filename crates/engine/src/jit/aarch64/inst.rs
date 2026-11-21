@@ -178,6 +178,11 @@ pub(in crate::jit) enum Vector {
         value: Value,
         amount: u32,
     },
+    MultiplyAdd {
+        accumulator: Value,
+        left: Value,
+        right: Value,
+    },
 }
 
 impl Vector {
@@ -193,6 +198,11 @@ impl Vector {
             }
             Self::Splat { value } | Self::Shift { value, .. } => [Some(value), None, None, None],
             Self::Binary { left, right, .. } => [Some(left), Some(right), None, None],
+            Self::MultiplyAdd {
+                accumulator,
+                left,
+                right,
+            } => [Some(accumulator), Some(left), Some(right), None],
         }
     }
 
@@ -208,6 +218,11 @@ impl Vector {
             }
             Self::Splat { value } | Self::Shift { value, .. } => [Some(value), None, None, None],
             Self::Binary { left, right, .. } => [Some(left), Some(right), None, None],
+            Self::MultiplyAdd {
+                accumulator,
+                left,
+                right,
+            } => [Some(accumulator), Some(left), Some(right), None],
         }
     }
 }
