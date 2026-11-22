@@ -186,7 +186,10 @@ fn stores(op: &Op) -> bool {
                 | JsOp::ArrayAppend(..)
                 | JsOp::Initialize(..)
                 | JsOp::Write(..)
-        )
+        ) | Op::HelperCall {
+            helper: crate::jit::helpers::Helper::PropertySetCached,
+            ..
+        }
     )
 }
 
@@ -279,15 +282,33 @@ pub(super) fn borrows(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>)
                     .map(|target| target.args[index])
                     .filter(|&value| facts.of(value).intersects(HEAP))
                     .collect();
-                if incoming.is_empty() || incoming.iter().any(|value| !objects.contains(value)) {
+                if incoming.is_empty()
+                    || incoming.iter().any(|&value| {
+                        !objects.contains(&value)
+                            && (chains.contains_key(&value)
+                                || graph.def_block(value) == block
+                                || !cfg.dominates(graph.def_block(value), block))
+                    })
+                {
+                    continue;
+                }
+                if !incoming.iter().any(|value| objects.contains(value)) {
                     continue;
                 }
                 let mut chain: Vec<_> = incoming
                     .iter()
-                    .flat_map(|value| chains[value].iter().copied())
+                    .flat_map(|value| match chains.get(value) {
+                        Some(owners) => owners.as_slice(),
+                        None => std::slice::from_ref(value),
+                    })
+                    .copied()
+                    .filter(|&owner| owner != param)
                     .collect();
                 chain.sort();
                 chain.dedup();
+                if chain.is_empty() && incoming.iter().any(|value| !objects.contains(value)) {
+                    continue;
+                }
                 if chain
                     .iter()
                     .any(|&owner| !cfg.dominates(graph.def_block(owner), block))
@@ -432,7 +453,9 @@ pub(super) fn borrows(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>)
             .iter()
             .filter(|value| {
                 if let Some(incoming) = merged.get(value) {
-                    return incoming.iter().any(|value| !accepted.contains(value));
+                    return incoming
+                        .iter()
+                        .any(|value| borrows.chains.contains_key(value) && !accepted.contains(value));
                 }
                 if local.contains(value) {
                     return false;
