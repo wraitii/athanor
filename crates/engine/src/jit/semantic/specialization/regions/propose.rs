@@ -100,6 +100,39 @@ pub(in crate::jit::semantic) fn numbers(graph: &mut Graph) -> Vec<(Value, Fact)>
                 }
                 let site = super::super::observations::numeric_site(graph, value);
                 proposals.push((inst, value, fact, site));
+                if fact == Fact::Type(ValueType::NUMBER)
+                    && let ValueDef::Param(header, param_index) = graph.values[value]
+                {
+                    for &pred in &cfg.preds[header] {
+                        if !cfg.dominates(pred, header) {
+                            continue;
+                        }
+                        let terminator = graph.blocks[pred].terminator.as_ref().unwrap();
+                        for target in terminator.kind.targets() {
+                            if target.block != header {
+                                continue;
+                            }
+                            let incoming = target.args[param_index];
+                            if incoming == value
+                                || hints.get(&incoming) == Some(&ReadType::Unknown)
+                                || !facts.of(incoming).intersects(NUMERIC)
+                                || facts.of(incoming).within(NUMERIC)
+                                || matches!(
+                                    graph.defining_op(incoming),
+                                    Some(Op::Javascript(JsOp::Constant(_)))
+                                )
+                            {
+                                continue;
+                            }
+                            let incoming_fact = Fact::Type(ValueType::NUMBER);
+                            if seen.insert((block, incoming, incoming_fact)) {
+                                let incoming_site =
+                                    super::super::observations::numeric_site(graph, incoming);
+                                proposals.push((inst, incoming, incoming_fact, incoming_site));
+                            }
+                        }
+                    }
+                }
             }
         }
     }
