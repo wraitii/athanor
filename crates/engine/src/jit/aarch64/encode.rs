@@ -266,6 +266,12 @@ pub(super) fn mov_imm(width: Width, rd: u8, value: u64, mut emit: impl FnMut(u32
     let chunks = &all[..count];
     let ones = chunks.iter().filter(|&&chunk| chunk == 0xFFFF).count();
     let zeros = chunks.iter().filter(|&&chunk| chunk == 0).count();
+    if ones.max(zeros) < count - 1
+        && let Some(word) = logical_imm(Logical::Orr, width, rd, ZR, value)
+    {
+        emit(word);
+        return;
+    }
     let (skip, first) = if ones > zeros {
         (0xFFFF, Wide::Movn)
     } else {
