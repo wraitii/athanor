@@ -41,10 +41,89 @@ fn numeric_demand(graph: &Graph, cfg: &Cfg, native_calls: &FxHashSet<Inst>) -> F
     demanded
 }
 
+fn integer_demand(graph: &Graph, cfg: &Cfg) -> FxHashSet<Value> {
+    let mut pending = Vec::new();
+    for &block in &cfg.rpo {
+        for &inst in &graph.blocks[block].insts {
+            match graph.insts[inst].op {
+                Op::Javascript(
+                    JsOp::GetIndex(_, key)
+                    | JsOp::TypedIndex(_, key, _)
+                    | JsOp::ArrayGet(_, key)
+                    | JsOp::ArrayLoad(_, key, _)
+                    | JsOp::SetIndex(_, key, _)
+                    | JsOp::TypedSet(_, key, ..),
+                ) => pending.push(key),
+                Op::Javascript(JsOp::Binary(
+                    BinaryOperator::BitwiseAnd
+                    | BinaryOperator::BitwiseOR
+                    | BinaryOperator::BitwiseXOR
+                    | BinaryOperator::ShiftLeft
+                    | BinaryOperator::ShiftRight
+                    | BinaryOperator::ShiftRightZeroFill
+                    | BinaryOperator::Remainder
+                    | BinaryOperator::LessThan
+                    | BinaryOperator::LessEqualThan
+                    | BinaryOperator::GreaterThan
+                    | BinaryOperator::GreaterEqualThan,
+                    left,
+                    right,
+                )) => pending.extend([left, right]),
+                Op::Javascript(JsOp::GuardedCompare { left, right, .. }) => {
+                    pending.extend([left, right])
+                }
+                Op::Javascript(JsOp::Unary(UnaryOp::BitwiseNot, value)) => pending.push(value),
+                _ => {}
+            }
+        }
+    }
+    let mut demanded = FxHashSet::default();
+    while let Some(value) = pending.pop() {
+        if !demanded.insert(value) {
+            continue;
+        }
+        match graph.values[value] {
+            ValueDef::Param(block, index) => {
+                for &pred in &cfg.preds[block] {
+                    let terminator = graph.blocks[pred].terminator.as_ref().unwrap();
+                    for target in terminator.kind.targets() {
+                        if target.block == block {
+                            pending.push(target.args[index]);
+                        }
+                    }
+                }
+            }
+            ValueDef::Result(inst, _) => match graph.insts[inst].op {
+                Op::Javascript(JsOp::Binary(
+                    BinaryOperator::Addition
+                    | BinaryOperator::Subtraction
+                    | BinaryOperator::Multiplication,
+                    left,
+                    right,
+                )) => pending.extend([left, right]),
+                Op::Javascript(
+                    JsOp::Unary(
+                        UnaryOp::Negate | UnaryOp::Plus | UnaryOp::Increment | UnaryOp::Decrement,
+                        value,
+                    )
+                    | JsOp::ToNumeric(value),
+                ) => pending.push(value),
+                _ => {}
+            },
+        }
+    }
+    demanded
+}
+
 pub(in crate::jit::semantic) fn numbers(graph: &mut Graph) -> Vec<(Value, Fact)> {
     let cfg = Cfg::new(graph);
     let facts = Facts::compute(graph);
     let hints = super::super::observations::type_hints(graph);
+    let looped: FxHashSet<Block> = natural_loops(graph, &cfg)
+        .into_iter()
+        .flat_map(|(_, body)| body)
+        .collect();
+    let integers = integer_demand(graph, &cfg);
     let native_calls: FxHashSet<Inst> = requirements(graph, &cfg.rpo)
         .into_iter()
         .map(|requirement| requirement.call)
@@ -56,7 +135,8 @@ pub(in crate::jit::semantic) fn numbers(graph: &mut Graph) -> Vec<(Value, Fact)>
         for &inst in &graph.blocks[block].insts {
             let op = &graph.insts[inst].op;
             for (index, value) in op.operands_iter().enumerate() {
-                let integer = hints.get(&value) == Some(&ReadType::Integer);
+                let integer = hints.get(&value) == Some(&ReadType::Integer)
+                    && (!looped.contains(&graph.def_block(value)) || integers.contains(&value));
                 let string = hints.get(&value) == Some(&ReadType::String);
                 let desired = if string {
                     ValueType::STRING
