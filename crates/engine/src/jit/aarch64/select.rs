@@ -177,10 +177,11 @@ fn indexed_load(graph: &Graph, inst: Inst) -> Option<(Address, Mem)> {
 
 struct Patterns {
     uses: SecondaryMap<Value, u32>,
+    branch_uses: SecondaryMap<Value, u32>,
 }
 
-fn fused_compare(graph: &Graph, value: Value, uses: &SecondaryMap<Value, u32>) -> Option<Inst> {
-    if uses[value] != 1 {
+fn fused_compare(graph: &Graph, value: Value, fusable: bool) -> Option<Inst> {
+    if !fusable {
         return None;
     }
     let ValueDef::Result(inst, 0) = graph.values[value] else {
@@ -308,8 +309,17 @@ fn shifted_operand(
 
 impl Patterns {
     fn new(graph: &Graph) -> Self {
+        let mut branch_uses = SecondaryMap::new();
+        for data in graph.blocks.values() {
+            if let Some(TerminatorKind::Branch(condition, ..)) =
+                data.terminator.as_ref().map(|terminator| &terminator.kind)
+            {
+                branch_uses[*condition] += 1;
+            }
+        }
         Self {
             uses: graph.use_counts(),
+            branch_uses,
         }
     }
 
@@ -317,7 +327,7 @@ impl Patterns {
         let Op::LowLevel(low_level::Op::Select { condition, .. }) = graph.insts[inst].op else {
             return None;
         };
-        fused_compare(graph, condition, &self.uses)
+        fused_compare(graph, condition, self.uses[condition] == 1)
     }
 
     fn branch_compare(&self, graph: &Graph, block: Block) -> Option<Inst> {
@@ -325,7 +335,11 @@ impl Patterns {
         else {
             return None;
         };
-        fused_compare(graph, condition, &self.uses)
+        fused_compare(
+            graph,
+            condition,
+            self.uses[condition] == self.branch_uses[condition],
+        )
     }
 
     fn address(&self, graph: &Graph, inst: Inst) -> Option<Address> {
