@@ -184,6 +184,7 @@ define_helpers! {
     GlobalGetBorrowed => js_global_get_borrowed(*mut GlobalCache) -> Value, borrowed;
     GlobalGetOptionalBorrowed => js_global_get_optional_borrowed(*mut GlobalCache) -> Value, borrowed;
     GlobalSet => js_global_set(*const u8, u64, Value) -> Value;
+    GlobalSetCached => js_global_set_cached(*mut GlobalCache, Value) -> Value;
     GlobalInitialize => js_global_initialize(*const u8, u64, Value) -> Value;
     Throw => js_throw(Value) -> Value;
     Catch => js_catch(Value) -> Value, owned;

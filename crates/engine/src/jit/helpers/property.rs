@@ -6,7 +6,7 @@ use crate::jit::profile::{PropertyAccess, ShapeAccess};
 pub(crate) struct GlobalCache {
     pub(crate) identity: *const (),
     pub(crate) revision: u64,
-    pub(crate) slot: *const Value,
+    pub(crate) slot: *mut Value,
     name: Box<str>,
     // Keep the environment identity and its parent chain alive while generated code retains slots.
     owner: Option<crate::environment::Environment>,
@@ -17,7 +17,7 @@ impl GlobalCache {
         Self {
             identity: std::ptr::null(),
             revision: 0,
-            slot: std::ptr::null(),
+            slot: std::ptr::null_mut(),
             name: name.into(),
             owner: None,
         }
@@ -27,8 +27,19 @@ impl GlobalCache {
         self.owner = Some(global.clone());
         self.identity = global.identity();
         self.revision = global.revision();
-        self.slot = global.binding_slot(&self.name).unwrap_or(std::ptr::null());
+        self.slot = global
+            .binding_slot(&self.name)
+            .map_or(std::ptr::null_mut(), |slot| slot.cast_mut());
         (!self.slot.is_null()).then(|| unsafe { *self.slot })
+    }
+
+    fn resolve_writable(&mut self, global: &crate::environment::Environment) {
+        self.owner = Some(global.clone());
+        self.identity = global.identity();
+        self.revision = global.revision();
+        self.slot = global
+            .writable_binding_slot(&self.name)
+            .unwrap_or(std::ptr::null_mut());
     }
 }
 
@@ -78,6 +89,21 @@ pub(super) extern "C" fn js_global_set(
     let ctx = unsafe { &mut *ctx };
     let name =
         unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len as usize)) };
+    set_global_binding(ctx, name, value)
+}
+
+pub(super) extern "C" fn js_global_set_cached(
+    ctx: *mut JitCtx,
+    cache: *mut GlobalCache,
+    value: Value,
+) -> Value {
+    let ctx = unsafe { &mut *ctx };
+    let cache = unsafe { &mut *cache };
+    cache.resolve_writable(&ctx.global);
+    set_global_binding(ctx, &cache.name, value)
+}
+
+fn set_global_binding(ctx: &mut JitCtx, name: &str, value: Value) -> Value {
     if let Err(reason) = ctx.global.set_binding(name, value) {
         if reason == "has invalid value" {
             ctx.error = Some(Box::new(crate::Error::Runtime(format!(

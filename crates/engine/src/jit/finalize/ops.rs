@@ -776,13 +776,96 @@ impl FunctionCompiler<'_, '_> {
     }
 
     pub(super) fn global_set(&mut self, name: &str, value: LoweredValue) -> LoweredValue {
-        let name: Box<str> = name.into();
-        let ptr = self.b.ins().iconst(self.pointer, name.as_ptr() as i64);
-        let len = self.b.ins().iconst(types::I64, name.len() as i64);
-        self.names.push(name);
-        let result = self.call_helper(Helper::GlobalSet, &[ptr, len, value]);
+        use crate::jit::helpers::GlobalCache;
+        use crate::jit::semantic::runtime::layout;
+        use crate::jit::session::{EPOCH_OFFSET, GLOBAL_IDENTITY_OFFSET, GLOBAL_REVISION_OFFSET};
+
+        let address = self.function_data(GlobalCache::new(name));
+        let flags = MemFlagsData::trusted();
+        let identity = self
+            .b
+            .ins()
+            .load(self.pointer, flags, self.ctx, GLOBAL_IDENTITY_OFFSET);
+        let expected_identity = self.b.ins().load(
+            self.pointer,
+            flags,
+            address,
+            std::mem::offset_of!(GlobalCache, identity) as i32,
+        );
+        let same = self.b.ins().icmp(IntCC::Equal, identity, expected_identity);
+        let revision_ptr = self
+            .b
+            .ins()
+            .load(self.pointer, flags, self.ctx, GLOBAL_REVISION_OFFSET);
+        let revision = self.b.ins().load(types::I64, flags, revision_ptr, 0);
+        let expected_revision = self.b.ins().load(
+            types::I64,
+            flags,
+            address,
+            std::mem::offset_of!(GlobalCache, revision) as i32,
+        );
+        let valid = self.b.ins().icmp(IntCC::Equal, revision, expected_revision);
+        let valid = self.b.ins().boolean_and(same, valid);
+        let slot = self.b.ins().load(
+            self.pointer,
+            flags,
+            address,
+            std::mem::offset_of!(GlobalCache, slot) as i32,
+        );
+        let present = self.b.ins().icmp_imm_s(IntCC::NotEqual, slot, 0);
+        let valid = self.b.ins().boolean_and(valid, present);
+
+        let hit = self.b.create_block();
+        let ready = self.b.create_block();
+        let release_old = self.b.create_block();
+        let invalidate = self.b.create_block();
+        let do_release = self.b.create_block();
+        let slow = self.b.create_block();
+        let done = self.b.create_block();
+        self.b.set_cold_block(slow);
+        self.brif(valid, hit, &[], slow, &[]);
+
+        self.switch(hit);
+        let old_word = self.b.ins().load(types::I64, flags, slot, 0);
+        let uninitialized = self.b.ins().icmp_imm_s(
+            IntCC::Equal,
+            old_word,
+            Value::UNINITIALIZED.bits() as i64,
+        );
+        self.brif(uninitialized, slow, &[], ready, &[]);
+
+        self.switch(ready);
+        self.increment(value);
+        let value_word = self.b.as_word(value);
+        self.b.ins().store(flags, value_word, slot, 0);
+        let old_is_heap = layout::is_heap(self.b, old_word);
+        self.brif(old_is_heap, release_old, &[], done, &[]);
+
+        self.switch(release_old);
+        let old_is_object = layout::is_object(self.b, old_word);
+        self.brif(old_is_object, invalidate, &[], do_release, &[]);
+
+        self.switch(invalidate);
+        let epoch_ptr = self
+            .b
+            .ins()
+            .load(self.pointer, flags, self.ctx, EPOCH_OFFSET);
+        let epoch = self.b.ins().load(types::I64, flags, epoch_ptr, 0);
+        let next_epoch = self.b.ins().iadd_imm_s(epoch, 1);
+        self.b.ins().store(flags, next_epoch, epoch_ptr, 0);
+        self.jump(do_release, &[]);
+
+        self.switch(do_release);
+        let old_boxed = self.b.as_boxed(old_word);
+        self.release_inline(old_boxed, done, true);
+
+        self.switch(slow);
+        self.call_helper(Helper::GlobalSetCached, &[address, value]);
         self.check_error();
-        result
+        self.jump(done, &[]);
+
+        self.switch(done);
+        value
     }
 
     pub(super) fn cached_global(&mut self, address: LoweredValue, helper: Helper) -> LoweredValue {

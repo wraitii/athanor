@@ -157,6 +157,19 @@ impl Environment {
             })
     }
 
+    pub(crate) fn writable_binding_slot(&self, name: &str) -> Option<*mut Value> {
+        let data = self.data.borrow();
+        if let Some((cell, mutable)) = data.lexical.get(name) {
+            return (*mutable).then(|| cell.as_ptr());
+        }
+        if let Some(cell) = data.bindings.get(name) {
+            return (!data.readonly.contains(name)).then(|| cell.as_ptr());
+        }
+        data.parent
+            .as_ref()
+            .and_then(|parent| parent.writable_binding_slot(name))
+    }
+
     pub(crate) fn get_object_raw(&self, name: &str) -> Option<Value> {
         let data = self.data.borrow();
         data.bindings
