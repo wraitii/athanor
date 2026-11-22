@@ -1,3 +1,4 @@
+pub(in crate::jit::semantic) mod conditions;
 pub(in crate::jit::semantic) mod conversions;
 pub(in crate::jit::semantic) mod cse;
 mod dce;

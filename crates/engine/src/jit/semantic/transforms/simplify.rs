@@ -94,7 +94,7 @@ pub(in crate::jit::semantic) fn simplify(function: &mut FunctionState, folder: &
     }
 }
 
-fn fold_constant_branches(graph: &mut Graph, cfg: &Cfg) -> bool {
+pub(super) fn fold_constant_branches(graph: &mut Graph, cfg: &Cfg) -> bool {
     let mut changed = false;
     for &block in &cfg.rpo {
         let Some(Terminator {
@@ -123,7 +123,7 @@ fn branch_condition(graph: &Graph, condition: Value) -> (Value, bool) {
     }
 }
 
-fn fold_dominated_branches(graph: &mut Graph, cfg: &Cfg) -> bool {
+pub(super) fn fold_dominated_branches(graph: &mut Graph, cfg: &Cfg) -> bool {
     let mut decided: FxHashMap<Value, Vec<(Block, bool)>> = FxHashMap::default();
     for &block in &cfg.rpo {
         let Some(Terminator {
@@ -170,7 +170,7 @@ fn fold_dominated_branches(graph: &mut Graph, cfg: &Cfg) -> bool {
     changed
 }
 
-fn thread_branches(graph: &mut Graph, cfg: &Cfg) -> bool {
+pub(super) fn thread_branches(graph: &mut Graph, cfg: &Cfg) -> bool {
     let uses = graph.use_counts();
     let header = |block: Block| {
         cfg.preds[block]

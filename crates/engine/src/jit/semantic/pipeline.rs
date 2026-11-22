@@ -13,7 +13,7 @@ use oxc_ast::ast::{Expression, FormalParameters, Statement};
 use oxc_semantic::Scoping;
 use oxc_span::Span;
 use oxc_syntax::symbol::SymbolId;
-use transforms::{conversions, reuse, unroll, vectorize};
+use transforms::{conditions, conversions, reuse, unroll, vectorize};
 
 use super::{
     FunctionState, Graph, Inst, RegionFallback, Result, SpecializationPlan, Value, borrow, boxing,
@@ -165,6 +165,7 @@ pub(in crate::jit) const LOW_LEVEL_PASSES: &[&str] = &[
     "unbox",
     "scalar-semantics",
     "unroll",
+    "conditions-split",
     "scalar-cleanup",
     "vectorize",
     "aarch64-select",
@@ -195,6 +196,10 @@ pub(in crate::jit) fn lower_low_level(
         graph.verify()?;
     }
     after("unroll", graph);
+    if conditions::split(graph) {
+        graph.verify()?;
+    }
+    after("conditions-split", graph);
     reuse::lowered(graph);
     after("scalar-cleanup", graph);
     if vectorize::vectorize(graph) {
