@@ -128,6 +128,7 @@ pub(in crate::jit::semantic) fn lower_stores(function: &mut FunctionState) {
     use crate::heap::{INLINE_PROPERTY_LENGTH_OFFSET, LENGTH_OFFSET, SHAPE_OFFSET};
     use crate::jit::helpers::{CACHE_ADDITION_DESTINATION_OFFSET, CACHE_ADDITION_INDEX_OFFSET};
     function.ensure_values();
+    let inline_guards = super::values::inline_objects(&function.graph, &function.facts.cfg);
     let graph = &mut function.graph;
     let mut checked = crate::FxHashMap::default();
     let mut insts = Vec::new();
@@ -158,6 +159,20 @@ pub(in crate::jit::semantic) fn lower_stores(function: &mut FunctionState) {
                         | JsOp::CanOverwrite(_, _, super::super::js::memory::Field::Elements)
                 )
             );
+            let inline = !indexed
+                && (addition
+                    || super::values::is_proven(
+                        &inline_guards,
+                        &function.facts.cfg,
+                        block,
+                        object,
+                    ));
+            let constant_index = (!addition && inline)
+                .then(|| match graph.defining_op(key) {
+                    Some(Op::LowLevel(low_level::Op::Integer { bits, .. })) => Some(*bits as i64),
+                    _ => None,
+                })
+                .flatten();
             let data_offset = if indexed {
                 crate::heap::DATA_OFFSET
             } else {
@@ -170,23 +185,39 @@ pub(in crate::jit::semantic) fn lower_stores(function: &mut FunctionState) {
             } else {
                 let view = existing_view
                     .unwrap_or_else(|| at.add(Op::Javascript(JsOp::View(object)), Repr::Boxed));
-                let base = at
-                    .ins()
-                    .load(types::I64, MemFlagsData::trusted(), view, data_offset);
-                let index = if addition {
-                    let raw = at.ins().load(
-                        types::I32,
-                        MemFlagsData::trusted(),
-                        key,
-                        CACHE_ADDITION_INDEX_OFFSET,
+                let (address, base, index) = if let Some(index_imm) = constant_index {
+                    let offset = at.ins().iconst(
+                        types::I64,
+                        i64::from(crate::heap::INLINE_VALUES_OFFSET) + index_imm * 8,
                     );
-                    at.ins().uextend(types::I64, raw)
+                    let address = at.ins().iadd(view, offset);
+                    (address, view, key)
                 } else {
-                    key
+                    let base = if inline {
+                        let offset = at
+                            .ins()
+                            .iconst(types::I64, i64::from(crate::heap::INLINE_VALUES_OFFSET));
+                        at.ins().iadd(view, offset)
+                    } else {
+                        at.ins()
+                            .load(types::I64, MemFlagsData::trusted(), view, data_offset)
+                    };
+                    let index = if addition {
+                        let raw = at.ins().load(
+                            types::I32,
+                            MemFlagsData::trusted(),
+                            key,
+                            CACHE_ADDITION_INDEX_OFFSET,
+                        );
+                        at.ins().uextend(types::I64, raw)
+                    } else {
+                        key
+                    };
+                    let shift = at.ins().iconst(types::I64, 3);
+                    let offset = at.ins().ishl(index, shift);
+                    let address = at.ins().iadd(base, offset);
+                    (address, base, index)
                 };
-                let shift = at.ins().iconst(types::I64, 3);
-                let offset = at.ins().ishl(index, shift);
-                let address = at.ins().iadd(base, offset);
                 let old = (!addition).then(|| {
                     at.ins()
                         .load(types::I64, MemFlagsData::trusted(), address, 0)

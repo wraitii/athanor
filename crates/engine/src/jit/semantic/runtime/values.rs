@@ -107,7 +107,44 @@ fn proven_objects(graph: &Graph, cfg: &Cfg) -> FxHashMap<Value, Vec<Block>> {
     proven
 }
 
-fn is_proven(
+pub(super) fn inline_objects(graph: &Graph, cfg: &Cfg) -> FxHashMap<Value, Vec<Block>> {
+    let mut proven: FxHashMap<Value, Vec<Block>> = FxHashMap::default();
+    for &inst in &graph.blocks[graph.entry].insts {
+        if let Op::EntryAssume(object, super::super::guards::Fact::Shape(shape)) =
+            graph.insts[inst].op
+            && crate::heap::is_inline_shape(shape)
+        {
+            proven.entry(object).or_default().push(graph.entry);
+        }
+    }
+    for &block in &cfg.rpo {
+        let Some(TerminatorKind::Branch(condition, yes, _)) =
+            graph.blocks[block].terminator.as_ref().map(|t| &t.kind)
+        else {
+            continue;
+        };
+        if cfg.preds[yes.block].len() != 1 {
+            continue;
+        }
+        let object = match graph.defining_op(*condition) {
+            Some(Op::Javascript(JsOp::IsShape(object, shape)))
+                if crate::heap::is_inline_shape(*shape) =>
+            {
+                *object
+            }
+            Some(Op::Javascript(JsOp::IsReadLayout(object, layout)))
+                if crate::heap::is_inline_shape(layout.shape) =>
+            {
+                *object
+            }
+            _ => continue,
+        };
+        proven.entry(object).or_default().push(yes.block);
+    }
+    proven
+}
+
+pub(super) fn is_proven(
     proven: &FxHashMap<Value, Vec<Block>>,
     cfg: &Cfg,
     block: Block,

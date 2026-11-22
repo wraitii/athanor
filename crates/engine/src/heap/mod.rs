@@ -41,8 +41,8 @@ use typed::*;
 
 pub(crate) use crate::builtins::{MathFunction, NativeFunction};
 pub(crate) use arena::{
-    CODE_OFFSET, DATA_OFFSET, INLINE_PROPERTY_LENGTH_OFFSET, KIND_OFFSET, LENGTH_OFFSET,
-    NO_ELEMENTS, PROPERTY_DATA_OFFSET, REFERENCES_OFFSET, SHAPE_OFFSET,
+    CODE_OFFSET, DATA_OFFSET, INLINE_PROPERTY_LENGTH_OFFSET, INLINE_VALUES_OFFSET, KIND_OFFSET,
+    LENGTH_OFFSET, NO_ELEMENTS, PROPERTY_DATA_OFFSET, REFERENCES_OFFSET, SHAPE_OFFSET,
 };
 pub(crate) use array::HOLE;
 pub use owned::OwnedValue;
@@ -51,7 +51,7 @@ pub(crate) use properties::{
     PropertyWriteCache,
 };
 pub(crate) use regexp::regexp_flags;
-pub(crate) use shape::{DICTIONARY, NO_SHAPE};
+pub(crate) use shape::{DICTIONARY, NO_SHAPE, is_inline_shape};
 pub(crate) use typed::TypedKind;
 
 #[derive(Clone, Default)]
@@ -107,6 +107,7 @@ impl Default for HeapData {
     }
 }
 
+#[repr(C, u8)]
 enum Payload {
     Vacant,
     Reserved,
@@ -512,8 +513,15 @@ impl HeapData {
             Payload::Closure(closure) => callable_code(closure),
             _ => 0,
         };
+        let slot_address = std::ptr::from_ref(slot) as usize;
         slot.property_data = match &slot.payload {
-            Payload::SmallObject(object) => object.values.as_ptr().cast(),
+            Payload::SmallObject(object) => {
+                debug_assert_eq!(
+                    object.values.as_ptr() as usize - slot_address,
+                    INLINE_VALUES_OFFSET as usize
+                );
+                object.values.as_ptr().cast()
+            }
             Payload::Object(object) => object.properties.raw().0,
             Payload::Closure(closure) => closure.properties.raw().0,
             Payload::Native(native) => native.properties.raw().0,

@@ -237,13 +237,16 @@ pub(in crate::jit::semantic) fn lower_accesses(
         return Ok(());
     }
     function.ensure_facts();
+    let inline = super::values::inline_objects(&function.graph, &function.facts.cfg);
     let graph = &mut function.graph;
     let mut entries = crate::FxHashMap::default();
     for inst in accesses {
         let data = graph.insts[inst].clone();
         match data.op {
             Op::Javascript(JsOp::ShapedGet(object, ref name, index)) => {
-                lower_shaped(graph, inst, object, name, index)
+                let is_inline =
+                    super::values::is_proven(&inline, &function.facts.cfg, data.block, object);
+                lower_shaped(graph, inst, object, name, index, is_inline)
             }
             Op::Javascript(JsOp::LayoutGet(object, ref name, layout)) => {
                 lower_layout(graph, inst, object, name, layout)
@@ -389,19 +392,34 @@ pub(in crate::jit::semantic) fn lower_accesses(
     function.graph.verify()
 }
 
-fn lower_shaped(graph: &mut Graph, inst: Inst, object: Value, name: &str, index: u32) {
+fn lower_shaped(
+    graph: &mut Graph,
+    inst: Inst,
+    object: Value,
+    name: &str,
+    index: u32,
+    inline: bool,
+) {
     use cranelift_codegen::ir::{MemFlagsData, types};
 
     let mut at = Cursor::before(graph, inst);
     let view = at.add_unassigned(Op::Javascript(JsOp::View(object)));
-    let values = at.ins().load(
-        types::I64,
-        MemFlagsData::trusted(),
-        view,
-        crate::heap::PROPERTY_DATA_OFFSET,
-    );
-    let offset = at.ins().iconst(types::I64, i64::from(index) * 8);
-    let address = at.ins().iadd(values, offset);
+    let address = if inline {
+        let offset = at.ins().iconst(
+            types::I64,
+            i64::from(crate::heap::INLINE_VALUES_OFFSET) + i64::from(index) * 8,
+        );
+        at.ins().iadd(view, offset)
+    } else {
+        let values = at.ins().load(
+            types::I64,
+            MemFlagsData::trusted(),
+            view,
+            crate::heap::PROPERTY_DATA_OFFSET,
+        );
+        let offset = at.ins().iconst(types::I64, i64::from(index) * 8);
+        at.ins().iadd(values, offset)
+    };
     graph.set_op(
         inst,
         Op::Javascript(JsOp::PropertyLoad(object, address, Field::named(name))),
@@ -410,20 +428,35 @@ fn lower_shaped(graph: &mut Graph, inst: Inst, object: Value, name: &str, index:
 
 fn lower_layout(graph: &mut Graph, inst: Inst, object: Value, name: &str, layout: ReadLayout) {
     let Some(storage) = layout.storage else {
-        lower_shaped(graph, inst, object, name, layout.index);
+        lower_shaped(
+            graph,
+            inst,
+            object,
+            name,
+            layout.index,
+            crate::heap::is_inline_shape(layout.shape),
+        );
         return;
     };
     use cranelift_codegen::ir::{MemFlagsData, types};
     let mut at = Cursor::before(graph, inst);
-    let holder = at.ins().iconst(types::I64, storage.identity as i64);
-    let values = at.ins().load(
-        types::I64,
-        MemFlagsData::trusted(),
-        holder,
-        crate::heap::PROPERTY_DATA_OFFSET,
-    );
-    let offset = at.ins().iconst(types::I64, i64::from(layout.index) * 8);
-    let address = at.ins().iadd(values, offset);
+    let address = if crate::heap::is_inline_shape(storage.shape) {
+        let direct = storage
+            .identity
+            .wrapping_add(crate::heap::INLINE_VALUES_OFFSET as u64)
+            .wrapping_add(u64::from(layout.index) * 8);
+        at.ins().iconst(types::I64, direct as i64)
+    } else {
+        let holder = at.ins().iconst(types::I64, storage.identity as i64);
+        let values = at.ins().load(
+            types::I64,
+            MemFlagsData::trusted(),
+            holder,
+            crate::heap::PROPERTY_DATA_OFFSET,
+        );
+        let offset = at.ins().iconst(types::I64, i64::from(layout.index) * 8);
+        at.ins().iadd(values, offset)
+    };
     graph.set_op(
         inst,
         Op::Javascript(JsOp::RelatedPropertyLoad(

@@ -531,12 +531,27 @@ impl Heap {
                 Payload::Native(native) => &mut native.properties,
                 _ => return Some(true),
             };
-            match properties {
+            let old = match properties {
                 Properties::Shaped(values) => index.map(|index| values.remove(index)),
                 Properties::Dictionary(table) => table.remove(name),
+            };
+            if let Payload::Object(object) = &slot.payload
+                && let Properties::Shaped(values) = &object.properties
+                && values.len() <= INLINE_PROPERTIES
+            {
+                let mut inline = SmallObject::new(object.error);
+                inline.prototype = object.prototype.unwrap_or(Value::NULL);
+                inline.len = values.len() as u8;
+                inline.values[..values.len()].copy_from_slice(values);
+                slot.payload = Payload::SmallObject(inline);
             }
+            old
         };
         slot.shape = next;
+        debug_assert!(
+            slot.shape == NO_SHAPE
+                || is_inline_shape(slot.shape) == matches!(slot.payload, Payload::SmallObject(_))
+        );
         if let Some(old) = old {
             if heap_id(old)
                 .and_then(|id| data.live(id))

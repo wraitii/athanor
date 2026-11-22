@@ -5,8 +5,12 @@ pub(super) type Atom = u32;
 pub(super) type ShapeId = u32;
 
 pub(crate) const NO_SHAPE: ShapeId = 0;
-pub(crate) const DICTIONARY: ShapeId = u32::MAX;
+pub(crate) const DICTIONARY: ShapeId = u32::MAX - 1;
 const INDEXED_KEYS: usize = 8;
+
+pub(crate) const fn is_inline_shape(shape: ShapeId) -> bool {
+    shape & 1 != 0
+}
 
 #[derive(Default)]
 pub(super) struct Atoms {
@@ -44,6 +48,7 @@ pub(super) struct Key {
 pub(super) struct Shape {
     prototype: u64,
     root: ShapeId,
+    root_kind: RootKind,
     keys: Vec<Key>,
     index: FxHashMap<Atom, usize>,
 }
@@ -64,7 +69,7 @@ impl Shape {
         self.index.get(&atom).copied()
     }
 
-    fn with(prototype: u64, keys: Vec<Key>) -> Self {
+    fn with(prototype: u64, root_kind: RootKind, keys: Vec<Key>) -> Self {
         let index = if keys.len() > INDEXED_KEYS {
             keys.iter()
                 .enumerate()
@@ -76,6 +81,7 @@ impl Shape {
         Self {
             prototype,
             root: NO_SHAPE,
+            root_kind,
             keys,
             index,
         }
@@ -100,7 +106,7 @@ pub(super) struct Shapes {
 impl Default for Shapes {
     fn default() -> Self {
         Self {
-            shapes: vec![Shape::with(0, Vec::new())],
+            shapes: vec![Shape::with(0, RootKind::Object, Vec::new())],
             roots: FxHashMap::default(),
             transitions: FxHashMap::default(),
             deletions: FxHashMap::default(),
@@ -110,7 +116,7 @@ impl Default for Shapes {
 
 impl Shapes {
     pub(super) fn get(&self, shape: ShapeId) -> &Shape {
-        &self.shapes[shape as usize]
+        &self.shapes[(shape >> 1) as usize]
     }
 
     // Roots are keyed by prototype address; a reused address describes its new occupant.
@@ -137,8 +143,9 @@ impl Shapes {
         if let Some(&shape) = self.roots.get(&key) {
             return shape;
         }
-        let shape = self.push(Shape::with(prototype, Vec::new()));
-        self.shapes[shape as usize].root = shape;
+        let inline = kind == RootKind::Object;
+        let shape = self.push(Shape::with(prototype, kind, Vec::new()), inline);
+        self.shapes[(shape >> 1) as usize].root = shape;
         self.roots.insert(key, shape);
         shape
     }
@@ -149,6 +156,7 @@ impl Shapes {
         }
         let parent = self.get(shape);
         let root = parent.root;
+        let root_kind = parent.root_kind;
         let mut keys = parent.keys.clone();
         if let Some(slot) = parent.slot(key.atom) {
             if keys[slot] == key {
@@ -162,9 +170,10 @@ impl Shapes {
             return next;
         }
         keys.push(key);
-        let mut layout = Shape::with(parent.prototype, keys);
+        let inline = root_kind == RootKind::Object && keys.len() <= INLINE_PROPERTIES;
+        let mut layout = Shape::with(parent.prototype, root_kind, keys);
         layout.root = root;
-        let next = self.push(layout);
+        let next = self.push(layout, inline);
         self.transitions.insert((shape, key), next);
         self.deletions.insert((next, key.atom), shape);
         next
@@ -196,8 +205,9 @@ impl Shapes {
         })
     }
 
-    fn push(&mut self, shape: Shape) -> ShapeId {
-        let id = self.shapes.len() as ShapeId;
+    fn push(&mut self, shape: Shape, inline: bool) -> ShapeId {
+        let index = self.shapes.len() as ShapeId;
+        let id = (index << 1) | u32::from(inline);
         assert!(id < DICTIONARY);
         self.shapes.push(shape);
         id
