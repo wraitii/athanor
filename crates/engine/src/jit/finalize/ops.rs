@@ -827,11 +827,10 @@ impl FunctionCompiler<'_, '_> {
 
         self.switch(hit);
         let old_word = self.b.ins().load(types::I64, flags, slot, 0);
-        let uninitialized = self.b.ins().icmp_imm_s(
-            IntCC::Equal,
-            old_word,
-            Value::UNINITIALIZED.bits() as i64,
-        );
+        let uninitialized =
+            self.b
+                .ins()
+                .icmp_imm_s(IntCC::Equal, old_word, Value::UNINITIALIZED.bits() as i64);
         self.brif(uninitialized, slow, &[], ready, &[]);
 
         self.switch(ready);

@@ -35,7 +35,8 @@ pub(crate) const LENGTH_OFFSET: i32 = std::mem::offset_of!(Slot, length) as i32;
 pub(crate) const INLINE_PROPERTY_LENGTH_OFFSET: i32 = std::mem::offset_of!(SmallObject, len) as i32;
 pub(crate) const INLINE_VALUES_OFFSET: i32 = (std::mem::offset_of!(Slot, payload)
     + std::mem::align_of::<Payload>()
-    + std::mem::offset_of!(SmallObject, values)) as i32;
+    + std::mem::offset_of!(SmallObject, values))
+    as i32;
 
 pub(crate) static NO_ELEMENTS: [u64; SLOT_SIZE / 8] = [0; SLOT_SIZE / 8];
 

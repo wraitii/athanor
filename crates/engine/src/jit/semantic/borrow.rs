@@ -453,9 +453,9 @@ pub(super) fn borrows(graph: &mut Graph, facts: &Facts, notes: &mut Vec<String>)
             .iter()
             .filter(|value| {
                 if let Some(incoming) = merged.get(value) {
-                    return incoming
-                        .iter()
-                        .any(|value| borrows.chains.contains_key(value) && !accepted.contains(value));
+                    return incoming.iter().any(|value| {
+                        borrows.chains.contains_key(value) && !accepted.contains(value)
+                    });
                 }
                 if local.contains(value) {
                     return false;

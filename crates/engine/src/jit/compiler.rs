@@ -992,7 +992,10 @@ impl Compiler {
         for callable in &callables {
             if !intrinsics
                 && !callable.generator
-                && self.inspection.as_ref().is_none_or(|options| options.tiered)
+                && self
+                    .inspection
+                    .as_ref()
+                    .is_none_or(|options| options.tiered)
             {
                 self.lazy.insert(
                     callable.id,

@@ -930,7 +930,9 @@ pub(in crate::jit::semantic) fn cost(graph: &Graph) -> usize {
                 .filter(|&pred| !throws(pred)),
         );
     }
-    hot.iter().map(|&block| graph.blocks[block].insts.len()).sum()
+    hot.iter()
+        .map(|&block| graph.blocks[block].insts.len())
+        .sum()
 }
 
 impl Plan {

@@ -150,11 +150,9 @@ pub(super) fn is_proven(
     block: Block,
     object: Value,
 ) -> bool {
-    proven.get(&object).is_some_and(|guards| {
-        guards
-            .iter()
-            .any(|&guard| cfg.dominates(guard, block))
-    })
+    proven
+        .get(&object)
+        .is_some_and(|guards| guards.iter().any(|&guard| cfg.dominates(guard, block)))
 }
 
 fn equals(at: &mut Cursor, value: Value, expected: JsValue) -> Value {
