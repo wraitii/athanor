@@ -168,11 +168,9 @@ pub(in crate::jit::semantic) fn lower_stores(function: &mut FunctionState) {
                         object,
                     ));
             let constant_index = (!addition && inline)
-                .then(|| match graph.defining_op(key) {
-                    Some(Op::LowLevel(low_level::Op::Integer { bits, .. })) => Some(*bits as i64),
-                    _ => None,
-                })
-                .flatten();
+                .then(|| super::super::ranges::integer_literal(graph, key))
+                .flatten()
+                .filter(|&index| index >= 0);
             let data_offset = if indexed {
                 crate::heap::DATA_OFFSET
             } else {
