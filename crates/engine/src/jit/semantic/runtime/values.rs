@@ -181,9 +181,8 @@ fn has_kind(at: &mut Cursor, object: Value, mask: u32) -> Value {
     at.ins().test_mask(kind, u64::from(mask))
 }
 
-fn integer_check(at: &mut Cursor, value: Value, float: Value, exact: Value) -> Value {
-    let word = at.as_word(value);
-    let numeric = layout::is_number(at, word);
+fn integer_check(at: &mut Cursor, value: Value, float: Value, exact: Value, word: bool) -> Value {
+    let bits = at.as_word(value);
     let integral = at.ins().fcmp(FloatCC::Equal, float, exact);
     let magnitude = at.add(
         Op::LowLevel(low_level::Op::Unary {
@@ -196,10 +195,14 @@ fn integer_check(at: &mut Cursor, value: Value, float: Value, exact: Value) -> V
     let limit = at.ins().f64const(9007199254740991.0);
     let safe = at.ins().fcmp(FloatCC::LessThanOrEqual, magnitude, limit);
     let negative_zero = at.ins().iconst(types::I64, i64::MIN);
-    let positive_zero = at.ins().icmp(IntCC::NotEqual, word, negative_zero);
-    let valid = at.ins().boolean_and(numeric, integral);
-    let valid = at.ins().boolean_and(valid, safe);
-    at.ins().boolean_and(valid, positive_zero)
+    let positive_zero = at.ins().icmp(IntCC::NotEqual, bits, negative_zero);
+    let valid = at.ins().boolean_and(integral, safe);
+    let valid = at.ins().boolean_and(valid, positive_zero);
+    if word {
+        return valid;
+    }
+    let numeric = layout::is_number(at, bits);
+    at.ins().boolean_and(numeric, valid)
 }
 
 fn scalar(types: ValueType) -> bool {
@@ -212,7 +215,9 @@ fn predicate(graph: &mut Graph, facts: &Facts, inst: Inst) -> Option<Value> {
     let boxed = |_: &Graph, value: Value| !scalar(facts.of(value));
     Some(match *op {
         Op::Javascript(JsOp::IntegerCheck(value, float, exact)) => {
-            integer_check(&mut Cursor::before(graph, inst), value, float, exact)
+            let word = boxed(graph, value)
+                && matches!(graph.defining_op(float), Some(Op::Javascript(JsOp::NumericFloat(input))) if *input == value);
+            integer_check(&mut Cursor::before(graph, inst), value, float, exact, word)
         }
         Op::Javascript(JsOp::IsInteger(value)) => {
             let mut at = Cursor::before(graph, inst);
@@ -220,7 +225,7 @@ fn predicate(graph: &mut Graph, facts: &Facts, inst: Inst) -> Option<Value> {
             let float = at.ins().bitcast(types::F64, MemFlagsData::new(), bits);
             let integer = at.ins().fcvt_to_sint_sat(types::I64, float);
             let exact = at.ins().fcvt_from_sint(types::F64, integer);
-            integer_check(&mut at, value, float, exact)
+            integer_check(&mut at, value, float, exact, true)
         }
         Op::Javascript(JsOp::IsIntegerInRange(value, min, max)) => {
             let mut at = Cursor::before(graph, inst);
@@ -228,7 +233,7 @@ fn predicate(graph: &mut Graph, facts: &Facts, inst: Inst) -> Option<Value> {
             let float = at.ins().bitcast(types::F64, MemFlagsData::new(), bits);
             let integer = at.ins().fcvt_to_sint_sat(types::I64, float);
             let exact = at.ins().fcvt_from_sint(types::F64, integer);
-            let valid = integer_check(&mut at, value, float, exact);
+            let valid = integer_check(&mut at, value, float, exact, true);
             let min = at.ins().iconst(types::I64, i64::from(min));
             let max = at.ins().iconst(types::I64, i64::from(max));
             let lower = at.ins().icmp(IntCC::SignedGreaterThanOrEqual, integer, min);
