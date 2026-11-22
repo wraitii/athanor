@@ -3,16 +3,20 @@ use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{MemFlagsData, types};
 
 use super::super::cursor::{Cursor, Insert};
-use super::super::{Facts, FunctionState, Graph, Inst, Op, Repr, Value, ValueType, low_level};
+use super::super::{
+    Block, Cfg, Facts, FunctionState, Graph, Inst, Op, Repr, TerminatorKind, Value, ValueType,
+    low_level,
+};
 use super::layout;
 use crate::FxHashMap;
-use crate::heap::{CODE_OFFSET, KIND_OFFSET, SHAPE_OFFSET, TypedKind, kind};
+use crate::heap::{CODE_OFFSET, KIND_OFFSET, NO_SHAPE, SHAPE_OFFSET, TypedKind, kind};
 use crate::value::Value as JsValue;
 
 pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) {
     function.ensure_values();
     let graph = &mut function.graph;
     let facts = &function.facts;
+    let proven = proven_objects(graph, &facts.cfg);
     let mut aliases = FxHashMap::default();
     let mut removed = Vec::new();
     let mut insts = Vec::new();
@@ -21,7 +25,13 @@ pub(in crate::jit::semantic) fn lower(function: &mut FunctionState) {
         for &inst in &insts {
             if let Op::Javascript(JsOp::View(object)) = graph.insts[inst].op {
                 let result = graph.insts[inst].result().unwrap();
-                let view = view(graph, inst, object);
+                let view = if is_proven(&proven, &facts.cfg, block, object) {
+                    let mut at = Cursor::before(graph, inst);
+                    let word = at.as_word(object);
+                    layout::address(&mut at, word)
+                } else {
+                    view(graph, inst, object)
+                };
                 aliases.insert(result, view);
                 removed.push(inst);
                 continue;
@@ -67,6 +77,47 @@ fn view(graph: &mut Graph, inst: Inst, object: Value) -> Value {
     let mut at = Cursor::before(graph, inst);
     let word = at.as_word(object);
     layout::object_view(&mut at, word)
+}
+
+fn proven_objects(graph: &Graph, cfg: &Cfg) -> FxHashMap<Value, Vec<Block>> {
+    let mut proven: FxHashMap<Value, Vec<Block>> = FxHashMap::default();
+    for &block in &cfg.rpo {
+        let Some(TerminatorKind::Branch(condition, yes, _)) =
+            graph.blocks[block].terminator.as_ref().map(|t| &t.kind)
+        else {
+            continue;
+        };
+        if cfg.preds[yes.block].len() != 1 {
+            continue;
+        }
+        let object = match graph.defining_op(*condition) {
+            Some(Op::Javascript(JsOp::IsShape(object, shape))) if *shape != NO_SHAPE => *object,
+            Some(Op::Javascript(JsOp::IsReadLayout(object, layout)))
+                if layout.shape != NO_SHAPE =>
+            {
+                *object
+            }
+            Some(Op::Javascript(
+                JsOp::IsTyped(object, _) | JsOp::IsCode(object, _) | JsOp::IsArray(object, _),
+            )) => *object,
+            _ => continue,
+        };
+        proven.entry(object).or_default().push(yes.block);
+    }
+    proven
+}
+
+fn is_proven(
+    proven: &FxHashMap<Value, Vec<Block>>,
+    cfg: &Cfg,
+    block: Block,
+    object: Value,
+) -> bool {
+    proven.get(&object).is_some_and(|guards| {
+        guards
+            .iter()
+            .any(|&guard| cfg.dominates(guard, block))
+    })
 }
 
 fn equals(at: &mut Cursor, value: Value, expected: JsValue) -> Value {
