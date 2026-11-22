@@ -7,6 +7,7 @@ use crate::value::{TAG_FIRST, TAG_LAST, TAG_OBJECT, TAG_SHIFT, TAG_STRING};
 
 const ADDRESS_BITS: u8 = TAG_SHIFT as u8;
 const TAG_BITS: u8 = 64 - ADDRESS_BITS;
+const ADDRESS_MASK: u64 = (1 << ADDRESS_BITS) - 1;
 const OBJECT: u64 = TAG_OBJECT >> TAG_SHIFT;
 const STRING: u64 = TAG_STRING >> TAG_SHIFT;
 const _: () = assert!(TAG_STRING - TAG_OBJECT == 1 << TAG_SHIFT);
@@ -47,13 +48,11 @@ pub(in crate::jit) fn heap_address<I: Insert>(at: &mut I, word: Value) -> Value 
 }
 
 pub(in crate::jit) fn object_view<I: Insert>(at: &mut I, word: Value) -> Value {
-    let object = is_object(at, word);
-    view(at, word, object)
+    tagged_view(at, word, TAG_OBJECT)
 }
 
 pub(in crate::jit) fn string_view<I: Insert>(at: &mut I, word: Value) -> Value {
-    let string = is_string(at, word);
-    view(at, word, string)
+    tagged_view(at, word, TAG_STRING)
 }
 
 pub(in crate::jit) fn heap_view<I: Insert>(at: &mut I, word: Value) -> Value {
@@ -61,10 +60,20 @@ pub(in crate::jit) fn heap_view<I: Insert>(at: &mut I, word: Value) -> Value {
     view(at, word, heap)
 }
 
+fn tagged_view<I: Insert>(at: &mut I, word: Value, tag: u64) -> Value {
+    let address = address(at, word);
+    let valid = at.ins().in_range(word, tag + 1, tag | ADDRESS_MASK);
+    empty_or(at, valid, address)
+}
+
 fn view<I: Insert>(at: &mut I, word: Value, tagged: Value) -> Value {
     let address = address(at, word);
     let present = at.ins().icmp_imm_s(IntCC::NotEqual, address, 0);
     let valid = at.ins().boolean_and(tagged, present);
+    empty_or(at, valid, address)
+}
+
+fn empty_or<I: Insert>(at: &mut I, valid: Value, address: Value) -> Value {
     let empty = at
         .ins()
         .iconst(types::I64, crate::heap::NO_ELEMENTS.as_ptr() as i64);
