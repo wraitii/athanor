@@ -41,7 +41,16 @@ fn numeric_demand(graph: &Graph, cfg: &Cfg, native_calls: &FxHashSet<Inst>) -> F
     demanded
 }
 
-fn integer_demand(graph: &Graph, cfg: &Cfg) -> FxHashSet<Value> {
+fn integer_demand(graph: &Graph, cfg: &Cfg, facts: &Facts) -> FxHashSet<Value> {
+    let integral = |value: Value| {
+        let types = facts.of(value);
+        types != ValueType::default()
+            && types.within(ValueType::INTEGER)
+            && !matches!(
+                graph.defining_op(value),
+                Some(Op::Javascript(JsOp::Constant(_)))
+            )
+    };
     let mut pending = Vec::new();
     for &block in &cfg.rpo {
         for &inst in &graph.blocks[block].insts {
@@ -61,16 +70,27 @@ fn integer_demand(graph: &Graph, cfg: &Cfg) -> FxHashSet<Value> {
                     | BinaryOperator::ShiftLeft
                     | BinaryOperator::ShiftRight
                     | BinaryOperator::ShiftRightZeroFill
-                    | BinaryOperator::Remainder
-                    | BinaryOperator::LessThan
-                    | BinaryOperator::LessEqualThan
-                    | BinaryOperator::GreaterThan
-                    | BinaryOperator::GreaterEqualThan,
+                    | BinaryOperator::Remainder,
                     left,
                     right,
                 )) => pending.extend([left, right]),
-                Op::Javascript(JsOp::GuardedCompare { left, right, .. }) => {
-                    pending.extend([left, right])
+                Op::Javascript(
+                    JsOp::Binary(
+                        BinaryOperator::LessThan
+                        | BinaryOperator::LessEqualThan
+                        | BinaryOperator::GreaterThan
+                        | BinaryOperator::GreaterEqualThan,
+                        left,
+                        right,
+                    )
+                    | JsOp::GuardedCompare { left, right, .. },
+                ) => {
+                    if integral(right) {
+                        pending.push(left);
+                    }
+                    if integral(left) {
+                        pending.push(right);
+                    }
                 }
                 Op::Javascript(JsOp::Unary(UnaryOp::BitwiseNot, value)) => pending.push(value),
                 _ => {}
@@ -123,7 +143,7 @@ pub(in crate::jit::semantic) fn numbers(graph: &mut Graph) -> Vec<(Value, Fact)>
         .into_iter()
         .flat_map(|(_, body)| body)
         .collect();
-    let integers = integer_demand(graph, &cfg);
+    let integers = integer_demand(graph, &cfg, &facts);
     let native_calls: FxHashSet<Inst> = requirements(graph, &cfg.rpo)
         .into_iter()
         .map(|requirement| requirement.call)

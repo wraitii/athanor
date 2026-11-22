@@ -105,8 +105,7 @@ fn string_read_feedback_fuses_entire_concatenation_chains() {
 
 #[test]
 fn numeric_guard_failures_widen_feedback_and_then_stop_speculating() {
-    let source =
-        "function accumulate(a){let sum=0;for(let i=0;i<10&&!(sum>1e9);++i)sum+=a[i];return sum;}";
+    let source = "function accumulate(a){let sum=0;for(let i=0;i<10&&!(sum<i-1e9);++i)sum+=a[i];return sum;}";
     let execute = r#"
         const runner = {call: accumulate};
         const values = Array(10).fill(5);
@@ -191,7 +190,7 @@ fn numeric_guard_failures_widen_feedback_and_then_stop_speculating() {
 
 #[test]
 fn integer_failure_replans_other_numeric_sites_as_numbers() {
-    let source = "function accumulate(a,b,c){let sum=0;for(let i=0;i<10&&!(sum>1e9);++i){sum+=a[i];sum+=b[i];sum+=c[i];}return sum;}";
+    let source = "function accumulate(a,b,c){let sum=0;for(let i=0;i<10&&!(sum<i-1e9);++i){sum+=a[i];sum+=b[i];sum+=c[i];}return sum;}";
     let execute = r#"
         const runner = {call: accumulate};
         const a = Array(10).fill(1);
