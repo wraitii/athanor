@@ -45,6 +45,10 @@ pub(in crate::jit) struct Repository {
         ),
         crate::jit::profile::ShapeAccess,
     >,
+    shape_fallback: FxHashMap<
+        (usize, u32, u32, crate::jit::profile::PropertyAccess),
+        crate::jit::profile::ShapeAccess,
+    >,
     locations: FxHashMap<(usize, u32), FuncId>,
     globals: FxHashMap<String, FuncId>,
     pub(in crate::jit) sources: FxHashMap<usize, usize>,
@@ -66,6 +70,7 @@ impl Default for Repository {
             native_feedback: Default::default(),
             read_feedback: Default::default(),
             shape_feedback: Default::default(),
+            shape_fallback: Default::default(),
             locations: Default::default(),
             globals: Default::default(),
             sources: Default::default(),
@@ -83,6 +88,20 @@ struct Body {
 }
 
 impl Repository {
+    pub(in crate::jit) fn insert_shape_feedback(
+        &mut self,
+        site: crate::jit::profile::Site,
+        property: crate::jit::profile::PropertyAccess,
+        access: crate::jit::profile::ShapeAccess,
+    ) {
+        self.shape_feedback.insert((site, property), access);
+        let key = (site.source, site.start, site.end, property);
+        self.shape_fallback
+            .entry(key)
+            .and_modify(|existing| *existing = existing.merge(access))
+            .or_insert(access);
+    }
+
     pub(in crate::jit) fn shape_feedback(
         &self,
         site: crate::jit::profile::Site,
@@ -104,6 +123,11 @@ impl Repository {
                 self.shape_feedback
                     .get(&(original, property))
                     .copied()
+                    .or_else(|| {
+                        self.shape_fallback
+                            .get(&(site.source, site.start, site.end, property))
+                            .copied()
+                    })
                     .filter(|access| {
                         matches!(
                             access,

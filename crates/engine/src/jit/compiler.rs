@@ -1378,8 +1378,8 @@ impl Compiler {
             for (site, element) in profile.reads() {
                 canonical.read_feedback.insert(site, element);
             }
-            for (site, access) in profile.shapes() {
-                canonical.shape_feedback.insert(site, access);
+            for ((site, property), access) in profile.shapes() {
+                canonical.insert_shape_feedback(site, property, access);
             }
         }
     }

@@ -69,7 +69,7 @@ impl ShapeAccess {
         }
     }
 
-    pub(super) fn merge(self, other: Self) -> Self {
+    pub(in crate::jit) fn merge(self, other: Self) -> Self {
         let reads = |access| match access {
             Self::Read(layout) => Some(([layout; 4], 1)),
             Self::PolymorphicRead { entries, len } => Some((entries, len)),
